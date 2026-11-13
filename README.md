@@ -1,8 +1,6 @@
 # samplez
 
-Real-time multichannel audio engine with MXL I/O, written in Rust. It is the
-shared engine of [foldz](https://github.com/danielclasen/foldz) (downmix) and
-[faderz](https://github.com/danielclasen/faderz) (mixer).
+Real-time multichannel audio engine with MXL I/O, written in Rust.
 
 ## Building
 
@@ -12,10 +10,11 @@ bindgen, and a Release build of libmxl (MXL v1.1.0) installed under
 
 ```sh
 docker build -t samplez-builder docker/builder
-docker run --rm -v "$PWD:/w" -w /w samplez-builder cargo test --workspace
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w \
+  samplez-builder cargo test --workspace
 ```
 
-## License
+## Licence
 
-Apache-2.0. libmxl is distributed under its own Apache-2.0 licence; its
-licence files are installed in `/opt/mxl` in the builder image.
+Apache-2.0. The builder image carries the licence files of MXL and of the
+libraries statically linked into libmxl under `/opt/mxl/share/licenses`.
