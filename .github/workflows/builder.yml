@@ -32,7 +32,8 @@ jobs:
         run: |
           mxl=$(sed -n 's/^ARG MXL_SHA=//p' docker/builder/Dockerfile)
           rust=$(sed -n 's/^ARG RUST_VERSION=//p' docker/builder/Dockerfile)
-          test -n "$mxl" && test -n "$rust"
+          test -n "$mxl"
+          test -n "$rust"
           echo "tag=mxl-${mxl:0:12}-rust-${rust}" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0

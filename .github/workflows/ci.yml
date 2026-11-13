@@ -28,7 +28,7 @@ jobs:
           tags: samplez-builder:ci
           cache-from: type=gha,scope=builder
           cache-to: type=gha,scope=builder,mode=max
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             target
@@ -47,3 +47,12 @@ jobs:
               cargo clippy --workspace --all-targets --locked -- -D warnings
               cargo test --workspace --locked
             '
+      # Saved from main only, so per-PR snapshots do not evict the builder
+      # image layers from the shared Actions cache.
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target
+            .cargo-registry
+          key: cargo-${{ hashFiles('Cargo.lock', 'docker/builder/Dockerfile') }}-${{ github.sha }}
