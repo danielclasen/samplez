@@ -33,8 +33,10 @@ jobs:
           path: |
             target
             .cargo-registry
-          key: cargo-${{ hashFiles('Cargo.lock', 'docker/builder/Dockerfile') }}
-          restore-keys: cargo-
+          key: cargo-${{ hashFiles('Cargo.lock', 'docker/builder/Dockerfile') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ hashFiles('Cargo.lock', 'docker/builder/Dockerfile') }}-
+            cargo-
       - name: Format, lint and test in the builder image
         run: |
           mkdir -p .cargo-registry

@@ -27,13 +27,20 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - id: versions
+        name: Read pinned versions from the Dockerfile
+        run: |
+          mxl=$(sed -n 's/^ARG MXL_SHA=//p' docker/builder/Dockerfile)
+          rust=$(sed -n 's/^ARG RUST_VERSION=//p' docker/builder/Dockerfile)
+          test -n "$mxl" && test -n "$rust"
+          echo "tag=mxl-${mxl:0:12}-rust-${rust}" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/danielclasen/samplez-builder
           tags: |
             type=sha,format=long,prefix=
-            type=raw,value=mxl-v1.1.0-rust-1.96.0
+            type=raw,value=${{ steps.versions.outputs.tag }},enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
