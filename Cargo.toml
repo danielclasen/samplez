@@ -1,0 +1,13 @@
+[package]
+name = "samplez"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/danielclasen/samplez"
+description = "Real-time multichannel audio engine with MXL I/O"
+publish = false
+
+[workspace]
+
+[dependencies]
