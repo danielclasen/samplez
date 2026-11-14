@@ -464,15 +464,16 @@ fn two_inputs() {
     });
     // Past input A's fade-in.
     std::thread::sleep(SECOND / 2);
-    let _ = rx.try_iter().count();
+    // Read before the verdicts are drained: a skip that starts after
+    // this read shows as a gap after the last drained block.
+    let skipped = engine.counters().overrun_skipped_samples.load(Relaxed);
     let mut a = OutputA {
         domain: &domain,
         flow: &out_a,
-        next: None,
+        next: rx.try_iter().last().map(|v| v.k + 1),
         checked: 0,
         skipped: 0,
     };
-    let skipped = engine.counters().overrun_skipped_samples.load(Relaxed);
 
     producer.kill();
     let t = Instant::now();
