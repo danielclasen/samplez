@@ -349,7 +349,13 @@ impl Engine {
         let supervisor = std::thread::Builder::new()
             .name("samplez-supervisor".to_owned())
             .stack_size(rt::STACK_SIZE)
-            .spawn(move || sup.run(rt_thread))
+            .spawn(move || {
+                sup.run(rt_thread);
+                // Held until the RT thread is joined, so its sender is
+                // never the last reference: dropping that frees the
+                // channel on whichever side lets go last.
+                drop(thread_rx);
+            })
             .map_err(|e| {
                 stop.store(true, Relaxed);
                 Error::Thread(format!("spawning the supervisor: {e}"))

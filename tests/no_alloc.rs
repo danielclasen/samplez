@@ -6,6 +6,9 @@
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::backtrace::Backtrace;
+use std::cell::Cell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -15,14 +18,27 @@ use samplez::InputState;
 /// The RT thread's kernel tid; 0 before it is known.
 static RT_TID: AtomicI32 = AtomicI32::new(0);
 static RT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Where the RT thread's first allocator call came from, so a failure
+/// names the call site.
+static FIRST_RT_CALL: OnceLock<Backtrace> = OnceLock::new();
+
+thread_local! {
+    /// Set while the first call's backtrace is taken, which allocates.
+    static CAPTURING: Cell<bool> = const { Cell::new(false) };
+}
 
 struct Counting;
 
 fn count() {
     let tid = RT_TID.load(Relaxed);
     // SAFETY: gettid has no preconditions.
-    if tid != 0 && unsafe { libc::gettid() } == tid {
-        RT_CALLS.fetch_add(1, Relaxed);
+    if tid == 0 || unsafe { libc::gettid() } != tid || CAPTURING.get() {
+        return;
+    }
+    if RT_CALLS.fetch_add(1, Relaxed) == 0 {
+        CAPTURING.set(true);
+        let _ = FIRST_RT_CALL.set(Backtrace::force_capture());
+        CAPTURING.set(false);
     }
 }
 
@@ -88,10 +104,11 @@ fn rt_thread_allocates_nothing() {
     let verdicts: Vec<_> = rx.try_iter().collect();
     assert!(verdicts.iter().any(|v| v.fading != 0), "no fade-in seen");
     assert!(verdicts.iter().any(|v| v.ramping), "no gain ramp seen");
-    assert_eq!(
-        RT_CALLS.load(Relaxed),
-        0,
-        "allocator calls on the RT thread"
+    let calls = RT_CALLS.load(Relaxed);
+    assert!(
+        calls == 0,
+        "{calls} allocator calls on the RT thread, the first from:\n{}",
+        FIRST_RT_CALL.get().expect("captured with the first call")
     );
     common::stop(engine);
 }
