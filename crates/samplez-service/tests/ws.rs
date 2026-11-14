@@ -662,11 +662,12 @@ impl Sink<Message> for StuckSocket {
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_open_connection_that_stopped_answering_is_not_live() {
+async fn a_client_that_stops_reading_ends_one_second_after_its_last_pong() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1"));
     let connect = connect(&sessions, Role::Operator, None, 1);
     let queue = Hub::new(8).subscribe();
+    let start = Instant::now();
     let task = tokio::spawn({
         let state = state.clone();
         async move {
@@ -676,8 +677,11 @@ async fn an_open_connection_that_stopped_answering_is_not_live() {
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(sessions.live().len(), 1, "answered at connect");
-    tokio::time::sleep(PONG_TIMEOUT).await;
-    assert!(!task.is_finished(), "still open, stuck sending");
-    assert!(sessions.live().is_empty(), "no answer for over 1 s");
-    task.abort();
+    let ended = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("not stuck sending")
+        .unwrap();
+    assert_eq!(ended, Ended::Failed);
+    assert_eq!(start.elapsed(), PONG_TIMEOUT);
+    assert!(sessions.live().is_empty());
 }

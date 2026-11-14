@@ -296,7 +296,8 @@ pub enum Ended {
     Closed,
     /// No pong within [`PONG_TIMEOUT`]; a close frame was sent.
     PongTimeout,
-    /// Sending or receiving failed.
+    /// Sending or receiving failed, or a send did not finish within
+    /// [`PONG_TIMEOUT`] of the last pong.
     Failed,
 }
 
@@ -324,6 +325,19 @@ async fn catch_up(
         revision: snapshot.revision,
     };
     (position, vec![snapshot.text])
+}
+
+/// Sends `message`, giving up once the client has not answered a ping for
+/// [`PONG_TIMEOUT`]: a client that stopped reading is not waited for.
+async fn send<T: Sink<Message> + Unpin>(
+    tx: &mut T,
+    message: Message,
+    answered: Instant,
+) -> Result<(), ()> {
+    match tokio::time::timeout_at(answered + PONG_TIMEOUT, tx.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(()),
+    }
 }
 
 /// Serves one client until it closes, fails or stops answering pings:
@@ -373,7 +387,7 @@ where
             let out: Vec<Message> = tokio::select! {
                 _ = ping.tick() => {
                     if answered.elapsed() >= PONG_TIMEOUT {
-                        let _ = tx.send(Message::Close(None)).await;
+                        let _ = send(&mut tx, Message::Close(None), answered).await;
                         return Ended::PongTimeout;
                     }
                     vec![Message::Ping(Bytes::new())]
@@ -421,7 +435,7 @@ where
                 },
             };
             for message in out {
-                if tx.send(message).await.is_err() {
+                if send(&mut tx, message, answered).await.is_err() {
                     return Ended::Failed;
                 }
             }
@@ -430,4 +444,28 @@ where
     .await;
     sessions.remove(owner);
     ended
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connection stays registered until its serving loop ends, which
+    /// can be a while after its last pong when the task is not polled.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_is_live_only_within_the_pong_timeout() {
+        let sessions = Sessions::new("r1");
+        let owner = Owner {
+            principal: "anonymous".into(),
+            session: "s1".into(),
+            connection: sessions.connection_id(),
+        };
+        sessions.answered(&owner);
+        tokio::time::advance(PONG_TIMEOUT).await;
+        assert_eq!(sessions.live(), std::slice::from_ref(&owner));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(sessions.live().is_empty(), "silent for over 1 s");
+        sessions.answered(&owner);
+        assert_eq!(sessions.live(), [owner]);
+    }
 }
