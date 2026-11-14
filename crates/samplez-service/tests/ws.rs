@@ -729,6 +729,27 @@ async fn a_pong_that_echoes_no_ping_does_not_count() {
     assert_eq!(start.elapsed(), PONG_TIMEOUT);
 }
 
+/// An unsolicited pong (RFC 6455 5.5.3) carrying 8 bytes that read as a
+/// number above every ping outstanding does not drop those pings: the
+/// pong that echoes one still counts.
+#[tokio::test(start_paused = true)]
+async fn an_unsolicited_pong_does_not_drop_the_pings_outstanding() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let start = Instant::now();
+    while start.elapsed() < 4 * PONG_TIMEOUT {
+        if let Message::Ping(p) = client.rx.recv().await.expect("serving") {
+            let unsolicited = Bytes::copy_from_slice(&1_700_000_000_000u64.to_be_bytes());
+            client.tx.send(Ok(Message::Pong(unsolicited))).unwrap();
+            client.tx.send(Ok(Message::Pong(p))).unwrap();
+        }
+    }
+    assert!(!client.task.is_finished());
+    assert_eq!(sessions.live().len(), 1);
+}
+
 /// A client may answer only the most recent of several pings (RFC 6455
 /// 5.5.3): answering every other one keeps the connection.
 #[tokio::test(start_paused = true)]

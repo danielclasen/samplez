@@ -604,13 +604,17 @@ where
                         // Counted from when its ping was sent, so pongs that
                         // waited unread do not count as fresh; one that
                         // echoes no ping sent and not answered yet does not
-                        // count.
+                        // count, and leaves the pings outstanding. Their
+                        // numbers are consecutive, so the echoed one is at
+                        // its distance from the oldest.
                         let echoed = <[u8; 8]>::try_from(&payload[..]).ok().map(u64::from_be_bytes);
-                        while pings.front().is_some_and(|p| Some(p.0) < echoed) {
-                            pings.pop_front();
-                        }
+                        let at = echoed
+                            .zip(pings.front())
+                            .and_then(|(n, oldest)| n.checked_sub(oldest.0))
+                            .and_then(|i| usize::try_from(i).ok())
+                            .filter(|&i| i < pings.len());
                         if let Some((_, sent, unread)) =
-                            pings.pop_front_if(|p| Some(p.0) == echoed)
+                            at.and_then(|i| pings.drain(..=i).next_back())
                         {
                             paused_before = paused_total - unread;
                             answered = sent + paused_before;
