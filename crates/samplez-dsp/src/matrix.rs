@@ -111,6 +111,17 @@ impl Matrix {
             .map_or(0.0, |k| col[k].ramp.current())
     }
 
+    /// Whether the coefficient from `input` to `output` is ramping: its
+    /// next sample differs from its target. False for a coefficient that
+    /// holds its value, a removed one included.
+    pub fn is_ramping(&self, input: usize, output: usize) -> bool {
+        let Some(col) = self.columns.get(output) else {
+            return false;
+        };
+        col.binary_search_by_key(&input, |t| t.input)
+            .is_ok_and(|k| col[k].ramp.is_active())
+    }
+
     /// Ramps the coefficient from `input` to `output` to `target` over
     /// `len` samples, per [`Ramp::set_target`].
     ///
@@ -318,6 +329,25 @@ mod tests {
         a.process(&input, &mut out_a, CAP);
         b.process(&input, &mut out_b, CAP);
         assert_bits_eq(&out_a, &out_b, CAP, "after advance");
+    }
+
+    #[test]
+    fn is_ramping_only_while_a_ramp_runs() {
+        let mut m = Matrix::new(2, 2);
+        assert!(!m.is_ramping(0, 0), "absent coefficient");
+        assert!(m.set(0, 0, 0.5, 10));
+        assert!(m.is_ramping(0, 0));
+        assert!(!m.is_ramping(1, 0) && !m.is_ramping(0, 1));
+        m.advance(10);
+        assert!(!m.is_ramping(0, 0), "ramp ended");
+        // A target equal to the held value starts no ramp.
+        assert!(m.set(0, 0, 0.5, 10));
+        assert!(!m.is_ramping(0, 0));
+        assert!(m.set(1, 1, 0.0, 10), "zero on an absent coefficient");
+        assert!(!m.is_ramping(1, 1));
+        assert!(m.set(0, 0, 0.0, 0), "jump");
+        assert!(!m.is_ramping(0, 0));
+        assert!(!m.is_ramping(5, 5), "out of range");
     }
 
     #[test]

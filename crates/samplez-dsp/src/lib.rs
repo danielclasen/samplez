@@ -22,4 +22,4 @@ pub use buffer::{MAX_FRAMES, PlanarBuffer};
 pub use matrix::{Matrix, Path};
 pub use meter::Meters;
 pub use mxcsr::{DAZ, FTZ, SavedMxcsr, mxcsr, restore_mxcsr, set_ftz_daz};
-pub use ramp::{MAX_GAIN, MAX_RAMP_LEN, Ramp};
+pub use ramp::{MAX_GAIN, MAX_RAMP_LEN, Ramp, valid_gain};
