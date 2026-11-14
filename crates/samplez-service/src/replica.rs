@@ -149,8 +149,9 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// Called about once per second by [`crate::Bound::serve`] with the
     /// owners whose connection to this replica is live
     /// ([`crate::ws::Sessions::live`]): it answered a ping within the last
-    /// second, or within the second before it stopped being read at
-    /// [`crate::ws::MAX_PENDING_REPLIES`]; not called when there are none.
+    /// second, not counting up to [`crate::ws::MAX_PAUSE_TOTAL`] in which
+    /// it was not read at [`crate::ws::MAX_PENDING_REPLIES`]; not called
+    /// when there are none.
     /// Must not block: the renewal is passed on to the replication
     /// mechanism.
     fn renew_sessions(&self, live: &[Owner]);
