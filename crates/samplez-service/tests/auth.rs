@@ -194,8 +194,16 @@ async fn token_mode_cookie_login_and_invalidation() {
         .await
         .unwrap();
     assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
-    let tls = login_req().header("x-forwarded-proto", "https");
-    assert!(login(&api, tls, API_TOKEN).await.1.contains("; Secure"));
+    for proto in ["https", "HTTPS", " https , http", "https,http"] {
+        let tls = login_req().header("x-forwarded-proto", proto);
+        let set_cookie = login(&api, tls, API_TOKEN).await.1;
+        assert!(set_cookie.contains("; Secure"), "{proto:?}");
+    }
+    for proto in ["http", "http, https", "httpsx"] {
+        let plain = login_req().header("x-forwarded-proto", proto);
+        let set_cookie = login(&api, plain, API_TOKEN).await.1;
+        assert!(!set_cookie.contains("Secure"), "{proto:?}");
+    }
 
     let cookie = cookie_pair(&set_cookie);
     let with_cookie =

@@ -490,10 +490,16 @@ pub(crate) async fn login(
     if !token.matches(body.token.as_bytes()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // A chain of proxies appends its schemes; the first is the client's.
     let secure = auth.tls
-        || headers
-            .get("x-forwarded-proto")
-            .is_some_and(|p| p.as_bytes().eq_ignore_ascii_case(b"https"));
+        || headers.get("x-forwarded-proto").is_some_and(|p| {
+            let first = p
+                .as_bytes()
+                .split(|&b| b == b',')
+                .next()
+                .unwrap_or_default();
+            first.trim_ascii().eq_ignore_ascii_case(b"https")
+        });
     let cookie = format!(
         "{SESSION_COOKIE}={}; Path=/api/v1; Max-Age={}; HttpOnly; SameSite=Strict{}",
         session_value(&token.get(), now() + SESSION_TTL.as_secs()),
