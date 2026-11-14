@@ -25,7 +25,8 @@ pub struct Config {
     pub max_catchup_blocks: u32,
     #[serde(default = "default_prune")]
     pub prune_after_blocks: u32,
-    /// Length of every gain ramp and input fade in samples.
+    /// Length of every gain ramp and input fade in samples, at most
+    /// `samplez_dsp::MAX_RAMP_LEN`.
     #[serde(default = "default_ramp")]
     pub ramp_samples: u32,
     /// Path of the libmxl shared library.
@@ -206,6 +207,13 @@ impl Config {
         if !(16..=1024).contains(&self.block_size) {
             return fail(format!("blockSize {} is not in 16..=1024", self.block_size));
         }
+        if self.ramp_samples > samplez_dsp::MAX_RAMP_LEN {
+            return fail(format!(
+                "rampSamples {} is above {}",
+                self.ramp_samples,
+                samplez_dsp::MAX_RAMP_LEN
+            ));
+        }
         if !(1..=99).contains(&self.rt.priority) {
             return fail(format!("rt.priority {} is not in 1..=99", self.rt.priority));
         }
@@ -244,6 +252,14 @@ impl Config {
             }
             samplez_mxl::output::flow_definition(&self.output_config(o))
                 .map_err(|e| Error(format!("output {}: {e}", o.name)))?;
+            if let Some(i) = self.inputs.iter().find(|i| {
+                i.flow_id == o.flow_id && self.domain(&i.domain) == self.domain(&o.domain)
+            }) {
+                return fail(format!(
+                    "output {} writes flow {}, which input {} reads in the same domain",
+                    o.name, o.flow_id, i.name
+                ));
+            }
         }
         let (n, m) = (self.input_channels(), self.output_channels());
         if self.matrix.len() != n || self.matrix.iter().any(|row| row.len() != m) {
@@ -255,7 +271,7 @@ impl Config {
             .matrix
             .iter()
             .flatten()
-            .find(|g| g.abs() > samplez_dsp::MAX_GAIN)
+            .find(|&&g| !samplez_dsp::valid_gain(g))
         {
             return fail(format!("matrix gain {g} is not finite within MAX_GAIN"));
         }
@@ -341,7 +357,7 @@ mod tests {
 
     #[test]
     fn invalid_configurations_are_refused() {
-        let cases: [(&str, serde_json::Value); 11] = [
+        let cases: [(&str, serde_json::Value); 13] = [
             ("sampleRate", serde_json::json!(44_100)),
             ("blockSize", serde_json::json!(8)),
             ("blockSize", serde_json::json!(2048)),
@@ -349,6 +365,15 @@ mod tests {
             ("matrix", serde_json::json!([[0.5, 1.0], [0.5, 1.0]])),
             ("matrix", serde_json::json!([[2.0e6], [0.5]])),
             ("rt", serde_json::json!({ "priority": 0 })),
+            (
+                "rampSamples",
+                serde_json::json!(samplez_dsp::MAX_RAMP_LEN + 1),
+            ),
+            (
+                "outputs",
+                serde_json::json!([{ "name": "out", "domain": "a", "flowId": IN, "label": "l",
+                                     "group": "hop", "role": "Audio", "channels": 1 }]),
+            ),
             ("unknownField", serde_json::json!(1)),
             (
                 "inputs",
@@ -369,5 +394,33 @@ mod tests {
             c[field] = value.clone();
             assert!(parse(&c).is_err(), "{field} = {value}");
         }
+    }
+
+    #[test]
+    fn limits_and_flows_are_checked() {
+        let mut c = base();
+        c["rampSamples"] = serde_json::json!(samplez_dsp::MAX_RAMP_LEN);
+        assert!(parse(&c).is_ok());
+        // The same flow id in another domain is another flow.
+        let mut c = base();
+        c["domains"] = serde_json::json!([{ "name": "a", "path": "/mxl/a" },
+                                          { "name": "b", "path": "/mxl/b" }]);
+        c["outputs"][0]["flowId"] = serde_json::json!(IN);
+        c["outputs"][0]["domain"] = serde_json::json!("b");
+        assert!(parse(&c).is_ok());
+        c["outputs"][0]["domain"] = serde_json::json!("a");
+        assert!(parse(&c).is_err());
+    }
+
+    /// JSON has no NaN, so the gain is set on a parsed configuration.
+    #[test]
+    fn a_nan_matrix_gain_is_refused() {
+        let mut c = parse(&base()).unwrap();
+        c.matrix[0][0] = f32::NAN;
+        assert!(c.validate().is_err());
+        c.matrix[0][0] = f32::INFINITY;
+        assert!(c.validate().is_err());
+        c.matrix[0][0] = 0.5;
+        assert!(c.validate().is_ok());
     }
 }
