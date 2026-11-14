@@ -525,7 +525,12 @@ async fn commands_apply_once_per_id_from_the_replicated_table() {
     };
     let mut submitted = pin!(pending.submit(command()));
     assert!(submitted.as_mut().now_or_never().is_none(), "committing");
-    assert!(matches!(commands.begin("c1"), Begin::InFlight));
+    // The client lost the connection and resent through the same replica.
+    let Begin::New(again) = commands.begin("c1") else {
+        panic!("not applied yet, so new again");
+    };
+    let mut resent = pin!(again.submit(command()));
+    assert!(resent.as_mut().now_or_never().is_none(), "committing");
     state.commit();
     let ack = submitted.await.unwrap();
     assert_eq!(
@@ -535,6 +540,8 @@ async fn commands_apply_once_per_id_from_the_replicated_table() {
             revision: 1
         }
     );
+    assert_eq!(resent.await.unwrap(), ack, "the resend gets the answer too");
+    assert_eq!(state.revision(), 1, "applied once");
     match commands.begin("c1") {
         Begin::Duplicate(again) => assert_eq!(again, ack),
         _ => panic!("c1 is applied"),

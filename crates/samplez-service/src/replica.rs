@@ -1,11 +1,10 @@
-//! The interface to the product's replicated state, and the local guard
-//! against submitting one command id twice at once from this replica.
+//! The interface to the product's replicated state, and the local check
+//! before a command is submitted to it.
 //!
 //! Every replica of a product applies the same deltas at the same global
 //! revisions. The service layer never counts revisions itself: they come
 //! from [`ReplicatedState`] and from the deltas the product publishes.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -113,27 +112,25 @@ pub struct NotApplied(pub String);
 
 pub enum Begin<'a> {
     /// Not applied as far as this replica has applied: submit it with
-    /// [`Pending::submit`]. Dropping the [`Pending`] unsubmitted releases
-    /// the id, so a resend is submitted.
+    /// [`Pending::submit`]. A resend while an earlier copy is still being
+    /// submitted, through this replica or another, is new as well; the
+    /// state machine applies it once and both copies get the same [`Ack`]
+    /// ([`ReplicatedState::submit`]).
     New(Pending<'a>),
     /// Applied already, through any replica; acknowledge it again without
     /// submitting it.
     Duplicate(Ack),
-    /// Being submitted from this replica right now.
-    InFlight,
     /// As many commands as the limit are being submitted from this replica.
     Busy,
 }
 
-/// The command ids being submitted from this replica, so a resend to the
-/// same replica waits for the first copy instead of ordering a second.
-/// Whether an id was applied is the replicated state's answer; that its
-/// state machine dedups by id ([`ReplicatedState::submit`]) is what keeps a
-/// copy resent through another replica from being applied twice.
+/// Answers a command that was applied already from the replicated table of
+/// applied command ids, and limits the commands being submitted from this
+/// replica at once.
 pub struct Commands {
     state: Arc<dyn ReplicatedState>,
     limit: usize,
-    in_flight: Mutex<HashSet<String>>,
+    in_flight: Mutex<usize>,
 }
 
 impl Commands {
@@ -147,27 +144,24 @@ impl Commands {
     }
 
     pub fn begin(&self, id: &str) -> Begin<'_> {
-        let mut in_flight = self.lock();
-        if in_flight.contains(id) {
-            return Begin::InFlight;
-        }
         if let Some(revision) = self.state.command_revision(id) {
             return Begin::Duplicate(Ack {
                 command: id.to_owned(),
                 revision,
             });
         }
-        if in_flight.len() >= self.limit {
+        let mut in_flight = self.lock();
+        if *in_flight >= self.limit {
             return Begin::Busy;
         }
-        in_flight.insert(id.to_owned());
+        *in_flight += 1;
         Begin::New(Pending {
             commands: self,
             id: id.to_owned(),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, usize> {
         self.in_flight.lock().expect("commands lock poisoned")
     }
 }
@@ -178,8 +172,8 @@ pub struct Pending<'a> {
 }
 
 impl Pending<'_> {
-    /// Submits the command to the replicated state and releases the id once
-    /// it resolved.
+    /// Submits the command to the replicated state; it counts against the
+    /// limit until it resolved.
     pub async fn submit(self, command: Bytes) -> Result<Ack, NotApplied> {
         self.commands.state.submit(&self.id, command).await
     }
@@ -187,6 +181,6 @@ impl Pending<'_> {
 
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        self.commands.lock().remove(&self.id);
+        *self.commands.lock() -= 1;
     }
 }
