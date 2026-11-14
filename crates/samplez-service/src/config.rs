@@ -108,7 +108,8 @@ pub struct Tls {
     /// PEM, PKCS#8, PKCS#1 or SEC1; `files` mode.
     pub key_file: Option<PathBuf>,
     /// PEM CA certificates; when set, a client must present a certificate
-    /// issued by one of them. Read at start only.
+    /// issued by one of them. Re-read with the certificate and key files; a
+    /// change applies from the next handshake on.
     pub client_ca_file: Option<PathBuf>,
     /// DNS names and IP addresses of the generated certificate;
     /// `selfSigned` mode.

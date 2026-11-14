@@ -33,7 +33,7 @@ pub const SESSION_RENEW_PERIOD: Duration = Duration::from_secs(1);
 pub const MAX_SESSION_ID: usize = 128;
 
 /// How often [`Bound::serve`] re-reads the token files and the TLS
-/// certificate and key files.
+/// certificate, key and client CA files.
 pub const SECRET_RELOAD_PERIOD: Duration = Duration::from_secs(10);
 
 type WsHandler =
@@ -219,9 +219,10 @@ impl Service {
         self
     }
 
-    /// Re-reads the token files and the TLS certificate and key files now,
-    /// each on its own. Sessions issued under a replaced API token end; a
-    /// replaced certificate is presented from the next handshake on.
+    /// Re-reads the token files and the TLS certificate, key and client CA
+    /// files now, each on its own. Sessions issued under a replaced API
+    /// token end; a replaced certificate or client CA applies from the next
+    /// handshake on.
     /// Returns the first error.
     pub fn reload_secrets(&self) -> Result<(), Error> {
         let mut first = self.auth.reload();

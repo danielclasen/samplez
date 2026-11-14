@@ -9,7 +9,10 @@
 //! read once more at once, since a rotation can replace the two files
 //! between the reads; when it still fails, the previous pair stays and the
 //! failure counts in
-//! `samplez_secret_reload_failures_total{secret="<listener>Tls"}`.
+//! `samplez_secret_reload_failures_total{secret="<listener>Tls"}`. A client
+//! CA file is re-read with them, in any mode, and a changed one applies
+//! from the next handshake on; one that does not parse keeps the previous
+//! CA and counts the same way.
 
 use std::io;
 use std::net::SocketAddr;
@@ -19,6 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use rustls::RootCertStore;
+use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -82,13 +86,23 @@ struct Files {
     loaded: Mutex<(Vec<u8>, Vec<u8>)>,
 }
 
+struct ClientCa {
+    path: PathBuf,
+    /// The content the verifier in use was built from.
+    loaded: Mutex<Vec<u8>>,
+}
+
+/// The configuration of new handshakes; replaced when the client CA changes.
+type SharedConfig = Arc<RwLock<Arc<ServerConfig>>>;
+
 pub(crate) struct ListenerTls {
     listener: &'static str,
     mode: TlsMode,
     files: Option<Files>,
+    client_ca: Option<ClientCa>,
     provider: Arc<CryptoProvider>,
     resolver: Arc<Resolver>,
-    acceptor: TlsAcceptor,
+    config: SharedConfig,
     loaded_at: AtomicU64,
     failures: Counter,
 }
@@ -146,34 +160,26 @@ impl ListenerTls {
             _ => (None, self_signed(&tls.sans, &provider)?),
         };
         let resolver = Arc::new(Resolver(RwLock::new(Arc::new(key))));
-        let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| Error::Config(format!("TLS: {e}")))?;
-        let builder = match &tls.client_ca_file {
-            Some(path) => {
-                let mut roots = RootCertStore::empty();
-                for cert in certs(&read(path)?, path)? {
-                    roots
-                        .add(cert)
-                        .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
-                }
-                let verifier =
-                    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-                        .build()
-                        .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
-                builder.with_client_cert_verifier(verifier)
-            }
-            None => builder.with_no_client_auth(),
+        let client_ca = match &tls.client_ca_file {
+            Some(path) => Some((path.clone(), read(path)?)),
+            None => None,
         };
-        let mut config = builder.with_cert_resolver(resolver.clone());
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let pem = client_ca
+            .as_ref()
+            .map(|(path, pem)| (path.as_path(), pem.as_slice()));
+        let config = server_config(&provider, pem, &resolver)?;
+        let client_ca = client_ca.map(|(path, pem)| ClientCa {
+            path,
+            loaded: Mutex::new(pem),
+        });
         let tls = ListenerTls {
             listener,
             mode: tls.mode,
             files,
+            client_ca,
             provider,
             resolver,
-            acceptor: TlsAcceptor::from(Arc::new(config)),
+            config: Arc::new(RwLock::new(Arc::new(config))),
             loaded_at: AtomicU64::new(crate::auth::now()),
             failures: metrics.counter(
                 "samplez_secret_reload_failures_total",
@@ -191,8 +197,8 @@ impl ListenerTls {
         Ok(Some(tls))
     }
 
-    /// Re-reads the certificate and key files in `files` mode and swaps in
-    /// what they hold when it changed.
+    /// Re-reads the certificate and key files in `files` mode and the client
+    /// CA file, and swaps in what they hold when it changed.
     pub(crate) fn reload(&self) -> Result<(), Error> {
         self.reload_with(read)
     }
@@ -201,42 +207,69 @@ impl ListenerTls {
         &self,
         mut read: impl FnMut(&Path) -> Result<Vec<u8>, Error>,
     ) -> Result<(), Error> {
-        let Some(files) = &self.files else {
+        if self.files.is_none() && self.client_ca.is_none() {
             return Ok(());
-        };
-        let result = (|| {
-            let mut loaded = files.loaded.lock().expect("certificate lock poisoned");
-            let mut retried = false;
-            loop {
-                let content = (read(&files.cert)?, read(&files.key)?);
-                if *loaded == content {
-                    return Ok(());
-                }
-                match certified_key(&content, &files.cert, &self.provider) {
-                    Ok(key) => {
-                        *self.resolver.0.write().expect("certificate lock poisoned") =
-                            Arc::new(key);
-                        *loaded = content;
-                        tracing::info!(
-                            listener = self.listener,
-                            fingerprint = %self.fingerprint(),
-                            "certificate changed"
-                        );
-                        return Ok(());
-                    }
-                    Err(_) if !retried => retried = true,
-                    Err(e) => return Err(e),
-                }
-            }
-        })();
+        }
+        let pair = self.reload_pair(&mut read);
+        let client_ca = self.reload_client_ca(&mut read);
+        let result = pair.and(client_ca);
         match &result {
             Ok(()) => self.loaded_at.store(crate::auth::now(), Ordering::Relaxed),
             Err(e) => {
                 self.failures.add(1);
-                tracing::warn!(listener = self.listener, error = %e, "keeping the previous certificate");
+                tracing::warn!(listener = self.listener, error = %e, "keeping what was in use");
             }
         }
         result
+    }
+
+    fn reload_pair(
+        &self,
+        read: &mut impl FnMut(&Path) -> Result<Vec<u8>, Error>,
+    ) -> Result<(), Error> {
+        let Some(files) = &self.files else {
+            return Ok(());
+        };
+        let mut loaded = files.loaded.lock().expect("certificate lock poisoned");
+        let mut retried = false;
+        loop {
+            let content = (read(&files.cert)?, read(&files.key)?);
+            if *loaded == content {
+                return Ok(());
+            }
+            match certified_key(&content, &files.cert, &self.provider) {
+                Ok(key) => {
+                    *self.resolver.0.write().expect("certificate lock poisoned") = Arc::new(key);
+                    *loaded = content;
+                    tracing::info!(
+                        listener = self.listener,
+                        fingerprint = %self.fingerprint(),
+                        "certificate changed"
+                    );
+                    return Ok(());
+                }
+                Err(_) if !retried => retried = true,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn reload_client_ca(
+        &self,
+        read: &mut impl FnMut(&Path) -> Result<Vec<u8>, Error>,
+    ) -> Result<(), Error> {
+        let Some(ca) = &self.client_ca else {
+            return Ok(());
+        };
+        let content = read(&ca.path)?;
+        let mut loaded = ca.loaded.lock().expect("client CA lock poisoned");
+        if *loaded != content {
+            let config = server_config(&self.provider, Some((&ca.path, &content)), &self.resolver)?;
+            *self.config.write().expect("config lock poisoned") = Arc::new(config);
+            *loaded = content;
+            tracing::info!(listener = self.listener, "client CA changed");
+        }
+        Ok(())
     }
 
     fn fingerprint(&self) -> String {
@@ -267,9 +300,8 @@ impl ListenerTls {
     fn listen(&self, tcp: TcpListener, handshakes: usize) -> io::Result<TlsListener> {
         let local = tcp.local_addr()?;
         let (tx, accepted) = mpsc::channel(ACCEPTED_QUEUE);
-        let acceptor = self.acceptor.clone();
         let handshakes = Arc::new(Semaphore::new(handshakes));
-        let task = tokio::spawn(accept_loop(tcp, acceptor, tx, handshakes));
+        let task = tokio::spawn(accept_loop(tcp, self.config.clone(), tx, handshakes));
         Ok(TlsListener {
             local,
             accepted,
@@ -280,6 +312,36 @@ impl ListenerTls {
 
 fn read(path: &Path) -> Result<Vec<u8>, Error> {
     std::fs::read(path).map_err(|e| Error::Secret(path.to_owned(), e))
+}
+
+/// Fails when the client CA file holds no usable certificate.
+fn server_config(
+    provider: &Arc<CryptoProvider>,
+    client_ca: Option<(&Path, &[u8])>,
+    resolver: &Arc<Resolver>,
+) -> Result<ServerConfig, Error> {
+    let builder = ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Config(format!("TLS: {e}")))?;
+    let builder = match client_ca {
+        Some((path, pem)) => {
+            let mut roots = RootCertStore::empty();
+            for cert in certs(pem, path)? {
+                roots
+                    .add(cert)
+                    .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+            }
+            let verifier =
+                WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                    .build()
+                    .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut config = builder.with_cert_resolver(resolver.clone());
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 fn certs(pem: &[u8], path: &Path) -> Result<Vec<CertificateDer<'static>>, Error> {
@@ -318,7 +380,7 @@ fn self_signed(sans: &[String], provider: &CryptoProvider) -> Result<CertifiedKe
 
 async fn accept_loop(
     mut tcp: TcpListener,
-    acceptor: TlsAcceptor,
+    config: SharedConfig,
     tx: mpsc::Sender<(TlsStream<TcpStream>, SocketAddr)>,
     handshakes: Arc<Semaphore>,
 ) {
@@ -329,7 +391,8 @@ async fn accept_loop(
             .await
             .expect("the semaphore is never closed");
         let (stream, addr) = axum::serve::Listener::accept(&mut tcp).await;
-        let (acceptor, tx) = (acceptor.clone(), tx.clone());
+        let acceptor = TlsAcceptor::from(config.read().expect("config lock poisoned").clone());
+        let tx = tx.clone();
         tokio::spawn(async move {
             let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
             drop(permit);
@@ -573,22 +636,26 @@ mod tests {
         assert!(get(&trusting, addr, "other.example").await.is_err());
     }
 
-    #[tokio::test]
-    async fn a_client_ca_refuses_clients_without_a_certificate_it_issued() {
+    /// A CA's PEM and a client identity it issued.
+    fn client_ca() -> (String, CertificateDer<'static>, PrivateKeyDer<'static>) {
         let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
-        let ca_file = dir().join("client-ca.crt");
-        std::fs::write(&ca_file, ca.pem()).unwrap();
         let client_key = KeyPair::generate().unwrap();
         let client_cert = CertificateParams::new(vec!["client".into()])
             .unwrap()
             .signed_by(&client_key, &ca)
             .unwrap();
-        let identity = || {
-            let key = PrivateKeyDer::Pkcs8(client_key.serialize_der().into());
-            Some((client_cert.der().clone(), key))
-        };
+        let key = PrivateKeyDer::Pkcs8(client_key.serialize_der().into());
+        (ca.pem(), client_cert.der().clone(), key)
+    }
+
+    #[tokio::test]
+    async fn a_client_ca_refuses_clients_without_a_certificate_it_issued() {
+        let (ca, client_cert, client_key) = client_ca();
+        let ca_file = dir().join("client-ca.crt");
+        std::fs::write(&ca_file, ca).unwrap();
+        let identity = || Some((client_cert.clone(), client_key.clone_key()));
 
         let (cert, key, der) = write_pair("mtls");
         let config = Tls {
@@ -621,6 +688,29 @@ mod tests {
             .unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(started.elapsed() < HANDSHAKE_TIMEOUT / 2);
+    }
+
+    #[tokio::test]
+    async fn a_reload_applies_a_changed_client_ca() {
+        let (first, _, _) = client_ca();
+        let (second, client_cert, client_key) = client_ca();
+        let ca_file = dir().join("rotated-client-ca.crt");
+        std::fs::write(&ca_file, first).unwrap();
+        let (cert, key, der) = write_pair("rotated-ca");
+        let config = Tls {
+            client_ca_file: Some(ca_file.clone()),
+            ..files(&cert, &key)
+        };
+        let tls = listener_tls(&config, &Metrics::default());
+        let addr = serve(&tls).await;
+        let issued_by_second =
+            || connector(&[&der], Some((client_cert.clone(), client_key.clone_key())));
+        assert!(get(&issued_by_second(), addr, "localhost").await.is_err());
+
+        std::fs::write(&ca_file, second).unwrap();
+        tls.reload().unwrap();
+        let (response, _) = get(&issued_by_second(), addr, "localhost").await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
     #[tokio::test]
