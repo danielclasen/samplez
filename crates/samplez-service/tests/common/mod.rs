@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header, request};
@@ -32,6 +33,8 @@ pub struct FakeState {
     commands: Mutex<HashMap<String, u64>>,
     /// Every `renew_sessions` call.
     pub renewals: Mutex<Vec<Vec<Owner>>>,
+    /// How long `snapshot` takes.
+    pub snapshot_delay: Mutex<Duration>,
 }
 
 impl FakeState {
@@ -49,6 +52,7 @@ impl FakeState {
             forgotten: Mutex::new(0),
             commands: Mutex::default(),
             renewals: Mutex::default(),
+            snapshot_delay: Mutex::default(),
         })
     }
 
@@ -105,7 +109,9 @@ impl ReplicatedState for FakeState {
 
     fn snapshot(&self) -> BoxFuture<'_, Snapshot> {
         let (epoch, revision) = (self.epoch(), self.revision());
+        let delay = *self.snapshot_delay.lock().unwrap();
         Box::pin(async move {
+            tokio::time::sleep(delay).await;
             Snapshot {
                 epoch,
                 revision,

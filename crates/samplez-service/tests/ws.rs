@@ -2,6 +2,7 @@ mod common;
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -11,7 +12,8 @@ use common::*;
 use futures_util::{Sink, Stream, StreamExt};
 use samplez_service::replica::{Ack, Begin, Commands};
 use samplez_service::ws::{
-    ClientQueue, Delta, Ended, Frame, Hub, PONG_TIMEOUT, Popped, Pushed, Sessions, serve_client,
+    ClientQueue, Delta, Ended, Frame, Hub, MAX_PENDING_REPLIES, PONG_TIMEOUT, Popped, Pushed,
+    Sessions, serve_client,
 };
 use samplez_service::{Connect, Forbidden, Identity, Ops, Owner, Position, Role};
 use tokio::sync::mpsc;
@@ -130,8 +132,9 @@ struct Client {
 }
 
 impl Client {
-    /// Runs `serve_client` over channels; the product callback echoes text
-    /// and grants a meter credit for the binary message `credit`.
+    /// Runs `serve_client` over channels; the product callback echoes text,
+    /// answers `slow` after 1.5 s and grants a meter credit for the binary
+    /// message `credit`.
     fn start(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
         let queue = hub.subscribe();
         let state = state.clone();
@@ -147,6 +150,10 @@ impl Client {
                 let q = q.clone();
                 async move {
                     match m {
+                        Message::Text(t) if t == "slow" => {
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            Some(Message::Text("slow done".into()))
+                        }
                         Message::Text(t) => Some(Message::Text(format!("echo {t}").into())),
                         Message::Binary(b) if &b[..] == b"credit" => {
                             q.grant_meter_credits(1);
@@ -379,6 +386,69 @@ async fn a_client_that_stops_answering_pings_is_closed_after_one_second() {
     let ended = client.ended().await;
     assert_eq!(ended, Ended::PongTimeout);
     assert_eq!(start.elapsed(), Duration::from_secs(1));
+}
+
+/// Longer than [`PONG_TIMEOUT`], as a reply waiting on a commit during an
+/// election can take.
+#[tokio::test(start_paused = true)]
+async fn a_slow_reply_keeps_the_heartbeat_and_the_order_of_replies() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let start = Instant::now();
+    client.tx.send(Ok(Message::Text("slow".into()))).unwrap();
+    client.tx.send(Ok(Message::Text("hello".into()))).unwrap();
+    assert_eq!(client.next().await, "slow done");
+    assert_eq!(start.elapsed(), Duration::from_millis(1500));
+    assert_eq!(client.next().await, "echo hello", "in the order received");
+    apply(&state, &hub, None);
+    assert_eq!(client.next().await, "delta@1", "still served");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_snapshot_keeps_the_heartbeat() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    *state.snapshot_delay.lock().unwrap() = Duration::from_millis(1500);
+    state.reset(8);
+    apply(&state, &hub, None);
+    assert_eq!(client.next().await, "snapshot@8:1");
+    apply(&state, &hub, None);
+    assert_eq!(client.next().await, "delta@2", "still served");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
+    let state = FakeState::new("r1", "leader");
+    let sessions = Arc::new(Sessions::new("r1"));
+    let connect = connect(&sessions, Role::Operator, None, 1);
+    let queue = Hub::new(8).subscribe();
+    let (to_client, _rx) = mpsc::unbounded_channel();
+    let (tx, from_client) = mpsc::unbounded_channel();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let calls = calls.clone();
+        async move {
+            let socket = ChannelSocket {
+                to_client,
+                from_client,
+            };
+            serve_client(socket, &connect, &queue, &*state, |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                std::future::pending::<Option<Message>>()
+            })
+            .await
+        }
+    });
+    for _ in 0..=MAX_PENDING_REPLIES {
+        tx.send(Ok(Message::Text("never answered".into()))).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(calls.load(Ordering::Relaxed), MAX_PENDING_REPLIES);
+    task.abort();
 }
 
 #[tokio::test(start_paused = true)]

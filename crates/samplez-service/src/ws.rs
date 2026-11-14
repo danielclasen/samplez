@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, Utf8Bytes};
+use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesOrdered;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -30,6 +32,9 @@ pub const PING_PERIOD: Duration = Duration::from_millis(250);
 /// [`serve_client`] closes a connection that has not answered a ping for
 /// this long, and only connections that answered within it are renewed.
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(1);
+/// The replies [`serve_client`] waits for on one connection before it stops
+/// reading it.
+pub const MAX_PENDING_REPLIES: usize = 64;
 
 /// A state change at a global revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +332,15 @@ async fn catch_up(
 /// `connect.sessions` while it answers, and passes each text and binary
 /// message to `on_message`, sending the reply it returns. Subscribe `queue`
 /// before calling.
+///
+/// `on_message` is called for each message in the order received, and the
+/// replies go out in that order. The futures it returns run beside the
+/// heartbeat and each other, so a reply that waits on a commit or an
+/// election does not stall the pings; work that must follow the order of
+/// the messages belongs in the call itself, before the future. With
+/// [`MAX_PENDING_REPLIES`] replies outstanding the connection is not read,
+/// pongs included, until one is ready. A catch-up runs beside the heartbeat
+/// as well, with `queue` waiting for it.
 pub async fn serve_client<S, E, F, Fut>(
     socket: S,
     connect: &Connect,
@@ -344,15 +358,17 @@ where
     let owner = &connect.owner;
     sessions.answered(owner);
     let ended = async {
-        let (mut position, batch) = catch_up(state, connect.since).await;
-        for text in batch {
-            if tx.send(Message::Text(text)).await.is_err() {
-                return Ended::Failed;
-            }
-        }
         let mut answered = Instant::now();
         let mut ping = tokio::time::interval(PING_PERIOD);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut catching_up: Option<BoxFuture<'_, _>> =
+            Some(Box::pin(catch_up(state, connect.since)));
+        // Set by the first catch-up, before `queue` is read.
+        let mut position = Position {
+            epoch: 0,
+            revision: 0,
+        };
+        let mut replies = FuturesOrdered::new();
         loop {
             let out: Vec<Message> = tokio::select! {
                 _ = ping.tick() => {
@@ -362,7 +378,7 @@ where
                     }
                     vec![Message::Ping(Bytes::new())]
                 }
-                received = rx.next() => match received {
+                received = rx.next(), if replies.len() < MAX_PENDING_REPLIES => match received {
                     None | Some(Ok(Message::Close(_))) => return Ended::Closed,
                     Some(Err(_)) => return Ended::Failed,
                     Some(Ok(Message::Pong(_))) => {
@@ -371,9 +387,20 @@ where
                         Vec::new()
                     }
                     Some(Ok(Message::Ping(_))) => Vec::new(),
-                    Some(Ok(m)) => on_message(m).await.into_iter().collect(),
+                    Some(Ok(m)) => {
+                        replies.push_back(on_message(m));
+                        Vec::new()
+                    }
                 },
-                popped = queue.pop() => match popped {
+                Some(reply) = replies.next(), if !replies.is_empty() => reply.into_iter().collect(),
+                (p, texts) = async { catching_up.as_mut().expect("guarded").await },
+                    if catching_up.is_some() =>
+                {
+                    catching_up = None;
+                    position = p;
+                    texts.into_iter().map(Message::Text).collect()
+                }
+                popped = queue.pop(), if catching_up.is_none() => match popped {
                     Popped::Frame(Frame::Delta(d))
                         if d.epoch == position.epoch && d.revision <= position.revision =>
                     {
@@ -386,9 +413,8 @@ where
                         vec![Message::Text(d.text)]
                     }
                     Popped::Frame(Frame::Delta(_)) | Popped::Resync => {
-                        let (p, texts) = catch_up(state, Some(position)).await;
-                        position = p;
-                        texts.into_iter().map(Message::Text).collect()
+                        catching_up = Some(Box::pin(catch_up(state, Some(position))));
+                        Vec::new()
                     }
                     Popped::Frame(Frame::Meters(m)) => vec![Message::Binary(m)],
                     Popped::Frame(Frame::Counters(c)) => vec![Message::Text(c)],
