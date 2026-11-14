@@ -1,0 +1,18 @@
+[package]
+name = "samplez-mxl"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/danielclasen/samplez"
+description = "MXL flow input and output for the samplez engine"
+publish = false
+
+[dependencies]
+mxl = { git = "https://github.com/dmf-mxl/mxl", rev = "8f3f1096e804bfb822eb959cdf2fc23199a7d15d", features = ["mxl-not-built"] }
+mxl-sys = { git = "https://github.com/dmf-mxl/mxl", rev = "8f3f1096e804bfb822eb959cdf2fc23199a7d15d", features = ["mxl-not-built"] }
+serde_json = "1"
+
+[[test]]
+name = "process"
+harness = false

@@ -9,6 +9,6 @@ description = "Real-time multichannel audio engine with MXL I/O"
 publish = false
 
 [workspace]
-members = ["crates/samplez-dsp"]
+members = ["crates/samplez-dsp", "crates/samplez-mxl"]
 
 [dependencies]
