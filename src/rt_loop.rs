@@ -6,6 +6,7 @@
 //! return ring; the whole state goes back to the supervisor when the loop
 //! ends.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
@@ -200,6 +201,138 @@ pub(crate) struct Out {
     pub first_k: u64,
 }
 
+/// What the loop processes after a wake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Plan {
+    /// Overdue blocks processed in order without a wait.
+    pub catchup: Range<u64>,
+    /// Samples skipped because the loop was more than `maxCatchupBlocks`
+    /// behind; libmxl zero-fills them on the next commit.
+    pub skipped: u64,
+    /// The block waited for and processed next.
+    pub k: u64,
+}
+
+/// The blocks to process after a wake, from `next`, the block after the
+/// last one processed, and `newest`, the newest block due. An overdue
+/// backlog of up to `max_catchup` blocks is processed in order, beyond
+/// that only the newest block. `k` is the block after the newest due one,
+/// so after a clock step either way it re-anchors to the clock.
+pub(crate) fn plan(next: Option<u64>, newest: Option<u64>, max_catchup: u64, block: u64) -> Plan {
+    let Some(n) = newest else {
+        return Plan {
+            catchup: 0..0,
+            skipped: 0,
+            k: 0,
+        };
+    };
+    let (first, skipped) = match next {
+        Some(nx) if n >= nx && n - nx < max_catchup => (nx, 0),
+        Some(nx) if n >= nx => (n, (n - nx) * block),
+        _ => (n + 1, 0),
+    };
+    Plan {
+        catchup: first..n + 1,
+        skipped,
+        k: n + 1,
+    }
+}
+
+/// The matrix, its position on the sample timeline and the gain changes
+/// waiting for their index.
+pub(crate) struct Mix {
+    pub matrix: Matrix,
+    pub block: u64,
+    /// Length of every coefficient ramp in samples.
+    pub ramp: u32,
+    /// The index of the next sample the matrix produces.
+    pub pos: Option<u64>,
+    /// The exclusive end index of the latest coefficient ramp.
+    pub ramp_end: u64,
+    /// Pending gain changes, by `at_index`, in arrival order within one
+    /// index. Capacity [`PENDING_CHANGES`], never exceeded.
+    pub pending: Vec<GainChange>,
+    /// Gain changes the matrix took.
+    pub applied: u64,
+    /// Gain changes taken off the pending list: applied, refused by the
+    /// matrix or late.
+    pub consumed: u64,
+}
+
+impl Mix {
+    pub fn new(matrix: Matrix, block: u64, ramp: u32) -> Mix {
+        Mix {
+            matrix,
+            block,
+            ramp,
+            pos: None,
+            ramp_end: 0,
+            pending: Vec::with_capacity(PENDING_CHANGES),
+            applied: 0,
+            consumed: 0,
+        }
+    }
+
+    /// Queues `change` by its index. False, and not queued, when
+    /// [`PENDING_CHANGES`] are pending.
+    pub fn push(&mut self, change: GainChange) -> bool {
+        if self.pending.len() >= PENDING_CHANGES {
+            return false;
+        }
+        let at = self
+            .pending
+            .partition_point(|c| c.at_index <= change.at_index);
+        self.pending.insert(at, change);
+        true
+    }
+
+    /// Brings the matrix to the start of block `k`: every pending change
+    /// due at or before `kB` is applied at its own index, and the ramps
+    /// advance over samples not mixed, so a coefficient's value depends on
+    /// the sample index and the ordered changes alone. A change whose
+    /// index the matrix has already produced is passed to `late` with the
+    /// matrix position, and not applied. A block below the position
+    /// follows a backward clock step: the position re-anchors to `kB` and
+    /// the ramps hold where they are, never rewound.
+    pub fn to(&mut self, k: u64, mut late: impl FnMut(GainChange, u64)) {
+        let start = k * self.block;
+        let mut pos = match self.pos {
+            Some(p) if p > start => {
+                // The remaining ramp length is kept.
+                self.ramp_end = start + self.ramp_end.saturating_sub(p);
+                start
+            }
+            Some(p) => p,
+            None => start,
+        };
+        while let Some(&c) = self.pending.first()
+            && c.at_index <= start
+        {
+            self.pending.remove(0);
+            self.consumed += 1;
+            if c.at_index < pos {
+                late(c, pos);
+                continue;
+            }
+            self.matrix.advance((c.at_index - pos) as usize);
+            pos = c.at_index;
+            if self.matrix.set(c.input, c.output, c.gain, self.ramp) {
+                self.applied += 1;
+                if self.matrix.is_ramping(c.input, c.output) {
+                    self.ramp_end = self.ramp_end.max(c.at_index + u64::from(self.ramp));
+                }
+            }
+        }
+        self.matrix.advance((start - pos) as usize);
+        self.pos = Some(start + self.block);
+    }
+
+    /// Whether a coefficient ramp runs in block `k`.
+    pub fn ramping(&self, k: u64) -> bool {
+        k * self.block < self.ramp_end
+    }
+}
+
 pub(crate) struct Rt {
     pub api: Arc<MxlApi>,
     pub block: u64,
@@ -211,15 +344,7 @@ pub(crate) struct Rt {
     pub statuses: Vec<GroupWait>,
     pub slots: Vec<Slot>,
     pub outs: Vec<Out>,
-    pub matrix: Matrix,
-    /// The index of the next sample the matrix produces.
-    pub matrix_pos: Option<u64>,
-    /// The exclusive end index of the latest coefficient ramp.
-    pub ramp_end: u64,
-    /// Pending gain changes, by `at_index`, in arrival order within one
-    /// index. Capacity [`PENDING_CHANGES`], never exceeded.
-    pub pending: Vec<GainChange>,
-    pub commands_applied: u64,
+    pub mix: Mix,
     pub inbuf: PlanarBuffer,
     pub outbuf: PlanarBuffer,
     /// One input's or one output's channels, planar.
@@ -288,51 +413,48 @@ impl Rt {
     /// that only the newest block. Returns its state when `stop` is set.
     pub fn run(mut self) -> Self {
         let mut next: Option<u64> = None;
-        let mut prev: Option<(u64, u64)> = None;
+        // libmxl's clock, the CLOCK_MONOTONIC midpoint of the two reads
+        // bracketing it and the bracket's width.
+        let mut prev: Option<(u64, u64, u64)> = None;
         let period = self.period_ns();
         while !self.stop.load(Relaxed) {
+            let m0 = monotonic_ns();
             let now = time::now(&self.api);
-            let mono = monotonic_ns();
-            if let Some((t0, m0)) = prev {
-                let step = (i128::from(now) - i128::from(t0)) - (i128::from(mono) - i128::from(m0));
-                if step.unsigned_abs() > u128::from(period) {
+            let m1 = monotonic_ns();
+            let (mono, width) = (m0 + (m1 - m0) / 2, m1 - m0);
+            if let Some((t0, mono0, width0)) = prev {
+                let step =
+                    (i128::from(now) - i128::from(t0)) - (i128::from(mono) - i128::from(mono0));
+                // Each midpoint lies within half its bracket of the read
+                // of libmxl's clock.
+                if step.unsigned_abs() > u128::from(period + width.max(width0)) {
                     add(&self.counters.clock_steps, 1);
                     self.send(Telemetry::ClockStep {
                         delta_ns: step as i64,
                     });
                 }
             }
-            prev = Some((now, mono));
+            prev = Some((now, mono, width));
             let newest = time::newest_due_block(&self.api, now, self.block, self.margin);
             self.drain_commands(newest.unwrap_or(0));
-            let k = match (next, newest) {
-                (_, None) => 0,
-                (None, Some(n)) => n + 1,
-                // The clock stepped back: re-anchor. Writers hold until
-                // the clock passes their last commit; inputs never read
-                // below their last range.
-                (Some(nx), Some(n)) if n + 1 < nx => n + 1,
-                (Some(nx), Some(n)) if n >= nx => {
-                    let first = if n - nx < self.max_catchup {
-                        nx
-                    } else {
-                        add(
-                            &self.counters.overrun_skipped_samples,
-                            (n - nx) * self.block,
-                        );
-                        n
-                    };
-                    for s in &mut self.statuses {
-                        *s = GroupWait::Skipped;
-                    }
-                    for k in first..=n {
-                        let deadline = time::deadline(&self.api, k, self.block, self.margin);
-                        self.process(k, deadline);
-                    }
-                    n + 1
+            // After a backward clock step writers hold until the clock
+            // passes their last commit, and inputs never read below their
+            // last range.
+            let Plan {
+                catchup,
+                skipped,
+                k,
+            } = plan(next, newest, self.max_catchup, self.block);
+            add(&self.counters.overrun_skipped_samples, skipped);
+            if !catchup.is_empty() {
+                for s in &mut self.statuses {
+                    *s = GroupWait::Skipped;
                 }
-                (Some(nx), Some(_)) => nx,
-            };
+            }
+            for k in catchup {
+                let deadline = time::deadline(&self.api, k, self.block, self.margin);
+                self.process(k, deadline);
+            }
             let deadline = time::deadline(&self.api, k, self.block, self.margin);
             self.wait(k, deadline);
             self.process(k, deadline);
@@ -373,7 +495,7 @@ impl Rt {
         loop {
             let Ok(cmd) = self.cmd.peek() else { return };
             let room = match cmd {
-                Command::Gain(_) => self.pending.len() < PENDING_CHANGES,
+                Command::Gain(_) => self.mix.pending.len() < PENDING_CHANGES,
                 _ => self.ret.slots() > 0,
             };
             if !room {
@@ -410,42 +532,11 @@ impl Rt {
                     }
                 }
                 Command::Gain(change) => {
-                    let at = self
-                        .pending
-                        .partition_point(|c| c.at_index <= change.at_index);
-                    self.pending.insert(at, change);
+                    // Room was checked before the pop.
+                    let _ = self.mix.push(change);
                 }
             }
         }
-    }
-
-    /// Brings the matrix to the start of block `k`: every pending change
-    /// due at or before `kB` is applied at its own index, and the ramps
-    /// advance over samples not mixed, so a coefficient's value depends on
-    /// the sample index and the ordered changes alone. A change whose
-    /// index the matrix has already produced is counted, not applied.
-    fn matrix_to(&mut self, k: u64) {
-        let start = k * self.block;
-        let mut pos = *self.matrix_pos.get_or_insert(start);
-        while let Some(&c) = self.pending.first()
-            && c.at_index <= start
-        {
-            self.pending.remove(0);
-            if c.at_index < pos {
-                add(&self.counters.command_late, 1);
-                continue;
-            }
-            self.matrix.advance((c.at_index - pos) as usize);
-            pos = c.at_index;
-            self.commands_applied += 1;
-            if self.matrix.set(c.input, c.output, c.gain, self.ramp) {
-                self.ramp_end = self.ramp_end.max(c.at_index + u64::from(self.ramp));
-            }
-        }
-        // A block below `pos` follows a backward clock step; ramps do not
-        // go back.
-        self.matrix.advance(start.saturating_sub(pos) as usize);
-        self.matrix_pos = Some(pos.max(start) + self.block);
     }
 
     /// Reads, mixes and writes block `k`, due at `deadline`.
@@ -536,9 +627,10 @@ impl Rt {
             }
         }
 
-        self.matrix_to(k);
-        let ramping = k * self.block < self.ramp_end;
-        self.matrix.process(&self.inbuf, &mut self.outbuf, b);
+        let counters = &self.counters;
+        self.mix.to(k, |_, _| add(&counters.command_late, 1));
+        let ramping = self.mix.ramping(k);
+        self.mix.matrix.process(&self.inbuf, &mut self.outbuf, b);
 
         let mut written = 0u64;
         for (o, out) in self.outs.iter_mut().enumerate() {
@@ -573,7 +665,7 @@ impl Rt {
             fading,
             ramping,
             written,
-            commands_applied: self.commands_applied,
+            commands_applied: self.mix.applied,
         }));
         if k.is_multiple_of(samplez_mxl::SAMPLE_RATE as u64 / self.block) {
             self.publish_stats(done);
@@ -599,5 +691,143 @@ impl Rt {
                 self.slots[i].stats = EMPTY_STATS;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const B: u64 = 48;
+
+    fn change(gain: f32, at_index: u64) -> GainChange {
+        GainChange {
+            input: 0,
+            output: 0,
+            gain,
+            at_index,
+        }
+    }
+
+    fn mix() -> Mix {
+        let mut m = Matrix::new(1, 1);
+        assert!(m.set(0, 0, 1.0, 0));
+        Mix::new(m, B, 480)
+    }
+
+    /// Runs `to(k)` and returns the late changes it reported.
+    fn to(m: &mut Mix, k: u64) -> Vec<(u64, u64)> {
+        let mut late = Vec::new();
+        m.to(k, |c, pos| late.push((c.at_index, pos)));
+        late
+    }
+
+    #[test]
+    fn plan_follows_the_clock() {
+        let p = |next, newest| plan(next, newest, 2, B);
+        let none = |k| Plan {
+            catchup: k..k,
+            skipped: 0,
+            k,
+        };
+        assert_eq!(p(None, None), none(0));
+        assert_eq!(p(None, Some(9)), none(10));
+        // On time: the newest due block is the last one processed.
+        assert_eq!(p(Some(10), Some(9)), none(10));
+        // Two blocks behind: both caught up in order.
+        assert_eq!(
+            p(Some(10), Some(11)),
+            Plan {
+                catchup: 10..12,
+                skipped: 0,
+                k: 12
+            }
+        );
+        // Forward clock step: only the newest block, the rest skipped.
+        assert_eq!(
+            p(Some(10), Some(100)),
+            Plan {
+                catchup: 100..101,
+                skipped: 90 * B,
+                k: 101
+            }
+        );
+        // Backward clock step: k re-anchors to the clock.
+        assert_eq!(p(Some(100), Some(49)), none(50));
+    }
+
+    #[test]
+    fn a_forward_step_applies_changes_at_their_index() {
+        let mut m = mix();
+        assert!(to(&mut m, 10).is_empty());
+        assert!(m.push(change(0.5, 50 * B)));
+        assert!(to(&mut m, 100).is_empty());
+        assert_eq!((m.applied, m.consumed), (1, 1));
+        // The ramp started at 50B and ended at 50B + 480, before 100B.
+        assert_eq!(m.matrix.gain(0, 0), 0.5);
+        assert_eq!(m.ramp_end, 50 * B + 480);
+        assert!(!m.ramping(100));
+        assert_eq!(m.pos, Some(101 * B));
+    }
+
+    #[test]
+    fn a_backward_step_re_anchors_and_applies_changes_at_its_start() {
+        let mut m = mix();
+        to(&mut m, 99);
+        assert!(m.push(change(0.5, 50 * B)));
+        // The clock stepped back to block 50: the change at the new start
+        // applies, it is not late.
+        assert!(to(&mut m, 50).is_empty());
+        assert_eq!((m.applied, m.consumed), (1, 1));
+        assert_eq!(m.pos, Some(51 * B));
+        assert!(m.ramping(50) && m.matrix.is_ramping(0, 0));
+        // The next block follows the new position.
+        assert!(m.push(change(0.25, 51 * B)));
+        assert!(to(&mut m, 51).is_empty());
+        assert_eq!(m.applied, 2);
+    }
+
+    #[test]
+    fn a_backward_step_keeps_the_remaining_ramp() {
+        let mut m = mix();
+        to(&mut m, 9);
+        assert!(m.push(change(0.5, 10 * B)));
+        to(&mut m, 10);
+        assert_eq!(m.ramp_end, 10 * B + 480);
+        // Back by 5 blocks at block 12: 480 - 2B of the ramp remain.
+        to(&mut m, 11);
+        to(&mut m, 7);
+        assert_eq!(m.ramp_end, 7 * B + 480 - 2 * B);
+    }
+
+    #[test]
+    fn a_change_below_the_position_is_late_and_not_applied() {
+        let mut m = mix();
+        to(&mut m, 10);
+        assert!(m.push(change(0.5, 5 * B)));
+        assert_eq!(to(&mut m, 11), vec![(5 * B, 11 * B)]);
+        assert_eq!((m.applied, m.consumed), (0, 1));
+        assert_eq!(m.matrix.gain(0, 0), 1.0);
+    }
+
+    #[test]
+    fn a_no_op_change_does_not_extend_the_ramp() {
+        let mut m = mix();
+        to(&mut m, 9);
+        assert!(m.push(change(1.0, 10 * B)));
+        to(&mut m, 10);
+        assert_eq!(m.applied, 1);
+        assert_eq!(m.ramp_end, 0);
+        assert!(!m.ramping(10));
+    }
+
+    #[test]
+    fn pending_is_bounded_and_ordered() {
+        let mut m = mix();
+        for i in 0..PENDING_CHANGES as u64 {
+            assert!(m.push(change(0.5, (100 - i) * B)));
+        }
+        assert!(!m.push(change(0.5, 200 * B)));
+        assert!(m.pending.windows(2).all(|w| w[0].at_index <= w[1].at_index));
     }
 }

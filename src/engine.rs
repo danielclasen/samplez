@@ -25,8 +25,8 @@ use samplez_mxl::{Instance, MxlApi, time};
 use crate::config::Config;
 use crate::rt::{self, ProcessStatus, RtStatus, ThreadStatus};
 use crate::rt_loop::{
-    BlockVerdict, Command, Counters, EMPTY_STATS, GainChange, Gen, Out, PENDING_CHANGES, Returned,
-    Rt, Slot, SlotStats, Telemetry,
+    BlockVerdict, Command, Counters, EMPTY_STATS, GainChange, Gen, Mix, Out, Returned, Rt, Slot,
+    SlotStats, Telemetry,
 };
 
 const COMMAND_RING: usize = 64;
@@ -194,11 +194,7 @@ impl Engine {
             statuses: (0..in_domains.len()).map(|_| GroupWait::Skipped).collect(),
             slots,
             outs,
-            matrix,
-            matrix_pos: None,
-            ramp_end: 0,
-            pending: Vec::with_capacity(PENDING_CHANGES),
-            commands_applied: 0,
+            mix: Mix::new(matrix, b, config.ramp_samples),
             inbuf: PlanarBuffer::new(n, b as usize),
             outbuf: PlanarBuffer::new(m, b as usize),
             scratch: vec![0.0; widest * b as usize],
