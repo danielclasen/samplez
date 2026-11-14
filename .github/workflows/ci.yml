@@ -41,11 +41,13 @@ jobs:
         run: |
           mkdir -p .cargo-registry
           docker run --rm --user "$(id -u):$(id -g)" \
+            -e SAMPLEZ_REQUIRE_PATHS=avx2 \
             -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
             -w /w samplez-builder:ci bash -euo pipefail -c '
               cargo fmt --all --check
               cargo clippy --workspace --all-targets --locked -- -D warnings
               cargo test --workspace --locked
+              cargo test --workspace --locked --release
             '
       # Saved from main only, so per-PR snapshots do not evict the builder
       # image layers from the shared Actions cache.
