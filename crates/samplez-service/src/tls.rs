@@ -5,8 +5,10 @@
 //! handshake holds up nobody else. At most [`MAX_HANDSHAKES`] run at once;
 //! further connections wait in the listen backlog. In `files` mode the certificate and key
 //! are re-read with the token files and swapped in for new handshakes when
-//! their content changes; a pair that does not parse or does not match
-//! keeps the previous one and counts in
+//! their content changes. A pair that does not parse or does not match is
+//! read once more at once, since a rotation can replace the two files
+//! between the reads; when it still fails, the previous pair stays and the
+//! failure counts in
 //! `samplez_secret_reload_failures_total{secret="<listener>Tls"}`.
 
 use std::io;
@@ -192,23 +194,40 @@ impl ListenerTls {
     /// Re-reads the certificate and key files in `files` mode and swaps in
     /// what they hold when it changed.
     pub(crate) fn reload(&self) -> Result<(), Error> {
+        self.reload_with(read)
+    }
+
+    fn reload_with(
+        &self,
+        mut read: impl FnMut(&Path) -> Result<Vec<u8>, Error>,
+    ) -> Result<(), Error> {
         let Some(files) = &self.files else {
             return Ok(());
         };
         let result = (|| {
-            let content = (read(&files.cert)?, read(&files.key)?);
             let mut loaded = files.loaded.lock().expect("certificate lock poisoned");
-            if *loaded != content {
-                let key = certified_key(&content, &files.cert, &self.provider)?;
-                *self.resolver.0.write().expect("certificate lock poisoned") = Arc::new(key);
-                *loaded = content;
-                tracing::info!(
-                    listener = self.listener,
-                    fingerprint = %self.fingerprint(),
-                    "certificate changed"
-                );
+            let mut retried = false;
+            loop {
+                let content = (read(&files.cert)?, read(&files.key)?);
+                if *loaded == content {
+                    return Ok(());
+                }
+                match certified_key(&content, &files.cert, &self.provider) {
+                    Ok(key) => {
+                        *self.resolver.0.write().expect("certificate lock poisoned") =
+                            Arc::new(key);
+                        *loaded = content;
+                        tracing::info!(
+                            listener = self.listener,
+                            fingerprint = %self.fingerprint(),
+                            "certificate changed"
+                        );
+                        return Ok(());
+                    }
+                    Err(_) if !retried => retried = true,
+                    Err(e) => return Err(e),
+                }
             }
-            Ok(())
         })();
         match &result {
             Ok(()) => self.loaded_at.store(crate::auth::now(), Ordering::Relaxed),
@@ -515,6 +534,24 @@ mod tests {
                 .render()
                 .contains("samplez_secret_reload_failures_total{secret=\"apiTls\"} 1")
         );
+    }
+
+    #[test]
+    fn a_pair_read_mid_rotation_is_read_again_before_it_counts_as_a_failure() {
+        let (cert, key, _) = write_pair("rotation");
+        let metrics = Metrics::default();
+        let tls = listener_tls(&files(&cert, &key), &metrics);
+        let (new_cert, new_key, second) = write_pair("rotation-new");
+        let file = |path: &Path| std::fs::read(path).unwrap();
+        // The first reads see the new certificate beside the old key.
+        let mut reads = [&new_cert, &key, &new_cert, &new_key]
+            .map(|p| file(p))
+            .into_iter();
+        tls.reload_with(|_| Ok(reads.next().expect("two reads of each file at most")))
+            .unwrap();
+        assert_eq!(tls.status().fingerprint, fingerprint_of(&second));
+        let failures = "samplez_secret_reload_failures_total{secret=\"apiTls\"} 0";
+        assert!(metrics.render().contains(failures));
     }
 
     #[tokio::test]
