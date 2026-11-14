@@ -321,6 +321,8 @@ impl Engine {
                 .collect(),
             dirty: vec![true; in_domains.len()],
             pollers: (0..in_domains.len()).map(|_| None).collect(),
+            poll_errors: vec![None; in_domains.len()],
+            rebuild_errors: vec![None; in_domains.len()],
             outs: (0..config.outputs.len())
                 .map(|_| SupOut {
                     realised: false,
@@ -456,7 +458,11 @@ enum SupState {
     Attached,
     /// To be attached by the next generation of its domain.
     Wanted,
-    Pruned(Recovery),
+    Pruned {
+        recovery: Recovery,
+        /// Holds one reference to its flow's poll reader.
+        held: bool,
+    },
 }
 
 struct SupSlot {
@@ -488,6 +494,10 @@ struct Supervisor {
     /// Input domains whose generation is to be rebuilt.
     dirty: Vec<bool>,
     pollers: Vec<Option<Pollers>>,
+    /// The last failure to create each input domain's poll instance and
+    /// generation, logged once per change of its text.
+    poll_errors: Vec<Option<String>>,
+    rebuild_errors: Vec<Option<String>>,
     outs: Vec<SupOut>,
     /// Output instance per configuration domain.
     out_instances: Vec<Option<Arc<Instance>>>,
@@ -606,35 +616,68 @@ impl Supervisor {
         self.dirty[d] = true;
     }
 
-    /// Moves `slot` to polling, holding the poll reader of its flow.
+    /// Moves `slot` to polling.
     fn start_polling(&mut self, slot: usize) {
+        let held = self.hold_poll(slot);
+        self.slots[slot].state = SupState::Pruned {
+            recovery: Recovery::default(),
+            held,
+        };
+        self.status().inputs[slot].state = InputState::Pruned;
+    }
+
+    /// Takes one hold on the poll reader of `slot`'s flow, creating the
+    /// domain's poll instance and the poll reader when missing. False when
+    /// either could not be created; `poll` tries again.
+    fn hold_poll(&mut self, slot: usize) -> bool {
         let d = self.input_domain(slot);
         let id = self.config.inputs[slot].flow_id.clone();
         if self.pollers[d].is_none() {
             let path = &self.config.domains[self.in_domains[d]].path;
             match Instance::new(&self.api, path) {
                 Ok(instance) => {
+                    self.poll_errors[d] = None;
                     self.pollers[d] = Some(Pollers {
                         instance,
                         flows: HashMap::new(),
                     })
                 }
-                Err(e) => log(format_args!("poll instance on {}: {e}", path.display())),
+                Err(e) => {
+                    let message = format!("poll instance on {}: {e}", path.display());
+                    if changed(&mut self.poll_errors[d], message) {
+                        log(format_args!(
+                            "{}",
+                            self.poll_errors[d].as_deref().unwrap_or("")
+                        ));
+                    }
+                    return false;
+                }
             }
         }
-        if let Some(p) = &mut self.pollers[d] {
-            if let Some(f) = p.flows.get_mut(&id) {
-                f.hold();
-            } else if let Ok(f) = PolledFlow::new(&p.instance, &id) {
-                p.flows.insert(id, f);
+        let Some(p) = &mut self.pollers[d] else {
+            return false;
+        };
+        if let Some(f) = p.flows.get_mut(&id) {
+            f.hold();
+        } else {
+            match PolledFlow::new(&p.instance, &id) {
+                Ok(f) => {
+                    p.flows.insert(id, f);
+                }
+                Err(e) => {
+                    log(format_args!("poll reader of {id}: {e}"));
+                    return false;
+                }
             }
         }
-        self.slots[slot].state = SupState::Pruned(Recovery::default());
-        self.status().inputs[slot].state = InputState::Pruned;
+        true
     }
 
-    /// Releases `slot`'s hold on its poll reader.
+    /// Releases `slot`'s hold on its poll reader, if it has one.
     fn release_poll(&mut self, slot: usize) {
+        let SupState::Pruned { held: true, .. } = self.slots[slot].state else {
+            return;
+        };
         let d = self.input_domain(slot);
         let id = &self.config.inputs[slot].flow_id;
         if let Some(p) = &mut self.pollers[d]
@@ -646,6 +689,14 @@ impl Supervisor {
     }
 
     fn poll(&mut self) {
+        for slot in 0..self.slots.len() {
+            if matches!(self.slots[slot].state, SupState::Pruned { held: false, .. }) {
+                let held = self.hold_poll(slot);
+                if let SupState::Pruned { held: h, .. } = &mut self.slots[slot].state {
+                    *h = held;
+                }
+            }
+        }
         let now = time::now(&self.api);
         let mut heads: HashMap<(usize, String), Option<u64>> = HashMap::new();
         for (d, p) in self.pollers.iter_mut().enumerate() {
@@ -662,7 +713,7 @@ impl Supervisor {
             let d = self.input_domain(slot);
             let cfg = &self.config.inputs[slot];
             let head = heads.get(&(d, cfg.flow_id.clone())).copied().flatten();
-            let SupState::Pruned(r) = &mut self.slots[slot].state else {
+            let SupState::Pruned { recovery: r, .. } = &mut self.slots[slot].state else {
                 continue;
             };
             if r.update(&self.api, head, now, &self.timing, cfg.offset_samples) {
@@ -682,13 +733,21 @@ impl Supervisor {
         let mut generation = match Generation::new(&self.api, &path, n) {
             Ok(g) => g,
             Err(e) => {
-                log(format_args!("input generation on {}: {e}", path.display()));
+                let message = format!("input generation on {}: {e}", path.display());
+                if changed(&mut self.rebuild_errors[d], message) {
+                    log(format_args!(
+                        "{}",
+                        self.rebuild_errors[d].as_deref().unwrap_or("")
+                    ));
+                }
                 return;
             }
         };
+        self.rebuild_errors[d] = None;
         let mut prune_after = vec![u64::MAX; n];
         for (slot, limit) in prune_after.iter_mut().enumerate() {
-            if self.input_domain(slot) != d || matches!(self.slots[slot].state, SupState::Pruned(_))
+            if self.input_domain(slot) != d
+                || matches!(self.slots[slot].state, SupState::Pruned { .. })
             {
                 continue;
             }
@@ -867,6 +926,16 @@ fn release(r: Returned) {
     }
 }
 
+/// Stores `error` in `last`; true when it differs from the one stored, so
+/// a failure repeated every tick is logged once per change of its text.
+fn changed(last: &mut Option<String>, error: String) -> bool {
+    if last.as_deref() == Some(error.as_str()) {
+        return false;
+    }
+    *last = Some(error);
+    true
+}
+
 fn retry(out: &mut SupOut, now: Instant) {
     out.next_try = now + out.backoff;
     out.backoff = (out.backoff * 2).min(BACKOFF_MAX);
@@ -905,4 +974,19 @@ fn minor_faults(tid: i32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
     // Field 10, counted from the state field after the command name.
     stat.rsplit_once(") ")?.1.split(' ').nth(7)?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_failure_is_logged_once_per_text() {
+        let mut last = None;
+        assert!(changed(&mut last, "a".to_owned()));
+        assert!(!changed(&mut last, "a".to_owned()));
+        assert!(changed(&mut last, "b".to_owned()));
+        last = None;
+        assert!(changed(&mut last, "b".to_owned()));
+    }
 }

@@ -55,15 +55,21 @@ impl Domain {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
+        let d = Domain(dir);
+        d.create();
+        d
+    }
+
+    /// Creates the directory again after it was removed.
+    pub fn create(&self) {
+        std::fs::create_dir(&self.0).unwrap();
         // A 1 s history, ring of 2 s: room for the checker and the
         // margins to lag on a loaded runner. libmxl reads it per domain.
         std::fs::write(
-            dir.join("options.json"),
+            self.0.join("options.json"),
             r#"{"urn:x-mxl:option:history_duration/v1.0": 1000000000}"#,
         )
         .unwrap();
-        Domain(dir)
     }
 
     pub fn has_flow(&self, id: &str) -> bool {

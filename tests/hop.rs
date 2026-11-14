@@ -51,6 +51,10 @@ fn main() {
             "late_producer_is_silenced_and_gets_a_margin_warning",
             late_producer,
         ),
+        (
+            "input_whose_domain_vanished_is_re_added_once_it_is_back",
+            domain_vanishes,
+        ),
         ("output_held_by_a_foreign_writer_is_retried", foreign_writer),
         ("samplez_hop_runs_from_a_config_file", binary),
     ] {
@@ -343,6 +347,36 @@ fn killed_producer() {
     assert!(back, "input not re-added: {:?}", engine.status().inputs[0]);
     assert!(c.ramp - gap.ramp >= 10, "no fade-in after re-add: {c:?}");
     assert!(c.clean - gap.clean > 1_000, "{c:?}");
+    engine.stop();
+}
+
+/// The input's domain directory is removed: the poll instance cannot be
+/// created when the input is pruned, so `poll` creates it once the
+/// directory is back, and the input is re-added.
+fn domain_vanishes() {
+    let (a, b) = (Domain::new(), Domain::new());
+    let (src, dst) = (new_id(), new_id());
+    let pilot = Pilot::start(&a.0, &src, 1, B, 0);
+    let mut cfg = config(&a.0, &[(&src, 1)], &[(&dst, 1)], vec![vec![1.0]], MARGIN);
+    cfg.domains.push(samplez::config::Domain {
+        name: "out".to_owned(),
+        path: b.0.clone(),
+    });
+    cfg.outputs[0].domain = "out".to_owned();
+    let (engine, _rx) = start(cfg);
+    let attached = || engine.status().inputs[0].state == InputState::Attached;
+    wait_for(5 * SECOND, "input attached", attached);
+
+    drop(pilot);
+    std::fs::remove_dir_all(&a.0).unwrap();
+    wait_for(5 * SECOND, "input pruned", || !attached());
+    std::thread::sleep(SECOND / 2);
+    assert!(!attached());
+
+    a.create();
+    let _pilot = Pilot::start(&a.0, &src, 1, B, 0);
+    wait_for(10 * SECOND, "input re-added", attached);
+    assert!(engine.status().outputs[0].realised);
     engine.stop();
 }
 
