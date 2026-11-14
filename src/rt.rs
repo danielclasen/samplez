@@ -288,7 +288,8 @@ fn pin(cpu: usize) -> std::io::Result<()> {
 
 /// The CFS quota of the process's cgroup: `None` when unlimited, else
 /// (quota, period) in microseconds. cgroup v2 `cpu.max`, else v1
-/// `cpu.cfs_quota_us` and `cpu.cfs_period_us`.
+/// `cpu.cfs_quota_us` and `cpu.cfs_period_us` in the cpu controller's
+/// directory from `/proc/self/mountinfo`.
 pub fn cgroup_quota() -> Result<Option<(u64, u64)>, String> {
     let cgroups = std::fs::read_to_string("/proc/self/cgroup")
         .map_err(|e| format!("/proc/self/cgroup: {e}"))?;
@@ -304,7 +305,10 @@ pub fn cgroup_quota() -> Result<Option<(u64, u64)>, String> {
             return parse_cpu_max(&text).ok_or_else(|| format!("{file}: unreadable {text:?}"));
         }
         if controllers.split(',').any(|c| c == "cpu") {
-            let dir = format!("/sys/fs/cgroup/{controllers}{}", path.trim_end_matches('/'));
+            let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+                .map_err(|e| format!("/proc/self/mountinfo: {e}"))?;
+            let dir = v1_cpu_dir(&mountinfo, path)
+                .ok_or("no cgroup v1 cpu mount in /proc/self/mountinfo")?;
             let read = |name: &str| -> Result<i64, String> {
                 let file = format!("{dir}/{name}");
                 let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
@@ -320,6 +324,34 @@ pub fn cgroup_quota() -> Result<Option<(u64, u64)>, String> {
         }
     }
     Err("no cpu cgroup in /proc/self/cgroup".to_owned())
+}
+
+/// The directory of cgroup v1 path `path` in the mount of the cpu
+/// controller. A path outside the mount's root, as in a container with
+/// its own cgroup namespace, is the mount point itself.
+fn v1_cpu_dir(mountinfo: &str, path: &str) -> Option<String> {
+    for line in mountinfo.lines() {
+        // `id parent dev root mount-point options [optional...] - type
+        // source super-options`
+        let Some((fields, fs)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<&str> = fields.split(' ').collect();
+        let fs: Vec<&str> = fs.split(' ').collect();
+        if fields.len() < 5
+            || fs.first() != Some(&"cgroup")
+            || !fs.get(2).is_some_and(|o| o.split(',').any(|o| o == "cpu"))
+        {
+            continue;
+        }
+        let (root, mount) = (fields[3].trim_end_matches('/'), fields[4]);
+        let rest = match path.strip_prefix(root) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+            _ => "",
+        };
+        return Some(format!("{mount}{}", rest.trim_end_matches('/')));
+    }
+    None
 }
 
 fn parse_cpu_max(text: &str) -> Option<Option<(u64, u64)>> {
@@ -483,6 +515,36 @@ pub fn setup_thread(rt: &Rt) -> ThreadStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_v1_cpu_directory_comes_from_mountinfo() {
+        let host = "25 1 0:22 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n\
+                    30 25 0:26 / /sys/fs/cgroup/cpuset rw shared:9 - cgroup cgroup rw,cpuset\n\
+                    31 25 0:27 / /sys/fs/cgroup/cpu,cpuacct rw shared:10 - cgroup cgroup \
+                    rw,cpu,cpuacct\n";
+        assert_eq!(
+            v1_cpu_dir(host, "/user.slice/a/"),
+            Some("/sys/fs/cgroup/cpu,cpuacct/user.slice/a".to_owned())
+        );
+        assert_eq!(
+            v1_cpu_dir(host, "/"),
+            Some("/sys/fs/cgroup/cpu,cpuacct".to_owned())
+        );
+        // A container whose mount is the subtree of its own cgroup.
+        let sub = "31 25 0:27 /docker/abc /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu,cpuacct\n";
+        assert_eq!(
+            v1_cpu_dir(sub, "/docker/abc/x"),
+            Some("/sys/fs/cgroup/cpu/x".to_owned())
+        );
+        // A cgroup namespace: the path is not under the mount's root.
+        assert_eq!(v1_cpu_dir(sub, "/"), Some("/sys/fs/cgroup/cpu".to_owned()));
+        assert_eq!(
+            v1_cpu_dir(sub, "/docker/abcd"),
+            Some("/sys/fs/cgroup/cpu".to_owned())
+        );
+        let cpuset_only = "30 25 0:26 / /sys/fs/cgroup/cpuset rw - cgroup cgroup rw,cpuset\n";
+        assert_eq!(v1_cpu_dir(cpuset_only, "/"), None);
+    }
 
     fn auto(
         r: Option<&str>,
