@@ -479,9 +479,16 @@ fn not_after(cert: &[u8]) -> Option<u64> {
     let field = |n: usize| number(rest + 2 * n..rest + 2 * n + 2);
     let (month, day) = (field(0)?, field(1)?);
     let (hour, minute, second) = (field(2)?, field(3)?, field(4)?);
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
     // A leap second is 60.
     if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+        || !(1..=days_in_month).contains(&day)
         || hour > 23
         || minute > 59
         || second > 60
@@ -887,7 +894,11 @@ mod tests {
         for expiry in [
             midnight(2000, 1, 1) - second,
             midnight(2024, 2, 29) + Duration::from_secs(12 * 3600 + 34 * 60 + 56),
+            midnight(2000, 2, 29),
+            midnight(2023, 4, 30),
+            midnight(2023, 12, 31),
             midnight(2050, 1, 1) - second,
+            midnight(2400, 2, 29),
             midnight(2050, 1, 1),
             midnight(4096, 1, 1),
         ] {
@@ -964,8 +975,16 @@ mod tests {
             "991399999999Z",
             "990001000000Z",
             "991300000000Z",
+            "991301000000Z",
             "990100000000Z",
             "990132000000Z",
+            "990229000000Z",
+            "000230000000Z",
+            "990231000000Z",
+            "990431000000Z",
+            "990631000000Z",
+            "990931000000Z",
+            "991131000000Z",
             "991231240000Z",
             "991231236000Z",
             "991231235961Z",
@@ -975,6 +994,22 @@ mod tests {
         let leap = not_after(&expiring_at_utc_time("161231235960Z"));
         let midnight = rcgen::date_time_ymd(2017, 1, 1).unix_timestamp();
         assert_eq!(leap, u64::try_from(midnight).ok(), "a leap second");
+
+        // GeneralizedTime from 2050 on: 2100 is not a leap year.
+        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(1975, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2100, 3, 1);
+        let mut der = params
+            .self_signed(&KeyPair::generate().unwrap())
+            .unwrap()
+            .der()
+            .to_vec();
+        let at = der
+            .windows(15)
+            .position(|w| w == b"21000301000000Z")
+            .unwrap();
+        der[at..at + 15].copy_from_slice(b"21000229000000Z");
+        assert_eq!(not_after(&der), None, "2100-02-29");
     }
 
     #[test]
