@@ -3,12 +3,13 @@
 //! A task accepts TCP connections and runs each handshake in a task of its
 //! own, bounded by [`HANDSHAKE_TIMEOUT`], so a client that stalls in the
 //! handshake holds up nobody else. At most [`MAX_HANDSHAKES`] run at once;
-//! further connections wait in the listen backlog. In `files` mode the certificate and key
-//! are re-read with the token files and swapped in for new handshakes when
-//! their content changes. A pair that does not parse or does not match is
-//! read once more at once, since a rotation can replace the two files
-//! between the reads; when it still fails, the previous pair stays and the
-//! failure counts in
+//! further connections wait in the listen backlog.
+//!
+//! In `files` mode the certificate and key are re-read with the token files
+//! and swapped in for new handshakes when their content changes. A pair
+//! that does not parse or does not match is read once more at once, since
+//! a rotation can replace the two files between the reads; when it still
+//! fails, the previous pair stays and the failure counts in
 //! `samplez_secret_reload_failures_total{secret="<listener>Tls"}`. A client
 //! CA file is re-read with them, in any mode, and a changed one applies
 //! from the next handshake on; one that does not parse keeps the previous
