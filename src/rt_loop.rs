@@ -57,6 +57,8 @@ pub struct Counters {
     pub gains_consumed: AtomicU64,
     /// Telemetry records not sent because the ring was full.
     pub telemetry_dropped: AtomicU64,
+    /// Block verdicts not sent because the verdict channel was full.
+    pub verdicts_dropped: AtomicU64,
     /// Largest wake lateness after `mxlSleepUntil(T_k)`, ns.
     pub wake_jitter_max_ns: AtomicU64,
     /// Largest block processing time, ns.

@@ -93,5 +93,5 @@ fn rt_thread_allocates_nothing() {
         0,
         "allocator calls on the RT thread"
     );
-    engine.stop();
+    common::stop(engine);
 }

@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Acquire, Ordering::Relaxed};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -161,11 +161,12 @@ pub struct Engine {
 impl Engine {
     /// Starts the RT thread and the supervisor. `process` is the outcome
     /// of [`rt::setup_process`], run before any other thread. Each block's
-    /// verdict goes to `verdicts` when given.
+    /// verdict goes to `verdicts` when given; one the channel has no room
+    /// for is counted in `verdicts_dropped`.
     pub fn start(
         config: Config,
         process: ProcessStatus,
-        verdicts: Option<Sender<BlockVerdict>>,
+        verdicts: Option<SyncSender<BlockVerdict>>,
     ) -> Result<Engine, Error> {
         let api = samplez_mxl::load(&config.libmxl).map_err(Error::Mxl)?;
         let b = u64::from(config.block_size);
@@ -504,7 +505,7 @@ struct Supervisor {
     cmd: rtrb::Producer<Command>,
     ret: rtrb::Consumer<Returned>,
     tel: rtrb::Consumer<Telemetry>,
-    verdicts: Option<Sender<BlockVerdict>>,
+    verdicts: Option<SyncSender<BlockVerdict>>,
     status: Arc<Mutex<Status>>,
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
@@ -558,8 +559,10 @@ impl Supervisor {
         while let Ok(t) = self.tel.pop() {
             match t {
                 Telemetry::Block(v) => {
-                    if let Some(tx) = &self.verdicts {
-                        let _ = tx.send(v);
+                    if let Some(tx) = &self.verdicts
+                        && let Err(TrySendError::Full(_)) = tx.try_send(v)
+                    {
+                        self.counters.verdicts_dropped.fetch_add(1, Relaxed);
                     }
                 }
                 Telemetry::Prune {

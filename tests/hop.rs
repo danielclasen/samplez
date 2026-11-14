@@ -98,7 +98,7 @@ fn one_hop() {
     let counters = engine.counters();
     assert!(counters.wait_early.load(Relaxed) > 1_000);
     assert_eq!(counters.input_wait_timeout.load(Relaxed), 0);
-    engine.stop();
+    common::stop(engine);
 }
 
 fn gain_change() {
@@ -170,7 +170,7 @@ fn gain_change() {
     assert_eq!(c.command_late.load(Relaxed), 0);
     assert_eq!(checker.gain(), 0.2);
     assert_eq!(engine.status().diverged, None);
-    engine.stop();
+    common::stop(engine);
 }
 
 /// Two engines on the same input, started at different times, given the
@@ -231,8 +231,8 @@ fn replicas() {
     // at_index differs from the block before at the same pilot phase.
     let ramp = (at / B - range.start) as usize * 2 * B as usize;
     assert_ne!(bits(&x[ramp..ramp + B as usize]), bits(&x[..B as usize]));
-    b.stop();
-    a.stop();
+    common::stop(b);
+    common::stop(a);
 }
 
 fn chain_of_three() {
@@ -272,7 +272,7 @@ fn chain_of_three() {
         "late at the last hop"
     );
     for (e, _) in hops.into_iter().rev() {
-        e.stop();
+        common::stop(e);
     }
 }
 
@@ -368,7 +368,7 @@ fn killed_producer() {
         pruned,
         "input not pruned after its second producer was killed"
     );
-    engine.stop();
+    common::stop(engine);
 }
 
 /// Output sample `n` is the gain times input sample `n + offsetSamples`,
@@ -415,7 +415,7 @@ fn offset() {
             }
         }
     }
-    engine.stop();
+    common::stop(engine);
 }
 
 /// A clean sample equals `want` bit for bit; a zero is +0.0.
@@ -491,7 +491,7 @@ fn two_inputs() {
     let skipped = engine.counters().overrun_skipped_samples.load(Relaxed) - skipped;
     assert_eq!(a.skipped * B, skipped);
     assert_eq!(state(0), InputState::Attached);
-    engine.stop();
+    common::stop(engine);
 }
 
 /// Checks the blocks of input A's output that the verdicts report since
@@ -563,7 +563,7 @@ fn domain_vanishes() {
     let _pilot = Pilot::start(&a.0, &src, 1, B, 0);
     wait_for(10 * SECOND, "input re-added", attached);
     assert!(engine.status().outputs[0].realised);
-    engine.stop();
+    common::stop(engine);
 }
 
 fn late_producer() {
@@ -604,7 +604,7 @@ fn late_producer() {
     let required = warning.expect("no margin warning");
     // The worst late block ends 192 samples or more past a batch boundary.
     assert!(required >= MARGIN + 192 + B, "required margin {required}");
-    engine.stop();
+    common::stop(engine);
 }
 
 fn foreign_writer() {
@@ -648,7 +648,7 @@ fn foreign_writer() {
     let mut checker = Checker::new(&domain.0, &dst, 1, &[0.5]);
     checker.run(&[&rx], 2 * SECOND, |_, _| {});
     assert!(checker.counts.clean > 1_000, "{:?}", checker.counts);
-    engine.stop();
+    common::stop(engine);
 }
 
 fn binary() {

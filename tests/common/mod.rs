@@ -573,9 +573,18 @@ pub fn read_blocks(domain: &Path, flow_id: &str, channels: usize, ks: Range<u64>
     out
 }
 
-/// Starts an engine with a verdict stream.
+/// Starts an engine with a verdict stream of 65 s of blocks.
 pub fn start(config: Config) -> (Engine, Receiver<BlockVerdict>) {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1 << 16);
     let process = samplez::rt::setup_process(&config.rt);
     (Engine::start(config, process, Some(tx)).unwrap(), rx)
+}
+
+/// Stops an engine whose verdicts were checked: every verdict was sent.
+pub fn stop(engine: Engine) {
+    assert_eq!(
+        engine.counters().verdicts_dropped.load(Ordering::Relaxed),
+        0
+    );
+    engine.stop();
 }
