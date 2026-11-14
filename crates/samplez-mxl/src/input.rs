@@ -21,6 +21,9 @@ use crate::{Error, Instance, MxlApi, Result, Status, check, id_cstring};
 /// probed for validity.
 pub const FROZEN_PROBE_BLOCKS: u32 = 10;
 
+/// The x86_64 base page size. A larger page is touched more than once.
+const PAGE: usize = 4096;
+
 /// How long a polled head must stay on time before the input is added back.
 pub const ON_TIME_NS: u64 = 1_000_000_000;
 
@@ -365,6 +368,12 @@ impl Generation {
         self.max_offset
     }
 
+    /// Supervisor side. [`Input::prefault`] on every attached input.
+    /// Returns the pages touched.
+    pub fn prefault(&self) -> Result<usize> {
+        self.inputs.iter().flatten().map(Input::prefault).sum()
+    }
+
     /// RT. `mxlFlowSynchronizationGroupWaitForDataAt` on the generation's
     /// group: [`GroupWait::Ok`] once every reader's head reached the index
     /// of `timestamp`. Otherwise it blocks on a futex until `timeout_ns`
@@ -461,6 +470,56 @@ impl Input {
 
     pub fn offset(&self) -> i64 {
         self.offset
+    }
+
+    /// Supervisor side. Reads one byte of every page of the flow's channel
+    /// rings in this reader's mapping, so that the RT thread's reads take
+    /// no first-touch page faults when memory is not locked with
+    /// `MCL_FUTURE`. Gets the sample below the head with
+    /// `mxlFlowReaderGetSamplesNonBlocking` and derives the start of
+    /// channel 0's ring from the first fragment. Returns the pages touched.
+    pub fn prefault(&self) -> Result<usize> {
+        let info = self.reader.config()?;
+        // SAFETY: both union members are structs of integers, so any bytes
+        // are a valid value; attach checked the flow is audio, for which
+        // libmxl fills `continuous`.
+        let buffer_length = u64::from(unsafe { info.__bindgen_anon_1.continuous }.bufferLength);
+        let head = self.reader.head().map_err(|status| Error::Mxl {
+            call: "mxlFlowReaderGetRuntimeInfo",
+            status,
+        })?;
+        let mut slice = WrappedMultiBufferSlice::default();
+        check(
+            "mxlFlowReaderGetSamplesNonBlocking",
+            self.reader.samples(head, 1, &mut slice),
+        )?;
+        if buffer_length == 0 || slice.stride as u64 != buffer_length * size_of::<f32>() as u64 {
+            return Err(Error::Format(format!(
+                "ring of {buffer_length} samples with a channel stride of {} bytes",
+                slice.stride
+            )));
+        }
+        // libmxl places fragment 0 at sample (index - count) mod
+        // bufferLength of channel 0's ring; the read above succeeded, so
+        // head >= 1.
+        let offset = ((head - 1) % buffer_length) as usize * size_of::<f32>();
+        let len = slice.count * slice.stride;
+        let mut pages = 0;
+        // SAFETY: libmxl returned fragment 0 `offset` bytes into channel
+        // 0's ring of the reader's mapping, and channel `c < slice.count`
+        // starts `c * stride` bytes after channel 0, `stride` being the
+        // whole ring of one channel (checked above). So `[base, base +
+        // len)` is mapped while the reader lives, which it does for the
+        // call. The reads are volatile byte reads, so no alignment is
+        // assumed and none is elided.
+        unsafe {
+            let base = slice.base.fragments[0].pointer.cast::<u8>().sub(offset);
+            for at in (0..len).step_by(PAGE).chain((len > 0).then(|| len - 1)) {
+                std::ptr::read_volatile(base.add(at));
+                pages += 1;
+            }
+        }
+        Ok(pages)
     }
 
     /// RT. Reads block `k`, the range `[kB + offset, (k + 1)B + offset)`,

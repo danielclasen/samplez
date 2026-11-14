@@ -111,6 +111,17 @@ impl Matrix {
             .map_or(0.0, |k| col[k].ramp.current())
     }
 
+    /// Whether the coefficient from `input` to `output` is ramping: its
+    /// next sample differs from its target. False for a coefficient that
+    /// holds its value, a removed one included.
+    pub fn is_ramping(&self, input: usize, output: usize) -> bool {
+        let Some(col) = self.columns.get(output) else {
+            return false;
+        };
+        col.binary_search_by_key(&input, |t| t.input)
+            .is_ok_and(|k| col[k].ramp.is_active())
+    }
+
     /// Ramps the coefficient from `input` to `output` to `target` over
     /// `len` samples, per [`Ramp::set_target`].
     ///
@@ -125,20 +136,20 @@ impl Matrix {
         let col = &mut self.columns[output];
         match col.binary_search_by_key(&input, |t| t.input) {
             Ok(k) => {
-                let accepted = col[k].ramp.set_target(target, len);
+                // `target` passed valid_gain, so set_target accepts it.
+                let _ = col[k].ramp.set_target(target, len);
                 if !col[k].ramp.is_active() && target == 0.0 {
                     col.remove(k);
                 }
-                accepted
             }
             Err(k) if target != 0.0 => {
                 let mut ramp = Ramp::new(0.0);
-                let accepted = ramp.set_target(target, len);
+                let _ = ramp.set_target(target, len);
                 col.insert(k, Term { input, ramp });
-                accepted
             }
-            Err(_) => true,
+            Err(_) => {}
         }
+        true
     }
 
     /// Mixes the first `frames` frames of `input` into `output` on
@@ -177,12 +188,25 @@ impl Matrix {
                     Path::Avx2 => unsafe { simd::mix_avx2(terms, input, out) },
                 },
             }
-            for t in col.iter_mut() {
-                t.ramp.advance(frames);
-            }
-            col.retain(|t| t.ramp.is_active() || t.ramp.target != 0.0);
+            advance_column(col, frames);
         }
     }
+
+    /// Moves every coefficient ramp `frames` samples on without mixing,
+    /// as [`Matrix::process`] over `frames` frames does. Keeps ramp
+    /// positions on the sample timeline over frames that are not mixed.
+    pub fn advance(&mut self, frames: usize) {
+        for col in &mut self.columns {
+            advance_column(col, frames);
+        }
+    }
+}
+
+fn advance_column(col: &mut Vec<Term>, frames: usize) {
+    for t in col.iter_mut() {
+        t.ramp.advance(frames);
+    }
+    col.retain(|t| t.ramp.is_active() || t.ramp.target != 0.0);
 }
 
 /// Scalar reference for one output, from sample `start` to the end of
@@ -286,6 +310,44 @@ mod tests {
             }
             restore_mxcsr(saved);
         }
+    }
+
+    #[test]
+    fn advance_moves_ramps_as_process_does() {
+        let mut rng = Rng::new(7);
+        let mut a = Matrix::new(3, 2);
+        assert!(a.set(0, 0, 0.8, 1000));
+        assert!(a.set(2, 1, -0.5, 300));
+        assert!(a.set(1, 1, 0.25, 0));
+        let mut b = a.clone();
+        let mut input = PlanarBuffer::new(3, CAP);
+        let (mut out_a, mut out_b) = (PlanarBuffer::new(2, CAP), PlanarBuffer::new(2, CAP));
+        fill(&mut rng, &mut input, CAP);
+        a.process(&input, &mut out_a, 400);
+        b.advance(400);
+        assert_eq!(a, b);
+        a.process(&input, &mut out_a, CAP);
+        b.process(&input, &mut out_b, CAP);
+        assert_bits_eq(&out_a, &out_b, CAP, "after advance");
+    }
+
+    #[test]
+    fn is_ramping_only_while_a_ramp_runs() {
+        let mut m = Matrix::new(2, 2);
+        assert!(!m.is_ramping(0, 0), "absent coefficient");
+        assert!(m.set(0, 0, 0.5, 10));
+        assert!(m.is_ramping(0, 0));
+        assert!(!m.is_ramping(1, 0) && !m.is_ramping(0, 1));
+        m.advance(10);
+        assert!(!m.is_ramping(0, 0), "ramp ended");
+        // A target equal to the held value starts no ramp.
+        assert!(m.set(0, 0, 0.5, 10));
+        assert!(!m.is_ramping(0, 0));
+        assert!(m.set(1, 1, 0.0, 10), "zero on an absent coefficient");
+        assert!(!m.is_ramping(1, 1));
+        assert!(m.set(0, 0, 0.0, 0), "jump");
+        assert!(!m.is_ramping(0, 0));
+        assert!(!m.is_ramping(5, 5), "out of range");
     }
 
     #[test]

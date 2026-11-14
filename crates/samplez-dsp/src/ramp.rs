@@ -7,7 +7,7 @@ pub const MAX_RAMP_LEN: u32 = 1 << 24;
 pub const MAX_GAIN: f32 = 1.0e6;
 
 /// Whether `gain` is finite and within [`MAX_GAIN`].
-pub(crate) fn valid_gain(gain: f32) -> bool {
+pub fn valid_gain(gain: f32) -> bool {
     gain.abs() <= MAX_GAIN
 }
 
@@ -124,6 +124,14 @@ impl Ramp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_gain_refuses_nan_and_infinities() {
+        assert!(valid_gain(MAX_GAIN) && valid_gain(-MAX_GAIN) && valid_gain(0.0));
+        assert!(!valid_gain(f32::NAN));
+        assert!(!valid_gain(f32::INFINITY) && !valid_gain(f32::NEG_INFINITY));
+        assert!(!valid_gain(MAX_GAIN * 1.01));
+    }
 
     /// Runs `ramp` over a block of ones in blocks of the given sizes.
     fn run(ramp: &mut Ramp, blocks: &[usize]) -> Vec<f32> {

@@ -220,6 +220,19 @@ fn each_outcome_is_produced() {
         // Beyond the head after a timed-out wait: late, no read.
         assert_eq!(r.read(&mut s, K0 + 300, &timeout, &mut dst), Outcome::Late);
 
+        // A block without a wait (catch-up) checks the head as a timed-out
+        // wait does: late beyond it, copied up to it.
+        let mut skipped = SlotState::default();
+        assert_eq!(
+            r.read(&mut skipped, K0 + 300, &GroupWait::Skipped, &mut dst),
+            Outcome::Late
+        );
+        assert_eq!(
+            r.read(&mut skipped, K0 + 299, &GroupWait::Skipped, &mut dst),
+            Outcome::Copy
+        );
+        assert_eq!(dst, expected(2, K0 + 299, 0));
+
         // Beyond the head after a group OK, which a head moving backwards
         // between the wait and the read produces: libmxl's TOO_EARLY.
         assert_eq!(

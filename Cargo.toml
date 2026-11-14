@@ -12,3 +12,19 @@ publish = false
 members = ["crates/samplez-dsp", "crates/samplez-mxl", "crates/samplez-service"]
 
 [dependencies]
+
+libc = "0.2"
+mxl-sys = { git = "https://github.com/dmf-mxl/mxl", rev = "8f3f1096e804bfb822eb959cdf2fc23199a7d15d", features = ["mxl-not-built"] }
+rtrb = "0.3"
+samplez-dsp = { path = "crates/samplez-dsp", version = "0.0.0" }
+samplez-mxl = { path = "crates/samplez-mxl", version = "0.0.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The end-to-end scenarios need SCHED_FIFO and mlockall to hold their
+# timing: `cargo test --workspace` leaves them out, CI runs them with
+# `--test hop` in a container with rtprio and memlock limits raised.
+[[test]]
+name = "hop"
+harness = false
+test = false

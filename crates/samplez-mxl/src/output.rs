@@ -327,18 +327,35 @@ mod tests {
     /// `create_writer` on a flow another writer holds: libmxl opens it with
     /// `was_created == false`, and the writer is released, not adopted.
     /// Against the real libmxl, which the builder image carries.
+    ///
+    /// Also a canary for upstream dmf-mxl/mxl#776: libmxl v1.1.0 leaves
+    /// the `.mxl-tmp-*` directory of the refused create in the domain. The
+    /// assertion on that directory fails once a libmxl with the fix is in
+    /// the builder image.
     #[test]
-    fn an_opened_existing_flow_is_released_as_raced() {
-        let api = crate::load(std::path::Path::new("/opt/mxl/lib/libmxl.so")).unwrap();
-        let domain = std::env::temp_dir().join(format!("samplez-mxl-raced-{}", std::process::id()));
-        std::fs::create_dir_all(&domain).unwrap();
-        let owner = Instance::new(&api, &domain).unwrap();
+    fn raced_create_is_released_and_upstream_776_leaves_a_tmp_dir() {
+        /// The test domain directory, removed on drop.
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let lib = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let api = crate::load(std::path::Path::new(&lib)).unwrap();
+        let dir =
+            Dir(std::env::temp_dir().join(format!("samplez-mxl-raced-{}", std::process::id())));
+        let domain = &dir.0;
+        let _ = std::fs::remove_dir_all(domain);
+        std::fs::create_dir_all(domain).unwrap();
+        let owner = Instance::new(&api, domain).unwrap();
         let Creation::Created { writer: mut w, .. } = create(&owner, &config()).unwrap() else {
             panic!("flow not created");
         };
         assert_eq!(w.write_block(1_000, &[0.5; 6 * 48]), Write::Committed);
 
-        let other = Instance::new(&api, &domain).unwrap();
+        let other = Instance::new(&api, domain).unwrap();
         let def = flow_definition(&config()).unwrap();
         assert!(matches!(
             create_writer(&other, &config(), def, false).unwrap(),
@@ -350,7 +367,14 @@ mod tests {
         drop(w);
         drop(other);
         drop(owner);
-        std::fs::remove_dir_all(&domain).unwrap();
+        // libmxl v1.1.0 leaves the temporary directory of the refused
+        // create behind (upstream #776); the creation rules rely on it.
+        let tmp: Vec<_> = std::fs::read_dir(domain)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".mxl-tmp-"))
+            .collect();
+        assert_eq!(tmp.len(), 1, "{tmp:?}");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::arch::asm;
+use std::marker::PhantomData;
 
 /// MXCSR flush-to-zero: denormal results are written as zero.
 pub const FTZ: u32 = 1 << 15;
@@ -15,10 +16,12 @@ pub fn mxcsr() -> u32 {
     value
 }
 
-/// MXCSR as it was before [`set_ftz_daz`], for [`restore_mxcsr`].
+/// MXCSR as it was before [`set_ftz_daz`], for [`restore_mxcsr`]. MXCSR
+/// is per thread, so the value is not `Send`: restoring it on another
+/// thread would load one thread's MXCSR into another.
 #[derive(Debug)]
 #[must_use]
-pub struct SavedMxcsr(u32);
+pub struct SavedMxcsr(u32, PhantomData<*const ()>);
 
 fn load_mxcsr(value: u32) {
     // SAFETY: ldmxcsr reads 4 bytes from a valid, aligned u32. Every value
@@ -50,13 +53,25 @@ pub fn set_ftz_daz(enabled: bool) -> SavedMxcsr {
         saved & !(FTZ | DAZ)
     };
     load_mxcsr(value);
-    SavedMxcsr(saved)
+    SavedMxcsr(saved, PhantomData)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::hint::black_box;
+
+    /// Compiles only while `SavedMxcsr` is not `Send`: for a `Send` type
+    /// both impls apply and the call is ambiguous.
+    #[test]
+    fn saved_mxcsr_is_not_send() {
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        <SavedMxcsr as AmbiguousIfSend<_>>::check();
+    }
 
     #[test]
     fn ftz_daz_flush_denormals_and_restore() {
