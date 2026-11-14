@@ -23,7 +23,7 @@ use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
 
 use crate::config::Config;
-use crate::rt::{self, ProcessStatus, RtStatus, ThreadStatus};
+use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
     BlockVerdict, Command, Counters, EMPTY_STATS, GainChange, Gen, Mix, Out, PENDING_CHANGES,
     Returned, Rt, Slot, SlotStats, Telemetry,
@@ -173,7 +173,12 @@ impl Engine {
         let counters = Arc::new(Counters::default());
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(COMMAND_RING);
         let (ret_tx, ret_rx) = rtrb::RingBuffer::new(RETURN_RING);
-        let (tel_tx, tel_rx) = rtrb::RingBuffer::new(TELEMETRY_RING);
+        let (mut tel_tx, mut tel_rx) = rtrb::RingBuffer::new(TELEMETRY_RING);
+        // The ring is allocated after mlockall: without MCL_FUTURE its
+        // pages would fault in on the RT thread's first pushes. Every slot
+        // is written once here instead.
+        while tel_tx.push(Telemetry::ClockStep { delta_ns: 0 }).is_ok() {}
+        while tel_rx.pop().is_ok() {}
         let (gain_tx, gain_rx) = rtrb::RingBuffer::new(PENDING_CHANGES);
 
         let mut in_domains: Vec<usize> = Vec::new();
@@ -261,7 +266,10 @@ impl Engine {
             .map_err(|_| Error::Thread("the RT thread ended during set-up".to_owned()))?;
 
         let status = Arc::new(Mutex::new(Status {
-            rt: RtStatus { process, thread },
+            rt: RtStatus {
+                process: process.clone(),
+                thread,
+            },
             diverged: None,
             inputs: config
                 .inputs
@@ -291,6 +299,9 @@ impl Engine {
                 .collect(),
         }));
         let now = Instant::now();
+        // Without MCL_FUTURE the pages of a new generation's rings are not
+        // locked; they are read once on the supervisor before handover.
+        let prefault = !matches!(process.mlock, Step::Active(_));
         let margin = u64::from(config.reader_margin_samples);
         let lead = (u64::from(config.max_catchup_blocks) + 2) * b;
         let sup = Supervisor {
@@ -300,6 +311,7 @@ impl Engine {
                 margin: u64::from(config.reader_margin_samples),
                 max_catchup_blocks: u64::from(config.max_catchup_blocks),
             },
+            prefault,
             in_domains: in_domains.clone(),
             slots: (0..config.inputs.len())
                 .map(|_| SupSlot {
@@ -468,6 +480,8 @@ struct Supervisor {
     api: Arc<MxlApi>,
     config: Config,
     timing: Timing,
+    /// Read every page of a new generation's rings before handover.
+    prefault: bool,
     /// Configuration domain index of each input domain.
     in_domains: Vec<usize>,
     slots: Vec<SupSlot>,
@@ -717,6 +731,14 @@ impl Supervisor {
                     self.start_polling(slot);
                 }
             }
+        }
+        if self.prefault
+            && let Err(e) = generation.prefault()
+        {
+            log(format_args!(
+                "input generation on {}: reading the rings before handover: {e}",
+                path.display()
+            ));
         }
         let command = Command::Generation {
             domain: d,

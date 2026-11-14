@@ -12,6 +12,17 @@ use common::{B, Domain, MARGIN, Pilot, config, new_id, wait_for};
 use samplez::rt::{self, Step};
 use samplez::{Engine, InputState};
 
+const CHANNELS: u32 = 4;
+/// Minor faults the RT thread may take in the second after a re-add.
+const MAX_FAULTS: u64 = 2;
+
+/// Minor page faults of thread `tid`, field 10 of its stat file.
+fn minor_faults(tid: i32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap();
+    let fields = stat.rsplit_once(") ").unwrap().1;
+    fields.split(' ').nth(7).unwrap().parse().unwrap()
+}
+
 fn rlimit(resource: libc::__rlimit_resource_t) -> u64 {
     let mut r = libc::rlimit {
         rlim_cur: 0,
@@ -40,12 +51,12 @@ fn rt_setup_degrades_without_privileges_and_the_engine_runs() {
 
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
-    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let pilot = Pilot::start(&domain.0, &src, CHANNELS, B, 0);
     let mut cfg = config(
         &domain.0,
-        &[(&src, 1)],
+        &[(&src, CHANNELS)],
         &[(&dst, 1)],
-        vec![vec![1.0]],
+        vec![vec![1.0]; CHANNELS as usize],
         MARGIN,
     );
     cfg.rt.rt_cpu = samplez::config::RtCpu::Auto;
@@ -98,5 +109,26 @@ fn rt_setup_degrades_without_privileges_and_the_engine_runs() {
     let beat = engine.counters().heartbeat_blocks.load(Relaxed);
     std::thread::sleep(Duration::from_millis(500));
     assert!(engine.counters().heartbeat_blocks.load(Relaxed) > beat + 300);
+
+    // Degraded memory locking: a re-added input's rings are mapped anew
+    // in a new generation, after mlockall(MCL_CURRENT). The supervisor
+    // reads their pages before handover, so the RT thread's reads over the
+    // following second take no page faults; without that it takes one
+    // per page read, about 47 per channel and second.
+    std::thread::sleep(Duration::from_secs(3));
+    let attached = || engine.status().inputs[0].state == InputState::Attached;
+    drop(pilot);
+    wait_for(Duration::from_secs(5), "input pruned", || !attached());
+    let _pilot = Pilot::start(&domain.0, &src, CHANNELS, B, 0);
+    wait_for(Duration::from_secs(10), "input re-added", attached);
+    let tid = s.thread.tid;
+    let before = minor_faults(tid);
+    std::thread::sleep(Duration::from_secs(1));
+    let faults = minor_faults(tid) - before;
+    eprintln!("RT thread minor faults in the second after the re-add: {faults}");
+    assert!(
+        faults <= MAX_FAULTS,
+        "{faults} minor faults on the RT thread"
+    );
     engine.stop();
 }
