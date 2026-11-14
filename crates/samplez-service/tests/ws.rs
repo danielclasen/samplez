@@ -11,6 +11,7 @@ use axum::extract::ws::Message;
 use common::*;
 use futures_util::{FutureExt, Sink, Stream, StreamExt};
 use samplez_service::replica::{Ack, Begin, Commands};
+use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
     ClientQueue, Delta, Ended, Frame, Hub, MAX_PAUSE, MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES,
     PONG_TIMEOUT, Popped, Pushed, Sessions, serve_client,
@@ -926,12 +927,17 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     let mut config = config("none", "loopback");
     let loopback = serde_json::json!({ "bind": "127.0.0.1", "port": 0 });
     config["listeners"] = serde_json::json!({ "api": loopback, "ops": loopback, "nmos": loopback });
+    let longest = SESSION.repeat(6)[..MAX_SESSION_ID].to_owned();
     let service = service_from(config, Ops::default(), state.clone()).ws({
-        let (hub, state) = (hub.clone(), state.clone());
+        let (hub, state, longest) = (hub.clone(), state.clone(), longest.clone());
         move |socket, connect| {
-            let (hub, state) = (hub.clone(), state.clone());
+            let (hub, state, longest) = (hub.clone(), state.clone(), longest.clone());
             async move {
-                assert_eq!(connect.owner.session, SESSION);
+                assert!(
+                    [SESSION, &longest].contains(&connect.owner.session.as_str()),
+                    "{}",
+                    connect.owner.session
+                );
                 assert_eq!(connect.owner.principal, "anonymous");
                 assert_eq!(connect.owner.role, Role::Operator);
                 assert!(connect.owner.connection.starts_with("r1:"));
@@ -961,7 +967,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
         "session=".to_owned(),
         "session=tab-1".to_owned(),
         format!("session={short}"),
-        format!("session={}", &SESSION.repeat(6)[..129]),
+        format!("session={}", &SESSION.repeat(6)[..MAX_SESSION_ID + 1]),
         format!("session={short}%3D"),
         format!("session={short}."),
     ];
@@ -987,6 +993,19 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     assert_eq!(next().await, "delta@3");
     apply(&state, &hub);
     assert_eq!(next().await, "delta@4");
+
+    let url = format!("ws://{addr}/api/v1/ws?since=7:3&session={longest}");
+    let (mut ws, res) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 101, "the longest session id");
+    loop {
+        match ws.next().await {
+            Some(Ok(tungstenite::Message::Text(t))) => break assert_eq!(t.as_str(), "delta@4"),
+            Some(Ok(tungstenite::Message::Ping(_))) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
     server.abort();
 }
 
