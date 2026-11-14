@@ -359,14 +359,14 @@ async fn send<T: Sink<Message> + Unpin>(
 /// before calling.
 ///
 /// `on_message` is called for each message in the order received, and the
-/// replies go out in that order. The futures it returns run beside the
-/// heartbeat and each other, so a reply that waits on a commit or an
-/// election does not stall the pings; work that must follow the order of
-/// the messages belongs in the call itself, before the future. With
-/// [`MAX_PENDING_REPLIES`] replies outstanding the connection is not read,
-/// pongs included, until one is ready, and that time does not count against
-/// the client's [`PONG_TIMEOUT`]. A catch-up runs beside the heartbeat
-/// as well, with `queue` waiting for it.
+/// replies go out in that order, the first after the first catch-up. The
+/// futures it returns run beside the heartbeat and each other, so a reply
+/// that waits on a commit or an election does not stall the pings; work
+/// that must follow the order of the messages belongs in the call itself,
+/// before the future. With [`MAX_PENDING_REPLIES`] replies outstanding the
+/// connection is not read, pongs included, until one is ready, and that
+/// time does not count against the client's [`PONG_TIMEOUT`]. A catch-up
+/// runs beside the heartbeat as well, with `queue` waiting for it.
 pub async fn serve_client<S, E, F, Fut>(
     socket: S,
     connect: &Connect,
@@ -392,7 +392,8 @@ where
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut catching_up: Option<BoxFuture<'_, _>> =
             Some(Box::pin(catch_up(state, connect.since)));
-        // Set by the first catch-up, before `queue` is read.
+        // Set by the first catch-up, before `queue` and replies are read.
+        let mut caught_up = false;
         let mut position = Position {
             epoch: 0,
             revision: 0,
@@ -431,11 +432,14 @@ where
                         Vec::new()
                     }
                 },
-                Some(reply) = replies.next(), if !replies.is_empty() => reply.into_iter().collect(),
+                Some(reply) = replies.next(), if caught_up && !replies.is_empty() => {
+                    reply.into_iter().collect()
+                }
                 (p, texts) = async { catching_up.as_mut().expect("guarded").await },
                     if catching_up.is_some() =>
                 {
                     catching_up = None;
+                    caught_up = true;
                     position = p;
                     texts.into_iter().map(Message::Text).collect()
                 }

@@ -429,6 +429,19 @@ async fn replies_at_the_limit_slower_than_the_pong_timeout_keep_the_connection()
     assert_eq!(client.next().await, "delta@1", "still served");
 }
 
+/// A client resending its unacknowledged commands at once after
+/// connecting reads the answers against the state they refer to.
+#[tokio::test(start_paused = true)]
+async fn no_reply_goes_out_before_the_first_catch_up() {
+    let state = FakeState::new("r1", "leader");
+    *state.snapshot_delay.lock().unwrap() = Duration::from_millis(500);
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    client.tx.send(Ok(Message::Text("hello".into()))).unwrap();
+    assert_eq!(client.next().await, "snapshot@7:0");
+    assert_eq!(client.next().await, "echo hello");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_slow_snapshot_keeps_the_heartbeat() {
     let state = FakeState::new("r1", "leader");
