@@ -43,13 +43,22 @@ pub fn api() -> Arc<MxlApi> {
     samplez_mxl::load(&libmxl()).unwrap()
 }
 
-/// A fresh MXL domain directory, removed on drop.
+/// A fresh MXL domain directory, removed on drop, on `/dev/shm` when it
+/// exists. On a disk-backed file system a write into a flow's shared
+/// mapping can wait for the page's writeback; the RT loop then stalls for
+/// tens of milliseconds and skips blocks.
 pub struct Domain(pub PathBuf);
 
 impl Domain {
     pub fn new() -> Domain {
         static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        let shm = Path::new("/dev/shm");
+        let base = if shm.is_dir() {
+            shm.to_owned()
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = base.join(format!(
             "samplez-engine-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)

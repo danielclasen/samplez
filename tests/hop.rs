@@ -1,6 +1,7 @@
 //! The engine end to end on real libmxl flows: one hop, a gain change,
-//! two replicas, a chain of three, a killed and restarted producer, a late
-//! producer, a foreign writer on the output and the `samplez-hop` binary.
+//! two replicas, a chain of three, a killed and restarted producer, an
+//! input offset, two inputs with one pruned, a late producer, a vanished
+//! domain, a foreign writer on the output and the `samplez-hop` binary.
 //! Runs without the test harness, one scenario at a time so their timing
 //! does not interfere, and re-executes itself as a producer process that
 //! can be SIGKILLed (`hop child <domain> <id>`).
@@ -21,6 +22,8 @@ use samplez_mxl::output::{self, Creation, OutputConfig};
 const SECOND: Duration = Duration::from_secs(1);
 /// Gain changes an engine holds outstanding.
 const PENDING: u64 = 64;
+/// An input offset that is not a multiple of the block size.
+const OFFSET: i64 = 100;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -47,6 +50,8 @@ fn main() {
             "killed_producer_is_silenced_pruned_and_re_added",
             killed_producer,
         ),
+        ("offset_input_is_read_offset_samples_ahead", offset),
+        ("two_inputs_prune_one_and_the_other_stays_exact", two_inputs),
         (
             "late_producer_is_silenced_and_gets_a_margin_warning",
             late_producer,
@@ -88,6 +93,11 @@ fn one_hop() {
     let c = checker.counts;
     assert!(c.clean - before.clean > 1_000, "{c:?}");
     assert!(before.ramp > 0, "the input fades in at start: {before:?}");
+    // The producer commits each block at its index, well before the
+    // deadline: the group wait returns early, never at the deadline.
+    let counters = engine.counters();
+    assert!(counters.wait_early.load(Relaxed) > 1_000);
+    assert_eq!(counters.input_wait_timeout.load(Relaxed), 0);
     engine.stop();
 }
 
@@ -338,7 +348,7 @@ fn killed_producer() {
 
     // The restarted producer collects the stale flow and creates the same
     // id; the poller finds it and the input is added back with a fade-in.
-    let _producer = spawn_producer(&domain, &src);
+    let producer = spawn_producer(&domain, &src);
     let mut back = false;
     checker.run(&[&rx], 4 * SECOND, |_, _| {
         back |= engine.status().inputs[0].state == InputState::Attached;
@@ -347,7 +357,183 @@ fn killed_producer() {
     assert!(back, "input not re-added: {:?}", engine.status().inputs[0]);
     assert!(c.ramp - gap.ramp >= 10, "no fade-in after re-add: {c:?}");
     assert!(c.clean - gap.clean > 1_000, "{c:?}");
+
+    // The re-added input is pruned again when its producer dies again.
+    producer.kill();
+    let mut pruned = false;
+    checker.run(&[&rx], 2 * SECOND, |_, _| {
+        pruned |= engine.status().inputs[0].state == InputState::Pruned;
+    });
+    assert!(
+        pruned,
+        "input not pruned after its second producer was killed"
+    );
     engine.stop();
+}
+
+/// Output sample `n` is the gain times input sample `n + offsetSamples`,
+/// with an offset that is not a multiple of the block size.
+fn offset() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let mut cfg = config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&dst, 2)],
+        diagonal(2, 0.5),
+        MARGIN,
+    );
+    cfg.inputs[0].offset_samples = OFFSET;
+    let (engine, rx) = start(cfg);
+    wait_for(5 * SECOND, "input attached and output realised", || {
+        let s = engine.status();
+        s.outputs[0].realised && s.inputs[0].state == InputState::Attached
+    });
+    std::thread::sleep(SECOND / 2);
+    let now = rx.try_iter().last().unwrap().k;
+    let range = now + 10..now + 110;
+    // Past the range and the margin, within the 1 s history.
+    std::thread::sleep(SECOND / 2);
+    let verdicts: Vec<_> = rx.try_iter().filter(|v| range.contains(&v.k)).collect();
+    assert_eq!(verdicts.len() as u64, range.end - range.start);
+    for v in &verdicts {
+        assert_eq!(v.verdict(), samplez::Verdict::Clean, "{v:?}");
+        assert_eq!(v.written, 1, "{v:?}");
+    }
+    let out = common::read_blocks(&domain.0, &dst, 2, range.clone());
+    for (j, k) in range.enumerate() {
+        for ch in 0..2 {
+            for i in 0..B {
+                let n = k * B + i;
+                let got = out[(j * 2 + ch) * B as usize + i as usize];
+                let want = 0.5 * common::pilot(ch, n.checked_add_signed(OFFSET).unwrap());
+                assert!(
+                    exact(got, want),
+                    "channel {ch} index {n}: got {got:e}, want {want:e}"
+                );
+            }
+        }
+    }
+    engine.stop();
+}
+
+/// A clean sample equals `want` bit for bit; a zero is +0.0.
+fn exact(got: f32, want: f32) -> bool {
+    if want == 0.0 {
+        got.to_bits() == 0
+    } else {
+        got == want
+    }
+}
+
+/// Two inputs in one domain, each to its own output: pruning and
+/// re-adding one, which swaps the domain's generation twice, leaves every
+/// block of the other's output that the loop processes clean and exact.
+fn two_inputs() {
+    let domain = Domain::new();
+    let (src_a, src_b, out_a, out_b) = (new_id(), new_id(), new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src_a, 1, B, 0);
+    let producer = spawn_producer(&domain, &src_b);
+    let cfg = config(
+        &domain.0,
+        &[(&src_a, 1), (&src_b, 2)],
+        &[(&out_a, 1), (&out_b, 2)],
+        diagonal(3, 0.5),
+        MARGIN,
+    );
+    let (engine, rx) = start(cfg);
+    let state = |slot: usize| engine.status().inputs[slot].state;
+    wait_for(5 * SECOND, "both inputs attached", || {
+        let s = engine.status();
+        s.outputs.iter().all(|o| o.realised)
+            && s.inputs.iter().all(|i| i.state == InputState::Attached)
+    });
+    // Past input A's fade-in.
+    std::thread::sleep(SECOND / 2);
+    let _ = rx.try_iter().count();
+    let mut a = OutputA {
+        domain: &domain,
+        flow: &out_a,
+        next: None,
+        checked: 0,
+        skipped: 0,
+    };
+    let skipped = engine.counters().overrun_skipped_samples.load(Relaxed);
+
+    producer.kill();
+    let t = Instant::now();
+    while state(1) != InputState::Pruned {
+        assert!(t.elapsed() < 5 * SECOND, "input B not pruned");
+        a.check(&rx);
+        std::thread::sleep(SECOND / 10);
+    }
+    a.check(&rx);
+    let _producer = spawn_producer(&domain, &src_b);
+    let t = Instant::now();
+    while state(1) != InputState::Attached {
+        assert!(t.elapsed() < 10 * SECOND, "input B not re-added");
+        a.check(&rx);
+        std::thread::sleep(SECOND / 10);
+    }
+    let t = Instant::now();
+    while t.elapsed() < SECOND {
+        a.check(&rx);
+        std::thread::sleep(SECOND / 10);
+    }
+    a.check(&rx);
+    assert!(
+        a.checked > 2_000,
+        "{} blocks of output A checked",
+        a.checked
+    );
+    // Every block not reported is an overrun skip.
+    let skipped = engine.counters().overrun_skipped_samples.load(Relaxed) - skipped;
+    assert_eq!(a.skipped * B, skipped);
+    assert_eq!(state(0), InputState::Attached);
+    engine.stop();
+}
+
+/// Checks the blocks of input A's output that the verdicts report since
+/// the last call: every one written, input A copied without a fade, each
+/// sample `0.5 pilot(0, n)`. Blocks between two reported ones are the
+/// loop's overrun skips, zero-filled by libmxl.
+struct OutputA<'a> {
+    domain: &'a Domain,
+    flow: &'a str,
+    next: Option<u64>,
+    checked: u64,
+    skipped: u64,
+}
+
+impl OutputA<'_> {
+    fn check(&mut self, rx: &std::sync::mpsc::Receiver<samplez::BlockVerdict>) {
+        let vs: Vec<_> = rx.try_iter().collect();
+        let (Some(first), Some(last)) = (vs.first(), vs.last()) else {
+            return;
+        };
+        let mut processed = std::collections::HashSet::new();
+        for v in &vs {
+            let want = self.next.unwrap_or(v.k);
+            assert!(v.k >= want, "block {} after block {want}", v.k);
+            self.skipped += v.k - want;
+            self.next = Some(v.k + 1);
+            assert_eq!((v.silenced & 1, v.fading & 1), (0, 0), "{v:?}");
+            assert_eq!(v.written & 1, 1, "{v:?}");
+            processed.insert(v.k);
+        }
+        let out = common::read_blocks(&self.domain.0, self.flow, 1, first.k..last.k + 1);
+        for (i, &got) in out.iter().enumerate() {
+            let n = first.k * B + i as u64;
+            let want = if processed.contains(&(n / B)) {
+                0.5 * common::pilot(0, n)
+            } else {
+                0.0
+            };
+            assert!(exact(got, want), "index {n}: got {got:e}, want {want:e}");
+        }
+        self.checked += vs.len() as u64;
+    }
 }
 
 /// The input's domain directory is removed: the poll instance cannot be
