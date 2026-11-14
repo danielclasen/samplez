@@ -12,5 +12,5 @@ pub mod rt;
 mod rt_loop;
 
 pub use config::Config;
-pub use engine::{Engine, InputState, InputStatus, OutputStatus, Status};
+pub use engine::{Engine, GainError, InputState, InputStatus, OutputStatus, Status};
 pub use rt_loop::{BlockVerdict, Counters, Verdict};

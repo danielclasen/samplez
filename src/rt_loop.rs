@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::Release};
 
 use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
 use rtrb::{Consumer, Producer};
@@ -45,11 +45,16 @@ pub struct Counters {
     pub output_held_blocks: AtomicU64,
     /// Output open or commit calls libmxl refused.
     pub output_failed_writes: AtomicU64,
-    /// Gain changes whose `at_index` lay in samples already produced;
-    /// not applied.
+    /// Gain changes whose `at_index` lay in samples already produced
+    /// when they reached the RT thread; not applied, and each one marks
+    /// the engine diverged.
     pub command_late: AtomicU64,
-    /// Gain changes the command ring had no room for; not applied.
-    pub command_rejected: AtomicU64,
+    /// The index of the next sample the matrix produces, published after
+    /// each block.
+    pub produced: AtomicU64,
+    /// Gain changes the RT thread took off its pending list: applied,
+    /// refused by the matrix or late.
+    pub gains_consumed: AtomicU64,
     /// Telemetry records not sent because the ring was full.
     pub telemetry_dropped: AtomicU64,
     /// Largest wake lateness after `mxlSleepUntil(T_k)`, ns.
@@ -137,6 +142,13 @@ pub(crate) enum Telemetry {
     ClockStep {
         delta_ns: i64,
     },
+    /// A gain change reached the RT thread after the matrix produced its
+    /// index; not applied.
+    LateGain {
+        change: GainChange,
+        /// The index of the next sample the matrix produced.
+        pos: u64,
+    },
 }
 
 /// An input generation of one domain and, per slot, the number of
@@ -155,12 +167,11 @@ pub(crate) enum Command {
         output: usize,
         writer: Box<FlowWriter>,
     },
-    /// Ramps one matrix coefficient to `gain`, starting at sample index
-    /// `at_index`, a multiple of B.
-    Gain(GainChange),
 }
 
-/// A matrix coefficient change at an explicit sample index.
+/// Ramps one matrix coefficient to `gain`, starting at sample index
+/// `at_index`, a multiple of B. Gain changes have a ring of their own, so
+/// a full pending list never holds back a generation or a writer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GainChange {
     pub input: usize,
@@ -169,7 +180,8 @@ pub(crate) struct GainChange {
     pub at_index: u64,
 }
 
-/// Gain changes the RT thread holds before their index.
+/// Gain changes the RT thread holds before their index, and the capacity
+/// of the gain ring.
 pub(crate) const PENDING_CHANGES: usize = 64;
 
 pub(crate) enum Returned {
@@ -350,6 +362,7 @@ pub(crate) struct Rt {
     /// One input's or one output's channels, planar.
     pub scratch: Vec<f32>,
     pub cmd: Consumer<Command>,
+    pub gains: Consumer<GainChange>,
     pub ret: Producer<Returned>,
     pub tel: Producer<Telemetry>,
     pub counters: Arc<Counters>,
@@ -437,6 +450,11 @@ impl Rt {
             prev = Some((now, mono, width));
             let newest = time::newest_due_block(&self.api, now, self.block, self.margin);
             self.drain_commands(newest.unwrap_or(0));
+            while self.mix.pending.len() < PENDING_CHANGES
+                && let Ok(change) = self.gains.pop()
+            {
+                let _ = self.mix.push(change);
+            }
             // After a backward clock step writers hold until the clock
             // passes their last commit, and inputs never read below their
             // last range.
@@ -493,12 +511,8 @@ impl Rt {
 
     fn drain_commands(&mut self, newest: u64) {
         loop {
-            let Ok(cmd) = self.cmd.peek() else { return };
-            let room = match cmd {
-                Command::Gain(_) => self.mix.pending.len() < PENDING_CHANGES,
-                _ => self.ret.slots() > 0,
-            };
-            if !room {
+            // Each command may return one object.
+            if self.ret.slots() == 0 {
                 return;
             }
             let Ok(cmd) = self.cmd.pop() else { return };
@@ -530,10 +544,6 @@ impl Rt {
                     if let Some(old) = out.writer.replace(writer) {
                         self.give_back(Returned::Writer(old));
                     }
-                }
-                Command::Gain(change) => {
-                    // Room was checked before the pop.
-                    let _ = self.mix.push(change);
                 }
             }
         }
@@ -627,8 +637,17 @@ impl Rt {
             }
         }
 
-        let counters = &self.counters;
-        self.mix.to(k, |_, _| add(&counters.command_late, 1));
+        let (counters, tel) = (&self.counters, &mut self.tel);
+        self.mix.to(k, |change, pos| {
+            add(&counters.command_late, 1);
+            if tel.push(Telemetry::LateGain { change, pos }).is_err() {
+                add(&counters.telemetry_dropped, 1);
+            }
+        });
+        self.counters.produced.store((k + 1) * self.block, Release);
+        self.counters
+            .gains_consumed
+            .store(self.mix.consumed, Release);
         let ramping = self.mix.ramping(k);
         self.mix.matrix.process(&self.inbuf, &mut self.outbuf, b);
 

@@ -8,8 +8,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering::Acquire, Ordering::Relaxed};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -25,8 +25,8 @@ use samplez_mxl::{Instance, MxlApi, time};
 use crate::config::Config;
 use crate::rt::{self, ProcessStatus, RtStatus, ThreadStatus};
 use crate::rt_loop::{
-    BlockVerdict, Command, Counters, EMPTY_STATS, GainChange, Gen, Mix, Out, Returned, Rt, Slot,
-    SlotStats, Telemetry,
+    BlockVerdict, Command, Counters, EMPTY_STATS, GainChange, Gen, Mix, Out, PENDING_CHANGES,
+    Returned, Rt, Slot, SlotStats, Telemetry,
 };
 
 const COMMAND_RING: usize = 64;
@@ -83,6 +83,10 @@ pub struct OutputStatus {
 #[derive(Clone, Debug)]
 pub struct Status {
     pub rt: RtStatus,
+    /// Why the output no longer follows from the inputs and the changes
+    /// sent: the first gain change that reached the RT thread after its
+    /// index.
+    pub diverged: Option<String>,
     pub inputs: Vec<InputStatus>,
     pub outputs: Vec<OutputStatus>,
 }
@@ -104,8 +108,37 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-enum Request {
-    Gain(GainChange),
+/// Why [`Engine::set_gain`] refused a change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GainError {
+    /// No such coefficient, a gain that is not finite within
+    /// `MAX_GAIN`, or an index that is not a multiple of the block size.
+    Invalid(String),
+    /// `at_index` is below `earliest`, the first index the engine accepts.
+    TooNear { at_index: u64, earliest: u64 },
+    /// [`PENDING_CHANGES`] changes are outstanding.
+    Full,
+}
+
+impl std::fmt::Display for GainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GainError::Invalid(m) => write!(f, "{m}"),
+            GainError::TooNear { at_index, earliest } => write!(
+                f,
+                "at_index {at_index} is below the earliest accepted index {earliest}"
+            ),
+            GainError::Full => write!(f, "{PENDING_CHANGES} gain changes are outstanding"),
+        }
+    }
+}
+
+impl std::error::Error for GainError {}
+
+/// The producer side of the gain ring and the changes pushed into it.
+struct GainTx {
+    ring: rtrb::Producer<GainChange>,
+    submitted: u64,
 }
 
 /// A running engine. Dropping it stops the engine and releases its
@@ -115,8 +148,13 @@ pub struct Engine {
     supervisor: Option<JoinHandle<()>>,
     counters: Arc<Counters>,
     status: Arc<Mutex<Status>>,
-    requests: Sender<Request>,
+    gains: Mutex<GainTx>,
+    api: Arc<MxlApi>,
     block: u64,
+    margin: u64,
+    /// Samples between the newest index the RT thread may have produced
+    /// and the earliest `at_index` accepted.
+    lead: u64,
     shape: (usize, usize),
 }
 
@@ -136,6 +174,7 @@ impl Engine {
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(COMMAND_RING);
         let (ret_tx, ret_rx) = rtrb::RingBuffer::new(RETURN_RING);
         let (tel_tx, tel_rx) = rtrb::RingBuffer::new(TELEMETRY_RING);
+        let (gain_tx, gain_rx) = rtrb::RingBuffer::new(PENDING_CHANGES);
 
         let mut in_domains: Vec<usize> = Vec::new();
         let mut slots = Vec::new();
@@ -199,6 +238,7 @@ impl Engine {
             outbuf: PlanarBuffer::new(m, b as usize),
             scratch: vec![0.0; widest * b as usize],
             cmd: cmd_rx,
+            gains: gain_rx,
             ret: ret_tx,
             tel: tel_tx,
             counters: Arc::clone(&counters),
@@ -222,6 +262,7 @@ impl Engine {
 
         let status = Arc::new(Mutex::new(Status {
             rt: RtStatus { process, thread },
+            diverged: None,
             inputs: config
                 .inputs
                 .iter()
@@ -249,10 +290,11 @@ impl Engine {
                 })
                 .collect(),
         }));
-        let (req_tx, req_rx) = mpsc::channel();
         let now = Instant::now();
+        let margin = u64::from(config.reader_margin_samples);
+        let lead = (u64::from(config.max_catchup_blocks) + 2) * b;
         let sup = Supervisor {
-            api,
+            api: Arc::clone(&api),
             timing: Timing {
                 block: b,
                 margin: u64::from(config.reader_margin_samples),
@@ -279,7 +321,6 @@ impl Engine {
             cmd: cmd_tx,
             ret: ret_rx,
             tel: tel_rx,
-            requests: req_rx,
             verdicts,
             status: Arc::clone(&status),
             counters: Arc::clone(&counters),
@@ -298,8 +339,14 @@ impl Engine {
             supervisor: Some(supervisor),
             counters,
             status,
-            requests: req_tx,
+            gains: Mutex::new(GainTx {
+                ring: gain_tx,
+                submitted: 0,
+            }),
+            api,
             block: b,
+            margin,
+            lead,
             shape: (n, m),
         })
     }
@@ -315,37 +362,62 @@ impl Engine {
     /// Ramps the gain from input channel `input` to output channel
     /// `output` to `gain` over the configured ramp length, starting at
     /// sample index `at_index`, a multiple of the block size. Changes at
-    /// one index apply in the order sent. A change whose index the engine
-    /// has already produced is counted in `command_late` and not applied;
-    /// one the command ring has no room for is counted in
-    /// `command_rejected`.
+    /// one index apply in the order sent.
+    ///
+    /// A change is refused, never dropped later, when `at_index` is below
+    /// `max(produced, mxlTimestampToIndex(now) - margin) + (maxCatchupBlocks
+    /// + 2)B`, `produced` being the index of the next sample the matrix
+    /// produces: the RT thread takes changes once per wake and may then
+    /// process a backlog of up to `maxCatchupBlocks` blocks and the next
+    /// one. It is refused with [`GainError::Full`] while
+    /// [`PENDING_CHANGES`] changes are outstanding, sent but not yet
+    /// applied. A change that still reaches the RT thread after its index,
+    /// after an overrun or a clock step, is counted in `command_late`,
+    /// not applied, and marks the engine diverged in [`Status`].
     pub fn set_gain(
         &self,
         input: usize,
         output: usize,
         gain: f32,
         at_index: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), GainError> {
         if input >= self.shape.0 || output >= self.shape.1 {
-            return Err(format!("no matrix coefficient {input} -> {output}"));
+            return Err(GainError::Invalid(format!(
+                "no matrix coefficient {input} -> {output}"
+            )));
         }
-        if gain.abs() > samplez_dsp::MAX_GAIN {
-            return Err(format!("gain {gain} is not finite within MAX_GAIN"));
+        if !samplez_dsp::valid_gain(gain) {
+            return Err(GainError::Invalid(format!(
+                "gain {gain} is not finite within MAX_GAIN"
+            )));
         }
         if !at_index.is_multiple_of(self.block) {
-            return Err(format!(
+            return Err(GainError::Invalid(format!(
                 "at_index {at_index} is not a multiple of the block size {}",
                 self.block
-            ));
+            )));
         }
-        self.requests
-            .send(Request::Gain(GainChange {
-                input,
-                output,
-                gain,
-                at_index,
-            }))
-            .map_err(|_| "the engine stopped".to_owned())
+        let mut tx = self.gains.lock().expect("gain lock");
+        let consumed = self.counters.gains_consumed.load(Acquire);
+        if tx.submitted - consumed >= PENDING_CHANGES as u64 {
+            return Err(GainError::Full);
+        }
+        let produced = self.counters.produced.load(Acquire);
+        let clock = time::timestamp_to_index(&self.api, time::now(&self.api));
+        let earliest = produced.max(clock.saturating_sub(self.margin)) + self.lead;
+        if at_index < earliest {
+            return Err(GainError::TooNear { at_index, earliest });
+        }
+        let change = GainChange {
+            input,
+            output,
+            gain,
+            at_index,
+        };
+        // The ring holds PENDING_CHANGES, at least the outstanding count.
+        tx.ring.push(change).map_err(|_| GainError::Full)?;
+        tx.submitted += 1;
+        Ok(())
     }
 
     /// Stops the RT thread and the supervisor and releases every libmxl
@@ -408,7 +480,6 @@ struct Supervisor {
     cmd: rtrb::Producer<Command>,
     ret: rtrb::Consumer<Returned>,
     tel: rtrb::Consumer<Telemetry>,
-    requests: Receiver<Request>,
     verdicts: Option<Sender<BlockVerdict>>,
     status: Arc<Mutex<Status>>,
     counters: Arc<Counters>,
@@ -427,14 +498,6 @@ impl Supervisor {
         while !self.stop.load(Relaxed) {
             while let Ok(r) = self.ret.pop() {
                 release(r);
-            }
-            while let Ok(Request::Gain(change)) = self.requests.try_recv() {
-                if self.cmd.push(Command::Gain(change)).is_err() {
-                    self.counters.command_rejected.fetch_add(1, Relaxed);
-                    log(format_args!(
-                        "gain change {change:?} rejected: command ring full"
-                    ));
-                }
             }
             self.telemetry();
             if last_poll.elapsed() >= POLL_PERIOD {
@@ -486,6 +549,15 @@ impl Supervisor {
                     log(format_args!(
                         "clock step of {delta_ns} ns against CLOCK_MONOTONIC"
                     ));
+                }
+                Telemetry::LateGain { change, pos } => {
+                    let reason = format!(
+                        "gain change {} -> {} to {} at index {} arrived after index {} \
+                         was produced; not applied",
+                        change.input, change.output, change.gain, change.at_index, pos
+                    );
+                    log(format_args!("diverged: {reason}"));
+                    self.status().diverged.get_or_insert(reason);
                 }
             }
         }

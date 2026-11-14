@@ -14,11 +14,13 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use common::{B, Checker, Domain, MARGIN, Pilot, config, diagonal, new_id, start, wait_for};
-use samplez::InputState;
+use samplez::{GainError, InputState};
 use samplez_mxl::Instance;
 use samplez_mxl::output::{self, Creation, OutputConfig};
 
 const SECOND: Duration = Duration::from_secs(1);
+/// Gain changes an engine holds outstanding.
+const PENDING: u64 = 64;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -122,13 +124,38 @@ fn gain_change() {
     );
     assert_eq!(checker.gain(), 0.2, "the ramp ended");
 
-    // A change at an index already produced is counted, never applied
-    // later; the checker fails on any ramp it does not expect.
+    assert!(matches!(
+        engine.set_gain(0, 0, f32::NAN, at + 100 * B),
+        Err(GainError::Invalid(_))
+    ));
+    // A change at an index already produced is refused at submit; the
+    // checker fails on any ramp it does not expect.
     let late = checker.last_k().unwrap() * B;
-    engine.set_gain(0, 0, 0.9, late).unwrap();
+    assert!(matches!(
+        engine.set_gain(0, 0, 0.9, late),
+        Err(GainError::TooNear { .. })
+    ));
+
+    // 64 outstanding changes fit, the 65th is refused. They hold the gain,
+    // so no block ramps.
+    let first = (checker.last_k().unwrap() + 200) * B;
+    for i in 0..PENDING {
+        engine.set_gain(0, 0, 0.2, first + i * B).unwrap();
+    }
+    assert_eq!(
+        engine.set_gain(0, 0, 0.2, first + PENDING * B),
+        Err(GainError::Full)
+    );
     checker.run(&[&rx], SECOND, |_, _| {});
-    assert_eq!(engine.counters().command_late.load(Relaxed), 1);
+    let c = engine.counters();
+    assert_eq!(c.gains_consumed.load(Relaxed), 1 + PENDING);
+    let next = (checker.last_k().unwrap() + 100) * B;
+    engine.set_gain(0, 0, 0.2, next).unwrap();
+    checker.run(&[&rx], SECOND, |_, _| {});
+    assert_eq!(c.gains_consumed.load(Relaxed), 2 + PENDING);
+    assert_eq!(c.command_late.load(Relaxed), 0);
     assert_eq!(checker.gain(), 0.2);
+    assert_eq!(engine.status().diverged, None);
     engine.stop();
 }
 
@@ -287,6 +314,14 @@ fn killed_producer() {
     checker.run(&[&rx], 2 * SECOND, |_, _| {});
     assert_eq!(engine.status().inputs[0].state, InputState::Attached);
     let before = checker.counts;
+
+    // Gain changes an hour ahead fill the pending list; generation swaps
+    // still go through.
+    let hour = (checker.last_k().unwrap() + 3_600_000) * B;
+    for i in 0..PENDING {
+        engine.set_gain(0, 0, 0.5, hour + i * B).unwrap();
+    }
+    assert_eq!(engine.set_gain(0, 0, 0.5, hour), Err(GainError::Full));
 
     producer.kill();
     let mut pruned = false;
