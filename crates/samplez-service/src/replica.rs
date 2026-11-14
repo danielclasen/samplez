@@ -117,7 +117,23 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// committed, before any returned future is polled: a command submitted
     /// after another is committed after it, also when the replica forwards
     /// them to the leader. One client's commands, submitted in the order it
-    /// sent them, so commit in that order.
+    /// sent them, so commit in that order. That holds among the commands
+    /// that commit: after one resolved with [`NotApplied`], a later one may
+    /// still commit, and a resend of the first then commits after it.
+    ///
+    /// So the command is queued before `submit` returns, not in the
+    /// returned future: an ordering call that is an `async fn`, such as
+    /// openraft's `Raft::client_write`, does nothing until it is polled.
+    /// One task that takes the queue in order and is its only writer keeps
+    /// the order, on the leader, and on a follower as one ordered stream to
+    /// the leader that resends what it did not get acknowledged in the
+    /// same order.
+    ///
+    /// A command folded into a later one before it is ordered, such as a
+    /// continuous control coalesced to its latest value, still has its id
+    /// recorded in its session's table, with the revision of the entry
+    /// that carries the later one; otherwise a resend of it is applied
+    /// after the commands that superseded it.
     ///
     /// Must resolve in bounded time, with [`NotApplied`] when the command
     /// cannot be ordered: a WebSocket connection with
@@ -178,7 +194,11 @@ pub struct Commands {
 }
 
 impl Commands {
-    /// `limit` caps the commands in flight at once.
+    /// `limit` caps the commands from this replica whose replies wait on
+    /// [`Pending::submit`] at once. A future dropped before it resolved
+    /// frees its place, but its command was ordered already and still
+    /// commits, so the limit bounds the replies waiting, not the commands
+    /// in the log; those the replication mechanism bounds.
     pub fn new(state: Arc<dyn ReplicatedState>, limit: usize) -> Commands {
         Commands {
             state,

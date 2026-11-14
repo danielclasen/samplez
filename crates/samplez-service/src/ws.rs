@@ -426,6 +426,44 @@ async fn send<T: Sink<Message> + Unpin>(
 /// time does not count against the client's [`PONG_TIMEOUT`]; when none is
 /// ready within [`MAX_PAUSE`], the connection ends. A catch-up
 /// runs beside the heartbeat as well, with `queue` waiting for it.
+///
+/// A command is begun and submitted in the call, outside the `async`
+/// block, so commands commit in the order the client sent them; submitted
+/// inside it, they are ordered as the futures happen to be polled:
+///
+/// ```
+/// # use axum::body::Bytes;
+/// # use axum::extract::ws::{Message, WebSocket};
+/// # use samplez_service::replica::{Begin, Commands};
+/// # use samplez_service::ws::{ClientQueue, Ended, serve_client};
+/// # use samplez_service::{Connect, ReplicatedState};
+/// # async fn serve(
+/// #     socket: WebSocket,
+/// #     connect: &Connect,
+/// #     queue: &ClientQueue,
+/// #     state: &dyn ReplicatedState,
+/// #     commands: &Commands,
+/// # ) -> Ended {
+/// serve_client(socket, connect, queue, state, |message| {
+///     // Here, in the order received: the message is the command's id.
+///     let submitted = match message {
+///         Message::Text(id) if connect.require_operator().is_ok() => {
+///             match commands.begin(&connect.owner, id.as_str()) {
+///                 Begin::New(pending) => Some(pending.submit(Bytes::from(id.to_string()))),
+///                 Begin::Duplicate(_) | Begin::Busy => None,
+///             }
+///         }
+///         _ => None,
+///     };
+///     // Only the wait for the reply is in the future.
+///     async move {
+///         let ack = submitted?.await.ok()?;
+///         Some(Message::Text(format!("{} {}", ack.command, ack.revision).into()))
+///     }
+/// })
+/// .await
+/// # }
+/// ```
 pub async fn serve_client<S, E, F, Fut>(
     socket: S,
     connect: &Connect,
