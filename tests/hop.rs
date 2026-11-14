@@ -1,9 +1,9 @@
 //! The engine end to end on real libmxl flows: one hop, a gain change,
 //! two replicas, a chain of three, a killed and restarted producer, a late
-//! producer and a foreign writer on the output. Runs without the test
-//! harness, one scenario at a time so their timing does not interfere, and
-//! re-executes itself as a producer process that can be SIGKILLed
-//! (`hop child <domain> <id>`).
+//! producer, a foreign writer on the output and the `samplez-hop` binary.
+//! Runs without the test harness, one scenario at a time so their timing
+//! does not interfere, and re-executes itself as a producer process that
+//! can be SIGKILLed (`hop child <domain> <id>`).
 
 mod common;
 
@@ -50,6 +50,7 @@ fn main() {
             late_producer,
         ),
         ("output_held_by_a_foreign_writer_is_retried", foreign_writer),
+        ("samplez_hop_runs_from_a_config_file", binary),
     ] {
         if filter.is_some_and(|f| !name.contains(f.as_str())) {
             continue;
@@ -393,4 +394,35 @@ fn foreign_writer() {
     checker.run(&[&rx], 2 * SECOND, |_, _| {});
     assert!(checker.counts.clean > 1_000, "{:?}", checker.counts);
     engine.stop();
+}
+
+fn binary() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let file = domain.0.join("hop.json");
+    let v = serde_json::json!({
+        "libmxl": common::libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "in", "domain": "d", "flowId": src, "channels": 1 }],
+        "outputs": [{ "name": "out", "domain": "d", "flowId": dst, "label": "hop out",
+                      "group": "hop", "role": "Audio", "channels": 1 }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    std::fs::write(&file, v.to_string()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_samplez-hop"))
+        .arg("--config")
+        .arg(&file)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(5 * SECOND, "the output flow", || domain.has_flow(&dst));
+    // SAFETY: kill with a live child pid and a valid signal.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(child.wait().unwrap().success());
+    assert!(
+        !domain.has_flow(&dst),
+        "the released writer deletes its flow"
+    );
 }
