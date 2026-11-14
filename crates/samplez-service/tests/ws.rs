@@ -14,7 +14,7 @@ use samplez_service::replica::{Ack, Begin, Commands};
 use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
     ClientQueue, Delta, Ended, Frame, Hub, MAX_PAUSE, MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES,
-    PONG_TIMEOUT, Popped, Pushed, Sessions, serve_client,
+    PING_PERIOD, PONG_TIMEOUT, Popped, Pushed, Sessions, serve_client,
 };
 use samplez_service::{Connect, Forbidden, Identity, Ops, Owner, Position, ReplicatedState, Role};
 use tokio::sync::mpsc;
@@ -749,6 +749,48 @@ async fn a_client_answering_every_other_ping_stays_connected() {
     }
     assert!(!client.task.is_finished());
     assert_eq!(sessions.live().len(), 1);
+}
+
+/// Answers every ping `delay` after it was sent, for 4 s or until the
+/// connection is closed: how it ended and when, if it did, and whether it
+/// was live throughout.
+async fn pongs_delayed_by(delay: Duration) -> (Option<(Ended, Duration)>, bool) {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let start = Instant::now();
+    let mut always_live = true;
+    while start.elapsed() < 4 * PONG_TIMEOUT {
+        match tokio::time::timeout(Duration::from_millis(50), client.rx.recv()).await {
+            Ok(Some(Message::Ping(p))) => {
+                let tx = client.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = tx.send(Ok(Message::Pong(p)));
+                });
+            }
+            Ok(Some(Message::Close(_)) | None) => {
+                let closed = start.elapsed();
+                return (Some((client.ended().await, closed)), always_live);
+            }
+            _ => {}
+        }
+        always_live &= !sessions.live().is_empty();
+    }
+    (None, always_live)
+}
+
+/// Pings go every PING_PERIOD, so by each one the ping sent
+/// PONG_TIMEOUT - PING_PERIOD before has to be answered: a steady round
+/// trip just below that keeps the connection live, one just above ends it.
+#[tokio::test(start_paused = true)]
+async fn the_round_trip_has_to_stay_below_the_pong_timeout_less_a_ping_period() {
+    let ceiling = PONG_TIMEOUT - PING_PERIOD;
+    let margin = Duration::from_millis(50);
+    assert_eq!(pongs_delayed_by(ceiling - margin).await, (None, true));
+    let (ended, _) = pongs_delayed_by(ceiling + margin).await;
+    assert_eq!(ended, Some((Ended::PongTimeout, PONG_TIMEOUT)));
 }
 
 /// Yields what the client sends and takes messages at once, except

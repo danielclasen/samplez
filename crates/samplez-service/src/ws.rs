@@ -36,6 +36,12 @@ pub const PING_PERIOD: Duration = Duration::from_millis(250);
 /// read at [`MAX_PENDING_REPLIES`]. It is counted from when the ping was
 /// sent, so the round trip counts against it and a pong that waited unread
 /// behind other messages is not taken as fresh.
+///
+/// With a ping every [`PING_PERIOD`], the pong to the ping sent
+/// `PONG_TIMEOUT - PING_PERIOD`, 750 ms, before each ping has to have been
+/// read by then: a connection whose round trip, send queues on both ends
+/// included, stays at 750 ms or more ends. A longer timeout would keep such
+/// connections, and keep a peer that is gone live for longer.
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(1);
 /// The replies [`serve_client`] waits for on one connection before it stops
 /// reading it. Its pongs then go unread as well, so the time until a reply
@@ -367,6 +373,7 @@ impl Sessions {
     /// [`MAX_PENDING_REPLIES`], and, while it is not read, until
     /// [`serve_client`] ends it after [`MAX_PAUSE`] or [`MAX_PAUSE_TOTAL`]:
     /// its pongs wait unread, and a client answering them keeps its lease.
+    /// A round trip of `PONG_TIMEOUT - PING_PERIOD` or more is not live.
     pub fn live(&self) -> Vec<Owner> {
         let now = Instant::now();
         let mut live: Vec<Owner> = self
@@ -390,7 +397,8 @@ pub enum Ended {
     Closed,
     /// No ping sent within [`PONG_TIMEOUT`] answered, not counting the time
     /// the connection was not read at [`MAX_PENDING_REPLIES`]; a close frame
-    /// was sent.
+    /// was sent. A round trip of `PONG_TIMEOUT - PING_PERIOD` or more ends a
+    /// connection this way.
     PongTimeout,
     /// Sending or receiving failed, a send did not finish within
     /// [`PONG_TIMEOUT`] of sending the last ping answered, counted the same
