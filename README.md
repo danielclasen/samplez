@@ -50,6 +50,23 @@ SCHED_FIFO for the RT thread, FTZ/DAZ and blocked signals on it.
 equal whole CPUs matching the allowed set and the cgroup CPU quota is
 unlimited or the same size.
 
+The binary is `src/bin/samplez-hop.rs`, built with the library.
+
+## Real-time requirements
+
+The RT thread does not allocate once its loop runs (`tests/no_alloc.rs`
+checks it), with one failure path excepted: while an input is late,
+libmxl's flow validity check, one `stat()` and path allocations, can
+run on the RT thread. It ends when the input is pruned, after
+`pruneAfterBlocks` blocks of a frozen head, or twice the producer's
+`maxCommitBatchSizeHint` plus `readerMarginSamples` when that is longer.
+
+The host needs swap off and `vm.compact_unevictable_allowed=0`, so that
+neither swapping nor compaction moves the locked pages of the RT
+thread. MXL domains belong on tmpfs: on a disk-backed file system a
+commit into an output's shared mapping can wait for the page's
+writeback, and the loop then skips blocks.
+
 ## Licence
 
 Apache-2.0. The builder image carries the licence files of MXL and of the
