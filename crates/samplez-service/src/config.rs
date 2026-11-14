@@ -92,8 +92,10 @@ pub enum TlsMode {
     /// [`crate::server::SECRET_RELOAD_PERIOD`] and swapped in when their
     /// content changes.
     Files,
-    /// A certificate for `sans` generated at start and lost at exit. Its
-    /// SHA-256 fingerprint is logged and in [`crate::ServiceStatus`].
+    /// A certificate for `sans` generated at start and lost at exit, valid
+    /// for [`crate::tls::SELF_SIGNED_VALIDITY`] (a year) from an hour before
+    /// the start. Its SHA-256 fingerprint is logged and in
+    /// [`crate::ServiceStatus`].
     SelfSigned,
 }
 

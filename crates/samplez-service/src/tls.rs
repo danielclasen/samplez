@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustls::RootCertStore;
 use rustls::ServerConfig;
@@ -45,6 +45,12 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The handshakes one listener runs at once.
 pub const MAX_HANDSHAKES: usize = 256;
+
+/// How long a `selfSigned` certificate is valid, starting an hour before
+/// it is generated so a client whose clock is behind accepts it. macOS and
+/// iOS refuse TLS server certificates valid for more than 825 days. A
+/// restart generates a new certificate.
+pub const SELF_SIGNED_VALIDITY: Duration = Duration::from_secs(365 * 24 * 3600);
 
 /// Handshaken connections waiting for the server to take them.
 const ACCEPTED_QUEUE: usize = 64;
@@ -371,11 +377,18 @@ fn certified_key(
 }
 
 fn self_signed(sans: &[String], provider: &CryptoProvider) -> Result<CertifiedKey, Error> {
-    let generated = rcgen::generate_simple_self_signed(sans.to_vec())
-        .map_err(|e| Error::Config(format!("generating a certificate: {e}")))?;
-    let key = PrivateKeyDer::Pkcs8(generated.signing_key.serialize_der().into());
-    CertifiedKey::from_der(vec![generated.cert.der().clone()], key, provider)
-        .map_err(|e| Error::Config(format!("generating a certificate: {e}")))
+    let failed =
+        |e: &dyn std::fmt::Display| Error::Config(format!("generating a certificate: {e}"));
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| failed(&e))?;
+    let mut params = rcgen::CertificateParams::new(sans.to_vec()).map_err(|e| failed(&e))?;
+    params.not_before = rcgen::date_time_ymd(1970, 1, 1) + since_epoch - Duration::from_secs(3600);
+    params.not_after = params.not_before + SELF_SIGNED_VALIDITY;
+    let signing_key = rcgen::KeyPair::generate().map_err(|e| failed(&e))?;
+    let cert = params.self_signed(&signing_key).map_err(|e| failed(&e))?;
+    let key = PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+    CertifiedKey::from_der(vec![cert.der().clone()], key, provider).map_err(|e| failed(&e))
 }
 
 async fn accept_loop(
@@ -648,6 +661,40 @@ mod tests {
             .unwrap();
         let key = PrivateKeyDer::Pkcs8(client_key.serialize_der().into());
         (ca.pem(), client_cert.der().clone(), key)
+    }
+
+    #[test]
+    fn a_self_signed_certificate_is_valid_from_an_hour_before_the_start_for_a_year() {
+        use rustls::client::WebPkiServerVerifier;
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::UnixTime;
+
+        let config = Tls {
+            mode: TlsMode::SelfSigned,
+            sans: vec!["localhost".into()],
+            ..Tls::default()
+        };
+        let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let tls = listener_tls(&config, &Metrics::default());
+        let der = tls.resolver.get().cert[0].clone();
+        let mut roots = RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let valid_at = |t: Duration| {
+            let now = UnixTime::since_unix_epoch(t);
+            verifier
+                .verify_server_cert(&der, &[], &name, &[], now)
+                .is_ok()
+        };
+        let (minute, hour) = (Duration::from_secs(60), Duration::from_secs(3600));
+        assert!(valid_at(start - hour + minute), "a clock an hour behind");
+        assert!(!valid_at(start - hour - minute));
+        assert!(valid_at(start + SELF_SIGNED_VALIDITY - hour - minute));
+        assert!(!valid_at(start + SELF_SIGNED_VALIDITY), "expired");
     }
 
     #[tokio::test]
