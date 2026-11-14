@@ -12,12 +12,14 @@ mod matrix;
 mod meter;
 mod mxcsr;
 mod ramp;
+#[cfg(test)]
+mod require;
 mod simd;
 #[cfg(test)]
 mod test_util;
 
-pub use buffer::PlanarBuffer;
+pub use buffer::{MAX_FRAMES, PlanarBuffer};
 pub use matrix::{Matrix, Path};
 pub use meter::Meters;
-pub use mxcsr::{DAZ, FTZ, mxcsr, restore_mxcsr, set_ftz_daz};
-pub use ramp::{MAX_RAMP_LEN, Ramp};
+pub use mxcsr::{DAZ, FTZ, SavedMxcsr, mxcsr, restore_mxcsr, set_ftz_daz};
+pub use ramp::{MAX_GAIN, MAX_RAMP_LEN, Ramp};

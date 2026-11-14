@@ -2,6 +2,15 @@
 /// f32 and as i32 in the SIMD kernels.
 pub const MAX_RAMP_LEN: u32 = 1 << 24;
 
+/// Largest gain magnitude a ramp accepts, +120 dB. With both ends of a
+/// ramp within it, `target - c0` and every ramp value stay finite.
+pub const MAX_GAIN: f32 = 1.0e6;
+
+/// Whether `gain` is finite and within [`MAX_GAIN`].
+pub(crate) fn valid_gain(gain: f32) -> bool {
+    gain.abs() <= MAX_GAIN
+}
+
 /// A linear ramp in the gain domain.
 ///
 /// Sample `n` of a ramp of length `len` from `c0` has the value
@@ -20,7 +29,19 @@ pub struct Ramp {
 
 impl Ramp {
     /// A ramp holding `value`.
+    ///
+    /// # Panics
+    ///
+    /// If `value` is not finite or exceeds [`MAX_GAIN`] in magnitude.
     pub fn new(value: f32) -> Self {
+        assert!(
+            valid_gain(value),
+            "gain {value} is not finite within MAX_GAIN"
+        );
+        Self::hold(value)
+    }
+
+    fn hold(value: f32) -> Self {
         Self {
             c0: value,
             step: 0.0,
@@ -56,11 +77,18 @@ impl Ramp {
     /// Ramps from the current value to `target` over `len` samples, clamped
     /// to [`MAX_RAMP_LEN`]. A length of 0 jumps to `target`. A target equal
     /// to the held value of an inactive ramp leaves the ramp unchanged.
-    pub fn set_target(&mut self, target: f32, len: u32) {
+    ///
+    /// Returns false and leaves the ramp unchanged if `target` is not
+    /// finite or exceeds [`MAX_GAIN`] in magnitude.
+    #[must_use]
+    pub fn set_target(&mut self, target: f32, len: u32) -> bool {
+        if !valid_gain(target) {
+            return false;
+        }
         let len = len.min(MAX_RAMP_LEN);
         if len == 0 || (!self.is_active() && target == self.target) {
-            *self = Self::new(target);
-            return;
+            *self = Self::hold(target);
+            return true;
         }
         let c0 = self.current();
         *self = Self {
@@ -70,6 +98,7 @@ impl Ramp {
             len,
             pos: 0,
         };
+        true
     }
 
     /// Moves the ramp `frames` samples on.
@@ -80,14 +109,13 @@ impl Ramp {
 
     /// Multiplies `buf` by the ramp sample by sample and advances it.
     pub fn process(&mut self, buf: &mut [f32]) {
-        if self.is_active() {
-            for (n, s) in buf.iter_mut().enumerate() {
-                *s *= self.value_at(self.pos.saturating_add(n as u32));
-            }
-        } else {
-            for s in buf.iter_mut() {
-                *s *= self.target;
-            }
+        let remaining = (self.len - self.pos) as usize;
+        let (ramp, held) = buf.split_at_mut(remaining.min(buf.len()));
+        for (n, s) in ramp.iter_mut().enumerate() {
+            *s *= self.value_at(self.pos + n as u32);
+        }
+        for s in held {
+            *s *= self.target;
         }
         self.advance(buf.len());
     }
@@ -112,7 +140,7 @@ mod tests {
     fn samples_follow_the_direct_formula() {
         let (c0, target, len) = (0.1f32, 0.7f32, 480u32);
         let mut r = Ramp::new(c0);
-        r.set_target(target, len);
+        assert!(r.set_target(target, len));
         let out = run(&mut r, &[7, 64, 1, 300, 128, 100]);
         let step = (target - c0) / len as f32;
         for (n, &v) in out.iter().enumerate() {
@@ -146,7 +174,7 @@ mod tests {
             })
             .expect("a length whose formula misses the target");
         let mut r = Ramp::new(c0);
-        r.set_target(target, len);
+        assert!(r.set_target(target, len));
         let out = run(&mut r, &[len as usize + 3]);
         assert!(out[len as usize - 1] != target);
         for &v in &out[len as usize..] {
@@ -159,13 +187,13 @@ mod tests {
     #[test]
     fn retarget_starts_from_the_current_value() {
         let mut r = Ramp::new(1.0);
-        r.set_target(0.0, 1000);
+        assert!(r.set_target(0.0, 1000));
         let first = run(&mut r, &[250]);
         let step1 = -1.0f32 / 1000.0;
         let c1 = 1.0 + 250.0 * step1;
         assert_eq!(r.current().to_bits(), c1.to_bits());
 
-        r.set_target(0.5, 100);
+        assert!(r.set_target(0.5, 100));
         let second = run(&mut r, &[40, 80]);
         let step2 = (0.5 - c1) / 100.0;
         for (n, &v) in first.iter().enumerate() {
@@ -180,7 +208,7 @@ mod tests {
     #[test]
     fn zero_length_jumps() {
         let mut r = Ramp::new(0.25);
-        r.set_target(0.75, 0);
+        assert!(r.set_target(0.75, 0));
         assert!(!r.is_active());
         assert_eq!(run(&mut r, &[3]), vec![0.75; 3]);
     }
@@ -188,14 +216,50 @@ mod tests {
     #[test]
     fn same_target_on_a_held_ramp_does_not_start_a_ramp() {
         let mut r = Ramp::new(0.5);
-        r.set_target(0.5, 480);
+        assert!(r.set_target(0.5, 480));
         assert!(!r.is_active());
     }
 
     #[test]
     fn length_is_clamped() {
         let mut r = Ramp::new(0.0);
-        r.set_target(1.0, u32::MAX);
+        assert!(r.set_target(1.0, u32::MAX));
         assert_eq!(r.len, MAX_RAMP_LEN);
+    }
+
+    #[test]
+    fn invalid_targets_are_rejected() {
+        let mut r = Ramp::new(0.5);
+        assert!(r.set_target(0.0, 1000));
+        r.advance(10);
+        let before = r;
+        for bad in [
+            f32::NAN,
+            f32::INFINITY,
+            -f32::INFINITY,
+            f32::MAX,
+            -MAX_GAIN * 1.5,
+        ] {
+            assert!(!r.set_target(bad, 100), "{bad}");
+            assert_eq!(r, before);
+        }
+    }
+
+    #[test]
+    fn extreme_ramps_stay_finite() {
+        for len in [1, 2, 3, 1000] {
+            let mut r = Ramp::new(-MAX_GAIN);
+            assert!(r.set_target(MAX_GAIN, len));
+            let out = run(&mut r, &[len as usize + 1]);
+            assert!(out.iter().all(|v| v.is_finite()), "len {len}");
+            assert_eq!(out[0], -MAX_GAIN);
+            assert_eq!(out[len as usize], MAX_GAIN);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not finite")]
+    fn new_rejects_non_finite() {
+        Ramp::new(f32::NAN);
     }
 }

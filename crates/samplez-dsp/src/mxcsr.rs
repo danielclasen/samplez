@@ -15,26 +15,42 @@ pub fn mxcsr() -> u32 {
     value
 }
 
-/// Loads `saved` into the calling thread's MXCSR with `ldmxcsr`.
-pub fn restore_mxcsr(saved: u32) {
-    // SAFETY: ldmxcsr reads 4 bytes from a valid, aligned u32. Reserved
-    // MXCSR bits are 0 in any value read by `mxcsr`.
+/// MXCSR as it was before [`set_ftz_daz`], for [`restore_mxcsr`].
+#[derive(Debug)]
+#[must_use]
+pub struct SavedMxcsr(u32);
+
+fn load_mxcsr(value: u32) {
+    // SAFETY: ldmxcsr reads 4 bytes from a valid, aligned u32. Every value
+    // loaded is one read by `mxcsr` with at most FTZ and DAZ changed, so
+    // no reserved bit is set.
     unsafe {
-        asm!("ldmxcsr [{}]", in(reg) &saved, options(nostack, readonly, preserves_flags));
+        asm!("ldmxcsr [{}]", in(reg) &value, options(nostack, readonly, preserves_flags));
     }
+}
+
+/// Loads the MXCSR saved by [`set_ftz_daz`] back into the calling
+/// thread's MXCSR with `ldmxcsr`.
+pub fn restore_mxcsr(saved: SavedMxcsr) {
+    load_mxcsr(saved.0);
 }
 
 /// Sets or clears FTZ and DAZ on the calling thread and returns the
 /// previous MXCSR for [`restore_mxcsr`].
-pub fn set_ftz_daz(enabled: bool) -> u32 {
+///
+/// LLVM compiles and constant-folds float code assuming IEEE denormal
+/// handling, which FTZ/DAZ departs from, so results on denormals can
+/// differ between compile time and run time. FTZ/DAZ is for the RT thread
+/// only.
+pub fn set_ftz_daz(enabled: bool) -> SavedMxcsr {
     let saved = mxcsr();
     let value = if enabled {
         saved | FTZ | DAZ
     } else {
         saved & !(FTZ | DAZ)
     };
-    restore_mxcsr(value);
-    saved
+    load_mxcsr(value);
+    SavedMxcsr(saved)
 }
 
 #[cfg(test)]
@@ -45,14 +61,18 @@ mod tests {
     #[test]
     fn ftz_daz_flush_denormals_and_restore() {
         let tiny = black_box(f32::from_bits(1));
+        let before = mxcsr();
         let saved = set_ftz_daz(true);
         assert_eq!(mxcsr() & (FTZ | DAZ), FTZ | DAZ);
         let on = black_box(tiny) * black_box(1.0f32);
-        set_ftz_daz(false);
+        restore_mxcsr(set_ftz_daz(false));
+        assert_eq!(mxcsr() & (FTZ | DAZ), FTZ | DAZ);
+        let inner = set_ftz_daz(false);
         assert_eq!(mxcsr() & (FTZ | DAZ), 0);
         let off = black_box(tiny) * black_box(1.0f32);
+        restore_mxcsr(inner);
         restore_mxcsr(saved);
-        assert_eq!(mxcsr(), saved);
+        assert_eq!(mxcsr(), before);
         assert_eq!(on.to_bits(), 0);
         assert_eq!(off.to_bits(), 1);
     }

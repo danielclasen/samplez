@@ -1,7 +1,7 @@
 use crate::PlanarBuffer;
 
 /// Sample peak and sum of squares per channel, accumulated over blocks
-/// until [`Meters::reset`].
+/// until [`Meters::reset`]. A NaN sample makes both NaN until the reset.
 #[derive(Clone, Debug)]
 pub struct Meters {
     peak: Vec<f32>,
@@ -23,14 +23,18 @@ impl Meters {
         assert_eq!(buf.channels(), self.peak.len());
         for (ch, (peak, sum_sq)) in self.peak.iter_mut().zip(&mut self.sum_sq).enumerate() {
             for &s in &buf.channel(ch)[..frames] {
-                *peak = peak.max(s.abs());
+                let a = s.abs();
+                if a > *peak || a.is_nan() {
+                    *peak = a;
+                }
                 *sum_sq += f64::from(s) * f64::from(s);
             }
         }
         self.frames += frames as u64;
     }
 
-    /// Largest absolute sample value of channel `ch`.
+    /// Largest absolute sample value of channel `ch`, NaN after a NaN
+    /// sample.
     pub fn peak(&self, ch: usize) -> f32 {
         self.peak[ch]
     }
@@ -112,5 +116,21 @@ mod tests {
             (meters.peak(0), meters.sum_sq(0), meters.rms(0)),
             (0.0, 0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn nan_shows_in_peak_and_sum() {
+        let mut buf = PlanarBuffer::new(1, 4);
+        buf.channel_mut(0)
+            .copy_from_slice(&[0.5, f32::NAN, 2.0, -3.0]);
+        let mut meters = Meters::new(1);
+        meters.process(&buf, 4);
+        buf.channel_mut(0).copy_from_slice(&[4.0; 4]);
+        meters.process(&buf, 4);
+        assert!(meters.peak(0).is_nan());
+        assert!(meters.sum_sq(0).is_nan());
+        meters.reset();
+        meters.process(&buf, 4);
+        assert_eq!(meters.peak(0), 4.0);
     }
 }

@@ -47,6 +47,7 @@ jobs:
               cargo fmt --all --check
               cargo clippy --workspace --all-targets --locked -- -D warnings
               cargo test --workspace --locked
+              cargo test --workspace --locked --release
             '
       # Saved from main only, so per-PR snapshots do not evict the builder
       # image layers from the shared Actions cache.

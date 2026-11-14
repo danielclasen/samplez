@@ -6,6 +6,9 @@ use std::cell::Cell;
 
 use samplez_dsp::{Matrix, Meters, Path, PlanarBuffer, Ramp, restore_mxcsr, set_ftz_daz};
 
+#[path = "../src/require.rs"]
+mod require;
+
 struct Counting;
 
 thread_local! {
@@ -51,15 +54,25 @@ fn process_calls_do_not_allocate() {
     let mut output = PlanarBuffer::new(m, cap);
     let mut meters = Meters::new(m);
     let mut ramp = Ramp::new(1.0);
-    let paths: Vec<Path> = Path::ALL.into_iter().filter(|p| p.is_supported()).collect();
-    let mut matrices: Vec<Matrix> = paths.iter().map(|_| Matrix::new(n, m)).collect();
+    let paths: Vec<Path> = Path::ALL
+        .into_iter()
+        .filter(|&p| require::path_runs("process_calls_do_not_allocate", p))
+        .collect();
+    // Every other matrix is a clone of a sparse one, so set() on a clone
+    // has to fill columns beyond the clone's length.
+    let mut sparse = Matrix::new(n, m);
+    assert!(sparse.set(1, 0, 0.5, 0));
+    let mut runs: Vec<(Path, Matrix)> = paths
+        .iter()
+        .flat_map(|&p| [(p, Matrix::new(n, m)), (p, sparse.clone())])
+        .collect();
     let mut scratch = vec![0.0f32; cap];
 
     let before = allocations();
     let saved = set_ftz_daz(true);
     for round in 0..8usize {
         let frames = 16 + round * 131;
-        for (matrix, &path) in matrices.iter_mut().zip(&paths) {
+        for (path, matrix) in &mut runs {
             // Fill every column, ramp some, route some, then empty them, so
             // every insert and removal of a coefficient is covered.
             for j in 0..m {
@@ -70,14 +83,14 @@ fn process_calls_do_not_allocate() {
                         _ => 0.5,
                     };
                     let len = if (i + j) % 3 == 0 { 0 } else { 300 };
-                    matrix.set(i, j, if round == 7 { 0.0 } else { c }, len);
+                    assert!(matrix.set(i, j, if round == 7 { 0.0 } else { c }, len));
                 }
             }
-            matrix.set(0, 1, 1.0, 0);
-            matrix.process_on(path, &input, &mut output, frames);
+            assert!(matrix.set(0, 1, 1.0, 0));
+            matrix.process_on(*path, &input, &mut output, frames);
             meters.process(&output, frames);
         }
-        ramp.set_target(0.25 * round as f32, 100);
+        assert!(ramp.set_target(0.25 * round as f32, 100));
         ramp.process(&mut scratch[..frames]);
     }
     restore_mxcsr(saved);

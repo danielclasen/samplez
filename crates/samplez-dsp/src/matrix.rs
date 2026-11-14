@@ -1,3 +1,4 @@
+use crate::ramp::valid_gain;
 use crate::{PlanarBuffer, Ramp, simd};
 
 /// Instruction set a [`Matrix`] runs on. Every path gives bit-identical
@@ -44,12 +45,39 @@ pub(crate) struct Term {
 /// coefficient change ramps per [`Ramp`]. An output with no coefficient is
 /// filled with +0.0; an output whose only coefficient is a settled 1.0 is a
 /// copy of its input.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Skipping zero coefficients and copying routes gives the same bits as
+/// the dense sum over all coefficients only for finite inputs: a NaN or
+/// infinity on an input with coefficient 0 does not reach the output, and
+/// a route passes -0.0, NaN payloads and, under DAZ, denormals unchanged
+/// where the sum would not.
+#[derive(Debug, PartialEq)]
 pub struct Matrix {
     inputs: usize,
     /// Per output, the nonzero or ramping coefficients sorted by input.
     columns: Vec<Vec<Term>>,
     path: Path,
+}
+
+impl Clone for Matrix {
+    /// A copy whose columns reserve room for every input, as in
+    /// [`Matrix::new`], so [`Matrix::set`] on it does not allocate.
+    fn clone(&self) -> Self {
+        let columns = self
+            .columns
+            .iter()
+            .map(|col| {
+                let mut copy = Vec::with_capacity(self.inputs);
+                copy.extend_from_slice(col);
+                copy
+            })
+            .collect();
+        Self {
+            inputs: self.inputs,
+            columns,
+            path: self.path,
+        }
+    }
 }
 
 impl Matrix {
@@ -85,22 +113,31 @@ impl Matrix {
 
     /// Ramps the coefficient from `input` to `output` to `target` over
     /// `len` samples, per [`Ramp::set_target`].
-    pub fn set(&mut self, input: usize, output: usize, target: f32, len: u32) {
-        assert!(input < self.inputs, "input {input} out of range");
+    ///
+    /// Returns false and changes nothing if `input` or `output` is out of
+    /// range, or `target` is not finite or exceeds
+    /// [`MAX_GAIN`](crate::MAX_GAIN) in magnitude.
+    #[must_use]
+    pub fn set(&mut self, input: usize, output: usize, target: f32, len: u32) -> bool {
+        if input >= self.inputs || output >= self.columns.len() || !valid_gain(target) {
+            return false;
+        }
         let col = &mut self.columns[output];
         match col.binary_search_by_key(&input, |t| t.input) {
             Ok(k) => {
-                col[k].ramp.set_target(target, len);
+                let accepted = col[k].ramp.set_target(target, len);
                 if !col[k].ramp.is_active() && target == 0.0 {
                     col.remove(k);
                 }
+                accepted
             }
             Err(k) if target != 0.0 => {
                 let mut ramp = Ramp::new(0.0);
-                ramp.set_target(target, len);
+                let accepted = ramp.set_target(target, len);
                 col.insert(k, Term { input, ramp });
+                accepted
             }
-            Err(_) => {}
+            Err(_) => true,
         }
     }
 
@@ -164,7 +201,8 @@ pub(crate) fn mix_scalar(terms: &[Term], input: &PlanarBuffer, out: &mut [f32], 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{Rng, path_runs};
+    use crate::require::path_runs;
+    use crate::test_util::Rng;
     use crate::{restore_mxcsr, set_ftz_daz};
 
     const CAP: usize = 1024;
@@ -188,7 +226,7 @@ mod tests {
                 _ => rng.below(2000) as u32,
             };
             let c = rng.coefficient();
-            m.set(i, j, c, len);
+            assert!(m.set(i, j, c, len));
         }
     }
 
@@ -269,7 +307,7 @@ mod tests {
             for i in 0..n {
                 for j in 0..m {
                     coef[i * m + j] = rng.coefficient();
-                    mat.set(i, j, coef[i * m + j], 0);
+                    assert!(mat.set(i, j, coef[i * m + j], 0));
                 }
             }
             let mut input = PlanarBuffer::new(n, CAP);
@@ -306,18 +344,18 @@ mod tests {
             }
             let mut rng = Rng::new(11);
             let mut mat = Matrix::new(3, 2);
-            mat.set(0, 0, 0.5, 0);
-            mat.set(1, 0, -0.25, 0);
-            mat.set(2, 1, 1.0, 0);
+            assert!(mat.set(0, 0, 0.5, 0));
+            assert!(mat.set(1, 0, -0.25, 0));
+            assert!(mat.set(2, 1, 1.0, 0));
             let mut input = PlanarBuffer::new(3, CAP);
             let mut out = PlanarBuffer::new(2, CAP);
 
             // Block 1: output 0 ramps input 0 from 0.5 to 0.9 over 300 and
             // input 2 in from 0 to 0.3 over 77; output 1 ramps its route
             // down to 0.125 over 200.
-            mat.set(0, 0, 0.9, 300);
-            mat.set(2, 0, 0.3, 77);
-            mat.set(2, 1, 0.125, 200);
+            assert!(mat.set(0, 0, 0.9, 300));
+            assert!(mat.set(2, 0, 0.3, 77));
+            assert!(mat.set(2, 1, 0.125, 200));
             let f1 = 131;
             fill(&mut rng, &mut input, f1);
             mat.process_on(path, &input, &mut out, f1);
@@ -340,7 +378,7 @@ mod tests {
             // Block 2: retarget input 0 on output 0 mid-ramp.
             let c_retarget = ramp(0.5, 0.9, 300, f1 as u32);
             assert_eq!(mat.gain(0, 0).to_bits(), c_retarget.to_bits());
-            mat.set(0, 0, 0.0, 100);
+            assert!(mat.set(0, 0, 0.0, 100));
             let f2 = 203;
             fill(&mut rng, &mut input, f2);
             mat.process_on(path, &input, &mut out, f2);
@@ -399,14 +437,14 @@ mod tests {
             let mut mat = Matrix::new(n, m);
             let src = [3, 0, 7, 1, 6, 2, 5, 4];
             for (j, &i) in src.iter().enumerate() {
-                mat.set(i, j, 1.0, 0);
+                assert!(mat.set(i, j, 1.0, 0));
             }
-            mat.set(3, 8, 1.0, 0);
-            mat.set(0, 9, 1.0, 0);
+            assert!(mat.set(3, 8, 1.0, 0));
+            assert!(mat.set(0, 9, 1.0, 0));
             let mut out = PlanarBuffer::new(m, CAP);
             mat.process_on(path, &input, &mut out, frames);
-            mat.set(0, 9, 0.0, 64);
-            mat.set(5, 9, 1.0, 64);
+            assert!(mat.set(0, 9, 0.0, 64));
+            assert!(mat.set(5, 9, 1.0, 64));
             let mut fade = PlanarBuffer::new(m, CAP);
             mat.process_on(path, &input, &mut fade, 64);
             mat.process_on(path, &input, &mut out, frames);
@@ -461,5 +499,76 @@ mod tests {
     fn best_path_is_supported() {
         assert!(Path::best().is_supported());
         assert_eq!(Matrix::new(1, 1).path(), Path::best());
+    }
+
+    /// A settled 1.0 is a copy, but a ramp towards 1.0 is not: the ramp is
+    /// computed until it ends, and the block after it copies.
+    #[test]
+    fn ramp_to_unity_is_not_copied_until_it_ends() {
+        for path in Path::ALL {
+            if !path_runs("ramp_to_unity_is_not_copied_until_it_ends", path) {
+                continue;
+            }
+            let saved = set_ftz_daz(true);
+            let mut rng = Rng::new(23);
+            let mut mat = Matrix::new(1, 1);
+            let mut input = PlanarBuffer::new(1, CAP);
+            let mut out = PlanarBuffer::new(1, CAP);
+            assert!(mat.set(0, 0, 0.5, 0));
+            fill(&mut rng, &mut input, 64);
+            mat.process_on(path, &input, &mut out, 64);
+
+            assert!(mat.set(0, 0, 1.0, 100));
+            let frames = 150;
+            fill(&mut rng, &mut input, frames);
+            mat.process_on(path, &input, &mut out, frames);
+            let step = (1.0f32 - 0.5) / 100.0;
+            for n in 0..frames {
+                let g = if n < 100 { 0.5 + n as f32 * step } else { 1.0 };
+                let want = 0.0 + g * input.channel(0)[n];
+                assert_eq!(
+                    out.channel(0)[n].to_bits(),
+                    want.to_bits(),
+                    "{path:?} n {n}"
+                );
+            }
+
+            let frames = 97;
+            for s in &mut input.channel_mut(0)[..frames] {
+                *s = special(&mut rng);
+            }
+            mat.process_on(path, &input, &mut out, frames);
+            restore_mxcsr(saved);
+            for n in 0..frames {
+                assert_eq!(
+                    out.channel(0)[n].to_bits(),
+                    input.channel(0)[n].to_bits(),
+                    "{path:?} n {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_coefficients_are_rejected() {
+        let mut mat = Matrix::new(2, 2);
+        assert!(mat.set(0, 1, 0.5, 0));
+        let before = mat.clone();
+        for bad in [f32::NAN, f32::INFINITY, f32::MAX] {
+            assert!(!mat.set(0, 1, bad, 10), "{bad}");
+            assert!(!mat.set(1, 0, bad, 10), "{bad}");
+        }
+        assert!(!mat.set(2, 0, 0.5, 0));
+        assert!(!mat.set(0, 2, 0.5, 0));
+        assert_eq!(mat, before);
+    }
+
+    #[test]
+    fn clone_reserves_every_input() {
+        let mut mat = Matrix::new(16, 3);
+        assert!(mat.set(4, 1, 0.5, 0));
+        let copy = mat.clone();
+        assert_eq!(copy, mat);
+        assert!(copy.columns.iter().all(|c| c.capacity() >= 16));
     }
 }
