@@ -917,6 +917,24 @@ mod tests {
         der
     }
 
+    /// The walk reads certificates from files, so a damaged one must not
+    /// panic it.
+    #[test]
+    fn a_truncated_or_bit_flipped_certificate_does_not_panic_the_expiry_walk() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().to_vec();
+        assert!(not_after(&der).is_some());
+        for end in 0..der.len() {
+            let _ = not_after(&der[..end]);
+        }
+        let mut flipped = der.clone();
+        for bit in 0..der.len() * 8 {
+            flipped[bit / 8] ^= 1 << (bit % 8);
+            let _ = not_after(&flipped);
+            flipped[bit / 8] ^= 1 << (bit % 8);
+        }
+    }
+
     /// rustls loads a certificate whatever its notAfter holds, and so does
     /// the listener, with the expiry unknown.
     #[test]
