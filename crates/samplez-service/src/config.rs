@@ -195,7 +195,13 @@ fn default_groups_header() -> String {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApiConfig {
     /// Host names accepted in `Host` on requests without a valid bearer,
-    /// in addition to `localhost` and `127.0.0.1`.
+    /// in addition to `localhost` and `127.0.0.1`; other requests without
+    /// one get 403.
+    ///
+    /// Behind a proxy that passes on the browser's `Host`, such as the
+    /// sidecar in `proxy` mode or anything that terminates TLS in front of
+    /// a plain listener, that is the external name, e.g. `samplez.example`,
+    /// which has to be listed here.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     /// `Origin` values accepted on WebSocket upgrades, in addition to
