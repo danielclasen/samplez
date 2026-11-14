@@ -200,6 +200,11 @@ pub struct ApiConfig {
     /// `<scheme>://localhost:<api port>` and `<scheme>://127.0.0.1:<api
     /// port>`, the scheme being `https` when the API listener runs TLS.
     /// Compared without case, a trailing `/` or the scheme's default port.
+    ///
+    /// Behind a proxy, such as the sidecar in `proxy` mode or anything that
+    /// terminates TLS in front of a plain listener, the browser's origin is
+    /// the external one, e.g. `https://samplez.example`, which the defaults
+    /// never match: WebSocket upgrades get 403 until it is listed here.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 }

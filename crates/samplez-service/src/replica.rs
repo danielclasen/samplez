@@ -41,7 +41,11 @@ pub struct Position {
 pub struct Owner {
     /// The user the proxy names, or `anonymous`.
     pub principal: String,
-    /// The client's own session id, stable across its reconnects.
+    /// The client's own session id, stable across its reconnects. The
+    /// client chooses it, so it is not an authenticated identity: any
+    /// client can present another's, and in `none` and `token` mode every
+    /// client has the principal `anonymous`. Grant nothing on it beyond
+    /// what the principal and role already allow.
     pub session: String,
     /// `<replica id>:<n>`, unique per connection on a running replica.
     pub connection: String,

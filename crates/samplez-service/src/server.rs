@@ -46,7 +46,8 @@ pub struct Connect {
     /// The last position the client saw, from `?since=<epoch>:<revision>`.
     pub since: Option<Position>,
     /// The principal is the proxy's user or `anonymous`; the session is
-    /// `?session=`, or the connection id when absent.
+    /// `?session=`, or the connection id when absent, and is chosen by the
+    /// client, not authenticated (see [`Owner::session`]).
     pub owner: Owner,
     /// Where [`crate::ws::serve_client`] keeps the connection while it
     /// answers pings.
@@ -197,7 +198,8 @@ impl Service {
     /// Serves WebSocket upgrades at `/api/v1/ws` once auth and the `Origin`
     /// check pass. `?since=` other than `<epoch>:<revision>`, or a
     /// `?session=` that is empty or longer than [`MAX_SESSION_ID`], gets
-    /// 400.
+    /// 400. `?session=` is taken as the client sends it and identifies
+    /// nobody: a client can send another client's session id.
     pub fn ws<F, Fut>(mut self, handler: F) -> Service
     where
         F: Fn(WebSocket, Connect) -> Fut + Send + Sync + 'static,
