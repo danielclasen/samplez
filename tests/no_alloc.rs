@@ -18,8 +18,8 @@ use samplez::InputState;
 /// The RT thread's kernel tid; 0 before it is known.
 static RT_TID: AtomicI32 = AtomicI32::new(0);
 static RT_CALLS: AtomicU64 = AtomicU64::new(0);
-/// Where the RT thread's first allocator call came from, so a failure
-/// names the call site.
+/// Where the RT thread's first allocator call outside a panic came
+/// from, so a failure names the call site.
 static FIRST_RT_CALL: OnceLock<Backtrace> = OnceLock::new();
 
 thread_local! {
@@ -35,9 +35,10 @@ fn count() {
     if tid == 0 || unsafe { libc::gettid() } != tid || CAPTURING.get() {
         return;
     }
+    RT_CALLS.fetch_add(1, Relaxed);
     // A panicking thread holds the backtrace lock already: capturing here
-    // would deadlock instead of failing.
-    if RT_CALLS.fetch_add(1, Relaxed) == 0 && !std::thread::panicking() {
+    // would deadlock instead of failing. A later call is captured instead.
+    if FIRST_RT_CALL.get().is_none() && !std::thread::panicking() {
         CAPTURING.set(true);
         let _ = FIRST_RT_CALL.set(Backtrace::force_capture());
         CAPTURING.set(false);
@@ -109,7 +110,7 @@ fn rt_thread_allocates_nothing() {
     let calls = RT_CALLS.load(Relaxed);
     assert!(
         calls == 0,
-        "{calls} allocator calls on the RT thread, the first from:\n{}",
+        "{calls} allocator calls on the RT thread, the first captured from:\n{}",
         FIRST_RT_CALL
             .get()
             .map_or_else(|| "not captured".into(), ToString::to_string)

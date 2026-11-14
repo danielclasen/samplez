@@ -346,30 +346,32 @@ impl Engine {
             counters: Arc::clone(&counters),
             stop: Arc::clone(&stop),
         };
-        // The RT thread's handle stays here until the supervisor runs: if
-        // that spawn fails, the RT thread is joined and its state released
-        // on this thread, never dropped on the RT thread itself.
+        // The RT thread's handle and the receiver of its set-up channel stay
+        // here until the supervisor runs: if that spawn fails, the RT thread
+        // is joined and its state released on this thread, never dropped
+        // on the RT thread itself. The receiver is dropped only after the
+        // join, so the RT thread's sender is never the last reference:
+        // dropping that frees the channel on whichever side lets go last.
         let (handle_tx, handle_rx) = mpsc::sync_channel(1);
         let supervisor = std::thread::Builder::new()
             .name("samplez-supervisor".to_owned())
             .stack_size(rt::STACK_SIZE)
             .spawn(move || {
-                sup.run(handle_rx.recv().expect("sent once spawned"));
-                // Held until the RT thread is joined, so its sender is
-                // never the last reference: dropping that frees the
-                // channel on whichever side lets go last.
+                let (rt_thread, thread_rx) = handle_rx.recv().expect("sent once spawned");
+                sup.run(rt_thread);
                 drop(thread_rx);
             });
         let supervisor = match supervisor {
             Ok(s) => {
                 handle_tx
-                    .send(rt_thread)
+                    .send((rt_thread, thread_rx))
                     .expect("the supervisor receives it");
                 s
             }
             Err(e) => {
                 stop.store(true, Relaxed);
                 let _ = rt_thread.join();
+                drop(thread_rx);
                 return Err(Error::Thread(format!("spawning the supervisor: {e}")));
             }
         };
