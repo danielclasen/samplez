@@ -470,9 +470,12 @@ fn two_inputs() {
     let mut a = OutputA {
         domain: &domain,
         flow: &out_a,
+        engine: &engine,
         next: rx.try_iter().last().map(|v| v.k + 1),
         checked: 0,
         skipped: 0,
+        timing: timing(engine.counters()),
+        skips: Vec::new(),
     };
 
     producer.kill();
@@ -501,9 +504,16 @@ fn two_inputs() {
         "{} blocks of output A checked",
         a.checked
     );
-    // Every block not reported is an overrun skip.
+    // Every block not reported is an overrun skip. With SCHED_FIFO and
+    // locked memory a skip is an RT stall: it fails the scenario, named
+    // with the RT timing recorded around it.
     let skipped = engine.counters().overrun_skipped_samples.load(Relaxed) - skipped;
-    assert_eq!(a.skipped * B, skipped);
+    assert_eq!(a.skipped * B, skipped, "{:#?}", a.skips);
+    if std::env::var("SAMPLEZ_REQUIRE_RT").as_deref() == Ok("1") {
+        assert!(a.skips.is_empty(), "overrun skips: {:#?}", a.skips);
+    } else if !a.skips.is_empty() {
+        println!("two_inputs: overrun skips: {:#?}", a.skips);
+    }
     assert_eq!(state(0), InputState::Attached);
     common::stop(engine);
 }
@@ -511,28 +521,58 @@ fn two_inputs() {
 /// Checks the blocks of input A's output that the verdicts report since
 /// the last call: every one written, input A copied without a fade, each
 /// sample `0.5 pilot(0, n)`. Blocks between two reported ones are the
-/// loop's overrun skips, zero-filled by libmxl.
+/// loop's overrun skips, zero-filled by libmxl; each is recorded with the
+/// RT timing counters read by the last call that saw verdicts and by the
+/// call that saw the skip.
 struct OutputA<'a> {
     domain: &'a Domain,
     flow: &'a str,
+    engine: &'a samplez::Engine,
     next: Option<u64>,
     checked: u64,
     skipped: u64,
+    timing: String,
+    skips: Vec<String>,
+}
+
+/// The RT timing counters that attribute an overrun skip.
+fn timing(c: &samplez::Counters) -> String {
+    format!(
+        "deadline_miss {}, process_time_max {} ns, wake_jitter_max {} ns",
+        c.deadline_miss.load(Relaxed),
+        c.process_time_max_ns.load(Relaxed),
+        c.wake_jitter_max_ns.load(Relaxed)
+    )
 }
 
 impl OutputA<'_> {
     fn check(&mut self, rx: &std::sync::mpsc::Receiver<samplez::BlockVerdict>) {
         let vs: Vec<_> = rx.try_iter().collect();
+        // Read after the verdicts, so it covers the blocks they report.
+        let after = timing(self.engine.counters());
         let (Some(first), Some(last)) = (vs.first(), vs.last()) else {
             return;
         };
+        let before = std::mem::replace(&mut self.timing, after.clone());
         let mut processed = std::collections::HashSet::new();
         for v in &vs {
             let want = self.next.unwrap_or(v.k);
             assert!(v.k >= want, "block {} after block {want}", v.k);
+            if v.k > want {
+                self.skips.push(format!(
+                    "{} blocks before block {}: {before} -> {after}",
+                    v.k - want,
+                    v.k
+                ));
+            }
             self.skipped += v.k - want;
             self.next = Some(v.k + 1);
-            assert_eq!((v.silenced & 1, v.fading & 1), (0, 0), "{v:?}");
+            assert_eq!(
+                (v.silenced & 1, v.fading & 1),
+                (0, 0),
+                "{v:?}, {after}, input A {:?}",
+                self.engine.status().inputs[0]
+            );
             assert_eq!(v.written & 1, 1, "{v:?}");
             processed.insert(v.k);
         }
