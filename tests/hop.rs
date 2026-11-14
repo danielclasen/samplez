@@ -471,6 +471,8 @@ fn two_inputs() {
     std::thread::sleep(SECOND / 2);
     // Read before the verdicts are drained: a skip that starts after
     // this read shows as a gap after the last drained block.
+    // Left open: a skip counted just before this read whose verdict comes
+    // after the drain shows as a gap but not in the counter delta.
     let skipped = engine.counters().overrun_skipped_samples.load(Relaxed);
     let mut a = OutputA {
         domain: &domain,
