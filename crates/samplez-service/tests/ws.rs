@@ -117,6 +117,7 @@ fn connect(sessions: &Arc<Sessions>, role: Role, since: Option<(u64, u64)>, n: u
         owner: Owner {
             principal: "anonymous".into(),
             session: format!("s{n}"),
+            role,
             connection: format!("r1:{n}"),
         },
         sessions: sessions.clone(),
@@ -611,6 +612,7 @@ fn owner(session: &str) -> Owner {
     Owner {
         principal: "anonymous".into(),
         session: session.into(),
+        role: Role::Operator,
         connection: "r1:1".into(),
     }
 }
@@ -815,6 +817,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
             async move {
                 assert_eq!(connect.owner.session, SESSION);
                 assert_eq!(connect.owner.principal, "anonymous");
+                assert_eq!(connect.owner.role, Role::Operator);
                 assert!(connect.owner.connection.starts_with("r1:"));
                 let queue = hub.subscribe();
                 serve_client(socket, &connect, &queue, &*state, |_| async { None }).await;
@@ -868,6 +871,44 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     assert_eq!(next().await, "delta@3");
     apply(&state, &hub);
     assert_eq!(next().await, "delta@4");
+    server.abort();
+}
+
+/// A forwarded command names who sent it, with the role it was allowed.
+#[tokio::test]
+async fn the_owner_carries_the_principal_and_role_from_the_proxy() {
+    let state = FakeState::new("r1", "leader");
+    let mut config = config("proxy", "owner-role");
+    let loopback = serde_json::json!({ "bind": "127.0.0.1", "port": 0 });
+    config["listeners"] = serde_json::json!({
+        "api": loopback, "ops": loopback, "nmos": loopback, "machine": loopback,
+    });
+    let (owners, mut owner) = mpsc::unbounded_channel();
+    let service = service_from(config, Ops::default(), state).ws(move |_, connect| {
+        let _ = owners.send(connect.owner);
+        async {}
+    });
+    let bound = service.bind().await.unwrap();
+    let addr = bound.api_addr().unwrap();
+    let server = tokio::spawn(bound.serve());
+    for (groups, role) in [("watchers", Role::Viewer), ("ops", Role::Operator)] {
+        let url = format!("ws://{addr}/api/v1/ws?session={SESSION}");
+        let mut req = url.as_str().into_client_request().unwrap();
+        req.headers_mut()
+            .insert("host", "samplez.example".parse().unwrap());
+        req.headers_mut()
+            .insert("origin", "https://samplez.example".parse().unwrap());
+        req.headers_mut()
+            .insert("x-forwarded-user", "alice".parse().unwrap());
+        req.headers_mut()
+            .insert("x-forwarded-groups", groups.parse().unwrap());
+        let _ = tokio_tungstenite::connect_async(req).await.unwrap();
+        let got = owner.recv().await.unwrap();
+        assert_eq!(
+            (got.principal.as_str(), got.session.as_str(), got.role),
+            ("alice", SESSION, role)
+        );
+    }
     server.abort();
 }
 

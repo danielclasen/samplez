@@ -559,6 +559,7 @@ mod tests {
         let owner = Owner {
             principal: "anonymous".into(),
             session: "s1".into(),
+            role: crate::Role::Operator,
             connection: sessions.connection_id(),
         };
         sessions.answered(&owner);
@@ -579,6 +580,7 @@ mod tests {
         let owner = Owner {
             principal: "anonymous".into(),
             session: "s1".into(),
+            role: crate::Role::Operator,
             connection: sessions.connection_id(),
         };
         sessions.answered(&owner);

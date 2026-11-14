@@ -23,7 +23,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, KeyInit, Mac};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
@@ -38,7 +38,7 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const LOGIN_PATH: &str = "/api/v1/login";
 pub(crate) const WS_PATH: &str = "/api/v1/ws";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Viewer,

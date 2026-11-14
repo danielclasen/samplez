@@ -11,6 +11,7 @@ use axum::body::Bytes;
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 
+use crate::auth::Role;
 use crate::ws::{Delta, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -51,6 +52,10 @@ pub struct Owner {
     /// per principal and session, so presenting another principal's
     /// session reaches none of its commands.
     pub session: String,
+    /// The role the connection was authorized with at the upgrade, so a
+    /// command forwarded to another replica carries it with the principal
+    /// and session.
+    pub role: Role,
     /// `<replica id>:<nonce>:<n>`: the nonce is 128 random bits drawn when
     /// the replica's [`crate::Service`] is created, `n` counts its
     /// connections from 1, so the id does not recur after a restart.

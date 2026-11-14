@@ -303,6 +303,7 @@ impl Service {
                                     .clone()
                                     .unwrap_or_else(|| "anonymous".into()),
                                 session,
+                                role: identity.role,
                                 connection,
                             };
                             let connect = Connect {
