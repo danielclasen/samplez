@@ -385,6 +385,8 @@ fn self_signed(sans: &[String], provider: &CryptoProvider) -> Result<CertifiedKe
     let mut params = rcgen::CertificateParams::new(sans.to_vec()).map_err(|e| failed(&e))?;
     params.not_before = rcgen::date_time_ymd(1970, 1, 1) + since_epoch - Duration::from_secs(3600);
     params.not_after = params.not_before + SELF_SIGNED_VALIDITY;
+    // Apple platforms refuse a TLS server certificate without it.
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let signing_key = rcgen::KeyPair::generate().map_err(|e| failed(&e))?;
     let cert = params.self_signed(&signing_key).map_err(|e| failed(&e))?;
     let key = PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
@@ -695,6 +697,27 @@ mod tests {
         assert!(!valid_at(start - hour - minute));
         assert!(valid_at(start + SELF_SIGNED_VALIDITY - hour - minute));
         assert!(!valid_at(start + SELF_SIGNED_VALIDITY), "expired");
+    }
+
+    #[test]
+    fn a_self_signed_certificate_is_for_server_authentication() {
+        let config = Tls {
+            mode: TlsMode::SelfSigned,
+            sans: vec!["localhost".into()],
+            ..Tls::default()
+        };
+        let der = listener_tls(&config, &Metrics::default())
+            .resolver
+            .get()
+            .cert[0]
+            .clone();
+        // extKeyUsage (2.5.29.37) holding only id-kp-serverAuth
+        // (1.3.6.1.5.5.7.3.1), RFC 5280 4.2.1.12.
+        let extension = [
+            0x06, 0x03, 0x55, 0x1d, 0x25, 0x04, 0x0c, 0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01,
+            0x05, 0x05, 0x07, 0x03, 0x01,
+        ];
+        assert!(der.windows(extension.len()).any(|w| w == extension));
     }
 
     #[tokio::test]
