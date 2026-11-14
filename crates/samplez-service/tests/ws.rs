@@ -11,9 +11,10 @@ use axum::extract::ws::Message;
 use common::*;
 use futures_util::{FutureExt, Sink, Stream, StreamExt};
 use samplez_service::replica::{Ack, Begin, Commands};
+use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
-    ClientQueue, Delta, Ended, Frame, Hub, MAX_PENDING_REPLIES, PONG_TIMEOUT, Popped, Pushed,
-    Sessions, serve_client,
+    ClientQueue, Delta, Ended, Frame, Hub, MAX_PAUSE, MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES,
+    PONG_TIMEOUT, Popped, Pushed, Sessions, serve_client,
 };
 use samplez_service::{Connect, Forbidden, Identity, Ops, Owner, Position, ReplicatedState, Role};
 use tokio::sync::mpsc;
@@ -117,6 +118,7 @@ fn connect(sessions: &Arc<Sessions>, role: Role, since: Option<(u64, u64)>, n: u
         owner: Owner {
             principal: "anonymous".into(),
             session: format!("s{n}"),
+            role,
             connection: format!("r1:{n}"),
         },
         sessions: sessions.clone(),
@@ -133,7 +135,7 @@ struct Client {
 
 impl Client {
     /// Runs `serve_client` over channels; the product callback echoes text,
-    /// answers `slow` after 1.5 s and grants a meter credit for the binary
+    /// answers text starting with `slow` after 1.5 s and grants a meter credit for the binary
     /// message `credit`.
     fn start(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
         let queue = hub.subscribe();
@@ -150,9 +152,9 @@ impl Client {
                 let q = q.clone();
                 async move {
                     match m {
-                        Message::Text(t) if t == "slow" => {
+                        Message::Text(t) if t.starts_with("slow") => {
                             tokio::time::sleep(Duration::from_millis(1500)).await;
-                            Some(Message::Text("slow done".into()))
+                            Some(Message::Text(format!("{t} done").into()))
                         }
                         Message::Text(t) => Some(Message::Text(format!("echo {t}").into())),
                         Message::Binary(b) if &b[..] == b"credit" => {
@@ -175,7 +177,7 @@ impl Client {
     }
 
     fn connect(hub: &Hub, state: &Arc<FakeState>, since: Option<(u64, u64)>) -> Client {
-        let sessions = Arc::new(Sessions::new("r1"));
+        let sessions = Arc::new(Sessions::new("r1").unwrap());
         Client::start(hub, state, connect(&sessions, Role::Operator, since, 1))
     }
 
@@ -225,8 +227,8 @@ impl Drop for Client {
 }
 
 /// Applies a delta to the state and publishes it, as the product does.
-fn apply(state: &FakeState, hub: &Hub, command: Option<&str>) -> Delta {
-    let d = state.apply(command);
+fn apply(state: &FakeState, hub: &Hub) -> Delta {
+    let d = state.apply(None);
     hub.publish(Frame::Delta(d.clone()));
     d
 }
@@ -236,7 +238,7 @@ async fn connect_catches_up_from_the_last_seen_position() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     for _ in 0..3 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
 
     let mut fresh = Client::connect(&hub, &state, None);
@@ -256,7 +258,7 @@ async fn connect_catches_up_from_the_last_seen_position() {
     let mut stale = Client::connect(&hub, &state, Some((7, 1)));
     assert_eq!(stale.next().await, "snapshot@7:3", "deltas no longer held");
 
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     hub.publish(Frame::Counters("c".into()));
     for client in [
         &mut fresh,
@@ -275,15 +277,15 @@ async fn a_new_epoch_sends_a_snapshot() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     for _ in 0..5 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     let mut client = Client::connect(&hub, &state, Some((7, 5)));
     client.silent().await;
 
     state.reset(8);
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "snapshot@8:1", "revision 1 is below 5");
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "delta@2");
 }
 
@@ -296,7 +298,7 @@ async fn a_gap_in_prev_catches_up_from_the_state() {
 
     state.apply(None);
     state.apply(None);
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "delta@1", "3 names prev 2, not 0");
     assert_eq!(client.next().await, "delta@2");
     assert_eq!(client.next().await, "delta@3");
@@ -307,12 +309,12 @@ async fn a_gap_in_prev_catches_up_from_the_state() {
 async fn a_lagging_replica_skips_what_the_client_saw_on_another() {
     let follower = FakeState::new("r2", "follower");
     let hub = Hub::new(8);
-    apply(&follower, &hub, None);
+    apply(&follower, &hub);
 
     let mut client = Client::connect(&hub, &follower, Some((7, 3)));
     client.silent().await;
     for _ in 0..3 {
-        apply(&follower, &hub, None);
+        apply(&follower, &hub);
     }
     assert_eq!(client.next().await, "delta@4", "2 and 3 skipped");
 }
@@ -324,13 +326,13 @@ async fn overflow_catches_up_from_the_last_sent_revision() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(2);
     for _ in 0..3 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     let mut client = Client::connect(&hub, &state, Some((7, 3)));
     client.silent().await;
 
     for _ in 0..6 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     let mut got = Vec::new();
     for _ in 0..6 {
@@ -341,7 +343,7 @@ async fn overflow_catches_up_from_the_last_sent_revision() {
     client.silent().await;
 
     for _ in 0..3 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     state.forget_through(12);
     assert_eq!(client.next().await, "snapshot@7:12");
@@ -402,8 +404,44 @@ async fn a_slow_reply_keeps_the_heartbeat_and_the_order_of_replies() {
     assert_eq!(client.next().await, "slow done");
     assert_eq!(start.elapsed(), Duration::from_millis(1500));
     assert_eq!(client.next().await, "echo hello", "in the order received");
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "delta@1", "still served");
+}
+
+/// At the limit the connection is not read, its pongs included, which is
+/// not the client's fault.
+#[tokio::test(start_paused = true)]
+async fn replies_at_the_limit_slower_than_the_pong_timeout_keep_the_connection() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let start = Instant::now();
+    for n in 0..MAX_PENDING_REPLIES {
+        let slow = format!("slow {n}");
+        client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
+    }
+    client.tx.send(Ok(Message::Text("hello".into()))).unwrap();
+    for n in 0..MAX_PENDING_REPLIES {
+        assert_eq!(client.next().await, format!("slow {n} done"));
+    }
+    assert_eq!(start.elapsed(), Duration::from_millis(1500));
+    assert_eq!(client.next().await, "echo hello", "read again");
+    apply(&state, &hub);
+    assert_eq!(client.next().await, "delta@1", "still served");
+}
+
+/// A client resending its unacknowledged commands at once after
+/// connecting reads the answers against the state they refer to.
+#[tokio::test(start_paused = true)]
+async fn no_reply_goes_out_before_the_first_catch_up() {
+    let state = FakeState::new("r1", "leader");
+    *state.snapshot_delay.lock().unwrap() = Duration::from_millis(500);
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    client.tx.send(Ok(Message::Text("hello".into()))).unwrap();
+    assert_eq!(client.next().await, "snapshot@7:0");
+    assert_eq!(client.next().await, "echo hello");
 }
 
 #[tokio::test(start_paused = true)]
@@ -414,16 +452,16 @@ async fn a_slow_snapshot_keeps_the_heartbeat() {
     assert_eq!(client.next().await, "snapshot@7:0");
     *state.snapshot_delay.lock().unwrap() = Duration::from_millis(1500);
     state.reset(8);
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "snapshot@8:1");
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "delta@2", "still served");
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
     let state = FakeState::new("r1", "leader");
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, None, 1);
     let queue = Hub::new(8).subscribe();
     let (to_client, _rx) = mpsc::unbounded_channel();
@@ -451,11 +489,182 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
     task.abort();
 }
 
+/// Replies that never resolve, to a client that never answers a ping: a
+/// peer that is gone is not held for as long as the replies hang.
+#[tokio::test(start_paused = true)]
+async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
+    let state = FakeState::new("r1", "leader");
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let connect = connect(&sessions, Role::Operator, None, 1);
+    let queue = Hub::new(8).subscribe();
+    let (to_client, _rx) = mpsc::unbounded_channel();
+    let (tx, from_client) = mpsc::unbounded_channel();
+    let start = Instant::now();
+    let task = tokio::spawn(async move {
+        let socket = ChannelSocket {
+            to_client,
+            from_client,
+        };
+        serve_client(socket, &connect, &queue, &*state, |_| {
+            std::future::pending::<Option<Message>>()
+        })
+        .await
+    });
+    for _ in 0..MAX_PENDING_REPLIES {
+        tx.send(Ok(Message::Text("never answered".into()))).unwrap();
+    }
+    let ended = tokio::time::timeout(MAX_PAUSE + Duration::from_secs(1), task)
+        .await
+        .expect("ended")
+        .unwrap();
+    assert_eq!(ended, Ended::Failed);
+    assert_eq!(start.elapsed(), MAX_PAUSE);
+    assert!(sessions.live().is_empty());
+}
+
+/// Replies that each resolve within the longest pause, to a client that
+/// never answers a ping, with messages queued for more pauses than the
+/// total allows: a peer that is gone is not held for as long as its queued
+/// messages last.
+#[tokio::test(start_paused = true)]
+async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause() {
+    let state = FakeState::new("r1", "leader");
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let connect = connect(&sessions, Role::Operator, None, 1);
+    let queue = Hub::new(8).subscribe();
+    let (to_client, _rx) = mpsc::unbounded_channel();
+    let (tx, from_client) = mpsc::unbounded_channel();
+    let reply = MAX_PAUSE - Duration::from_millis(100);
+    let start = Instant::now();
+    let task = tokio::spawn(async move {
+        let socket = ChannelSocket {
+            to_client,
+            from_client,
+        };
+        serve_client(socket, &connect, &queue, &*state, |_| async move {
+            tokio::time::sleep(reply).await;
+            Some(Message::Text("done".into()))
+        })
+        .await
+    });
+    for _ in 0..5 * MAX_PENDING_REPLIES {
+        tx.send(Ok(Message::Text("queued".into()))).unwrap();
+    }
+    tokio::time::sleep(MAX_PAUSE_TOTAL - Duration::from_millis(1)).await;
+    assert_eq!(
+        sessions.live().len(),
+        1,
+        "every pause shorter than the longest"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("ended")
+        .unwrap();
+    assert_eq!(ended, Ended::Failed);
+    assert_eq!(start.elapsed(), MAX_PAUSE_TOTAL);
+    assert!(sessions.live().is_empty());
+}
+
+/// Its pongs wait unread behind the messages, so a healthy client at the
+/// limit keeps its lease until the connection ends.
+#[tokio::test(start_paused = true)]
+async fn a_connection_that_answered_before_the_limit_stays_live_while_not_read() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    assert_eq!(client.next().await, "snapshot@7:0");
+    for n in 0..MAX_PENDING_REPLIES {
+        let slow = format!("slow {n}");
+        client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert_eq!(
+        sessions.live().len(),
+        1,
+        "not read for over {PONG_TIMEOUT:?}, answered before"
+    );
+    assert_eq!(client.next().await, "slow 0 done");
+}
+
+/// The messages fill the limit three times over, so the pongs wait unread
+/// through several pauses with almost no reading between them; twice, so
+/// the second time adds up to more than the total pause and the pongs read
+/// in between restart the count.
+#[tokio::test(start_paused = true)]
+async fn a_client_answering_every_ping_stays_live_through_repeated_pauses() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let round = 3 * MAX_PENDING_REPLIES;
+    let (mut sent, mut replies, mut not_live) = (0, 0, Vec::new());
+    let mut ended = false;
+    let start = Instant::now();
+    while !ended && start.elapsed() < Duration::from_secs(10) {
+        if replies == sent && sent < 2 * round {
+            for n in sent..sent + round {
+                let slow = format!("slow {n}");
+                client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
+            }
+            sent += round;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match client.rx.recv().await {
+                    Some(Message::Ping(_)) => {
+                        let _ = client.tx.send(Ok(Message::Pong(Bytes::new())));
+                    }
+                    Some(Message::Text(_)) => replies += 1,
+                    Some(_) => {}
+                    None => break ended = true,
+                }
+            }
+        })
+        .await;
+        if !ended && sessions.live().is_empty() {
+            not_live.push(start.elapsed());
+        }
+    }
+    assert!(!ended, "connection ended after {:?}", start.elapsed());
+    assert_eq!(replies, 2 * round);
+    assert!(not_live.is_empty(), "not live at {not_live:?}");
+}
+
+/// After a pause the client has its whole pong timeout again, counted from
+/// its last pong as if the pause had not happened.
+#[tokio::test(start_paused = true)]
+async fn a_pause_does_not_count_against_the_pong_timeout_after_it_ends() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    assert_eq!(client.next().await, "snapshot@7:0");
+    client.pong = false;
+    let start = Instant::now();
+    for n in 0..MAX_PENDING_REPLIES {
+        let slow = format!("slow {n}");
+        client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
+    }
+    for n in 0..MAX_PENDING_REPLIES {
+        assert_eq!(client.next().await, format!("slow {n} done"));
+    }
+    let resumed = start.elapsed();
+    assert_eq!(resumed, Duration::from_millis(1500));
+    tokio::time::sleep(PONG_TIMEOUT - Duration::from_millis(100)).await;
+    assert_eq!(sessions.live().len(), 1, "within the pong timeout after it");
+    assert_eq!(client.next_message().await, Message::Close(None));
+    assert_eq!(client.ended().await, Ended::PongTimeout);
+    assert_eq!(start.elapsed(), resumed + PONG_TIMEOUT);
+    assert!(sessions.live().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn live_sessions_are_renewed_once_per_second_in_one_batch() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let renew = tokio::spawn({
         let (sessions, state) = (sessions.clone(), state.clone());
         async move { samplez_service::server::renew_sessions(&sessions, &*state).await }
@@ -500,7 +709,7 @@ async fn wait_both(a: &mut Client, b: &mut Client) {
 
 #[test]
 fn require_operator_refuses_a_viewer() {
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     assert_eq!(
         connect(&sessions, Role::Operator, None, 1).require_operator(),
         Ok(())
@@ -515,17 +724,33 @@ fn command() -> Bytes {
     Bytes::from_static(b"gain -6")
 }
 
+/// The owner of a command sent by an `anonymous` client with this session.
+fn owner(session: &str) -> Owner {
+    Owner {
+        principal: "anonymous".into(),
+        session: session.into(),
+        role: Role::Operator,
+        connection: "r1:1".into(),
+    }
+}
+
 #[tokio::test]
 async fn commands_apply_once_per_id_from_the_replicated_table() {
     let state = FakeState::new("r1", "leader");
     let commands = Commands::new(state.clone(), 2);
+    let s1 = owner("s1");
 
-    let Begin::New(pending) = commands.begin("c1") else {
+    let Begin::New(pending) = commands.begin(&s1, "c1") else {
         panic!("c1 is new");
     };
     let mut submitted = pin!(pending.submit(command()));
     assert!(submitted.as_mut().now_or_never().is_none(), "committing");
-    assert!(matches!(commands.begin("c1"), Begin::InFlight));
+    // The client lost the connection and resent through the same replica.
+    let Begin::New(again) = commands.begin(&s1, "c1") else {
+        panic!("not applied yet, so new again");
+    };
+    let mut resent = pin!(again.submit(command()));
+    assert!(resent.as_mut().now_or_never().is_none(), "committing");
     state.commit();
     let ack = submitted.await.unwrap();
     assert_eq!(
@@ -535,24 +760,26 @@ async fn commands_apply_once_per_id_from_the_replicated_table() {
             revision: 1
         }
     );
-    match commands.begin("c1") {
+    assert_eq!(resent.await.unwrap(), ack, "the resend gets the answer too");
+    assert_eq!(state.revision(), 1, "applied once");
+    match commands.begin(&s1, "c1") {
         Begin::Duplicate(again) => assert_eq!(again, ack),
         _ => panic!("c1 is applied"),
     }
 
-    let Begin::New(rejected) = commands.begin("c2") else {
+    let Begin::New(rejected) = commands.begin(&s1, "c2") else {
         panic!("c2 is new");
     };
     drop(rejected);
     assert!(
-        matches!(commands.begin("c2"), Begin::New(_)),
+        matches!(commands.begin(&s1, "c2"), Begin::New(_)),
         "a rejected command may be resent"
     );
 
-    let _a = commands.begin("a");
-    let _b = commands.begin("b");
+    let _a = commands.begin(&s1, "a");
+    let _b = commands.begin(&s1, "b");
     assert!(
-        matches!(commands.begin("c"), Begin::Busy),
+        matches!(commands.begin(&s1, "c"), Begin::Busy),
         "two in flight at most"
     );
 }
@@ -566,12 +793,13 @@ async fn a_command_resent_through_another_replica_while_pending_applies_once() {
         Commands::new(state.clone(), 8),
         Commands::new(state.clone(), 8),
     );
-    let Begin::New(a) = on_a.begin("cmd-1") else {
+    let s1 = owner("s1");
+    let Begin::New(a) = on_a.begin(&s1, "cmd-1") else {
         panic!("cmd-1 is new on a");
     };
     let mut first = pin!(a.submit(command()));
     assert!(first.as_mut().now_or_never().is_none(), "committing");
-    let Begin::New(b) = on_b.begin("cmd-1") else {
+    let Begin::New(b) = on_b.begin(&s1, "cmd-1") else {
         panic!("not applied yet, so new on b as well");
     };
     let mut second = pin!(b.submit(command()));
@@ -595,32 +823,123 @@ fn a_command_resent_to_another_replica_is_not_applied_twice() {
         FakeState::new("a", "leader"),
         FakeState::new("b", "follower"),
     );
-    let applied = a.apply(Some("cmd-1"));
-    b.receive(applied.clone());
+    let s1 = owner("s1");
+    let applied = a.apply(Some((&s1, "cmd-1")));
+    b.receive(applied.clone(), Some(&s1));
     let on_b = Commands::new(b.clone(), 8);
-    match on_b.begin("cmd-1") {
+    match on_b.begin(&s1, "cmd-1") {
         Begin::Duplicate(ack) => assert_eq!(ack.revision, applied.revision),
         _ => panic!("replica b holds cmd-1 in the replicated table"),
     }
 }
+
+/// The futures of a connection's replies are polled in no particular
+/// order, so the order of the submit calls has to be the commit order.
+#[tokio::test]
+async fn commands_commit_in_the_order_they_were_submitted() {
+    let state = FakeState::new("r1", "leader");
+    let commands = Commands::new(state.clone(), 8);
+    let s1 = owner("s1");
+    let (Begin::New(first), Begin::New(second)) =
+        (commands.begin(&s1, "1"), commands.begin(&s1, "2"))
+    else {
+        panic!("both new");
+    };
+    let mut first = pin!(first.submit(command()));
+    let mut second = pin!(second.submit(command()));
+    assert!(second.as_mut().now_or_never().is_none(), "committing");
+    assert!(first.as_mut().now_or_never().is_none(), "committing");
+    state.commit();
+    assert_eq!(first.await.unwrap().revision, 1);
+    assert_eq!(second.await.unwrap().revision, 2);
+}
+
+/// Ids are unique within a session only, such as per-client sequence
+/// numbers.
+#[tokio::test]
+async fn the_same_id_from_two_sessions_is_two_commands() {
+    let state = FakeState::new("r1", "leader");
+    let commands = Commands::new(state.clone(), 8);
+    let (s1, s2) = (owner("s1"), owner("s2"));
+    let Begin::New(first) = commands.begin(&s1, "1") else {
+        panic!("new for s1");
+    };
+    let Begin::New(second) = commands.begin(&s2, "1") else {
+        panic!("new for s2");
+    };
+    let mut first = pin!(first.submit(command()));
+    let mut second = pin!(second.submit(command()));
+    assert!(first.as_mut().now_or_never().is_none(), "committing");
+    assert!(second.as_mut().now_or_never().is_none(), "committing");
+    state.commit();
+    assert_eq!(first.await.unwrap().revision, 1);
+    assert_eq!(second.await.unwrap().revision, 2, "applied as well");
+    match commands.begin(&s2, "1") {
+        Begin::Duplicate(ack) => assert_eq!(ack.revision, 2),
+        _ => panic!("applied for s2"),
+    }
+    state.apply(Some((&s1, "2")));
+    assert!(
+        matches!(commands.begin(&s2, "2"), Begin::New(_)),
+        "applied for s1 only"
+    );
+}
+
+/// The session id is not authenticated: another principal presenting it
+/// must not apply a command the session's own client sends later.
+#[tokio::test]
+async fn another_principal_with_the_same_session_cannot_pre_empt_its_commands() {
+    let state = FakeState::new("r1", "leader");
+    let commands = Commands::new(state.clone(), 8);
+    let session = "kM2pV9xQ4tR7wY1zB6nC3d";
+    let alice = Owner {
+        principal: "alice".into(),
+        ..owner(session)
+    };
+    let mallory = Owner {
+        principal: "mallory".into(),
+        ..owner(session)
+    };
+    let Begin::New(early) = commands.begin(&mallory, "1") else {
+        panic!("new for mallory");
+    };
+    let early = early.submit(command());
+    state.commit();
+    assert_eq!(early.await.unwrap().revision, 1);
+    let Begin::New(own) = commands.begin(&alice, "1") else {
+        panic!("not applied for alice");
+    };
+    let own = own.submit(command());
+    state.commit();
+    assert_eq!(own.await.unwrap().revision, 2, "applied for alice");
+}
+
+/// A client session id: 16 random bytes in base64url without padding.
+const SESSION: &str = "q3Jx-Lh0_9TfWzKcVb2s1A";
 
 #[tokio::test]
 async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     let state = FakeState::new("r1", "leader");
     let hub = Arc::new(Hub::new(8));
     for _ in 0..3 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     let mut config = config("none", "loopback");
     let loopback = serde_json::json!({ "bind": "127.0.0.1", "port": 0 });
     config["listeners"] = serde_json::json!({ "api": loopback, "ops": loopback, "nmos": loopback });
+    let longest = SESSION.repeat(6)[..MAX_SESSION_ID].to_owned();
     let service = service_from(config, Ops::default(), state.clone()).ws({
-        let (hub, state) = (hub.clone(), state.clone());
+        let (hub, state, longest) = (hub.clone(), state.clone(), longest.clone());
         move |socket, connect| {
-            let (hub, state) = (hub.clone(), state.clone());
+            let (hub, state, longest) = (hub.clone(), state.clone(), longest.clone());
             async move {
-                assert_eq!(connect.owner.session, "tab-1");
+                assert!(
+                    [SESSION, &longest].contains(&connect.owner.session.as_str()),
+                    "{}",
+                    connect.owner.session
+                );
                 assert_eq!(connect.owner.principal, "anonymous");
+                assert_eq!(connect.owner.role, Role::Operator);
                 assert!(connect.owner.connection.starts_with("r1:"));
                 let queue = hub.subscribe();
                 serve_client(socket, &connect, &queue, &*state, |_| async { None }).await;
@@ -631,7 +950,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     let addr = bound.api_addr().unwrap();
     let server = tokio::spawn(bound.serve());
 
-    let url = format!("ws://{addr}/api/v1/ws?since=7:2&session=tab-1");
+    let url = format!("ws://{addr}/api/v1/ws?since=7:2&session={SESSION}");
     let mut foreign = url.as_str().into_client_request().unwrap();
     foreign
         .headers_mut()
@@ -640,7 +959,19 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
         Err(tungstenite::Error::Http(res)) => assert_eq!(res.status(), 403),
         other => panic!("foreign Origin accepted: {other:?}"),
     }
-    for bad in ["since=2", "since=7:", "since=%2B7:2", "session="] {
+    let short = &SESSION[1..];
+    let bad = [
+        "since=2".to_owned(),
+        "since=7:".to_owned(),
+        "since=%2B7:2".to_owned(),
+        "session=".to_owned(),
+        "session=tab-1".to_owned(),
+        format!("session={short}"),
+        format!("session={}", &SESSION.repeat(6)[..MAX_SESSION_ID + 1]),
+        format!("session={short}%3D"),
+        format!("session={short}."),
+    ];
+    for bad in bad {
         let url = format!("ws://{addr}/api/v1/ws?{bad}");
         match tokio_tungstenite::connect_async(url.as_str()).await {
             Err(tungstenite::Error::Http(res)) => assert_eq!(res.status(), 400, "{bad}"),
@@ -660,8 +991,59 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
         }
     };
     assert_eq!(next().await, "delta@3");
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(next().await, "delta@4");
+
+    let url = format!("ws://{addr}/api/v1/ws?since=7:3&session={longest}");
+    let (mut ws, res) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 101, "the longest session id");
+    loop {
+        match ws.next().await {
+            Some(Ok(tungstenite::Message::Text(t))) => break assert_eq!(t.as_str(), "delta@4"),
+            Some(Ok(tungstenite::Message::Ping(_))) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    server.abort();
+}
+
+/// A forwarded command names who sent it, with the role it was allowed.
+#[tokio::test]
+async fn the_owner_carries_the_principal_and_role_from_the_proxy() {
+    let state = FakeState::new("r1", "leader");
+    let mut config = config("proxy", "owner-role");
+    let loopback = serde_json::json!({ "bind": "127.0.0.1", "port": 0 });
+    config["listeners"] = serde_json::json!({
+        "api": loopback, "ops": loopback, "nmos": loopback, "machine": loopback,
+    });
+    let (owners, mut owner) = mpsc::unbounded_channel();
+    let service = service_from(config, Ops::default(), state).ws(move |_, connect| {
+        let _ = owners.send(connect.owner);
+        async {}
+    });
+    let bound = service.bind().await.unwrap();
+    let addr = bound.api_addr().unwrap();
+    let server = tokio::spawn(bound.serve());
+    for (groups, role) in [("watchers", Role::Viewer), ("ops", Role::Operator)] {
+        let url = format!("ws://{addr}/api/v1/ws?session={SESSION}");
+        let mut req = url.as_str().into_client_request().unwrap();
+        req.headers_mut()
+            .insert("host", "samplez.example".parse().unwrap());
+        req.headers_mut()
+            .insert("origin", "https://samplez.example".parse().unwrap());
+        req.headers_mut()
+            .insert("x-forwarded-user", "alice".parse().unwrap());
+        req.headers_mut()
+            .insert("x-forwarded-groups", groups.parse().unwrap());
+        let _ = tokio_tungstenite::connect_async(req).await.unwrap();
+        let got = owner.recv().await.unwrap();
+        assert_eq!(
+            (got.principal.as_str(), got.session.as_str(), got.role),
+            ("alice", SESSION, role)
+        );
+    }
     server.abort();
 }
 
@@ -702,7 +1084,7 @@ impl Sink<Message> for StuckSocket {
 #[tokio::test(start_paused = true)]
 async fn a_client_that_stops_reading_ends_one_second_after_its_last_pong() {
     let state = FakeState::new("r1", "leader");
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, None, 1);
     let queue = Hub::new(8).subscribe();
     let start = Instant::now();

@@ -33,7 +33,8 @@ pub use tls::TlsStatus;
 
 #[derive(Debug)]
 pub enum Error {
-    /// The settings contradict each other or a secret is empty.
+    /// The settings contradict each other, a secret is empty or invalid, or
+    /// generating a certificate or drawing random bits failed.
     Config(String),
     /// A secret file could not be read.
     Secret(PathBuf, io::Error),

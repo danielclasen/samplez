@@ -24,17 +24,53 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::Error;
 use crate::replica::{Owner, Position, ReplicatedState};
 use crate::server::Connect;
 
 /// How often [`serve_client`] pings.
 pub const PING_PERIOD: Duration = Duration::from_millis(250);
 /// [`serve_client`] closes a connection that has not answered a ping for
-/// this long, and only connections that answered within it are renewed.
+/// this long, and only connections that answered within it are renewed
+/// ([`Sessions::live`]); neither counts the time the connection was not
+/// read at [`MAX_PENDING_REPLIES`].
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(1);
 /// The replies [`serve_client`] waits for on one connection before it stops
-/// reading it.
+/// reading it. Its pongs then go unread as well, so the time until a reply
+/// is ready does not count against [`PONG_TIMEOUT`], and the connection
+/// stays live in [`Sessions`] meanwhile when it answered within
+/// [`PONG_TIMEOUT`] before. A connection not read for [`MAX_PAUSE`] at
+/// once, or [`MAX_PAUSE_TOTAL`] since the last pong read, ends.
 pub const MAX_PENDING_REPLIES: usize = 64;
+/// How long [`serve_client`] goes without reading a connection that has
+/// [`MAX_PENDING_REPLIES`] replies outstanding before it ends it as
+/// [`Ended::Failed`]. Without a bound, replies that never resolve would hold
+/// a peer that is gone, and its place in [`crate::replica::Commands`], for
+/// as long as they hang.
+///
+/// 2 s: the replication is sized to commit again within about 1 s of losing
+/// its leader (two election rounds of 300 ms, the 50 ms apply lead cap and
+/// three pages), so a reply waiting through one failover resolves within
+/// half of it. How long a peer that is gone stays live is bounded by
+/// [`MAX_PAUSE_TOTAL`].
+pub const MAX_PAUSE: Duration = Duration::from_secs(2);
+/// How long [`serve_client`] goes without reading a connection in all, over
+/// the pauses at [`MAX_PENDING_REPLIES`] since it last read a pong, before
+/// it ends it as [`Ended::Failed`]. A pong waits unread behind the messages
+/// sent before it, and each pause is taken off the client's
+/// [`PONG_TIMEOUT`], so without this bound a peer that is gone, with
+/// messages queued, would stay live for as long as they last.
+///
+/// Three times [`MAX_PAUSE`]: a client whose pongs wait behind three times
+/// [`MAX_PENDING_REPLIES`] messages, each answered within [`MAX_PAUSE`],
+/// keeps its connection. A peer that is gone is counted live by
+/// [`Sessions::live`] for at most [`PONG_TIMEOUT`] + [`MAX_PAUSE_TOTAL`],
+/// 7 s, after the last pong read from it, however long that pong waited
+/// unread. Its touch ownership then lasts as long as the
+/// [`crate::ReplicatedState`] implementation keeps a session lease without
+/// renewal, 2 s in the replication this crate is sized for: up to 9 s after
+/// that pong.
+pub const MAX_PAUSE_TOTAL: Duration = Duration::from_secs(6);
 
 /// A state change at a global revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,51 +274,103 @@ impl Hub {
     }
 }
 
-/// The connections served on this replica and when each last answered a
-/// ping.
+/// The connections served on this replica, when each last answered a ping
+/// and whether it is read, as [`serve_client`] counts them.
 #[derive(Debug)]
 pub struct Sessions {
     replica: String,
+    /// Random, so connection ids do not recur after a restart.
+    nonce: String,
     next: AtomicU64,
-    live: Mutex<HashMap<String, (Owner, Instant)>>,
+    live: Mutex<HashMap<String, Connection>>,
+}
+
+#[derive(Debug)]
+struct Connection {
+    owner: Owner,
+    /// When it last answered a ping, moved on by the pauses since.
+    answered: Instant,
+    /// Since when it is not read at [`MAX_PENDING_REPLIES`], and when it
+    /// ends unless read again.
+    paused: Option<(Instant, Instant)>,
 }
 
 impl Sessions {
-    /// `replica` prefixes the connection ids.
-    pub fn new(replica: &str) -> Sessions {
-        Sessions {
+    /// `replica` prefixes the connection ids, followed by 128 random bits
+    /// drawn here.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] when the operating system's random source fails.
+    pub fn new(replica: &str) -> Result<Sessions, Error> {
+        let mut nonce = [0u8; 16];
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(&mut nonce)
+            .map_err(|_| Error::Config("the random source failed".into()))?;
+        Ok(Sessions {
             replica: replica.to_owned(),
+            nonce: nonce.iter().map(|b| format!("{b:02x}")).collect(),
             next: AtomicU64::new(1),
             live: Mutex::default(),
-        }
+        })
     }
 
+    /// `<replica id>:<nonce>:<n>`, see [`Owner::connection`].
     pub(crate) fn connection_id(&self) -> String {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
-        format!("{}:{n}", self.replica)
+        format!("{}:{}:{n}", self.replica, self.nonce)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Owner, Instant)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Connection>> {
         self.live.lock().expect("sessions lock poisoned")
     }
 
     fn answered(&self, owner: &Owner) {
-        let entry = (owner.clone(), Instant::now());
+        let entry = Connection {
+            owner: owner.clone(),
+            answered: Instant::now(),
+            paused: None,
+        };
         self.lock().insert(owner.connection.clone(), entry);
+    }
+
+    /// The connection is not read since `since`, and ends at `end` unless
+    /// it is read again.
+    fn paused(&self, owner: &Owner, since: Instant, end: Instant) {
+        if let Some(connection) = self.lock().get_mut(&owner.connection) {
+            connection.paused = Some((since, end));
+        }
+    }
+
+    /// The connection is read again; `answered` is its last pong moved on
+    /// by the pauses since.
+    fn resumed(&self, owner: &Owner, answered: Instant) {
+        if let Some(connection) = self.lock().get_mut(&owner.connection) {
+            connection.answered = answered;
+            connection.paused = None;
+        }
     }
 
     fn remove(&self, owner: &Owner) {
         self.lock().remove(&owner.connection);
     }
 
-    /// The owners whose connection answered within [`PONG_TIMEOUT`].
+    /// The owners whose connection answered within [`PONG_TIMEOUT`], not
+    /// counting the time it was not read at [`MAX_PENDING_REPLIES`], and,
+    /// while it is not read, until [`serve_client`] ends it after
+    /// [`MAX_PAUSE`] or [`MAX_PAUSE_TOTAL`]: its pongs wait unread, and a
+    /// client answering them keeps its lease.
     pub fn live(&self) -> Vec<Owner> {
         let now = Instant::now();
         let mut live: Vec<Owner> = self
             .lock()
             .values()
-            .filter(|(_, at)| now.duration_since(*at) <= PONG_TIMEOUT)
-            .map(|(owner, _)| owner.clone())
+            .filter(|c| match c.paused {
+                None => now.duration_since(c.answered) <= PONG_TIMEOUT,
+                Some((since, end)) => since.duration_since(c.answered) <= PONG_TIMEOUT && now < end,
+            })
+            .map(|c| c.owner.clone())
             .collect();
         live.sort_by(|a, b| a.connection.cmp(&b.connection));
         live
@@ -294,10 +382,13 @@ impl Sessions {
 pub enum Ended {
     /// The client closed the connection or the stream ended.
     Closed,
-    /// No pong within [`PONG_TIMEOUT`]; a close frame was sent.
+    /// No pong within [`PONG_TIMEOUT`], not counting the time the connection
+    /// was not read at [`MAX_PENDING_REPLIES`]; a close frame was sent.
     PongTimeout,
-    /// Sending or receiving failed, or a send did not finish within
-    /// [`PONG_TIMEOUT`] of the last pong.
+    /// Sending or receiving failed, a send did not finish within
+    /// [`PONG_TIMEOUT`] of the last pong, counted the same way, or the
+    /// connection was not read at [`MAX_PENDING_REPLIES`] for [`MAX_PAUSE`]
+    /// at once or [`MAX_PAUSE_TOTAL`] since the last pong read.
     Failed,
 }
 
@@ -327,14 +418,21 @@ async fn catch_up(
     (position, vec![snapshot.text])
 }
 
-/// Sends `message`, giving up once the client has not answered a ping for
-/// [`PONG_TIMEOUT`]: a client that stopped reading is not waited for.
+/// When the client has to have answered a ping by: [`PONG_TIMEOUT`] after
+/// the pong it last `answered`, not counting the time since `paused`, the
+/// server not reading the connection meanwhile.
+fn pong_deadline(answered: Instant, paused: Option<Instant>) -> Instant {
+    answered + PONG_TIMEOUT + paused.map_or(Duration::ZERO, |since| since.elapsed())
+}
+
+/// Sends `message`, giving up at `deadline`, the client's
+/// [`pong_deadline`]: a client that stopped reading is not waited for.
 async fn send<T: Sink<Message> + Unpin>(
     tx: &mut T,
     message: Message,
-    answered: Instant,
+    deadline: Instant,
 ) -> Result<(), ()> {
-    match tokio::time::timeout_at(answered + PONG_TIMEOUT, tx.send(message)).await {
+    match tokio::time::timeout_at(deadline, tx.send(message)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) | Err(_) => Err(()),
     }
@@ -348,13 +446,54 @@ async fn send<T: Sink<Message> + Unpin>(
 /// before calling.
 ///
 /// `on_message` is called for each message in the order received, and the
-/// replies go out in that order. The futures it returns run beside the
-/// heartbeat and each other, so a reply that waits on a commit or an
-/// election does not stall the pings; work that must follow the order of
-/// the messages belongs in the call itself, before the future. With
-/// [`MAX_PENDING_REPLIES`] replies outstanding the connection is not read,
-/// pongs included, until one is ready. A catch-up runs beside the heartbeat
-/// as well, with `queue` waiting for it.
+/// replies go out in that order, the first after the first catch-up. The
+/// futures it returns run beside the heartbeat and each other, so a reply
+/// that waits on a commit or an election does not stall the pings; work
+/// that must follow the order of the messages belongs in the call itself,
+/// before the future. With [`MAX_PENDING_REPLIES`] replies outstanding the
+/// connection is not read, pongs included, until one is ready, and that
+/// time does not count against the client's [`PONG_TIMEOUT`]; when none is
+/// ready within [`MAX_PAUSE`], or the pauses since the last pong read reach
+/// [`MAX_PAUSE_TOTAL`], the connection ends. A catch-up
+/// runs beside the heartbeat as well, with `queue` waiting for it.
+///
+/// A command is begun and submitted in the call, outside the `async`
+/// block, so commands commit in the order the client sent them; submitted
+/// inside it, they are ordered as the futures happen to be polled:
+///
+/// ```
+/// # use axum::body::Bytes;
+/// # use axum::extract::ws::{Message, WebSocket};
+/// # use samplez_service::replica::{Begin, Commands};
+/// # use samplez_service::ws::{ClientQueue, Ended, serve_client};
+/// # use samplez_service::{Connect, ReplicatedState};
+/// # async fn serve(
+/// #     socket: WebSocket,
+/// #     connect: &Connect,
+/// #     queue: &ClientQueue,
+/// #     state: &dyn ReplicatedState,
+/// #     commands: &Commands,
+/// # ) -> Ended {
+/// serve_client(socket, connect, queue, state, |message| {
+///     // Here, in the order received: the message is the command's id.
+///     let submitted = match message {
+///         Message::Text(id) if connect.require_operator().is_ok() => {
+///             match commands.begin(&connect.owner, id.as_str()) {
+///                 Begin::New(pending) => Some(pending.submit(Bytes::from(id.to_string()))),
+///                 Begin::Duplicate(_) | Begin::Busy => None,
+///             }
+///         }
+///         _ => None,
+///     };
+///     // Only the wait for the reply is in the future.
+///     async move {
+///         let ack = submitted?.await.ok()?;
+///         Some(Message::Text(format!("{} {}", ack.command, ack.revision).into()))
+///     }
+/// })
+/// .await
+/// # }
+/// ```
 pub async fn serve_client<S, E, F, Fut>(
     socket: S,
     connect: &Connect,
@@ -372,31 +511,64 @@ where
     let owner = &connect.owner;
     sessions.answered(owner);
     let ended = async {
+        // The last pong read, moved on by the pauses since.
         let mut answered = Instant::now();
+        // The time not read in the pauses since the last pong read, the
+        // current one not included.
+        let mut paused_before = Duration::ZERO;
+        // Since when the connection is not read for the replies at the
+        // limit, and when it ends unless read again.
+        let mut paused: Option<(Instant, Instant)> = None;
         let mut ping = tokio::time::interval(PING_PERIOD);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut catching_up: Option<BoxFuture<'_, _>> =
             Some(Box::pin(catch_up(state, connect.since)));
-        // Set by the first catch-up, before `queue` is read.
+        // Set by the first catch-up, before `queue` and replies are read.
+        let mut caught_up = false;
         let mut position = Position {
             epoch: 0,
             revision: 0,
         };
         let mut replies = FuturesOrdered::new();
         loop {
+            let at_limit = replies.len() >= MAX_PENDING_REPLIES;
+            match paused {
+                None if at_limit => {
+                    let since = Instant::now();
+                    let end = since + MAX_PAUSE.min(MAX_PAUSE_TOTAL.saturating_sub(paused_before));
+                    paused = Some((since, end));
+                    sessions.paused(owner, since, end);
+                }
+                Some((since, _)) if !at_limit => {
+                    let pause = since.elapsed();
+                    answered += pause;
+                    paused_before += pause;
+                    paused = None;
+                    sessions.resumed(owner, answered);
+                }
+                _ => {}
+            }
+            let paused_since = paused.map(|(since, _)| since);
             let out: Vec<Message> = tokio::select! {
+                _ = tokio::time::sleep_until(paused.map_or_else(Instant::now, |(_, end)| end)),
+                    if paused.is_some() =>
+                {
+                    return Ended::Failed;
+                }
                 _ = ping.tick() => {
-                    if answered.elapsed() >= PONG_TIMEOUT {
-                        let _ = send(&mut tx, Message::Close(None), answered).await;
+                    let deadline = pong_deadline(answered, paused_since);
+                    if Instant::now() >= deadline {
+                        let _ = send(&mut tx, Message::Close(None), deadline).await;
                         return Ended::PongTimeout;
                     }
                     vec![Message::Ping(Bytes::new())]
                 }
-                received = rx.next(), if replies.len() < MAX_PENDING_REPLIES => match received {
+                received = rx.next(), if !at_limit => match received {
                     None | Some(Ok(Message::Close(_))) => return Ended::Closed,
                     Some(Err(_)) => return Ended::Failed,
                     Some(Ok(Message::Pong(_))) => {
                         answered = Instant::now();
+                        paused_before = Duration::ZERO;
                         sessions.answered(owner);
                         Vec::new()
                     }
@@ -406,11 +578,14 @@ where
                         Vec::new()
                     }
                 },
-                Some(reply) = replies.next(), if !replies.is_empty() => reply.into_iter().collect(),
+                Some(reply) = replies.next(), if caught_up && !replies.is_empty() => {
+                    reply.into_iter().collect()
+                }
                 (p, texts) = async { catching_up.as_mut().expect("guarded").await },
                     if catching_up.is_some() =>
                 {
                     catching_up = None;
+                    caught_up = true;
                     position = p;
                     texts.into_iter().map(Message::Text).collect()
                 }
@@ -435,7 +610,10 @@ where
                 },
             };
             for message in out {
-                if send(&mut tx, message, answered).await.is_err() {
+                if send(&mut tx, message, pong_deadline(answered, paused_since))
+                    .await
+                    .is_err()
+                {
                     return Ended::Failed;
                 }
             }
@@ -454,10 +632,11 @@ mod tests {
     /// can be a while after its last pong when the task is not polled.
     #[tokio::test(start_paused = true)]
     async fn a_connection_is_live_only_within_the_pong_timeout() {
-        let sessions = Sessions::new("r1");
+        let sessions = Sessions::new("r1").unwrap();
         let owner = Owner {
             principal: "anonymous".into(),
             session: "s1".into(),
+            role: crate::Role::Operator,
             connection: sessions.connection_id(),
         };
         sessions.answered(&owner);
@@ -467,5 +646,81 @@ mod tests {
         assert!(sessions.live().is_empty(), "silent for over 1 s");
         sessions.answered(&owner);
         assert_eq!(sessions.live(), [owner]);
+    }
+
+    /// Paused within the pong timeout of its last pong, a connection stays
+    /// live until the pause ends it; paused later, it is not live.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_connection_is_live_if_it_answered_before_the_pause() {
+        let sessions = Sessions::new("r1").unwrap();
+        let owner = Owner {
+            principal: "anonymous".into(),
+            session: "s1".into(),
+            role: crate::Role::Operator,
+            connection: sessions.connection_id(),
+        };
+        sessions.answered(&owner);
+        tokio::time::advance(PONG_TIMEOUT).await;
+        let now = Instant::now();
+        sessions.paused(&owner, now, now + MAX_PAUSE);
+        tokio::time::advance(MAX_PAUSE - Duration::from_millis(1)).await;
+        assert_eq!(sessions.live(), std::slice::from_ref(&owner));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(sessions.live().is_empty(), "paused until its end");
+
+        sessions.answered(&owner);
+        tokio::time::advance(PONG_TIMEOUT + Duration::from_millis(1)).await;
+        let now = Instant::now();
+        sessions.paused(&owner, now, now + MAX_PAUSE);
+        assert!(sessions.live().is_empty(), "silent for over 1 s before");
+    }
+
+    /// Resumed, a connection is live within the pong timeout of the moved
+    /// last pong, and paused again within it, until the new pause ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_connection_counts_from_its_moved_last_pong() {
+        let sessions = Sessions::new("r1").unwrap();
+        let owner = Owner {
+            principal: "anonymous".into(),
+            session: "s1".into(),
+            role: crate::Role::Operator,
+            connection: sessions.connection_id(),
+        };
+        sessions.answered(&owner);
+        let answered = Instant::now();
+        sessions.paused(&owner, answered, answered + MAX_PAUSE);
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        sessions.resumed(&owner, answered + Duration::from_millis(1500));
+        tokio::time::advance(PONG_TIMEOUT).await;
+        assert_eq!(sessions.live(), std::slice::from_ref(&owner));
+        let now = Instant::now();
+        sessions.paused(&owner, now, now + Duration::from_millis(500));
+        tokio::time::advance(Duration::from_millis(499)).await;
+        assert_eq!(sessions.live(), std::slice::from_ref(&owner));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(sessions.live().is_empty(), "the pause ended");
+
+        sessions.resumed(&owner, answered + Duration::from_millis(2000));
+        assert_eq!(
+            sessions.live(),
+            std::slice::from_ref(&owner),
+            "both taken off"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(sessions.live().is_empty(), "over 1 s since the moved pong");
+    }
+
+    /// The connection id is the session of a client that names none, and
+    /// the per-session tables of applied command ids outlive a restart.
+    #[test]
+    fn connection_ids_do_not_recur_after_a_restart() {
+        let before = Sessions::new("r1").unwrap().connection_id();
+        let after = Sessions::new("r1").unwrap().connection_id();
+        assert_ne!(before, after);
+        let (replica, rest) = before.split_once(':').unwrap();
+        let (nonce, n) = rest.split_once(':').unwrap();
+        assert_eq!((replica, n), ("r1", "1"));
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }

@@ -31,14 +31,15 @@ pub struct FakeState {
     log: Mutex<Vec<Delta>>,
     /// Deltas at or below this revision are no longer held.
     forgotten: Mutex<u64>,
-    /// The replicated table of applied command ids.
-    commands: Mutex<HashMap<String, u64>>,
+    /// The replicated tables of applied command ids, by principal, session
+    /// and id.
+    commands: Mutex<HashMap<(String, String, String), u64>>,
     /// Every `renew_sessions` call.
     pub renewals: Mutex<Vec<Vec<Owner>>>,
     /// How long `snapshot` takes.
     pub snapshot_delay: Mutex<Duration>,
-    /// Submitted commands that `commit` applies.
-    submitted: Mutex<Vec<(String, oneshot::Sender<Ack>)>>,
+    /// Submitted commands, by owner and id, that `commit` applies.
+    submitted: Mutex<Vec<(Owner, String, oneshot::Sender<Ack>)>>,
 }
 
 impl FakeState {
@@ -61,39 +62,49 @@ impl FakeState {
         })
     }
 
-    /// Applies the next revision `r` as the delta `delta@r`.
-    pub fn apply(&self, command: Option<&str>) -> Delta {
+    /// Applies the next revision `r` as the delta `delta@r`, caused by the
+    /// command `(owner, id)` when given.
+    pub fn apply(&self, command: Option<(&Owner, &str)>) -> Delta {
         let prev = self.revision();
         let revision = prev + 1;
         let delta = Delta {
             epoch: self.epoch(),
             revision,
             prev,
-            command: command.map(str::to_owned),
+            command: command.map(|(_, id)| id.to_owned()),
             text: format!("delta@{revision}").into(),
         };
-        self.receive(delta.clone());
+        self.receive(delta.clone(), command.map(|(owner, _)| owner));
         delta
     }
 
-    pub fn receive(&self, delta: Delta) {
-        if let Some(id) = &delta.command {
+    /// Takes a delta as replicated from another replica; `owner` is the
+    /// owner of the command it names.
+    pub fn receive(&self, delta: Delta, owner: Option<&Owner>) {
+        if let (Some(id), Some(owner)) = (&delta.command, owner) {
             self.commands
                 .lock()
                 .unwrap()
-                .insert(id.clone(), delta.revision);
+                .insert(key(owner, id), delta.revision);
         }
         self.log.lock().unwrap().push(delta);
     }
 
-    /// Applies the submitted commands in order, each id once, as a state
-    /// machine does when the entries carrying them are committed.
+    /// Applies the submitted commands in order, each id once per principal
+    /// and session, as a state machine does when the entries carrying them
+    /// are committed.
     pub fn commit(&self) {
         let submitted = std::mem::take(&mut *self.submitted.lock().unwrap());
-        for (id, done) in submitted {
-            let revision = match self.command_revision(&id) {
+        for (owner, id, done) in submitted {
+            let applied = self
+                .commands
+                .lock()
+                .unwrap()
+                .get(&key(&owner, &id))
+                .copied();
+            let revision = match applied {
                 Some(revision) => revision,
-                None => self.apply(Some(&id)).revision,
+                None => self.apply(Some((&owner, &id))).revision,
             };
             let _ = done.send(Ack {
                 command: id,
@@ -113,6 +124,15 @@ impl FakeState {
         self.commands.lock().unwrap().clear();
         *self.forgotten.lock().unwrap() = 0;
     }
+}
+
+/// The key of a command in the tables of applied command ids.
+fn key(owner: &Owner, id: &str) -> (String, String, String) {
+    (
+        owner.principal.clone(),
+        owner.session.clone(),
+        id.to_owned(),
+    )
 }
 
 impl ReplicatedState for FakeState {
@@ -154,13 +174,14 @@ impl ReplicatedState for FakeState {
         Box::pin(async move { held.then_some(deltas) })
     }
 
-    fn command_revision(&self, id: &str) -> Option<u64> {
-        self.commands.lock().unwrap().get(id).copied()
+    fn command_revision(&self, owner: &Owner, id: &str) -> Option<u64> {
+        self.commands.lock().unwrap().get(&key(owner, id)).copied()
     }
 
-    fn submit(&self, id: &str, _: Bytes) -> BoxFuture<'_, Result<Ack, NotApplied>> {
+    fn submit(&self, owner: &Owner, id: &str, _: Bytes) -> BoxFuture<'_, Result<Ack, NotApplied>> {
         let (done, ack) = oneshot::channel();
-        self.submitted.lock().unwrap().push((id.to_owned(), done));
+        let command = (owner.clone(), id.to_owned(), done);
+        self.submitted.lock().unwrap().push(command);
         Box::pin(async move { ack.await.map_err(|_| NotApplied("not committed".into())) })
     }
 
