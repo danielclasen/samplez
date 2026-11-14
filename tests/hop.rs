@@ -409,7 +409,12 @@ fn offset() {
     // Past the range and the margin, within the 1 s history.
     std::thread::sleep(SECOND / 2);
     let verdicts: Vec<_> = rx.try_iter().filter(|v| range.contains(&v.k)).collect();
-    assert_eq!(verdicts.len() as u64, range.end - range.start);
+    assert_eq!(
+        verdicts.len() as u64,
+        range.end - range.start,
+        "{}",
+        timing(engine.counters())
+    );
     for v in &verdicts {
         assert_eq!(v.verdict(), samplez::Verdict::Clean, "{v:?}");
         assert_eq!(v.written, 1, "{v:?}");
