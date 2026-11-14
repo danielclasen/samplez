@@ -622,6 +622,27 @@ fn a_command_resent_to_another_replica_is_not_applied_twice() {
     }
 }
 
+/// The futures of a connection's replies are polled in no particular
+/// order, so the order of the submit calls has to be the commit order.
+#[tokio::test]
+async fn commands_commit_in_the_order_they_were_submitted() {
+    let state = FakeState::new("r1", "leader");
+    let commands = Commands::new(state.clone(), 8);
+    let s1 = owner("s1");
+    let (Begin::New(first), Begin::New(second)) =
+        (commands.begin(&s1, "1"), commands.begin(&s1, "2"))
+    else {
+        panic!("both new");
+    };
+    let mut first = pin!(first.submit(command()));
+    let mut second = pin!(second.submit(command()));
+    assert!(second.as_mut().now_or_never().is_none(), "committing");
+    assert!(first.as_mut().now_or_never().is_none(), "committing");
+    state.commit();
+    assert_eq!(first.await.unwrap().revision, 1);
+    assert_eq!(second.await.unwrap().revision, 2);
+}
+
 /// Ids are unique within a session only, such as per-client sequence
 /// numbers.
 #[tokio::test]

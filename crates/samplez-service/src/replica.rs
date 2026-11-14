@@ -91,6 +91,12 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// once, and both submits resolve to the same [`Ack`]. A check before
     /// ordering, such as [`Commands::begin`], cannot give that: both copies
     /// pass it before either is applied.
+    ///
+    /// The calls on one replica fix the order in which their commands are
+    /// committed, before any returned future is polled: a command submitted
+    /// after another is committed after it, also when the replica forwards
+    /// them to the leader. One client's commands, submitted in the order it
+    /// sent them, so commit in that order.
     fn submit(
         &self,
         owner: &Owner,
@@ -182,14 +188,18 @@ pub struct Pending<'a> {
     id: String,
 }
 
-impl Pending<'_> {
-    /// Submits the command to the replicated state; it counts against the
-    /// limit until it resolved.
-    pub async fn submit(self, command: Bytes) -> Result<Ack, NotApplied> {
-        self.commands
-            .state
-            .submit(&self.owner, &self.id, command)
-            .await
+impl<'a> Pending<'a> {
+    /// Submits the command to the replicated state now, not when the
+    /// returned future is first polled, so commands submitted one after
+    /// another commit in that order; it counts against the limit until the
+    /// future resolved or was dropped.
+    pub fn submit(self, command: Bytes) -> BoxFuture<'a, Result<Ack, NotApplied>> {
+        let state: &'a dyn ReplicatedState = &*self.commands.state;
+        let submitted = state.submit(&self.owner, &self.id, command);
+        Box::pin(async move {
+            let _counted = self;
+            submitted.await
+        })
     }
 }
 
