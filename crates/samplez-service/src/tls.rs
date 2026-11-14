@@ -2,7 +2,8 @@
 //!
 //! A task accepts TCP connections and runs each handshake in a task of its
 //! own, bounded by [`HANDSHAKE_TIMEOUT`], so a client that stalls in the
-//! handshake holds up nobody else. In `files` mode the certificate and key
+//! handshake holds up nobody else. At most [`MAX_HANDSHAKES`] run at once;
+//! further connections wait in the listen backlog. In `files` mode the certificate and key
 //! are re-read with the token files and swapped in for new handshakes when
 //! their content changes; a pair that does not parse or does not match
 //! keeps the previous one and counts in
@@ -24,7 +25,7 @@ use rustls::sign::CertifiedKey;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
@@ -34,7 +35,10 @@ use crate::config::{Tls, TlsMode};
 use crate::metrics::{Counter, Metrics};
 
 /// The longest a client may take from connecting to finishing the handshake.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The handshakes one listener runs at once.
+pub const MAX_HANDSHAKES: usize = 256;
 
 /// Handshaken connections waiting for the server to take them.
 const ACCEPTED_QUEUE: usize = 64;
@@ -238,10 +242,15 @@ impl ListenerTls {
 
     /// Starts accepting on `tcp`.
     pub(crate) fn bind(&self, tcp: TcpListener) -> io::Result<TlsListener> {
+        self.listen(tcp, MAX_HANDSHAKES)
+    }
+
+    fn listen(&self, tcp: TcpListener, handshakes: usize) -> io::Result<TlsListener> {
         let local = tcp.local_addr()?;
         let (tx, accepted) = mpsc::channel(ACCEPTED_QUEUE);
         let acceptor = self.acceptor.clone();
-        let task = tokio::spawn(accept_loop(tcp, acceptor, tx));
+        let handshakes = Arc::new(Semaphore::new(handshakes));
+        let task = tokio::spawn(accept_loop(tcp, acceptor, tx, handshakes));
         Ok(TlsListener {
             local,
             accepted,
@@ -292,12 +301,20 @@ async fn accept_loop(
     mut tcp: TcpListener,
     acceptor: TlsAcceptor,
     tx: mpsc::Sender<(TlsStream<TcpStream>, SocketAddr)>,
+    handshakes: Arc<Semaphore>,
 ) {
     loop {
+        let permit = handshakes
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
         let (stream, addr) = axum::serve::Listener::accept(&mut tcp).await;
         let (acceptor, tx) = (acceptor.clone(), tx.clone());
         tokio::spawn(async move {
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+            let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
+            drop(permit);
+            match handshake {
                 Ok(Ok(tls)) => {
                     let _ = tx.send((tls, addr)).await;
                 }
@@ -387,8 +404,12 @@ mod tests {
     }
 
     async fn serve(tls: &ListenerTls) -> SocketAddr {
+        serve_with(tls, MAX_HANDSHAKES).await
+    }
+
+    async fn serve_with(tls: &ListenerTls, handshakes: usize) -> SocketAddr {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let listener = tls.bind(tcp).unwrap();
+        let listener = tls.listen(tcp, handshakes).unwrap();
         let addr = axum::serve::Listener::local_addr(&listener).unwrap();
         let router = Router::new().route("/", routing::get(|| async { "ok" }));
         tokio::spawn(axum::serve(listener, router).into_future());
@@ -563,6 +584,25 @@ mod tests {
             .unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(started.elapsed() < HANDSHAKE_TIMEOUT / 2);
+    }
+
+    #[tokio::test]
+    async fn handshakes_beyond_the_limit_wait_for_a_running_one_to_end() {
+        let (cert, key, der) = write_pair("limit");
+        let tls = listener_tls(&files(&cert, &key), &Metrics::default());
+        let addr = serve_with(&tls, 2).await;
+        let stalled = [
+            TcpStream::connect(addr).await.unwrap(),
+            TcpStream::connect(addr).await.unwrap(),
+        ];
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let client = connector(&[&der], None);
+        let third =
+            tokio::time::timeout(Duration::from_millis(500), get(&client, addr, "localhost")).await;
+        assert!(third.is_err(), "not started while two stall: {third:?}");
+        drop(stalled);
+        let (response, _) = get(&client, addr, "localhost").await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
     #[test]
