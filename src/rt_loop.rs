@@ -4,7 +4,7 @@
 //! Nothing here allocates, frees or drops a libmxl object once the loop
 //! runs. Objects arrive through the command ring and leave through the
 //! return ring; the whole state goes back to the supervisor when the loop
-//! ends.
+//! ends, also when it panics.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -66,6 +66,10 @@ pub struct Counters {
     /// Minor page faults of the RT thread, read by the supervisor.
     pub rt_minor_faults: AtomicU64,
 }
+
+/// Makes the RT loop panic once, for the panic containment test.
+#[cfg(test)]
+pub(crate) static PANIC: AtomicBool = AtomicBool::new(false);
 
 fn add(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Relaxed);
@@ -425,14 +429,31 @@ impl Rt {
     /// for the group timestamp until `T_k`, read, process and write,
     /// `mxlSleepUntil(T_k)`. After a wake, an overdue backlog of up to
     /// `maxCatchupBlocks` is processed in order without waiting, beyond
-    /// that only the newest block. Returns its state when `stop` is set.
-    pub fn run(mut self) -> Self {
+    /// that only the newest block. Returns its state when `stop` is set,
+    /// or when the loop panics, with the panic's message, so that no
+    /// libmxl object is released on the RT thread while it unwinds.
+    pub fn run(mut self) -> (Self, Option<String>) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.blocks()));
+        let message = result.err().map(|p| {
+            p.downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic without a message".to_owned())
+        });
+        (self, message)
+    }
+
+    fn blocks(&mut self) {
         let mut next: Option<u64> = None;
         // libmxl's clock, the CLOCK_MONOTONIC midpoint of the two reads
         // bracketing it and the bracket's width.
         let mut prev: Option<(u64, u64, u64)> = None;
         let period = self.period_ns();
         while !self.stop.load(Relaxed) {
+            #[cfg(test)]
+            if PANIC.swap(false, Relaxed) {
+                panic!("the panic test hook");
+            }
             let m0 = monotonic_ns();
             let now = time::now(&self.api);
             let m1 = monotonic_ns();
@@ -483,7 +504,6 @@ impl Rt {
             self.counters.wake_jitter_max_ns.fetch_max(late, Relaxed);
             next = Some(k + 1);
         }
-        self
     }
 
     /// Waits on each input domain's group for block `k`, until `deadline`.

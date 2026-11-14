@@ -327,8 +327,13 @@ mod tests {
     /// `create_writer` on a flow another writer holds: libmxl opens it with
     /// `was_created == false`, and the writer is released, not adopted.
     /// Against the real libmxl, which the builder image carries.
+    ///
+    /// Also a canary for upstream dmf-mxl/mxl#776: libmxl v1.1.0 leaves
+    /// the `.mxl-tmp-*` directory of the refused create in the domain. The
+    /// assertion on that directory fails once a libmxl with the fix is in
+    /// the builder image.
     #[test]
-    fn an_opened_existing_flow_is_released_as_raced() {
+    fn raced_create_is_released_and_upstream_776_leaves_a_tmp_dir() {
         /// The test domain directory, removed on drop.
         struct Dir(std::path::PathBuf);
         impl Drop for Dir {

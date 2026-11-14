@@ -87,6 +87,10 @@ pub struct Status {
     /// sent: the first gain change that reached the RT thread after its
     /// index.
     pub diverged: Option<String>,
+    /// The message of a panic on the RT thread. The engine then stops
+    /// processing: its state was released on the supervisor and every
+    /// output flow deleted.
+    pub rt_panic: Option<String>,
     pub inputs: Vec<InputStatus>,
     pub outputs: Vec<OutputStatus>,
 }
@@ -272,6 +276,7 @@ impl Engine {
                 thread,
             },
             diverged: None,
+            rt_panic: None,
             inputs: config
                 .inputs
                 .iter()
@@ -516,7 +521,8 @@ fn log(message: std::fmt::Arguments) {
 }
 
 impl Supervisor {
-    fn run(mut self, rt_thread: JoinHandle<Rt>) {
+    fn run(mut self, rt_thread: JoinHandle<(Rt, Option<String>)>) {
+        let mut rt_thread = Some(rt_thread);
         let tid = self.status().rt.thread.tid;
         let mut last_poll = Instant::now();
         let mut last_faults = Instant::now();
@@ -541,13 +547,41 @@ impl Supervisor {
                     self.counters.rt_minor_faults.store(f, Relaxed);
                 }
             }
+            if rt_thread.as_ref().is_some_and(JoinHandle::is_finished) {
+                self.rt_ended(rt_thread.take());
+                break;
+            }
             std::thread::sleep(SUPERVISOR_TICK);
         }
-        // The RT thread sees the same flag. Its state, with every
-        // generation and writer it holds, is released here.
-        drop(rt_thread.join());
+        // The RT thread sees the same flag.
+        self.rt_ended(rt_thread);
+    }
+
+    /// Joins the RT thread and releases its state, with every generation
+    /// and writer it holds, and what it handed back. A panic is recorded
+    /// in the status.
+    fn rt_ended(&mut self, rt_thread: Option<JoinHandle<(Rt, Option<String>)>>) {
+        let Some(t) = rt_thread else { return };
+        let message = match t.join() {
+            Ok((state, message)) => {
+                drop(state);
+                message
+            }
+            Err(_) => Some("the RT thread ended outside its loop".to_owned()),
+        };
         while let Ok(r) = self.ret.pop() {
             release(r);
+        }
+        if let Some(message) = message {
+            log(format_args!(
+                "the RT thread panicked: {message}; processing stopped"
+            ));
+            let mut st = self.status();
+            for o in &mut st.outputs {
+                o.realised = false;
+                o.reason = Some("the RT thread panicked".to_owned());
+            }
+            st.rt_panic = Some(message);
         }
     }
 
@@ -982,6 +1016,52 @@ fn minor_faults(tid: i32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic on the RT thread hands the state back: the supervisor
+    /// releases the writer, which deletes the output flow, and records
+    /// the panic.
+    #[test]
+    fn a_panic_on_the_rt_thread_releases_its_state_on_the_supervisor() {
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-panic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let id = "7fbec3b1-1b0f-417d-9059-8b94a47197ed";
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "domains": [{ "name": "d", "path": domain }],
+            "outputs": [{ "name": "out", "domain": "d", "flowId": id, "label": "panic",
+                          "group": "panic", "role": "Audio", "channels": 1 }],
+            "matrix": [],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let process = rt::setup_process(&config.rt);
+        let engine = Engine::start(config, process, None).unwrap();
+        let wait = |what: &str, f: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !f() {
+                assert!(
+                    t.elapsed() < Duration::from_secs(5),
+                    "timed out waiting for {what}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let flow = domain.join(format!("{id}.mxl-flow"));
+        wait("output realised", &|| engine.status().outputs[0].realised);
+        assert!(flow.exists());
+
+        crate::rt_loop::PANIC.store(true, Relaxed);
+        wait("the panic recorded", &|| engine.status().rt_panic.is_some());
+        let st = engine.status();
+        assert_eq!(st.rt_panic.as_deref(), Some("the panic test hook"));
+        assert!(!st.outputs[0].realised);
+        assert!(!flow.exists(), "the released writer deletes its flow");
+        engine.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
 
     #[test]
     fn a_repeated_failure_is_logged_once_per_text() {
