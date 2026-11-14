@@ -522,7 +522,7 @@ fn two_inputs() {
 /// the last call: every one written, input A copied without a fade, each
 /// sample `0.5 pilot(0, n)`. Blocks between two reported ones are the
 /// loop's overrun skips, zero-filled by libmxl; each is recorded with the
-/// RT timing counters read by the last call that saw verdicts and by the
+/// counters of `timing` read by the last call that saw verdicts and by the
 /// call that saw the skip.
 struct OutputA<'a> {
     domain: &'a Domain,
@@ -535,13 +535,19 @@ struct OutputA<'a> {
     skips: Vec<String>,
 }
 
-/// The RT timing counters that attribute an overrun skip.
+/// The counters that attribute a gap in the verdicts: the RT timing of an
+/// overrun skip, a forward clock step, which skips without a late wake,
+/// and dropped verdicts or telemetry, which look like a skip.
 fn timing(c: &samplez::Counters) -> String {
     format!(
-        "deadline_miss {}, process_time_max {} ns, wake_jitter_max {} ns",
+        "deadline_miss {}, process_time_max {} ns, wake_jitter_max {} ns, \
+         clock_steps {}, telemetry_dropped {}, verdicts_dropped {}",
         c.deadline_miss.load(Relaxed),
         c.process_time_max_ns.load(Relaxed),
-        c.wake_jitter_max_ns.load(Relaxed)
+        c.wake_jitter_max_ns.load(Relaxed),
+        c.clock_steps.load(Relaxed),
+        c.telemetry_dropped.load(Relaxed),
+        c.verdicts_dropped.load(Relaxed)
     )
 }
 
