@@ -46,8 +46,8 @@ pub const PONG_TIMEOUT: Duration = Duration::from_secs(1);
 /// The replies [`serve_client`] waits for on one connection before it stops
 /// reading it. Its pongs then go unread as well, so the time until a reply
 /// is ready does not count against [`PONG_TIMEOUT`], and the connection
-/// stays live in [`Sessions`] meanwhile when it answered within
-/// [`PONG_TIMEOUT`] before. A connection not read for [`MAX_PAUSE`] at
+/// stays live in [`Sessions`] meanwhile when it answered a ping sent
+/// within [`PONG_TIMEOUT`] before. A connection not read for [`MAX_PAUSE`] at
 /// once, or [`MAX_PAUSE_TOTAL`] since the last ping it answered was sent,
 /// ends.
 pub const MAX_PENDING_REPLIES: usize = 64;
@@ -680,7 +680,8 @@ mod tests {
     use super::*;
 
     /// A connection stays registered until its serving loop ends, which
-    /// can be a while after its last pong when the task is not polled.
+    /// can be a while after the last ping it answered was sent when the
+    /// task is not polled.
     #[tokio::test(start_paused = true)]
     async fn a_connection_is_live_only_within_the_pong_timeout() {
         let sessions = Sessions::new("r1").unwrap();
@@ -699,8 +700,9 @@ mod tests {
         assert_eq!(sessions.live(), [owner]);
     }
 
-    /// Paused within the pong timeout of its last pong, a connection stays
-    /// live until the pause ends it; paused later, it is not live.
+    /// Paused within the pong timeout of sending the last ping answered, a
+    /// connection stays live until the pause ends it; paused later, it is
+    /// not live.
     #[tokio::test(start_paused = true)]
     async fn a_paused_connection_is_live_if_it_answered_before_the_pause() {
         let sessions = Sessions::new("r1").unwrap();
@@ -726,10 +728,11 @@ mod tests {
         assert!(sessions.live().is_empty(), "silent for over 1 s before");
     }
 
-    /// Resumed, a connection is live within the pong timeout of the moved
-    /// last pong, and paused again within it, until the new pause ends.
+    /// Resumed, a connection is live within the pong timeout of sending
+    /// the last ping answered, moved on by the pause, and paused again
+    /// within it, until the new pause ends.
     #[tokio::test(start_paused = true)]
-    async fn a_resumed_connection_counts_from_its_moved_last_pong() {
+    async fn a_resumed_connection_counts_from_its_moved_last_ping_answered() {
         let sessions = Sessions::new("r1").unwrap();
         let owner = Owner {
             principal: "anonymous".into(),

@@ -633,7 +633,7 @@ async fn a_client_answering_every_ping_stays_live_through_repeated_pauses() {
 }
 
 /// After a pause the client has its whole pong timeout again, counted from
-/// its last pong as if the pause had not happened.
+/// sending the last ping answered as if the pause had not happened.
 #[tokio::test(start_paused = true)]
 async fn a_pause_does_not_count_against_the_pong_timeout_after_it_ends() {
     let state = FakeState::new("r1", "leader");
@@ -1359,7 +1359,7 @@ impl Sink<Message> for StuckSocket {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_client_that_stops_reading_ends_one_second_after_its_last_pong() {
+async fn a_client_that_stops_reading_ends_one_second_after_it_connected() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, None, 1);
