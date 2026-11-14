@@ -730,8 +730,9 @@ async fn a_pong_that_echoes_no_ping_does_not_count() {
 }
 
 /// An unsolicited pong (RFC 6455 5.5.3) carrying 8 bytes that read as a
-/// number above every ping outstanding does not drop those pings: the
-/// pong that echoes one still counts.
+/// number above every ping outstanding, including the number of the next
+/// ping not yet sent, does not drop those pings: the pong that echoes one
+/// still counts.
 #[tokio::test(start_paused = true)]
 async fn an_unsolicited_pong_does_not_drop_the_pings_outstanding() {
     let state = FakeState::new("r1", "leader");
@@ -741,8 +742,11 @@ async fn an_unsolicited_pong_does_not_drop_the_pings_outstanding() {
     let start = Instant::now();
     while start.elapsed() < 4 * PONG_TIMEOUT {
         if let Message::Ping(p) = client.rx.recv().await.expect("serving") {
-            let unsolicited = Bytes::copy_from_slice(&1_700_000_000_000u64.to_be_bytes());
-            client.tx.send(Ok(Message::Pong(unsolicited))).unwrap();
+            let next = u64::from_be_bytes(p[..].try_into().unwrap()) + 1;
+            for unsolicited in [1_700_000_000_000u64, next] {
+                let unsolicited = Bytes::copy_from_slice(&unsolicited.to_be_bytes());
+                client.tx.send(Ok(Message::Pong(unsolicited))).unwrap();
+            }
             client.tx.send(Ok(Message::Pong(p))).unwrap();
         }
     }
@@ -751,21 +755,23 @@ async fn an_unsolicited_pong_does_not_drop_the_pings_outstanding() {
 }
 
 /// A client may answer only the most recent of several pings (RFC 6455
-/// 5.5.3): answering every other one keeps the connection.
+/// 5.5.3): answering every third one keeps the connection, because
+/// liveness counts from the ping answered, not from the oldest one the
+/// answer drops.
 #[tokio::test(start_paused = true)]
-async fn a_client_answering_every_other_ping_stays_connected() {
+async fn a_client_answering_every_third_ping_stays_connected() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
     let start = Instant::now();
-    let mut skip = true;
+    let mut n = 0u32;
     while start.elapsed() < 4 * PONG_TIMEOUT {
         if let Message::Ping(p) = client.rx.recv().await.expect("serving") {
-            if !skip {
+            if n % 3 == 2 {
                 client.tx.send(Ok(Message::Pong(p))).unwrap();
             }
-            skip = !skip;
+            n += 1;
         }
     }
     assert!(!client.task.is_finished());
