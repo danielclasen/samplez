@@ -466,7 +466,17 @@ fn not_after(cert: &[u8]) -> Option<u64> {
     };
     let field = |n: usize| number(rest + 2 * n..rest + 2 * n + 2);
     let (month, day) = (field(0)?, field(1)?);
-    let seconds = field(2)? * 3600 + field(3)? * 60 + field(4)?;
+    let (hour, minute, second) = (field(2)?, field(3)?, field(4)?);
+    // A leap second is 60.
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let seconds = hour * 3600 + minute * 60 + second;
     // Days since 1970-01-01 in the proleptic Gregorian calendar, after
     // http://howardhinnant.github.io/date_algorithms.html#days_from_civil
     let y = if month <= 2 { year - 1 } else { year };
@@ -876,6 +886,41 @@ mod tests {
             assert_eq!(not_after(cert.der()), Some(expected), "{expiry}");
         }
         assert_eq!(not_after(&[0x30, 0x03, 0x30, 0x01]), None, "truncated");
+    }
+
+    /// A certificate expiring at 2030-01-01T00:00:00Z with the UTCTime of
+    /// its notAfter replaced by `time`, 12 digits and `Z`.
+    fn expiring_at_utc_time(time: &str) -> Vec<u8> {
+        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(1975, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        let mut der = params
+            .self_signed(&KeyPair::generate().unwrap())
+            .unwrap()
+            .der()
+            .to_vec();
+        let at = der.windows(13).position(|w| w == b"300101000000Z").unwrap();
+        der[at..at + 13].copy_from_slice(time.as_bytes());
+        der
+    }
+
+    #[test]
+    fn an_expiry_with_a_field_out_of_range_is_not_read() {
+        for time in [
+            "991399999999Z",
+            "990001000000Z",
+            "991300000000Z",
+            "990100000000Z",
+            "990132000000Z",
+            "991231240000Z",
+            "991231236000Z",
+            "991231235961Z",
+        ] {
+            assert_eq!(not_after(&expiring_at_utc_time(time)), None, "{time}");
+        }
+        let leap = not_after(&expiring_at_utc_time("161231235960Z"));
+        let midnight = rcgen::date_time_ymd(2017, 1, 1).unix_timestamp();
+        assert_eq!(leap, u64::try_from(midnight).ok(), "a leap second");
     }
 
     #[test]
