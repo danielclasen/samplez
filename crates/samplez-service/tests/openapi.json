@@ -1,0 +1,125 @@
+{
+  "components": {
+    "schemas": {
+      "Login": {
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "type": "object"
+      },
+      "Status": {
+        "properties": {
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "scheme": "bearer",
+        "type": "http"
+      },
+      "session": {
+        "in": "cookie",
+        "name": "samplez_session",
+        "type": "apiKey"
+      }
+    }
+  },
+  "info": {
+    "description": "Listeners, auth, ops endpoints and WebSocket fan-out shared by samplez products",
+    "license": {
+      "identifier": "Apache-2.0",
+      "name": "Apache-2.0"
+    },
+    "title": "example",
+    "version": "0.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/login": {
+      "post": {
+        "operationId": "login",
+        "parameters": [
+          {
+            "description": "Must be 1",
+            "in": "header",
+            "name": "X-Samplez-Request",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Login"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Session cookie set for 12 h"
+          },
+          "401": {
+            "description": "Wrong token"
+          },
+          "403": {
+            "description": "Host not allowed or request header missing"
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Exchanges the API token for a session cookie; `token` mode only.",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "operationId": "status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Only the OpenAPI path generated from it is used.",
+        "tags": [
+          "example"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    },
+    {
+      "session": []
+    }
+  ]
+}
