@@ -40,13 +40,20 @@ pub struct Position {
 pub struct Owner {
     /// The user the proxy names, or `anonymous`.
     pub principal: String,
-    /// The client's own session id, stable across its reconnects. The
-    /// client chooses it, so it is not an authenticated identity: any
-    /// client can present another's, and in `none` and `token` mode every
-    /// client has the principal `anonymous`. Grant nothing on it beyond
-    /// what the principal and role already allow.
+    /// The client's own session id, stable across its reconnects: 128
+    /// random bits or more, drawn once per client instance, so two clients
+    /// or two tabs never share one (see [`crate::Service::ws`]); or, for a
+    /// client that sends none, its connection id. The client chooses it,
+    /// so it is not an authenticated identity: any client can present
+    /// another's, and in `none` and `token` mode every client has the
+    /// principal `anonymous`. Grant nothing on it beyond what the principal
+    /// and role already allow; the tables of applied command ids are kept
+    /// per principal and session, so presenting another principal's
+    /// session reaches none of its commands.
     pub session: String,
-    /// `<replica id>:<n>`, unique per connection on a running replica.
+    /// `<replica id>:<nonce>:<n>`: the nonce is 128 random bits drawn when
+    /// the replica's [`crate::Service`] is created, `n` counts its
+    /// connections from 1, so the id does not recur after a restart.
     pub connection: String,
 }
 
@@ -72,9 +79,17 @@ pub trait ReplicatedState: Send + Sync + 'static {
     fn deltas_since(&self, since: Position) -> BoxFuture<'_, Option<Vec<Delta>>>;
 
     /// The revision at which the command with this client-generated id was
-    /// applied for `owner.session`, from the replicated per-session tables
-    /// of applied command ids that snapshots carry; `None` when this replica
-    /// has not applied it.
+    /// applied for `owner.principal` and `owner.session`, from the
+    /// replicated per-session tables of applied command ids that snapshots
+    /// carry; `None` when this replica has not applied it.
+    ///
+    /// A session's table is kept as long as a client may resend a command
+    /// of it that it got no [`Ack`] for, which is longer than the session's
+    /// lease: a client that reconnects after its lease expired resends
+    /// what it did not get answered, and with the table dropped at the
+    /// expiry the resend is applied twice. The service sets no bound on
+    /// that time; the implementation sets the retention after which a
+    /// session's table is dropped, and a resend after it is applied again.
     fn command_revision(&self, owner: &Owner, id: &str) -> Option<u64>;
 
     /// Orders `command`, the product's encoding of it, under the
@@ -82,11 +97,12 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// applied the entry carrying it. The entry carries `owner`, so a
     /// replica forwarding it to the leader passes on who sent it.
     ///
-    /// The state machine dedups by `owner.session` and `id` when it applies
-    /// an entry: an entry whose id the session's table of applied command
-    /// ids holds changes nothing and resolves with the revision the table
-    /// holds. An id is unique within its session only, so the same id from
-    /// two sessions is two commands. A command resent through another
+    /// The state machine dedups by `owner.principal`, `owner.session` and
+    /// `id` when it applies an entry: an entry whose id the table of the
+    /// principal's session holds changes nothing and resolves with the
+    /// revision the table holds. An id is unique within its session only,
+    /// so the same id from two sessions, or from two principals presenting
+    /// the same session, is two commands. A command resent through another
     /// replica while the first copy is still being committed is so applied
     /// once, and both submits resolve to the same [`Ack`]. A check before
     /// ordering, such as [`Commands::begin`], cannot give that: both copies

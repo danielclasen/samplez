@@ -29,6 +29,9 @@ use crate::{Error, config};
 /// How often [`Bound::serve`] passes the live sessions to
 /// [`ReplicatedState::renew_sessions`].
 pub const SESSION_RENEW_PERIOD: Duration = Duration::from_secs(1);
+/// The shortest client session id accepted in `?session=`: 16 bytes in
+/// base64url without padding.
+pub const MIN_SESSION_ID: usize = 22;
 /// The longest client session id accepted in `?session=`.
 pub const MAX_SESSION_ID: usize = 128;
 
@@ -46,8 +49,8 @@ pub struct Connect {
     /// The last position the client saw, from `?since=<epoch>:<revision>`.
     pub since: Option<Position>,
     /// The principal is the proxy's user or `anonymous`; the session is
-    /// `?session=`, or the connection id when absent, and is chosen by the
-    /// client, not authenticated (see [`Owner::session`]).
+    /// `?session=`, chosen by the client and not authenticated, or the
+    /// connection id when absent (see [`Owner::session`]).
     pub owner: Owner,
     /// Where [`crate::ws::serve_client`] keeps the connection while it
     /// answers pings.
@@ -73,6 +76,14 @@ impl Connect {
 struct WsQuery {
     since: Option<String>,
     session: Option<String>,
+}
+
+/// `?session=`: [`MIN_SESSION_ID`] to [`MAX_SESSION_ID`] characters of the
+/// base64url alphabet (RFC 4648 section 5), without padding.
+fn session_id_valid(s: &str) -> bool {
+    (MIN_SESSION_ID..=MAX_SESSION_ID).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn parse_position(s: &str) -> Option<Position> {
@@ -196,10 +207,17 @@ impl Service {
     }
 
     /// Serves WebSocket upgrades at `/api/v1/ws` once auth and the `Origin`
-    /// check pass. `?since=` other than `<epoch>:<revision>`, or a
-    /// `?session=` that is empty or longer than [`MAX_SESSION_ID`], gets
-    /// 400. `?session=` is taken as the client sends it and identifies
-    /// nobody: a client can send another client's session id.
+    /// check pass. `?since=` other than `<epoch>:<revision>` gets 400.
+    ///
+    /// `?session=` is the client's session id, kept across its
+    /// reconnects: at least 16 bytes from a cryptographic random source,
+    /// drawn once per client instance and sent in base64url without
+    /// padding ([`MIN_SESSION_ID`] to [`MAX_SESSION_ID`] characters of
+    /// `A-Z a-z 0-9 - _`). Other values get 400. The service checks the
+    /// encoding and length only, not the randomness. It is taken as the
+    /// client sends it and identifies nobody: a client can send another
+    /// client's session id. Without it the session is the connection id,
+    /// new for every connection.
     pub fn ws<F, Fut>(mut self, handler: F) -> Service
     where
         F: Fn(WebSocket, Connect) -> Fut + Send + Sync + 'static,
@@ -273,7 +291,7 @@ impl Service {
                             };
                             let connection = sessions.connection_id();
                             let session = match query.session {
-                                Some(s) if s.is_empty() || s.len() > MAX_SESSION_ID => {
+                                Some(s) if !session_id_valid(&s) => {
                                     return StatusCode::BAD_REQUEST.into_response();
                                 }
                                 Some(s) => s,

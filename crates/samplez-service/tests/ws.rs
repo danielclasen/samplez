@@ -606,7 +606,7 @@ fn command() -> Bytes {
     Bytes::from_static(b"gain -6")
 }
 
-/// The owner of a command sent by the client with this session.
+/// The owner of a command sent by an `anonymous` client with this session.
 fn owner(session: &str) -> Owner {
     Owner {
         principal: "anonymous".into(),
@@ -704,10 +704,11 @@ fn a_command_resent_to_another_replica_is_not_applied_twice() {
         FakeState::new("a", "leader"),
         FakeState::new("b", "follower"),
     );
-    let applied = a.apply(Some(("s1", "cmd-1")));
-    b.receive(applied.clone(), Some("s1"));
+    let s1 = owner("s1");
+    let applied = a.apply(Some((&s1, "cmd-1")));
+    b.receive(applied.clone(), Some(&s1));
     let on_b = Commands::new(b.clone(), 8);
-    match on_b.begin(&owner("s1"), "cmd-1") {
+    match on_b.begin(&s1, "cmd-1") {
         Begin::Duplicate(ack) => assert_eq!(ack.revision, applied.revision),
         _ => panic!("replica b holds cmd-1 in the replicated table"),
     }
@@ -758,12 +759,44 @@ async fn the_same_id_from_two_sessions_is_two_commands() {
         Begin::Duplicate(ack) => assert_eq!(ack.revision, 2),
         _ => panic!("applied for s2"),
     }
-    state.apply(Some(("s1", "2")));
+    state.apply(Some((&s1, "2")));
     assert!(
         matches!(commands.begin(&s2, "2"), Begin::New(_)),
         "applied for s1 only"
     );
 }
+
+/// The session id is not authenticated: another principal presenting it
+/// must not apply a command the session's own client sends later.
+#[tokio::test]
+async fn another_principal_with_the_same_session_cannot_pre_empt_its_commands() {
+    let state = FakeState::new("r1", "leader");
+    let commands = Commands::new(state.clone(), 8);
+    let session = "kM2pV9xQ4tR7wY1zB6nC3d";
+    let alice = Owner {
+        principal: "alice".into(),
+        ..owner(session)
+    };
+    let mallory = Owner {
+        principal: "mallory".into(),
+        ..owner(session)
+    };
+    let Begin::New(early) = commands.begin(&mallory, "1") else {
+        panic!("new for mallory");
+    };
+    let early = early.submit(command());
+    state.commit();
+    assert_eq!(early.await.unwrap().revision, 1);
+    let Begin::New(own) = commands.begin(&alice, "1") else {
+        panic!("not applied for alice");
+    };
+    let own = own.submit(command());
+    state.commit();
+    assert_eq!(own.await.unwrap().revision, 2, "applied for alice");
+}
+
+/// A client session id: 16 random bytes in base64url without padding.
+const SESSION: &str = "q3Jx-Lh0_9TfWzKcVb2s1A";
 
 #[tokio::test]
 async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
@@ -780,7 +813,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
         move |socket, connect| {
             let (hub, state) = (hub.clone(), state.clone());
             async move {
-                assert_eq!(connect.owner.session, "tab-1");
+                assert_eq!(connect.owner.session, SESSION);
                 assert_eq!(connect.owner.principal, "anonymous");
                 assert!(connect.owner.connection.starts_with("r1:"));
                 let queue = hub.subscribe();
@@ -792,7 +825,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     let addr = bound.api_addr().unwrap();
     let server = tokio::spawn(bound.serve());
 
-    let url = format!("ws://{addr}/api/v1/ws?since=7:2&session=tab-1");
+    let url = format!("ws://{addr}/api/v1/ws?since=7:2&session={SESSION}");
     let mut foreign = url.as_str().into_client_request().unwrap();
     foreign
         .headers_mut()
@@ -801,7 +834,19 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
         Err(tungstenite::Error::Http(res)) => assert_eq!(res.status(), 403),
         other => panic!("foreign Origin accepted: {other:?}"),
     }
-    for bad in ["since=2", "since=7:", "since=%2B7:2", "session="] {
+    let short = &SESSION[1..];
+    let bad = [
+        "since=2".to_owned(),
+        "since=7:".to_owned(),
+        "since=%2B7:2".to_owned(),
+        "session=".to_owned(),
+        "session=tab-1".to_owned(),
+        format!("session={short}"),
+        format!("session={}", &SESSION.repeat(6)[..129]),
+        format!("session={short}%3D"),
+        format!("session={short}."),
+    ];
+    for bad in bad {
         let url = format!("ws://{addr}/api/v1/ws?{bad}");
         match tokio_tungstenite::connect_async(url.as_str()).await {
             Err(tungstenite::Error::Http(res)) => assert_eq!(res.status(), 400, "{bad}"),

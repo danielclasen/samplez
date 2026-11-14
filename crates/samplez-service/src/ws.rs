@@ -261,6 +261,8 @@ impl Hub {
 #[derive(Debug)]
 pub struct Sessions {
     replica: String,
+    /// Random, so connection ids do not recur after a restart.
+    nonce: String,
     next: AtomicU64,
     live: Mutex<HashMap<String, Connection>>,
 }
@@ -273,18 +275,30 @@ struct Connection {
 }
 
 impl Sessions {
-    /// `replica` prefixes the connection ids.
+    /// `replica` prefixes the connection ids, followed by 128 random bits
+    /// drawn here.
+    ///
+    /// # Panics
+    ///
+    /// When the operating system's random source fails.
     pub fn new(replica: &str) -> Sessions {
+        let mut nonce = [0u8; 16];
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(&mut nonce)
+            .expect("the random source failed");
         Sessions {
             replica: replica.to_owned(),
+            nonce: nonce.iter().map(|b| format!("{b:02x}")).collect(),
             next: AtomicU64::new(1),
             live: Mutex::default(),
         }
     }
 
+    /// `<replica id>:<nonce>:<n>`, see [`Owner::connection`].
     pub(crate) fn connection_id(&self) -> String {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
-        format!("{}:{n}", self.replica)
+        format!("{}:{}:{n}", self.replica, self.nonce)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Connection>> {
@@ -581,5 +595,19 @@ mod tests {
         assert!(sessions.live().is_empty(), "silent for over 1 s before");
         sessions.paused(&owner, None);
         assert!(sessions.live().is_empty());
+    }
+
+    /// The connection id is the session of a client that names none, and
+    /// the per-session tables of applied command ids outlive a restart.
+    #[test]
+    fn connection_ids_do_not_recur_after_a_restart() {
+        let before = Sessions::new("r1").connection_id();
+        let after = Sessions::new("r1").connection_id();
+        assert_ne!(before, after);
+        let (replica, rest) = before.split_once(':').unwrap();
+        let (nonce, n) = rest.split_once(':').unwrap();
+        assert_eq!((replica, n), ("r1", "1"));
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }
