@@ -225,8 +225,8 @@ impl Drop for Client {
 }
 
 /// Applies a delta to the state and publishes it, as the product does.
-fn apply(state: &FakeState, hub: &Hub, command: Option<&str>) -> Delta {
-    let d = state.apply(command);
+fn apply(state: &FakeState, hub: &Hub) -> Delta {
+    let d = state.apply(None);
     hub.publish(Frame::Delta(d.clone()));
     d
 }
@@ -236,7 +236,7 @@ async fn connect_catches_up_from_the_last_seen_position() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     for _ in 0..3 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
 
     let mut fresh = Client::connect(&hub, &state, None);
@@ -256,7 +256,7 @@ async fn connect_catches_up_from_the_last_seen_position() {
     let mut stale = Client::connect(&hub, &state, Some((7, 1)));
     assert_eq!(stale.next().await, "snapshot@7:3", "deltas no longer held");
 
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     hub.publish(Frame::Counters("c".into()));
     for client in [
         &mut fresh,
@@ -275,15 +275,15 @@ async fn a_new_epoch_sends_a_snapshot() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     for _ in 0..5 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     let mut client = Client::connect(&hub, &state, Some((7, 5)));
     client.silent().await;
 
     state.reset(8);
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "snapshot@8:1", "revision 1 is below 5");
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "delta@2");
 }
 
@@ -296,7 +296,7 @@ async fn a_gap_in_prev_catches_up_from_the_state() {
 
     state.apply(None);
     state.apply(None);
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "delta@1", "3 names prev 2, not 0");
     assert_eq!(client.next().await, "delta@2");
     assert_eq!(client.next().await, "delta@3");
@@ -307,12 +307,12 @@ async fn a_gap_in_prev_catches_up_from_the_state() {
 async fn a_lagging_replica_skips_what_the_client_saw_on_another() {
     let follower = FakeState::new("r2", "follower");
     let hub = Hub::new(8);
-    apply(&follower, &hub, None);
+    apply(&follower, &hub);
 
     let mut client = Client::connect(&hub, &follower, Some((7, 3)));
     client.silent().await;
     for _ in 0..3 {
-        apply(&follower, &hub, None);
+        apply(&follower, &hub);
     }
     assert_eq!(client.next().await, "delta@4", "2 and 3 skipped");
 }
@@ -324,13 +324,13 @@ async fn overflow_catches_up_from_the_last_sent_revision() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(2);
     for _ in 0..3 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     let mut client = Client::connect(&hub, &state, Some((7, 3)));
     client.silent().await;
 
     for _ in 0..6 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     let mut got = Vec::new();
     for _ in 0..6 {
@@ -341,7 +341,7 @@ async fn overflow_catches_up_from_the_last_sent_revision() {
     client.silent().await;
 
     for _ in 0..3 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     state.forget_through(12);
     assert_eq!(client.next().await, "snapshot@7:12");
@@ -402,7 +402,7 @@ async fn a_slow_reply_keeps_the_heartbeat_and_the_order_of_replies() {
     assert_eq!(client.next().await, "slow done");
     assert_eq!(start.elapsed(), Duration::from_millis(1500));
     assert_eq!(client.next().await, "echo hello", "in the order received");
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "delta@1", "still served");
 }
 
@@ -414,9 +414,9 @@ async fn a_slow_snapshot_keeps_the_heartbeat() {
     assert_eq!(client.next().await, "snapshot@7:0");
     *state.snapshot_delay.lock().unwrap() = Duration::from_millis(1500);
     state.reset(8);
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "snapshot@8:1");
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(client.next().await, "delta@2", "still served");
 }
 
@@ -515,18 +515,28 @@ fn command() -> Bytes {
     Bytes::from_static(b"gain -6")
 }
 
+/// The owner of a command sent by the client with this session.
+fn owner(session: &str) -> Owner {
+    Owner {
+        principal: "anonymous".into(),
+        session: session.into(),
+        connection: "r1:1".into(),
+    }
+}
+
 #[tokio::test]
 async fn commands_apply_once_per_id_from_the_replicated_table() {
     let state = FakeState::new("r1", "leader");
     let commands = Commands::new(state.clone(), 2);
+    let s1 = owner("s1");
 
-    let Begin::New(pending) = commands.begin("c1") else {
+    let Begin::New(pending) = commands.begin(&s1, "c1") else {
         panic!("c1 is new");
     };
     let mut submitted = pin!(pending.submit(command()));
     assert!(submitted.as_mut().now_or_never().is_none(), "committing");
     // The client lost the connection and resent through the same replica.
-    let Begin::New(again) = commands.begin("c1") else {
+    let Begin::New(again) = commands.begin(&s1, "c1") else {
         panic!("not applied yet, so new again");
     };
     let mut resent = pin!(again.submit(command()));
@@ -542,24 +552,24 @@ async fn commands_apply_once_per_id_from_the_replicated_table() {
     );
     assert_eq!(resent.await.unwrap(), ack, "the resend gets the answer too");
     assert_eq!(state.revision(), 1, "applied once");
-    match commands.begin("c1") {
+    match commands.begin(&s1, "c1") {
         Begin::Duplicate(again) => assert_eq!(again, ack),
         _ => panic!("c1 is applied"),
     }
 
-    let Begin::New(rejected) = commands.begin("c2") else {
+    let Begin::New(rejected) = commands.begin(&s1, "c2") else {
         panic!("c2 is new");
     };
     drop(rejected);
     assert!(
-        matches!(commands.begin("c2"), Begin::New(_)),
+        matches!(commands.begin(&s1, "c2"), Begin::New(_)),
         "a rejected command may be resent"
     );
 
-    let _a = commands.begin("a");
-    let _b = commands.begin("b");
+    let _a = commands.begin(&s1, "a");
+    let _b = commands.begin(&s1, "b");
     assert!(
-        matches!(commands.begin("c"), Begin::Busy),
+        matches!(commands.begin(&s1, "c"), Begin::Busy),
         "two in flight at most"
     );
 }
@@ -573,12 +583,13 @@ async fn a_command_resent_through_another_replica_while_pending_applies_once() {
         Commands::new(state.clone(), 8),
         Commands::new(state.clone(), 8),
     );
-    let Begin::New(a) = on_a.begin("cmd-1") else {
+    let s1 = owner("s1");
+    let Begin::New(a) = on_a.begin(&s1, "cmd-1") else {
         panic!("cmd-1 is new on a");
     };
     let mut first = pin!(a.submit(command()));
     assert!(first.as_mut().now_or_never().is_none(), "committing");
-    let Begin::New(b) = on_b.begin("cmd-1") else {
+    let Begin::New(b) = on_b.begin(&s1, "cmd-1") else {
         panic!("not applied yet, so new on b as well");
     };
     let mut second = pin!(b.submit(command()));
@@ -602,13 +613,44 @@ fn a_command_resent_to_another_replica_is_not_applied_twice() {
         FakeState::new("a", "leader"),
         FakeState::new("b", "follower"),
     );
-    let applied = a.apply(Some("cmd-1"));
-    b.receive(applied.clone());
+    let applied = a.apply(Some(("s1", "cmd-1")));
+    b.receive(applied.clone(), Some("s1"));
     let on_b = Commands::new(b.clone(), 8);
-    match on_b.begin("cmd-1") {
+    match on_b.begin(&owner("s1"), "cmd-1") {
         Begin::Duplicate(ack) => assert_eq!(ack.revision, applied.revision),
         _ => panic!("replica b holds cmd-1 in the replicated table"),
     }
+}
+
+/// Ids are unique within a session only, such as per-client sequence
+/// numbers.
+#[tokio::test]
+async fn the_same_id_from_two_sessions_is_two_commands() {
+    let state = FakeState::new("r1", "leader");
+    let commands = Commands::new(state.clone(), 8);
+    let (s1, s2) = (owner("s1"), owner("s2"));
+    let Begin::New(first) = commands.begin(&s1, "1") else {
+        panic!("new for s1");
+    };
+    let Begin::New(second) = commands.begin(&s2, "1") else {
+        panic!("new for s2");
+    };
+    let mut first = pin!(first.submit(command()));
+    let mut second = pin!(second.submit(command()));
+    assert!(first.as_mut().now_or_never().is_none(), "committing");
+    assert!(second.as_mut().now_or_never().is_none(), "committing");
+    state.commit();
+    assert_eq!(first.await.unwrap().revision, 1);
+    assert_eq!(second.await.unwrap().revision, 2, "applied as well");
+    match commands.begin(&s2, "1") {
+        Begin::Duplicate(ack) => assert_eq!(ack.revision, 2),
+        _ => panic!("applied for s2"),
+    }
+    state.apply(Some(("s1", "2")));
+    assert!(
+        matches!(commands.begin(&s2, "2"), Begin::New(_)),
+        "applied for s1 only"
+    );
 }
 
 #[tokio::test]
@@ -616,7 +658,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     let state = FakeState::new("r1", "leader");
     let hub = Arc::new(Hub::new(8));
     for _ in 0..3 {
-        apply(&state, &hub, None);
+        apply(&state, &hub);
     }
     let mut config = config("none", "loopback");
     let loopback = serde_json::json!({ "bind": "127.0.0.1", "port": 0 });
@@ -667,7 +709,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
         }
     };
     assert_eq!(next().await, "delta@3");
-    apply(&state, &hub, None);
+    apply(&state, &hub);
     assert_eq!(next().await, "delta@4");
     server.abort();
 }

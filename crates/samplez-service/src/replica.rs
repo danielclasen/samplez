@@ -72,22 +72,31 @@ pub trait ReplicatedState: Send + Sync + 'static {
     fn deltas_since(&self, since: Position) -> BoxFuture<'_, Option<Vec<Delta>>>;
 
     /// The revision at which the command with this client-generated id was
-    /// applied, from the replicated table of applied command ids that
-    /// snapshots carry; `None` when this replica has not applied it.
-    fn command_revision(&self, id: &str) -> Option<u64>;
+    /// applied for `owner.session`, from the replicated per-session tables
+    /// of applied command ids that snapshots carry; `None` when this replica
+    /// has not applied it.
+    fn command_revision(&self, owner: &Owner, id: &str) -> Option<u64>;
 
     /// Orders `command`, the product's encoding of it, under the
-    /// client-generated `id`, and resolves once this replica has applied
-    /// the entry carrying it.
+    /// client-generated `id` for `owner`, and resolves once this replica has
+    /// applied the entry carrying it. The entry carries `owner`, so a
+    /// replica forwarding it to the leader passes on who sent it.
     ///
-    /// The state machine dedups by id when it applies an entry: an entry
-    /// whose id the replicated table of applied command ids holds changes
-    /// nothing and resolves with the revision the table holds. A command
-    /// resent through another replica while the first copy is still being
-    /// committed is so applied once, and both submits resolve to the same
-    /// [`Ack`]. A check before ordering, such as [`Commands::begin`], cannot
-    /// give that: both copies pass it before either is applied.
-    fn submit(&self, id: &str, command: Bytes) -> BoxFuture<'_, Result<Ack, NotApplied>>;
+    /// The state machine dedups by `owner.session` and `id` when it applies
+    /// an entry: an entry whose id the session's table of applied command
+    /// ids holds changes nothing and resolves with the revision the table
+    /// holds. An id is unique within its session only, so the same id from
+    /// two sessions is two commands. A command resent through another
+    /// replica while the first copy is still being committed is so applied
+    /// once, and both submits resolve to the same [`Ack`]. A check before
+    /// ordering, such as [`Commands::begin`], cannot give that: both copies
+    /// pass it before either is applied.
+    fn submit(
+        &self,
+        owner: &Owner,
+        id: &str,
+        command: Bytes,
+    ) -> BoxFuture<'_, Result<Ack, NotApplied>>;
 
     /// Called about once per second by [`crate::Bound::serve`] with the
     /// owners whose connection to this replica answered a ping within the
@@ -124,7 +133,7 @@ pub enum Begin<'a> {
     Busy,
 }
 
-/// Answers a command that was applied already from the replicated table of
+/// Answers a command that was applied already from its session's table of
 /// applied command ids, and limits the commands being submitted from this
 /// replica at once.
 pub struct Commands {
@@ -143,8 +152,8 @@ impl Commands {
         }
     }
 
-    pub fn begin(&self, id: &str) -> Begin<'_> {
-        if let Some(revision) = self.state.command_revision(id) {
+    pub fn begin(&self, owner: &Owner, id: &str) -> Begin<'_> {
+        if let Some(revision) = self.state.command_revision(owner, id) {
             return Begin::Duplicate(Ack {
                 command: id.to_owned(),
                 revision,
@@ -157,6 +166,7 @@ impl Commands {
         *in_flight += 1;
         Begin::New(Pending {
             commands: self,
+            owner: owner.clone(),
             id: id.to_owned(),
         })
     }
@@ -168,6 +178,7 @@ impl Commands {
 
 pub struct Pending<'a> {
     commands: &'a Commands,
+    owner: Owner,
     id: String,
 }
 
@@ -175,7 +186,10 @@ impl Pending<'_> {
     /// Submits the command to the replicated state; it counts against the
     /// limit until it resolved.
     pub async fn submit(self, command: Bytes) -> Result<Ack, NotApplied> {
-        self.commands.state.submit(&self.id, command).await
+        self.commands
+            .state
+            .submit(&self.owner, &self.id, command)
+            .await
     }
 }
 
