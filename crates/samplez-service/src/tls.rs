@@ -45,7 +45,8 @@ use crate::metrics::{Counter, Metrics};
 /// The longest a client may take from connecting to finishing the handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The handshakes one listener runs at once.
+/// The handshakes one listener runs at once, counting finished ones whose
+/// connection the server has not taken yet.
 pub const MAX_HANDSHAKES: usize = 256;
 
 /// How long a `selfSigned` certificate is valid, starting an hour before
@@ -352,12 +353,12 @@ impl ListenerTls {
 
     /// Starts accepting on `tcp`.
     pub(crate) fn bind(&self, tcp: TcpListener) -> io::Result<TlsListener> {
-        self.listen(tcp, MAX_HANDSHAKES)
+        self.listen(tcp, MAX_HANDSHAKES, ACCEPTED_QUEUE)
     }
 
-    fn listen(&self, tcp: TcpListener, handshakes: usize) -> io::Result<TlsListener> {
+    fn listen(&self, tcp: TcpListener, handshakes: usize, queue: usize) -> io::Result<TlsListener> {
         let local = tcp.local_addr()?;
-        let (tx, accepted) = mpsc::channel(ACCEPTED_QUEUE);
+        let (tx, accepted) = mpsc::channel(queue);
         let handshakes = Arc::new(Semaphore::new(handshakes));
         let task = tokio::spawn(accept_loop(tcp, self.config.clone(), tx, handshakes));
         Ok(TlsListener {
@@ -534,7 +535,6 @@ async fn accept_loop(
         let tx = tx.clone();
         tokio::spawn(async move {
             let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
-            drop(permit);
             match handshake {
                 Ok(Ok(tls)) => {
                     let _ = tx.send((tls, addr)).await;
@@ -542,6 +542,9 @@ async fn accept_loop(
                 Ok(Err(e)) => tracing::debug!(%addr, error = %e, "TLS handshake failed"),
                 Err(_) => tracing::debug!(%addr, "TLS handshake timed out"),
             }
+            // Only now: a connection waiting to be taken holds its TLS
+            // state, so it counts against the limit as well.
+            drop(permit);
         });
     }
 }
@@ -630,7 +633,7 @@ mod tests {
 
     async fn serve_with(tls: &ListenerTls, handshakes: usize) -> SocketAddr {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let listener = tls.listen(tcp, handshakes).unwrap();
+        let listener = tls.listen(tcp, handshakes, ACCEPTED_QUEUE).unwrap();
         let addr = axum::serve::Listener::local_addr(&listener).unwrap();
         let router = Router::new().route("/", routing::get(|| async { "ok" }));
         tokio::spawn(axum::serve(listener, router).into_future());
@@ -1015,6 +1018,31 @@ mod tests {
         drop(stalled);
         let (response, _) = get(&client, addr, "localhost").await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn connections_waiting_to_be_taken_count_against_the_handshake_limit() {
+        let (cert, key, der) = write_pair("untaken");
+        let tls = listener_tls(&files(&cert, &key), &Metrics::default());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Nothing takes the connections: one fits the queue, one handshake
+        // runs.
+        let listener = tls.listen(tcp, 1, 1).unwrap();
+        let addr = axum::serve::Listener::local_addr(&listener).unwrap();
+        let client = connector(&[&der], None);
+        let handshake = || async {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            client.connect(name, tcp).await
+        };
+        let mut open = Vec::new();
+        for _ in 0..2 {
+            let connected = tokio::time::timeout(LIMIT, handshake()).await;
+            open.push(connected.expect("within 5 s").expect("handshaken"));
+        }
+        let third = tokio::time::timeout(Duration::from_millis(500), handshake()).await;
+        assert!(third.is_err(), "not started: {third:?}");
+        drop(listener);
     }
 
     #[test]
