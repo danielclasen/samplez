@@ -75,16 +75,17 @@ pub struct TlsStatus {
     /// generation.
     pub loaded_at: u64,
     /// Seconds since the Unix epoch at which the certificate in use
-    /// expires.
-    pub not_after: u64,
+    /// expires; `null` when its notAfter could not be read, such as one
+    /// before 1970 or not in the form RFC 5280 requires.
+    pub not_after: Option<u64>,
 }
 
 /// A certificate with its key, and when it expires.
 #[derive(Debug, Clone)]
 struct Presented {
     key: Arc<CertifiedKey>,
-    /// Seconds since the Unix epoch.
-    not_after: u64,
+    /// Seconds since the Unix epoch, `None` when unreadable.
+    not_after: Option<u64>,
 }
 
 /// The certificate presented to new handshakes.
@@ -222,7 +223,7 @@ impl ListenerTls {
             listener,
             mode = ?tls.mode,
             fingerprint = %tls.fingerprint(),
-            not_after = tls.resolver.get().not_after,
+            not_after = %shown(tls.resolver.get().not_after),
             "certificate in use"
         );
         Ok(Some(tls))
@@ -281,7 +282,7 @@ impl ListenerTls {
                     tracing::info!(
                         listener = self.listener,
                         fingerprint = %self.fingerprint(),
-                        not_after,
+                        not_after = %shown(not_after),
                         "certificate changed"
                     );
                     return Ok(());
@@ -294,7 +295,11 @@ impl ListenerTls {
 
     fn renew_self_signed(&self, now: u64) -> Result<(), Error> {
         if self.mode != TlsMode::SelfSigned
-            || self.resolver.get().not_after > now + SELF_SIGNED_RENEWAL.as_secs()
+            || self
+                .resolver
+                .get()
+                .not_after
+                .is_some_and(|t| t > now + SELF_SIGNED_RENEWAL.as_secs())
         {
             return Ok(());
         }
@@ -305,7 +310,7 @@ impl ListenerTls {
         tracing::info!(
             listener = self.listener,
             fingerprint = %self.fingerprint(),
-            not_after,
+            not_after = %shown(not_after),
             "generated a new self-signed certificate"
         );
         Ok(())
@@ -417,7 +422,14 @@ fn certs(pem: &[u8], path: &Path) -> Result<Vec<CertificateDer<'static>>, Error>
     Ok(certs)
 }
 
-/// Fails when the key does not belong to the first certificate.
+/// An expiry for the log: seconds since the Unix epoch, or `unknown`.
+fn shown(not_after: Option<u64>) -> String {
+    not_after.map_or_else(|| "unknown".to_owned(), |t| t.to_string())
+}
+
+/// Fails when the key does not belong to the first certificate. A
+/// certificate whose notAfter cannot be read is loaded with an unknown
+/// expiry: rustls does not need it.
 fn certified_key(
     (cert, key): &(Vec<u8>, Vec<u8>),
     cert_path: &Path,
@@ -425,7 +437,7 @@ fn certified_key(
 ) -> Result<Presented, Error> {
     let chain = certs(cert, cert_path)?;
     let config = |e: &dyn std::fmt::Display| Error::Config(format!("{}: {e}", cert_path.display()));
-    let not_after = not_after(&chain[0]).ok_or_else(|| config(&"no readable validity"))?;
+    let not_after = not_after(&chain[0]);
     let key =
         PrivateKeyDer::from_pem_slice(key).map_err(|e| Error::Config(format!("TLS key: {e}")))?;
     let key = CertifiedKey::from_der(chain, key, provider).map_err(|e| config(&e))?;
@@ -518,7 +530,7 @@ fn self_signed(sans: &[String], provider: &CryptoProvider) -> Result<Presented, 
     // Apple platforms refuse a TLS server certificate without it.
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let signing_key = rcgen::KeyPair::generate().map_err(|e| failed(&e))?;
-    let not_after = u64::try_from(params.not_after.unix_timestamp()).map_err(|e| failed(&e))?;
+    let not_after = Some(u64::try_from(params.not_after.unix_timestamp()).map_err(|e| failed(&e))?);
     let cert = params.self_signed(&signing_key).map_err(|e| failed(&e))?;
     let key = PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
     let key =
@@ -719,7 +731,8 @@ mod tests {
         let status = tls.status();
         assert_eq!(status.fingerprint, fingerprint_of(&der));
         assert_eq!(
-            status.not_after, 67_090_118_400,
+            status.not_after,
+            Some(67_090_118_400),
             "4096-01-01, rcgen's default"
         );
     }
@@ -843,7 +856,7 @@ mod tests {
         assert!(valid_at(start + SELF_SIGNED_VALIDITY - hour - minute));
         assert!(!valid_at(start + SELF_SIGNED_VALIDITY), "expired");
         let expiry = (start + SELF_SIGNED_VALIDITY - hour).as_secs();
-        assert!(tls.status().not_after.abs_diff(expiry) <= 1);
+        assert!(tls.status().not_after.unwrap().abs_diff(expiry) <= 1);
     }
 
     #[test]
@@ -855,7 +868,7 @@ mod tests {
         };
         let tls = listener_tls(&config, &Metrics::default());
         let first = tls.status();
-        let renewal = first.not_after - SELF_SIGNED_RENEWAL.as_secs();
+        let renewal = first.not_after.unwrap() - SELF_SIGNED_RENEWAL.as_secs();
         let nothing = |_: &Path| -> Result<Vec<u8>, Error> { panic!("no file to read") };
         tls.reload_with(renewal - 1, nothing).unwrap();
         assert_eq!(tls.status(), first, "a second before");
@@ -902,6 +915,29 @@ mod tests {
         let at = der.windows(13).position(|w| w == b"300101000000Z").unwrap();
         der[at..at + 13].copy_from_slice(time.as_bytes());
         der
+    }
+
+    /// rustls loads a certificate whatever its notAfter holds, and so does
+    /// the listener, with the expiry unknown.
+    #[test]
+    fn a_certificate_whose_expiry_cannot_be_read_is_loaded() {
+        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(1955, 1, 1);
+        params.not_after = rcgen::date_time_ymd(1960, 1, 1);
+        let signing_key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&signing_key).unwrap();
+        assert_eq!(not_after(cert.der()), None, "before 1970");
+        let (cert_path, key_path) = (dir().join("unread.crt"), dir().join("unread.key"));
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+        let tls = listener_tls(&files(&cert_path, &key_path), &Metrics::default());
+        let status = tls.status();
+        assert_eq!(status.fingerprint, fingerprint_of(cert.der()));
+        assert_eq!(status.not_after, None);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["notAfter"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
