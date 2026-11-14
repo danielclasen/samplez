@@ -187,8 +187,8 @@ impl Client {
         let wait = async {
             loop {
                 match self.rx.recv().await.expect("serving") {
-                    Message::Ping(_) if self.pong => {
-                        let _ = self.tx.send(Ok(Message::Pong(Bytes::new())));
+                    Message::Ping(p) if self.pong => {
+                        let _ = self.tx.send(Ok(Message::Pong(p)));
                     }
                     Message::Ping(_) => {}
                     other => return other,
@@ -613,8 +613,8 @@ async fn a_client_answering_every_ping_stays_live_through_repeated_pauses() {
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             loop {
                 match client.rx.recv().await {
-                    Some(Message::Ping(_)) => {
-                        let _ = client.tx.send(Ok(Message::Pong(Bytes::new())));
+                    Some(Message::Ping(p)) => {
+                        let _ = client.tx.send(Ok(Message::Pong(p)));
                     }
                     Some(Message::Text(_)) => replies += 1,
                     Some(_) => {}
@@ -658,6 +658,97 @@ async fn a_pause_does_not_count_against_the_pong_timeout_after_it_ends() {
     assert_eq!(client.ended().await, Ended::PongTimeout);
     assert_eq!(start.elapsed(), resumed + PONG_TIMEOUT);
     assert!(sessions.live().is_empty());
+}
+
+/// A client answering every ping, each pong queued behind another limit's
+/// worth of messages, that then stops: the pongs it left wait unread
+/// through the backlog, and each one read counts from when its ping was
+/// sent, so the backlog does not keep the gone peer live.
+#[tokio::test(start_paused = true)]
+async fn pongs_left_behind_a_backlog_do_not_keep_a_gone_peer_live() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let start = Instant::now();
+    let mut last_ping = start;
+    while start.elapsed() < Duration::from_secs(2) {
+        if let Message::Ping(p) = client.rx.recv().await.expect("serving") {
+            for n in 0..MAX_PENDING_REPLIES {
+                let slow = format!("slow {n}");
+                client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
+            }
+            client.tx.send(Ok(Message::Pong(p))).unwrap();
+            last_ping = Instant::now();
+        }
+    }
+    let bound = last_ping + PONG_TIMEOUT + MAX_PAUSE_TOTAL;
+    let mut last_live = None;
+    while !client.task.is_finished() && start.elapsed() < Duration::from_secs(30) {
+        if !sessions.live().is_empty() {
+            last_live = Some(Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(client.task.is_finished(), "still served after 30 s");
+    assert!(
+        last_live.is_none_or(|t| t <= bound),
+        "live {:?} after the last ping answered, at {:?}",
+        last_live.map(|t| t - last_ping),
+        last_ping - start,
+    );
+}
+
+/// A pong counts only when it echoes a ping's payload: an empty or made-up
+/// one does not keep the connection.
+#[tokio::test(start_paused = true)]
+async fn a_pong_that_echoes_no_ping_does_not_count() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    client.pong = false;
+    let start = Instant::now();
+    let answer = async {
+        loop {
+            match client.rx.recv().await {
+                Some(Message::Ping(_)) => {
+                    let _ = client.tx.send(Ok(Message::Pong(Bytes::new())));
+                    let forged = Bytes::copy_from_slice(&u64::MAX.to_be_bytes());
+                    let _ = client.tx.send(Ok(Message::Pong(forged)));
+                }
+                Some(Message::Close(_)) | None => break,
+                Some(_) => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), answer)
+        .await
+        .expect("closed");
+    assert_eq!(client.ended().await, Ended::PongTimeout);
+    assert_eq!(start.elapsed(), PONG_TIMEOUT);
+}
+
+/// A client may answer only the most recent of several pings (RFC 6455
+/// 5.5.3): answering every other one keeps the connection.
+#[tokio::test(start_paused = true)]
+async fn a_client_answering_every_other_ping_stays_connected() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let start = Instant::now();
+    let mut skip = true;
+    while start.elapsed() < 4 * PONG_TIMEOUT {
+        if let Message::Ping(p) = client.rx.recv().await.expect("serving") {
+            if !skip {
+                client.tx.send(Ok(Message::Pong(p))).unwrap();
+            }
+            skip = !skip;
+        }
+    }
+    assert!(!client.task.is_finished());
+    assert_eq!(sessions.live().len(), 1);
 }
 
 /// Yields what the client sends and takes messages at once, except
