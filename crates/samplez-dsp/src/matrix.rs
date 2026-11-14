@@ -177,12 +177,25 @@ impl Matrix {
                     Path::Avx2 => unsafe { simd::mix_avx2(terms, input, out) },
                 },
             }
-            for t in col.iter_mut() {
-                t.ramp.advance(frames);
-            }
-            col.retain(|t| t.ramp.is_active() || t.ramp.target != 0.0);
+            advance_column(col, frames);
         }
     }
+
+    /// Moves every coefficient ramp `frames` samples on without mixing,
+    /// as [`Matrix::process`] over `frames` frames does. Keeps ramp
+    /// positions on the sample timeline over frames that are not mixed.
+    pub fn advance(&mut self, frames: usize) {
+        for col in &mut self.columns {
+            advance_column(col, frames);
+        }
+    }
+}
+
+fn advance_column(col: &mut Vec<Term>, frames: usize) {
+    for t in col.iter_mut() {
+        t.ramp.advance(frames);
+    }
+    col.retain(|t| t.ramp.is_active() || t.ramp.target != 0.0);
 }
 
 /// Scalar reference for one output, from sample `start` to the end of
@@ -286,6 +299,25 @@ mod tests {
             }
             restore_mxcsr(saved);
         }
+    }
+
+    #[test]
+    fn advance_moves_ramps_as_process_does() {
+        let mut rng = Rng::new(7);
+        let mut a = Matrix::new(3, 2);
+        assert!(a.set(0, 0, 0.8, 1000));
+        assert!(a.set(2, 1, -0.5, 300));
+        assert!(a.set(1, 1, 0.25, 0));
+        let mut b = a.clone();
+        let mut input = PlanarBuffer::new(3, CAP);
+        let (mut out_a, mut out_b) = (PlanarBuffer::new(2, CAP), PlanarBuffer::new(2, CAP));
+        fill(&mut rng, &mut input, CAP);
+        a.process(&input, &mut out_a, 400);
+        b.advance(400);
+        assert_eq!(a, b);
+        a.process(&input, &mut out_a, CAP);
+        b.process(&input, &mut out_b, CAP);
+        assert_bits_eq(&out_a, &out_b, CAP, "after advance");
     }
 
     #[test]
