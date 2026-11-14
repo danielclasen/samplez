@@ -12,8 +12,8 @@ use common::*;
 use futures_util::{FutureExt, Sink, Stream, StreamExt};
 use samplez_service::replica::{Ack, Begin, Commands};
 use samplez_service::ws::{
-    ClientQueue, Delta, Ended, Frame, Hub, MAX_PENDING_REPLIES, PONG_TIMEOUT, Popped, Pushed,
-    Sessions, serve_client,
+    ClientQueue, Delta, Ended, Frame, Hub, MAX_PAUSE, MAX_PENDING_REPLIES, PONG_TIMEOUT, Popped,
+    Pushed, Sessions, serve_client,
 };
 use samplez_service::{Connect, Forbidden, Identity, Ops, Owner, Position, ReplicatedState, Role};
 use tokio::sync::mpsc;
@@ -485,6 +485,39 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(calls.load(Ordering::Relaxed), MAX_PENDING_REPLIES);
     task.abort();
+}
+
+/// Replies that never resolve, to a client that never answers a ping: a
+/// peer that is gone is not held for as long as the replies hang.
+#[tokio::test(start_paused = true)]
+async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
+    let state = FakeState::new("r1", "leader");
+    let sessions = Arc::new(Sessions::new("r1"));
+    let connect = connect(&sessions, Role::Operator, None, 1);
+    let queue = Hub::new(8).subscribe();
+    let (to_client, _rx) = mpsc::unbounded_channel();
+    let (tx, from_client) = mpsc::unbounded_channel();
+    let start = Instant::now();
+    let task = tokio::spawn(async move {
+        let socket = ChannelSocket {
+            to_client,
+            from_client,
+        };
+        serve_client(socket, &connect, &queue, &*state, |_| {
+            std::future::pending::<Option<Message>>()
+        })
+        .await
+    });
+    for _ in 0..MAX_PENDING_REPLIES {
+        tx.send(Ok(Message::Text("never answered".into()))).unwrap();
+    }
+    let ended = tokio::time::timeout(MAX_PAUSE + Duration::from_secs(1), task)
+        .await
+        .expect("ended")
+        .unwrap();
+    assert_eq!(ended, Ended::Failed);
+    assert_eq!(start.elapsed(), MAX_PAUSE);
+    assert!(sessions.live().is_empty());
 }
 
 #[tokio::test(start_paused = true)]

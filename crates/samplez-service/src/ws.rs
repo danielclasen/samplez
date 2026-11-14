@@ -35,9 +35,22 @@ pub const PONG_TIMEOUT: Duration = Duration::from_secs(1);
 /// The replies [`serve_client`] waits for on one connection before it stops
 /// reading it. Its pongs then go unread as well, so the time until a reply
 /// is ready does not count against [`PONG_TIMEOUT`], and the connection is
-/// not renewed in [`Sessions`] meanwhile. [`ReplicatedState::submit`] has to
-/// resolve in bounded time for the connection to be read again.
+/// not renewed in [`Sessions`] meanwhile. A connection not read for
+/// [`MAX_PAUSE`] ends.
 pub const MAX_PENDING_REPLIES: usize = 64;
+/// How long [`serve_client`] goes without reading a connection that has
+/// [`MAX_PENDING_REPLIES`] replies outstanding before it ends it as
+/// [`Ended::Failed`]. Without a bound, replies that never resolve would hold
+/// a peer that is gone, and its place in [`crate::replica::Commands`], for
+/// as long as they hang.
+///
+/// 2 s: the replication is sized to commit again within about 1 s of losing
+/// its leader (two election rounds of 300 ms, the 50 ms apply lead cap and
+/// three pages), so a reply waiting through one failover resolves within
+/// half of it; and 2 s is how long a session lease lasts without renewal,
+/// so a peer that is gone holds its touch ownership no longer than it would
+/// after a lost connection.
+pub const MAX_PAUSE: Duration = Duration::from_secs(2);
 
 /// A state change at a global revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,8 +313,9 @@ pub enum Ended {
     /// No pong within [`PONG_TIMEOUT`], not counting the time the connection
     /// was not read at [`MAX_PENDING_REPLIES`]; a close frame was sent.
     PongTimeout,
-    /// Sending or receiving failed, or a send did not finish within
-    /// [`PONG_TIMEOUT`] of the last pong, counted the same way.
+    /// Sending or receiving failed, a send did not finish within
+    /// [`PONG_TIMEOUT`] of the last pong, counted the same way, or the
+    /// connection was not read for [`MAX_PAUSE`] at [`MAX_PENDING_REPLIES`].
     Failed,
 }
 
@@ -365,7 +379,8 @@ async fn send<T: Sink<Message> + Unpin>(
 /// that must follow the order of the messages belongs in the call itself,
 /// before the future. With [`MAX_PENDING_REPLIES`] replies outstanding the
 /// connection is not read, pongs included, until one is ready, and that
-/// time does not count against the client's [`PONG_TIMEOUT`]. A catch-up
+/// time does not count against the client's [`PONG_TIMEOUT`]; when none is
+/// ready within [`MAX_PAUSE`], the connection ends. A catch-up
 /// runs beside the heartbeat as well, with `queue` waiting for it.
 pub async fn serve_client<S, E, F, Fut>(
     socket: S,
@@ -409,7 +424,13 @@ where
                 }
                 _ => {}
             }
+            let pause_end = paused.map(|since| since + MAX_PAUSE);
             let out: Vec<Message> = tokio::select! {
+                _ = tokio::time::sleep_until(pause_end.unwrap_or_else(Instant::now)),
+                    if pause_end.is_some() =>
+                {
+                    return Ended::Failed;
+                }
                 _ = ping.tick() => {
                     let deadline = pong_deadline(answered, paused);
                     if Instant::now() >= deadline {
