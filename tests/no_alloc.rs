@@ -35,7 +35,9 @@ fn count() {
     if tid == 0 || unsafe { libc::gettid() } != tid || CAPTURING.get() {
         return;
     }
-    if RT_CALLS.fetch_add(1, Relaxed) == 0 {
+    // A panicking thread holds the backtrace lock already: capturing here
+    // would deadlock instead of failing.
+    if RT_CALLS.fetch_add(1, Relaxed) == 0 && !std::thread::panicking() {
         CAPTURING.set(true);
         let _ = FIRST_RT_CALL.set(Backtrace::force_capture());
         CAPTURING.set(false);
@@ -108,7 +110,9 @@ fn rt_thread_allocates_nothing() {
     assert!(
         calls == 0,
         "{calls} allocator calls on the RT thread, the first from:\n{}",
-        FIRST_RT_CALL.get().expect("captured with the first call")
+        FIRST_RT_CALL
+            .get()
+            .map_or_else(|| "not captured".into(), ToString::to_string)
     );
     common::stop(engine);
 }
