@@ -426,7 +426,8 @@ fn pong_deadline(answered: Instant, paused: Option<Instant>) -> Instant {
 }
 
 /// Sends `message`, giving up at `deadline`, the client's
-/// [`pong_deadline`]: a client that stopped reading is not waited for.
+/// [`pong_deadline`] or, while the connection is not read, the end of the
+/// pause if sooner: a client that stopped reading is not waited for.
 async fn send<T: Sink<Message> + Unpin>(
     tx: &mut T,
     message: Message,
@@ -539,6 +540,10 @@ where
                     paused = Some((since, end));
                     sessions.paused(owner, since, end);
                 }
+                // Ended even with a reply ready: one ready at the instant
+                // the pause ends can win the select over the end, and a
+                // send can finish at the end.
+                Some((_, end)) if !at_limit && Instant::now() >= end => return Ended::Failed,
                 Some((since, _)) if !at_limit => {
                     let pause = since.elapsed();
                     answered += pause;
@@ -609,11 +614,12 @@ where
                     Popped::Frame(Frame::Counters(c)) => vec![Message::Text(c)],
                 },
             };
+            // While paused, a send does not outlast the pause.
+            let end = paused.map(|(_, end)| end);
             for message in out {
-                if send(&mut tx, message, pong_deadline(answered, paused_since))
-                    .await
-                    .is_err()
-                {
+                let deadline = pong_deadline(answered, paused_since);
+                let deadline = end.map_or(deadline, |end| deadline.min(end));
+                if send(&mut tx, message, deadline).await.is_err() {
                     return Ended::Failed;
                 }
             }
