@@ -53,26 +53,40 @@ fn child(domain: &Path, id: &str) -> ! {
     }
 }
 
-fn spawn_writer(domain: &Domain, id: &str) -> Child {
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .arg("child")
-        .arg(&domain.0)
-        .arg(id)
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+/// A child process killed with SIGKILL when dropped, so a failing test
+/// leaves no writer behind.
+struct Writer(Child);
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Child::kill sends SIGKILL; it fails only for a reaped child.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_writer(domain: &Domain, id: &str) -> Writer {
+    let mut child = Writer(
+        Command::new(std::env::current_exe().unwrap())
+            .arg("child")
+            .arg(&domain.0)
+            .arg(id)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap())
+    BufReader::new(child.0.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
     assert_eq!(line, "ready\n");
     child
 }
 
-fn kill(mut child: Child) {
+fn kill(mut child: Writer) {
     // Child::kill sends SIGKILL.
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
 }
 
 fn poller_recreates_its_reader_after_the_flow_is_replaced() {

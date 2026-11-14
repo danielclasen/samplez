@@ -4,13 +4,14 @@
 //!
 //! None of the types here may be dropped on the RT thread: dropping a
 //! reader or group releases it in libmxl (munmap, instance mutex), and
-//! dropping a generation can destroy its instance.
+//! dropping a generation destroys its instance.
 
 use std::sync::Arc;
 
 use mxl_sys::{
-    MXL_DATA_FORMAT_AUDIO, MXL_ERR_FLOW_INVALID, MXL_ERR_OUT_OF_RANGE_TOO_EARLY,
-    MXL_ERR_OUT_OF_RANGE_TOO_LATE, MXL_STATUS_OK, WrappedMultiBufferSlice,
+    MXL_DATA_FORMAT_AUDIO, MXL_ERR_FLOW_INVALID, MXL_ERR_INVALID_ARG,
+    MXL_ERR_OUT_OF_RANGE_TOO_EARLY, MXL_ERR_OUT_OF_RANGE_TOO_LATE, MXL_STATUS_OK,
+    WrappedMultiBufferSlice,
 };
 
 use crate::time::{RATE, timestamp_to_index};
@@ -62,6 +63,7 @@ impl FlowReader {
     pub fn open(instance: &Arc<Instance>, flow_id: &str) -> Result<FlowReader> {
         let id = id_cstring(flow_id)?;
         let mut raw = std::ptr::null_mut();
+        let _lock = instance.lock();
         // SAFETY: valid instance, NUL-terminated id, a null options pointer
         // and a writable out pointer.
         check("mxlCreateFlowReader", unsafe {
@@ -125,13 +127,17 @@ impl FlowReader {
     /// a range beyond the head, for which libmxl runs its flow validity
     /// check (one `stat()` and path allocations).
     fn probe(&self, head: u64) -> Status {
+        let Some(end) = head.checked_add(1) else {
+            return MXL_ERR_INVALID_ARG;
+        };
         let mut slice = WrappedMultiBufferSlice::default();
-        self.samples(head + 1, 1, &mut slice)
+        self.samples(end, 1, &mut slice)
     }
 }
 
 impl Drop for FlowReader {
     fn drop(&mut self) {
+        let _lock = self.instance.lock();
         // SAFETY: `raw` came from mxlCreateFlowReader on this instance and
         // this reference is released exactly once, here.
         unsafe {
@@ -142,21 +148,25 @@ impl Drop for FlowReader {
     }
 }
 
-/// A libmxl flow synchronization group. Must not be dropped on the RT
-/// thread.
-pub struct SyncGroup {
+/// A libmxl flow synchronization group. libmxl v1.1.0 locks neither the
+/// group nor, for group creation and release, the instance's group list,
+/// so a group exists only inside a [`Generation`], which keeps its instance
+/// private. Must not be dropped on the RT thread.
+pub(crate) struct SyncGroup {
     instance: Arc<Instance>,
     raw: mxl_sys::FlowSynchronizationGroup,
 }
 
 // SAFETY: the group handle stays valid until Drop and one thread at a time
-// owns the wrapper; libmxl's group has no lock of its own.
+// owns the wrapper; libmxl's group has no lock of its own, so its use is
+// serialised by that ownership.
 unsafe impl Send for SyncGroup {}
 
 impl SyncGroup {
     /// `mxlCreateFlowSynchronizationGroup`.
-    pub fn new(instance: &Arc<Instance>) -> Result<SyncGroup> {
+    fn new(instance: &Arc<Instance>) -> Result<SyncGroup> {
         let mut raw = std::ptr::null_mut();
+        let _lock = instance.lock();
         // SAFETY: valid instance, writable out pointer.
         check("mxlCreateFlowSynchronizationGroup", unsafe {
             instance
@@ -172,7 +182,7 @@ impl SyncGroup {
     /// `mxlFlowSynchronizationGroupAddReader`. The reader must belong to the
     /// group's instance: libmxl removes a released reader only from the
     /// groups of its own instance.
-    pub fn add(&mut self, reader: &FlowReader) -> Result<()> {
+    fn add(&mut self, reader: &FlowReader) -> Result<()> {
         if !Arc::ptr_eq(&self.instance, &reader.instance) {
             return Err(Error::Format(
                 "reader and group belong to different instances".to_owned(),
@@ -187,11 +197,12 @@ impl SyncGroup {
     }
 
     /// RT. `mxlFlowSynchronizationGroupWaitForDataAt`: OK once every
-    /// reader's head reached the index of `timestamp`;
-    /// `MXL_ERR_OUT_OF_RANGE_TOO_EARLY` when `timeout_ns` passed first;
-    /// `MXL_ERR_FLOW_INVALID` for the first reader found on a replaced flow.
-    /// Blocks on a futex while a reader is behind.
-    pub fn wait(&self, timestamp: u64, timeout_ns: u64) -> Status {
+    /// reader's head reached the index of `timestamp`. Otherwise it blocks
+    /// on a futex until `timeout_ns` passed, then returns
+    /// `MXL_ERR_OUT_OF_RANGE_TOO_EARLY`, or `MXL_ERR_FLOW_INVALID` when the
+    /// first reader found behind is on a replaced flow: libmxl checks
+    /// validity only once the timeout expired.
+    fn wait(&self, timestamp: u64, timeout_ns: u64) -> Status {
         // SAFETY: live group; its readers are live while this wrapper's
         // generation holds them.
         unsafe {
@@ -204,6 +215,7 @@ impl SyncGroup {
 
 impl Drop for SyncGroup {
     fn drop(&mut self) {
+        let _lock = self.instance.lock();
         // SAFETY: `raw` came from mxlCreateFlowSynchronizationGroup on this
         // instance and is released exactly once, here.
         unsafe {
@@ -212,6 +224,18 @@ impl Drop for SyncGroup {
                 .release_flow_synchronization_group(self.instance.raw(), self.raw)
         };
     }
+}
+
+/// The group wait that preceded one block, passed to [`Input::read`] and
+/// [`Input::identify`] for that block only.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GroupWait {
+    /// `MXL_STATUS_OK`: the group checked every reader's head.
+    Ok,
+    /// The wait returned this status.
+    Failed(Status),
+    /// No wait preceded this block (catch-up).
+    Skipped,
 }
 
 /// One input generation: an instance of its own, a reader reference per
@@ -230,6 +254,7 @@ pub struct Generation {
 pub struct Input {
     reader: FlowReader,
     block: u64,
+    channels: usize,
     offset: i64,
 }
 
@@ -245,8 +270,13 @@ impl Generation {
         })
     }
 
-    pub fn instance(&self) -> &Arc<Instance> {
-        &self.instance
+    pub fn api(&self) -> &MxlApi {
+        self.instance.api()
+    }
+
+    /// True when both generations use the same libmxl instance.
+    pub fn same_instance(&self, other: &Generation) -> bool {
+        Arc::ptr_eq(&self.instance, &other.instance)
     }
 
     /// Opens a reader reference for `slot`, checks the flow and adds the
@@ -274,7 +304,8 @@ impl Generation {
         let rate = info.common.grainRate;
         if info.common.format != MXL_DATA_FORMAT_AUDIO
             || rate.denominator == 0
-            || rate.numerator * RATE.denominator != RATE.numerator * rate.denominator
+            || i128::from(rate.numerator) * i128::from(RATE.denominator)
+                != i128::from(RATE.numerator) * i128::from(rate.denominator)
             || cont.channelCount != cfg.channels
         {
             return Err(Error::Format(format!(
@@ -308,6 +339,7 @@ impl Generation {
         self.inputs[slot] = Some(Input {
             reader,
             block: timing.block,
+            channels: cont.channelCount as usize,
             offset: cfg.offset,
         });
         self.max_offset = self
@@ -333,26 +365,31 @@ impl Generation {
         self.max_offset
     }
 
-    /// RT. The group wait, see [`SyncGroup::wait`].
-    pub fn wait(&self, timestamp: u64, timeout_ns: u64) -> Status {
-        self.group.wait(timestamp, timeout_ns)
+    /// RT. `mxlFlowSynchronizationGroupWaitForDataAt` on the generation's
+    /// group: [`GroupWait::Ok`] once every reader's head reached the index
+    /// of `timestamp`. Otherwise it blocks on a futex until `timeout_ns`
+    /// passed, then fails with `MXL_ERR_OUT_OF_RANGE_TOO_EARLY`, or with
+    /// `MXL_ERR_FLOW_INVALID` when the first reader found behind is on a
+    /// replaced flow: libmxl checks validity only once the timeout expired.
+    pub fn wait(&self, timestamp: u64, timeout_ns: u64) -> GroupWait {
+        match self.group.wait(timestamp, timeout_ns) {
+            MXL_STATUS_OK => GroupWait::Ok,
+            status => GroupWait::Failed(status),
+        }
     }
 }
 
 fn check_flow_def(def: &str, cfg: &InputConfig) -> Result<()> {
     let v: serde_json::Value = serde_json::from_str(def)
         .map_err(|e| Error::Format(format!("flow {}: definition: {e}", cfg.flow_id)))?;
-    let rate = &v["sample_rate"];
-    // libmxl's flow parser defaults an absent denominator and an absent
+    // The rate is checked on the normalised grainRate of the config info.
+    // libmxl's flow parser reads numbers as doubles and defaults an absent
     // channel_count to 1.
     let ok = v["format"] == "urn:x-nmos:format:audio"
         && v["media_type"] == "audio/float32"
-        && rate["numerator"] == RATE.numerator
-        && rate.get("denominator").is_none_or(|d| *d == 1)
-        && v["bit_depth"] == 32
-        && v.get("channel_count")
-            .map_or(1, |c| c.as_u64().unwrap_or(0))
-            == u64::from(cfg.channels);
+        && v["bit_depth"].as_f64() == Some(32.0)
+        && v.get("channel_count").map_or(Some(1.0), |c| c.as_f64())
+            == Some(f64::from(cfg.channels));
     if ok {
         Ok(())
     } else {
@@ -429,16 +466,23 @@ impl Input {
     /// RT. Reads block `k`, the range `[kB + offset, (k + 1)B + offset)`,
     /// into `dst`, planar with B samples per channel:
     /// 1. a range starting below `state.last_end` is not read;
-    /// 2. unless `group` is `MXL_STATUS_OK`, the head from
+    /// 2. unless `group` is [`GroupWait::Ok`], the head from
     ///    `mxlFlowReaderGetRuntimeInfo` is checked and a range ending above
-    ///    it is late and not read. `group` is the status of the group wait
-    ///    that preceded this block; a block without a wait (catch-up) passes
-    ///    any other status;
+    ///    it is late and not read. `group` is the group wait that preceded
+    ///    this block, [`GroupWait::Skipped`] for a catch-up block;
     /// 3. `mxlFlowReaderGetSamplesNonBlocking((k + 1)B + offset, B)`, both
     ///    fragments copied out at once.
     ///
-    /// `dst` is zeroed for every outcome but [`Outcome::Copy`].
-    pub fn read(&self, state: &mut SlotState, k: u64, group: Status, dst: &mut [f32]) -> Outcome {
+    /// `dst` must hold channels x B samples, else the outcome is
+    /// `Other(MXL_ERR_INVALID_ARG)`. It is zeroed for every outcome but
+    /// [`Outcome::Copy`].
+    pub fn read(
+        &self,
+        state: &mut SlotState,
+        k: u64,
+        group: &GroupWait,
+        dst: &mut [f32],
+    ) -> Outcome {
         let outcome = self.read_range(state, k, group, dst);
         let c = &mut state.counters;
         match outcome {
@@ -459,10 +503,24 @@ impl Input {
         outcome
     }
 
-    fn read_range(&self, state: &mut SlotState, k: u64, group: Status, dst: &mut [f32]) -> Outcome {
+    fn read_range(
+        &self,
+        state: &mut SlotState,
+        k: u64,
+        group: &GroupWait,
+        dst: &mut [f32],
+    ) -> Outcome {
         let b = self.block;
-        let Some(end) = ((k + 1) * b).checked_add_signed(self.offset) else {
-            return Outcome::TooLate;
+        let n = b as usize;
+        if self.channels.checked_mul(n) != Some(dst.len()) {
+            return Outcome::Other(MXL_ERR_INVALID_ARG);
+        }
+        let Some(end) = k
+            .checked_add(1)
+            .and_then(|k1| k1.checked_mul(b))
+            .and_then(|e| e.checked_add_signed(self.offset))
+        else {
+            return Outcome::Other(MXL_ERR_INVALID_ARG);
         };
         let Some(start) = end.checked_sub(b) else {
             return Outcome::TooLate;
@@ -470,7 +528,7 @@ impl Input {
         if state.last_end.is_some_and(|last| start < last) {
             return Outcome::BelowLastRead;
         }
-        if group == MXL_STATUS_OK {
+        if *group == GroupWait::Ok {
             state.frozen_late_blocks = 0;
         } else {
             let head = match self.reader.head() {
@@ -490,7 +548,6 @@ impl Input {
             state.frozen_late_blocks = 0;
         }
 
-        let n = b as usize;
         let mut slice = WrappedMultiBufferSlice::default();
         match self.reader.samples(end, n, &mut slice) {
             MXL_STATUS_OK => {}
@@ -527,16 +584,18 @@ impl Input {
     }
 
     /// RT, failure path. Identifies a failed input after a late block: on
-    /// a group status of `MXL_ERR_FLOW_INVALID`, which names no reader, or
+    /// a group wait failed with `MXL_ERR_FLOW_INVALID`, which names no
+    /// reader, or
     /// when the head has been frozen for [`FROZEN_PROBE_BLOCKS`] late blocks,
     /// probes the flow once with `mxlFlowReaderGetSamplesNonBlocking(head +
     /// 1, 1)`, which runs libmxl's validity check, and marks the slot
     /// invalid on `MXL_ERR_FLOW_INVALID`. A slot already marked is not
     /// probed. Returns true when it marked the slot.
-    pub fn identify(&self, state: &mut SlotState, group: Status, outcome: Outcome) -> bool {
+    pub fn identify(&self, state: &mut SlotState, group: &GroupWait, outcome: Outcome) -> bool {
         if state.invalid
             || outcome != Outcome::Late
-            || (group != MXL_ERR_FLOW_INVALID && state.frozen_late_blocks != FROZEN_PROBE_BLOCKS)
+            || (*group != GroupWait::Failed(MXL_ERR_FLOW_INVALID)
+                && state.frozen_late_blocks != FROZEN_PROBE_BLOCKS)
         {
             return false;
         }

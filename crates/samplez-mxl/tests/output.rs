@@ -53,11 +53,19 @@ fn blocks_are_read_back_at_the_indices_written() {
     let instance = Instance::new(&api, &domain.0).unwrap();
     let mut w = created(&instance, &id, 3);
     assert_eq!(w.hints(), (B as u32, B as u32));
-    write_blocks(&mut w, K0..K0 + 10);
+    // Blocks around a ring wrap that falls inside a block, so libmxl hands
+    // out a second fragment for it.
+    let len = w.buffer_length();
+    let wrap = (K0 * B / len + 1..)
+        .map(|m| m * len)
+        .find(|w| !w.is_multiple_of(B))
+        .unwrap();
+    let k0 = wrap / B - 5;
+    write_blocks(&mut w, k0..k0 + 10);
 
     let r = RawReader::open(&api, &domain.0, &id);
-    assert_eq!(r.head(), (K0 + 10) * B);
-    for k in K0..K0 + 10 {
+    assert_eq!(r.head(), (k0 + 10) * B);
+    for k in k0..k0 + 10 {
         let got = r.samples((k + 1) * B, B as usize).unwrap();
         for (ch, chan) in got.iter().enumerate() {
             let want: Vec<f32> = (k * B..(k + 1) * B).map(|i| sample(ch, i)).collect();

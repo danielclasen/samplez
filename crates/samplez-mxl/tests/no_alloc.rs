@@ -9,8 +9,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use common::{B, Domain, RawWriter, TIMING, api, input, new_id};
-use mxl_sys::{MXL_ERR_OUT_OF_RANGE_TOO_EARLY, MXL_STATUS_OK};
-use samplez_mxl::input::{Generation, Outcome, SlotState};
+use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
+use samplez_mxl::input::{Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{self, Creation, OutputConfig, Write};
 use samplez_mxl::{Instance, time};
 
@@ -74,7 +74,7 @@ fn rt_functions_do_not_allocate() {
     };
     let n = 2 * B as usize;
     let mut buf = vec![0.0f32; n];
-    let timeout = MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
+    let timeout = GroupWait::Failed(MXL_ERR_OUT_OF_RANGE_TOO_EARLY);
     let mut counts = [0u64; 7];
 
     let before = allocations();
@@ -88,14 +88,14 @@ fn rt_functions_do_not_allocate() {
         counts[0] +=
             u64::from(time::timestamp_to_index(&api, t) <= time::timestamp_to_index(&api, now));
         let status = g.wait(ts, 0);
-        assert_eq!(status, MXL_STATUS_OK);
-        counts[1] += u64::from(r.read(&mut s, k, status, &mut buf) == Outcome::Copy);
-        counts[2] += u64::from(r.read(&mut s, k, status, &mut buf) == Outcome::BelowLastRead);
-        let o = r.read(&mut s, k + 200, timeout, &mut buf);
+        assert_eq!(status, GroupWait::Ok);
+        counts[1] += u64::from(r.read(&mut s, k, &status, &mut buf) == Outcome::Copy);
+        counts[2] += u64::from(r.read(&mut s, k, &status, &mut buf) == Outcome::BelowLastRead);
+        let o = r.read(&mut s, k + 200, &timeout, &mut buf);
         counts[3] += u64::from(o == Outcome::Late);
-        counts[4] += u64::from(!r.identify(&mut s, timeout, o));
+        counts[4] += u64::from(!r.identify(&mut s, &timeout, o));
         let mut old = SlotState::default();
-        counts[6] += u64::from(r.read(&mut old, k - 250, timeout, &mut buf) == Outcome::TooLate);
+        counts[6] += u64::from(r.read(&mut old, k - 250, &timeout, &mut buf) == Outcome::TooLate);
         assert_eq!(out.write_block(k, &buf), Write::Committed);
         counts[5] += u64::from(out.write_block(k - 1, &buf) == Write::Held);
         time::sleep_until(&api, 0);

@@ -12,7 +12,7 @@
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub mod input;
 pub mod output;
@@ -39,6 +39,9 @@ pub enum Error {
     /// The input's read window needs `required` samples of readable
     /// history, the flow offers `buffer_length / 2`.
     Window { required: u64, buffer_length: u64 },
+    /// The output's block size is longer than the `buffer_length / 2`
+    /// samples libmxl lets a writer open at once.
+    Block { block: u64, buffer_length: u64 },
 }
 
 impl fmt::Display for Error {
@@ -55,6 +58,14 @@ impl fmt::Display for Error {
                 f,
                 "read window needs {required} samples of history, the flow's ring of \
                  {buffer_length} offers half of it"
+            ),
+            Error::Block {
+                block,
+                buffer_length,
+            } => write!(
+                f,
+                "block of {block} samples is longer than half the flow's ring of \
+                 {buffer_length}"
             ),
         }
     }
@@ -100,16 +111,23 @@ pub fn load(path: &Path) -> Result<Arc<MxlApi>> {
 pub struct Instance {
     api: Arc<MxlApi>,
     raw: mxl_sys::Instance,
+    /// Serialises reader and group creation and release on this instance.
+    lock: Mutex<()>,
 }
 
-// SAFETY: the handle is a plain pointer to a libmxl instance; libmxl
-// serialises its reader, writer and group maps with the instance's own
-// mutex.
+// SAFETY: the handle is a plain pointer to a libmxl instance, usable from
+// any thread.
 unsafe impl Send for Instance {}
-// SAFETY: as for Send. The calls on `&Instance` (reader, writer and group
-// creation and release, mxlIsFlowActive, mxlGetFlowDef,
-// mxlGarbageCollectFlows) either take that mutex or touch no instance
-// state.
+// SAFETY: in libmxl v1.1.0 reader and writer creation and release take the
+// instance's own mutex; mxlIsFlowActive, mxlGetFlowDef and
+// mxlGarbageCollectFlows touch no instance state. Group creation and
+// release modify the instance's group list without that mutex, reader
+// release walks that list and removes the reader from every group, and a
+// group wait reorders the group's reader list without any lock. samplez
+// serialises those calls by ownership: groups exist only inside a
+// `Generation`, which keeps its instance private and is used by one thread
+// at a time. `lock` additionally serialises reader and group creation and
+// release, all of which run on the supervisor side.
 unsafe impl Sync for Instance {}
 
 impl Instance {
@@ -129,7 +147,13 @@ impl Instance {
         Ok(Arc::new(Instance {
             api: Arc::clone(api),
             raw,
+            lock: Mutex::new(()),
         }))
+    }
+
+    /// Held around reader and group creation and release.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn api(&self) -> &MxlApi {
@@ -140,7 +164,10 @@ impl Instance {
         self.raw
     }
 
-    /// `mxlIsFlowActive`: `None` for `MXL_ERR_FLOW_NOT_FOUND`.
+    /// `mxlIsFlowActive`: `None` for `MXL_ERR_FLOW_NOT_FOUND`. libmxl
+    /// v1.1.0 returns that status for any failure to open the flow's data
+    /// file, not only for a missing one: a flow whose data file this
+    /// process cannot open reads as absent.
     pub fn is_flow_active(&self, flow_id: &str) -> Result<Option<bool>> {
         let id = id_cstring(flow_id)?;
         let mut active = false;

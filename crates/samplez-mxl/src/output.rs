@@ -75,8 +75,17 @@ pub enum Creation {
 /// create options set `maxCommitBatchSizeHint` and `maxSyncBatchSizeHint`
 /// to B; a new flow is zero-filled by libmxl, so nothing is written before
 /// the first block.
+///
+/// libmxl v1.1.0's `mxlIsFlowActive` reports `MXL_ERR_FLOW_NOT_FOUND` for
+/// any failure to open the flow's data file. An existing flow this process
+/// cannot open therefore reads as absent, and the create that follows
+/// fails on it: `Err(Error::Mxl { call: "mxlCreateFlowWriter", .. })`,
+/// which the caller counts as a create failure.
 pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
     let def = flow_definition(c)?;
+    if c.block == 0 {
+        return Err(Error::Format(format!("output {}: block size 0", c.flow_id)));
+    }
     let mut collected = false;
     match instance.is_flow_active(c.flow_id)? {
         None => {}
@@ -90,7 +99,17 @@ pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
             }
         }
     }
+    create_writer(instance, c, def, collected)
+}
 
+/// `mxlCreateFlowWriter` with the batch size hints at B; an existing flow
+/// it opens (`was_created == false`) is released as [`Creation::Raced`].
+fn create_writer(
+    instance: &Arc<Instance>,
+    c: &OutputConfig,
+    def: String,
+    collected: bool,
+) -> Result<Creation> {
     let c_def = CString::new(def).expect("JSON from serde_json has no NUL");
     let options = serde_json::json!({
         "maxCommitBatchSizeHint": c.block,
@@ -131,9 +150,9 @@ pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
         drop(writer);
         return Ok(Creation::Raced);
     }
-    if c.block == 0 || c.block > writer.buffer_length / 2 {
-        return Err(Error::Window {
-            required: c.block,
+    if c.block > writer.buffer_length / 2 {
+        return Err(Error::Block {
+            block: c.block,
             buffer_length: writer.buffer_length,
         });
     }
@@ -203,7 +222,12 @@ impl FlowWriter {
     /// forward gap on commit.
     pub fn write_block(&mut self, k: u64, data: &[f32]) -> Write {
         let b = self.block;
-        let start = k * b;
+        let Some((start, end)) = k
+            .checked_mul(b)
+            .and_then(|start| Some((start, start.checked_add(b)?)))
+        else {
+            return Write::Failed(mxl_sys::MXL_ERR_INVALID_ARG);
+        };
         if self.last_commit.is_some_and(|last| start < last) {
             self.held_blocks += 1;
             return Write::Held;
@@ -215,7 +239,7 @@ impl FlowWriter {
         let api = self.instance.api();
         let mut slice = mxl_sys::MutableWrappedMultiBufferSlice::default();
         // SAFETY: live writer, writable slice.
-        let status = unsafe { api.flow_writer_open_samples(self.raw, start + b, n, &mut slice) };
+        let status = unsafe { api.flow_writer_open_samples(self.raw, end, n, &mut slice) };
         if status != mxl_sys::MXL_STATUS_OK {
             return Write::Failed(status);
         }
@@ -247,7 +271,7 @@ impl FlowWriter {
         if status != mxl_sys::MXL_STATUS_OK {
             return Write::Failed(status);
         }
-        self.last_commit = Some(start + b);
+        self.last_commit = Some(end);
         Write::Committed
     }
 }
@@ -298,6 +322,35 @@ mod tests {
                 "tags": { "urn:x-nmos:tag:grouphint/v1.0": ["foldz-1:Audio 1"] },
             })
         );
+    }
+
+    /// `create_writer` on a flow another writer holds: libmxl opens it with
+    /// `was_created == false`, and the writer is released, not adopted.
+    /// Against the real libmxl, which the builder image carries.
+    #[test]
+    fn an_opened_existing_flow_is_released_as_raced() {
+        let api = crate::load(std::path::Path::new("/opt/mxl/lib/libmxl.so")).unwrap();
+        let domain = std::env::temp_dir().join(format!("samplez-mxl-raced-{}", std::process::id()));
+        std::fs::create_dir_all(&domain).unwrap();
+        let owner = Instance::new(&api, &domain).unwrap();
+        let Creation::Created { writer: mut w, .. } = create(&owner, &config()).unwrap() else {
+            panic!("flow not created");
+        };
+        assert_eq!(w.write_block(1_000, &[0.5; 6 * 48]), Write::Committed);
+
+        let other = Instance::new(&api, &domain).unwrap();
+        let def = flow_definition(&config()).unwrap();
+        assert!(matches!(
+            create_writer(&other, &config(), def, false).unwrap(),
+            Creation::Raced
+        ));
+        // The owner's flow is intact and still active.
+        assert_eq!(other.is_flow_active(ID).unwrap(), Some(true));
+        assert_eq!(w.write_block(1_001, &[0.5; 6 * 48]), Write::Committed);
+        drop(w);
+        drop(other);
+        drop(owner);
+        std::fs::remove_dir_all(&domain).unwrap();
     }
 
     #[test]
