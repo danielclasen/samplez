@@ -316,8 +316,10 @@ impl ListenerTls {
         let Some(ca) = &self.client_ca else {
             return Ok(());
         };
-        let content = read(&ca.path)?;
+        // Read under the lock, so a concurrent reload cannot install an
+        // older read after a newer one.
         let mut loaded = ca.loaded.lock().expect("client CA lock poisoned");
+        let content = read(&ca.path)?;
         if *loaded != content {
             let config = server_config(&self.provider, Some((&ca.path, &content)), &self.resolver)?;
             *self.config.write().expect("config lock poisoned") = Arc::new(config);
@@ -955,6 +957,45 @@ mod tests {
         tls.reload().unwrap();
         let (response, _) = get(&issued_by_second(), addr, "localhost").await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// Two reloads at once, the first reading the CA file before a rotation
+    /// and finishing after the second.
+    #[test]
+    fn of_two_concurrent_reloads_the_later_read_of_the_client_ca_stays() {
+        let pem = || client_ca().0.into_bytes();
+        let (before, rotated) = (pem(), pem());
+        let ca_file = dir().join("concurrent-client-ca.crt");
+        std::fs::write(&ca_file, pem()).unwrap();
+        let config = Tls {
+            mode: TlsMode::SelfSigned,
+            sans: vec!["localhost".into()],
+            client_ca_file: Some(ca_file),
+            ..Tls::default()
+        };
+        let tls = listener_tls(&config, &Metrics::default());
+        let (reading, read) = std::sync::mpsc::channel();
+        let (go_on, wait) = std::sync::mpsc::channel::<()>();
+        let (tls, before) = (&tls, &before);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                tls.reload_with(crate::auth::now(), move |_| {
+                    reading.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Ok(before.clone())
+                })
+            });
+            read.recv().unwrap();
+            let second =
+                scope.spawn(|| tls.reload_with(crate::auth::now(), |_| Ok(rotated.clone())));
+            // Time for the second to finish, were it not held up.
+            std::thread::sleep(Duration::from_millis(200));
+            go_on.send(()).unwrap();
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+        let loaded = tls.client_ca.as_ref().unwrap().loaded.lock().unwrap();
+        assert!(*loaded == rotated, "the rotated CA is in use");
     }
 
     #[tokio::test]
