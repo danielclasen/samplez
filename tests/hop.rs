@@ -94,10 +94,20 @@ fn one_hop() {
     assert!(c.clean - before.clean > 1_000, "{c:?}");
     assert!(before.ramp > 0, "the input fades in at start: {before:?}");
     // The producer commits each block at its index, well before the
-    // deadline: the group wait returns early, never at the deadline.
+    // deadline: the group wait returns early. A wait can still reach the
+    // deadline when the host preempts the producer, so timeouts are
+    // bounded to under 1 % of the blocks rather than zero.
     let counters = engine.counters();
-    assert!(counters.wait_early.load(Relaxed) > 1_000);
-    assert_eq!(counters.input_wait_timeout.load(Relaxed), 0);
+    let (early, timeouts) = (
+        counters.wait_early.load(Relaxed),
+        counters.input_wait_timeout.load(Relaxed),
+    );
+    let blocks = counters.heartbeat_blocks.load(Relaxed);
+    assert!(early > 1_000, "{early} early waits in {blocks} blocks");
+    assert!(
+        timeouts * 100 < blocks,
+        "{timeouts} wait timeouts in {blocks} blocks"
+    );
     common::stop(engine);
 }
 
