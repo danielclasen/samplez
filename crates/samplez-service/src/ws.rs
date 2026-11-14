@@ -24,6 +24,7 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::Error;
 use crate::replica::{Owner, Position, ReplicatedState};
 use crate::server::Connect;
 
@@ -298,21 +299,21 @@ impl Sessions {
     /// `replica` prefixes the connection ids, followed by 128 random bits
     /// drawn here.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// When the operating system's random source fails.
-    pub fn new(replica: &str) -> Sessions {
+    /// [`Error::Config`] when the operating system's random source fails.
+    pub fn new(replica: &str) -> Result<Sessions, Error> {
         let mut nonce = [0u8; 16];
         rustls::crypto::ring::default_provider()
             .secure_random
             .fill(&mut nonce)
-            .expect("the random source failed");
-        Sessions {
+            .map_err(|_| Error::Config("the random source failed".into()))?;
+        Ok(Sessions {
             replica: replica.to_owned(),
             nonce: nonce.iter().map(|b| format!("{b:02x}")).collect(),
             next: AtomicU64::new(1),
             live: Mutex::default(),
-        }
+        })
     }
 
     /// `<replica id>:<nonce>:<n>`, see [`Owner::connection`].
@@ -631,7 +632,7 @@ mod tests {
     /// can be a while after its last pong when the task is not polled.
     #[tokio::test(start_paused = true)]
     async fn a_connection_is_live_only_within_the_pong_timeout() {
-        let sessions = Sessions::new("r1");
+        let sessions = Sessions::new("r1").unwrap();
         let owner = Owner {
             principal: "anonymous".into(),
             session: "s1".into(),
@@ -651,7 +652,7 @@ mod tests {
     /// live until the pause ends it; paused later, it is not live.
     #[tokio::test(start_paused = true)]
     async fn a_paused_connection_is_live_if_it_answered_before_the_pause() {
-        let sessions = Sessions::new("r1");
+        let sessions = Sessions::new("r1").unwrap();
         let owner = Owner {
             principal: "anonymous".into(),
             session: "s1".into(),
@@ -678,7 +679,7 @@ mod tests {
     /// last pong, and paused again within it, until the new pause ends.
     #[tokio::test(start_paused = true)]
     async fn a_resumed_connection_counts_from_its_moved_last_pong() {
-        let sessions = Sessions::new("r1");
+        let sessions = Sessions::new("r1").unwrap();
         let owner = Owner {
             principal: "anonymous".into(),
             session: "s1".into(),
@@ -713,8 +714,8 @@ mod tests {
     /// the per-session tables of applied command ids outlive a restart.
     #[test]
     fn connection_ids_do_not_recur_after_a_restart() {
-        let before = Sessions::new("r1").connection_id();
-        let after = Sessions::new("r1").connection_id();
+        let before = Sessions::new("r1").unwrap().connection_id();
+        let after = Sessions::new("r1").unwrap().connection_id();
         assert_ne!(before, after);
         let (replica, rest) = before.split_once(':').unwrap();
         let (nonce, n) = rest.split_once(':').unwrap();

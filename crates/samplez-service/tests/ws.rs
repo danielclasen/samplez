@@ -177,7 +177,7 @@ impl Client {
     }
 
     fn connect(hub: &Hub, state: &Arc<FakeState>, since: Option<(u64, u64)>) -> Client {
-        let sessions = Arc::new(Sessions::new("r1"));
+        let sessions = Arc::new(Sessions::new("r1").unwrap());
         Client::start(hub, state, connect(&sessions, Role::Operator, since, 1))
     }
 
@@ -461,7 +461,7 @@ async fn a_slow_snapshot_keeps_the_heartbeat() {
 #[tokio::test(start_paused = true)]
 async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
     let state = FakeState::new("r1", "leader");
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, None, 1);
     let queue = Hub::new(8).subscribe();
     let (to_client, _rx) = mpsc::unbounded_channel();
@@ -494,7 +494,7 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
 #[tokio::test(start_paused = true)]
 async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
     let state = FakeState::new("r1", "leader");
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, None, 1);
     let queue = Hub::new(8).subscribe();
     let (to_client, _rx) = mpsc::unbounded_channel();
@@ -529,7 +529,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
 #[tokio::test(start_paused = true)]
 async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause() {
     let state = FakeState::new("r1", "leader");
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, None, 1);
     let queue = Hub::new(8).subscribe();
     let (to_client, _rx) = mpsc::unbounded_channel();
@@ -571,7 +571,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause()
 async fn a_connection_that_answered_before_the_limit_stays_live_while_not_read() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
     for n in 0..MAX_PENDING_REPLIES {
@@ -595,7 +595,7 @@ async fn a_connection_that_answered_before_the_limit_stays_live_while_not_read()
 async fn a_client_answering_every_ping_stays_live_through_repeated_pauses() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
     let round = 3 * MAX_PENDING_REPLIES;
@@ -638,7 +638,7 @@ async fn a_client_answering_every_ping_stays_live_through_repeated_pauses() {
 async fn a_pause_does_not_count_against_the_pong_timeout_after_it_ends() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
     client.pong = false;
@@ -664,7 +664,7 @@ async fn a_pause_does_not_count_against_the_pong_timeout_after_it_ends() {
 async fn live_sessions_are_renewed_once_per_second_in_one_batch() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let renew = tokio::spawn({
         let (sessions, state) = (sessions.clone(), state.clone());
         async move { samplez_service::server::renew_sessions(&sessions, &*state).await }
@@ -709,7 +709,7 @@ async fn wait_both(a: &mut Client, b: &mut Client) {
 
 #[test]
 fn require_operator_refuses_a_viewer() {
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     assert_eq!(
         connect(&sessions, Role::Operator, None, 1).require_operator(),
         Ok(())
@@ -1084,7 +1084,7 @@ impl Sink<Message> for StuckSocket {
 #[tokio::test(start_paused = true)]
 async fn a_client_that_stops_reading_ends_one_second_after_its_last_pong() {
     let state = FakeState::new("r1", "leader");
-    let sessions = Arc::new(Sessions::new("r1"));
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, None, 1);
     let queue = Hub::new(8).subscribe();
     let start = Instant::now();

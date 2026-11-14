@@ -152,7 +152,8 @@ pub struct Routers {
 
 impl Service {
     /// Checks the auth and TLS settings against the listeners, reads the
-    /// token and TLS files and generates the self-signed certificates.
+    /// token and TLS files, generates the self-signed certificates and
+    /// draws the random part of the connection ids ([`Sessions::new`]).
     pub fn new(
         config: ServiceConfig,
         ops: Ops,
@@ -175,7 +176,7 @@ impl Service {
         Ok(Service {
             auth: Arc::new(Auth::new(&config, ops.metrics())?),
             tls: tls.into(),
-            sessions: Arc::new(Sessions::new(&state.replica().id)),
+            sessions: Arc::new(Sessions::new(&state.replica().id)?),
             config,
             ops,
             state,
