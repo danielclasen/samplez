@@ -49,6 +49,16 @@ jobs:
               cargo test --workspace --locked
               cargo test --workspace --locked --release
             '
+      - name: End-to-end scenarios with SCHED_FIFO and locked memory
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --ulimit rtprio=99 --ulimit memlock=-1 \
+            -e SAMPLEZ_REQUIRE_PATHS=avx2 -e SAMPLEZ_REQUIRE_RT=1 \
+            -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
+            -w /w samplez-builder:ci bash -euo pipefail -c '
+              cargo test --locked --test hop
+              cargo test --locked --release --test hop
+            '
       # Saved from main only, so per-PR snapshots do not evict the builder
       # image layers from the shared Actions cache.
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'

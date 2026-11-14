@@ -21,6 +21,7 @@ use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use samplez::rt::Step as RtStep;
 use samplez::{BlockVerdict, Config, Engine};
 use samplez_mxl::input::{Generation, GroupWait, InputConfig, Outcome, SlotState, Timing};
 use samplez_mxl::output::{self, Creation, OutputConfig};
@@ -573,11 +574,27 @@ pub fn read_blocks(domain: &Path, flow_id: &str, channels: usize, ks: Range<u64>
     out
 }
 
-/// Starts an engine with a verdict stream of 65 s of blocks.
+/// Starts an engine with a verdict stream of 65 s of blocks. With
+/// `SAMPLEZ_REQUIRE_RT=1` the RT thread must run SCHED_FIFO and the
+/// process memory must be locked.
 pub fn start(config: Config) -> (Engine, Receiver<BlockVerdict>) {
     let (tx, rx) = std::sync::mpsc::sync_channel(1 << 16);
     let process = samplez::rt::setup_process(&config.rt);
-    (Engine::start(config, process, Some(tx)).unwrap(), rx)
+    let engine = Engine::start(config, process, Some(tx)).unwrap();
+    if std::env::var("SAMPLEZ_REQUIRE_RT").as_deref() == Ok("1") {
+        let rt = engine.status().rt;
+        assert!(
+            matches!(rt.thread.sched, RtStep::Active(_)),
+            "{:?}",
+            rt.thread.sched
+        );
+        assert!(
+            matches!(rt.process.mlock, RtStep::Active(_)),
+            "{:?}",
+            rt.process.mlock
+        );
+    }
+    (engine, rx)
 }
 
 /// Stops an engine whose verdicts were checked: every verdict was sent.
