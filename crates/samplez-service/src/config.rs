@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Role;
 
@@ -49,17 +49,20 @@ impl Default for Listeners {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
     pub bind: IpAddr,
     pub port: u16,
+    #[serde(default)]
+    pub tls: Tls,
 }
 
 fn default_api() -> Listener {
     Listener {
         bind: Ipv4Addr::LOCALHOST.into(),
         port: 8080,
+        tls: Tls::default(),
     }
 }
 
@@ -67,6 +70,7 @@ fn default_ops() -> Listener {
     Listener {
         bind: Ipv4Addr::UNSPECIFIED.into(),
         port: 9090,
+        tls: Tls::default(),
     }
 }
 
@@ -74,7 +78,42 @@ fn default_nmos() -> Listener {
     Listener {
         bind: Ipv4Addr::LOCALHOST.into(),
         port: 8081,
+        tls: Tls::default(),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TlsMode {
+    /// Plain HTTP, for a listener behind something that terminates TLS.
+    #[default]
+    None,
+    /// `certFile` and `keyFile`, re-read every
+    /// [`crate::server::SECRET_RELOAD_PERIOD`] and swapped in when their
+    /// content changes.
+    Files,
+    /// A certificate for `sans` generated at start and lost at exit. Its
+    /// SHA-256 fingerprint is logged and in [`crate::ServiceStatus`].
+    SelfSigned,
+}
+
+/// TLS on one listener. See [`crate::tls`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Tls {
+    #[serde(default)]
+    pub mode: TlsMode,
+    /// PEM, the server certificate first, then its chain; `files` mode.
+    pub cert_file: Option<PathBuf>,
+    /// PEM, PKCS#8, PKCS#1 or SEC1; `files` mode.
+    pub key_file: Option<PathBuf>,
+    /// PEM CA certificates; when set, a client must present a certificate
+    /// issued by one of them. Read at start only.
+    pub client_ca_file: Option<PathBuf>,
+    /// DNS names and IP addresses of the generated certificate;
+    /// `selfSigned` mode.
+    #[serde(default)]
+    pub sans: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -155,7 +194,8 @@ pub struct ApiConfig {
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     /// `Origin` values accepted on WebSocket upgrades, in addition to
-    /// `http://localhost:<api port>` and `http://127.0.0.1:<api port>`.
+    /// `<scheme>://localhost:<api port>` and `<scheme>://127.0.0.1:<api
+    /// port>`, the scheme being `https` when the API listener runs TLS.
     /// Compared without case, a trailing `/` or the scheme's default port.
     #[serde(default)]
     pub allowed_origins: Vec<String>,

@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 
-use crate::config::{AuthMode, ProxyConfig, ServiceConfig};
+use crate::config::{AuthMode, ProxyConfig, ServiceConfig, TlsMode};
 use crate::metrics::{Counter, Metrics};
 use crate::{Error, ServiceStatus};
 
@@ -133,6 +133,8 @@ pub(crate) struct Auth {
     proxy: ProxyConfig,
     hosts: Vec<String>,
     origins: Vec<String>,
+    /// The API listener runs TLS, so session cookies are `Secure`.
+    tls: bool,
 }
 
 impl Auth {
@@ -173,6 +175,8 @@ impl Auth {
             _ => None,
         };
         let port = listeners.api.port;
+        let tls = listeners.api.tls.mode != TlsMode::None;
+        let scheme = if tls { "https" } else { "http" };
         let mut hosts = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
         hosts.extend(
             config
@@ -182,8 +186,8 @@ impl Auth {
                 .map(|h| h.to_ascii_lowercase()),
         );
         let mut origins = vec![
-            format!("http://localhost:{port}"),
-            format!("http://127.0.0.1:{port}"),
+            format!("{scheme}://localhost:{port}"),
+            format!("{scheme}://127.0.0.1:{port}"),
         ];
         origins.extend(config.api.allowed_origins.iter().cloned());
         let origins = origins.iter().map(|o| normalize_origin(o)).collect();
@@ -194,6 +198,7 @@ impl Auth {
             proxy: auth.proxy.clone(),
             hosts,
             origins,
+            tls,
         })
     }
 
@@ -395,7 +400,7 @@ fn session_cookies(headers: &HeaderMap) -> impl Iterator<Item = &str> {
         .filter_map(|c| c.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='))
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")
@@ -485,9 +490,10 @@ pub(crate) async fn login(
     if !token.matches(body.token.as_bytes()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let secure = headers
-        .get("x-forwarded-proto")
-        .is_some_and(|p| p.as_bytes().eq_ignore_ascii_case(b"https"));
+    let secure = auth.tls
+        || headers
+            .get("x-forwarded-proto")
+            .is_some_and(|p| p.as_bytes().eq_ignore_ascii_case(b"https"));
     let cookie = format!(
         "{SESSION_COOKIE}={}; Path=/api/v1; Max-Age={}; HttpOnly; SameSite=Strict{}",
         session_value(&token.get(), now() + SESSION_TTL.as_secs()),

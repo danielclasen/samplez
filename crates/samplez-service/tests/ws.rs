@@ -11,7 +11,7 @@ use common::*;
 use futures_util::{Sink, Stream, StreamExt};
 use samplez_service::replica::{Ack, Begin, Commands};
 use samplez_service::ws::{
-    ClientQueue, Delta, Ended, Frame, Hub, Popped, Pushed, Sessions, serve_client,
+    ClientQueue, Delta, Ended, Frame, Hub, PONG_TIMEOUT, Popped, Pushed, Sessions, serve_client,
 };
 use samplez_service::{Connect, Forbidden, Identity, Ops, Owner, Position, Role};
 use tokio::sync::mpsc;
@@ -555,4 +555,59 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     apply(&state, &hub, None);
     assert_eq!(next().await, "delta@4");
     server.abort();
+}
+
+/// Takes the first message, then never accepts another and never yields
+/// one: the connection stays open while the server is stuck sending.
+struct StuckSocket {
+    sent: usize,
+}
+
+impl Stream for StuckSocket {
+    type Item = Result<Message, ()>;
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
+    }
+}
+
+impl Sink<Message> for StuckSocket {
+    type Error = ();
+    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        if self.sent == 0 {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+    fn start_send(mut self: Pin<&mut Self>, _: Message) -> Result<(), ()> {
+        self.sent += 1;
+        Ok(())
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_open_connection_that_stopped_answering_is_not_live() {
+    let state = FakeState::new("r1", "leader");
+    let sessions = Arc::new(Sessions::new("r1"));
+    let connect = connect(&sessions, Role::Operator, None, 1);
+    let queue = Hub::new(8).subscribe();
+    let task = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let socket = StuckSocket { sent: 0 };
+            serve_client(socket, &connect, &queue, &*state, |_| async { None }).await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(sessions.live().len(), 1, "answered at connect");
+    tokio::time::sleep(PONG_TIMEOUT).await;
+    assert!(!task.is_finished(), "still open, stuck sending");
+    assert!(sessions.live().is_empty(), "no answer for over 1 s");
+    task.abort();
 }

@@ -14,6 +14,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router, middleware};
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
@@ -21,6 +22,7 @@ use crate::auth::{self, Auth, Identity, Listener, Role};
 use crate::config::{AuthMode, ServiceConfig};
 use crate::ops::Ops;
 use crate::replica::{Owner, Position, ReplicatedState};
+use crate::tls::{ListenerTls, TlsListener, TlsStatus};
 use crate::ws::Sessions;
 use crate::{Error, config};
 
@@ -30,7 +32,8 @@ pub const SESSION_RENEW_PERIOD: Duration = Duration::from_secs(1);
 /// The longest client session id accepted in `?session=`.
 pub const MAX_SESSION_ID: usize = 128;
 
-/// How often [`Bound::serve`] re-reads the token files.
+/// How often [`Bound::serve`] re-reads the token files and the TLS
+/// certificate and key files.
 pub const SECRET_RELOAD_PERIOD: Duration = Duration::from_secs(10);
 
 type WsHandler =
@@ -88,6 +91,8 @@ fn parse_position(s: &str) -> Option<Position> {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceStatus {
     pub secrets: Vec<SecretStatus>,
+    /// One per listener that runs TLS.
+    pub tls: Vec<TlsStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -101,12 +106,13 @@ pub struct SecretStatus {
 
 /// Reads the current [`ServiceStatus`]; cloned into the product's routes.
 #[derive(Clone)]
-pub struct StatusSource(Arc<Auth>);
+pub struct StatusSource(Arc<Auth>, Arc<[ListenerTls]>);
 
 impl StatusSource {
     pub fn get(&self) -> ServiceStatus {
         let mut status = ServiceStatus::default();
         self.0.status(&mut status);
+        status.tls = self.1.iter().map(ListenerTls::status).collect();
         status
     }
 }
@@ -114,6 +120,7 @@ impl StatusSource {
 pub struct Service {
     config: ServiceConfig,
     auth: Arc<Auth>,
+    tls: Arc<[ListenerTls]>,
     ops: Ops,
     state: Arc<dyn ReplicatedState>,
     api: Router,
@@ -132,15 +139,30 @@ pub struct Routers {
 }
 
 impl Service {
-    /// Checks the auth settings against the listeners and reads the token
-    /// files.
+    /// Checks the auth and TLS settings against the listeners, reads the
+    /// token and TLS files and generates the self-signed certificates.
     pub fn new(
         config: ServiceConfig,
         ops: Ops,
         state: Arc<dyn ReplicatedState>,
     ) -> Result<Service, Error> {
+        let listeners = &config.listeners;
+        let mut tls = Vec::new();
+        for (name, listener) in [
+            ("api", Some(&listeners.api)),
+            ("machine", listeners.machine.as_ref()),
+            ("ops", Some(&listeners.ops)),
+            ("nmos", Some(&listeners.nmos)),
+        ] {
+            if let Some(l) = listener
+                && let Some(t) = ListenerTls::new(name, &l.tls, ops.metrics())?
+            {
+                tls.push(t);
+            }
+        }
         Ok(Service {
             auth: Arc::new(Auth::new(&config, ops.metrics())?),
+            tls: tls.into(),
             sessions: Arc::new(Sessions::new(&state.replica().id)),
             config,
             ops,
@@ -169,7 +191,7 @@ impl Service {
 
     /// The source of [`ServiceStatus`] for the product's routes.
     pub fn status(&self) -> StatusSource {
-        StatusSource(self.auth.clone())
+        StatusSource(self.auth.clone(), self.tls.clone())
     }
 
     /// Serves WebSocket upgrades at `/api/v1/ws` once auth and the `Origin`
@@ -197,10 +219,18 @@ impl Service {
         self
     }
 
-    /// Re-reads the token files now. Sessions issued under a replaced API
-    /// token end.
+    /// Re-reads the token files and the TLS certificate and key files now,
+    /// each on its own. Sessions issued under a replaced API token end; a
+    /// replaced certificate is presented from the next handshake on.
+    /// Returns the first error.
     pub fn reload_secrets(&self) -> Result<(), Error> {
-        self.auth.reload()
+        let mut first = self.auth.reload();
+        for tls in self.tls.iter() {
+            if let Err(e) = tls.reload() {
+                first = first.and(Err(e));
+            }
+        }
+        first
     }
 
     pub fn routers(&self) -> Routers {
@@ -209,6 +239,7 @@ impl Service {
             .config
             .listeners
             .machine
+            .as_ref()
             .map(|_| self.authenticated(Listener::Machine));
         Routers {
             api,
@@ -287,17 +318,24 @@ impl Service {
         }
     }
 
-    /// Binds every listener.
+    /// Binds every listener and starts the TLS handshakes on those that
+    /// run TLS.
     pub async fn bind(self) -> io::Result<Bound> {
         let listeners = &self.config.listeners;
-        let tcp = |l: config::Listener| TcpListener::bind(SocketAddr::new(l.bind, l.port));
-        let api = tcp(listeners.api).await?;
-        let machine = match listeners.machine {
-            Some(l) => Some(tcp(l).await?),
+        let bind = async |name: &str, l: &config::Listener| -> io::Result<Socket> {
+            let tcp = TcpListener::bind(SocketAddr::new(l.bind, l.port)).await?;
+            match self.tls.iter().find(|t| t.listener() == name) {
+                Some(tls) => Ok(Socket::Tls(tls.bind(tcp)?)),
+                None => Ok(Socket::Plain(tcp)),
+            }
+        };
+        let api = bind("api", &listeners.api).await?;
+        let machine = match &listeners.machine {
+            Some(l) => Some(bind("machine", l).await?),
             None => None,
         };
-        let ops = tcp(listeners.ops).await?;
-        let nmos = tcp(listeners.nmos).await?;
+        let ops = bind("ops", &listeners.ops).await?;
+        let nmos = bind("nmos", &listeners.nmos).await?;
         Ok(Bound {
             routers: self.routers(),
             api,
@@ -309,13 +347,34 @@ impl Service {
     }
 }
 
+enum Socket {
+    Plain(TcpListener),
+    Tls(TlsListener),
+}
+
+impl Socket {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Socket::Plain(l) => l.local_addr(),
+            Socket::Tls(l) => axum::serve::Listener::local_addr(l),
+        }
+    }
+
+    fn serve(self, router: Router) -> BoxFuture<'static, io::Result<()>> {
+        match self {
+            Socket::Plain(l) => Box::pin(axum::serve(l, router).into_future()),
+            Socket::Tls(l) => Box::pin(axum::serve(l, router).into_future()),
+        }
+    }
+}
+
 pub struct Bound {
     service: Service,
     routers: Routers,
-    api: TcpListener,
-    machine: Option<TcpListener>,
-    ops: TcpListener,
-    nmos: TcpListener,
+    api: Socket,
+    machine: Option<Socket>,
+    ops: Socket,
+    nmos: Socket,
 }
 
 impl Bound {
@@ -336,8 +395,8 @@ impl Bound {
     }
 
     /// Serves every listener, watches the heartbeat and reloads the token
-    /// files until a listener fails. A failed reload keeps the previous
-    /// token. `/readyz` reports the API as serving while this runs.
+    /// and TLS files until a listener fails. A failed reload keeps the
+    /// previous token or certificate. `/readyz` reports the API as serving while this runs.
     pub async fn serve(self) -> io::Result<()> {
         let Bound {
             service,
@@ -349,23 +408,23 @@ impl Bound {
         } = self;
         let machine = async move {
             match (machine, routers.machine) {
-                (Some(l), Some(r)) => axum::serve(l, r).await,
+                (Some(l), Some(r)) => l.serve(r).await,
                 _ => std::future::pending().await,
             }
         };
         let servers = async {
             tokio::try_join!(
-                axum::serve(api, routers.api).into_future(),
+                api.serve(routers.api),
                 machine,
-                axum::serve(ops, routers.ops).into_future(),
-                axum::serve(nmos, routers.nmos).into_future(),
+                ops.serve(routers.ops),
+                nmos.serve(routers.nmos),
             )
         };
         let reload = async {
             let mut ticks = tokio::time::interval(SECRET_RELOAD_PERIOD);
             loop {
                 ticks.tick().await;
-                let _ = service.auth.reload();
+                let _ = service.reload_secrets();
             }
         };
         let renew = renew_sessions(&service.sessions, &*service.state);

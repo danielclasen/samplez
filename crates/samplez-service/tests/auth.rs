@@ -593,3 +593,28 @@ fn config_shape_and_defaults() {
     let secret_value = json!({ "auth": { "mode": "token", "token": { "value": "inline" } } });
     assert!(serde_json::from_value::<ServiceConfig>(secret_value).is_err());
 }
+
+#[tokio::test]
+async fn an_api_listener_with_tls_sets_secure_cookies_and_allows_its_https_origin() {
+    let mut config = config("token", "tls-cookie");
+    config["listeners"] = json!({ "api": {
+        "bind": "127.0.0.1",
+        "port": 8080,
+        "tls": { "mode": "selfSigned", "sans": ["localhost"] },
+    } });
+    let service = service_from(config, Ops::default(), FakeState::new("r1", "leader"));
+    let api = service.routers().api;
+    let (code, cookie) = login(&api, write_req("/api/v1/login"), API_TOKEN).await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    assert!(cookie.contains("; Secure"), "{cookie}");
+
+    let auth = header::AUTHORIZATION;
+    let https = upgrade_req()
+        .header(header::ORIGIN, "https://localhost:8080")
+        .header(auth.clone(), bearer(API_TOKEN));
+    assert_eq!(status(&api, https).await, PASSED_UPGRADE);
+    let http = upgrade_req()
+        .header(header::ORIGIN, "http://localhost:8080")
+        .header(auth, bearer(API_TOKEN));
+    assert_eq!(status(&api, http).await, StatusCode::FORBIDDEN);
+}
