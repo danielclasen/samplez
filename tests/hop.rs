@@ -156,6 +156,9 @@ fn gain_change() {
     for i in 0..PENDING {
         engine.set_gain(0, 0, 0.2, first + i * B).unwrap();
     }
+    // The RT thread has moved them from the ring to its pending list, so
+    // the ring has room: the outstanding count refuses the 65th.
+    std::thread::sleep(SECOND / 20);
     assert_eq!(
         engine.set_gain(0, 0, 0.2, first + PENDING * B),
         Err(GainError::Full)
