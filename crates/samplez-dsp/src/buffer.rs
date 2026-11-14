@@ -18,14 +18,18 @@ impl PlanarBuffer {
     ///
     /// # Panics
     ///
-    /// If `capacity` exceeds [`MAX_FRAMES`].
+    /// If `capacity` exceeds [`MAX_FRAMES`], or `channels * capacity`
+    /// overflows `usize`.
     pub fn new(channels: usize, capacity: usize) -> Self {
         assert!(
             capacity <= MAX_FRAMES,
             "capacity {capacity} exceeds MAX_FRAMES"
         );
+        let len = channels
+            .checked_mul(capacity)
+            .unwrap_or_else(|| panic!("{channels} channels of {capacity} frames overflow usize"));
         Self {
-            data: vec![0.0; channels * capacity],
+            data: vec![0.0; len],
             channels,
             capacity,
         }
@@ -58,6 +62,12 @@ mod tests {
     #[should_panic(expected = "exceeds MAX_FRAMES")]
     fn capacity_is_capped() {
         PlanarBuffer::new(0, MAX_FRAMES + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "overflow usize")]
+    fn sample_count_overflow_is_named() {
+        PlanarBuffer::new(usize::MAX, 2);
     }
 
     #[test]

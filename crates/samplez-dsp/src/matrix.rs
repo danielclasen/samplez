@@ -125,20 +125,20 @@ impl Matrix {
         let col = &mut self.columns[output];
         match col.binary_search_by_key(&input, |t| t.input) {
             Ok(k) => {
-                let accepted = col[k].ramp.set_target(target, len);
+                // `target` passed valid_gain, so set_target accepts it.
+                let _ = col[k].ramp.set_target(target, len);
                 if !col[k].ramp.is_active() && target == 0.0 {
                     col.remove(k);
                 }
-                accepted
             }
             Err(k) if target != 0.0 => {
                 let mut ramp = Ramp::new(0.0);
-                let accepted = ramp.set_target(target, len);
+                let _ = ramp.set_target(target, len);
                 col.insert(k, Term { input, ramp });
-                accepted
             }
-            Err(_) => true,
+            Err(_) => {}
         }
+        true
     }
 
     /// Mixes the first `frames` frames of `input` into `output` on
