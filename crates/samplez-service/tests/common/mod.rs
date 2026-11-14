@@ -5,16 +5,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header, request};
 use axum::routing::get;
 use axum::{Extension, Router};
 use futures_util::future::BoxFuture;
+use samplez_service::replica::{Ack, NotApplied};
 use samplez_service::ws::{Delta, Snapshot};
 use samplez_service::{
     Identity, Ops, Owner, Position, ReplicaInfo, ReplicatedState, Service, ServiceConfig,
 };
 use serde_json::json;
+use tokio::sync::oneshot;
 use tower::ServiceExt;
 
 pub const HOST: &str = "localhost:8080";
@@ -35,6 +37,8 @@ pub struct FakeState {
     pub renewals: Mutex<Vec<Vec<Owner>>>,
     /// How long `snapshot` takes.
     pub snapshot_delay: Mutex<Duration>,
+    /// Submitted commands that `commit` applies.
+    submitted: Mutex<Vec<(String, oneshot::Sender<Ack>)>>,
 }
 
 impl FakeState {
@@ -53,6 +57,7 @@ impl FakeState {
             commands: Mutex::default(),
             renewals: Mutex::default(),
             snapshot_delay: Mutex::default(),
+            submitted: Mutex::default(),
         })
     }
 
@@ -79,6 +84,22 @@ impl FakeState {
                 .insert(id.clone(), delta.revision);
         }
         self.log.lock().unwrap().push(delta);
+    }
+
+    /// Applies the submitted commands in order, each id once, as a state
+    /// machine does when the entries carrying them are committed.
+    pub fn commit(&self) {
+        let submitted = std::mem::take(&mut *self.submitted.lock().unwrap());
+        for (id, done) in submitted {
+            let revision = match self.command_revision(&id) {
+                Some(revision) => revision,
+                None => self.apply(Some(&id)).revision,
+            };
+            let _ = done.send(Ack {
+                command: id,
+                revision,
+            });
+        }
     }
 
     pub fn forget_through(&self, revision: u64) {
@@ -135,6 +156,12 @@ impl ReplicatedState for FakeState {
 
     fn command_revision(&self, id: &str) -> Option<u64> {
         self.commands.lock().unwrap().get(id).copied()
+    }
+
+    fn submit(&self, id: &str, _: Bytes) -> BoxFuture<'_, Result<Ack, NotApplied>> {
+        let (done, ack) = oneshot::channel();
+        self.submitted.lock().unwrap().push((id.to_owned(), done));
+        Box::pin(async move { ack.await.map_err(|_| NotApplied("not committed".into())) })
     }
 
     fn renew_sessions(&self, live: &[Owner]) {

@@ -1,5 +1,5 @@
 //! The interface to the product's replicated state, and the local guard
-//! against applying one command id twice at once.
+//! against submitting one command id twice at once from this replica.
 //!
 //! Every replica of a product applies the same deltas at the same global
 //! revisions. The service layer never counts revisions itself: they come
@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use axum::body::Bytes;
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 
@@ -69,8 +70,21 @@ pub trait ReplicatedState: Send + Sync + 'static {
 
     /// The revision at which the command with this client-generated id was
     /// applied, from the replicated table of applied command ids that
-    /// snapshots carry; `None` when it was not applied.
+    /// snapshots carry; `None` when this replica has not applied it.
     fn command_revision(&self, id: &str) -> Option<u64>;
+
+    /// Orders `command`, the product's encoding of it, under the
+    /// client-generated `id`, and resolves once this replica has applied
+    /// the entry carrying it.
+    ///
+    /// The state machine dedups by id when it applies an entry: an entry
+    /// whose id the replicated table of applied command ids holds changes
+    /// nothing and resolves with the revision the table holds. A command
+    /// resent through another replica while the first copy is still being
+    /// committed is so applied once, and both submits resolve to the same
+    /// [`Ack`]. A check before ordering, such as [`Commands::begin`], cannot
+    /// give that: both copies pass it before either is applied.
+    fn submit(&self, id: &str, command: Bytes) -> BoxFuture<'_, Result<Ack, NotApplied>>;
 
     /// Called about once per second by [`crate::Bound::serve`] with the
     /// owners whose connection to this replica answered a ping within the
@@ -87,21 +101,31 @@ pub struct Ack {
     pub revision: u64,
 }
 
+/// [`ReplicatedState::submit`] could not order the command, for example
+/// without a quorum. Whether it was applied is unknown; a resend with the
+/// same id is applied at most once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotApplied(pub String);
+
 pub enum Begin<'a> {
-    /// Not applied: apply it, then call [`Pending::applied`]. Dropping the
-    /// [`Pending`] releases the id, so a resend is applied.
+    /// Not applied as far as this replica has applied: submit it with
+    /// [`Pending::submit`]. Dropping the [`Pending`] unsubmitted releases
+    /// the id, so a resend is submitted.
     New(Pending<'a>),
-    /// Applied already, on any replica; acknowledge it again without
-    /// applying it.
+    /// Applied already, through any replica; acknowledge it again without
+    /// submitting it.
     Duplicate(Ack),
-    /// Being applied on this replica right now.
+    /// Being submitted from this replica right now.
     InFlight,
-    /// As many commands as the limit are being applied on this replica.
+    /// As many commands as the limit are being submitted from this replica.
     Busy,
 }
 
-/// The command ids being applied on this replica. Whether an id was applied
-/// is the replicated state's answer, [`ReplicatedState::command_revision`].
+/// The command ids being submitted from this replica, so a resend to the
+/// same replica waits for the first copy instead of ordering a second.
+/// Whether an id was applied is the replicated state's answer; that its
+/// state machine dedups by id ([`ReplicatedState::submit`]) is what keeps a
+/// copy resent through another replica from being applied twice.
 pub struct Commands {
     state: Arc<dyn ReplicatedState>,
     limit: usize,
@@ -150,13 +174,10 @@ pub struct Pending<'a> {
 }
 
 impl Pending<'_> {
-    /// Call once the state has applied the command at `revision`, so
-    /// [`ReplicatedState::command_revision`] answers for it.
-    pub fn applied(self, revision: u64) -> Ack {
-        Ack {
-            command: self.id.clone(),
-            revision,
-        }
+    /// Submits the command to the replicated state and releases the id once
+    /// it resolved.
+    pub async fn submit(self, command: Bytes) -> Result<Ack, NotApplied> {
+        self.commands.state.submit(&self.id, command).await
     }
 }
 

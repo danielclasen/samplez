@@ -1,6 +1,6 @@
 mod common;
 
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -9,13 +9,13 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::ws::Message;
 use common::*;
-use futures_util::{Sink, Stream, StreamExt};
+use futures_util::{FutureExt, Sink, Stream, StreamExt};
 use samplez_service::replica::{Ack, Begin, Commands};
 use samplez_service::ws::{
     ClientQueue, Delta, Ended, Frame, Hub, MAX_PENDING_REPLIES, PONG_TIMEOUT, Popped, Pushed,
     Sessions, serve_client,
 };
-use samplez_service::{Connect, Forbidden, Identity, Ops, Owner, Position, Role};
+use samplez_service::{Connect, Forbidden, Identity, Ops, Owner, Position, ReplicatedState, Role};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite;
@@ -511,17 +511,23 @@ fn require_operator_refuses_a_viewer() {
     );
 }
 
-#[test]
-fn commands_apply_once_per_id_from_the_replicated_table() {
+fn command() -> Bytes {
+    Bytes::from_static(b"gain -6")
+}
+
+#[tokio::test]
+async fn commands_apply_once_per_id_from_the_replicated_table() {
     let state = FakeState::new("r1", "leader");
     let commands = Commands::new(state.clone(), 2);
 
     let Begin::New(pending) = commands.begin("c1") else {
         panic!("c1 is new");
     };
+    let mut submitted = pin!(pending.submit(command()));
+    assert!(submitted.as_mut().now_or_never().is_none(), "committing");
     assert!(matches!(commands.begin("c1"), Begin::InFlight));
-    let applied = state.apply(Some("c1"));
-    let ack = pending.applied(applied.revision);
+    state.commit();
+    let ack = submitted.await.unwrap();
     assert_eq!(
         ack,
         Ack {
@@ -549,6 +555,38 @@ fn commands_apply_once_per_id_from_the_replicated_table() {
         matches!(commands.begin("c"), Begin::Busy),
         "two in flight at most"
     );
+}
+
+/// Two replicas over one replicated state: the client lost the first
+/// before its commit finished and resent through the second.
+#[tokio::test]
+async fn a_command_resent_through_another_replica_while_pending_applies_once() {
+    let state = FakeState::new("r1", "leader");
+    let (on_a, on_b) = (
+        Commands::new(state.clone(), 8),
+        Commands::new(state.clone(), 8),
+    );
+    let Begin::New(a) = on_a.begin("cmd-1") else {
+        panic!("cmd-1 is new on a");
+    };
+    let mut first = pin!(a.submit(command()));
+    assert!(first.as_mut().now_or_never().is_none(), "committing");
+    let Begin::New(b) = on_b.begin("cmd-1") else {
+        panic!("not applied yet, so new on b as well");
+    };
+    let mut second = pin!(b.submit(command()));
+    assert!(second.as_mut().now_or_never().is_none(), "committing");
+    state.commit();
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+    assert_eq!(
+        first,
+        Ack {
+            command: "cmd-1".into(),
+            revision: 1
+        }
+    );
+    assert_eq!(second, first, "the same result");
+    assert_eq!(state.revision(), 1, "applied once");
 }
 
 #[test]
