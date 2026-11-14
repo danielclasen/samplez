@@ -99,7 +99,11 @@ pub struct AuthConfig {
     pub proxy: ProxyConfig,
 }
 
-/// A secret mounted as a file. Trailing whitespace is not part of it.
+/// A secret mounted as a file, re-read every
+/// [`crate::server::SECRET_RELOAD_PERIOD`]. Trailing whitespace is not part
+/// of it. A token is 32 random bytes or more, e.g. `openssl rand -hex 32`.
+/// Kubernetes never updates a Secret mounted with `subPath`; mount the
+/// Secret as a directory so a rotation reaches the file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretFile {
@@ -129,12 +133,18 @@ impl Default for ProxyConfig {
     }
 }
 
+// oauth2-proxy v7.15.x as a reverse proxy sends `X-Forwarded-User` and
+// `X-Forwarded-Groups` upstream (`--pass-user-headers`, default true) and
+// strips client-supplied copies (`--skip-auth-strip-headers`, default
+// true); `X-Auth-Request-*` are response headers for nginx `auth_request`
+// (`--set-xauthrequest`). Source:
+// https://oauth2-proxy.github.io/oauth2-proxy/configuration/overview
 fn default_user_header() -> String {
-    "X-Auth-Request-User".into()
+    "X-Forwarded-User".into()
 }
 
 fn default_groups_header() -> String {
-    "X-Auth-Request-Groups".into()
+    "X-Forwarded-Groups".into()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -146,6 +156,7 @@ pub struct ApiConfig {
     pub allowed_hosts: Vec<String>,
     /// `Origin` values accepted on WebSocket upgrades, in addition to
     /// `http://localhost:<api port>` and `http://127.0.0.1:<api port>`.
+    /// Compared without case, a trailing `/` or the scheme's default port.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 }

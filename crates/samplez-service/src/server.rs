@@ -7,18 +7,28 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::Query;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router, middleware};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::auth::{self, Auth, Identity, Listener};
+use crate::auth::{self, Auth, Identity, Listener, Role};
 use crate::config::{AuthMode, ServiceConfig};
 use crate::ops::Ops;
-use crate::replica::ReplicatedState;
+use crate::replica::{Owner, Position, ReplicatedState};
+use crate::ws::Sessions;
 use crate::{Error, config};
+
+/// How often [`Bound::serve`] passes the live sessions to
+/// [`ReplicatedState::renew_sessions`].
+pub const SESSION_RENEW_PERIOD: Duration = Duration::from_secs(1);
+/// The longest client session id accepted in `?session=`.
+pub const MAX_SESSION_ID: usize = 128;
 
 /// How often [`Bound::serve`] re-reads the token files.
 pub const SECRET_RELOAD_PERIOD: Duration = Duration::from_secs(10);
@@ -30,14 +40,75 @@ type WsHandler =
 #[derive(Debug, Clone)]
 pub struct Connect {
     pub identity: Identity,
-    /// The last global revision the client saw, from `?since=`; the
-    /// argument of the same name to [`crate::ws::pump`].
-    pub since: Option<u64>,
+    /// The last position the client saw, from `?since=<epoch>:<revision>`.
+    pub since: Option<Position>,
+    /// The principal is the proxy's user or `anonymous`; the session is
+    /// `?session=`, or the connection id when absent.
+    pub owner: Owner,
+    /// Where [`crate::ws::serve_client`] keeps the connection while it
+    /// answers pings.
+    pub sessions: Arc<Sessions>,
+}
+
+/// Returned by [`Connect::require_operator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Forbidden;
+
+impl Connect {
+    /// Call before applying a command received over the WebSocket: the
+    /// role check of the auth middleware covers HTTP requests only.
+    pub fn require_operator(&self) -> Result<(), Forbidden> {
+        match self.identity.role {
+            Role::Operator => Ok(()),
+            Role::Viewer => Err(Forbidden),
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct WsQuery {
-    since: Option<u64>,
+    since: Option<String>,
+    session: Option<String>,
+}
+
+fn parse_position(s: &str) -> Option<Position> {
+    let (epoch, revision) = s.split_once(':')?;
+    let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+    if !digits(epoch) || !digits(revision) {
+        return None;
+    }
+    Some(Position {
+        epoch: epoch.parse().ok()?,
+        revision: revision.parse().ok()?,
+    })
+}
+
+/// The service's own state for a product's status report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStatus {
+    pub secrets: Vec<SecretStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretStatus {
+    /// `token` or `machineToken`.
+    pub name: &'static str,
+    /// Seconds since the Unix epoch of the last successful read.
+    pub loaded_at: u64,
+}
+
+/// Reads the current [`ServiceStatus`]; cloned into the product's routes.
+#[derive(Clone)]
+pub struct StatusSource(Arc<Auth>);
+
+impl StatusSource {
+    pub fn get(&self) -> ServiceStatus {
+        let mut status = ServiceStatus::default();
+        self.0.status(&mut status);
+        status
+    }
 }
 
 pub struct Service {
@@ -46,8 +117,10 @@ pub struct Service {
     ops: Ops,
     state: Arc<dyn ReplicatedState>,
     api: Router,
+    ui: Router,
     ws: Option<WsHandler>,
     nmos: Router,
+    sessions: Arc<Sessions>,
 }
 
 /// The routers of each listener, for serving or for driving in tests.
@@ -67,11 +140,13 @@ impl Service {
         state: Arc<dyn ReplicatedState>,
     ) -> Result<Service, Error> {
         Ok(Service {
-            auth: Arc::new(Auth::new(&config)?),
+            auth: Arc::new(Auth::new(&config, ops.metrics())?),
+            sessions: Arc::new(Sessions::new(&state.replica().id)),
             config,
             ops,
             state,
             api: Router::new(),
+            ui: Router::new(),
             ws: None,
             nmos: Router::new(),
         })
@@ -84,8 +159,23 @@ impl Service {
         self
     }
 
+    /// Served at `/` on the API listener with the `Host` check only, no
+    /// authentication: the UI's static files and login page. Paths under
+    /// `/api/v1` never reach it.
+    pub fn ui(mut self, router: Router) -> Service {
+        self.ui = router;
+        self
+    }
+
+    /// The source of [`ServiceStatus`] for the product's routes.
+    pub fn status(&self) -> StatusSource {
+        StatusSource(self.auth.clone())
+    }
+
     /// Serves WebSocket upgrades at `/api/v1/ws` once auth and the `Origin`
-    /// check pass.
+    /// check pass. `?since=` other than `<epoch>:<revision>`, or a
+    /// `?session=` that is empty or longer than [`MAX_SESSION_ID`], gets
+    /// 400.
     pub fn ws<F, Fut>(mut self, handler: F) -> Service
     where
         F: Fn(WebSocket, Connect) -> Fut + Send + Sync + 'static,
@@ -97,8 +187,11 @@ impl Service {
         self
     }
 
-    /// The NMOS listener's router, served as is: no auth, `Authorization`
-    /// is not read.
+    /// The NMOS listener's router, served as is: no auth, no `Host` check,
+    /// `Authorization` is not read. IS-05 on it is unauthenticated, so the
+    /// bind address and a NetworkPolicy are what protect it. Controllers
+    /// address the node by its advertised href under any name, which is why
+    /// `Host` is not checked.
     pub fn nmos(mut self, router: Router) -> Service {
         self.nmos = router;
         self
@@ -129,6 +222,7 @@ impl Service {
         let mut inner = self.api.clone();
         if let Some(handler) = &self.ws {
             let handler = handler.clone();
+            let sessions = self.sessions.clone();
             inner = inner.route(
                 "/ws",
                 get(
@@ -136,11 +230,37 @@ impl Service {
                           Extension(identity): Extension<Identity>,
                           Query(query): Query<WsQuery>| {
                         let handler = handler.clone();
-                        let connect = Connect {
-                            identity,
-                            since: query.since,
-                        };
-                        async move { upgrade.on_upgrade(move |socket| handler(socket, connect)) }
+                        let sessions = sessions.clone();
+                        async move {
+                            let since = match query.since.as_deref().map(parse_position) {
+                                Some(None) => return StatusCode::BAD_REQUEST.into_response(),
+                                Some(p) => p,
+                                None => None,
+                            };
+                            let connection = sessions.connection_id();
+                            let session = match query.session {
+                                Some(s) if s.is_empty() || s.len() > MAX_SESSION_ID => {
+                                    return StatusCode::BAD_REQUEST.into_response();
+                                }
+                                Some(s) => s,
+                                None => connection.clone(),
+                            };
+                            let owner = Owner {
+                                principal: identity
+                                    .user
+                                    .clone()
+                                    .unwrap_or_else(|| "anonymous".into()),
+                                session,
+                                connection,
+                            };
+                            let connect = Connect {
+                                identity,
+                                since,
+                                owner,
+                                sessions,
+                            };
+                            upgrade.on_upgrade(move |socket| handler(socket, connect))
+                        }
                     },
                 ),
             );
@@ -148,12 +268,23 @@ impl Service {
         if listener == Listener::Api && self.auth.mode() == AuthMode::Token {
             inner = inner.route("/login", post(auth::login).with_state(self.auth.clone()));
         }
-        Router::new()
-            .nest("/api/v1", inner)
+        let api = Router::new()
+            .nest(
+                "/api/v1",
+                inner.fallback(|| async { StatusCode::NOT_FOUND }),
+            )
             .layer(middleware::from_fn_with_state(
                 (self.auth.clone(), listener),
                 auth::middleware,
-            ))
+            ));
+        match listener {
+            Listener::Api => api.merge(
+                self.ui
+                    .clone()
+                    .layer(middleware::from_fn_with_state(self.auth.clone(), host_only)),
+            ),
+            Listener::Machine => api,
+        }
     }
 
     /// Binds every listener.
@@ -237,13 +368,36 @@ impl Bound {
                 let _ = service.auth.reload();
             }
         };
+        let renew = renew_sessions(&service.sessions, &*service.state);
         service.ops.set_api_serving(true);
         let _serving = Serving(service.ops.clone());
         tokio::select! {
             r = servers => r.map(|_| ()),
             () = service.ops.clone().watch_heartbeat() => unreachable!("the watch never returns"),
             () = reload => unreachable!("the reload loop never returns"),
+            () = renew => unreachable!("the renew loop never returns"),
         }
+    }
+}
+
+/// Passes the live sessions to the state every [`SESSION_RENEW_PERIOD`];
+/// never returns. [`Bound::serve`] runs it.
+pub async fn renew_sessions(sessions: &Sessions, state: &dyn ReplicatedState) {
+    let mut ticks = tokio::time::interval(SESSION_RENEW_PERIOD);
+    loop {
+        ticks.tick().await;
+        let live = sessions.live();
+        if !live.is_empty() {
+            state.renew_sessions(&live);
+        }
+    }
+}
+
+async fn host_only(State(auth): State<Arc<Auth>>, req: Request, next: Next) -> Response {
+    if auth.host_allowed(&req) {
+        next.run(req).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
     }
 }
 

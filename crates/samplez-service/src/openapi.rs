@@ -8,37 +8,54 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder
 use utoipa::openapi::{Components, OpenApi, OpenApiVersion, Paths, SecurityRequirement};
 
 use crate::auth::SESSION_COOKIE;
+use crate::config::AuthMode;
 
 /// Set to write the generated document instead of comparing it.
 pub const UPDATE_ENV: &str = "SAMPLEZ_UPDATE_COMMITTED";
 
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(crate::auth::login))]
-struct ServiceApi;
+struct LoginApi;
 
-/// The product's document with its paths and the login route under
-/// `/api/v1`, the `bearer` and `session` security schemes, and a top-level
-/// requirement of either. In `none` and `proxy` mode the API listener asks
-/// for neither.
-pub fn document(product: OpenApi) -> OpenApi {
+/// The product's document with its paths under `/api/v1` and what `mode`
+/// adds: in `token` mode the login route, the `bearer` and `session`
+/// security schemes and a top-level requirement of either; in `proxy` mode
+/// the `bearer` scheme of the machine listener, the API listener taking
+/// its identity from the proxy in front; in `none` mode no security.
+pub fn document(product: OpenApi, mode: AuthMode) -> OpenApi {
     let info = product.info.clone();
-    let mut api = ServiceApi::openapi();
+    let mut api = match mode {
+        AuthMode::Token => LoginApi::openapi(),
+        AuthMode::None | AuthMode::Proxy => OpenApi::new(info.clone(), Paths::new()),
+    };
     api.merge(product);
     let mut doc = OpenApi::new(info, Paths::new()).nest("/api/v1", api);
     doc.openapi = OpenApiVersion::Version31;
-    let components = doc.components.get_or_insert_with(Components::default);
-    components.add_security_scheme(
-        "bearer",
-        SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build()),
-    );
-    components.add_security_scheme(
-        "session",
-        SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new(SESSION_COOKIE))),
-    );
-    doc.security = Some(vec![
-        SecurityRequirement::new("bearer", Vec::<String>::new()),
-        SecurityRequirement::new("session", Vec::<String>::new()),
-    ]);
+    let bearer = || SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build());
+    let mut schemes = Vec::new();
+    match mode {
+        AuthMode::None => {}
+        AuthMode::Token => {
+            schemes.push(("bearer", bearer()));
+            schemes.push((
+                "session",
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new(SESSION_COOKIE))),
+            ));
+        }
+        AuthMode::Proxy => schemes.push(("bearer", bearer())),
+    }
+    if !schemes.is_empty() {
+        doc.security = Some(
+            schemes
+                .iter()
+                .map(|(name, _)| SecurityRequirement::new(*name, Vec::<String>::new()))
+                .collect(),
+        );
+        let components = doc.components.get_or_insert_with(Components::default);
+        for (name, scheme) in schemes {
+            components.add_security_scheme(name, scheme);
+        }
+    }
     doc
 }
 

@@ -2,7 +2,7 @@
 //!
 //! [`Counter::add`] and [`Histogram::observe`] make no allocation and take
 //! no lock, so the RT thread may call them. Registration and rendering lock
-//! the registry and allocate.
+//! the registry and allocate. Registering a series that exists returns it.
 
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +17,7 @@ struct Family {
     series: Vec<(Vec<(String, String)>, Series)>,
 }
 
+#[derive(Clone)]
 enum Series {
     Counter(Counter),
     Histogram(Histogram),
@@ -56,7 +57,13 @@ struct HistogramInner {
 }
 
 impl Histogram {
+    /// NaN is not counted. With one thread observing, as the RT thread does
+    /// with its own histograms, the update of the sum succeeds at the first
+    /// attempt; concurrent observers retry it.
     pub fn observe(&self, value: f64) {
+        if value.is_nan() {
+            return;
+        }
         let h = &self.0;
         let i = h.bounds.iter().take_while(|b| value > **b).count();
         h.buckets[i].fetch_add(1, Ordering::Relaxed);
@@ -83,16 +90,20 @@ fn valid_name(name: &str) -> bool {
 }
 
 impl Metrics {
-    /// Panics when the name or a label name is invalid, when `name` is
-    /// registered with another type, or when the series exists.
+    /// The series of `name` with `labels`, created when absent. Panics when
+    /// the name or a label name is invalid, or when `name` is registered
+    /// with another type.
     pub fn counter(&self, name: &str, help: &str, labels: &[(&str, &str)]) -> Counter {
         let counter = Counter(Arc::default());
-        self.register(name, help, labels, Series::Counter(counter.clone()));
-        counter
+        match self.register(name, help, labels, Series::Counter(counter.clone())) {
+            Series::Counter(c) => c,
+            Series::Histogram(_) => unreachable!("register checks the type"),
+        }
     }
 
-    /// `bounds` are the bucket upper bounds, ascending; `+Inf` is added.
-    /// Panics like [`Metrics::counter`] and when `bounds` are not ascending.
+    /// `bounds` are the bucket upper bounds, finite and ascending; `+Inf` is
+    /// added. Panics like [`Metrics::counter`], when `bounds` are not
+    /// finite and ascending, and when the series exists with other bounds.
     pub fn histogram(
         &self,
         name: &str,
@@ -101,19 +112,38 @@ impl Metrics {
         bounds: &[f64],
     ) -> Histogram {
         assert!(
-            bounds.windows(2).all(|w| w[0] < w[1]),
-            "histogram bounds of {name} are not ascending"
+            bounds.iter().all(|b| b.is_finite()) && bounds.windows(2).all(|w| w[0] < w[1]),
+            "histogram bounds of {name} are not finite and ascending"
         );
         let histogram = Histogram(Arc::new(HistogramInner {
             bounds: bounds.into(),
             buckets: (0..=bounds.len()).map(|_| AtomicU64::new(0)).collect(),
             sum: AtomicU64::new(0f64.to_bits()),
         }));
-        self.register(name, help, labels, Series::Histogram(histogram.clone()));
-        histogram
+        match self.register(name, help, labels, Series::Histogram(histogram)) {
+            Series::Histogram(h) => {
+                assert!(
+                    *h.0.bounds == *bounds,
+                    "{name} registered with other bounds"
+                );
+                h
+            }
+            Series::Counter(_) => unreachable!("register checks the type"),
+        }
     }
 
-    fn register(&self, name: &str, help: &str, labels: &[(&str, &str)], series: Series) {
+    /// Removes the series of `name` with `labels`; the handles still count
+    /// but are no longer rendered.
+    pub fn remove(&self, name: &str, labels: &[(&str, &str)]) {
+        let mut families = self.0.lock().expect("metrics lock poisoned");
+        for family in families.iter_mut().filter(|f| f.name == name) {
+            family.series.retain(|(l, _)| !same_labels(l, labels));
+        }
+        families.retain(|f| !f.series.is_empty());
+    }
+
+    /// The registered series, or `series` once registered.
+    fn register(&self, name: &str, help: &str, labels: &[(&str, &str)], series: Series) -> Series {
         assert!(valid_name(name), "invalid metric name {name:?}");
         for (label, _) in labels {
             assert!(
@@ -144,11 +174,11 @@ impl Metrics {
                 "{name} registered as another type"
             );
         }
-        assert!(
-            family.series.iter().all(|(l, _)| *l != labels),
-            "{name} with these labels is registered"
-        );
-        family.series.push((labels, series));
+        if let Some((_, existing)) = family.series.iter().find(|(l, _)| *l == labels) {
+            return existing.clone();
+        }
+        family.series.push((labels, series.clone()));
+        series
     }
 
     pub fn render(&self) -> String {
@@ -169,11 +199,11 @@ impl Metrics {
                         let mut cumulative = 0;
                         for (i, bucket) in h.buckets.iter().enumerate() {
                             cumulative += bucket.load(Ordering::Relaxed);
-                            let le = h.bounds.get(i).map_or("+Inf".into(), |b| b.to_string());
+                            let le = h.bounds.get(i).map_or("+Inf".into(), |b| float(*b));
                             let set = label_set(pairs(labels).chain([("le", le.as_str())]));
                             writeln!(out, "{name}_bucket{set} {cumulative}").unwrap();
                         }
-                        let sum = f64::from_bits(h.sum.load(Ordering::Relaxed));
+                        let sum = float(f64::from_bits(h.sum.load(Ordering::Relaxed)));
                         let set = label_set(pairs(labels));
                         writeln!(out, "{name}_sum{set} {sum}").unwrap();
                         writeln!(out, "{name}_count{set} {cumulative}").unwrap();
@@ -183,6 +213,24 @@ impl Metrics {
         }
         out
     }
+}
+
+/// A float as the Prometheus text format writes it.
+fn float(v: f64) -> String {
+    match v {
+        f64::INFINITY => "+Inf".into(),
+        f64::NEG_INFINITY => "-Inf".into(),
+        v if v.is_nan() => "NaN".into(),
+        v => v.to_string(),
+    }
+}
+
+fn same_labels(registered: &[(String, String)], labels: &[(&str, &str)]) -> bool {
+    registered.len() == labels.len()
+        && registered
+            .iter()
+            .zip(labels)
+            .all(|((k, v), (k2, v2))| k == k2 && v == v2)
 }
 
 fn pairs(labels: &[(String, String)]) -> impl Iterator<Item = (&str, &str)> {

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use samplez_service::config::AuthMode;
 use samplez_service::openapi::{check_committed, document};
 use utoipa::OpenApi;
 
@@ -26,7 +27,7 @@ fn committed() -> PathBuf {
 /// the committed file.
 #[test]
 fn committed_document_matches() {
-    let doc = serde_json::to_value(document(Product::openapi())).unwrap();
+    let doc = serde_json::to_value(document(Product::openapi(), AuthMode::Token)).unwrap();
     assert_eq!(doc["openapi"], "3.1.0");
     assert_eq!(doc["info"]["title"], "example");
     assert!(doc["paths"]["/api/v1/status"]["get"].is_object());
@@ -42,7 +43,7 @@ fn committed_document_matches() {
 fn drift_and_a_missing_file_are_reported() {
     let copy = Path::new(env!("CARGO_TARGET_TMPDIR")).join("openapi-drift.json");
     std::fs::copy(committed(), &copy).unwrap();
-    let mut doc = serde_json::to_value(document(Product::openapi())).unwrap();
+    let mut doc = serde_json::to_value(document(Product::openapi(), AuthMode::Token)).unwrap();
     check_committed(&copy, &doc).unwrap();
 
     doc["info"]["version"] = "0.0.1".into();
@@ -51,4 +52,22 @@ fn drift_and_a_missing_file_are_reported() {
 
     let err = check_committed(&copy.with_extension("missing"), &doc).unwrap_err();
     assert!(err.contains("SAMPLEZ_UPDATE_COMMITTED=1"), "{err}");
+}
+
+#[test]
+fn security_follows_the_mode() {
+    let none = serde_json::to_value(document(Product::openapi(), AuthMode::None)).unwrap();
+    assert!(none.get("security").is_none());
+    assert!(none["components"].get("securitySchemes").is_none());
+    assert!(none["paths"].get("/api/v1/login").is_none());
+    assert!(none["paths"]["/api/v1/status"]["get"].is_object());
+
+    let proxy = serde_json::to_value(document(Product::openapi(), AuthMode::Proxy)).unwrap();
+    assert!(proxy["paths"].get("/api/v1/login").is_none());
+    assert_eq!(proxy["security"], serde_json::json!([{ "bearer": [] }]));
+    assert!(
+        proxy["components"]["securitySchemes"]
+            .get("session")
+            .is_none()
+    );
 }

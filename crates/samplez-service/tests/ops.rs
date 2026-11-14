@@ -70,7 +70,7 @@ async fn readyz_is_api_serving_and_engine_started_whatever_the_role() {
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
         body["replica"],
-        serde_json::json!({ "id": "r2", "role": "follower" })
+        serde_json::json!({ "id": "r2", "role": "follower", "leader": "r1", "inSync": true, "lag": 0 })
     );
 
     ops.set_engine_started(false);
@@ -163,9 +163,51 @@ fn a_name_keeps_its_type() {
 }
 
 #[test]
-#[should_panic(expected = "with these labels is registered")]
-fn a_series_registers_once() {
+fn registering_a_series_again_returns_it_and_remove_drops_it() {
     let m = Metrics::default();
-    m.counter("samplez_x", "x", &[("a", "1")]);
-    m.counter("samplez_x", "x", &[("a", "1")]);
+    let first = m.counter("samplez_x_total", "x", &[("a", "1")]);
+    let again = m.counter("samplez_x_total", "x", &[("a", "1")]);
+    again.add(2);
+    assert_eq!(first.get(), 2, "one series");
+    let h = m.histogram("samplez_h", "h", &[], &[1.0]);
+    m.histogram("samplez_h", "h", &[], &[1.0]).observe(0.5);
+    h.observe(0.5);
+    assert!(m.render().contains("samplez_h_count 2"));
+
+    m.remove("samplez_x_total", &[("a", "1")]);
+    m.remove("samplez_h", &[]);
+    assert_eq!(m.render(), "");
+    let fresh = m.counter("samplez_x_total", "x", &[("a", "1")]);
+    assert_eq!(fresh.get(), 0, "registered anew after removal");
+}
+
+#[test]
+fn histograms_skip_nan_and_render_infinities() {
+    let m = Metrics::default();
+    let h = m.histogram("samplez_h", "h", &[], &[1.0]);
+    h.observe(f64::NAN);
+    assert!(m.render().contains("samplez_h_count 0"), "NaN not counted");
+    h.observe(f64::INFINITY);
+    assert!(
+        m.render().contains("samplez_h_sum +Inf\n"),
+        "{}",
+        m.render()
+    );
+    let n = m.histogram("samplez_n", "n", &[], &[1.0]);
+    n.observe(f64::NEG_INFINITY);
+    assert!(m.render().contains("samplez_n_sum -Inf\n"));
+}
+
+#[test]
+#[should_panic(expected = "not finite and ascending")]
+fn histogram_bounds_are_finite() {
+    Metrics::default().histogram("samplez_h", "h", &[], &[1.0, f64::INFINITY]);
+}
+
+#[test]
+#[should_panic(expected = "registered with other bounds")]
+fn a_histogram_keeps_its_bounds() {
+    let m = Metrics::default();
+    m.histogram("samplez_h", "h", &[], &[1.0]);
+    m.histogram("samplez_h", "h", &[], &[2.0]);
 }

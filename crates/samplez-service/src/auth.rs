@@ -8,9 +8,12 @@
 //! Requests without a valid bearer must name an allowed `Host` and, when
 //! they change state, carry `X-Samplez-Request: 1` with a JSON content
 //! type. Every WebSocket upgrade with an `Origin` must name an allowed one;
-//! one without is accepted only with a valid bearer or in `none` mode.
+//! one without is accepted only with a valid bearer or in `none` mode. The
+//! same `Origin` rule holds for every request to the WebSocket path and for
+//! every `CONNECT`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,13 +28,15 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 
-use crate::Error;
 use crate::config::{AuthMode, ProxyConfig, ServiceConfig};
+use crate::metrics::{Counter, Metrics};
+use crate::{Error, ServiceStatus};
 
 pub const SESSION_COOKIE: &str = "samplez_session";
 pub const CSRF_HEADER: &str = "x-samplez-request";
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const LOGIN_PATH: &str = "/api/v1/login";
+pub(crate) const WS_PATH: &str = "/api/v1/ws";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -40,8 +45,10 @@ pub enum Role {
     Operator,
 }
 
-/// Inserted as a request extension on every authenticated request; a
-/// viewer's state-changing requests are refused before they reach a route.
+/// Inserted as a request extension on every authenticated request. A
+/// viewer's state-changing HTTP requests are refused before they reach a
+/// route; WebSocket messages are not HTTP requests, so a WebSocket handler
+/// calls [`crate::Connect::require_operator`] before it applies a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// The user named by the proxy; `None` in the other modes.
@@ -56,21 +63,44 @@ pub(crate) enum Listener {
 }
 
 struct Secret {
+    name: &'static str,
     path: PathBuf,
     value: RwLock<Vec<u8>>,
+    /// Seconds since the Unix epoch of the last successful read.
+    loaded_at: AtomicU64,
+    failures: Counter,
 }
 
 impl Secret {
-    fn load(path: &Path) -> Result<Secret, Error> {
+    fn load(name: &'static str, path: &Path, metrics: &Metrics) -> Result<Secret, Error> {
         Ok(Secret {
+            name,
             path: path.to_owned(),
             value: RwLock::new(read_secret(path)?),
+            loaded_at: AtomicU64::new(now()),
+            failures: metrics.counter(
+                "samplez_secret_reload_failures_total",
+                "Failed re-reads of a secret file; the previous value stays in use.",
+                &[("secret", name)],
+            ),
         })
     }
 
     fn reload(&self) -> Result<(), Error> {
-        let value = read_secret(&self.path)?;
-        *self.value.write().expect("secret lock poisoned") = value;
+        let value = match read_secret(&self.path) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failures.add(1);
+                tracing::warn!(secret = self.name, error = %e, "keeping the previous secret");
+                return Err(e);
+            }
+        };
+        let mut current = self.value.write().expect("secret lock poisoned");
+        if *current != value {
+            tracing::info!(secret = self.name, "secret changed");
+            *current = value;
+        }
+        self.loaded_at.store(now(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -106,7 +136,7 @@ pub(crate) struct Auth {
 }
 
 impl Auth {
-    pub(crate) fn new(config: &ServiceConfig) -> Result<Auth, Error> {
+    pub(crate) fn new(config: &ServiceConfig, metrics: &Metrics) -> Result<Auth, Error> {
         let auth = &config.auth;
         let listeners = &config.listeners;
         if auth.mode == AuthMode::Proxy && listeners.api.bind != std::net::Ipv4Addr::LOCALHOST {
@@ -126,15 +156,20 @@ impl Auth {
                 ));
             }
         }
+        if auth.mode == AuthMode::Proxy && auth.proxy.group_roles.is_empty() {
+            return Err(Error::Config(
+                "proxy mode needs auth.proxy.groupRoles; without it nobody gets a role".into(),
+            ));
+        }
         let token = match (auth.mode, &auth.token) {
-            (AuthMode::Token, Some(t)) => Some(Secret::load(&t.file)?),
+            (AuthMode::Token, Some(t)) => Some(Secret::load("token", &t.file, metrics)?),
             (AuthMode::Token, None) => {
                 return Err(Error::Config("token mode needs auth.token".into()));
             }
             _ => None,
         };
         let machine_token = match (&listeners.machine, &auth.machine_token) {
-            (Some(_), Some(t)) => Some(Secret::load(&t.file)?),
+            (Some(_), Some(t)) => Some(Secret::load("machineToken", &t.file, metrics)?),
             _ => None,
         };
         let port = listeners.api.port;
@@ -151,6 +186,7 @@ impl Auth {
             format!("http://127.0.0.1:{port}"),
         ];
         origins.extend(config.api.allowed_origins.iter().cloned());
+        let origins = origins.iter().map(|o| normalize_origin(o)).collect();
         Ok(Auth {
             mode: auth.mode,
             token,
@@ -161,12 +197,30 @@ impl Auth {
         })
     }
 
-    /// Re-reads the token files. A failed read keeps the previous value.
+    fn secrets(&self) -> impl Iterator<Item = &Secret> {
+        [&self.token, &self.machine_token].into_iter().flatten()
+    }
+
+    /// Re-reads every token file, each on its own: a failed read keeps that
+    /// secret's previous value and does not stop the others. Returns the
+    /// first error.
     pub(crate) fn reload(&self) -> Result<(), Error> {
-        for secret in [&self.token, &self.machine_token].into_iter().flatten() {
-            secret.reload()?;
+        let mut first = Ok(());
+        for secret in self.secrets() {
+            if let Err(e) = secret.reload() {
+                first = first.and(Err(e));
+            }
         }
-        Ok(())
+        first
+    }
+
+    pub(crate) fn status(&self, status: &mut ServiceStatus) {
+        for secret in self.secrets() {
+            status.secrets.push(crate::SecretStatus {
+                name: secret.name,
+                loaded_at: secret.loaded_at.load(Ordering::Relaxed),
+            });
+        }
     }
 
     pub(crate) fn mode(&self) -> AuthMode {
@@ -183,8 +237,8 @@ impl Auth {
             (Listener::Api, _) => None,
         };
         let bearer = match bearer_secret {
-            Some(secret) => match headers.get(header::AUTHORIZATION) {
-                Some(value) => match bearer_token(value.as_bytes()) {
+            Some(secret) => match single(headers, header::AUTHORIZATION.as_str())? {
+                Some(value) => match bearer_token(value) {
                     Some(t) if secret.matches(t) => true,
                     _ => return Err(StatusCode::UNAUTHORIZED),
                 },
@@ -197,9 +251,9 @@ impl Auth {
         if !bearer && !self.host_allowed(req) {
             return Err(StatusCode::FORBIDDEN);
         }
-        if is_upgrade(headers) {
+        if is_upgrade(headers) || req.method() == Method::CONNECT || req.uri().path() == WS_PATH {
             match headers.get(header::ORIGIN) {
-                Some(o) if !self.origins.iter().any(|a| a.as_bytes() == o.as_bytes()) => {
+                Some(o) if !self.origin_allowed(o.as_bytes()) => {
                     return Err(StatusCode::FORBIDDEN);
                 }
                 None if !bearer && self.mode != AuthMode::None => {
@@ -225,9 +279,11 @@ impl Auth {
                 AuthMode::Token if req.uri().path() == LOGIN_PATH => return Ok(None),
                 AuthMode::Token => {
                     let token = self.token.as_ref().expect("token mode has a token");
-                    match session_cookie(headers) {
-                        Some(c) if session_valid(&token.get(), c, now()) => operator,
-                        _ => return Err(StatusCode::UNAUTHORIZED),
+                    let key = token.get();
+                    if session_cookies(headers).any(|c| session_valid(&key, c, now())) {
+                        operator
+                    } else {
+                        return Err(StatusCode::UNAUTHORIZED);
                     }
                 }
                 AuthMode::Proxy => self.proxy_identity(headers)?,
@@ -239,7 +295,12 @@ impl Auth {
         Ok(Some(identity))
     }
 
-    fn host_allowed(&self, req: &Request) -> bool {
+    fn origin_allowed(&self, origin: &[u8]) -> bool {
+        std::str::from_utf8(origin)
+            .is_ok_and(|o| self.origins.iter().any(|a| *a == normalize_origin(o)))
+    }
+
+    pub(crate) fn host_allowed(&self, req: &Request) -> bool {
         if req.headers().get_all(header::HOST).iter().nth(1).is_some() {
             return false;
         }
@@ -256,15 +317,13 @@ impl Auth {
     }
 
     fn proxy_identity(&self, headers: &HeaderMap) -> Result<Identity, StatusCode> {
-        let user = headers
-            .get(self.proxy.user_header.as_str())
-            .and_then(|v| v.to_str().ok())
+        let user = single(headers, &self.proxy.user_header)?
+            .and_then(|v| std::str::from_utf8(v).ok())
             .filter(|u| !u.is_empty())
             .ok_or(StatusCode::UNAUTHORIZED)?;
-        let role = headers
-            .get_all(self.proxy.groups_header.as_str())
-            .iter()
-            .filter_map(|v| v.to_str().ok())
+        let role = single(headers, &self.proxy.groups_header)?
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .into_iter()
             .flat_map(|v| v.split(','))
             .filter_map(|g| self.proxy.group_roles.get(g.trim()))
             .max()
@@ -275,6 +334,33 @@ impl Auth {
             role,
         })
     }
+}
+
+/// The value of a header that may appear at most once; a repeated one is
+/// refused, since the parts in front of the service may disagree on which
+/// copy counts.
+fn single<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a [u8]>, StatusCode> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(first.map(|v| v.as_bytes()))
+}
+
+/// Lowercase, without a trailing `/` and without the scheme's default
+/// port, so equal origins compare equal whatever way they are written.
+pub(crate) fn normalize_origin(origin: &str) -> String {
+    let lower = origin.trim().to_ascii_lowercase();
+    let lower = lower.strip_suffix('/').unwrap_or(&lower);
+    for (scheme, port) in [("http://", ":80"), ("https://", ":443")] {
+        if lower.starts_with(scheme)
+            && let Some(rest) = lower.strip_suffix(port)
+        {
+            return rest.to_owned();
+        }
+    }
+    lower.to_owned()
 }
 
 fn bearer_token(value: &[u8]) -> Option<&[u8]> {
@@ -298,13 +384,15 @@ fn csrf_ok(headers: &HeaderMap) -> bool {
     marked && json
 }
 
-fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+/// Every `samplez_session` value: a browser sends one per matching path
+/// and domain, and only one of them may be current.
+fn session_cookies(headers: &HeaderMap) -> impl Iterator<Item = &str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .find_map(|c| c.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='))
+        .filter_map(|c| c.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='))
 }
 
 fn now() -> u64 {
@@ -332,6 +420,9 @@ fn session_valid(token: &[u8], value: &str, now: u64) -> bool {
     let Some((expiry, hex)) = value.split_once('.') else {
         return false;
     };
+    if expiry.is_empty() || !expiry.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
     let Ok(expiry) = expiry.parse::<u64>() else {
         return false;
     };
@@ -403,7 +494,14 @@ pub(crate) async fn login(
         SESSION_TTL.as_secs(),
         if secure { "; Secure" } else { "" },
     );
-    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response()
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (header::SET_COOKIE, cookie),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -421,6 +519,24 @@ mod tests {
         assert!(!session_valid(b"secret", &far, t));
         assert!(!session_valid(b"secret", "", t));
         assert!(!session_valid(b"secret", &v.replace('.', "x"), t));
+        assert!(!session_valid(b"secret", &format!("+{v}"), t), "sign");
+    }
+
+    #[test]
+    fn origins_compare_normalized() {
+        assert_eq!(
+            normalize_origin("HTTPS://Faderz.Example:443/"),
+            "https://faderz.example"
+        );
+        assert_eq!(normalize_origin("http://a.example:80"), "http://a.example");
+        assert_eq!(
+            normalize_origin("http://a.example:443"),
+            "http://a.example:443"
+        );
+        assert_eq!(
+            normalize_origin("https://a.example:8443"),
+            "https://a.example:8443"
+        );
     }
 
     #[test]

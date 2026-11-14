@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -7,8 +8,11 @@ use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header, request};
 use axum::routing::get;
 use axum::{Extension, Router};
+use futures_util::future::BoxFuture;
 use samplez_service::ws::{Delta, Snapshot};
-use samplez_service::{Identity, Ops, ReplicaInfo, ReplicatedState, Service, ServiceConfig};
+use samplez_service::{
+    Identity, Ops, Owner, Position, ReplicaInfo, ReplicatedState, Service, ServiceConfig,
+};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -20,9 +24,14 @@ pub const MACHINE_TOKEN: &str = "machine-token";
 /// for replication from another replica.
 pub struct FakeState {
     pub replica: Mutex<ReplicaInfo>,
+    pub epoch: Mutex<u64>,
     log: Mutex<Vec<Delta>>,
     /// Deltas at or below this revision are no longer held.
     forgotten: Mutex<u64>,
+    /// The replicated table of applied command ids.
+    commands: Mutex<HashMap<String, u64>>,
+    /// Every `renew_sessions` call.
+    pub renewals: Mutex<Vec<Vec<Owner>>>,
 }
 
 impl FakeState {
@@ -31,17 +40,26 @@ impl FakeState {
             replica: Mutex::new(ReplicaInfo {
                 id: id.into(),
                 role: role.into(),
+                leader: Some("r1".into()),
+                in_sync: true,
+                lag: Some(0),
             }),
+            epoch: Mutex::new(7),
             log: Mutex::default(),
             forgotten: Mutex::new(0),
+            commands: Mutex::default(),
+            renewals: Mutex::default(),
         })
     }
 
     /// Applies the next revision `r` as the delta `delta@r`.
     pub fn apply(&self, command: Option<&str>) -> Delta {
-        let revision = self.revision() + 1;
+        let prev = self.revision();
+        let revision = prev + 1;
         let delta = Delta {
+            epoch: self.epoch(),
             revision,
+            prev,
             command: command.map(str::to_owned),
             text: format!("delta@{revision}").into(),
         };
@@ -50,11 +68,25 @@ impl FakeState {
     }
 
     pub fn receive(&self, delta: Delta) {
+        if let Some(id) = &delta.command {
+            self.commands
+                .lock()
+                .unwrap()
+                .insert(id.clone(), delta.revision);
+        }
         self.log.lock().unwrap().push(delta);
     }
 
     pub fn forget_through(&self, revision: u64) {
         *self.forgotten.lock().unwrap() = revision;
+    }
+
+    /// Starts a new history, as a state that lost its storage does.
+    pub fn reset(&self, epoch: u64) {
+        *self.epoch.lock().unwrap() = epoch;
+        self.log.lock().unwrap().clear();
+        self.commands.lock().unwrap().clear();
+        *self.forgotten.lock().unwrap() = 0;
     }
 }
 
@@ -63,29 +95,44 @@ impl ReplicatedState for FakeState {
         self.replica.lock().unwrap().clone()
     }
 
+    fn epoch(&self) -> u64 {
+        *self.epoch.lock().unwrap()
+    }
+
     fn revision(&self) -> u64 {
         self.log.lock().unwrap().last().map_or(0, |d| d.revision)
     }
 
-    fn snapshot(&self) -> Snapshot {
-        let revision = self.revision();
-        Snapshot {
-            revision,
-            text: format!("snapshot@{revision}").into(),
-        }
+    fn snapshot(&self) -> BoxFuture<'_, Snapshot> {
+        let (epoch, revision) = (self.epoch(), self.revision());
+        Box::pin(async move {
+            Snapshot {
+                epoch,
+                revision,
+                text: format!("snapshot@{epoch}:{revision}").into(),
+            }
+        })
     }
 
-    fn deltas_since(&self, revision: u64) -> Option<Vec<Delta>> {
-        if revision < *self.forgotten.lock().unwrap() {
-            return None;
-        }
-        let log = self.log.lock().unwrap();
-        Some(
-            log.iter()
-                .filter(|d| d.revision > revision)
-                .cloned()
-                .collect(),
-        )
+    fn deltas_since(&self, since: Position) -> BoxFuture<'_, Option<Vec<Delta>>> {
+        let held = since.epoch == self.epoch() && since.revision >= *self.forgotten.lock().unwrap();
+        let deltas: Vec<Delta> = self
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| d.revision > since.revision)
+            .cloned()
+            .collect();
+        Box::pin(async move { held.then_some(deltas) })
+    }
+
+    fn command_revision(&self, id: &str) -> Option<u64> {
+        self.commands.lock().unwrap().get(id).copied()
+    }
+
+    fn renew_sessions(&self, live: &[Owner]) {
+        self.renewals.lock().unwrap().push(live.to_vec());
     }
 }
 

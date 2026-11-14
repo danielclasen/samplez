@@ -3,9 +3,9 @@
 //! health, readiness and metrics endpoints, the OpenAPI document and the
 //! WebSocket send queues.
 //!
-//! A product passes its replicated state, its `/api/v1` router, its
-//! WebSocket handler and its NMOS router to [`Service`], then binds and
-//! serves it.
+//! A product passes its replicated state, its `/api/v1` router, its UI
+//! router, its WebSocket handler and its NMOS router to [`Service`], then
+//! binds and serves it.
 
 use std::fmt;
 use std::io;
@@ -24,8 +24,10 @@ pub use auth::{Identity, Role};
 pub use config::ServiceConfig;
 pub use metrics::{Counter, Histogram, Metrics};
 pub use ops::{Heartbeat, Ops};
-pub use replica::{ReplicaInfo, ReplicatedState};
-pub use server::{Bound, Connect, Routers, Service};
+pub use replica::{Owner, Position, ReplicaInfo, ReplicatedState};
+pub use server::{
+    Bound, Connect, Forbidden, Routers, SecretStatus, Service, ServiceStatus, StatusSource,
+};
 
 #[derive(Debug)]
 pub enum Error {
