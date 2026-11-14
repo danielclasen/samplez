@@ -12,7 +12,9 @@
 //! `samplez_secret_reload_failures_total{secret="<listener>Tls"}`. A client
 //! CA file is re-read with them, in any mode, and a changed one applies
 //! from the next handshake on; one that does not parse keeps the previous
-//! CA and counts the same way.
+//! CA and counts the same way. In `selfSigned` mode a new certificate
+//! replaces the one in use at the first reload within
+//! [`SELF_SIGNED_RENEWAL`] of its expiry.
 
 use std::io;
 use std::net::SocketAddr;
@@ -48,9 +50,12 @@ pub const MAX_HANDSHAKES: usize = 256;
 
 /// How long a `selfSigned` certificate is valid, starting an hour before
 /// it is generated so a client whose clock is behind accepts it. macOS and
-/// iOS refuse TLS server certificates valid for more than 825 days. A
-/// restart generates a new certificate.
+/// iOS refuse TLS server certificates valid for more than 825 days.
 pub const SELF_SIGNED_VALIDITY: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// A `selfSigned` certificate is replaced by a new one at the first reload
+/// within this of its expiry.
+pub const SELF_SIGNED_RENEWAL: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// Handshaken connections waiting for the server to take them.
 const ACCEPTED_QUEUE: usize = 64;
@@ -67,21 +72,36 @@ pub struct TlsStatus {
     /// Seconds since the Unix epoch of the last successful read or
     /// generation.
     pub loaded_at: u64,
+    /// Seconds since the Unix epoch at which the certificate in use
+    /// expires.
+    pub not_after: u64,
+}
+
+/// A certificate with its key, and when it expires.
+#[derive(Debug, Clone)]
+struct Presented {
+    key: Arc<CertifiedKey>,
+    /// Seconds since the Unix epoch.
+    not_after: u64,
 }
 
 /// The certificate presented to new handshakes.
 #[derive(Debug)]
-struct Resolver(RwLock<Arc<CertifiedKey>>);
+struct Resolver(RwLock<Presented>);
 
 impl Resolver {
-    fn get(&self) -> Arc<CertifiedKey> {
+    fn get(&self) -> Presented {
         self.0.read().expect("certificate lock poisoned").clone()
+    }
+
+    fn set(&self, presented: Presented) {
+        *self.0.write().expect("certificate lock poisoned") = presented;
     }
 }
 
 impl ResolvesServerCert for Resolver {
     fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        Some(self.get())
+        Some(self.get().key)
     }
 }
 
@@ -104,6 +124,8 @@ type SharedConfig = Arc<RwLock<Arc<ServerConfig>>>;
 pub(crate) struct ListenerTls {
     listener: &'static str,
     mode: TlsMode,
+    /// The names a `selfSigned` certificate is generated for.
+    sans: Vec<String>,
     files: Option<Files>,
     client_ca: Option<ClientCa>,
     provider: Arc<CryptoProvider>,
@@ -165,7 +187,7 @@ impl ListenerTls {
             }
             _ => (None, self_signed(&tls.sans, &provider)?),
         };
-        let resolver = Arc::new(Resolver(RwLock::new(Arc::new(key))));
+        let resolver = Arc::new(Resolver(RwLock::new(key)));
         let client_ca = match &tls.client_ca_file {
             Some(path) => Some((path.clone(), read(path)?)),
             None => None,
@@ -181,6 +203,7 @@ impl ListenerTls {
         let tls = ListenerTls {
             listener,
             mode: tls.mode,
+            sans: tls.sans.clone(),
             files,
             client_ca,
             provider,
@@ -193,34 +216,39 @@ impl ListenerTls {
                 &[("secret", &format!("{listener}Tls"))],
             ),
         };
-        if tls.mode == TlsMode::SelfSigned {
-            tracing::info!(
-                listener,
-                fingerprint = %tls.fingerprint(),
-                "generated a self-signed certificate"
-            );
-        }
+        tracing::info!(
+            listener,
+            mode = ?tls.mode,
+            fingerprint = %tls.fingerprint(),
+            not_after = tls.resolver.get().not_after,
+            "certificate in use"
+        );
         Ok(Some(tls))
     }
 
     /// Re-reads the certificate and key files in `files` mode and the client
-    /// CA file, and swaps in what they hold when it changed.
+    /// CA file, and swaps in what they hold when it changed. In `selfSigned`
+    /// mode, generates a new certificate within [`SELF_SIGNED_RENEWAL`] of
+    /// the expiry of the one in use.
     pub(crate) fn reload(&self) -> Result<(), Error> {
-        self.reload_with(read)
+        self.reload_with(crate::auth::now(), read)
     }
 
+    /// `now` in seconds since the Unix epoch.
     fn reload_with(
         &self,
+        now: u64,
         mut read: impl FnMut(&Path) -> Result<Vec<u8>, Error>,
     ) -> Result<(), Error> {
-        if self.files.is_none() && self.client_ca.is_none() {
-            return Ok(());
-        }
+        let renewed = self.renew_self_signed(now);
         let pair = self.reload_pair(&mut read);
         let client_ca = self.reload_client_ca(&mut read);
-        let result = pair.and(client_ca);
+        let result = renewed.and(pair).and(client_ca);
         match &result {
-            Ok(()) => self.loaded_at.store(crate::auth::now(), Ordering::Relaxed),
+            Ok(()) if self.files.is_some() || self.client_ca.is_some() => {
+                self.loaded_at.store(now, Ordering::Relaxed);
+            }
+            Ok(()) => {}
             Err(e) => {
                 self.failures.add(1);
                 tracing::warn!(listener = self.listener, error = %e, "keeping what was in use");
@@ -245,11 +273,13 @@ impl ListenerTls {
             }
             match certified_key(&content, &files.cert, &self.provider) {
                 Ok(key) => {
-                    *self.resolver.0.write().expect("certificate lock poisoned") = Arc::new(key);
+                    let not_after = key.not_after;
+                    self.resolver.set(key);
                     *loaded = content;
                     tracing::info!(
                         listener = self.listener,
                         fingerprint = %self.fingerprint(),
+                        not_after,
                         "certificate changed"
                     );
                     return Ok(());
@@ -258,6 +288,25 @@ impl ListenerTls {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    fn renew_self_signed(&self, now: u64) -> Result<(), Error> {
+        if self.mode != TlsMode::SelfSigned
+            || self.resolver.get().not_after > now + SELF_SIGNED_RENEWAL.as_secs()
+        {
+            return Ok(());
+        }
+        let key = self_signed(&self.sans, &self.provider)?;
+        let not_after = key.not_after;
+        self.resolver.set(key);
+        self.loaded_at.store(now, Ordering::Relaxed);
+        tracing::info!(
+            listener = self.listener,
+            fingerprint = %self.fingerprint(),
+            not_after,
+            "generated a new self-signed certificate"
+        );
+        Ok(())
     }
 
     fn reload_client_ca(
@@ -279,7 +328,7 @@ impl ListenerTls {
     }
 
     fn fingerprint(&self) -> String {
-        let key = self.resolver.get();
+        let key = self.resolver.get().key;
         let digest = Sha256::digest(key.cert[0].as_ref());
         let hex: Vec<String> = digest.iter().map(|b| format!("{b:02X}")).collect();
         hex.join(":")
@@ -291,6 +340,7 @@ impl ListenerTls {
             mode: self.mode,
             fingerprint: self.fingerprint(),
             loaded_at: self.loaded_at.load(Ordering::Relaxed),
+            not_after: self.resolver.get().not_after,
         }
     }
 
@@ -368,15 +418,81 @@ fn certified_key(
     (cert, key): &(Vec<u8>, Vec<u8>),
     cert_path: &Path,
     provider: &CryptoProvider,
-) -> Result<CertifiedKey, Error> {
+) -> Result<Presented, Error> {
     let chain = certs(cert, cert_path)?;
+    let config = |e: &dyn std::fmt::Display| Error::Config(format!("{}: {e}", cert_path.display()));
+    let not_after = not_after(&chain[0]).ok_or_else(|| config(&"no readable validity"))?;
     let key =
         PrivateKeyDer::from_pem_slice(key).map_err(|e| Error::Config(format!("TLS key: {e}")))?;
-    CertifiedKey::from_der(chain, key, provider)
-        .map_err(|e| Error::Config(format!("{}: {e}", cert_path.display())))
+    let key = CertifiedKey::from_der(chain, key, provider).map_err(|e| config(&e))?;
+    Ok(Presented {
+        key: Arc::new(key),
+        not_after,
+    })
 }
 
-fn self_signed(sans: &[String], provider: &CryptoProvider) -> Result<CertifiedKey, Error> {
+/// The notAfter of a DER X.509 certificate in seconds since the Unix epoch
+/// (RFC 5280 4.1, 4.1.2.5).
+fn not_after(cert: &[u8]) -> Option<u64> {
+    let (_, certificate, _) = der(cert)?;
+    let (_, tbs, _) = der(certificate)?;
+    let (tag, _, after_version) = der(tbs)?;
+    // version [0], then serialNumber, signature and issuer before validity
+    let mut rest = if tag == 0xa0 { after_version } else { tbs };
+    for _ in 0..3 {
+        rest = der(rest)?.2;
+    }
+    let (_, validity, _) = der(rest)?;
+    let (_, _, after_not_before) = der(validity)?;
+    let (tag, time, _) = der(after_not_before)?;
+    let digits = std::str::from_utf8(time).ok()?.strip_suffix('Z')?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| digits.get(range)?.parse::<i64>().ok();
+    let (year, rest) = match (tag, digits.len()) {
+        // UTCTime YYMMDDHHMMSSZ, the years 1950 to 2049
+        (0x17, 12) => match number(0..2)? {
+            yy @ 50.. => (1900 + yy, 2),
+            yy => (2000 + yy, 2),
+        },
+        // GeneralizedTime YYYYMMDDHHMMSSZ
+        (0x18, 14) => (number(0..4)?, 4),
+        _ => return None,
+    };
+    let field = |n: usize| number(rest + 2 * n..rest + 2 * n + 2);
+    let (month, day) = (field(0)?, field(1)?);
+    let seconds = field(2)? * 3600 + field(3)? * 60 + field(4)?;
+    // Days since 1970-01-01 in the proleptic Gregorian calendar, after
+    // http://howardhinnant.github.io/date_algorithms.html#days_from_civil
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    u64::try_from(days * 86_400 + seconds).ok()
+}
+
+/// The tag, content and remainder of the DER value at the start of `input`.
+fn der(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, input) = input.split_first()?;
+    let (&first, input) = input.split_first()?;
+    let (len, input) = if first < 0x80 {
+        (usize::from(first), input)
+    } else {
+        let n = usize::from(first & 0x7f);
+        let (bytes, input) = input.split_at_checked(n)?;
+        let len = bytes.iter().try_fold(0usize, |len, &b| {
+            len.checked_mul(256)?.checked_add(usize::from(b))
+        })?;
+        (len, input)
+    };
+    let (content, rest) = input.split_at_checked(len)?;
+    Some((tag, content, rest))
+}
+
+fn self_signed(sans: &[String], provider: &CryptoProvider) -> Result<Presented, Error> {
     let failed =
         |e: &dyn std::fmt::Display| Error::Config(format!("generating a certificate: {e}"));
     let since_epoch = SystemTime::now()
@@ -388,9 +504,15 @@ fn self_signed(sans: &[String], provider: &CryptoProvider) -> Result<CertifiedKe
     // Apple platforms refuse a TLS server certificate without it.
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let signing_key = rcgen::KeyPair::generate().map_err(|e| failed(&e))?;
+    let not_after = u64::try_from(params.not_after.unix_timestamp()).map_err(|e| failed(&e))?;
     let cert = params.self_signed(&signing_key).map_err(|e| failed(&e))?;
     let key = PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
-    CertifiedKey::from_der(vec![cert.der().clone()], key, provider).map_err(|e| failed(&e))
+    let key =
+        CertifiedKey::from_der(vec![cert.der().clone()], key, provider).map_err(|e| failed(&e))?;
+    Ok(Presented {
+        key: Arc::new(key),
+        not_after,
+    })
 }
 
 async fn accept_loop(
@@ -578,7 +700,12 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.ends_with("ok"), "{response}");
         assert_eq!(presented, der);
-        assert_eq!(tls.status().fingerprint, fingerprint_of(&der));
+        let status = tls.status();
+        assert_eq!(status.fingerprint, fingerprint_of(&der));
+        assert_eq!(
+            status.not_after, 67_090_118_400,
+            "4096-01-01, rcgen's default"
+        );
     }
 
     #[tokio::test]
@@ -625,8 +752,10 @@ mod tests {
         let mut reads = [&new_cert, &key, &new_cert, &new_key]
             .map(|p| file(p))
             .into_iter();
-        tls.reload_with(|_| Ok(reads.next().expect("two reads of each file at most")))
-            .unwrap();
+        tls.reload_with(crate::auth::now(), |_| {
+            Ok(reads.next().expect("two reads of each file at most"))
+        })
+        .unwrap();
         assert_eq!(tls.status().fingerprint, fingerprint_of(&second));
         let failures = "samplez_secret_reload_failures_total{secret=\"apiTls\"} 0";
         assert!(metrics.render().contains(failures));
@@ -640,7 +769,7 @@ mod tests {
             ..Tls::default()
         };
         let tls = listener_tls(&config, &Metrics::default());
-        let der = tls.resolver.get().cert[0].clone();
+        let der = tls.resolver.get().key.cert[0].clone();
         assert_eq!(tls.status().fingerprint, fingerprint_of(&der));
         let addr = serve(&tls).await;
         let trusting = connector(&[&der], None);
@@ -678,7 +807,7 @@ mod tests {
         };
         let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let tls = listener_tls(&config, &Metrics::default());
-        let der = tls.resolver.get().cert[0].clone();
+        let der = tls.resolver.get().key.cert[0].clone();
         let mut roots = RootCertStore::empty();
         roots.add(der.clone()).unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -697,6 +826,50 @@ mod tests {
         assert!(!valid_at(start - hour - minute));
         assert!(valid_at(start + SELF_SIGNED_VALIDITY - hour - minute));
         assert!(!valid_at(start + SELF_SIGNED_VALIDITY), "expired");
+        let expiry = (start + SELF_SIGNED_VALIDITY - hour).as_secs();
+        assert!(tls.status().not_after.abs_diff(expiry) <= 1);
+    }
+
+    #[test]
+    fn a_self_signed_certificate_is_replaced_within_thirty_days_of_its_expiry() {
+        let config = Tls {
+            mode: TlsMode::SelfSigned,
+            sans: vec!["localhost".into()],
+            ..Tls::default()
+        };
+        let tls = listener_tls(&config, &Metrics::default());
+        let first = tls.status();
+        let renewal = first.not_after - SELF_SIGNED_RENEWAL.as_secs();
+        let nothing = |_: &Path| -> Result<Vec<u8>, Error> { panic!("no file to read") };
+        tls.reload_with(renewal - 1, nothing).unwrap();
+        assert_eq!(tls.status(), first, "a second before");
+        tls.reload_with(renewal, nothing).unwrap();
+        let renewed = tls.status();
+        assert_ne!(renewed.fingerprint, first.fingerprint);
+        assert!(renewed.not_after >= first.not_after);
+        assert_eq!(renewed.loaded_at, renewal);
+    }
+
+    #[test]
+    fn the_expiry_is_read_from_utc_and_generalized_time() {
+        let midnight = |y, m, d| rcgen::date_time_ymd(y, m, d);
+        let second = Duration::from_secs(1);
+        // UTCTime before and after 2000, then GeneralizedTime from 2050 on.
+        for expiry in [
+            midnight(2000, 1, 1) - second,
+            midnight(2024, 2, 29) + Duration::from_secs(12 * 3600 + 34 * 60 + 56),
+            midnight(2050, 1, 1) - second,
+            midnight(2050, 1, 1),
+            midnight(4096, 1, 1),
+        ] {
+            let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+            params.not_before = midnight(1975, 1, 1);
+            params.not_after = expiry;
+            let cert = params.self_signed(&KeyPair::generate().unwrap()).unwrap();
+            let expected = u64::try_from(expiry.unix_timestamp()).unwrap();
+            assert_eq!(not_after(cert.der()), Some(expected), "{expiry}");
+        }
+        assert_eq!(not_after(&[0x30, 0x03, 0x30, 0x01]), None, "truncated");
     }
 
     #[test]
@@ -709,6 +882,7 @@ mod tests {
         let der = listener_tls(&config, &Metrics::default())
             .resolver
             .get()
+            .key
             .cert[0]
             .clone();
         // extKeyUsage (2.5.29.37) holding only id-kp-serverAuth
