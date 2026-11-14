@@ -520,6 +520,28 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
     assert!(sessions.live().is_empty());
 }
 
+/// Its pongs wait unread behind the messages, so a healthy client at the
+/// limit keeps its lease until the connection ends.
+#[tokio::test(start_paused = true)]
+async fn a_connection_that_answered_before_the_limit_stays_live_while_not_read() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1"));
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    assert_eq!(client.next().await, "snapshot@7:0");
+    for n in 0..MAX_PENDING_REPLIES {
+        let slow = format!("slow {n}");
+        client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert_eq!(
+        sessions.live().len(),
+        1,
+        "not read for over {PONG_TIMEOUT:?}, answered before"
+    );
+    assert_eq!(client.next().await, "slow 0 done");
+}
+
 #[tokio::test(start_paused = true)]
 async fn live_sessions_are_renewed_once_per_second_in_one_batch() {
     let state = FakeState::new("r1", "leader");

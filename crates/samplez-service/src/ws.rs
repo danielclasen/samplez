@@ -30,13 +30,15 @@ use crate::server::Connect;
 /// How often [`serve_client`] pings.
 pub const PING_PERIOD: Duration = Duration::from_millis(250);
 /// [`serve_client`] closes a connection that has not answered a ping for
-/// this long, and only connections that answered within it are renewed.
+/// this long, and only connections that answered within it, or within it
+/// before the connection stopped being read at [`MAX_PENDING_REPLIES`], are
+/// renewed ([`Sessions::live`]).
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(1);
 /// The replies [`serve_client`] waits for on one connection before it stops
 /// reading it. Its pongs then go unread as well, so the time until a reply
-/// is ready does not count against [`PONG_TIMEOUT`], and the connection is
-/// not renewed in [`Sessions`] meanwhile. A connection not read for
-/// [`MAX_PAUSE`] ends.
+/// is ready does not count against [`PONG_TIMEOUT`], and the connection
+/// stays live in [`Sessions`] meanwhile when it answered within
+/// [`PONG_TIMEOUT`] before. A connection not read for [`MAX_PAUSE`] ends.
 pub const MAX_PENDING_REPLIES: usize = 64;
 /// How long [`serve_client`] goes without reading a connection that has
 /// [`MAX_PENDING_REPLIES`] replies outstanding before it ends it as
@@ -254,13 +256,20 @@ impl Hub {
     }
 }
 
-/// The connections served on this replica and when each last answered a
-/// ping.
+/// The connections served on this replica, when each last answered a ping
+/// and since when it is not read at [`MAX_PENDING_REPLIES`].
 #[derive(Debug)]
 pub struct Sessions {
     replica: String,
     next: AtomicU64,
-    live: Mutex<HashMap<String, (Owner, Instant)>>,
+    live: Mutex<HashMap<String, Connection>>,
+}
+
+#[derive(Debug)]
+struct Connection {
+    owner: Owner,
+    answered: Instant,
+    paused: Option<Instant>,
 }
 
 impl Sessions {
@@ -278,27 +287,48 @@ impl Sessions {
         format!("{}:{n}", self.replica)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Owner, Instant)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Connection>> {
         self.live.lock().expect("sessions lock poisoned")
     }
 
     fn answered(&self, owner: &Owner) {
-        let entry = (owner.clone(), Instant::now());
+        let entry = Connection {
+            owner: owner.clone(),
+            answered: Instant::now(),
+            paused: None,
+        };
         self.lock().insert(owner.connection.clone(), entry);
+    }
+
+    /// Since when the connection is not read, `None` once it is again.
+    fn paused(&self, owner: &Owner, since: Option<Instant>) {
+        if let Some(connection) = self.lock().get_mut(&owner.connection) {
+            connection.paused = since;
+        }
     }
 
     fn remove(&self, owner: &Owner) {
         self.lock().remove(&owner.connection);
     }
 
-    /// The owners whose connection answered within [`PONG_TIMEOUT`].
+    /// The owners whose connection answered within [`PONG_TIMEOUT`], or,
+    /// while it is not read at [`MAX_PENDING_REPLIES`], answered within
+    /// [`PONG_TIMEOUT`] before that and has not been paused for
+    /// [`MAX_PAUSE`]: its pongs wait unread, and a client answering them
+    /// keeps its lease.
     pub fn live(&self) -> Vec<Owner> {
         let now = Instant::now();
         let mut live: Vec<Owner> = self
             .lock()
             .values()
-            .filter(|(_, at)| now.duration_since(*at) <= PONG_TIMEOUT)
-            .map(|(owner, _)| owner.clone())
+            .filter(|c| match c.paused {
+                None => now.duration_since(c.answered) <= PONG_TIMEOUT,
+                Some(since) => {
+                    since.duration_since(c.answered) <= PONG_TIMEOUT
+                        && now.duration_since(since) < MAX_PAUSE
+                }
+            })
+            .map(|c| c.owner.clone())
             .collect();
         live.sort_by(|a, b| a.connection.cmp(&b.connection));
         live
@@ -417,10 +447,14 @@ where
         loop {
             let at_limit = replies.len() >= MAX_PENDING_REPLIES;
             match paused {
-                None if at_limit => paused = Some(Instant::now()),
+                None if at_limit => {
+                    paused = Some(Instant::now());
+                    sessions.paused(owner, paused);
+                }
                 Some(since) if !at_limit => {
                     answered += since.elapsed();
                     paused = None;
+                    sessions.paused(owner, None);
                 }
                 _ => {}
             }
@@ -520,5 +554,32 @@ mod tests {
         assert!(sessions.live().is_empty(), "silent for over 1 s");
         sessions.answered(&owner);
         assert_eq!(sessions.live(), [owner]);
+    }
+
+    /// Paused within the pong timeout of its last pong, a connection stays
+    /// live until it has been paused for the longest pause; paused later,
+    /// it is not live.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_connection_is_live_if_it_answered_before_the_pause() {
+        let sessions = Sessions::new("r1");
+        let owner = Owner {
+            principal: "anonymous".into(),
+            session: "s1".into(),
+            connection: sessions.connection_id(),
+        };
+        sessions.answered(&owner);
+        tokio::time::advance(PONG_TIMEOUT).await;
+        sessions.paused(&owner, Some(Instant::now()));
+        tokio::time::advance(MAX_PAUSE - Duration::from_millis(1)).await;
+        assert_eq!(sessions.live(), std::slice::from_ref(&owner));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(sessions.live().is_empty(), "paused for the longest pause");
+
+        sessions.answered(&owner);
+        tokio::time::advance(PONG_TIMEOUT + Duration::from_millis(1)).await;
+        sessions.paused(&owner, Some(Instant::now()));
+        assert!(sessions.live().is_empty(), "silent for over 1 s before");
+        sessions.paused(&owner, None);
+        assert!(sessions.live().is_empty());
     }
 }
