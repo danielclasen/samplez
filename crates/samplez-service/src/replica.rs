@@ -97,6 +97,11 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// after another is committed after it, also when the replica forwards
     /// them to the leader. One client's commands, submitted in the order it
     /// sent them, so commit in that order.
+    ///
+    /// Must resolve in bounded time, with [`NotApplied`] when the command
+    /// cannot be ordered: a WebSocket connection with
+    /// [`crate::ws::MAX_PENDING_REPLIES`] replies waiting is not read until
+    /// one of them is ready.
     fn submit(
         &self,
         owner: &Owner,

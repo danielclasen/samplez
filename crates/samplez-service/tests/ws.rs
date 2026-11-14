@@ -133,7 +133,7 @@ struct Client {
 
 impl Client {
     /// Runs `serve_client` over channels; the product callback echoes text,
-    /// answers `slow` after 1.5 s and grants a meter credit for the binary
+    /// answers text starting with `slow` after 1.5 s and grants a meter credit for the binary
     /// message `credit`.
     fn start(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
         let queue = hub.subscribe();
@@ -150,9 +150,9 @@ impl Client {
                 let q = q.clone();
                 async move {
                     match m {
-                        Message::Text(t) if t == "slow" => {
+                        Message::Text(t) if t.starts_with("slow") => {
                             tokio::time::sleep(Duration::from_millis(1500)).await;
-                            Some(Message::Text("slow done".into()))
+                            Some(Message::Text(format!("{t} done").into()))
                         }
                         Message::Text(t) => Some(Message::Text(format!("echo {t}").into())),
                         Message::Binary(b) if &b[..] == b"credit" => {
@@ -402,6 +402,29 @@ async fn a_slow_reply_keeps_the_heartbeat_and_the_order_of_replies() {
     assert_eq!(client.next().await, "slow done");
     assert_eq!(start.elapsed(), Duration::from_millis(1500));
     assert_eq!(client.next().await, "echo hello", "in the order received");
+    apply(&state, &hub);
+    assert_eq!(client.next().await, "delta@1", "still served");
+}
+
+/// At the limit the connection is not read, its pongs included, which is
+/// not the client's fault.
+#[tokio::test(start_paused = true)]
+async fn replies_at_the_limit_slower_than_the_pong_timeout_keep_the_connection() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let start = Instant::now();
+    for n in 0..MAX_PENDING_REPLIES {
+        let slow = format!("slow {n}");
+        client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
+    }
+    client.tx.send(Ok(Message::Text("hello".into()))).unwrap();
+    for n in 0..MAX_PENDING_REPLIES {
+        assert_eq!(client.next().await, format!("slow {n} done"));
+    }
+    assert_eq!(start.elapsed(), Duration::from_millis(1500));
+    assert_eq!(client.next().await, "echo hello", "read again");
     apply(&state, &hub);
     assert_eq!(client.next().await, "delta@1", "still served");
 }

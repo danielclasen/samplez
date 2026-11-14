@@ -33,7 +33,10 @@ pub const PING_PERIOD: Duration = Duration::from_millis(250);
 /// this long, and only connections that answered within it are renewed.
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(1);
 /// The replies [`serve_client`] waits for on one connection before it stops
-/// reading it.
+/// reading it. Its pongs then go unread as well, so the time until a reply
+/// is ready does not count against [`PONG_TIMEOUT`], and the connection is
+/// not renewed in [`Sessions`] meanwhile. [`ReplicatedState::submit`] has to
+/// resolve in bounded time for the connection to be read again.
 pub const MAX_PENDING_REPLIES: usize = 64;
 
 /// A state change at a global revision.
@@ -294,10 +297,11 @@ impl Sessions {
 pub enum Ended {
     /// The client closed the connection or the stream ended.
     Closed,
-    /// No pong within [`PONG_TIMEOUT`]; a close frame was sent.
+    /// No pong within [`PONG_TIMEOUT`], not counting the time the connection
+    /// was not read at [`MAX_PENDING_REPLIES`]; a close frame was sent.
     PongTimeout,
     /// Sending or receiving failed, or a send did not finish within
-    /// [`PONG_TIMEOUT`] of the last pong.
+    /// [`PONG_TIMEOUT`] of the last pong, counted the same way.
     Failed,
 }
 
@@ -327,14 +331,21 @@ async fn catch_up(
     (position, vec![snapshot.text])
 }
 
-/// Sends `message`, giving up once the client has not answered a ping for
-/// [`PONG_TIMEOUT`]: a client that stopped reading is not waited for.
+/// When the client has to have answered a ping by: [`PONG_TIMEOUT`] after
+/// the pong it last `answered`, not counting the time since `paused`, the
+/// server not reading the connection meanwhile.
+fn pong_deadline(answered: Instant, paused: Option<Instant>) -> Instant {
+    answered + PONG_TIMEOUT + paused.map_or(Duration::ZERO, |since| since.elapsed())
+}
+
+/// Sends `message`, giving up at `deadline`, the client's
+/// [`pong_deadline`]: a client that stopped reading is not waited for.
 async fn send<T: Sink<Message> + Unpin>(
     tx: &mut T,
     message: Message,
-    answered: Instant,
+    deadline: Instant,
 ) -> Result<(), ()> {
-    match tokio::time::timeout_at(answered + PONG_TIMEOUT, tx.send(message)).await {
+    match tokio::time::timeout_at(deadline, tx.send(message)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) | Err(_) => Err(()),
     }
@@ -353,7 +364,8 @@ async fn send<T: Sink<Message> + Unpin>(
 /// election does not stall the pings; work that must follow the order of
 /// the messages belongs in the call itself, before the future. With
 /// [`MAX_PENDING_REPLIES`] replies outstanding the connection is not read,
-/// pongs included, until one is ready. A catch-up runs beside the heartbeat
+/// pongs included, until one is ready, and that time does not count against
+/// the client's [`PONG_TIMEOUT`]. A catch-up runs beside the heartbeat
 /// as well, with `queue` waiting for it.
 pub async fn serve_client<S, E, F, Fut>(
     socket: S,
@@ -373,6 +385,9 @@ where
     sessions.answered(owner);
     let ended = async {
         let mut answered = Instant::now();
+        // Since when the connection is not read for the replies at the
+        // limit.
+        let mut paused: Option<Instant> = None;
         let mut ping = tokio::time::interval(PING_PERIOD);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut catching_up: Option<BoxFuture<'_, _>> =
@@ -384,15 +399,25 @@ where
         };
         let mut replies = FuturesOrdered::new();
         loop {
+            let at_limit = replies.len() >= MAX_PENDING_REPLIES;
+            match paused {
+                None if at_limit => paused = Some(Instant::now()),
+                Some(since) if !at_limit => {
+                    answered += since.elapsed();
+                    paused = None;
+                }
+                _ => {}
+            }
             let out: Vec<Message> = tokio::select! {
                 _ = ping.tick() => {
-                    if answered.elapsed() >= PONG_TIMEOUT {
-                        let _ = send(&mut tx, Message::Close(None), answered).await;
+                    let deadline = pong_deadline(answered, paused);
+                    if Instant::now() >= deadline {
+                        let _ = send(&mut tx, Message::Close(None), deadline).await;
                         return Ended::PongTimeout;
                     }
                     vec![Message::Ping(Bytes::new())]
                 }
-                received = rx.next(), if replies.len() < MAX_PENDING_REPLIES => match received {
+                received = rx.next(), if !at_limit => match received {
                     None | Some(Ok(Message::Close(_))) => return Ended::Closed,
                     Some(Err(_)) => return Ended::Failed,
                     Some(Ok(Message::Pong(_))) => {
@@ -435,7 +460,10 @@ where
                 },
             };
             for message in out {
-                if send(&mut tx, message, answered).await.is_err() {
+                if send(&mut tx, message, pong_deadline(answered, paused))
+                    .await
+                    .is_err()
+                {
                     return Ended::Failed;
                 }
             }
