@@ -293,6 +293,7 @@ impl std::error::Error for ResetError {}
 /// A replicated engine's progress and clock as [`Engine::progress`] reads
 /// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Progress {
     /// The highest block computed, its statuses set, none before the
     /// first.
@@ -377,6 +378,8 @@ enum LogMsg {
     },
     /// Uncommitted entries from `from` on were removed.
     Truncate { from: LogId },
+    /// Uncommitted entry `id` was removed.
+    Skip { id: LogId },
 }
 
 /// Appended entries not yet committed, and the producer of the RT
@@ -452,6 +455,18 @@ impl Log {
             self.uncommitted.pop_front();
         }
         self.committed = self.committed.max(up_to.min(self.last));
+    }
+
+    /// Removes uncommitted entry `id`, and the generation built for it;
+    /// false when no uncommitted entry has that id.
+    fn skip(&mut self, id: LogId) -> bool {
+        let before = self.uncommitted.len();
+        self.uncommitted.retain(|e| e.id != id);
+        let skipped = self.uncommitted.len() < before;
+        if skipped {
+            let _ = self.sup.send(LogMsg::Skip { id });
+        }
+        skipped
     }
 
     /// Removes the uncommitted entries from `from` on. Committed entries
@@ -1178,6 +1193,14 @@ impl Engine {
     /// RT thread, in log order.
     pub fn commit(&self, up_to: LogId) {
         self.log.lock().expect("log lock").commit(up_to);
+    }
+
+    /// Replicated mode: the appended entry `id` is never applied, and its
+    /// generation is dropped: its commit was not known by its apply
+    /// deadline, so the log decides it. False when no uncommitted entry has
+    /// that id: it was committed already, or never appended.
+    pub fn skip(&self, id: LogId) -> bool {
+        self.log.lock().expect("log lock").skip(id)
     }
 
     /// Removes the uncommitted entries from log id `from` on, and drops
@@ -2118,6 +2141,9 @@ impl Supervisor {
                 LogMsg::Truncate { from } => self
                     .jobs
                     .retain(|j| j.id < from || matches!(j.stage, Stage::Sent(_))),
+                LogMsg::Skip { id } => self
+                    .jobs
+                    .retain(|j| j.id != id || matches!(j.stage, Stage::Sent(_))),
             }
         }
     }
