@@ -8,14 +8,17 @@ use axum::body::Bytes;
 use harness::{Options, Set, owner};
 use samplez_replica::dedup::Limits;
 use samplez_service::ReplicatedState;
-use samplez_service::replica::{NotApplied, Reason};
+use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 
 async fn set(replica: &impl ReplicatedState, session: &str, id: &str, command: &str) -> u64 {
+    ack(replica, session, id, command).await.revision
+}
+
+async fn ack(replica: &impl ReplicatedState, session: &str, id: &str, command: &str) -> Ack {
     replica
         .submit(&owner(session), id, Bytes::from(command.to_owned()))
         .await
-        .expect("applied")
-        .revision
+        .expect("committed")
 }
 
 #[tokio::test(start_paused = true)]
@@ -126,9 +129,21 @@ async fn a_coalesced_entry_acknowledges_every_merged_id() {
     ]
     .map(|(session, id, command)| replica.submit(&owner(session), id, Bytes::from(command)));
     let mut revisions = Vec::new();
+    let mut resolutions = Vec::new();
     for ack in pending {
-        revisions.push(ack.await.expect("applied").revision);
+        let ack = ack.await.expect("committed");
+        revisions.push(ack.revision);
+        resolutions.push(ack.resolution);
     }
+    assert_eq!(
+        resolutions,
+        [
+            Resolution::Superseded,
+            Resolution::Superseded,
+            Resolution::Applied,
+            Resolution::Applied
+        ]
+    );
     assert!(
         revisions.iter().all(|r| *r == revisions[0]),
         "{revisions:?}"
@@ -138,7 +153,9 @@ async fn a_coalesced_entry_acknowledges_every_merged_id() {
         assert_eq!(sm.product.values["gain"].0, "3");
     });
     // A superseded id is recorded: its resend changes nothing.
-    assert_eq!(set(&**replica, "s", "1", "gain=1@1").await, revisions[0]);
+    let resent = ack(&**replica, "s", "1", "gain=1@1").await;
+    assert_eq!(resent.revision, revisions[0]);
+    assert_eq!(resent.resolution, Resolution::Duplicate);
     assert_eq!(
         replica
             .store()
@@ -154,10 +171,15 @@ async fn a_delayed_copy_is_a_duplicate_within_retention_and_stale_after_it() {
     let seven = set(&**replica, "s", "7", "gain=7@7").await;
     set(&**replica, "s", "8", "gain=8@8").await;
     tokio::time::sleep(Duration::from_secs(5)).await;
-    assert_eq!(set(&**replica, "s", "7", "gain=7@7").await, seven);
+    let within = ack(&**replica, "s", "7", "gain=7@7").await;
+    assert_eq!(
+        (within.revision, within.resolution),
+        (seven, Resolution::Duplicate)
+    );
     tokio::time::sleep(Duration::from_secs(11)).await;
-    let again = set(&**replica, "s", "7", "gain=7@7").await;
-    assert_ne!(again, seven);
+    let after = ack(&**replica, "s", "7", "gain=7@7").await;
+    assert_ne!(after.revision, seven);
+    assert_eq!(after.resolution, Resolution::Stale, "the client is told");
     replica.store().with_state(|sm| {
         assert_eq!(sm.product.values["gain"].0, "8");
         assert_eq!(sm.product.applied, 2);

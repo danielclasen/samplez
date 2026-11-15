@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, Request, StatusCode, header, request};
 use axum::routing::get;
 use axum::{Extension, Router};
 use futures_util::future::BoxFuture;
-use samplez_service::replica::{Ack, NotApplied, Reason};
+use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::ws::{Delta, Snapshot};
 use samplez_service::{
     Identity, Ops, Owner, Position, ReplicaInfo, ReplicatedState, Service, ServiceConfig,
@@ -104,13 +104,17 @@ impl FakeState {
                 .unwrap()
                 .get(&key(&owner, &id))
                 .copied();
-            let revision = match applied {
-                Some(revision) => revision,
-                None => self.apply(Some((&owner, &id))).revision,
+            let (revision, resolution) = match applied {
+                Some(revision) => (revision, Resolution::Duplicate),
+                None => (
+                    self.apply(Some((&owner, &id))).revision,
+                    Resolution::Applied,
+                ),
             };
             let _ = done.send(Ack {
                 command: id,
                 revision,
+                resolution,
             });
         }
     }

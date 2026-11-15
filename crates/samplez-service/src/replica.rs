@@ -189,7 +189,8 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// so the same id from two sessions, or from two principals presenting
     /// the same session, is two commands. A command resent through another
     /// replica while the first copy is still being committed is so applied
-    /// once, and both submits resolve to the same [`Ack`]. A check before
+    /// once, and both submits resolve to the same revision, the copy
+    /// applied second with [`Resolution::Duplicate`]. A check before
     /// ordering, such as [`Commands::begin`], cannot give that: both copies
     /// pass it before either is applied.
     ///
@@ -242,8 +243,29 @@ pub trait ReplicatedState: Send + Sync + 'static {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Ack {
     pub command: String,
-    /// The revision whose delta carries the command's change.
+    /// The revision the command resolved at; its delta carries the
+    /// command's change when there is one.
     pub revision: u64,
+    pub resolution: Resolution,
+}
+
+/// How a committed command resolved. A product answers each in its own
+/// protocol: a client told only that its command committed cannot tell
+/// a refused one from an applied one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Resolution {
+    /// The product applied it.
+    Applied,
+    /// Its id was applied already, through any replica: nothing changed,
+    /// and the revision is the one its session's table holds.
+    Duplicate,
+    /// A later command folded into the same entry replaced its value.
+    Superseded,
+    /// The product refused it as older than what it applied already;
+    /// nothing changed.
+    Stale,
 }
 
 /// [`ReplicatedState::submit`] did not apply the command. Every reason is
@@ -311,7 +333,7 @@ pub enum Begin<'a> {
     /// Not applied as far as this replica has applied: submit it with
     /// [`Pending::submit`]. A resend while an earlier copy is still being
     /// submitted, through this replica or another, is new as well; the
-    /// state machine applies it once and both copies get the same [`Ack`]
+    /// state machine applies it once and both copies get the same revision
     /// ([`ReplicatedState::submit`]).
     New(Pending<'a>),
     /// Applied already, through any replica; acknowledge it again without
@@ -349,6 +371,7 @@ impl Commands {
             return Begin::Duplicate(Ack {
                 command: id.to_owned(),
                 revision,
+                resolution: Resolution::Duplicate,
             });
         }
         let mut in_flight = self.lock();

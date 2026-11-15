@@ -18,7 +18,7 @@ use futures_util::future::BoxFuture;
 use openraft::network::RaftNetworkFactory;
 use openraft::storage::Adaptor;
 use openraft::{BasicNode, Raft, ServerState};
-use samplez_service::replica::{Ack, NotApplied, Reason};
+use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::ws::{Delta, Snapshot};
 use samplez_service::{Owner, Position, ReplicaInfo, ReplicatedState};
 use tokio::sync::{mpsc, oneshot};
@@ -206,6 +206,12 @@ async fn write<P: Product>(
                             let _ = reply.send(Ok(Ack {
                                 command: id,
                                 revision: outcome.revision,
+                                resolution: match outcome.result {
+                                    entry::Resolution::Applied => Resolution::Applied,
+                                    entry::Resolution::Duplicate => Resolution::Duplicate,
+                                    entry::Resolution::Superseded => Resolution::Superseded,
+                                    entry::Resolution::Stale => Resolution::Stale,
+                                },
                             }));
                         }
                     }

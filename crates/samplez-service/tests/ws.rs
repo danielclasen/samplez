@@ -11,7 +11,7 @@ use axum::extract::ws::Message;
 use common::*;
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, Sink, Stream, StreamExt};
-use samplez_service::replica::{Ack, Begin, Commands, NotApplied, Reason};
+use samplez_service::replica::{Ack, Begin, Commands, NotApplied, Reason, Resolution};
 use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
     ClientQueue, Delta, Ended, Frame, Hub, MAX_PAUSE, MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES,
@@ -1121,7 +1121,7 @@ async fn uuid_command_ids_apply_once_as_faderz_sends_them() {
     let ack = submitted.await.unwrap();
     assert_eq!(ack.command, id);
     match commands.begin(&s1, id) {
-        Begin::Duplicate(again) => assert_eq!(again, ack),
+        Begin::Duplicate(again) => assert_eq!(again.revision, ack.revision),
         _ => panic!("applied"),
     }
     assert!(matches!(
@@ -1169,13 +1169,22 @@ async fn commands_apply_once_per_id_from_the_replicated_table() {
         ack,
         Ack {
             command: "c1".into(),
-            revision: 1
+            revision: 1,
+            resolution: Resolution::Applied,
         }
     );
-    assert_eq!(resent.await.unwrap(), ack, "the resend gets the answer too");
+    let duplicate = Ack {
+        resolution: Resolution::Duplicate,
+        ..ack.clone()
+    };
+    assert_eq!(
+        resent.await.unwrap(),
+        duplicate,
+        "the resend gets the revision too"
+    );
     assert_eq!(state.revision(), 1, "applied once");
     match commands.begin(&s1, "c1") {
-        Begin::Duplicate(again) => assert_eq!(again, ack),
+        Begin::Duplicate(again) => assert_eq!(again, duplicate, "a duplicate, not applied again"),
         _ => panic!("c1 is applied"),
     }
 
@@ -1222,10 +1231,12 @@ async fn a_command_resent_through_another_replica_while_pending_applies_once() {
         first,
         Ack {
             command: "cmd-1".into(),
-            revision: 1
+            revision: 1,
+            resolution: Resolution::Applied,
         }
     );
-    assert_eq!(second, first, "the same result");
+    assert_eq!(second.revision, first.revision, "the same revision");
+    assert_eq!(second.resolution, Resolution::Duplicate, "applied once");
     assert_eq!(state.revision(), 1, "applied once");
 }
 
