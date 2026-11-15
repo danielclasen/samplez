@@ -273,8 +273,10 @@ fn reply_all(replies: Vec<(usize, String, Reply)>, reason: Reason, detail: &str)
 }
 
 impl<P: Product + Sync> ReplicatedState for Replica<P> {
-    /// `ready` once the replica applied the log up to the committed id it
-    /// knows, which after a restart is the saved one; it stays set. The
+    /// `ready` once the replica has joined a set, a vote or a committed id
+    /// saved on its volume, and applied the log up to the committed id it
+    /// knows, which after a restart is the saved one; it stays set. An
+    /// empty volume is not ready until it has joined. The
     /// clock verification and the generations 2.11 adds to it are not
     /// known here. `commitable` while this replica is the leader: no
     /// write is forwarded, so a follower orders nothing and answers

@@ -384,6 +384,11 @@ impl Set {
         }
     }
 
+    /// Removes what `id`'s volume holds; for a stopped replica.
+    pub fn wipe(&self, id: NodeId) {
+        std::fs::remove_dir_all(self.root.join(id.to_string())).expect("wipes");
+    }
+
     /// Waits until every running replica applied `index`.
     pub async fn applied(&self, index: u64) {
         let deadline = Instant::now() + Duration::from_secs(30);

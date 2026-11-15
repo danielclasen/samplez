@@ -60,6 +60,32 @@ async fn a_restarted_replica_is_back_at_its_last_applied_revision_before_any_ele
     assert!(!info.commitable, "no leader, so it orders nothing");
 }
 
+/// A replica whose volume was lost starts at revision 0 in the set's
+/// epoch: it is not ready, so clients do not see the state go back,
+/// until it has joined and applied what was committed.
+#[tokio::test(start_paused = true)]
+async fn an_empty_volume_is_ready_only_once_it_has_joined() {
+    let mut set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let revision = set(&**set_.replica(leader), "s", "1", "gain=1@1").await;
+    set_.applied(revision).await;
+    let follower = (leader + 1) % 3;
+    set_.crash(follower).await;
+    set_.wipe(follower);
+    set_.net.isolate(follower, set_.ids());
+    set_.restart(follower).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let replica = set_.replica(follower).clone();
+    assert_eq!(replica.revision(), 0);
+    assert!(
+        !replica.replica().ready,
+        "an empty volume has joined nothing"
+    );
+    set_.net.heal();
+    set_.applied(revision).await;
+    assert!(replica.replica().ready);
+}
+
 async fn refused(replica: &impl ReplicatedState, id: &str) -> NotApplied {
     replica
         .submit(&owner("s"), id, Bytes::from("gain=1@1"))
