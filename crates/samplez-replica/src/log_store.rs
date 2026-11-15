@@ -341,13 +341,17 @@ impl<P> Inner<P> {
         self.last_purged = Some(upto);
     }
 
-    /// `log` as it holds now, without purged entries.
-    fn compacted(&self) -> Vec<u8> {
+    /// `log` as it holds once the entries up to `upto` are purged.
+    fn compacted(&self, upto: StoredLogId) -> Vec<u8> {
         let mut records = Vec::new();
         records.extend(self.vote.map(Record::Vote));
         records.push(Record::Committed(self.committed));
-        records.extend(self.last_purged.map(Record::Purge));
-        records.extend(self.log.values().cloned().map(Record::Entry));
+        records.push(Record::Purge(upto));
+        records.extend(
+            self.log
+                .range(upto.index + 1..)
+                .map(|(_, e)| Record::Entry(e.clone())),
+        );
         let mut out = Vec::new();
         encode(&records, &mut out);
         out
@@ -494,10 +498,10 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), Error> {
+        let upto = StoredLogId::from(&log_id);
         let (dir, out) = {
-            let mut inner = self.lock();
-            inner.purge(StoredLogId::from(&log_id));
-            (inner.dir.clone(), inner.compacted())
+            let inner = self.lock();
+            (inner.dir.clone(), inner.compacted(upto))
         };
         let file = blocking(move || {
             replace(&dir, "log", &out)?;
@@ -505,7 +509,9 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         })
         .await
         .map_err(|e| io_error(StorageIOError::write_logs, &e))?;
-        self.lock().file = Arc::new(file);
+        let mut inner = self.lock();
+        inner.purge(upto);
+        inner.file = Arc::new(file);
         Ok(())
     }
 
@@ -845,6 +851,29 @@ mod tests {
         assert_eq!(
             store.try_get_log_entries(1..).await.expect("entries").len(),
             2
+        );
+    }
+
+    /// A purge whose file cannot be written leaves the entries readable,
+    /// as the log on disk still holds them.
+    #[tokio::test]
+    async fn a_failed_purge_leaves_the_log_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir("purge-readonly");
+        let mut store = open(&dir);
+        store
+            .append_to_log((1..=6).map(entry))
+            .await
+            .expect("append");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("read-only");
+        let purged = store.purge_logs_upto(id(4)).await;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("writable");
+        assert!(purged.is_err());
+        let state = store.get_log_state().await.expect("state");
+        assert_eq!(state.last_purged_log_id, None);
+        assert_eq!(
+            store.try_get_log_entries(1..).await.expect("entries").len(),
+            6
         );
     }
 
