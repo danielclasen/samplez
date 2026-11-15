@@ -96,7 +96,7 @@ jobs:
                 engine::tests::the_failure_paths_run_on_the_rt_thread; do
                 grep -qx "test $t ... ok" rtsan.log || { echo "$t did not pass" >&2; exit 1; }
               done
-              cargo bench --locked -p samplez-dsp -p samplez-mxl --bench rt
+              cargo bench --locked -p samplez -p samplez-dsp -p samplez-mxl --bench rt
             '
       # Saved from main only, so per-PR snapshots do not evict the builder
       # image layers from the shared Actions cache.
