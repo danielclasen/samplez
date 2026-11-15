@@ -2,19 +2,24 @@
 //! allocator once it runs, over a run that includes input generation
 //! swaps, a prune and the `InputDown` it brings, an `InputUp` whose
 //! generation is swapped in at its index with a fade-in, a re-route
-//! crossfade, a gain ramp, output metering and a loudness reset. libmxl's
-//! own C++ allocations are not seen by this allocator.
+//! crossfade, a gain ramp, output metering and a loudness reset, and,
+//! for a replicated engine, every path of the hold ring (see
+//! `common::hold_scenario`). libmxl's own C++ allocations are not seen by
+//! this allocator.
 
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::backtrace::Backtrace;
 use std::cell::Cell;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering::Relaxed};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use common::{B, Domain, MARGIN, Pilot, config, new_id, start, wait_for};
+
+/// The tests count the allocations of one RT thread at a time.
+static ONE: Mutex<()> = Mutex::new(());
 use samplez::InputState;
 
 /// The RT thread's kernel tid; 0 before it is known.
@@ -71,8 +76,37 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
+fn assert_no_rt_calls() {
+    let calls = RT_CALLS.load(Relaxed);
+    assert!(
+        calls == 0,
+        "{calls} allocator calls on the RT thread, the first captured from:\n{}",
+        FIRST_RT_CALL
+            .get()
+            .map_or_else(|| "not captured".into(), ToString::to_string)
+    );
+}
+
+#[test]
+fn rt_thread_allocates_nothing_holding_blocks() {
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let engine = common::start_held(&domain.0, &src, &dst, 2);
+    RT_TID.store(engine.status().rt.thread.tid, Relaxed);
+    common::hold_scenario(&engine);
+    RT_TID.store(0, Relaxed);
+    let c = engine.counters();
+    assert!(c.hold_overflows.load(Relaxed) > 0);
+    assert!(c.blocks_withheld.load(Relaxed) > 0);
+    assert_no_rt_calls();
+    engine.stop();
+}
+
 #[test]
 fn rt_thread_allocates_nothing() {
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -132,13 +166,7 @@ fn rt_thread_allocates_nothing() {
         m.window.is_some() && m.max_true_peak.iter().all(|&t| t > 0.0),
         "{m:?}"
     );
-    let calls = RT_CALLS.load(Relaxed);
-    assert!(
-        calls == 0,
-        "{calls} allocator calls on the RT thread, the first captured from:\n{}",
-        FIRST_RT_CALL
-            .get()
-            .map_or_else(|| "not captured".into(), ToString::to_string)
-    );
+    RT_TID.store(0, Relaxed);
+    assert_no_rt_calls();
     common::stop(engine);
 }

@@ -108,14 +108,18 @@ pub struct BlockStatus {
 pub const HEALTHY: u64 = 0x2d06_8005_38d3_94c2;
 
 /// The digest of a degraded block: XXH3-64 over the sorted log ids, then
-/// the bitmask of inputs whose wanted read failed, each as 8 bytes little
-/// endian. `ids` must be sorted.
-pub fn degraded_digest(ids: &[u64], failed: u64) -> u64 {
+/// the bitmask of inputs whose wanted read failed (an input's flow, the
+/// incoming one during a crossfade), then the bitmask of crossfades whose
+/// outgoing flow failed, each as 8 bytes little endian. The two legs of
+/// a crossfade differ in the output, so they differ in the digest. `ids`
+/// must be sorted.
+pub fn degraded_digest(ids: &[u64], incoming: u64, outgoing: u64) -> u64 {
     let mut h = xxhash_rust::xxh3::Xxh3Default::new();
     for id in ids {
         h.update(&id.to_le_bytes());
     }
-    h.update(&failed.to_le_bytes());
+    h.update(&incoming.to_le_bytes());
+    h.update(&outgoing.to_le_bytes());
     h.digest()
 }
 
@@ -414,6 +418,14 @@ pub enum StatusChange {
         from: u64,
         to: u64,
     },
+    /// Samples `[from, to)` of committed blocks the member flow refused
+    /// (`Write::Held` or `Write::Failed`): their statuses say committed,
+    /// the flow does not hold them.
+    Unwritten {
+        output: u32,
+        from: u64,
+        to: u64,
+    },
 }
 
 /// Where the RT thread sends status changes, and the counters it keeps.
@@ -426,13 +438,25 @@ pub struct Changes<'a> {
 
 impl Changes<'_> {
     fn send(&mut self, status: BlockStatus) {
-        let c = StatusChange::Block {
+        self.push(StatusChange::Block {
             output: self.output,
             status,
-        };
+        });
+    }
+
+    fn push(&mut self, c: StatusChange) {
         if self.ring.push(c).is_err() {
             self.dropped.fetch_add(1, Relaxed);
         }
+    }
+
+    /// A committed range the sink did not write.
+    fn unwritten(&mut self, from: u64, len: usize) {
+        self.push(StatusChange::Unwritten {
+            output: self.output,
+            from,
+            to: from + len as u64,
+        });
     }
 }
 
@@ -594,7 +618,7 @@ impl Hold {
                 _ => cur,
             };
         }
-        self.flush(sink);
+        self.flush(changes, sink);
         self.pending.clear();
         self.committed_end = None;
     }
@@ -753,7 +777,7 @@ impl Hold {
                 self.overflows += u64::from(st.cause == Cause::Overflow);
                 out.withdraw = true;
             }
-            self.flush(sink);
+            self.flush(changes, sink);
         }
         // A block withheld for a cause withdraws the replica before block
         // k is decided: k follows the withdrawn rules.
@@ -885,8 +909,10 @@ impl Hold {
             }
             Kind::Committed if self.pending.is_empty() => {
                 let off = (live.0 - start) as usize;
-                if !sink.write(live.0, (live.1 - live.0) as usize, &data[off..], b as usize) {
+                let len = (live.1 - live.0) as usize;
+                if !sink.write(live.0, len, &data[off..], b as usize) {
                     self.failed_writes += 1;
+                    changes.unwritten(live.0, len);
                 }
                 self.frontier = Some(live.1);
                 self.committed_end = Some(live.1);
@@ -981,13 +1007,13 @@ impl Hold {
                 break;
             }
         }
-        self.flush(sink);
+        self.flush(changes, sink);
         out
     }
 
     /// Writes the committed blocks at the front of the ring, each run of
     /// contiguous ones in one write, and drops the withheld ones.
-    fn flush(&mut self, sink: &mut impl Sink) {
+    fn flush(&mut self, changes: &mut Changes, sink: &mut impl Sink) {
         let n = self.block as usize;
         let samples = self.cap * n;
         loop {
@@ -1016,6 +1042,7 @@ impl Hold {
                     }
                     if !sink.write(first.start, len, &self.run, samples) {
                         self.failed_writes += 1;
+                        changes.unwritten(first.start, len);
                     }
                     self.committed_end = Some(end);
                 }
@@ -1037,10 +1064,15 @@ mod tests {
     struct Recorder {
         writes: Vec<(u64, usize)>,
         samples: Vec<(u64, f32, f32)>,
+        /// Refuses every write, as a member flow holding or failing.
+        refuse: bool,
     }
 
     impl Sink for Recorder {
         fn write(&mut self, start: u64, len: usize, data: &[f32], stride: usize) -> bool {
+            if self.refuse {
+                return false;
+            }
             self.writes.push((start, len));
             for i in 0..len {
                 self.samples
@@ -1205,8 +1237,10 @@ mod tests {
     #[test]
     fn the_healthy_digest_is_xxh3_over_nothing() {
         assert_eq!(HEALTHY, xxhash_rust::xxh3::xxh3_64(&[]));
-        assert_ne!(degraded_digest(&[], 0), HEALTHY);
-        assert_ne!(degraded_digest(&[1], 0), degraded_digest(&[], 1));
+        assert_ne!(degraded_digest(&[], 0, 0), HEALTHY);
+        assert_ne!(degraded_digest(&[1], 0, 0), degraded_digest(&[], 1, 0));
+        // The crossfade legs of one slot differ.
+        assert_ne!(degraded_digest(&[], 1, 0), degraded_digest(&[], 0, 1));
     }
 
     /// A healthy block with F past it is committed and written at once,
@@ -1600,11 +1634,38 @@ mod tests {
             .iter()
             .map(|c| match c {
                 StatusChange::Block { status, .. } => status.kind,
-                StatusChange::Skipped { .. } => unreachable!(),
+                _ => unreachable!(),
             })
             .collect();
         assert_eq!(kinds, [Kind::Fenced, Kind::Held, Kind::Committed]);
         let _ = t.changes();
+    }
+
+    /// A committed range the member flow refuses is reported unwritten,
+    /// at once and from the ring alike.
+    #[test]
+    fn a_refused_write_is_reported() {
+        let mut t = T::committing(false, K0);
+        t.sink.refuse = true;
+        t.compute(K0, Some(HEALTHY));
+        t.ctx.fence = 0;
+        t.compute(K0 + 1, Some(HEALTHY));
+        t.ctx.fence = u64::MAX;
+        t.advance();
+        assert_eq!(t.kind(K0 + 1), Some(Kind::Committed));
+        let unwritten: Vec<_> = t
+            .sent()
+            .into_iter()
+            .filter_map(|c| match c {
+                StatusChange::Unwritten { from, to, .. } => Some((from, to)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unwritten,
+            [(K0 * B, (K0 + 1) * B), ((K0 + 1) * B, (K0 + 2) * B)]
+        );
+        assert_eq!(t.hold.failed_writes, 2);
     }
 
     /// A full ring's overflow withholds its oldest block, which

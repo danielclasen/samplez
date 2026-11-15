@@ -582,7 +582,12 @@ fn a_report_the_channel_had_no_room_for_is_sent_again() {
         MARGIN,
     );
     let process = samplez::rt::setup_process(&cfg.rt);
-    let e = Engine::start_replicated(cfg, process, Some(verdict_tx), report_tx.clone()).unwrap();
+    let replication = samplez::Replication {
+        voters: 1,
+        reports: report_tx.clone(),
+        statuses: None,
+    };
+    let e = Engine::start_replicated(cfg, process, Some(verdict_tx), replication).unwrap();
     let dropped = || e.counters().reports_dropped.load(Relaxed);
     wait_for(10 * SECOND, "a report dropped", || dropped() >= 1);
     assert_eq!(reports.recv().unwrap(), filler);

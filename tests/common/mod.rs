@@ -605,7 +605,12 @@ pub fn start_replicated(config: Config) -> (Engine, Receiver<BlockVerdict>, Rece
     let (tx, rx) = std::sync::mpsc::sync_channel(1 << 16);
     let (report_tx, reports) = std::sync::mpsc::sync_channel(64);
     let process = samplez::rt::setup_process(&config.rt);
-    let engine = Engine::start_replicated(config, process, Some(tx), report_tx).unwrap();
+    let replication = samplez::Replication {
+        voters: 1,
+        reports: report_tx,
+        statuses: None,
+    };
+    let engine = Engine::start_replicated(config, process, Some(tx), replication).unwrap();
     (engine, rx, reports)
 }
 
@@ -616,4 +621,99 @@ pub fn stop(engine: Engine) {
         0
     );
     engine.stop();
+}
+
+/// A replicated engine of `voters` voters over one pilot input and one
+/// output, with gain 1.
+pub fn start_held(domain: &Path, src: &str, out: &str, voters: usize) -> Engine {
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": MARGIN,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain }],
+        "inputs": [{ "name": "in0", "domain": "d", "flowId": src, "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d", "flowId": out, "label": "held",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let config = Config::parse(&v.to_string()).unwrap();
+    let (report_tx, _reports) = std::sync::mpsc::sync_channel(64);
+    let process = samplez::rt::setup_process(&config.rt);
+    let replication = samplez::Replication {
+        voters,
+        reports: report_tx,
+        statuses: None,
+    };
+    let e = Engine::start_replicated(config, process, None, replication).unwrap();
+    wait_for(Duration::from_secs(5), "output realised", || {
+        e.status().outputs[0].realised
+    });
+    e
+}
+
+/// The block after the last one whose statuses are set.
+pub fn processed(e: &Engine) -> u64 {
+    e.counters().processed.load(Ordering::Acquire)
+}
+
+/// Drives a replicated engine of more than one voter through every RT
+/// path of the hold ring: a commit start at a page boundary, blocks
+/// degraded by an unresolved entry held and committed through, a frozen
+/// F filling the ring until it overflows and withdraws the replica,
+/// unfillable blocks, fills committed through, a block withheld before
+/// it is computed and a stop. It checks no outcome: an overrun skip under
+/// load changes which paths run, and tests/hold.rs checks outcomes.
+pub fn hold_scenario(e: &Engine) {
+    use samplez::blocks::{Cause, PAGE};
+    let wait = |k: u64| {
+        wait_for(Duration::from_secs(10), "blocks processed", || {
+            processed(e) > k
+        })
+    };
+    let through = |e: &Engine| {
+        let p = processed(e);
+        for k in p.saturating_sub(40)..p {
+            let _ = e.commit_through(0, k, 1);
+        }
+    };
+    e.set_fence(u64::MAX).unwrap();
+    let from = processed(e) + 2;
+    e.commit_from(0, from).unwrap();
+    let kp = (from * B).next_multiple_of(PAGE) / B;
+    wait(kp + 10);
+
+    // Degraded blocks, held, then committed through on evidence.
+    e.unresolved(7, processed(e) * B).unwrap();
+    let k = processed(e) + 5;
+    wait(k + 5);
+    through(e);
+    wait(processed(e) + 5);
+    e.resolved(7).unwrap();
+
+    // F frozen: the ring fills and overflows; the replica is withdrawn.
+    e.set_fence(processed(e) * B).unwrap();
+    let before = e.counters().hold_overflows.load(Ordering::Relaxed);
+    wait_for(Duration::from_secs(10), "a hold ring overflow", || {
+        e.counters().hold_overflows.load(Ordering::Relaxed) > before
+    });
+    e.set_fence(u64::MAX).unwrap();
+    // A block withheld before it is computed.
+    let later = processed(e) + 30;
+    e.withhold(0, later, Cause::FenceDeadline).unwrap();
+    // Fills from the page boundaries on, committed through.
+    let end = later + 3 * PAGE / B;
+    while processed(e) <= end {
+        through(e);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Committing again, then a stop inside a block.
+    let from = processed(e) + 2;
+    e.commit_from(0, from).unwrap();
+    let kp = (from * B).next_multiple_of(PAGE) / B;
+    wait(kp + 5);
+    e.stop_at(0, (processed(e) + 3) * B + 7).unwrap();
+    wait(processed(e) + 10);
+    through(e);
+    wait(processed(e) + 10);
 }
