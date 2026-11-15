@@ -243,8 +243,8 @@ pub(crate) struct MeterRecord {
     pub true_peak: f32,
     /// Sum of squares of the K-weighted samples.
     pub sum_sq: f64,
-    /// The loudness measurement restarts with this slice: the filters
-    /// started from silence at its first sample.
+    /// The loudness measurement restarts with this slice: the
+    /// K-weighting started from silence at its first sample.
     pub reset: bool,
 }
 
@@ -308,12 +308,15 @@ impl OutMeter {
                 self.flush(sink);
                 self.slice = Some(slice);
                 // From a reset on, the measurement depends only on the
-                // output from its index: replicas computing the same
-                // output measure the same, whenever they started.
+                // output from 11 samples before its index on: the
+                // K-weighting restarts from silence, and the true-peak
+                // interpolator keeps its history of the last output
+                // samples, so it does not overshoot on partial sums.
+                // Replicas that computed those samples measure the same,
+                // whenever they started.
                 if self.reset_at.is_some_and(|t| slice * SLICE >= t) {
                     self.reset_at = None;
                     self.reset = true;
-                    self.tp.reset();
                     self.kw.reset();
                 }
             }
@@ -959,9 +962,10 @@ mod tests {
         records
     }
 
-    /// From a reset on, the records depend only on the output since its
-    /// index: two engines that started at different blocks, with
-    /// different filter histories, send the same bits. Records cover
+    /// From a reset on, the records depend only on the output since 11
+    /// samples before its index: two engines that started at different
+    /// blocks before that, with different K-weighting histories, send the
+    /// same bits. Records cover
     /// whole slices, and the reset lands on the window boundary after its
     /// index.
     #[test]
@@ -995,6 +999,49 @@ mod tests {
         );
         assert!(a.iter().all(|r| r.2 == SLICE as u32));
         assert_eq!(a, b);
+    }
+
+    /// A reset leaves the true peak of a steady signal alone: the
+    /// interpolator keeps the samples before the reset index, so the
+    /// first interpolated outputs after it are not partial sums of the
+    /// filter, which overshoot by up to 1 dB.
+    #[test]
+    fn a_reset_does_not_move_the_true_peak() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(1 << 12);
+        let counters = Counters::default();
+        let mut seq = 0;
+        let mut m = OutMeter::new(1);
+        let mut buf = PlanarBuffer::new(1, B as usize);
+        let mut peaks = Vec::new();
+        for k in 0..30 * SLICE / B {
+            if k == 10 * SLICE / B {
+                m.reset_at = Some(2 * WINDOW);
+            }
+            // A 1 kHz cosine at -1.9 dBFS, one period per block.
+            for (n, s) in buf.channel_mut(0).iter_mut().enumerate() {
+                *s = 0.8 * (std::f32::consts::TAU * n as f32 / B as f32).cos();
+            }
+            let mut sink = MeterSink {
+                output: 0,
+                ring: &mut tx,
+                seq: &mut seq,
+                counters: &counters,
+            };
+            m.add(&mut sink, 0, &buf, k * B, B as usize);
+            while let Ok(r) = rx.pop() {
+                peaks.push((r.reset, r.true_peak.to_bits()));
+            }
+        }
+        let reset = peaks.iter().position(|p| p.0).unwrap();
+        assert_eq!(reset as u64, 2 * WINDOW / SLICE);
+        assert!(
+            peaks[1..].iter().all(|p| p.1 == peaks[1].1),
+            "{:?}",
+            peaks
+                .iter()
+                .map(|p| f32::from_bits(p.1))
+                .collect::<Vec<_>>()
+        );
     }
 
     const B: u64 = 48;
