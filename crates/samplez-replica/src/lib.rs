@@ -433,6 +433,9 @@ impl<P: Product> Replica<P> {
             )),
             PeerRequest::ReadIndex => match shared.raft.get_read_log_id().await {
                 Ok((read, _)) => Ok(PeerResponse::ReadIndex(read.map_or(0, |id| id.index))),
+                Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_))) => {
+                    Err(Refused::CutOff)
+                }
                 Err(RaftError::APIError(_)) => Err(Refused::NotLeader),
                 Err(e) => Err(unavailable(&e)),
             },
@@ -570,6 +573,7 @@ impl Shared {
             .await;
         match asked {
             Ok(Ok(PeerResponse::ReadIndex(index))) => Ok(index),
+            Ok(Err(Refused::CutOff)) => Err(ReadIndex::CutOff),
             _ => Err(ReadIndex::NotLeader),
         }
     }

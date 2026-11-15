@@ -712,3 +712,30 @@ async fn a_new_leader_finishes_an_inherited_joint_configuration() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// A follower whose leader lost its majority, though not the follower,
+/// is cut off, as the leader is: a reader there gets the state applied
+/// here at once, marked stale, rather than waiting for its own position.
+#[tokio::test(start_paused = true)]
+async fn a_follower_of_a_leader_without_a_majority_is_cut_off() {
+    let set_ = Set::start(Options {
+        voters: 5,
+        ..Options::default()
+    })
+    .await;
+    let leader = set_.leader().await;
+    let follower = (leader + 1) % 5;
+    for id in set_.ids().filter(|&id| id != leader && id != follower) {
+        set_.net.cut(leader, id);
+        set_.net.cut(follower, id);
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        set_.replica(follower).quorum().await,
+        "the follower still hears its leader"
+    );
+    let asked = Instant::now();
+    assert_eq!(set_.replica(follower).read_index().await, ReadIndex::CutOff);
+    assert!(asked.elapsed() < Duration::from_millis(500), "at once");
+    assert_eq!(set_.replica(leader).read_index().await, ReadIndex::CutOff);
+}

@@ -97,6 +97,9 @@ pub enum Refused {
     OtherCluster,
     /// A join for a slot the set does not want.
     NotWanted,
+    /// A leader asked for a read index that no majority acknowledged
+    /// within the lease: the asker reads its own state, marked stale.
+    CutOff,
 }
 
 pub type PeerReply = Result<PeerResponse, Refused>;
