@@ -1132,6 +1132,27 @@ fn an_owner_shows_a_one_way_handle_of_its_session() {
     }
 }
 
+/// A resend of a command the product refused as stale is answered stale
+/// again from the table, not as a duplicate of an applied one.
+#[test]
+fn a_resend_of_a_stale_command_is_answered_stale() {
+    let state = FakeState::new("r1", "leader");
+    let commands = Commands::new(state.clone(), 2);
+    let s1 = owner("s1");
+    state.refused_stale(&s1, "c7", 4);
+    match commands.begin(&s1, "c7") {
+        Begin::Duplicate(ack) => assert_eq!(
+            ack,
+            Ack {
+                command: "c7".into(),
+                revision: 4,
+                resolution: Resolution::Stale,
+            }
+        ),
+        _ => panic!("c7 is committed"),
+    }
+}
+
 /// faderz's command ids are UUIDs in their text form.
 #[tokio::test]
 async fn uuid_command_ids_apply_once_as_faderz_sends_them() {

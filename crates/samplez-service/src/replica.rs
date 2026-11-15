@@ -166,9 +166,13 @@ pub trait ReplicatedState: Send + Sync + 'static {
     fn deltas_since(&self, since: Position) -> BoxFuture<'_, Option<Vec<Delta>>>;
 
     /// The revision at which the command with this client-generated id was
-    /// applied for `owner.principal` and `owner.session`, from the
-    /// replicated per-session tables of applied command ids that snapshots
-    /// carry; `None` when this replica has not applied it.
+    /// committed for `owner.principal` and `owner.session`, and the
+    /// [`Resolution`] a copy of it gets, from the replicated per-session
+    /// tables of committed command ids that snapshots carry; `None` when
+    /// this replica has not applied it. A copy of an applied command is a
+    /// [`Resolution::Duplicate`]; one of a superseded or stale command
+    /// resolves as its first copy did, so a client resending a command it
+    /// got no answer for learns what happened to it.
     ///
     /// A session's table is kept as long as a client may resend a command
     /// of it that it got no [`Ack`] for, which is longer than the session's
@@ -177,7 +181,7 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// expiry the resend is applied twice. The service sets no bound on
     /// that time; the implementation sets the retention after which a
     /// session's table is dropped, and a resend after it is applied again.
-    fn command_revision(&self, owner: &Owner, id: &str) -> Option<u64>;
+    fn command_resolution(&self, owner: &Owner, id: &str) -> Option<(u64, Resolution)>;
 
     /// Orders `command`, the product's encoding of it, under the
     /// client-generated `id` for `owner`, and resolves once this replica has
@@ -187,7 +191,8 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// The state machine dedups by `owner.principal`, `owner.session` and
     /// `id` when it applies an entry: an entry whose id the table of the
     /// principal's session holds changes nothing and resolves with the
-    /// revision the table holds. An id is unique within its session only,
+    /// revision and resolution the table holds
+    /// ([`ReplicatedState::command_resolution`]). An id is unique within its session only,
     /// so the same id from two sessions, or from two principals presenting
     /// the same session, is two commands. A command resent through another
     /// replica while the first copy is still being committed is so applied
@@ -260,13 +265,14 @@ pub struct Ack {
 pub enum Resolution {
     /// The product applied it.
     Applied,
-    /// Its id was applied already, through any replica: nothing changed,
-    /// and the revision is the one its session's table holds.
+    /// A copy of a command applied already, through any replica: nothing
+    /// changed, and the revision is the one its session's table holds.
     Duplicate,
-    /// A later command folded into the same entry replaced its value.
+    /// A later command folded into the same entry replaced its value; so
+    /// does a copy of it.
     Superseded,
     /// The product refused it as older than what it applied already;
-    /// nothing changed.
+    /// nothing changed, and a copy of it resolves so as well.
     Stale,
 }
 
@@ -339,8 +345,9 @@ pub enum Begin<'a> {
     /// state machine applies it once and both copies get the same revision
     /// ([`ReplicatedState::submit`]).
     New(Pending<'a>),
-    /// Applied already, through any replica; acknowledge it again without
-    /// submitting it.
+    /// Committed already, through any replica; answer it again without
+    /// submitting it, with the resolution a copy gets
+    /// ([`ReplicatedState::command_resolution`]).
     Duplicate(Ack),
     /// As many commands as the limit are being submitted from this replica.
     Busy,
@@ -370,11 +377,11 @@ impl Commands {
     }
 
     pub fn begin(&self, owner: &Owner, id: &str) -> Begin<'_> {
-        if let Some(revision) = self.state.command_revision(owner, id) {
+        if let Some((revision, resolution)) = self.state.command_resolution(owner, id) {
             return Begin::Duplicate(Ack {
                 command: id.to_owned(),
                 revision,
-                resolution: Resolution::Duplicate,
+                resolution,
             });
         }
         let mut in_flight = self.lock();

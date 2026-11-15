@@ -206,12 +206,7 @@ async fn write<P: Product>(
                             let _ = reply.send(Ok(Ack {
                                 command: id,
                                 revision: outcome.revision,
-                                resolution: match outcome.result {
-                                    entry::Resolution::Applied => Resolution::Applied,
-                                    entry::Resolution::Duplicate => Resolution::Duplicate,
-                                    entry::Resolution::Superseded => Resolution::Superseded,
-                                    entry::Resolution::Stale => Resolution::Stale,
-                                },
+                                resolution: resolution_of(outcome.result),
                             }));
                         }
                     }
@@ -225,6 +220,15 @@ async fn write<P: Product>(
                 }
             }
         }
+    }
+}
+
+fn resolution_of(resolution: entry::Resolution) -> Resolution {
+    match resolution {
+        entry::Resolution::Applied => Resolution::Applied,
+        entry::Resolution::Duplicate => Resolution::Duplicate,
+        entry::Resolution::Superseded => Resolution::Superseded,
+        entry::Resolution::Stale => Resolution::Stale,
     }
 }
 
@@ -306,9 +310,10 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         Box::pin(async move { deltas })
     }
 
-    fn command_revision(&self, owner: &Owner, id: &str) -> Option<u64> {
+    fn command_resolution(&self, owner: &Owner, id: &str) -> Option<(u64, Resolution)> {
         self.store
-            .with_state(|sm| sm.dedup.revision(&SessionKey::from(owner), id))
+            .with_state(|sm| sm.dedup.answer(&SessionKey::from(owner), id))
+            .map(|(revision, resolution)| (revision, resolution_of(resolution)))
     }
 
     fn submit(

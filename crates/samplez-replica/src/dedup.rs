@@ -1,8 +1,8 @@
 //! The replicated tables of applied command ids.
 //!
 //! Keyed by (principal, session, XXH3-128 of the client's id), each record
-//! holds the revision of the entry that carried the command and that
-//! entry's stamping index. Every change happens in state-machine apply, in
+//! holds the revision of the entry that carried the command, how the
+//! command resolved and that entry's stamping index. Every change happens in state-machine apply, in
 //! apply order, and every container is ordered, so every replica and every
 //! snapshot install holds the same table.
 
@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::entry::SessionKey;
+use crate::entry::{Resolution, SessionKey};
 
 /// Bounds on the table, set alike on every replica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +41,8 @@ pub struct Record {
     pub session: SessionKey,
     pub id: u128,
     pub revision: u64,
+    /// How the first copy resolved: applied, superseded or stale.
+    pub resolution: Resolution,
     pub stamp: u64,
 }
 
@@ -88,6 +90,34 @@ impl Dedup {
         Some(self.records[seq].revision)
     }
 
+    /// The answer to a copy of `id` in `session` while its record is held:
+    /// its revision, and how its first copy resolved, an applied one as a
+    /// duplicate.
+    pub fn answer(&self, session: &SessionKey, id: &str) -> Option<(u64, Resolution)> {
+        let seq = self.sessions.get(session)?.get(&hash_id(id))?;
+        let record = &self.records[seq];
+        let resolution = match record.resolution {
+            Resolution::Applied => Resolution::Duplicate,
+            other => other,
+        };
+        Some((record.revision, resolution))
+    }
+
+    /// Sets how the command just recorded resolved, which its record holds
+    /// as applied until then.
+    pub fn resolve(&mut self, session: &SessionKey, id: &str, resolution: Resolution) {
+        if let Some(seq) = self
+            .sessions
+            .get(session)
+            .and_then(|ids| ids.get(&hash_id(id)))
+        {
+            self.records
+                .get_mut(seq)
+                .expect("indexed record")
+                .resolution = resolution;
+        }
+    }
+
     /// Records `id` for `session` at `revision`, carried by an entry
     /// stamped `stamp`. Retention runs first, at the entry's stamp, so a
     /// copy applied more than the retention after its original applies
@@ -119,6 +149,7 @@ impl Dedup {
                 session: session.clone(),
                 id: hash,
                 revision,
+                resolution: Resolution::Applied,
                 stamp,
             },
         );

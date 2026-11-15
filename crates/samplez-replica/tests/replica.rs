@@ -80,7 +80,7 @@ async fn only_the_leader_is_commitable_and_every_refusal_names_its_reason() {
     let not_ordered = refused(&**set_.replica(follower), "f").await;
     assert_eq!(not_ordered.reason, Reason::NotCommitable);
     assert_eq!(
-        set_.replica(follower).command_revision(&owner("s"), "f"),
+        set_.replica(follower).command_resolution(&owner("s"), "f"),
         None
     );
 
@@ -107,8 +107,8 @@ async fn a_resend_after_failover_and_election_resolves_to_the_stored_revision() 
     assert_ne!(first, second);
     let replica = set_.replica(second);
     assert_eq!(
-        replica.command_revision(&owner("s"), "cmd-1"),
-        Some(revision)
+        replica.command_resolution(&owner("s"), "cmd-1"),
+        Some((revision, Resolution::Duplicate))
     );
     assert_eq!(set(&**replica, "s", "cmd-1", "gain=1@1").await, revision);
     assert_eq!(replica.store().with_state(|sm| sm.product.applied), 1);
@@ -155,7 +155,7 @@ async fn a_coalesced_entry_acknowledges_every_merged_id() {
     // A superseded id is recorded: its resend changes nothing.
     let resent = ack(&**replica, "s", "1", "gain=1@1").await;
     assert_eq!(resent.revision, revisions[0]);
-    assert_eq!(resent.resolution, Resolution::Duplicate);
+    assert_eq!(resent.resolution, Resolution::Superseded);
     assert_eq!(
         replica
             .store()
@@ -252,10 +252,76 @@ async fn tables_stay_identical_under_the_caps_and_after_a_snapshot_install() {
     // it as stale and the state does not change.
     let leader = set_.leader().await;
     let replica = set_.replica(leader);
-    assert_eq!(replica.command_revision(&owner("b"), "1"), None);
+    assert_eq!(replica.command_resolution(&owner("b"), "1"), None);
     let before = replica.snapshot().await.text;
     let applied = replica.store().with_state(|sm| sm.product.applied);
     set(&**replica, "b", "1", "b.pan=1@1").await;
     assert_eq!(replica.snapshot().await.text, before);
     assert_eq!(replica.store().with_state(|sm| sm.product.applied), applied);
+}
+
+/// A client resending a command it got no answer for learns how its first
+/// copy resolved, on every replica and after a snapshot install: a stale
+/// one stays stale and an applied one is a duplicate.
+#[tokio::test(start_paused = true)]
+async fn a_resend_answers_as_its_first_copy_resolved_also_after_a_snapshot_install() {
+    let mut options = Options::default();
+    // One snapshot taken by hand, as in the caps row.
+    options.raft.snapshot_policy = openraft::SnapshotPolicy::Never;
+    options.raft.max_in_snapshot_log_to_keep = 0;
+    options.raft.purge_batch_size = 1;
+    let mut set_ = Set::start(options).await;
+    let leader = set_.leader().await;
+    let behind = (leader + 1) % 3;
+    set_.crash(behind).await;
+    let replica = set_.replica(leader).clone();
+    let eight = ack(&*replica, "s", "8", "gain=8@8").await;
+    assert_eq!(eight.resolution, Resolution::Applied);
+    let seven = ack(&*replica, "s", "7", "gain=7@7").await;
+    assert_eq!(seven.resolution, Resolution::Stale);
+    let resent = ack(&*replica, "s", "7", "gain=7@7").await;
+    assert_eq!(resent, seven, "stale again, at the same revision");
+    let expected = |id: &str| match id {
+        "7" => Some((seven.revision, Resolution::Stale)),
+        _ => Some((eight.revision, Resolution::Duplicate)),
+    };
+    for id in ["7", "8"] {
+        assert_eq!(replica.command_resolution(&owner("s"), id), expected(id));
+    }
+
+    let last = replica.store().applied_index();
+    let raft = replica.raft().clone();
+    raft.trigger().snapshot().await.expect("snapshot");
+    while raft.metrics().borrow().snapshot.map(|id| id.index) != Some(last) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    raft.trigger().purge_log(last).await.expect("purge");
+    while raft.metrics().borrow().purged.map(|id| id.index) != Some(last) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    set_.restart(behind).await;
+    set_.applied(last).await;
+    let installed = set_.replica(behind);
+    assert!(
+        installed.raft().metrics().borrow().snapshot.is_some(),
+        "the restarted replica installed a snapshot"
+    );
+    for id in ["7", "8"] {
+        assert_eq!(installed.command_resolution(&owner("s"), id), expected(id));
+    }
+    // A resend through the next leader resolves as its first copy did, and
+    // the installed replica applies it from its table alike.
+    set_.crash(leader).await;
+    let next = set_.replica(set_.leader().await).clone();
+    assert_eq!(ack(&*next, "s", "7", "gain=7@7").await, seven);
+    let again = ack(&*next, "s", "8", "gain=8@8").await;
+    assert_eq!(
+        (again.revision, again.resolution),
+        (eight.revision, Resolution::Duplicate)
+    );
+    let tables: Vec<_> = set_
+        .running()
+        .map(|id| set_.replica(id).store().with_state(|sm| sm.dedup.save()))
+        .collect();
+    assert_eq!(tables[0], tables[1]);
 }

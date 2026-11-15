@@ -200,11 +200,14 @@ pub struct Request {
 pub enum Resolution {
     /// The product applied it.
     Applied,
-    /// Its id was in its session's table: nothing changed.
+    /// A copy of an applied command, its id in its session's table:
+    /// nothing changed.
     Duplicate,
-    /// A later command in the entry replaced its value.
+    /// A later command in the entry replaced its value; a copy of it while
+    /// its id is held resolves so as well.
     Superseded,
-    /// The product refused it as older than what it already applied.
+    /// The product refused it as older than what it already applied; a
+    /// copy of it while its id is held resolves so as well.
     Stale,
 }
 

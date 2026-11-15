@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +34,8 @@ pub struct FakeState {
     /// The replicated tables of applied command ids, by principal, session
     /// and id.
     commands: Mutex<HashMap<(String, String, String), u64>>,
+    /// Ids among `commands` the product refused as stale.
+    stale: Mutex<HashSet<(String, String, String)>>,
     /// Every `renew_sessions` call.
     pub renewals: Mutex<Vec<Vec<Owner>>>,
     /// How long `snapshot` takes.
@@ -58,6 +60,7 @@ impl FakeState {
             log: Mutex::default(),
             forgotten: Mutex::new(0),
             commands: Mutex::default(),
+            stale: Mutex::default(),
             renewals: Mutex::default(),
             snapshot_delay: Mutex::default(),
             submitted: Mutex::default(),
@@ -123,6 +126,15 @@ impl FakeState {
         *self.forgotten.lock().unwrap() = revision;
     }
 
+    /// Records `id` as committed at `revision` and refused as stale.
+    pub fn refused_stale(&self, owner: &Owner, id: &str, revision: u64) {
+        self.commands
+            .lock()
+            .unwrap()
+            .insert(key(owner, id), revision);
+        self.stale.lock().unwrap().insert(key(owner, id));
+    }
+
     /// Starts a new history, as a state that lost its storage does.
     pub fn reset(&self, epoch: u64) {
         *self.epoch.lock().unwrap() = epoch;
@@ -180,8 +192,16 @@ impl ReplicatedState for FakeState {
         Box::pin(async move { held.then_some(deltas) })
     }
 
-    fn command_revision(&self, owner: &Owner, id: &str) -> Option<u64> {
-        self.commands.lock().unwrap().get(&key(owner, id)).copied()
+    fn command_resolution(&self, owner: &Owner, id: &str) -> Option<(u64, Resolution)> {
+        let commands = self.commands.lock().unwrap();
+        let revision = commands.get(&key(owner, id)).copied()?;
+        let stale = self.stale.lock().unwrap().contains(&key(owner, id));
+        let resolution = if stale {
+            Resolution::Stale
+        } else {
+            Resolution::Duplicate
+        };
+        Some((revision, resolution))
     }
 
     fn submit(&self, owner: &Owner, id: &str, _: Bytes) -> BoxFuture<'_, Result<Ack, NotApplied>> {

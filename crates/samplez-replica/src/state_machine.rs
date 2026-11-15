@@ -160,13 +160,17 @@ impl<P: Product> StateMachine<P> {
         let session = command.origin.key();
         // A command renews its session's lease.
         self.leases.insert(session.clone(), stamp);
-        if let Some(stored) = self.dedup.record(&session, &command.id, revision, stamp) {
-            return Outcome {
-                revision: stored,
-                result: Resolution::Duplicate,
-            };
+        if self
+            .dedup
+            .record(&session, &command.id, revision, stamp)
+            .is_some()
+        {
+            let (revision, result) = self.dedup.answer(&session, &command.id).expect("held");
+            return Outcome { revision, result };
         }
         let Some(body) = &command.body else {
+            self.dedup
+                .resolve(&session, &command.id, Resolution::Superseded);
             return Outcome {
                 revision,
                 result: Resolution::Superseded,
@@ -191,6 +195,7 @@ impl<P: Product> StateMachine<P> {
             Effect::Unchanged => Resolution::Applied,
             Effect::Stale => Resolution::Stale,
         };
+        self.dedup.resolve(&session, &command.id, result);
         Outcome { revision, result }
     }
 
@@ -313,6 +318,50 @@ pub(crate) mod tests {
         }
     }
 
+    /// A copy resolves as its first copy did, from the table a snapshot
+    /// carries as well: stale stays stale at its revision, superseded stays
+    /// superseded and an applied command is a duplicate.
+    #[test]
+    fn a_copy_resolves_as_its_first_copy_also_after_a_snapshot_load() {
+        let mut sm = machine();
+        sm.apply(1, &commands(48, vec![command("s", "8", "gain=8@8")]));
+        let mut batch = Batch::default();
+        for (id, body) in [("6", "pan=6@6"), ("9", "pan=9@9")] {
+            let c = command("s", id, body);
+            let path = Paths::coalesce_path(c.body.as_deref().expect("body"));
+            batch.push(c, path);
+        }
+        sm.apply(2, &commands(96, batch.into_commands()));
+        let first = sm.apply(3, &commands(144, vec![command("s", "7", "gain=7@7")]));
+        assert_eq!(first.0[0].result, Resolution::Stale);
+        let mut loaded = machine();
+        loaded
+            .load(sm.save(), Limits::defaults(48_000), 3)
+            .expect("loads");
+        for machine in [&mut sm, &mut loaded] {
+            let copies = machine.apply(
+                4,
+                &commands(
+                    192,
+                    vec![
+                        command("s", "7", "gain=7@7"),
+                        command("s", "8", "gain=8@8"),
+                        command("s", "6", "pan=6@6"),
+                    ],
+                ),
+            );
+            let results: Vec<_> = copies.0.iter().map(|o| (o.revision, o.result)).collect();
+            assert_eq!(
+                results,
+                [
+                    (3, Resolution::Stale),
+                    (1, Resolution::Duplicate),
+                    (2, Resolution::Superseded)
+                ]
+            );
+        }
+    }
+
     #[test]
     fn a_coalesced_entry_acknowledges_every_merged_id() {
         let mut batch = Batch::default();
@@ -338,9 +387,10 @@ pub(crate) mod tests {
         );
         assert_eq!(sm.product.applied, 2);
         assert_eq!(sm.product.values["gain"].0, "2");
-        // The superseded id is recorded: a resend of it changes nothing.
+        // The superseded id is recorded: a resend of it changes nothing and
+        // is told it was superseded.
         let resend = sm.apply(6, &commands(96, vec![command("s", "1", "gain=1@1")]));
-        assert_eq!(resend.0[0].result, Resolution::Duplicate);
+        assert_eq!(resend.0[0].result, Resolution::Superseded);
         assert_eq!(resend.0[0].revision, 5);
         assert_eq!(sm.product.values["gain"].0, "2");
     }
