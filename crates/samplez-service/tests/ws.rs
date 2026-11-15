@@ -31,7 +31,7 @@ fn delta(revision: u64) -> Frame {
         epoch: 7,
         revision,
         prev: revision - 1,
-        command: None,
+        commands: Vec::new(),
         text: format!("delta@{revision}").into(),
     })
 }
@@ -429,7 +429,7 @@ async fn an_epoch_change_closes_every_connection() {
     assert_eq!(delta.next_message().await, Message::Close(None));
     assert_eq!(delta.ended().await, Ended::EpochChanged);
 
-    *state.read_index.lock().unwrap() = ReadIndex::Hang;
+    *state.read_index.lock().unwrap() = Reads::Hang;
     let start = Instant::now();
     let mut reconnected = Client::connect(&hub, &state, Some((7, 5)));
     assert_eq!(
@@ -451,7 +451,7 @@ async fn an_answer_of_another_epoch_closes_the_connection() {
     let hub = Hub::new(8);
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
-    *state.read_index.lock().unwrap() = ReadIndex::Committed(1);
+    *state.read_index.lock().unwrap() = Reads::Committed(1);
     client.tx.send(sync(Some((7, 0)))).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let start = Instant::now();
@@ -487,7 +487,7 @@ async fn a_lagging_replica_answers_once_it_applied_the_read_index() {
     let follower = FakeState::new("r2", "follower");
     let hub = Hub::new(8);
     apply(&follower, &hub);
-    *follower.read_index.lock().unwrap() = ReadIndex::Committed(4);
+    *follower.read_index.lock().unwrap() = Reads::Committed(4);
 
     let mut client = Client::connect(&hub, &follower, Some((7, 3)));
     client.silent().await;
@@ -499,6 +499,36 @@ async fn a_lagging_replica_answers_once_it_applied_the_read_index() {
     client.silent().await;
     apply(&follower, &hub);
     assert_eq!(client.next().await, "delta@5");
+    assert_eq!(
+        follower.catch_ups.load(Ordering::Relaxed),
+        1,
+        "the deltas the answer covered start no catch-up of their own"
+    );
+}
+
+/// A follower confirms no read index: it holds the answer, within the
+/// same bound, until it has applied the client's position, and answers
+/// it unmarked then; one that does not get there answers stale.
+#[tokio::test(start_paused = true)]
+async fn a_follower_answers_once_it_applied_the_clients_position() {
+    let follower = FakeState::new("r2", "follower");
+    let hub = Hub::new(8);
+    apply(&follower, &hub);
+    *follower.read_index.lock().unwrap() = Reads::NotLeader;
+    let mut client = Client::connect(&hub, &follower, Some((7, 3)));
+    client.silent().await;
+    apply(&follower, &hub);
+    client.silent().await;
+    apply(&follower, &hub);
+    // Answered at 3 with no delta to send, and not marked stale.
+    client.silent().await;
+    apply(&follower, &hub);
+    assert_eq!(client.next().await, "delta@4");
+
+    let start = Instant::now();
+    let mut behind = Client::connect(&hub, &follower, Some((7, 9)));
+    assert_eq!(behind.next().await, "snapshot@7:4 stale");
+    assert_eq!(start.elapsed(), READ_INDEX_HOLD);
 }
 
 /// Held up to [`READ_INDEX_HOLD`]: a replica that does not get the read
@@ -512,9 +542,9 @@ async fn a_catch_up_held_for_two_seconds_answers_stale() {
         apply(&follower, &hub);
     }
     for (read_index, since, answer) in [
-        (ReadIndex::Committed(9), (7, 1), "resume@7:3 stale"),
-        (ReadIndex::Hang, (7, 3), "resume@7:3 stale"),
-        (ReadIndex::Hang, (7, 5), "snapshot@7:3 stale"),
+        (Reads::Committed(9), (7, 1), "resume@7:3 stale"),
+        (Reads::Hang, (7, 3), "resume@7:3 stale"),
+        (Reads::Hang, (7, 5), "snapshot@7:3 stale"),
     ] {
         *follower.read_index.lock().unwrap() = read_index;
         let start = Instant::now();
@@ -538,7 +568,7 @@ async fn a_replica_cut_off_answers_stale_at_once() {
     for _ in 0..3 {
         apply(&state, &hub);
     }
-    *state.read_index.lock().unwrap() = ReadIndex::CutOff;
+    *state.read_index.lock().unwrap() = Reads::CutOff;
     let start = Instant::now();
     let mut resumed = Client::connect(&hub, &state, Some((7, 1)));
     assert_eq!(resumed.next().await, "resume@7:3 stale");
@@ -600,7 +630,7 @@ async fn nothing_after_a_catch_up_request_is_read_until_it_is_answered() {
     let state = FakeState::new("r2", "follower");
     let hub = Hub::new(8);
     apply(&state, &hub);
-    *state.read_index.lock().unwrap() = ReadIndex::Committed(2);
+    *state.read_index.lock().unwrap() = Reads::Committed(2);
     let sessions = Arc::new(Sessions::new("r2").unwrap());
     let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
     client.pong = false;
@@ -631,6 +661,7 @@ async fn nothing_after_a_catch_up_request_is_read_until_it_is_answered() {
 #[tokio::test(start_paused = true)]
 async fn commands_after_a_promote_wait_until_its_position_is_applied() {
     let state = FakeState::new("r2", "follower");
+    *state.read_index.lock().unwrap() = Reads::NotLeader;
     let hub = Hub::new(8);
     apply(&state, &hub);
     let mut client = Client::connect(&hub, &state, Some((7, 1)));
@@ -654,11 +685,32 @@ async fn commands_after_a_promote_wait_until_its_position_is_applied() {
     }
 }
 
+/// A promote above everything committed in the state's epoch, then the
+/// resync the client sends after it: the read index releases the hold, so
+/// the resync is answered `ahead` rather than never read.
+#[tokio::test(start_paused = true)]
+async fn a_promote_above_the_read_index_then_resync_is_answered_ahead() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    for _ in 0..3 {
+        apply(&state, &hub);
+    }
+    *state.read_index.lock().unwrap() = Reads::Committed(3);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:3");
+    client.tx.send(text("promote 7:5")).unwrap();
+    client.tx.send(sync(Some((7, 5)))).unwrap();
+    let start = Instant::now();
+    assert_eq!(client.next().await, "ahead@7:3 below 5");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
 /// A position this replica never applies holds the client's next commands
 /// for no longer than the read index hold plus [`MAX_PAUSE`].
 #[tokio::test(start_paused = true)]
 async fn a_promote_never_applied_ends_the_connection() {
     let state = FakeState::new("r2", "follower");
+    *state.read_index.lock().unwrap() = Reads::NotLeader;
     let hub = Hub::new(8);
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
@@ -868,6 +920,47 @@ async fn a_slow_snapshot_keeps_the_heartbeat() {
     assert_eq!(client.next().await, "snapshot@7:2");
     apply(&state, &hub);
     assert_eq!(client.next().await, "delta@3", "still served");
+}
+
+/// A reply ready while a catch-up after a gap is under way waits for it,
+/// so it never goes out ahead of the state it refers to.
+#[tokio::test(start_paused = true)]
+async fn a_reply_waits_for_a_catch_up_under_way() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    *state.snapshot_delay.lock().unwrap() = Duration::from_millis(1000);
+    state.apply(None);
+    state.forget_through(1);
+    apply(&state, &hub);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.tx.send(text("hello")).unwrap();
+    assert_eq!(client.next().await, "snapshot@7:2");
+    assert_eq!(client.next().await, "echo hello");
+}
+
+/// The epoch is checked before each reply: one ready between two pings
+/// after the epoch changed closes the connection instead of going out.
+#[tokio::test(start_paused = true)]
+async fn a_reply_after_an_epoch_change_closes_the_connection() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    client.silent().await;
+    // Answered 1.5 s later, at 1800 ms; pings go at multiples of 250 ms.
+    client.tx.send(text("slow")).unwrap();
+    for _ in 0..4 {
+        client.silent().await;
+    }
+    // Past the ping at 1750 ms, before the reply.
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let changed = Instant::now();
+    state.reset(8);
+    assert_eq!(client.next_message().await, Message::Close(None));
+    assert_eq!(client.ended().await, Ended::EpochChanged);
+    assert_eq!(changed.elapsed(), Duration::from_millis(40));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1123,6 +1216,47 @@ async fn a_pause_does_not_count_against_the_pong_timeout_after_it_ends() {
     assert_eq!(client.ended().await, Ended::PongTimeout);
     assert_eq!(start.elapsed(), resumed + PONG_TIMEOUT);
     assert!(sessions.live().is_empty());
+}
+
+/// A pong read after a pause counts from its ping's send moved on by the
+/// pause, as the other pongs and the pause itself: the client answered in
+/// time, and only the server did not read it.
+#[tokio::test(start_paused = true)]
+async fn a_pong_read_after_a_pause_counts_the_pause() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let start = Instant::now();
+    let mut paused_at = None;
+    while start.elapsed() < Duration::from_secs(4) && !client.task.is_finished() {
+        let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(50), client.rx.recv()).await
+        else {
+            continue;
+        };
+        let Some(t) = ping_of(&m) else { continue };
+        match paused_at {
+            None if start.elapsed() >= Duration::from_millis(500) => {
+                // The pong waits unread behind a limit's worth of replies.
+                for n in 0..MAX_PENDING_REPLIES {
+                    client.tx.send(text(&format!("slow {n}"))).unwrap();
+                }
+                client.tx.send(pong(t)).unwrap();
+                paused_at = Some(Instant::now());
+            }
+            // Silent until 300 ms after the pause, so only that pong
+            // carries the client over it.
+            Some(at) if at.elapsed() < Duration::from_millis(1800) => {}
+            _ => client.tx.send(pong(t)).unwrap(),
+        }
+    }
+    assert!(
+        !client.task.is_finished(),
+        "ended {:?}",
+        client.ended().await
+    );
+    assert_eq!(sessions.live().len(), 1);
 }
 
 /// A client answering every ping, each pong queued behind another limit's

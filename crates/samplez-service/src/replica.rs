@@ -141,6 +141,20 @@ impl fmt::Display for OwnerHandle {
     }
 }
 
+/// What [`ReplicatedState::read_index`] could establish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIndex {
+    /// Committed up to this revision, confirmed by a majority now.
+    Confirmed(u64),
+    /// This replica does not confirm read indices, as a follower that
+    /// knows a leader: the service waits, within the same bound, for this
+    /// replica to apply the client's position instead.
+    NotLeader,
+    /// This replica cannot reach the quorum: the service answers at once,
+    /// marked stale, without waiting. Resolve with it at once.
+    CutOff,
+}
+
 /// Implemented by the product or by the replication mechanism.
 pub trait ReplicatedState: Send + Sync + 'static {
     fn replica(&self) -> ReplicaInfo;
@@ -158,13 +172,10 @@ pub trait ReplicatedState: Send + Sync + 'static {
 
     /// The revision up to which the replication has committed, as a
     /// majority confirms it now: the read index a client naming its last
-    /// position is answered against ([`crate::ws::serve_client`]). `None`
-    /// once it is clear this replica cannot have it confirmed, such as while
-    /// it is cut off from the quorum: resolve at once then, so such a client
-    /// is answered without waiting. The service waits for it at most
-    /// [`crate::ws::READ_INDEX_HOLD`]. A single replica answers its own
-    /// revision.
-    fn read_index(&self) -> BoxFuture<'_, Option<u64>>;
+    /// position is answered against ([`crate::ws::serve_client`]). The
+    /// service waits for it at most [`crate::ws::READ_INDEX_HOLD`]. A single
+    /// replica answers its own revision.
+    fn read_index(&self) -> BoxFuture<'_, ReadIndex>;
 
     /// Resolves once this replica has applied `revision`; the service drops
     /// it when it stops waiting.
@@ -267,14 +278,17 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// The session's lifetime ends when the implementation ends its lease,
     /// on every replica at the same point of the state's history: a lease
     /// renewed again before the expiry is applied ends nothing. The
-    /// implementation tells the product then, which keeps the ordering
-    /// state of the session's commands, such as the last sequence number
-    /// applied per target ([`Resolution::Stale`]), for the lifetime plus the
-    /// retention of the session's table of command ids
+    /// ordering state of the session's commands, such as the last sequence
+    /// number applied per target ([`Resolution::Stale`]), has to outlive
+    /// the lifetime by the retention of the session's table of command ids
     /// ([`ReplicatedState::command_resolution`]) plus the longest a client
-    /// resends a command after it first sent it, counted the same way: a
-    /// copy of a command can apply that late after the original, and with
-    /// the ordering state dropped it could undo a later command.
+    /// resends a command after it first sent it: a copy of a command can
+    /// apply that late after the original, and with the ordering state
+    /// dropped it could undo a later command. The implementation tells the
+    /// product when that time has passed, counted in the replicated
+    /// state's own time like the retention, so every replica drops it at
+    /// the same point of the history; a session that comes back before
+    /// then keeps it.
     fn renew_sessions(&self, live: &[Owner]);
 }
 
@@ -296,8 +310,12 @@ pub struct Ack {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Resolution {
-    /// The product applied it.
+    /// The product applied it, and it changed the state: the delta at the
+    /// revision lists it ([`crate::ws::Delta::commands`]).
     Applied,
+    /// The product applied it, and it changed nothing: the state held it
+    /// already. No delta lists it.
+    Unchanged,
     /// A copy of a command applied already, through any replica: nothing
     /// changed, and the revision is the one its session's table holds.
     Duplicate,

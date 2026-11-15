@@ -28,7 +28,7 @@ use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::Error;
-use crate::replica::{Owner, Position, ReplicatedState};
+use crate::replica::{Owner, Position, ReadIndex, ReplicatedState};
 use crate::server::Connect;
 
 /// How often [`serve_client`] pings.
@@ -124,8 +124,9 @@ pub enum Reply<Fut> {
     /// The client makes this connection the one it sends commands on, with
     /// the last position it saw: when that is of the state's epoch, nothing
     /// after it is read until this replica has applied it, so no command
-    /// the client sends next applies to a state older than the one it saw.
-    /// Sends nothing.
+    /// the client sends next applies to a state older than the one it saw,
+    /// or until the read index is confirmed below it, so the catch-up the
+    /// client sends next is answered [`Answer::Ahead`]. Sends nothing.
     Promote(Option<Position>),
     /// The client's answer to the ping [`Encode::ping`] made with `t`.
     /// Sends nothing.
@@ -222,10 +223,11 @@ pub struct Delta {
     /// The revision of the delta before this one in the same epoch, 0 for
     /// the first.
     pub prev: u64,
-    /// The id of the command that caused it, when one did; the text echoes
-    /// it. `None` for a delta of several commands' changes, or of a change
-    /// no command made, such as a lease expiry.
-    pub command: Option<String>,
+    /// The ids of the commands whose changes it carries, in the order
+    /// applied; empty for a change no command made, such as a lease
+    /// expiry. A command that changed nothing is in no delta
+    /// ([`crate::replica::Resolution::Unchanged`]).
+    pub commands: Vec<String>,
     pub text: Utf8Bytes,
 }
 
@@ -569,21 +571,28 @@ pub enum Ended {
 /// Answers a client's [`CatchUp`]. A position of the state's epoch waits up
 /// to [`READ_INDEX_HOLD`] for the read index and for this replica to apply
 /// it, so the answer is never older than what the client saw or what was
-/// committed before; one above the read index is [`Answer::Ahead`]. Without
-/// the read index in that time, the answer is the state applied here,
-/// stale. Another epoch's position, or none, is answered at once.
+/// committed before; one above the read index is [`Answer::Ahead`]. A
+/// replica that confirms no read index ([`ReadIndex::NotLeader`]) waits as
+/// long for applying the client's position. Without either in that time,
+/// or at once when the replica is [`ReadIndex::CutOff`], the answer is the
+/// state applied here, stale. Another epoch's position, or none, is
+/// answered at once.
 async fn answer(state: &dyn ReplicatedState, request: CatchUp) -> Answer {
     let mut stale = false;
     if let Some(since) = request.since
         && since.epoch == state.epoch()
     {
         let confirmed = tokio::time::timeout(READ_INDEX_HOLD, async {
-            let committed = state.read_index().await?;
-            if since.revision > committed {
-                return Some(Err(committed));
-            }
-            if state.revision() < committed {
-                state.applied(committed).await;
+            let wait_for = match state.read_index().await {
+                ReadIndex::Confirmed(committed) if since.revision > committed => {
+                    return Some(Err(committed));
+                }
+                ReadIndex::Confirmed(committed) => committed,
+                ReadIndex::NotLeader => since.revision,
+                ReadIndex::CutOff => return None,
+            };
+            if state.revision() < wait_for {
+                state.applied(wait_for).await;
             }
             Some(Ok(()))
         })
@@ -601,6 +610,23 @@ async fn answer(state: &dyn ReplicatedState, request: CatchUp) -> Answer {
         }
     }
     catch_up(state, request, stale).await
+}
+
+/// Resolves once this replica has applied `revision`, the position of a
+/// promote, or once the read index is confirmed below it: the client holds
+/// state the replication never committed, and the catch-up it sends next is
+/// answered [`Answer::Ahead`] rather than held.
+async fn promote_floor(state: &dyn ReplicatedState, revision: u64) {
+    let below = async {
+        match state.read_index().await {
+            ReadIndex::Confirmed(committed) if committed < revision => {}
+            _ => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        () = state.applied(revision) => {}
+        () = below => {}
+    }
 }
 
 /// The deltas after `request.since` when this replica holds them, has
@@ -660,7 +686,8 @@ async fn send<T: Sink<Message> + Unpin>(
 ///
 /// `on_message` is called for each message in the order received. The
 /// [`Reply::Command`] replies go out in that order, the first after the
-/// first answer to a [`CatchUp`]; a [`Reply::Now`] goes out at once. The
+/// first answer to a [`CatchUp`], and none while a catch-up after a gap or
+/// a full delta queue is under way; a [`Reply::Now`] goes out at once. The
 /// futures run beside the heartbeat and each other, so a reply that waits
 /// on a commit or an election does not stall the pings; work that must
 /// follow the order of the messages belongs in the call itself, before the
@@ -672,7 +699,7 @@ async fn send<T: Sink<Message> + Unpin>(
 /// [`MAX_PENDING_REPLIES`] [`Reply::Command`] replies wait, until one is
 /// ready; while the answer to a [`CatchUp`] is held, until it is sent; and
 /// after a [`Reply::Promote`] of the state's epoch, until this replica has
-/// applied its position. That time does not count against the client's
+/// applied its position or the read index is confirmed below it. That time does not count against the client's
 /// [`PONG_TIMEOUT`]. A pause ends the connection as [`Ended::Failed`] when
 /// it lasts longer than [`MAX_PAUSE`] at the limit, or than
 /// [`READ_INDEX_HOLD`] plus [`MAX_PAUSE`] otherwise, or when the pauses
@@ -680,7 +707,8 @@ async fn send<T: Sink<Message> + Unpin>(
 ///
 /// Once the client was answered in an epoch, the connection is closed as
 /// [`Ended::EpochChanged`] when the state's epoch, a delta's or a later
-/// answer's is another, checked at least every [`PING_PERIOD`]. A client
+/// answer's is another, checked before each reply and at least every
+/// [`PING_PERIOD`]. A client
 /// answered [`Answer::Ahead`] is sent no deltas until it is answered with
 /// state again.
 ///
@@ -881,7 +909,7 @@ where
                         Reply::Promote(Some(p))
                             if p.epoch == state.epoch() && state.revision() < p.revision =>
                         {
-                            floor = Some(state.applied(p.revision));
+                            floor = Some(Box::pin(promote_floor(state, p.revision)));
                             Vec::new()
                         }
                         Reply::Promote(_) => Vec::new(),
@@ -891,7 +919,16 @@ where
                     floor = None;
                     Vec::new()
                 }
-                Some(reply) = replies.next(), if caught_up && !replies.is_empty() => {
+                // Not while catching up, so no reply overtakes the state it
+                // refers to.
+                Some(reply) = replies.next(),
+                    if caught_up && catching_up.is_none() && !replies.is_empty() =>
+                {
+                    if epoch.is_some_and(|e| e != state.epoch()) {
+                        let deadline = pong_deadline(answered, paused_since);
+                        let _ = send(&mut tx, Message::Close(None), deadline).await;
+                        return Ended::EpochChanged;
+                    }
                     reply.into_iter().collect()
                 }
                 a = async { catching_up.as_mut().expect("guarded").0.as_mut().await },
