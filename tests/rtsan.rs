@@ -3,7 +3,10 @@
 //! RTSan counts as blocking (allocation, pthread lock, sleep, blocking
 //! syscall) inside it aborts the process. The run covers input generation
 //! swaps, a re-route crossfade, a gain ramp, output commits, metering and
-//! a loudness reset. libmxl's sync-group wait, `mxlSleepUntil`, the
+//! a loudness reset, and a writer's refusals; the lib test
+//! `the_failure_paths_run_on_the_rt_thread`, run under the same flags,
+//! covers catch-up, clock steps and a late input. libmxl's sync-group
+//! wait, `mxlSleepUntil`, the
 //! commit's `FUTEX_WAKE` and the failure path's probe are allowed by call
 //! site. Other builds compile this file to nothing.
 
@@ -17,6 +20,8 @@ use std::time::Duration;
 
 use common::{B, Domain, MARGIN, Pilot, config, new_id, start, wait_for};
 use samplez::InputState;
+use samplez_mxl::Instance;
+use samplez_mxl::output::{self, Creation, FlowWriter, OutputConfig, Write};
 
 const PROBE: &str = "SAMPLEZ_RTSAN_PROBE";
 
@@ -97,4 +102,41 @@ fn the_rt_thread_passes_rtsan() {
     assert_eq!(engine.status().diverged, None);
     assert_eq!(engine.status().rt_panic, None);
     common::stop(engine);
+}
+
+/// Writes block `k`, then block `k - 1`, below the last commit, then block
+/// `k + 1` from too little data, in a real-time function.
+#[sanitize(realtime = "nonblocking")]
+fn refusals(w: &mut FlowWriter, k: u64, data: &[f32]) -> [Write; 3] {
+    [
+        w.write_block(k, data),
+        w.write_block(k - 1, data),
+        w.write_block(k + 1, &data[1..]),
+    ]
+}
+
+/// A writer's refusals, a block below its last commit (held) and too
+/// little data (failed), run in the real-time context.
+#[test]
+fn a_writer_refuses_in_the_real_time_context() {
+    let domain = Domain::new();
+    let id = new_id();
+    let api = common::api();
+    let instance = Instance::new(&api, &domain.0).unwrap();
+    let cfg = OutputConfig {
+        flow_id: &id,
+        label: "rtsan refusals",
+        group: "samplez-test",
+        role: "Audio",
+        channels: 2,
+        block: B,
+    };
+    let Creation::Created { writer: mut w, .. } = output::create(&instance, &cfg).unwrap() else {
+        panic!("flow not created");
+    };
+    let data = vec![0.25f32; 2 * B as usize];
+    let [committed, held, failed] = refusals(&mut w, 1_000_000, &data);
+    assert_eq!(committed, Write::Committed);
+    assert_eq!(held, Write::Held);
+    assert!(matches!(failed, Write::Failed(_)), "{failed:?}");
 }

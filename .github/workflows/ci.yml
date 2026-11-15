@@ -74,9 +74,9 @@ jobs:
               cargo test --locked --test hop
               cargo test --locked --release --test hop
             '
-      # RealtimeSanitizer over the RT thread's real-time functions on the
-      # builder's pinned nightly, and the Callgrind instruction-count
-      # limits of the RT benchmarks.
+      # RealtimeSanitizer over the RT loop on the builder's pinned nightly,
+      # with the lib tests' failure paths, and the Callgrind
+      # instruction-count limits of the RT benchmarks.
       # Docker's seccomp profile refuses the personality call setarch -R
       # makes, so Valgrind runs with ASLR on; the counts do not move with
       # it (two runs give equal counts).
@@ -88,7 +88,13 @@ jobs:
             -w /w samplez-builder:ci bash -euo pipefail -c '
               RUSTFLAGS="-Zsanitizer=realtime --cfg samplez_rtsan" \
                 cargo "+$SAMPLEZ_NIGHTLY" test --locked -Zbuild-std \
-                --target x86_64-unknown-linux-gnu --test rtsan
+                --target x86_64-unknown-linux-gnu --lib --test rtsan 2>&1 | tee rtsan.log
+              # The gate tests ran: without the cfg they compile to nothing.
+              for t in rtsan_aborts_an_allocation_in_a_real_time_function \
+                the_rt_thread_passes_rtsan a_writer_refuses_in_the_real_time_context \
+                engine::tests::the_failure_paths_run_on_the_rt_thread; do
+                grep -qx "test $t ... ok" rtsan.log || { echo "$t did not pass" >&2; exit 1; }
+              done
               cargo bench --locked -p samplez-dsp -p samplez-mxl --bench rt
             '
       # Saved from main only, so per-PR snapshots do not evict the builder

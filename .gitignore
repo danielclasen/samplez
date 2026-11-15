@@ -1,3 +1,4 @@
 /target
 /.cargo-registry
 lint-probe.log
+rtsan.log

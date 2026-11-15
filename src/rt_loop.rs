@@ -80,6 +80,22 @@ pub struct Counters {
 #[cfg(test)]
 pub(crate) static PANIC: AtomicBool = AtomicBool::new(false);
 
+/// Stalls the RT loop once for this many ms, for the overrun tests.
+#[cfg(test)]
+pub(crate) static STALL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Shifts libmxl's clock as the RT loop reads it, for the clock-step
+/// tests: its waits and sleeps take the shift off again.
+#[cfg(test)]
+pub(crate) static CLOCK_SHIFT_NS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Added to [`CLOCK_SHIFT_NS`] at the RT loop's next wake, so that the
+/// step lands between two blocks, not between a deadline and its sleep.
+#[cfg(test)]
+pub(crate) static CLOCK_STEP_NS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
 fn add(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Relaxed);
 }
@@ -707,7 +723,29 @@ fn monotonic_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// libmxl's clock as the RT loop reads it, shifted in the clock-step
+/// tests.
+fn clock_now(api: &MxlApi) -> u64 {
+    let now = time::now(api);
+    #[cfg(test)]
+    let now = now.saturating_add_signed(CLOCK_SHIFT_NS.load(Relaxed));
+    now
+}
+
 impl Rt {
+    /// libmxl's clock as the loop reads it.
+    fn now(&self) -> u64 {
+        clock_now(&self.api)
+    }
+
+    /// `mxlSleepUntil(timestamp)` on the clock [`Rt::now`] reads; it waits
+    /// by design, so RealtimeSanitizer allows it.
+    fn sleep_until(&self, timestamp: u64) {
+        #[cfg(test)]
+        let timestamp = timestamp.saturating_add_signed(-CLOCK_SHIFT_NS.load(Relaxed));
+        samplez_mxl::rtsan::allow(|| time::sleep_until(&self.api, timestamp));
+    }
+
     fn period_ns(&self) -> u64 {
         self.block * 1_000_000_000 / samplez_mxl::SAMPLE_RATE as u64
     }
@@ -761,8 +799,18 @@ impl Rt {
             if PANIC.swap(false, Relaxed) {
                 panic!("the panic test hook");
             }
+            #[cfg(test)]
+            #[allow(clippy::disallowed_methods, reason = "a test hook")]
+            match STALL_MS.swap(0, Relaxed) {
+                0 => {}
+                ms => samplez_mxl::rtsan::allow(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(ms))
+                }),
+            }
+            #[cfg(test)]
+            CLOCK_SHIFT_NS.fetch_add(CLOCK_STEP_NS.swap(0, Relaxed), Relaxed);
             let m0 = monotonic_ns();
-            let now = time::now(&self.api);
+            let now = self.now();
             let m1 = monotonic_ns();
             let (mono, width) = (m0 + (m1 - m0) / 2, m1 - m0);
             if let Some((t0, mono0, width0)) = prev {
@@ -804,8 +852,8 @@ impl Rt {
             let deadline = time::deadline(&self.api, k, self.block, self.margin);
             self.wait(k, deadline);
             self.process(k, deadline);
-            samplez_mxl::rtsan::allow(|| time::sleep_until(&self.api, deadline));
-            let late = time::now(&self.api).saturating_sub(deadline);
+            self.sleep_until(deadline);
+            let late = self.now().saturating_sub(deadline);
             self.counters.wake_jitter_max_ns.fetch_max(late, Relaxed);
             next = Some(k + 1);
         }
@@ -819,7 +867,7 @@ impl Rt {
             *status = match g {
                 Some(g) if g.mxl.has_inputs() => {
                     let ts = time::group_timestamp(&self.api, k, self.block, g.mxl.max_offset());
-                    let timeout = deadline.saturating_sub(time::now(&self.api));
+                    let timeout = deadline.saturating_sub(clock_now(&self.api));
                     let s = samplez_mxl::rtsan::allow(|| g.mxl.wait(ts, timeout));
                     if matches!(s, GroupWait::Failed(MXL_ERR_OUT_OF_RANGE_TOO_EARLY)) {
                         add(&self.counters.input_wait_timeout, 1);
@@ -831,7 +879,7 @@ impl Rt {
             };
             all_ok &= matches!(status, GroupWait::Ok);
         }
-        if waited && all_ok && time::now(&self.api) < deadline {
+        if waited && all_ok && self.now() < deadline {
             add(&self.counters.wait_early, 1);
         }
     }
@@ -1019,7 +1067,7 @@ impl Rt {
     /// Reads, mixes and writes block `k`, due at `deadline`.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn process(&mut self, k: u64, deadline: u64) {
-        let t0 = time::now(&self.api);
+        let t0 = self.now();
         let b = self.block as usize;
         // Entries apply at the start of the block at their index, before
         // its inputs are read.
@@ -1213,7 +1261,7 @@ impl Rt {
             );
         }
 
-        let done = time::now(&self.api);
+        let done = self.now();
         if done > deadline + self.period_ns() / 4 {
             add(&self.counters.deadline_miss, 1);
         }
