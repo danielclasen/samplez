@@ -138,8 +138,9 @@ struct Client {
 
 impl Client {
     /// Runs `serve_client` over channels; the product callback echoes text,
-    /// answers text starting with `slow` after 1.5 s and grants a meter credit for the binary
-    /// message `credit`.
+    /// answers text starting with `slow` after 1.5 s, `beat` at once,
+    /// `quiet` with nothing at once and grants a meter credit for the
+    /// binary message `credit`.
     fn start(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
         let queue = hub.subscribe();
         let state = state.clone();
@@ -157,6 +158,7 @@ impl Client {
                     Message::Text(t) if t.as_str() == "beat" => {
                         return Reply::Now(Some(Message::Text("beat back".into())));
                     }
+                    Message::Text(t) if t.as_str() == "quiet" => return Reply::Now(None),
                     Message::Text(t) if t.as_str() == "hang" => {
                         return Reply::Command(Box::pin(std::future::pending()) as BoxFuture<_>);
                     }
@@ -441,6 +443,30 @@ async fn replies_at_the_limit_slower_than_the_pong_timeout_keep_the_connection()
     assert_eq!(client.next().await, "echo hello", "read again");
     apply(&state, &hub);
     assert_eq!(client.next().await, "delta@1", "still served");
+}
+
+/// `Reply::Now(None)` sends nothing and takes no place among the replies
+/// waiting: one place short of the limit, the connection is still read.
+#[tokio::test(start_paused = true)]
+async fn a_message_answered_now_with_nothing_sends_nothing_and_counts_nothing() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let start = Instant::now();
+    for n in 1..MAX_PENDING_REPLIES {
+        let slow = format!("slow {n}");
+        client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
+    }
+    client.tx.send(Ok(Message::Text("quiet".into()))).unwrap();
+    client.tx.send(Ok(Message::Text("beat".into()))).unwrap();
+    assert_eq!(client.next().await, "beat back");
+    assert_eq!(start.elapsed(), Duration::ZERO, "read below the limit");
+    for n in 1..MAX_PENDING_REPLIES {
+        assert_eq!(client.next().await, format!("slow {n} done"));
+    }
+    client.tx.send(Ok(Message::Text("hello".into()))).unwrap();
+    assert_eq!(client.next().await, "echo hello", "nothing for quiet");
 }
 
 /// A client resending its unacknowledged commands at once after
