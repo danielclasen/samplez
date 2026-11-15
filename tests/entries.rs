@@ -67,10 +67,15 @@ fn block(v: &[f32], channels: usize, i: usize, c: usize) -> &[f32] {
     &v[(i * channels + c) * b..(i * channels + c + 1) * b]
 }
 
-/// Whether both engines computed block `k`. A block an engine skipped
-/// after an overrun is zero-filled by libmxl, not computed.
+/// Whether an engine with verdicts `v` computed block `k`. A block it
+/// skipped after an overrun is zero-filled by libmxl, not computed.
+fn computed(v: &[BlockVerdict], k: u64) -> bool {
+    v.iter().any(|v| v.k == k)
+}
+
+/// Whether both engines computed block `k`.
 fn both(va: &[BlockVerdict], vb: &[BlockVerdict], k: u64) -> bool {
-    va.iter().any(|v| v.k == k) && vb.iter().any(|v| v.k == k)
+    computed(va, k) && computed(vb, k)
 }
 
 /// Whether two blocks are bit-identical.
@@ -128,19 +133,21 @@ fn input_down_and_up_apply_at_their_index_on_every_engine() {
                    want: &dyn Fn(usize, u64) -> Vec<f32>| {
         let x = common::read_blocks(&domain.0, &out_a, 2, range.clone());
         let y = common::read_blocks(&domain.0, &out_b, 2, range.clone());
+        // Each engine against the expected values on the blocks it
+        // computed, and the two bit-identical where both did.
         let mut compared = 0;
         for (i, k) in range.clone().enumerate() {
-            if !both(va, vb, k) {
-                continue;
-            }
-            compared += 1;
+            let (in_a, in_b) = (computed(va, k), computed(vb, k));
             for c in 0..2 {
-                assert!(same(block(&x, 2, i, c), block(&y, 2, i, c)), "block {k}");
-                assert!(block(&x, 2, i, c) == want(c, k), "block {k} channel {c}");
+                let (p, q) = (block(&x, 2, i, c), block(&y, 2, i, c));
+                assert!(!in_a || p == want(c, k), "engine a block {k} channel {c}");
+                assert!(!in_b || q == want(c, k), "engine b block {k} channel {c}");
+                assert!(!(in_a && in_b) || same(p, q), "block {k}");
             }
+            compared += u64::from(in_a && in_b);
         }
         assert!(
-            compared * 4 > range.count() * 3,
+            compared * 4 > range.count() as u64 * 3,
             "{compared} blocks compared"
         );
     };
