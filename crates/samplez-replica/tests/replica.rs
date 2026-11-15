@@ -7,6 +7,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use harness::{Options, Set, owner};
 use samplez_replica::dedup::Limits;
+use samplez_replica::entry::{Body, SessionKey};
 use samplez_service::ReplicatedState;
 use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 
@@ -94,6 +95,31 @@ async fn only_the_leader_is_commitable_and_every_refusal_names_its_reason() {
     let stopped = set_.replica(leader).clone();
     set_.crash(leader).await;
     assert_eq!(refused(&*stopped, "x").await.reason, Reason::Unavailable);
+}
+
+/// The write timeout counts from the submit: a command queued behind
+/// writes that cannot commit, a command and an entry of the set's own,
+/// waits no longer than one that is written at once.
+#[tokio::test(start_paused = true)]
+async fn a_queued_submit_times_out_at_its_own_deadline() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    set_.net.isolate(leader, set_.ids());
+    let replica = set_.replica(leader).clone();
+    let first = tokio::spawn({
+        let replica = replica.clone();
+        async move { refused(&*replica, "a").await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    replica.append(Body::LeaseRenew(vec![SessionKey::from_parts(
+        "anonymous",
+        "s",
+    )]));
+    let queued_at = tokio::time::Instant::now();
+    let second = refused(&*replica, "b").await;
+    assert_eq!(second.reason, Reason::Unavailable);
+    assert_eq!(queued_at.elapsed(), Duration::from_secs(2));
+    assert_eq!(first.await.expect("joins").reason, Reason::Unavailable);
 }
 
 #[tokio::test(start_paused = true)]

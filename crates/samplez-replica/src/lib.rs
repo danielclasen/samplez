@@ -22,6 +22,7 @@ use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::ws::{Delta, Snapshot};
 use samplez_service::{Owner, Position, ReplicaInfo, ReplicatedState};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 use crate::dedup::Limits;
 use crate::entry::{
@@ -59,8 +60,11 @@ pub struct Settings {
     pub limits: Limits,
     /// The engine block size B the stamping index rounds to.
     pub block: u64,
-    /// The longest a submit waits for its entry to apply here before it
-    /// resolves [`NotApplied`] with [`Reason::Unavailable`].
+    /// The longest a submit waits, from the call, for its command to apply
+    /// here, queueing behind earlier writes included, before it resolves
+    /// [`NotApplied`] with [`Reason::Unavailable`]. A command still queued
+    /// at its deadline is not ordered. An entry the replica set decides on
+    /// waits this long from the moment it is proposed.
     pub write_timeout: Duration,
 }
 
@@ -70,7 +74,7 @@ pub type Estimate = Arc<dyn Fn() -> u64 + Send + Sync>;
 type Reply = oneshot::Sender<Result<Ack, NotApplied>>;
 
 enum Queued {
-    Command(Command, Reply),
+    Command(Command, Instant, Reply),
     Entry(Body),
 }
 
@@ -156,6 +160,12 @@ impl<P: Product> Replica<P> {
 /// entry was written into the next one (group commit). A copy of a
 /// command the batch holds already is folded into it and answered from
 /// its outcome, an applied one as a duplicate.
+///
+/// A first cut: one entry is in flight at a time and the writer waits for
+/// it to commit and apply here before it proposes the next, so the
+/// batching window is one commit round-trip, not one log append and
+/// fsync, and a command that arrives just after a write starts waits for
+/// up to two commits.
 async fn write(
     raft: Raft<TypeConfig>,
     mut queued: mpsc::UnboundedReceiver<Queued>,
@@ -181,25 +191,37 @@ async fn write(
                     tokio::time::timeout(settings.write_timeout, raft.client_write(request(body)))
                         .await;
             }
-            Queued::Command(command, reply) => {
+            Queued::Command(command, deadline, reply) => {
                 let mut batch = Batch::default();
                 let mut replies = Vec::new();
-                let mut push = |command: Command, reply| {
+                let mut latest = Instant::now();
+                let mut push = |command: Command, deadline: Instant, reply: Reply| {
+                    // Its submit timed out while it queued: not ordered.
+                    if deadline <= Instant::now() {
+                        let _ = reply.send(Err(NotApplied::new(Reason::Unavailable, "timed out")));
+                        return;
+                    }
+                    latest = latest.max(deadline);
                     let id = command.id.clone();
                     replies.push((batch.push(command), id, reply));
                 };
-                push(command, reply);
+                push(command, deadline, reply);
                 while let Ok(item) = queued.try_recv() {
                     match item {
-                        Queued::Command(command, reply) => push(command, reply),
+                        Queued::Command(command, deadline, reply) => push(command, deadline, reply),
                         entry => {
                             next = Some(entry);
                             break;
                         }
                     }
                 }
-                let written = tokio::time::timeout(
-                    settings.write_timeout,
+                if batch.is_empty() {
+                    continue;
+                }
+                // Each submit times out at its own deadline; the writer
+                // waits for the latest of them.
+                let written = tokio::time::timeout_at(
+                    latest,
                     raft.client_write(request(Body::Commands(batch.into_commands()))),
                 )
                 .await;
@@ -331,6 +353,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         command: axum::body::Bytes,
     ) -> BoxFuture<'_, Result<Ack, NotApplied>> {
         let (reply, replied) = oneshot::channel();
+        let deadline = Instant::now() + self.settings.write_timeout;
         let queued = self.queue.send(Queued::Command(
             Command {
                 origin: Origin::from(owner),
@@ -338,12 +361,16 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                 at_index: None,
                 body: command.to_vec(),
             },
+            deadline,
             reply,
         ));
         Box::pin(async move {
             let stopped = || NotApplied::new(Reason::Unavailable, "replica stopped");
             queued.map_err(|_| stopped())?;
-            replied.await.unwrap_or_else(|_| Err(stopped()))
+            match tokio::time::timeout_at(deadline, replied).await {
+                Ok(replied) => replied.unwrap_or_else(|_| Err(stopped())),
+                Err(_) => Err(NotApplied::new(Reason::Unavailable, "timed out")),
+            }
         })
     }
 
