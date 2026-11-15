@@ -141,10 +141,10 @@ fn withdraw(mut o: Out) -> Out {
     o
 }
 
-const AT_ONCE: u64 = 450;
-const FLUSH: u64 = 18_100;
-const OVERFLOW: u64 = 5_100;
-const WITHDRAW: u64 = 8_000;
+const AT_ONCE: u64 = 437;
+const FLUSH: u64 = 18_154;
+const OVERFLOW: u64 = 12_012;
+const WITHDRAW: u64 = 8_096;
 
 library_benchmark_group!(
     name = hold,

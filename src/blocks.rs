@@ -12,6 +12,8 @@
 //!
 //! Nothing here allocates once built.
 
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::sync::atomic::{AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
 
 use rtrb::Producer;
@@ -260,39 +262,44 @@ impl Statuses {
     }
 
     /// The status of block `k`; none before its first status, or once
-    /// the ring reused its slot.
+    /// the ring reused its slot. The word read last decides: a slot being
+    /// reused clears its word before its digest changes ([`Statuses::first`]),
+    /// so a word read again unchanged after the digest pairs with it.
     pub fn get(&self, k: u64) -> Option<BlockStatus> {
         let s = self.slot(k);
-        let word = s.word.load(Acquire);
-        decode(word, s.digest.load(Relaxed), k, self.block)
+        let mut word = s.word.load(Acquire);
+        loop {
+            let digest = s.digest.load(Acquire);
+            let again = s.word.load(Acquire);
+            if again == word {
+                return decode(word, digest, k, self.block);
+            }
+            word = again;
+        }
     }
 
     /// Supervisor. Moves block `k` to `withheld` for `cause`: from no
     /// status yet (not computed), `fenced` or `held`. Returns the status
     /// the block ends with: `withheld`, or `committed` when the RT thread
-    /// committed it first. A slot that still holds another block's open
-    /// or a later block's status keeps it: the RT thread then withholds
-    /// `k` for [`Cause::NoSlot`] if it computes it, so it is never
-    /// written either way.
-    pub fn withhold(&self, k: u64, cause: Cause) -> BlockStatus {
+    /// committed it first. Returns none, recording nothing, while the slot
+    /// still holds another block's open status or a later block's: the
+    /// caller settles that block first and withholds `k` again.
+    pub fn withhold(&self, k: u64, cause: Cause) -> Option<BlockStatus> {
         let s = self.slot(k);
         let mut cur = s.word.load(Acquire);
         loop {
-            let old = decode(cur, s.digest.load(Relaxed), k, self.block);
+            let old = decode(cur, s.digest.load(Acquire), k, self.block);
             let new = match old {
-                Some(st) if matches!(st.kind, Kind::Committed | Kind::Withheld) => return st,
+                Some(st) if matches!(st.kind, Kind::Committed | Kind::Withheld) => {
+                    return Some(st);
+                }
                 Some(st) => BlockStatus {
                     kind: Kind::Withheld,
                     through: false,
                     cause,
                     ..st
                 },
-                None if occupant(cur, k) != Occupant::Free => {
-                    return BlockStatus {
-                        cause,
-                        ..no_slot(k)
-                    };
-                }
+                None if occupant(cur, k) != Occupant::Free => return None,
                 None => BlockStatus {
                     k,
                     kind: Kind::Withheld,
@@ -308,7 +315,7 @@ impl Statuses {
                 .word
                 .compare_exchange(cur, encode(&new, self.block), Release, Acquire)
             {
-                Ok(_) => return new,
+                Ok(_) => return Some(new),
                 Err(w) => cur = w,
             }
         }
@@ -342,20 +349,29 @@ impl Statuses {
         }
     }
 
-    /// RT. Sets the first status of block `k`: the digest, then the word,
-    /// unless the supervisor gave `k` a status first, which is returned,
-    /// or the slot is not free ([`Cause::NoSlot`]).
+    /// RT. Sets the first status of block `k`, unless the supervisor gave
+    /// `k` a status first, which is returned, or the slot is not free
+    /// ([`Cause::NoSlot`]). An earlier block's final word is cleared
+    /// first, then the digest stored, then the word set, so no reader
+    /// pairs the earlier block's word with this digest.
     fn first(&self, new: &BlockStatus) -> Result<(), BlockStatus> {
         let s = self.slot(new.k);
         let mut cur = s.word.load(Acquire);
         loop {
-            if let Some(st) = decode(cur, s.digest.load(Relaxed), new.k, self.block) {
+            if let Some(st) = decode(cur, s.digest.load(Acquire), new.k, self.block) {
                 return Err(st);
             }
             if occupant(cur, new.k) != Occupant::Free {
                 return Err(no_slot(new.k));
             }
-            s.digest.store(new.digest.unwrap_or(0), Relaxed);
+            if cur != 0 {
+                if let Err(w) = s.word.compare_exchange(cur, 0, Release, Acquire) {
+                    cur = w;
+                    continue;
+                }
+                cur = 0;
+            }
+            s.digest.store(new.digest.unwrap_or(0), Release);
             match s
                 .word
                 .compare_exchange(cur, encode(new, self.block), Release, Acquire)
@@ -477,6 +493,9 @@ pub struct Hold {
     mode: Mode,
     /// The index the next commit continues from.
     frontier: Option<u64>,
+    /// The end of the last block this output committed, while no block
+    /// after it is final without a commit: a fill may continue from it.
+    committed_end: Option<u64>,
     /// A requested commit start: the first page boundary in a block at
     /// or after it.
     start_from: Option<u64>,
@@ -514,6 +533,7 @@ impl Hold {
             next_slot: 0,
             mode: Mode::Idle,
             frontier: None,
+            committed_end: None,
             start_from: None,
             stop_at: None,
             withheld: 0,
@@ -552,33 +572,53 @@ impl Hold {
         self.stop_at = Some(p);
     }
 
-    /// Commits nothing from now on and drops the ring: its blocks are
-    /// withheld, cause `cause`.
-    pub fn idle(&mut self, statuses: &Statuses, changes: &mut Changes, cause: Cause) {
+    /// Commits nothing from now on and empties the ring: its open blocks
+    /// are withheld, cause `cause`, and its committed ones written to
+    /// `sink`, the writer they were committed for.
+    pub fn idle(
+        &mut self,
+        statuses: &Statuses,
+        changes: &mut Changes,
+        sink: &mut impl Sink,
+        cause: Cause,
+    ) {
         self.mode = Mode::Idle;
         self.frontier = None;
         self.start_from = None;
         self.stop_at = None;
-        while let Some(p) = self.pending.pop_front() {
-            if !matches!(p.status.kind, Kind::Committed | Kind::Withheld) {
-                self.withhold_rt(statuses, changes, p.status, cause);
-            }
+        for n in 0..self.pending.len() {
+            let p = self.pending[n].status;
+            let cur = statuses.get(p.k).unwrap_or(p);
+            self.pending[n].status = match cur.kind {
+                Kind::Fenced | Kind::Held => self.withhold_rt(statuses, changes, cur, cause),
+                _ => cur,
+            };
         }
+        self.flush(sink);
+        self.pending.clear();
+        self.committed_end = None;
     }
 
     /// The replica is withdrawn: from now on this output commits through
     /// only, from the next page boundary on. Blocks in the ring that a
     /// withdrawn replica cannot fill are withheld at once. One replica
     /// is never withdrawn.
+    /// A pending commit start or stop lapses in every mode: the
+    /// supervisor names a commit start again once it still wants one.
     pub fn withdraw(&mut self, statuses: &Statuses, changes: &mut Changes) {
         // One replica has no member to leave a block to: it goes on
         // committing after a block it withheld, from any index.
-        if self.mode == Mode::Idle || self.alone {
+        if self.alone {
+            return;
+        }
+        self.start_from = None;
+        self.stop_at = None;
+        if self.mode == Mode::Idle {
             return;
         }
         self.mode = Mode::Withdrawn;
-        self.frontier = None;
-        self.stop_at = None;
+        // The page stays whole on this member after a block it committed.
+        self.frontier = self.committed_end;
         for n in 0..self.pending.len() {
             let mut p = self.pending[n];
             p.status = statuses.get(p.status.k).unwrap_or(p.status);
@@ -695,6 +735,31 @@ impl Hold {
         let healthy = digest == Some(HEALTHY);
         let mut range = Range::Whole;
         let mut live = (start, end);
+        // The overflowing block is past its hold cap by now: a stalled
+        // supervisor freezes F.
+        let mut out = Outcome::default();
+        // Each pass ends with the front block final, unless the supervisor
+        // moved it meanwhile; it moves a block a bounded number of times.
+        while !self.alone && self.mode != Mode::Idle && self.pending.len() == self.cap {
+            out.withdraw |= self.advance(ctx, statuses, changes, sink).withdraw;
+            if self.pending.len() < self.cap {
+                break;
+            }
+            let front = self.pending[0].status;
+            let front = statuses.get(front.k).unwrap_or(front);
+            let st = self.withhold_rt(statuses, changes, front, Cause::Overflow);
+            self.pending[0].status = st;
+            if st.kind == Kind::Withheld {
+                self.overflows += u64::from(st.cause == Cause::Overflow);
+                out.withdraw = true;
+            }
+            self.flush(sink);
+        }
+        // A block withheld for a cause withdraws the replica before block
+        // k is decided: k follows the withdrawn rules.
+        if out.withdraw {
+            self.withdraw(statuses, changes);
+        }
         if let Some(min_k) = self.start_from
             && k >= min_k
             && self.mode != Mode::Committing
@@ -718,7 +783,7 @@ impl Hold {
         let mut fill = false;
         let mut stopped = false;
         match self.mode {
-            Mode::Idle => return Outcome::default(),
+            Mode::Idle => return out,
             Mode::Committing => {
                 if let Some(p) = self.stop_at
                     && p < end
@@ -758,33 +823,14 @@ impl Hold {
                         self.withheld += 1;
                         changes.send(st);
                     }
-                    return Outcome::default();
+                    self.committed_end = None;
+                    return out;
                 }
                 if at > start {
                     range = Range::From(at);
                     live.0 = at;
                 }
             }
-        }
-        // The overflowing block is past its hold cap by now: a stalled
-        // supervisor freezes F.
-        let mut out = Outcome::default();
-        // Each pass ends with the front block final, unless the supervisor
-        // moved it meanwhile; it moves a block a bounded number of times.
-        while !self.alone && self.pending.len() == self.cap {
-            out.withdraw |= self.advance(ctx, statuses, changes, sink).withdraw;
-            if self.pending.len() < self.cap {
-                break;
-            }
-            let front = self.pending[0].status;
-            let front = statuses.get(front.k).unwrap_or(front);
-            let st = self.withhold_rt(statuses, changes, front, Cause::Overflow);
-            self.pending[0].status = st;
-            if st.kind == Kind::Withheld {
-                self.overflows += u64::from(st.cause == Cause::Overflow);
-                out.withdraw = true;
-            }
-            self.flush(sink);
         }
         let passed = ctx.fence >= end;
         let ahead = self
@@ -825,6 +871,7 @@ impl Hold {
             }
             out.withdraw |= now.kind == Kind::Withheld;
             self.frontier = None;
+            self.committed_end = None;
             return out;
         }
         changes.send(st);
@@ -832,6 +879,7 @@ impl Hold {
             Kind::Withheld => {
                 self.withheld += 1;
                 self.frontier = None;
+                self.committed_end = None;
                 out.withdraw = true;
                 return out;
             }
@@ -841,6 +889,7 @@ impl Hold {
                     self.failed_writes += 1;
                 }
                 self.frontier = Some(live.1);
+                self.committed_end = Some(live.1);
             }
             _ => {
                 let slot = self.next_slot;
@@ -888,7 +937,7 @@ impl Hold {
                     Kind::Fenced if ctx.fence < (cur.k + 1) * self.block => break,
                     Kind::Fenced => {
                         let healthy = cur.digest == Some(HEALTHY);
-                        if self.mode == Mode::Committing && !p.fill && healthy && prefix {
+                        if !p.fill && healthy && prefix {
                             BlockStatus {
                                 kind: Kind::Committed,
                                 ..cur
@@ -903,7 +952,7 @@ impl Hold {
                     }
                     Kind::Held => {
                         let healthy = cur.digest == Some(HEALTHY);
-                        let auto = self.mode == Mode::Committing && !p.fill && healthy && prefix;
+                        let auto = !p.fill && healthy && prefix;
                         if !cur.through && !auto {
                             break;
                         }
@@ -945,6 +994,7 @@ impl Hold {
             match self.pending.front().map(|p| p.status.kind) {
                 Some(Kind::Withheld) => {
                     self.pending.pop_front();
+                    self.committed_end = None;
                 }
                 Some(Kind::Committed) => {
                     let first = self.pending[0];
@@ -967,6 +1017,7 @@ impl Hold {
                     if !sink.write(first.start, len, &self.run, samples) {
                         self.failed_writes += 1;
                     }
+                    self.committed_end = Some(end);
                 }
                 _ => return,
             }
@@ -1251,7 +1302,7 @@ mod tests {
         let mut t = T::committing(false, K0);
         t.compute(K0, DEGRADED);
         t.compute(K0 + 1, Some(HEALTHY));
-        let st = t.statuses.withhold(K0, Cause::HoldCap);
+        let st = t.statuses.withhold(K0, Cause::HoldCap).unwrap();
         assert_eq!((st.kind, st.cause), (Kind::Withheld, Cause::HoldCap));
         assert!(t.advance().withdraw);
         t.withdraw();
@@ -1267,14 +1318,17 @@ mod tests {
         assert!(t.sink.writes.is_empty());
     }
 
-    /// A withdrawn replica fills from the next page boundary on, through
-    /// only: the block holding it reports `From(P)`, is held without a
-    /// digest, and commits `[P, (k + 1)B)` on evidence; the blocks after
-    /// it are filled as well.
+    /// After a block final without a commit, a withdrawn replica fills
+    /// from the next page boundary on, through only: the block holding it
+    /// reports `From(P)`, is held without a digest, and commits
+    /// `[P, (k + 1)B)` on evidence; the blocks after it are filled as
+    /// well.
     #[test]
     fn a_withdrawn_replica_fills_from_the_next_page_boundary() {
         let mut t = T::committing(false, K0);
-        t.compute(K0, Some(HEALTHY));
+        t.compute(K0, DEGRADED);
+        t.statuses.withhold(K0, Cause::HoldCap).unwrap();
+        assert!(t.advance().withdraw);
         t.withdraw();
         // The next page boundary lies inside block k1.
         let p = (K0 * B + 1).next_multiple_of(PAGE);
@@ -1292,11 +1346,11 @@ mod tests {
             (Kind::Held, Range::From(p), None)
         );
         t.advance();
-        assert_eq!(t.sink.writes.len(), 1, "a fill commits on evidence only");
+        assert!(t.sink.writes.is_empty(), "a fill commits on evidence only");
         assert!(t.statuses.commit_through(k1, 0));
         assert!(t.statuses.commit_through(k1 + 1, 0));
         t.advance();
-        assert_eq!(t.sink.writes[1], (p, ((k1 + 2) * B - p) as usize));
+        assert_eq!(t.sink.writes[0], (p, ((k1 + 2) * B - p) as usize));
         t.sink.check();
     }
 
@@ -1337,7 +1391,7 @@ mod tests {
             t.compute(k, Some(HEALTHY));
         }
         assert_eq!(t.hold.len(), CAP);
-        t.statuses.withhold(K0 + 2, Cause::HoldCap);
+        t.statuses.withhold(K0 + 2, Cause::HoldCap).unwrap();
         t.ctx.fence = u64::MAX;
         assert!(t.advance().withdraw);
         t.withdraw();
@@ -1380,8 +1434,8 @@ mod tests {
         // The RT thread stalls past both deadlines: K0 + 1 fenced, K0 + 2
         // not computed yet.
         t.compute(K0 + 1, Some(HEALTHY));
-        t.statuses.withhold(K0 + 1, Cause::FenceDeadline);
-        t.statuses.withhold(K0 + 2, Cause::FenceDeadline);
+        t.statuses.withhold(K0 + 1, Cause::FenceDeadline).unwrap();
+        t.statuses.withhold(K0 + 2, Cause::FenceDeadline).unwrap();
         t.ctx.fence = u64::MAX;
         assert!(t.advance().withdraw);
         assert!(t.compute(K0 + 2, Some(HEALTHY)).withdraw);
@@ -1401,8 +1455,8 @@ mod tests {
         t.ctx.fence = 0;
         t.compute(K0, Some(HEALTHY));
         let ahead = K0 + 64;
-        let st = t.statuses.withhold(ahead, Cause::FenceDeadline);
-        assert_eq!((st.kind, st.cause), (Kind::Withheld, Cause::FenceDeadline));
+        // Nothing recorded: the supervisor learns it withheld nothing.
+        assert_eq!(t.statuses.withhold(ahead, Cause::FenceDeadline), None);
         assert_eq!(t.kind(K0), Some(Kind::Fenced));
         t.ctx.fence = u64::MAX;
         for k in K0 + 1..ahead {
@@ -1415,7 +1469,7 @@ mod tests {
         let mut t = T::committing(false, K0);
         t.ctx.fence = 0;
         t.compute(K0, Some(HEALTHY));
-        t.statuses.withhold(K0 + 64, Cause::FenceDeadline);
+        assert_eq!(t.statuses.withhold(K0 + 64, Cause::FenceDeadline), None);
         let st = t.statuses.get(K0 + 64);
         assert_eq!(st, None, "the open block's slot was taken");
         let data = T::block(K0 + 64);
@@ -1443,8 +1497,8 @@ mod tests {
             StatusChange::Block { status, .. } if status.k == K0 + 64 && status.cause == Cause::NoSlot)));
         // A later block's status set ahead keeps its slot.
         let s = Statuses::new(64, B);
-        s.withhold(K0 + 64, Cause::FenceDeadline);
-        assert_eq!(s.withhold(K0, Cause::HoldCap).cause, Cause::HoldCap);
+        assert!(s.withhold(K0 + 64, Cause::FenceDeadline).is_some());
+        assert_eq!(s.withhold(K0, Cause::HoldCap), None);
         assert_eq!(s.get(K0 + 64).unwrap().cause, Cause::FenceDeadline);
     }
 
@@ -1454,7 +1508,7 @@ mod tests {
     fn a_committed_block_cannot_be_withheld() {
         let mut t = T::committing(false, K0);
         t.compute(K0, Some(HEALTHY));
-        let st = t.statuses.withhold(K0, Cause::OtherDigest);
+        let st = t.statuses.withhold(K0, Cause::OtherDigest).unwrap();
         assert_eq!(st.kind, Kind::Committed);
         assert!(!t.statuses.commit_through(K0, 0));
     }
@@ -1551,5 +1605,163 @@ mod tests {
             .collect();
         assert_eq!(kinds, [Kind::Fenced, Kind::Held, Kind::Committed]);
         let _ = t.changes();
+    }
+
+    /// A full ring's overflow withholds its oldest block, which
+    /// withdraws the replica; the block computed in the same call must
+    /// follow the withdrawn rules, never commit at once.
+    #[test]
+    fn a_block_after_an_overflow_does_not_commit_at_once() {
+        let mut t = T::committing(false, K0);
+        t.compute(K0, DEGRADED);
+        for k in K0 + 1..K0 + CAP as u64 {
+            t.compute(k, Some(HEALTHY));
+            assert!(t.statuses.commit_through(k, 0), "block {k} not held");
+        }
+        t.advance();
+        for k in K0 + 1..K0 + CAP as u64 {
+            assert_eq!(t.kind(k), Some(Kind::Committed), "block {k}");
+        }
+        assert_eq!(t.hold.len(), CAP);
+        let k = K0 + CAP as u64;
+        assert!(t.compute(k, Some(HEALTHY)).withdraw);
+        assert_eq!(t.statuses.get(K0).unwrap().cause, Cause::Overflow);
+        assert_ne!(
+            t.kind(k),
+            Some(Kind::Committed),
+            "the block after the overflowed one committed at once"
+        );
+    }
+
+    /// A stop at P (key hand-over) ends committing at P: the healthy
+    /// blocks before P that wait fenced in the ring still commit once F
+    /// passes them, as does `[kB, P)`.
+    #[test]
+    fn blocks_before_a_stop_commit_once_f_passes() {
+        let mut t = T::committing(false, K0);
+        t.ctx.fence = 0;
+        t.compute(K0, Some(HEALTHY));
+        t.compute(K0 + 1, Some(HEALTHY));
+        let p = (K0 + 2) * B + 10;
+        t.hold.stop_at(p);
+        t.compute(K0 + 2, Some(HEALTHY));
+        t.ctx.fence = u64::MAX;
+        t.advance();
+        for k in [K0, K0 + 1, K0 + 2] {
+            assert_eq!(
+                t.kind(k),
+                Some(Kind::Committed),
+                "block {k} before the stop"
+            );
+        }
+    }
+
+    /// A commit start whose block is skipped (an overrun or a clock step
+    /// withholds it, which withdraws the replica) does not move on to the
+    /// next page boundary by itself: the Named rule waits for a later
+    /// Baseline, Resume for a new reference.
+    #[test]
+    fn a_skipped_commit_start_is_not_moved_to_the_next_page() {
+        // P = 9001 * 1024 lies in block K0 + 21, the next page in K0 + 42.
+        let mut t = T::committing(false, K0 + 1);
+        for k in K0 + 1..K0 + 21 {
+            t.compute(k, Some(HEALTHY));
+        }
+        // K0 + 21 skipped: withheld at the skip, the replica withdrawn.
+        t.withdraw();
+        for k in K0 + 22..K0 + 44 {
+            t.compute(k, Some(HEALTHY));
+            assert_ne!(
+                t.kind(k),
+                Some(Kind::Committed),
+                "block {k} committed at once after the skipped commit start"
+            );
+        }
+    }
+
+    /// A commit start named while the output already commits is not
+    /// latent: a later withdrawal is not undone by it at the next page
+    /// boundary. K0 + 1, withheld before it is computed, leaves no block
+    /// to fill from, so only a commit start could commit K0 + 21.
+    #[test]
+    fn a_withdrawal_is_not_undone_by_an_earlier_commit_start() {
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        t.hold.commit_from(K0 + 1);
+        t.statuses.withhold(K0 + 1, Cause::HoldCap).unwrap();
+        assert!(t.compute(K0 + 1, Some(HEALTHY)).withdraw);
+        t.withdraw();
+        assert_eq!(t.hold.mode(), Mode::Withdrawn);
+        for k in K0 + 2..K0 + 23 {
+            t.compute(k, Some(HEALTHY));
+            assert_ne!(
+                t.kind(k),
+                Some(Kind::Committed),
+                "block {k} committed at once while withdrawn"
+            );
+        }
+    }
+
+    /// What `withhold` returns is what the block ends with: it reports
+    /// nothing for a block whose slot another block's open status holds,
+    /// and that block may then be written.
+    #[test]
+    fn a_block_withhold_reported_withheld_is_never_written() {
+        let mut t = T::committing(false, K0);
+        t.ctx.fence = 0;
+        t.compute(K0, Some(HEALTHY));
+        let st = t.statuses.withhold(K0 + 64, Cause::FenceDeadline);
+        t.ctx.fence = u64::MAX;
+        for k in K0 + 1..=K0 + 64 {
+            t.compute(k, Some(HEALTHY));
+        }
+        // The slot still held K0's open status: nothing was recorded, and
+        // the supervisor was told so.
+        assert_eq!(st, None, "withhold() reported a status it did not record");
+        assert!(t.sink.wrote(K0 + 64));
+    }
+
+    /// A block whose status is `committed` is written: idling an output
+    /// (writer replaced) does not drop committed blocks unwritten.
+    #[test]
+    fn idle_does_not_drop_committed_blocks_unwritten() {
+        let mut t = T::committing(false, K0);
+        t.compute(K0, DEGRADED);
+        t.compute(K0 + 1, Some(HEALTHY));
+        assert!(t.statuses.commit_through(K0 + 1, 0));
+        t.advance();
+        assert_eq!(t.kind(K0 + 1), Some(Kind::Committed));
+        let statuses = &t.statuses;
+        let mut changes = Changes {
+            ring: &mut t.tx,
+            dropped: &t.dropped,
+            output: 0,
+        };
+        t.hold
+            .idle(statuses, &mut changes, &mut t.sink, Cause::Released);
+        assert!(
+            t.sink.wrote(K0 + 1),
+            "block {} reported committed, never written",
+            K0 + 1
+        );
+    }
+
+    /// A withdrawn replica withholds at once only a block with no page
+    /// boundary whose previous block is final without a commit: the block
+    /// right after one this replica committed can be filled, the page
+    /// staying whole on this member.
+    #[test]
+    fn a_block_after_a_committed_one_can_be_filled() {
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        assert_eq!(t.kind(K0), Some(Kind::Committed));
+        t.withdraw();
+        t.compute(K0 + 1, Some(HEALTHY));
+        let st = t.statuses.get(K0 + 1).unwrap();
+        assert_ne!(
+            (st.kind, st.cause),
+            (Kind::Withheld, Cause::Unfillable),
+            "the block after a committed one withheld as unfillable"
+        );
     }
 }
