@@ -170,8 +170,8 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// [`Resolution`] a copy of it gets, from the replicated per-session
     /// tables of committed command ids that snapshots carry; `None` when
     /// this replica has not applied it. A copy of an applied command is a
-    /// [`Resolution::Duplicate`]; one of a superseded or stale command
-    /// resolves as its first copy did, so a client resending a command it
+    /// [`Resolution::Duplicate`]; one of a stale command resolves as its
+    /// first copy did, so a client resending a command it
     /// got no answer for learns what happened to it.
     ///
     /// A session's table is kept as long as a client may resend a command
@@ -217,11 +217,10 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// the leader that resends what it did not get acknowledged in the
     /// same order.
     ///
-    /// A command folded into a later one before it is ordered, such as a
-    /// continuous control coalesced to its latest value, still has its id
-    /// recorded in its session's table, with the revision of the entry
-    /// that carries the later one; otherwise a resend of it is applied
-    /// after the commands that superseded it.
+    /// Commands that share an entry are applied one by one, each with its
+    /// own body: dropping one for a later command on the same value would
+    /// let an older command, such as a resend after [`NotApplied`], undo a
+    /// newer one that the product's own ordering keeps.
     ///
     /// Must resolve in bounded time, with [`NotApplied`] when the command
     /// cannot be ordered, [`Reason::NotCommitable`] while
@@ -268,9 +267,6 @@ pub enum Resolution {
     /// A copy of a command applied already, through any replica: nothing
     /// changed, and the revision is the one its session's table holds.
     Duplicate,
-    /// A later command folded into the same entry replaced its value; so
-    /// does a copy of it.
-    Superseded,
     /// The product refused it as older than what it applied already;
     /// nothing changed, and a copy of it resolves so as well.
     Stale,
