@@ -253,8 +253,28 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// ([`crate::ws::Sessions::live`]): it answered a ping sent within the
     /// last second, not counting up to [`crate::ws::MAX_PAUSE_TOTAL`] in
     /// which it was not read ([`crate::ws::serve_client`]), which takes a
-    /// round trip below 750 ms; not called when there are none. Must not
-    /// block: the renewal is passed on to the replication mechanism.
+    /// round trip below 750 ms; not called when there are none. A new
+    /// connection is live from its upgrade, so its session is in the next
+    /// call. Must not block: the renewal is passed on to the replication
+    /// mechanism.
+    ///
+    /// A session whose client is gone is renewed for up to
+    /// [`crate::ws::PONG_TIMEOUT`] plus [`crate::ws::MAX_PAUSE_TOTAL`], 7 s,
+    /// after the last ping it answered was sent, so what it holds under its
+    /// lease lasts that plus the lease: up to 9 s with the 2 s lease of the
+    /// replication this crate is sized for.
+    ///
+    /// The session's lifetime ends when the implementation ends its lease,
+    /// on every replica at the same point of the state's history: a lease
+    /// renewed again before the expiry is applied ends nothing. The
+    /// implementation tells the product then, which keeps the ordering
+    /// state of the session's commands, such as the last sequence number
+    /// applied per target ([`Resolution::Stale`]), for the lifetime plus the
+    /// retention of the session's table of command ids
+    /// ([`ReplicatedState::command_resolution`]) plus the longest a client
+    /// resends a command after it first sent it, counted the same way: a
+    /// copy of a command can apply that late after the original, and with
+    /// the ordering state dropped it could undo a later command.
     fn renew_sessions(&self, live: &[Owner]);
 }
 
