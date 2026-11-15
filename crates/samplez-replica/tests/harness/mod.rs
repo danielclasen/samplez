@@ -29,9 +29,9 @@ use openraft::raft::{
 use openraft::{BasicNode, Raft, ServerState};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
-use samplez_replica::state_machine::{Effect, Product};
+use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
-use samplez_service::{Owner, Role};
+use samplez_service::{Owner, ReplicatedState, Role};
 use tokio::time::Instant;
 
 pub const RATE: u64 = 48_000;
@@ -62,7 +62,24 @@ impl Product for Paths {
         self.values.insert(path.clone(), (value.clone(), seq));
         Effect::Changed(format!("{path}={value}"))
     }
-    fn expire(&mut self, _session: &SessionKey) {}
+    fn expire(&mut self, _session: &SessionKey) -> Effect {
+        Effect::Unchanged
+    }
+    fn delta(&self, changes: &[Changed<'_>]) -> String {
+        // Later wins per path; every command that changed something is an
+        // origin, a server-side change none.
+        let mut values = BTreeMap::new();
+        let mut origins = Vec::new();
+        for changed in changes {
+            let (path, value) = changed.change.split_once('=').expect("path=value");
+            values.insert(path, value);
+            if let Some((origin, id)) = changed.command {
+                origins.push(format!("{}/{id}", origin.session));
+            }
+        }
+        let values: Vec<String> = values.iter().map(|(p, v)| format!("{p}={v}")).collect();
+        format!("{} from {}", values.join(","), origins.join(","))
+    }
     fn text(&self) -> String {
         serde_json::to_string(&self.values).expect("encodes")
     }
@@ -396,17 +413,18 @@ impl Set {
         std::fs::remove_dir_all(self.root.join(id.to_string())).expect("wipes");
     }
 
-    /// Waits until every running replica applied `index`.
-    pub async fn applied(&self, index: u64) {
+    /// Waits until every running replica applied product revision
+    /// `revision`.
+    pub async fn applied(&self, revision: u64) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while self
             .replicas
             .values()
-            .any(|r| r.store().applied_index() < index)
+            .any(|r| ReplicatedState::revision(&**r) < revision)
         {
             assert!(
                 Instant::now() < deadline,
-                "index {index} not applied within 30 s"
+                "revision {revision} not applied within 30 s"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

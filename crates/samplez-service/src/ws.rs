@@ -222,7 +222,9 @@ pub struct Delta {
     /// The revision of the delta before this one in the same epoch, 0 for
     /// the first.
     pub prev: u64,
-    /// The id of the command that caused it; the text echoes it.
+    /// The id of the command that caused it, when one did; the text echoes
+    /// it. `None` for a delta of several commands' changes, or of a change
+    /// no command made, such as a lease expiry.
     pub command: Option<String>,
     pub text: Utf8Bytes,
 }

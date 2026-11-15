@@ -302,29 +302,43 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         self.settings.epoch
     }
 
+    /// The product revision ([`state_machine::StateMachine::revision`]), not the log
+    /// index: a client checks that each delta follows the one before.
     fn revision(&self) -> u64 {
-        self.store.applied_index()
+        self.store.with_state(|sm| sm.revision)
     }
 
-    /// The leader's read index, confirmed by a round of heartbeats to a
-    /// majority. A follower answers `None` at once, judged by its own state:
-    /// openraft 0.9.21's check answered a follower's call in the replica
-    /// tests. Nothing is forwarded to the leader yet.
+    /// The product revision once the leader's read index, the log index
+    /// a round of heartbeats to a majority confirms, is applied here. A
+    /// follower answers `None` at once, judged by its own state: openraft
+    /// 0.9.21's check answered a follower's call in the replica tests.
+    /// Nothing is forwarded to the leader yet.
     fn read_index(&self) -> BoxFuture<'_, Option<u64>> {
         Box::pin(async move {
             if self.raft.metrics().borrow().state != ServerState::Leader {
                 return None;
             }
             let (read, _) = self.raft.get_read_log_id().await.ok()?;
-            Some(read.map_or(0, |id| id.index))
+            if let Some(read) = read {
+                self.raft
+                    .wait(None)
+                    .applied_index_at_least(Some(read.index), "read index")
+                    .await
+                    .ok()?;
+            }
+            Some(self.revision())
         })
     }
 
     fn applied(&self, revision: u64) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            let wait = self.raft.wait(None);
-            if wait
-                .applied_index_at_least(Some(revision), "applied")
+            // Metrics change with every entry applied, after the state
+            // machine took it.
+            let applied = |_: &_| self.revision() >= revision;
+            if self
+                .raft
+                .wait(None)
+                .metrics(applied, "applied")
                 .await
                 .is_err()
             {
@@ -335,9 +349,9 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     }
 
     fn snapshot(&self) -> BoxFuture<'_, Snapshot> {
-        let snapshot = self.store.view(|revision, sm| Snapshot {
+        let snapshot = self.store.with_state(|sm| Snapshot {
             epoch: self.settings.epoch,
-            revision,
+            revision: sm.revision,
             text: sm.product.text().into(),
         });
         Box::pin(async move { snapshot })
@@ -345,9 +359,9 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
 
     fn deltas_since(&self, since: Position) -> BoxFuture<'_, Option<Vec<Delta>>> {
         let epoch = self.settings.epoch;
-        let deltas = self.store.view(|revision, sm| {
+        let deltas = self.store.with_state(|sm| {
             if since.epoch != epoch || since.revision < sm.deltas_after {
-                return if since.epoch == epoch && since.revision >= revision {
+                return if since.epoch == epoch && since.revision >= sm.revision {
                     Some(Vec::new())
                 } else {
                     None
@@ -361,7 +375,10 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                         epoch,
                         revision: change.revision,
                         prev: change.prev,
-                        command: Some(change.command.clone()),
+                        command: match &change.commands[..] {
+                            [one] => Some(one.clone()),
+                            _ => None,
+                        },
                         text: change.text.clone().into(),
                     })
                     .collect(),

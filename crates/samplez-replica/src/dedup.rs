@@ -1,8 +1,8 @@
 //! The replicated tables of applied command ids.
 //!
 //! Keyed by (principal, session, XXH3-128 of the client's id), each record
-//! holds the revision of the entry that carried the command, how the
-//! command resolved and that entry's stamping index. Every change happens in state-machine apply, in
+//! holds the product revision the command resolved at, how it resolved
+//! and the stamping index of the entry that carried it. Every change happens in state-machine apply, in
 //! apply order, and every container is ordered, so every replica and every
 //! snapshot install holds the same table.
 
@@ -108,17 +108,22 @@ impl Dedup {
     }
 
     /// Sets how the command just recorded resolved, which its record holds
-    /// as applied until then.
-    pub fn resolve(&mut self, session: &SessionKey, id: &str, resolution: Resolution) {
+    /// as applied until then, and the revision it resolved at.
+    pub fn resolve(
+        &mut self,
+        session: &SessionKey,
+        id: &str,
+        resolution: Resolution,
+        revision: u64,
+    ) {
         if let Some(seq) = self
             .sessions
             .get(session)
             .and_then(|ids| ids.get(&hash_id(id)))
         {
-            self.records
-                .get_mut(seq)
-                .expect("indexed record")
-                .resolution = resolution;
+            let record = self.records.get_mut(seq).expect("indexed record");
+            record.resolution = resolution;
+            record.revision = revision;
         }
     }
 

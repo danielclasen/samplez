@@ -29,9 +29,8 @@ pub struct Replicated {
     /// Each session's last renewal, in session order: JSON keys are
     /// strings only.
     pub leases: Vec<(SessionKey, u64)>,
-    /// The revision of the last product delta, which the next one names
-    /// as its `prev`.
-    pub last_change: u64,
+    /// The product revision ([`crate::state_machine::StateMachine::revision`]).
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
