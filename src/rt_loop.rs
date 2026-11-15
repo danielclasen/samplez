@@ -847,26 +847,6 @@ impl Rt {
             .store(self.mix.consumed, Release);
         let ramping = self.mix.ramping(k);
         self.mix.matrix.process(&self.inbuf, &mut self.outbuf, b);
-        while let Ok(r) = self.resets.pop() {
-            self.outs[r.output].meter.reset_at = Some(r.at_index.div_ceil(WINDOW) * WINDOW);
-        }
-        // Every computed block is metered, written or not: the meters
-        // follow the engine's output, not a flow's state.
-        for (o, out) in self.outs.iter_mut().enumerate() {
-            let mut sink = MeterSink {
-                output: o as u32,
-                ring: &mut self.meters,
-                seq: &mut self.meter_seq,
-                counters: &self.counters,
-            };
-            out.meter.add(
-                &mut sink,
-                out.first_channel,
-                &self.outbuf,
-                k * self.block,
-                b,
-            );
-        }
 
         let mut written = 0u64;
         for (o, out) in self.outs.iter_mut().enumerate() {
@@ -885,6 +865,28 @@ impl Rt {
                 Write::Held => add(&self.counters.output_held_blocks, 1),
                 Write::Failed(_) => add(&self.counters.output_failed_writes, 1),
             }
+        }
+
+        while let Ok(r) = self.resets.pop() {
+            self.outs[r.output].meter.reset_at = Some(r.at_index.div_ceil(WINDOW) * WINDOW);
+        }
+        // Every computed block is metered, written or not: the meters
+        // follow the engine's output, not a flow's state. After the
+        // writes, since nothing written depends on them.
+        for (o, out) in self.outs.iter_mut().enumerate() {
+            let mut sink = MeterSink {
+                output: o as u32,
+                ring: &mut self.meters,
+                seq: &mut self.meter_seq,
+                counters: &self.counters,
+            };
+            out.meter.add(
+                &mut sink,
+                out.first_channel,
+                &self.outbuf,
+                k * self.block,
+                b,
+            );
         }
 
         let done = time::now(&self.api);
