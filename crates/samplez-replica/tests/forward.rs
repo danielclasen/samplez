@@ -3,16 +3,29 @@
 
 mod harness;
 
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Bytes;
+use axum::extract::ws::Message;
 use harness::{Options, Set, owner};
 use samplez_replica::entry::{Body, Command, Origin, SessionKey};
 use samplez_replica::peer::{Forwarded, PeerRequest, PeerResponse, Refused};
-use samplez_replica::{Freshness, MAX_COMMAND_BYTES, MAX_ENTRY_BYTES};
-use samplez_service::ReplicatedState;
+use samplez_replica::{MAX_COMMAND_BYTES, MAX_ENTRY_BYTES};
 use samplez_service::replica::{Reason, Resolution};
+use samplez_service::ws::{Answer, CatchUp, ClientQueue, Encode, Reply, Sessions, serve_client};
+use samplez_service::{Connect, Identity, Position, ReadIndex, ReplicatedState, Role};
 use tokio::time::Instant;
+
+async fn set(replica: &impl ReplicatedState, session: &str, id: &str, command: &str) -> u64 {
+    replica
+        .submit(&owner(session), id, Bytes::from(command.to_owned()))
+        .await
+        .expect("committed")
+        .revision
+}
 
 fn others(set_: &Set, of: u64) -> Vec<u64> {
     set_.ids().filter(|&id| id != of).collect()
@@ -84,8 +97,8 @@ async fn a_command_sent_to_a_follower_is_forwarded_with_its_owner() {
 }
 
 /// Without a quorum writes are refused 503 within the write timeout and
-/// reads get the local state marked stale at once; once the quorum is
-/// back both work again.
+/// the read index is cut off at once, so a reader gets the local state
+/// marked stale without waiting; once the quorum is back both work again.
 #[tokio::test(start_paused = true)]
 async fn quorum_loss_refuses_writes_and_serves_stale_reads_until_it_returns() {
     let set_ = Set::start(Options::default()).await;
@@ -98,8 +111,8 @@ async fn quorum_loss_refuses_writes_and_serves_stale_reads_until_it_returns() {
         .expect("committed");
     set_.applied(before.revision).await;
     assert_eq!(
-        set_.replica(follower).read(Duration::from_secs(2)).await,
-        Freshness::Current
+        set_.replica(follower).read_index().await,
+        ReadIndex::Confirmed(before.revision)
     );
 
     // Links that drop what they carry: a read that asked for a read
@@ -113,7 +126,7 @@ async fn quorum_loss_refuses_writes_and_serves_stale_reads_until_it_returns() {
         let replica = set_.replica(id);
         assert!(!replica.quorum().await, "replica {id}");
         let asked = Instant::now();
-        assert_eq!(replica.read(Duration::from_secs(2)).await, Freshness::Stale);
+        assert_eq!(replica.read_index().await, ReadIndex::CutOff);
         assert_eq!(asked.elapsed(), Duration::ZERO, "replica {id}: no wait");
         assert_eq!(replica.revision(), before.revision, "the local state");
         let refused = replica
@@ -134,9 +147,10 @@ async fn quorum_loss_refuses_writes_and_serves_stale_reads_until_it_returns() {
     for id in set_.ids() {
         let replica = set_.replica(id);
         assert!(replica.quorum().await, "replica {id}");
-        assert_eq!(
-            replica.read(Duration::from_secs(2)).await,
-            Freshness::Current
+        let read = replica.read_index().await;
+        assert!(
+            matches!(read, ReadIndex::Confirmed(r) if r >= after.revision),
+            "replica {id}: {read:?}"
         );
         assert!(replica.revision() >= after.revision, "replica {id}");
     }
@@ -474,4 +488,126 @@ async fn quiesce_waits_for_a_proposal_that_raced_its_flag() {
         let matched = metrics.replication.as_ref().unwrap()[&id];
         assert!(matched.is_some_and(|m| m.index >= ack.revision), "{id}");
     }
+}
+
+/// A WebSocket made of two channels.
+struct ChannelSocket {
+    to_client: tokio::sync::mpsc::UnboundedSender<Message>,
+    from_client: tokio::sync::mpsc::UnboundedReceiver<Result<Message, ()>>,
+}
+
+impl futures_util::Stream for ChannelSocket {
+    type Item = Result<Message, ()>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.from_client.poll_recv(cx)
+    }
+}
+
+impl futures_util::Sink<Message> for ChannelSocket {
+    type Error = ();
+    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), ()> {
+        self.to_client.send(item).map_err(|_| ())
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Answers as `resume <revision> <stale>`, `snapshot <revision> <stale>`
+/// or `ahead`.
+struct Wire;
+
+impl Encode for Wire {
+    fn ping(&mut self, t: u64) -> Message {
+        Message::Text(format!("ping {t}").into())
+    }
+
+    fn answer(&mut self, answer: Answer) -> Vec<Message> {
+        let text = match answer {
+            Answer::Resume {
+                revision, stale, ..
+            } => format!("resume {revision} {stale}"),
+            Answer::Snapshot { snapshot, stale } => {
+                format!("snapshot {} {stale}", snapshot.revision)
+            }
+            Answer::Ahead { .. } => "ahead".into(),
+        };
+        vec![Message::Text(text.into())]
+    }
+}
+
+/// A client reconnecting to a follower that has not applied the leader's
+/// latest write yet is answered, unmarked, with that write: the follower
+/// takes the read index from its leader and applies up to it first.
+#[tokio::test(start_paused = true)]
+async fn a_follower_catches_a_client_up_to_what_its_leader_committed() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let [slow, _] = others(&set_, leader)[..] else {
+        unreachable!()
+    };
+    let replica = set_.replica(slow).clone();
+    let seen = set(&*replica, "s", "1", "gain=1@1").await;
+    set_.applied(seen).await;
+    set_.net.stall(slow, Duration::from_millis(40));
+    let committed = set(&**set_.replica(leader), "s", "2", "gain=2@2").await;
+    assert!(replica.revision() < committed, "the follower lags");
+
+    let (to_client, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (send, from_client) = tokio::sync::mpsc::unbounded_channel();
+    let socket = ChannelSocket {
+        to_client,
+        from_client,
+    };
+    let sessions = Arc::new(Sessions::new("r1").expect("a replica id"));
+    let connect = Connect {
+        identity: Identity {
+            user: None,
+            role: Role::Operator,
+        },
+        owner: owner("c"),
+        sessions,
+    };
+    let queue = ClientQueue::new(16);
+    let since = Position {
+        epoch: replica.epoch(),
+        revision: seen,
+    };
+    send.send(Ok(Message::Text("sync".into()))).unwrap();
+    let served = serve_client(
+        socket,
+        &connect,
+        &queue,
+        &*replica,
+        Wire,
+        |message, _| match message {
+            Message::Text(t) if t.as_str() == "sync" => Reply::CatchUp(CatchUp {
+                since: Some(since),
+                full: false,
+            }),
+            _ => Reply::<std::future::Ready<Option<Message>>>::Now(None),
+        },
+    );
+    let answered = async {
+        loop {
+            match received.recv().await {
+                Some(Message::Text(t)) if !t.as_str().starts_with("ping") => {
+                    break t.as_str().to_owned();
+                }
+                Some(_) => {}
+                None => panic!("the connection ended"),
+            }
+        }
+    };
+    let answer = tokio::select! {
+        answer = answered => answer,
+        ended = served => panic!("ended: {ended:?}"),
+    };
+    assert_eq!(answer, format!("resume {committed} false"));
 }

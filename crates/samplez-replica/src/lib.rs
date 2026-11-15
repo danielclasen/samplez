@@ -98,6 +98,10 @@ pub struct Settings {
     pub addr: String,
 }
 
+/// The longest a follower waits for its leader's read index before it
+/// answers [`ReadIndex::NotLeader`].
+pub const READ_INDEX_ASK: Duration = Duration::from_secs(1);
+
 /// This replica's estimate E of the set's processed index, in samples.
 pub type Estimate = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -124,15 +128,6 @@ enum Queued {
     },
 }
 
-/// Whether a read sees every write committed before it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Freshness {
-    /// Applied up to the leader's read index.
-    Current,
-    /// The locally applied state: no quorum, or no read index in time.
-    Stale,
-}
-
 /// What the writer and the peer handlers share.
 pub(crate) struct Shared {
     settings: Settings,
@@ -147,6 +142,8 @@ pub(crate) struct Shared {
     quiescing: AtomicBool,
     /// Proposals between the leadership check and openraft's answer.
     proposing: AtomicUsize,
+    /// The product revision this replica applied.
+    revision: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
 /// Counts a proposal while it lives.
@@ -220,6 +217,10 @@ impl<P: Product> Replica<P> {
             heartbeat: Duration::from_millis(raft_config.heartbeat_interval),
             quiescing: AtomicBool::new(false),
             proposing: AtomicUsize::new(0),
+            revision: {
+                let store = store.clone();
+                Box::new(move || store.with_state(|sm| sm.revision))
+            },
         });
         let (queue, queued) = mpsc::unbounded_channel();
         tokio::spawn(write(shared.clone(), queued, estimate.clone()));
@@ -275,37 +276,6 @@ impl<P: Product> Replica<P> {
     /// within the lease; else its leader's last append arrived within it.
     pub async fn quorum(&self) -> bool {
         self.shared.quorum().await
-    }
-
-    /// Waits up to `within` until this replica applied every write
-    /// committed before the call, and says whether it did. Without a
-    /// quorum it answers [`Freshness::Stale`] at once, so a reader never
-    /// waits on a set that cannot answer.
-    pub async fn read(&self, within: Duration) -> Freshness {
-        let shared = &self.shared;
-        if !shared.quorum().await {
-            return Freshness::Stale;
-        }
-        let index = async {
-            if shared.leads() {
-                let (read, _) = shared.raft.get_read_log_id().await.ok()?;
-                return Some(read.map_or(0, |id| id.index));
-            }
-            let (leader, addr) = shared.leader()?;
-            match shared
-                .peers
-                .call(Some(leader), &addr, PeerRequest::ReadIndex, within)
-                .await
-            {
-                Ok(Ok(PeerResponse::ReadIndex(index))) => Some(index),
-                _ => None,
-            }
-        };
-        let deadline = Instant::now() + within;
-        match tokio::time::timeout_at(deadline, index).await {
-            Ok(Some(index)) if shared.applied(index, deadline).await => Freshness::Current,
-            _ => Freshness::Stale,
-        }
     }
 
     /// For a voter's preStop. Stops ordering commands: forwarded ones are
@@ -504,14 +474,46 @@ impl Shared {
         }
     }
 
-    /// Waits until this replica applied `index`; false at `deadline`.
-    async fn applied(&self, index: u64, deadline: Instant) -> bool {
+    /// Waits until this replica applied product revision `revision`;
+    /// false at `deadline`. Metrics change with every entry applied, after
+    /// the state machine took it.
+    async fn applied(&self, revision: u64, deadline: Instant) -> bool {
         let within = deadline.saturating_duration_since(Instant::now());
         self.raft
             .wait(Some(within))
-            .applied_index_at_least(Some(index), "applied")
+            .metrics(|_| (self.revision)() >= revision, "applied")
             .await
             .is_ok()
+    }
+
+    /// The log index a read must have applied to see every write
+    /// committed before it: the leader's, confirmed by a round of
+    /// heartbeats to a majority; a follower asks its leader for it. The
+    /// error is what a reader is told instead.
+    async fn read_log_index(&self) -> Result<u64, ReadIndex> {
+        if !self.quorum().await {
+            return Err(ReadIndex::CutOff);
+        }
+        if self.raft.metrics().borrow().state == ServerState::Leader {
+            return match self.raft.get_read_log_id().await {
+                Ok((read, _)) => Ok(read.map_or(0, |id| id.index)),
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))
+                    if forward.leader_id.is_some() =>
+                {
+                    Err(ReadIndex::NotLeader)
+                }
+                Err(_) => Err(ReadIndex::CutOff),
+            };
+        }
+        let (leader, addr) = self.leader().ok_or(ReadIndex::CutOff)?;
+        let asked = self
+            .peers
+            .call(Some(leader), &addr, PeerRequest::ReadIndex, READ_INDEX_ASK)
+            .await;
+        match asked {
+            Ok(Ok(PeerResponse::ReadIndex(index))) => Ok(index),
+            _ => Err(ReadIndex::NotLeader),
+        }
     }
 
     /// Orders an entry: appends it as leader, else forwards it to the
@@ -822,31 +824,26 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         self.store.with_state(|sm| sm.revision)
     }
 
-    /// The product revision once the leader's read index, the log index
-    /// a round of heartbeats to a majority confirms, is applied here.
-    /// openraft refuses the check on a follower: one that knows a leader is
-    /// [`ReadIndex::NotLeader`], one that knows none, or a leader without a
-    /// majority, [`ReadIndex::CutOff`]. Nothing is forwarded to the leader
-    /// yet.
+    /// The product revision once a leader-confirmed read index, the log
+    /// index a round of heartbeats to a majority confirms, is applied
+    /// here. A follower asks its leader for one over the peer listener.
+    /// Without a quorum, or a leader without a majority, it is
+    /// [`ReadIndex::CutOff`] at once. A follower whose leader does not
+    /// answer, and a deposed leader that knows its successor, are
+    /// [`ReadIndex::NotLeader`].
     fn read_index(&self) -> BoxFuture<'_, ReadIndex> {
         Box::pin(async move {
-            let read = match self.shared.raft.get_read_log_id().await {
-                Ok((read, _)) => read,
-                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))
-                    if forward.leader_id.is_some() =>
-                {
-                    return ReadIndex::NotLeader;
-                }
-                Err(_) => return ReadIndex::CutOff,
+            let index = match self.shared.read_log_index().await {
+                Ok(index) => index,
+                Err(answer) => return answer,
             };
-            if let Some(read) = read
-                && self
-                    .shared
-                    .raft
-                    .wait(None)
-                    .applied_index_at_least(Some(read.index), "read index")
-                    .await
-                    .is_err()
+            if self
+                .shared
+                .raft
+                .wait(None)
+                .applied_index_at_least(Some(index), "read index")
+                .await
+                .is_err()
             {
                 return ReadIndex::CutOff;
             }

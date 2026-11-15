@@ -199,11 +199,7 @@ impl Set {
 
     async fn applied(&self, index: u64) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while self
-            .nodes
-            .values()
-            .any(|n| n.replica.store().applied_index() < index)
-        {
+        while self.nodes.values().any(|n| n.replica.revision() < index) {
             assert!(Instant::now() < deadline, "{index} not applied in 10 s");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -300,6 +296,12 @@ async fn a_snapshot_is_installed_over_the_peer_listener() {
             .revision;
     }
     set.applied(last).await;
+    // `last` is a product revision; snapshots and purges count log ids.
+    let log = |node: &Node| {
+        let applied = node.replica.raft().metrics().borrow().last_applied;
+        applied.map_or(0, |id| id.index)
+    };
+    let upto = set.nodes.values().map(log).min().unwrap();
     // On every running replica, so whichever leads after the restart
     // holds no entry the follower lacks.
     for node in set.nodes.values() {
@@ -309,16 +311,16 @@ async fn a_snapshot_is_installed_over_the_peer_listener() {
             .metrics()
             .borrow()
             .snapshot
-            .is_none_or(|id| id.index < last)
+            .is_none_or(|id| id.index < upto)
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        raft.trigger().purge_log(last).await.unwrap();
+        raft.trigger().purge_log(upto).await.unwrap();
         while raft
             .metrics()
             .borrow()
             .purged
-            .is_none_or(|id| id.index < last)
+            .is_none_or(|id| id.index < upto)
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
