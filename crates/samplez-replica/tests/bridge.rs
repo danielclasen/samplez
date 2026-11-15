@@ -155,3 +155,23 @@ fn an_unresolved_entry_the_engine_has_no_room_for_is_refused() {
         "{given} unresolved entries taken: the engine has room for a bounded number"
     );
 }
+
+#[test]
+fn a_block_without_a_status_word_is_reported_withheld() {
+    use samplez::blocks::{Cause, Kind};
+    let domain = Domain::new();
+    // No commit start: the output's blocks take no status word.
+    let (engine, audio) = bridge(&domain, 1 << 16);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    let sample = audio.sample();
+    let processed = sample.own.processed.unwrap();
+    assert_eq!(engine.block_status(0, processed), None);
+    let reported = status_of(&sample.own.statuses[0], processed).expect("reported");
+    assert_eq!(
+        (reported.kind, reported.cause),
+        (Kind::Withheld, Cause::Skip)
+    );
+}

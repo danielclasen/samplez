@@ -1502,10 +1502,11 @@ mod tests {
         f.tick();
         f.clock.step.store(1, Ordering::SeqCst);
         f.contact.receive(f.report(2, None));
-        // The engine detects a step at the clock's next read: the report's
-        // own timestamp comes before it, so its flags may say nothing yet;
-        // a report built after it must carry the flag.
-        f.engine.step_at.store(f.clock.get() + 1, Ordering::SeqCst);
+        // The engine detects a step two reads on: after the period's own
+        // timestamp and its sample of the engine, so the first report's
+        // flags say nothing yet and none of its timestamps may postdate
+        // the step.
+        f.engine.step_at.store(f.clock.get() + 2, Ordering::SeqCst);
         for _ in 0..3 {
             let (_, _, r) = f.tick().pop().unwrap();
             let step_at = f.engine.step_at.load(Ordering::SeqCst);
