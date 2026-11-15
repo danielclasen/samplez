@@ -930,7 +930,9 @@ impl Rt {
             s.head = 0;
             s.frozen_late_blocks = 0;
             s.invalid = false;
-            slot.xfade = (on_time && !slot.silenced_last).then_some(e.at_index);
+            // Anchored at the index whatever the slot's last block was:
+            // an outgoing flow that is silent fades the new one in.
+            slot.xfade = on_time.then_some(e.at_index);
         }
         self.send(Telemetry::GenerationDone {
             id: e.id,
