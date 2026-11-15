@@ -35,7 +35,8 @@ use crate::Error;
 use crate::replica::{Owner, Position, ReadIndex, ReplicatedState};
 use crate::server::Connect;
 
-/// How often [`serve_client`] pings.
+/// How often [`serve_client`] pings, from the client's first [`CatchUp`]
+/// on.
 pub const PING_PERIOD: Duration = Duration::from_millis(250);
 /// [`serve_client`] closes a connection that has answered no ping sent in
 /// this long, and only connections that answered one are renewed
@@ -709,9 +710,9 @@ pub enum Ended {
     /// The client closed the connection or the stream ended.
     Closed,
     /// No ping sent within [`PONG_TIMEOUT`] answered, not counting the time
-    /// the connection was not read; a close frame
-    /// was sent. A round trip of `PONG_TIMEOUT - PING_PERIOD` or more ends a
-    /// connection this way.
+    /// the connection was not read, or no [`CatchUp`] read within it of the
+    /// connection being accepted; a close frame was sent. A round trip of
+    /// `PONG_TIMEOUT - PING_PERIOD` or more ends a connection this way.
     PongTimeout,
     /// Sending or receiving failed, a send did not finish within
     /// [`PONG_TIMEOUT`] of sending the last ping answered, counted the same
@@ -836,10 +837,15 @@ async fn send<T: Sink<Message> + Unpin>(
 
 /// Serves one client until it closes, fails, stops answering pings or the
 /// state's epoch changes: sends a ping made by `encode` every
-/// [`PING_PERIOD`], keeps the connection in `connect.sessions` while it
+/// [`PING_PERIOD`] from the client's first [`CatchUp`] on, its hello in the
+/// product's protocol, keeps the connection in `connect.sessions` while it
 /// answers, passes each text and binary message to `on_message` and acts on
 /// what it returns, answers each [`CatchUp`] (see the module docs) and then
 /// sends what `queue` holds. Subscribe `queue` before calling.
+///
+/// The first [`CatchUp`] has to be read within [`PONG_TIMEOUT`] of the
+/// connection being accepted, and counts as the answer to a ping sent when
+/// it is read; the first ping goes out with it.
 ///
 /// `on_message` is called for each message in the order received, with
 /// whether the product may submit a command now ([`Admission`]). The
@@ -972,6 +978,8 @@ where
         // The pings not answered yet: the `t` each carries, when it was
         // sent, and the time not read until then.
         let mut pings: VecDeque<(u64, Instant, Duration)> = VecDeque::new();
+        // Set by the first catch-up request, before which nothing pings.
+        let mut pinging = false;
         // Since when the connection is not read, and when it ends unless
         // read again.
         let mut paused: Option<(Instant, Instant)> = None;
@@ -1041,6 +1049,9 @@ where
                         let _ = send(&mut tx, Message::Close(None), deadline).await;
                         return Ended::EpochChanged;
                     }
+                    if !pinging {
+                        continue;
+                    }
                     let unread = paused_since.map_or(Duration::ZERO, |since| since.elapsed());
                     let ms = u64::try_from(accepted.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let t = pings.back().map_or(ms, |&(last, _, _)| ms.max(last + 1));
@@ -1072,6 +1083,14 @@ where
                             Vec::new()
                         }
                         Reply::CatchUp(request) => {
+                            if !pinging {
+                                // Read now, so not paused.
+                                pinging = true;
+                                answered = Instant::now();
+                                paused_before = Duration::ZERO;
+                                sessions.answered(owner, answered);
+                                ping.reset_immediately();
+                            }
                             catching_up = Some((Box::pin(answer(state, request)), true));
                             Vec::new()
                         }

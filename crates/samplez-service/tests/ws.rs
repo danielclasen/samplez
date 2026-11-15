@@ -948,6 +948,50 @@ async fn pings_are_the_products_with_the_time_since_the_connection_opened() {
     client.silent().await;
 }
 
+/// No ping goes out before the client's first catch-up request, its hello:
+/// the product's protocol has the client identify itself first. The first
+/// ping goes out with the request, and they follow every ping period.
+#[tokio::test(start_paused = true)]
+async fn pings_start_with_the_first_catch_up() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(client.rx.try_recv().is_err(), "a ping before the hello");
+    client.tx.send(sync(None)).unwrap();
+    let (mut ts, mut others) = (Vec::new(), Vec::new());
+    while ts.len() < 3 {
+        let m = client.rx.recv().await.expect("serving");
+        match ping_of(&m) {
+            Some(t) => {
+                client.tx.send(pong(t)).unwrap();
+                ts.push(t);
+            }
+            None => others.push(m),
+        }
+    }
+    assert_eq!(ts, [600, 850, 1100]);
+    assert_eq!(others, [Message::Text("snapshot@7:0".into())]);
+    assert_eq!(sessions.live().len(), 1);
+}
+
+/// A client that never asks to catch up is sent nothing and closed once
+/// [`PONG_TIMEOUT`] passed since it was accepted, as one that stops
+/// answering pings is.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_sends_no_catch_up_is_closed_after_the_pong_timeout() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
+    let start = Instant::now();
+    assert_eq!(client.ended().await, Ended::PongTimeout);
+    assert_eq!(start.elapsed(), PONG_TIMEOUT);
+    assert_eq!(client.rx.recv().await, Some(Message::Close(None)));
+    assert!(sessions.live().is_empty());
+}
+
 /// The bursts below run without an await, so the client cannot drain the
 /// two-delta queue in between.
 #[tokio::test(start_paused = true)]
@@ -1577,12 +1621,14 @@ async fn a_client_answering_every_third_ping_stays_connected() {
 /// Answers every ping `delay` after it was sent, for 4 s or until the
 /// connection is closed: how it ended and when, if it did, and whether it
 /// was live throughout.
-async fn pongs_delayed_by(delay: Duration) -> (Option<(Ended, Duration)>, bool) {
+async fn pongs_delayed_by(hello: Duration, delay: Duration) -> (Option<(Ended, Duration)>, bool) {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
     let start = Instant::now();
+    tokio::time::sleep(hello).await;
+    client.tx.send(sync(None)).unwrap();
     let mut always_live = true;
     while start.elapsed() < 4 * PONG_TIMEOUT {
         match tokio::time::timeout(Duration::from_millis(50), client.rx.recv()).await {
@@ -1611,9 +1657,24 @@ async fn pongs_delayed_by(delay: Duration) -> (Option<(Ended, Duration)>, bool) 
 async fn the_round_trip_has_to_stay_below_the_pong_timeout_less_a_ping_period() {
     let ceiling = PONG_TIMEOUT - PING_PERIOD;
     let margin = Duration::from_millis(50);
-    assert_eq!(pongs_delayed_by(ceiling - margin).await, (None, true));
-    let (ended, _) = pongs_delayed_by(ceiling + margin).await;
+    let hello = Duration::ZERO;
+    assert_eq!(
+        pongs_delayed_by(hello, ceiling - margin).await,
+        (None, true)
+    );
+    let (ended, _) = pongs_delayed_by(hello, ceiling + margin).await;
     assert_eq!(ended, Some((Ended::PongTimeout, PONG_TIMEOUT)));
+}
+
+/// The pong timeout counts from the hello, as no ping went out before it:
+/// a client whose hello is read just inside it keeps the connection, and
+/// stays live, with the slowest round trip allowed.
+#[tokio::test(start_paused = true)]
+async fn a_late_hello_has_the_whole_pong_timeout_for_its_first_pong() {
+    let margin = Duration::from_millis(50);
+    let hello = PONG_TIMEOUT - 2 * margin;
+    let slowest = PONG_TIMEOUT - PING_PERIOD - margin;
+    assert_eq!(pongs_delayed_by(hello, slowest).await, (None, true));
 }
 
 /// Yields what the client sends and takes messages at once, except
@@ -2255,16 +2316,23 @@ async fn the_owner_carries_the_principal_and_role_from_the_proxy() {
     server.abort();
 }
 
-/// Takes the first message, then never accepts another and never yields
-/// one: the connection stays open while the server is stuck sending.
+/// Yields a catch-up request, takes the first message, then never accepts
+/// another and never yields one: the connection stays open while the
+/// server is stuck sending.
 struct StuckSocket {
     sent: usize,
+    synced: bool,
 }
 
 impl Stream for StuckSocket {
     type Item = Result<Message, ()>;
-    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Pending
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.synced {
+            Poll::Pending
+        } else {
+            self.synced = true;
+            Poll::Ready(Some(sync(None)))
+        }
     }
 }
 
@@ -2299,9 +2367,12 @@ async fn a_client_that_stops_reading_ends_one_second_after_it_connected() {
     let task = tokio::spawn({
         let state = state.clone();
         async move {
-            let socket = StuckSocket { sent: 0 };
-            serve_client(socket, &connect, &queue, &*state, Wire, |_, _| {
-                Reply::Command(async { None })
+            let socket = StuckSocket {
+                sent: 0,
+                synced: false,
+            };
+            serve_client(socket, &connect, &queue, &*state, Wire, |m, _| {
+                protocol(&m).unwrap_or(Reply::Command(async { None }))
             })
             .await
         }
