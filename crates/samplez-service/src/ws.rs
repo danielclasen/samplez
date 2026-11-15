@@ -133,6 +133,18 @@ pub enum Reply<Fut> {
     Pong(u64),
 }
 
+/// Whether the product may submit a command [`serve_client`] passes it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Submit,
+    /// The client promoted this connection naming a position the
+    /// replication never committed, and has not taken state since: a
+    /// command now would apply to state older than the one the client saw.
+    /// Answer it not applied, at once and without submitting it, so the
+    /// client sends it again once it has taken the cluster's state.
+    NotApplied,
+}
+
 /// A client's request to catch up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatchUp {
@@ -612,11 +624,11 @@ async fn answer(state: &dyn ReplicatedState, request: CatchUp) -> Answer {
     catch_up(state, request, stale).await
 }
 
-/// Resolves once this replica has applied `revision`, the position of a
-/// promote, or once the read index is confirmed below it: the client holds
-/// state the replication never committed, and the catch-up it sends next is
-/// answered [`Answer::Ahead`] rather than held.
-async fn promote_floor(state: &dyn ReplicatedState, revision: u64) {
+/// Resolves `true` once this replica has applied `revision`, the position
+/// of a promote, or `false` once the read index is confirmed below it: the
+/// client holds state the replication never committed, and the catch-up it
+/// sends next is answered [`Answer::Ahead`] rather than held.
+async fn promote_floor(state: &dyn ReplicatedState, revision: u64) -> bool {
     let below = async {
         match state.read_index().await {
             ReadIndex::Confirmed(committed) if committed < revision => {}
@@ -624,8 +636,8 @@ async fn promote_floor(state: &dyn ReplicatedState, revision: u64) {
         }
     };
     tokio::select! {
-        () = state.applied(revision) => {}
-        () = below => {}
+        () = state.applied(revision) => true,
+        () = below => false,
     }
 }
 
@@ -684,7 +696,8 @@ async fn send<T: Sink<Message> + Unpin>(
 /// what it returns, answers each [`CatchUp`] (see the module docs) and then
 /// sends what `queue` holds. Subscribe `queue` before calling.
 ///
-/// `on_message` is called for each message in the order received. The
+/// `on_message` is called for each message in the order received, with
+/// whether the product may submit a command now ([`Admission`]). The
 /// [`Reply::Command`] replies go out in that order, the first after the
 /// first answer to a [`CatchUp`], and none while a catch-up after a gap or
 /// a full delta queue is under way; a [`Reply::Now`] goes out at once. The
@@ -720,7 +733,10 @@ async fn send<T: Sink<Message> + Unpin>(
 /// # use axum::body::Bytes;
 /// # use axum::extract::ws::{Message, WebSocket};
 /// # use samplez_service::replica::{Begin, Commands};
-/// # use samplez_service::ws::{Answer, CatchUp, ClientQueue, Encode, Ended, Reply, serve_client};
+/// # use futures_util::future::BoxFuture;
+/// # use samplez_service::ws::{
+/// #     Admission, Answer, CatchUp, ClientQueue, Encode, Ended, Reply, serve_client,
+/// # };
 /// # use samplez_service::{Connect, ReplicatedState};
 /// struct Text;
 ///
@@ -747,7 +763,7 @@ async fn send<T: Sink<Message> + Unpin>(
 /// #     state: &dyn ReplicatedState,
 /// #     commands: &Commands,
 /// # ) -> Ended {
-/// serve_client(socket, connect, queue, state, Text, |message| {
+/// serve_client(socket, connect, queue, state, Text, |message, admission| {
 ///     // Here, in the order received: `hello` asks for a snapshot,
 ///     // `pong <t>` answers a ping, and other text is a command's id.
 ///     let submitted = match message {
@@ -758,6 +774,11 @@ async fn send<T: Sink<Message> + Unpin>(
 ///         Message::Text(t) if t.starts_with("pong ") => {
 ///             return t.as_str()[5..].parse().map_or(Reply::Now(None), Reply::Pong);
 ///         }
+///         Message::Text(id) if admission == Admission::NotApplied => {
+///             let refused = format!("{id} not applied");
+///             let reply = async move { Some(Message::Text(refused.into())) };
+///             return Reply::Command(Box::pin(reply) as BoxFuture<'_, _>);
+///         }
 ///         Message::Text(id) if connect.require_operator().is_ok() => {
 ///             match commands.begin(&connect.owner, id.as_str()) {
 ///                 Begin::New(pending) => Some(pending.submit(Bytes::from(id.to_string()))),
@@ -767,10 +788,10 @@ async fn send<T: Sink<Message> + Unpin>(
 ///         _ => None,
 ///     };
 ///     // Only the wait for the reply is in the future.
-///     Reply::Command(async move {
+///     Reply::Command(Box::pin(async move {
 ///         let ack = submitted?.await.ok()?;
 ///         Some(Message::Text(format!("{} {}", ack.command, ack.revision).into()))
-///     })
+///     }) as BoxFuture<'_, _>)
 /// })
 /// .await
 /// # }
@@ -786,7 +807,7 @@ pub async fn serve_client<S, E, P, F, Fut>(
 where
     S: Sink<Message> + Stream<Item = Result<Message, E>>,
     P: Encode,
-    F: FnMut(Message) -> Reply<Fut>,
+    F: FnMut(Message, Admission) -> Reply<Fut>,
     Fut: Future<Output = Option<Message>>,
 {
     let (mut tx, mut rx) = socket.split();
@@ -822,7 +843,10 @@ where
         // the replication never committed.
         let mut position: Option<Position> = None;
         // This replica applying the position of a promote.
-        let mut floor: Option<BoxFuture<'_, ()>> = None;
+        let mut floor: Option<BoxFuture<'_, bool>> = None;
+        // Set when a promote's position turned out above the read index,
+        // until a catch-up is answered with state.
+        let mut admission = Admission::Submit;
         let mut replies = FuturesOrdered::new();
         loop {
             let at_limit = replies.len() >= MAX_PENDING_REPLIES;
@@ -882,7 +906,7 @@ where
                     None | Some(Ok(Message::Close(_))) => return Ended::Closed,
                     Some(Err(_)) => return Ended::Failed,
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => Vec::new(),
-                    Some(Ok(m)) => match on_message(m) {
+                    Some(Ok(m)) => match on_message(m, admission) {
                         Reply::Command(reply) => {
                             replies.push_back(reply);
                             Vec::new()
@@ -915,8 +939,11 @@ where
                         Reply::Promote(_) => Vec::new(),
                     },
                 },
-                () = async { floor.as_mut().expect("guarded").await }, if floor.is_some() => {
+                applied = async { floor.as_mut().expect("guarded").await }, if floor.is_some() => {
                     floor = None;
+                    if !applied {
+                        admission = Admission::NotApplied;
+                    }
                     Vec::new()
                 }
                 // Not while catching up, so no reply overtakes the state it
@@ -943,6 +970,9 @@ where
                     caught_up = true;
                     epoch = Some(a.epoch());
                     position = a.position();
+                    if position.is_some() {
+                        admission = Admission::Submit;
+                    }
                     encode.answer(a)
                 }
                 popped = queue.pop(), if caught_up && catching_up.is_none() => match (popped, position) {

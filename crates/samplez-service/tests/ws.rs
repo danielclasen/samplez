@@ -14,9 +14,9 @@ use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use samplez_service::replica::{Ack, Begin, Commands, NotApplied, Reason, Resolution};
 use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
-    Answer, CatchUp, ClientQueue, Delta, Encode, Ended, Frame, Hub, MAX_PAUSE, MAX_PAUSE_TOTAL,
-    MAX_PENDING_REPLIES, PING_PERIOD, PONG_TIMEOUT, Popped, Pushed, READ_INDEX_HOLD, Reply,
-    Sessions, serve_client,
+    Admission, Answer, CatchUp, ClientQueue, Delta, Encode, Ended, Frame, Hub, MAX_PAUSE,
+    MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES, PING_PERIOD, PONG_TIMEOUT, Popped, Pushed,
+    READ_INDEX_HOLD, Reply, Sessions, serve_client,
 };
 use samplez_service::{
     Connect, Forbidden, Identity, Ops, Owner, OwnerHandle, Position, ReplicatedState, Role,
@@ -234,7 +234,8 @@ struct Client {
 
 impl Client {
     /// Runs `serve_client` over channels with the [`Wire`] protocol; the
-    /// product callback echoes other text, answers text starting with
+    /// product callback answers other text `not applied` while it may not
+    /// submit commands ([`Admission::NotApplied`]), else echoes it, answers text starting with
     /// `slow` after 1.5 s, `beat` at once, `quiet` with nothing at once and
     /// grants a meter credit for the binary message `credit`. Sends nothing
     /// for the client.
@@ -249,9 +250,13 @@ impl Client {
         };
         let q = queue.clone();
         let task = tokio::spawn(async move {
-            serve_client(socket, &connect, &q, &*state, Wire, |m| {
+            serve_client(socket, &connect, &q, &*state, Wire, |m, admission| {
                 if let Some(reply) = protocol(&m) {
                     return reply;
+                }
+                if let (Message::Text(t), Admission::NotApplied) = (&m, admission) {
+                    let refused = Some(Message::Text(format!("not applied {t}").into()));
+                    return Reply::Command(Box::pin(async move { refused }) as BoxFuture<_>);
                 }
                 let q = q.clone();
                 match &m {
@@ -705,6 +710,38 @@ async fn a_promote_above_the_read_index_then_resync_is_answered_ahead() {
     assert_eq!(start.elapsed(), Duration::ZERO);
 }
 
+/// The contract applies no command that follows a promote of the state's
+/// epoch before its position is applied: after one above the read index,
+/// a command read before the client takes the cluster's state is answered
+/// not applied and never reaches the product; once the client took a
+/// snapshot, commands apply again.
+#[tokio::test(start_paused = true)]
+async fn a_command_after_a_promote_above_the_read_index_is_not_applied() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    for _ in 0..3 {
+        apply(&state, &hub);
+    }
+    *state.read_index.lock().unwrap() = Reads::Committed(3);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:3");
+    for m in [text("promote 7:5"), text("hello"), sync(Some((7, 5)))] {
+        client.tx.send(m).unwrap();
+    }
+    // The refusal is ready before the resync is read, so either may go
+    // first.
+    let mut got = [client.next().await, client.next().await];
+    got.sort();
+    assert_eq!(got, ["ahead@7:3 below 5", "not applied hello"]);
+    client.silent().await;
+    client.tx.send(text("again")).unwrap();
+    assert_eq!(client.next().await, "not applied again", "still ahead");
+    client.tx.send(sync(None)).unwrap();
+    client.tx.send(text("hello")).unwrap();
+    assert_eq!(client.next().await, "snapshot@7:3");
+    assert_eq!(client.next().await, "echo hello");
+}
+
 /// A position this replica never applies holds the client's next commands
 /// for no longer than the read index hold plus [`MAX_PAUSE`].
 #[tokio::test(start_paused = true)]
@@ -979,7 +1016,7 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
                 to_client,
                 from_client,
             };
-            serve_client(socket, &connect, &queue, &*state, Wire, |_| {
+            serve_client(socket, &connect, &queue, &*state, Wire, |_, _| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Reply::Command(std::future::pending::<Option<Message>>())
             })
@@ -1060,7 +1097,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
             to_client,
             from_client,
         };
-        serve_client(socket, &connect, &queue, &*state, Wire, |_| {
+        serve_client(socket, &connect, &queue, &*state, Wire, |_, _| {
             Reply::Command(std::future::pending::<Option<Message>>())
         })
         .await
@@ -1096,7 +1133,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause()
             to_client,
             from_client,
         };
-        serve_client(socket, &connect, &queue, &*state, Wire, |m| {
+        serve_client(socket, &connect, &queue, &*state, Wire, |m, _| {
             protocol(&m).unwrap_or(Reply::Command(Box::pin(async move {
                 tokio::time::sleep(reply).await;
                 Some(Message::Text("done".into()))
@@ -1481,7 +1518,7 @@ async fn a_send_while_not_read_does_not_outlast_the_pause() {
             until: ready + Duration::from_millis(500),
             stall: None,
         };
-        serve_client(socket, &connect, &queue, &*state, Wire, |m| {
+        serve_client(socket, &connect, &queue, &*state, Wire, |m, _| {
             protocol(&m).unwrap_or(Reply::Command(Box::pin(async move {
                 tokio::time::sleep_until(ready).await;
                 Some(Message::Text("done".into()))
@@ -1525,7 +1562,7 @@ async fn a_reply_ready_as_the_pause_ends_does_not_resume_the_connection() {
                 to_client,
                 from_client,
             };
-            serve_client(socket, &connect, &queue, &*state, Wire, |m| {
+            serve_client(socket, &connect, &queue, &*state, Wire, |m, _| {
                 protocol(&m).unwrap_or(Reply::Command(Box::pin(async move {
                     tokio::time::sleep_until(end).await;
                     Some(Message::Text("done".into()))
@@ -1941,7 +1978,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_the_first_message() {
                 assert_eq!(connect.owner.role, Role::Operator);
                 assert!(connect.owner.connection.starts_with("r1:"));
                 let queue = hub.subscribe();
-                serve_client(socket, &connect, &queue, &*state, Wire, |m| {
+                serve_client(socket, &connect, &queue, &*state, Wire, |m, _| {
                     protocol(&m).unwrap_or(Reply::Command(async { None }))
                 })
                 .await;
@@ -2104,7 +2141,7 @@ async fn a_client_that_stops_reading_ends_one_second_after_it_connected() {
         let state = state.clone();
         async move {
             let socket = StuckSocket { sent: 0 };
-            serve_client(socket, &connect, &queue, &*state, Wire, |_| {
+            serve_client(socket, &connect, &queue, &*state, Wire, |_, _| {
                 Reply::Command(async { None })
             })
             .await

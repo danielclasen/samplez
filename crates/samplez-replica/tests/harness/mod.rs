@@ -38,7 +38,8 @@ pub const RATE: u64 = 48_000;
 pub const BLOCK: u64 = 48;
 
 /// One value per path, set by `path=value@seq`: a seq not above the last
-/// applied on its path is refused stale, as faderz orders its commands.
+/// applied on its path is refused stale, as faderz orders its commands, and
+/// the value a path holds already is unchanged.
 #[derive(Default)]
 pub struct Paths {
     pub values: BTreeMap<String, (String, u64)>,
@@ -61,7 +62,10 @@ impl Product for Paths {
             return Effect::Stale;
         }
         self.applied += 1;
-        self.values.insert(path.clone(), (value.clone(), seq));
+        let was = self.values.insert(path.clone(), (value.clone(), seq));
+        if was.is_some_and(|(was, _)| was == value) {
+            return Effect::Unchanged;
+        }
         Effect::Changed((path, value))
     }
     fn expire(&mut self, _session: &SessionKey) -> Effect<(String, String)> {

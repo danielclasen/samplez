@@ -357,8 +357,8 @@ async fn a_resend_after_failover_and_election_resolves_to_the_stored_revision() 
 /// Submitted before the writer runs, so they form one entry: every
 /// command is applied in order with its own body, the product refusing
 /// the older seq that came later, and a copy of a command in the same
-/// entry is answered as its first copy resolved: an applied one as a
-/// duplicate, a stale one as stale. The entry is one delta at one
+/// entry is answered as its first copy resolved: an applied or unchanged
+/// one as a duplicate, a stale one as stale. The entry is one delta at one
 /// revision, every command resolving at it, with the changes of both
 /// commands that made one.
 #[tokio::test(start_paused = true)]
@@ -371,6 +371,8 @@ async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
         ("s", "1", "gain=5@5"),
         ("s", "2", "pan=0@4"),
         ("t", "1", "gain=3@3"),
+        ("u", "1", "pan=0@5"),
+        ("u", "1", "pan=0@5"),
     ]
     .map(|(session, id, command)| replica.submit(&owner(session), id, Bytes::from(command)));
     let mut revisions = Vec::new();
@@ -387,10 +389,12 @@ async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
             Resolution::Stale,
             Resolution::Duplicate,
             Resolution::Applied,
-            Resolution::Stale
+            Resolution::Stale,
+            Resolution::Unchanged,
+            Resolution::Duplicate
         ]
     );
-    assert_eq!(revisions, [1; 5]);
+    assert_eq!(revisions, [1; 7]);
     let since = Position {
         epoch: replica.epoch(),
         revision: 0,
@@ -403,7 +407,7 @@ async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
     let ids = vec!["1".to_owned(), "2".to_owned()];
     assert_eq!(deltas, [(1, 0, ids, "gain=5,pan=0 from s/1,s/2")]);
     replica.store().with_state(|sm| {
-        assert_eq!(sm.product.applied, 2);
+        assert_eq!(sm.product.applied, 3);
         assert_eq!(sm.product.values["gain"].0, "5");
     });
     // The stale command's id is recorded: its resend is stale again.
