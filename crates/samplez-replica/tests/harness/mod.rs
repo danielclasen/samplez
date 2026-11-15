@@ -53,28 +53,31 @@ fn parse(command: &[u8]) -> (String, String, u64) {
 }
 
 impl Product for Paths {
-    fn apply(&mut self, _origin: &Origin, command: &[u8]) -> Effect {
+    type Change = (String, String);
+
+    fn apply(&mut self, _origin: &Origin, command: &[u8]) -> Effect<(String, String)> {
         let (path, value, seq) = parse(command);
         if self.values.get(&path).is_some_and(|(_, last)| *last >= seq) {
             return Effect::Stale;
         }
         self.applied += 1;
         self.values.insert(path.clone(), (value.clone(), seq));
-        Effect::Changed(format!("{path}={value}"))
+        Effect::Changed((path, value))
     }
-    fn expire(&mut self, _session: &SessionKey) -> Effect {
+    fn expire(&mut self, _session: &SessionKey) -> Effect<(String, String)> {
         Effect::Unchanged
     }
-    fn delta(&self, changes: &[Changed<'_>]) -> String {
+    fn forget(&mut self, _session: &SessionKey) {}
+    fn delta(&self, _stamp: u64, changes: &[Changed<'_, (String, String)>]) -> String {
         // Later wins per path; every command that changed something is an
-        // origin, a server-side change none.
+        // origin.
         let mut values = BTreeMap::new();
         let mut origins = Vec::new();
         for changed in changes {
-            let (path, value) = changed.change.split_once('=').expect("path=value");
+            let (path, value) = changed.change;
             values.insert(path, value);
-            if let Some((origin, id)) = changed.command {
-                origins.push(format!("{}/{id}", origin.session));
+            if let Some(command) = changed.command {
+                origins.push(format!("{}/{}", command.origin.session, command.id));
             }
         }
         let values: Vec<String> = values.iter().map(|(p, v)| format!("{p}={v}")).collect();

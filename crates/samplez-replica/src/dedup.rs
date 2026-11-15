@@ -26,15 +26,22 @@ pub struct Limits {
     pub max_session_commands: usize,
     /// `maxDedupEntries`: records in the set, oldest retired first.
     pub max_dedup_entries: usize,
+    /// The client's failover bound in samples: the longest it resends a
+    /// command after it first sent it. A session's ordering state is kept
+    /// this plus `retention` past its lifetime
+    /// ([`crate::state_machine::Product::forget`]).
+    pub failover: u64,
 }
 
 impl Limits {
-    /// The defaults at `rate` samples per second: 10 s, 1024 and 65536.
+    /// The defaults at `rate` samples per second: 10 s, 1024, 65536 and
+    /// 3 s.
     pub fn defaults(rate: u64) -> Limits {
         Limits {
             retention: 10 * rate,
             max_session_commands: 1024,
             max_dedup_entries: 65536,
+            failover: 3 * rate,
         }
     }
 }
@@ -101,7 +108,7 @@ impl Dedup {
         let seq = self.sessions.get(session)?.get(&hash_id(id))?;
         let record = &self.records[seq];
         let resolution = match record.resolution {
-            Resolution::Applied => Resolution::Duplicate,
+            Resolution::Applied | Resolution::Unchanged => Resolution::Duplicate,
             other => other,
         };
         Some((record.revision, resolution))
@@ -270,6 +277,7 @@ mod tests {
             retention: 1000,
             max_session_commands: 1024,
             max_dedup_entries: 65536,
+            failover: 0,
         }
     }
 
@@ -326,6 +334,7 @@ mod tests {
             retention: u64::MAX,
             max_session_commands: 4,
             max_dedup_entries: 6,
+            failover: 0,
         });
         for n in 0..6 {
             dedup.record(&key("a"), &n.to_string(), n, n);
@@ -350,6 +359,7 @@ mod tests {
             retention: 100,
             max_session_commands: 3,
             max_dedup_entries: 5,
+            failover: 0,
         });
         for n in 0..20u64 {
             dedup.record(&key(&(n % 3).to_string()), &n.to_string(), n, n * 10);

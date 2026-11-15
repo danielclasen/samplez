@@ -15,12 +15,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
+use openraft::error::{CheckIsLeaderError, RaftError};
 use openraft::network::RaftNetworkFactory;
 use openraft::storage::Adaptor;
 use openraft::{BasicNode, Raft, ServerState};
 use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::ws::{Delta, Snapshot};
-use samplez_service::{Owner, Position, ReplicaInfo, ReplicatedState};
+use samplez_service::{Owner, Position, ReadIndex, ReplicaInfo, ReplicatedState};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
@@ -232,7 +233,9 @@ async fn write(
                         for (at, id, reply) in replies {
                             let outcome = outcomes[at];
                             let resolution = match outcome.result {
-                                entry::Resolution::Applied if answered[at] => {
+                                entry::Resolution::Applied | entry::Resolution::Unchanged
+                                    if answered[at] =>
+                                {
                                     entry::Resolution::Duplicate
                                 }
                                 result => result,
@@ -261,6 +264,7 @@ async fn write(
 fn resolution_of(resolution: entry::Resolution) -> Resolution {
     match resolution {
         entry::Resolution::Applied => Resolution::Applied,
+        entry::Resolution::Unchanged => Resolution::Unchanged,
         entry::Resolution::Duplicate => Resolution::Duplicate,
         entry::Resolution::Stale => Resolution::Stale,
     }
@@ -309,24 +313,33 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     }
 
     /// The product revision once the leader's read index, the log index
-    /// a round of heartbeats to a majority confirms, is applied here. A
-    /// follower answers `None` at once, judged by its own state: openraft
-    /// 0.9.21's check answered a follower's call in the replica tests.
-    /// Nothing is forwarded to the leader yet.
-    fn read_index(&self) -> BoxFuture<'_, Option<u64>> {
+    /// a round of heartbeats to a majority confirms, is applied here.
+    /// openraft refuses the check on a follower: one that knows a leader is
+    /// [`ReadIndex::NotLeader`], one that knows none, or a leader without a
+    /// majority, [`ReadIndex::CutOff`]. Nothing is forwarded to the leader
+    /// yet.
+    fn read_index(&self) -> BoxFuture<'_, ReadIndex> {
         Box::pin(async move {
-            if self.raft.metrics().borrow().state != ServerState::Leader {
-                return None;
-            }
-            let (read, _) = self.raft.get_read_log_id().await.ok()?;
-            if let Some(read) = read {
-                self.raft
+            let read = match self.raft.get_read_log_id().await {
+                Ok((read, _)) => read,
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))
+                    if forward.leader_id.is_some() =>
+                {
+                    return ReadIndex::NotLeader;
+                }
+                Err(_) => return ReadIndex::CutOff,
+            };
+            if let Some(read) = read
+                && self
+                    .raft
                     .wait(None)
                     .applied_index_at_least(Some(read.index), "read index")
                     .await
-                    .ok()?;
+                    .is_err()
+            {
+                return ReadIndex::CutOff;
             }
-            Some(self.revision())
+            ReadIndex::Confirmed(self.revision())
         })
     }
 
@@ -375,10 +388,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                         epoch,
                         revision: change.revision,
                         prev: change.prev,
-                        command: match &change.commands[..] {
-                            [one] => Some(one.clone()),
-                            _ => None,
-                        },
+                        commands: change.commands.clone(),
                         text: change.text.clone().into(),
                     })
                     .collect(),

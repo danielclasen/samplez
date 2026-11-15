@@ -202,8 +202,11 @@ pub struct Request {
 /// How one command of an entry resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Resolution {
-    /// The product applied it.
+    /// The product applied it, and it changed the product.
     Applied,
+    /// The product applied it, and it changed nothing: the state held it
+    /// already.
+    Unchanged,
     /// A copy of an applied command, its id in its session's table:
     /// nothing changed.
     Duplicate,

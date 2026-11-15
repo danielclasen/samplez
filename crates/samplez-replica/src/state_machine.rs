@@ -14,22 +14,38 @@ use crate::snapshot::Replicated;
 /// snapshot install loads into a [`Default`] one before it replaces the
 /// state.
 pub trait Product: Default + Send + 'static {
+    /// What one command or expiry changed, as [`Product::delta`] gets it
+    /// back.
+    type Change;
+
     /// Applies one command. A command whose second application could undo
     /// a later one's effect carries the ordering its apply needs and is
     /// refused as [`Effect::Stale`] when older, with no effect: a copy can
     /// apply again once its dedup record retired.
-    fn apply(&mut self, origin: &Origin, command: &[u8]) -> Effect;
+    fn apply(&mut self, origin: &Origin, command: &[u8]) -> Effect<Self::Change>;
 
     /// Ends what `session` held under its lease, such as touch ownership:
-    /// [`Effect::Changed`] when that changed the state.
-    fn expire(&mut self, session: &SessionKey) -> Effect;
+    /// [`Effect::Changed`] when that changed the state. The session's
+    /// lifetime ends here; a later command or renewal of it starts a new
+    /// one.
+    fn expire(&mut self, session: &SessionKey) -> Effect<Self::Change>;
+
+    /// Drops what the product keeps for `session` past its lifetime, such
+    /// as the last sequence number applied per target: called once the
+    /// stamping index of the entries applied reaches the one of the expiry
+    /// that ended the lifetime plus the dedup retention plus the failover
+    /// bound ([`Limits`]), the longest a copy of one of its commands can
+    /// apply after the original, unless the session came back meanwhile.
+    /// In apply order, so at the same point on every replica.
+    fn forget(&mut self, session: &SessionKey);
 
     /// The one delta clients get for one entry's changes, in the order
-    /// applied: a command's with its origin and id, a server-side one, such
-    /// as a lease expiry, without. Where two change the same value the later
-    /// one wins. Called with the state after the entry, and only when
-    /// something changed.
-    fn delta(&self, changes: &[Changed<'_>]) -> String;
+    /// applied: a command's with its origin, id and at_index, a server-side
+    /// one, such as a lease expiry, without; `stamp` is the entry's
+    /// stamping index. Where two change the same value the later one wins.
+    /// Called with the state after the entry, and only when something
+    /// changed.
+    fn delta(&self, stamp: u64, changes: &[Changed<'_, Self::Change>]) -> String;
 
     /// The whole state as the product's clients read it.
     fn text(&self) -> String;
@@ -43,21 +59,21 @@ pub trait Product: Default + Send + 'static {
 
 /// How the product applied a command or an expiry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Effect {
-    /// Changed, with the product's description of the change, which
-    /// [`Product::delta`] gets back.
-    Changed(String),
+pub enum Effect<C> {
+    /// Changed, with what changed, which [`Product::delta`] gets back.
+    Changed(C),
+    /// Applied, changing nothing: the state already held it.
     Unchanged,
     Stale,
 }
 
 /// One change of an entry, as [`Product::delta`] gets it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Changed<'a> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct Changed<'a, C> {
     /// The command that made it, `None` for a server-side change.
-    pub command: Option<(&'a Origin, &'a str)>,
+    pub command: Option<&'a Command>,
     /// What [`Effect::Changed`] carried.
-    pub change: &'a str,
+    pub change: &'a C,
 }
 
 /// A product delta: one entry's changes at the product revision it makes.
@@ -84,6 +100,14 @@ pub struct StateMachine<P> {
     pub slot: Option<Disruption>,
     /// Each session's last renewal, as a stamping index.
     pub leases: BTreeMap<SessionKey, u64>,
+    /// The sessions whose lifetime ended and that did not come back, with
+    /// the stamping index of the expiry that ended it, until
+    /// [`Product::forget`].
+    pub ended: BTreeMap<SessionKey, u64>,
+    /// The highest stamping index applied, which [`StateMachine::ended`]
+    /// is counted against.
+    pub highest_stamp: u64,
+    limits: Limits,
     /// The product revision: the entries that changed the product, each
     /// one delta, so deltas number 1, 2, 3 without a gap. The revision
     /// [`samplez_service::ReplicatedState`] names; entries that do not
@@ -109,6 +133,9 @@ impl<P: Product> StateMachine<P> {
             verdicts: BTreeMap::new(),
             slot: None,
             leases: BTreeMap::new(),
+            ended: BTreeMap::new(),
+            highest_stamp: 0,
+            limits,
             revision: 0,
             deltas: VecDeque::new(),
             deltas_after: 0,
@@ -118,6 +145,7 @@ impl<P: Product> StateMachine<P> {
     /// Applies the request of the entry at log index `revision`.
     pub fn apply(&mut self, revision: u64, request: &Request) -> Response {
         let stamp = request.stamp;
+        self.forget_ended(stamp);
         match &request.body {
             Body::Commands(commands) => self.commands(stamp, commands),
             Body::Baseline(baseline) => {
@@ -157,12 +185,13 @@ impl<P: Product> StateMachine<P> {
                 // the lease: the expiry is a no-op.
                 if self.leases.get(session).is_some_and(|at| at <= renewed) {
                     self.leases.remove(session);
+                    self.ended.insert(session.clone(), stamp);
                     if let Effect::Changed(change) = self.product.expire(session) {
                         let changed = Changed {
                             command: None,
                             change: &change,
                         };
-                        let text = self.product.delta(&[changed]);
+                        let text = self.product.delta(stamp, &[changed]);
                         self.push(Vec::new(), text);
                     }
                 }
@@ -207,7 +236,7 @@ impl<P: Product> StateMachine<P> {
                     changes.push((n, change));
                     Resolution::Applied
                 }
-                Effect::Unchanged => Resolution::Applied,
+                Effect::Unchanged => Resolution::Unchanged,
                 Effect::Stale => Resolution::Stale,
             };
             self.dedup.resolve(&session, &command.id, result, ENTRY);
@@ -218,14 +247,14 @@ impl<P: Product> StateMachine<P> {
             });
         }
         if !changes.is_empty() {
-            let changed: Vec<Changed<'_>> = changes
+            let changed: Vec<Changed<'_, P::Change>> = changes
                 .iter()
                 .map(|(n, change)| Changed {
-                    command: Some((&commands[*n].origin, commands[*n].id.as_str())),
+                    command: Some(&commands[*n]),
                     change,
                 })
                 .collect();
-            let text = self.product.delta(&changed);
+            let text = self.product.delta(stamp, &changed);
             let ids = changes
                 .iter()
                 .map(|(n, _)| commands[*n].id.clone())
@@ -242,6 +271,24 @@ impl<P: Product> StateMachine<P> {
             }
         }
         Response(outcomes)
+    }
+
+    /// Calls [`Product::forget`] for every session whose lifetime ended at
+    /// least the dedup retention plus the failover bound before `stamp`,
+    /// the highest stamping index applied counting this entry's.
+    fn forget_ended(&mut self, stamp: u64) {
+        self.highest_stamp = self.highest_stamp.max(stamp);
+        let keep = self.limits.retention + self.limits.failover;
+        let gone: Vec<SessionKey> = self
+            .ended
+            .iter()
+            .filter(|&(_, &ended)| ended.saturating_add(keep) <= self.highest_stamp)
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in gone {
+            self.ended.remove(&session);
+            self.product.forget(&session);
+        }
     }
 
     /// Makes `text` the delta at the next product revision.
@@ -264,6 +311,8 @@ impl<P: Product> StateMachine<P> {
     /// leader after a failover can stamp lower than the one before, and
     /// an expiry decided on the higher renewal must not end a live lease.
     fn renew(&mut self, session: &SessionKey, stamp: u64) {
+        // Back: a new lifetime, whose ordering state the product keeps.
+        self.ended.remove(session);
         let renewed = self.leases.entry(session.clone()).or_insert(stamp);
         *renewed = (*renewed).max(stamp);
     }
@@ -277,6 +326,8 @@ impl<P: Product> StateMachine<P> {
             slot: self.slot.clone(),
             dedup: self.dedup.save(),
             leases: self.leases.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            ended: self.ended.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            highest_stamp: self.highest_stamp,
             revision: self.revision,
         }
     }
@@ -290,6 +341,9 @@ impl<P: Product> StateMachine<P> {
         self.verdicts = saved.verdicts;
         self.slot = saved.slot;
         self.leases = saved.leases.into_iter().collect();
+        self.ended = saved.ended.into_iter().collect();
+        self.highest_stamp = saved.highest_stamp;
+        self.limits = limits;
         self.revision = saved.revision;
         self.deltas.clear();
         self.deltas_after = saved.revision;
@@ -312,14 +366,23 @@ pub(crate) mod tests {
     use super::*;
     use crate::entry::Batch;
     use samplez_service::Role;
+    use std::collections::BTreeSet;
 
     /// One value per path, set by `path=value@seq`; an older seq on a path
     /// is stale.
+    /// One value per path, set by `path=value@seq`: a seq not above the
+    /// last applied on its path is stale, the value it holds already is
+    /// unchanged. A session that changed something holds it until its
+    /// lease expires, as touch ownership.
     #[derive(Default)]
     pub struct Paths {
         pub values: BTreeMap<String, (String, u64)>,
         pub applied: u64,
+        pub holding: BTreeSet<SessionKey>,
         pub expired: Vec<SessionKey>,
+        pub forgotten: Vec<SessionKey>,
+        /// Each [`Product::delta`] call's stamp and its changes' at_index.
+        pub delta_calls: std::sync::Mutex<Vec<(u64, Vec<Option<u64>>)>>,
     }
 
     pub fn parse(command: &[u8]) -> (String, String, u64) {
@@ -330,30 +393,47 @@ pub(crate) mod tests {
     }
 
     impl Product for Paths {
-        fn apply(&mut self, _origin: &Origin, command: &[u8]) -> Effect {
+        type Change = (String, String);
+
+        fn apply(&mut self, origin: &Origin, command: &[u8]) -> Effect<(String, String)> {
             let (path, value, seq) = parse(command);
-            if self.values.get(&path).is_some_and(|(_, last)| *last >= seq) {
+            let held = self.values.get(&path).cloned();
+            if held.as_ref().is_some_and(|(_, last)| *last >= seq) {
                 return Effect::Stale;
             }
             self.applied += 1;
             self.values.insert(path.clone(), (value.clone(), seq));
-            Effect::Changed(format!("{path}={value}"))
+            if held.is_some_and(|(was, _)| was == value) {
+                return Effect::Unchanged;
+            }
+            self.holding.insert(origin.key());
+            Effect::Changed((path, value))
         }
-        /// Releases what the session held, as a touch ownership.
-        fn expire(&mut self, session: &SessionKey) -> Effect {
+        fn expire(&mut self, session: &SessionKey) -> Effect<(String, String)> {
+            if !self.holding.remove(session) {
+                return Effect::Unchanged;
+            }
             self.expired.push(session.clone());
-            Effect::Changed(format!("owner={}", self.expired.len()))
+            Effect::Changed(("owner".into(), self.expired.len().to_string()))
         }
-        fn delta(&self, changes: &[Changed<'_>]) -> String {
+        fn forget(&mut self, session: &SessionKey) {
+            self.forgotten.push(session.clone());
+        }
+        fn delta(&self, stamp: u64, changes: &[Changed<'_, (String, String)>]) -> String {
+            let at = changes
+                .iter()
+                .map(|c| c.command.and_then(|c| c.at_index))
+                .collect();
+            self.delta_calls.lock().unwrap().push((stamp, at));
             // Later wins per path; every command that changed something is an
             // origin, a server-side change none.
             let mut values = BTreeMap::new();
             let mut origins = Vec::new();
             for changed in changes {
-                let (path, value) = changed.change.split_once('=').expect("path=value");
+                let (path, value) = changed.change;
                 values.insert(path, value);
-                if let Some((origin, id)) = changed.command {
-                    origins.push(format!("{}/{id}", origin.session));
+                if let Some(command) = changed.command {
+                    origins.push(format!("{}/{}", command.origin.session, command.id));
                 }
             }
             let values: Vec<String> = values.iter().map(|(p, v)| format!("{p}={v}")).collect();
@@ -438,6 +518,23 @@ pub(crate) mod tests {
         assert_eq!(sm.dedup.revision(&origin("c").key(), "3"), Some(1));
     }
 
+    /// The product gets the entry's stamping index and each command's
+    /// at_index with its changes, for the one atIndex its delta carries.
+    #[test]
+    fn delta_gets_the_stamp_and_each_commands_at_index() {
+        let mut sm = machine();
+        let mut scheduled = command("a", "1", "gain=1@1");
+        scheduled.at_index = Some(4800);
+        let batch = vec![scheduled, command("b", "2", "pan=1@1")];
+        sm.apply(1, &commands(96, batch));
+        let expiry = expire_at(192, &origin("a").key(), 96);
+        sm.apply(2, &expiry);
+        assert_eq!(
+            *sm.product.delta_calls.lock().unwrap(),
+            [(96, vec![Some(4800), None]), (192, vec![None])]
+        );
+    }
+
     /// An entry whose commands change nothing takes no revision and makes
     /// no delta; its commands resolve at the revision before it.
     #[test]
@@ -477,6 +574,101 @@ pub(crate) mod tests {
         assert_eq!(
             deltas(&sm)[1],
             (2, 1, Vec::new(), "owner=1 from ".to_owned())
+        );
+        // A session that only renewed holds nothing: its expiry ends the
+        // lifetime and changes nothing.
+        let renewed_only = SessionKey::from_parts("anonymous", "t");
+        sm.apply(4, &lease(144, vec![renewed_only.clone()]));
+        sm.apply(5, &expire_at(192, &renewed_only, 144));
+        assert_eq!(sm.revision, 2, "nothing released");
+        assert_eq!(deltas(&sm).len(), 2);
+        assert_eq!(
+            sm.ended.get(&renewed_only),
+            Some(&192),
+            "its lifetime ended"
+        );
+    }
+
+    fn lease(stamp: u64, sessions: Vec<SessionKey>) -> Request {
+        Request {
+            stamp,
+            body: Body::LeaseRenew(sessions),
+        }
+    }
+
+    fn expire_at(stamp: u64, session: &SessionKey, renewed: u64) -> Request {
+        Request {
+            stamp,
+            body: Body::LeaseExpiry {
+                session: session.clone(),
+                renewed,
+            },
+        }
+    }
+
+    /// A session's ordering state goes the dedup retention plus the failover
+    /// bound after the expiry that ended its lifetime, counted in stamping
+    /// index on the entries applied, so alike on every replica and after a
+    /// snapshot load; a session that came back before then keeps it.
+    #[test]
+    fn a_session_is_forgotten_retention_plus_failover_after_its_lifetime_ended() {
+        let limits = Limits {
+            retention: 100,
+            max_session_commands: 1024,
+            max_dedup_entries: 65536,
+            failover: 30,
+        };
+        let mut sm = StateMachine::new(Paths::default(), limits);
+        let (gone, back) = (origin("s").key(), origin("u").key());
+        sm.apply(
+            1,
+            &commands(
+                10,
+                vec![command("s", "1", "gain=1@1"), command("u", "1", "pan=1@1")],
+            ),
+        );
+        sm.apply(2, &expire_at(20, &gone, 10));
+        sm.apply(3, &expire_at(20, &back, 10));
+        sm.apply(4, &commands(40, vec![command("u", "2", "pan=2@2")]));
+        let other = SessionKey::from_parts("anonymous", "t");
+        sm.apply(5, &lease(149, vec![other.clone()]));
+        assert!(sm.product.forgotten.is_empty(), "one sample short of 130");
+        let mut loaded = StateMachine::new(Paths::default(), limits);
+        loaded.load(sm.save(), limits).expect("loads");
+        for machine in [&mut sm, &mut loaded] {
+            machine.apply(6, &lease(150, vec![other.clone()]));
+            assert_eq!(machine.product.forgotten, std::slice::from_ref(&gone));
+            machine.apply(7, &lease(10_000, vec![other.clone()]));
+            assert_eq!(
+                machine.product.forgotten,
+                std::slice::from_ref(&gone),
+                "u came back"
+            );
+        }
+    }
+
+    /// A command that changes nothing resolves unchanged at the revision
+    /// current after its entry and is listed in no delta; a copy of it is a
+    /// duplicate.
+    #[test]
+    fn a_command_that_changes_nothing_is_unchanged_and_in_no_delta() {
+        let mut sm = machine();
+        sm.apply(1, &commands(48, vec![command("a", "1", "gain=1@1")]));
+        let batch = vec![command("b", "2", "gain=1@2"), command("c", "3", "pan=1@1")];
+        let response = sm.apply(2, &commands(96, batch));
+        let outcomes: Vec<_> = response.0.iter().map(|o| (o.revision, o.result)).collect();
+        assert_eq!(
+            outcomes,
+            [(2, Resolution::Unchanged), (2, Resolution::Applied)]
+        );
+        assert_eq!(
+            deltas(&sm)[1],
+            (2, 1, vec!["3".into()], "pan=1 from c/3".to_owned())
+        );
+        let copy = sm.apply(3, &commands(144, vec![command("b", "2", "gain=1@2")]));
+        assert_eq!(
+            (copy.0[0].revision, copy.0[0].result),
+            (2, Resolution::Duplicate)
         );
     }
 
@@ -570,6 +762,7 @@ pub(crate) mod tests {
                 retention: 100,
                 max_session_commands: 1024,
                 max_dedup_entries: 65536,
+                failover: 0,
             },
         );
         sm.apply(1, &commands(0, vec![command("s", "7", "gain=1@7")]));
@@ -603,6 +796,7 @@ pub(crate) mod tests {
                 retention: 100,
                 max_session_commands: 1024,
                 max_dedup_entries: 65536,
+                failover: 0,
             },
         );
         sm.apply(1, &commands(0, vec![command("s", "1", "a=1@1")]));

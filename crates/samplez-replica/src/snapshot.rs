@@ -29,6 +29,11 @@ pub struct Replicated {
     /// Each session's last renewal, in session order: JSON keys are
     /// strings only.
     pub leases: Vec<(SessionKey, u64)>,
+    /// The sessions whose lifetime ended, with the stamping index it ended
+    /// at, until the product forgets them; in session order.
+    pub ended: Vec<(SessionKey, u64)>,
+    /// The highest stamping index applied.
+    pub highest_stamp: u64,
     /// The product revision ([`crate::state_machine::StateMachine::revision`]).
     pub revision: u64,
 }
