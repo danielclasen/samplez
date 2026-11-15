@@ -89,8 +89,8 @@ withheld block, an overrun skip or a full ring withdraws the replica on
 every output: it then commits only on evidence, from the next page
 boundary. Each block carries a digest of what degraded it: inputs whose
 read failed, entries applied without their generation and unresolved
-entries (`unresolved`). The member flow's commit batch hints are the
-ring's length, and an output whose flow ring is not twice that is not
+entries (`unresolved`). A writer commits a range of up to the ring's
+length, and an output whose flow ring is not twice that is not
 realised.
 
 Real-time set-up reports each step and runs degraded rather than failing:

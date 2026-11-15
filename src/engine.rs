@@ -618,6 +618,7 @@ impl Engine {
                 unresolved: Vec::with_capacity(UNRESOLVED),
                 ids: Vec::with_capacity(UNRESOLVED + PENDING_CHANGES),
                 late_routes: Vec::with_capacity(PENDING_CHANGES),
+                late_lost_until: 0,
             };
             let control = ReplicaControl {
                 ring: control_tx,

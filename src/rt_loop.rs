@@ -92,6 +92,10 @@ pub struct Counters {
     /// Status changes the supervisor could not pass on: the replicated
     /// state's channel was full.
     pub status_changes_unsent: AtomicU64,
+    /// Late re-routes the digest could not name: more than
+    /// [`PENDING_CHANGES`] crossfades at once. Their blocks carry a
+    /// degraded digest naming no entry.
+    pub late_routes_lost: AtomicU64,
 }
 
 /// Makes the RT loop panic once, for the panic containment test.
@@ -292,6 +296,9 @@ pub(crate) struct Replica {
     /// crossfade an on-time engine runs: their blocks differ from its
     /// until then. Capacity [`PENDING_CHANGES`].
     pub late_routes: Vec<(LogId, u64)>,
+    /// The latest crossfade end of the late re-routes `late_routes` had
+    /// no room for: blocks before it stay degraded.
+    pub late_lost_until: u64,
 }
 
 /// The index of a log entry in the log that orders it.
@@ -845,6 +852,18 @@ fn ctx(shared: &Shared) -> Ctx {
 /// without their generation, the re-routes swapped in late until the end
 /// of the crossfade they skipped, and the unresolved entries at or below
 /// `start`; none under a clock self-report.
+/// Names late re-route `id` in the digest until `until`; false when
+/// `late_routes` is full, and the blocks before `until` then carry a
+/// degraded digest naming no entry.
+fn note_late_route(r: &mut Replica, id: LogId, until: u64) -> bool {
+    if r.late_routes.len() < PENDING_CHANGES {
+        r.late_routes.push((id, until));
+        return true;
+    }
+    r.late_lost_until = r.late_lost_until.max(until);
+    false
+}
+
 fn digest(
     r: &mut Replica,
     awaiting: &[RtEntry],
@@ -861,6 +880,10 @@ fn digest(
     r.ids.extend(r.late_routes.iter().map(|l| l.0));
     r.ids
         .extend(r.unresolved.iter().filter(|u| u.1 <= start).map(|u| u.0));
+    // A late re-route the list had no room for: no log id names it.
+    if start < r.late_lost_until {
+        r.ids.push(LogId::MAX);
+    }
     if r.ids.is_empty() && incoming == 0 && outgoing == 0 {
         return Some(crate::blocks::HEALTHY);
     }
@@ -1266,10 +1289,9 @@ impl Rt {
             if !on_time
                 && matches!(e.change, Change::Route { .. })
                 && let Some(r) = self.replica.as_mut()
-                && r.late_routes.len() < PENDING_CHANGES
+                && !note_late_route(r, e.id, e.at_index.saturating_add(u64::from(self.ramp)))
             {
-                r.late_routes
-                    .push((e.id, e.at_index.saturating_add(u64::from(self.ramp))));
+                add(&self.counters.late_routes_lost, 1);
             }
         }
         self.send(Telemetry::GenerationDone {
@@ -1970,6 +1992,7 @@ mod tests {
             unresolved: Vec::with_capacity(UNRESOLVED),
             ids: Vec::with_capacity(UNRESOLVED + PENDING_CHANGES),
             late_routes: Vec::with_capacity(PENDING_CHANGES),
+            late_lost_until: 0,
         }
     }
 
@@ -2010,6 +2033,16 @@ mod tests {
         assert_ne!(digest(&mut r, &awaiting, 11 * B, 0, 0), Some(want));
         r.shared.self_report.store(true, Relaxed);
         assert_eq!(digest(&mut r, &awaiting, 10 * B, 0, 0), None);
+        r.shared.self_report.store(false, Relaxed);
+        r.unresolved.clear();
+        // A late re-route the full list has no room for still degrades
+        // the blocks of its window.
+        for id in 0..PENDING_CHANGES as u64 {
+            assert!(note_late_route(&mut r, id, 13 * B));
+        }
+        assert!(!note_late_route(&mut r, 99, 20 * B));
+        assert_ne!(digest(&mut r, &[], 15 * B, 0, 0), Some(HEALTHY));
+        assert_eq!(digest(&mut r, &[], 20 * B, 0, 0), Some(HEALTHY));
     }
 
     /// Input entries leave the pending list at the block of their index,
