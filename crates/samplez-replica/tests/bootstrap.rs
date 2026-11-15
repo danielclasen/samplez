@@ -378,6 +378,30 @@ impl Set {
         }
     }
 
+    /// Makes `slot` lead, the voters settled. Followers refuse a vote while
+    /// they heard their leader within the 1-2 s election timeout, so an
+    /// election `slot` calls takes that long; it calls the next only once
+    /// the last one had the time to end.
+    async fn lead(&self, slot: Slot) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if self.settled().await == slot {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{slot:?} did not take the lead in 60 s:\n{}",
+                self.describe()
+            );
+            let raft = self.replica(slot).raft().clone();
+            let _ = raft.trigger().elect().await;
+            until(Duration::from_secs(5), || {
+                raft.metrics().borrow().state == ServerState::Leader
+            })
+            .await;
+        }
+    }
+
     /// Each replica's view, for a failure message.
     fn describe(&self) -> String {
         let mut lines = Vec::new();
@@ -512,15 +536,7 @@ async fn a_set_starts_from_the_marker_and_takes_writes_through_any_audio_replica
     assert_eq!(refused.reason, Reason::NotCommitable);
 
     // The witness can lead: writes are forwarded to it.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while set.settled().await != Slot::Witness {
-        assert!(
-            Instant::now() < deadline,
-            "the witness did not take the lead"
-        );
-        let _ = witness.raft().trigger().elect().await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    set.lead(Slot::Witness).await;
     let revision = write(set.replica(Slot::Audio(1)), "led", "pan=1@1").await;
     set.applied(revision).await;
     assert_eq!(witness.store().with_state(|sm| sm.product.applied), 3);
@@ -539,12 +555,7 @@ async fn ordinal_0_rejoins_as_a_learner_after_losing_its_volume() {
     // does not on a follower, so a purge on one that is elected meanwhile
     // can race its replication. The leader that takes the new volume in
     // is the one that purged its log.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while set.settled().await != Slot::Audio(1) {
-        assert!(Instant::now() < deadline, "ordinal 1 did not take the lead");
-        let _ = set.replica(Slot::Audio(1)).raft().trigger().elect().await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    set.lead(Slot::Audio(1)).await;
     let leader = Slot::Audio(1);
     let epoch = set.replica(leader).epoch();
     let mut last = 0;
@@ -796,12 +807,7 @@ async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
 
     // Ordinal 2 leads when it goes, so its volume holds a vote for itself
     // that a restart restores as leadership.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while set.settled().await != Slot::Audio(2) {
-        assert!(Instant::now() < deadline, "ordinal 2 did not take the lead");
-        let _ = set.replica(Slot::Audio(2)).raft().trigger().elect().await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    set.lead(Slot::Audio(2)).await;
 
     // Scale to one: ordinal 2 goes first, the release restarts the other
     // pods with one wanted voter and the leader drops ordinals 1 and 2.
