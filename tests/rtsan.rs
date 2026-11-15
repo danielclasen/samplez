@@ -3,12 +3,14 @@
 //! RTSan counts as blocking (allocation, pthread lock, sleep, blocking
 //! syscall) inside it aborts the process. The run covers input generation
 //! swaps, a re-route crossfade, a gain ramp, output commits, metering and
-//! a loudness reset, and a writer's refusals; the lib test
+//! a loudness reset, a writer's refusals, and, for a replicated engine,
+//! every path of the hold ring (`common::hold_scenario`): holding,
+//! withholding and overflow. The lib test
 //! `the_failure_paths_run_on_the_rt_thread`, run under the same flags,
 //! covers catch-up, clock steps and a late input. libmxl's sync-group
-//! wait, `mxlSleepUntil`, the
-//! commit's `FUTEX_WAKE` and the failure path's probe are allowed by call
-//! site. Other builds compile this file to nothing.
+//! wait, `mxlSleepUntil`, the commit's `FUTEX_WAKE` and the failure
+//! path's probe are allowed by call site. Other builds compile this file
+//! to nothing.
 
 #![cfg(samplez_rtsan)]
 #![feature(sanitize)]
@@ -140,4 +142,17 @@ fn a_writer_refuses_in_the_real_time_context() {
     assert_eq!(committed, Write::Committed);
     assert_eq!(held, Write::Held);
     assert!(matches!(failed, Write::Failed(_)), "{failed:?}");
+}
+
+#[test]
+fn the_rt_thread_passes_rtsan_holding_blocks() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let engine = common::start_held(&domain.0, &src, &dst, 2);
+    common::hold_scenario(&engine);
+    let c = engine.counters();
+    assert!(c.hold_overflows.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert_eq!(engine.status().rt_panic, None);
+    engine.stop();
 }

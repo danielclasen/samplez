@@ -29,6 +29,14 @@ pub struct Config {
     /// `samplez_dsp::MAX_RAMP_LEN`.
     #[serde(default = "default_ramp")]
     pub ramp_samples: u32,
+    /// Replicated mode: D, how long past a block's deadline T_k a fenced
+    /// block is held before it is withheld, in ms.
+    #[serde(default = "default_hold_ms")]
+    pub hold_ms: u32,
+    /// Replicated mode: w, the contact window, in ms. A held block is
+    /// withheld at `T_k + D + w`.
+    #[serde(default = "default_contact_window_ms")]
+    pub contact_window_ms: u32,
     /// Path of the libmxl shared library.
     pub libmxl: PathBuf,
     pub domains: Vec<Domain>,
@@ -186,6 +194,12 @@ fn default_catchup() -> u32 {
 fn default_prune() -> u32 {
     50
 }
+fn default_hold_ms() -> u32 {
+    10
+}
+fn default_contact_window_ms() -> u32 {
+    8
+}
 fn default_ramp() -> u32 {
     480
 }
@@ -229,6 +243,14 @@ impl Config {
         self.outputs.iter().map(|o| o.channels as usize).sum()
     }
 
+    /// The hold ring of a replicated output in blocks: `D + w + 2B`
+    /// samples, rounded up to whole blocks.
+    pub fn hold_blocks(&self) -> usize {
+        let samples =
+            u64::from(self.hold_ms + self.contact_window_ms) * u64::from(self.sample_rate) / 1000;
+        samples.div_ceil(u64::from(self.block_size)) as usize + 2
+    }
+
     /// The index of the domain named `name`.
     pub fn domain(&self, name: &str) -> Option<usize> {
         self.domains.iter().position(|d| d.name == name)
@@ -241,6 +263,12 @@ impl Config {
         }
         if !(16..=1024).contains(&self.block_size) {
             return fail(format!("blockSize {} is not in 16..=1024", self.block_size));
+        }
+        if !(1..=1000).contains(&self.hold_ms) || !(1..=1000).contains(&self.contact_window_ms) {
+            return fail(format!(
+                "holdMs {} and contactWindowMs {} must be in 1..=1000",
+                self.hold_ms, self.contact_window_ms
+            ));
         }
         if self.ramp_samples > samplez_dsp::MAX_RAMP_LEN {
             return fail(format!(
@@ -386,6 +414,21 @@ mod tests {
         assert!(c.rt.enabled);
         assert_eq!(c.rt.rt_cpu, RtCpu::Auto);
         assert_eq!(c.inputs[0].offset_samples, 0);
+        assert_eq!((c.hold_ms, c.contact_window_ms), (10, 8));
+        // D + w + 2B: 864 + 96 samples.
+        assert_eq!(c.hold_blocks() as u64 * 48, 960);
+    }
+
+    #[test]
+    fn the_hold_ring_rounds_up_to_whole_blocks() {
+        let mut v = base();
+        v["holdMs"] = serde_json::json!(1);
+        v["contactWindowMs"] = serde_json::json!(1);
+        v["blockSize"] = serde_json::json!(64);
+        // 96 samples of D + w take two blocks of 64, plus 2B.
+        assert_eq!(parse(&v).unwrap().hold_blocks(), 4);
+        v["holdMs"] = serde_json::json!(0);
+        assert!(parse(&v).is_err());
     }
 
     #[test]

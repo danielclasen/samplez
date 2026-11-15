@@ -8,7 +8,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Acquire, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release,
+};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -22,12 +24,14 @@ use samplez_mxl::input::{
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
 
+use crate::blocks::{BlockStatus, Cause, Hold, StatusChange, Statuses};
 use crate::config::Config;
 use crate::meters::{OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
-    BlockVerdict, Change, Command, Counters, EMPTY_STATS, Gen, LogId, LoudnessReset, MeterRecord,
-    Mix, Out, OutMeter, PENDING_CHANGES, Returned, Rt, RtEntry, SLICE, Slot, SlotStats, Telemetry,
+    BlockVerdict, Change, Command, Control, Counters, EMPTY_STATS, Gen, LogId, LoudnessReset,
+    MeterRecord, Mix, Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE,
+    Shared, Slot, SlotStats, Telemetry, UNRESOLVED,
 };
 
 const COMMAND_RING: usize = 64;
@@ -37,6 +41,10 @@ const TELEMETRY_RING: usize = 8192;
 const METER_RING_SECONDS: usize = 2;
 /// Loudness resets the reset ring holds per output.
 const RESETS_PER_OUTPUT: usize = 4;
+/// Status changes the change ring holds per output, and the fewest
+/// status words per output.
+const CHANGES_PER_OUTPUT: usize = 1024;
+const MIN_STATUS_SLOTS: usize = 64;
 const SUPERVISOR_TICK: Duration = Duration::from_millis(5);
 const POLL_PERIOD: Duration = Duration::from_millis(100);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
@@ -263,6 +271,51 @@ impl std::fmt::Display for ResetError {
 
 impl std::error::Error for ResetError {}
 
+/// How an engine that follows a replicated log takes part in its set.
+pub struct Replication {
+    /// Voters of the set, the witness included. With one the engine
+    /// commits each block at once and holds nothing; with more, every
+    /// output starts committing nothing, holds blocks it cannot commit
+    /// at once in a ring of `D + w + 2B` samples, and creates its member
+    /// flow with that ring as the commit batch.
+    pub voters: usize,
+    /// Where [`Report`]s go, for the log to stamp; one the channel has no
+    /// room for is counted in `reports_dropped`.
+    pub reports: SyncSender<Report>,
+    /// Where the block-status changes go, in the order the RT thread made
+    /// them; one the channel has no room for is counted in
+    /// `status_changes_dropped`.
+    pub statuses: Option<SyncSender<StatusChange>>,
+}
+
+/// Why the engine refused a replication control.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlError {
+    /// No such output, or an engine that is not replicated.
+    Invalid(String),
+    /// The control ring is full, or [`UNRESOLVED`] entries are
+    /// unresolved.
+    Full,
+}
+
+impl std::fmt::Display for ControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlError::Invalid(m) => write!(f, "{m}"),
+            ControlError::Full => write!(f, "the control ring or the unresolved list is full"),
+        }
+    }
+}
+
+impl std::error::Error for ControlError {}
+
+/// The engine side of the replicated state: the control ring to the RT
+/// thread and the entries it holds unresolved.
+struct ReplicaControl {
+    ring: rtrb::Producer<Control>,
+    unresolved: Vec<LogId>,
+}
+
 /// What the supervisor learns of the log besides committed entries.
 enum LogMsg {
     /// A generation-needing entry was appended: its generation is built
@@ -441,6 +494,8 @@ pub struct Engine {
     shape: (usize, usize),
     resets: Mutex<rtrb::Producer<LoudnessReset>>,
     config: Config,
+    /// Replicated mode with more than one voter.
+    replica: Option<(Arc<Shared>, Mutex<ReplicaControl>)>,
 }
 
 impl Engine {
@@ -460,24 +515,30 @@ impl Engine {
 
     /// [`Engine::start`] for an engine that follows a replicated log: its
     /// entries come through [`Engine::append`], [`Engine::commit`] and
-    /// [`Engine::truncate`], and its [`Report`]s go to `reports` for the
-    /// log to stamp; one the channel has no room for is counted in
-    /// `reports_dropped`.
+    /// [`Engine::truncate`], and it takes part in the set as
+    /// `replication` says. With more than one voter, each block of each
+    /// output gets a status, and an output commits only from a commit
+    /// start ([`Engine::commit_from`]) and while F
+    /// ([`Engine::set_fence`]) has passed its blocks.
     pub fn start_replicated(
         config: Config,
         process: ProcessStatus,
         verdicts: Option<SyncSender<BlockVerdict>>,
-        reports: SyncSender<Report>,
+        replication: Replication,
     ) -> Result<Engine, Error> {
-        Engine::start_with(config, process, verdicts, Some(reports))
+        Engine::start_with(config, process, verdicts, Some(replication))
     }
 
     fn start_with(
         config: Config,
         process: ProcessStatus,
         verdicts: Option<SyncSender<BlockVerdict>>,
-        reports: Option<SyncSender<Report>>,
+        replication: Option<Replication>,
     ) -> Result<Engine, Error> {
+        let (reports, status_tx, voters) = match replication {
+            Some(r) => (Some(r.reports), r.statuses, r.voters),
+            None => (None, None, 0),
+        };
         let api = samplez_mxl::load(&config.libmxl).map_err(Error::Mxl)?;
         let b = u64::from(config.block_size);
         let stop = Arc::new(AtomicBool::new(false));
@@ -525,6 +586,46 @@ impl Engine {
         while meter_rx.pop().is_ok() {}
         let (reset_tx, reset_rx) =
             rtrb::RingBuffer::new((RESETS_PER_OUTPUT * config.outputs.len()).max(1));
+        let hold_blocks = config.hold_blocks();
+        let alone = voters == 1;
+        let (replica, rt_replica, change_rx) = if reports.is_some() {
+            let slots = (4 * hold_blocks).next_power_of_two().max(MIN_STATUS_SLOTS);
+            let shared = Arc::new(Shared {
+                fence: AtomicU64::new(if alone { u64::MAX } else { 0 }),
+                rank: AtomicU64::new(0),
+                self_report: AtomicBool::new(false),
+                statuses: (0..config.outputs.len())
+                    .map(|_| Statuses::new(slots, b))
+                    .collect(),
+            });
+            let changes = (CHANGES_PER_OUTPUT * config.outputs.len()).max(1);
+            let (mut change_tx, mut change_rx) = rtrb::RingBuffer::new(changes);
+            // Written once here: the RT thread's first pushes fault no page.
+            while change_tx
+                .push(StatusChange::Skipped { from: 0, to: 0 })
+                .is_ok()
+            {}
+            while change_rx.pop().is_ok() {}
+            let (control_tx, control_rx) = rtrb::RingBuffer::new(UNRESOLVED);
+            let rt_replica = Replica {
+                shared: Arc::clone(&shared),
+                changes: change_tx,
+                control: control_rx,
+                unresolved: Vec::with_capacity(UNRESOLVED),
+                ids: Vec::with_capacity(UNRESOLVED + PENDING_CHANGES),
+            };
+            let control = ReplicaControl {
+                ring: control_tx,
+                unresolved: Vec::with_capacity(UNRESOLVED),
+            };
+            (
+                Some((shared, Mutex::new(control))),
+                Some(rt_replica),
+                Some(change_rx),
+            )
+        } else {
+            (None, None, None)
+        };
 
         let mut in_domains: Vec<usize> = Vec::new();
         let mut slots = Vec::new();
@@ -561,6 +662,11 @@ impl Engine {
                 writer: None,
                 first_k: 0,
                 meter: OutMeter::new(o.channels as usize),
+                hold: if replica.is_some() {
+                    Hold::new(o.channels as usize, b, hold_blocks, alone)
+                } else {
+                    Hold::new(o.channels as usize, b, 0, true)
+                },
             });
             channel += o.channels as usize;
         }
@@ -605,6 +711,7 @@ impl Engine {
             meter_seq: 0,
             counters: Arc::clone(&counters),
             stop: Arc::clone(&stop),
+            replica: rt_replica,
         };
 
         let (thread_tx, thread_rx) = mpsc::sync_channel::<ThreadStatus>(1);
@@ -725,6 +832,13 @@ impl Engine {
             tel: tel_rx,
             meter_rx,
             next_meter_seq: 0,
+            change_rx,
+            status_tx,
+            batch: if replica.is_some() && !alone {
+                hold_blocks as u64 * b
+            } else {
+                b
+            },
             loudness: config_loudness,
             verdicts,
             status: Arc::clone(&status),
@@ -774,6 +888,7 @@ impl Engine {
             shape: (n, m),
             resets: Mutex::new(reset_tx),
             config,
+            replica,
         })
     }
 
@@ -972,6 +1087,137 @@ impl Engine {
         self.log.lock().expect("log lock").truncate(from);
     }
 
+    fn replica(&self) -> Result<&(Arc<Shared>, Mutex<ReplicaControl>), ControlError> {
+        self.replica
+            .as_ref()
+            .ok_or_else(|| ControlError::Invalid("the engine is not replicated".to_owned()))
+    }
+
+    fn output_index(&self, output: usize) -> Result<(), ControlError> {
+        if output < self.config.outputs.len() {
+            Ok(())
+        } else {
+            Err(ControlError::Invalid(format!("no output {output}")))
+        }
+    }
+
+    fn control(&self, c: Control) -> Result<(), ControlError> {
+        let (_, control) = self.replica()?;
+        let mut control = control.lock().expect("control lock");
+        match c {
+            Control::Unresolved { id, .. } => {
+                if control.unresolved.contains(&id) {
+                    return Ok(());
+                }
+                if control.unresolved.len() >= UNRESOLVED || control.ring.slots() == 0 {
+                    return Err(ControlError::Full);
+                }
+                control.unresolved.push(id);
+            }
+            Control::Resolved { id } => {
+                if !control.unresolved.contains(&id) {
+                    return Ok(());
+                }
+                if control.ring.slots() == 0 {
+                    return Err(ControlError::Full);
+                }
+                control.unresolved.retain(|&u| u != id);
+            }
+            _ => {}
+        }
+        control.ring.push(c).map_err(|_| ControlError::Full)
+    }
+
+    /// Replicated mode: publishes F, the end index of the highest block up
+    /// to which every block not yet final is B1-valid (plan 2.11,
+    /// Fencing). A block ending above F is `fenced`; once F passes it, it
+    /// is committed, or held at the rank published then. F starts at 0
+    /// with more than one voter, and past every block with one.
+    pub fn set_fence(&self, end: u64) -> Result<(), ControlError> {
+        self.replica()?.0.fence.store(end, Release);
+        Ok(())
+    }
+
+    /// Replicated mode: this replica's rank, 0 the top, fixed into each
+    /// block's status when F passes it; at most [`crate::blocks::MAX_RANK`].
+    pub fn set_rank(&self, rank: u8) -> Result<(), ControlError> {
+        self.replica()?.0.rank.store(u64::from(rank), Relaxed);
+        Ok(())
+    }
+
+    /// Replicated mode: output `output` commits again from its commit
+    /// start, the first page boundary P in a block at or after `min_k`
+    /// it computes (with one voter, from that block's start). The block
+    /// holding P reports `committed from P`, and `[kB, P)` withheld
+    /// without a cause.
+    pub fn commit_from(&self, output: usize, min_k: u64) -> Result<(), ControlError> {
+        self.output_index(output)?;
+        self.control(Control::CommitFrom { output, min_k })
+    }
+
+    /// Replicated mode: output `output` stops committing at sample index
+    /// `at`: the block holding it commits `[kB, at)`, reported `committed
+    /// up to at`, withholds `[at, (k + 1)B)` without a cause, and the
+    /// output is withdrawn from there.
+    pub fn stop_at(&self, output: usize, at: u64) -> Result<(), ControlError> {
+        self.output_index(output)?;
+        self.control(Control::StopAt { output, at })
+    }
+
+    /// Replicated mode: the replica is withdrawn on every output that
+    /// commits: from now on it commits through only, from the next page
+    /// boundary on.
+    pub fn withdraw(&self) -> Result<(), ControlError> {
+        self.control(Control::Withdraw)
+    }
+
+    /// Replicated mode: moves block `k` of output `output` to `withheld`
+    /// for `cause`, from no status yet, `fenced` or `held`; the RT thread
+    /// never writes it then. Returns the status the block ends with,
+    /// `committed` when the RT thread committed it first, or none when
+    /// nothing was recorded: the slot still holds another block's open
+    /// status, which is settled first ([`crate::blocks::Statuses::withhold`]).
+    pub fn withhold(
+        &self,
+        output: usize,
+        k: u64,
+        cause: Cause,
+    ) -> Result<Option<BlockStatus>, ControlError> {
+        self.output_index(output)?;
+        Ok(self.replica()?.0.statuses[output].withhold(k, cause))
+    }
+
+    /// Replicated mode: block `k` of output `output`, `held`, commits
+    /// through on evidence that used the silence of the voters in
+    /// `on_silence_of`, by bit. False when it is not `held`.
+    pub fn commit_through(
+        &self,
+        output: usize,
+        k: u64,
+        on_silence_of: u8,
+    ) -> Result<bool, ControlError> {
+        self.output_index(output)?;
+        Ok(self.replica()?.0.statuses[output].commit_through(k, on_silence_of))
+    }
+
+    /// Replicated mode: the status of block `k` of output `output`, none
+    /// before its first one or once its slot was reused.
+    pub fn block_status(&self, output: usize, k: u64) -> Option<BlockStatus> {
+        self.replica.as_ref()?.0.statuses.get(output)?.get(k)
+    }
+
+    /// Replicated mode: log entry `id` at `at_index` is unresolved; every
+    /// block from its index carries it in its digest until
+    /// [`Engine::resolved`]. At most [`UNRESOLVED`] at a time.
+    pub fn unresolved(&self, id: LogId, at_index: u64) -> Result<(), ControlError> {
+        self.control(Control::Unresolved { id, at_index })
+    }
+
+    /// Replicated mode: log entry `id` is decided.
+    pub fn resolved(&self, id: LogId) -> Result<(), ControlError> {
+        self.control(Control::Resolved { id })
+    }
+
     /// Restarts the loudness measurement of output `output` (the
     /// integrated loudness, the loudness range, the maxima and the
     /// validity) at the first 100 ms window starting at or after
@@ -1118,6 +1364,11 @@ struct Supervisor {
     tel: rtrb::Consumer<Telemetry>,
     meter_rx: rtrb::Consumer<MeterRecord>,
     next_meter_seq: u64,
+    /// The RT thread's status changes and where they go.
+    change_rx: Option<rtrb::Consumer<StatusChange>>,
+    status_tx: Option<SyncSender<StatusChange>>,
+    /// Both batch hints of a member flow: B, or the hold ring.
+    batch: u64,
     loudness: Vec<OutputLoudness>,
     verdicts: Option<SyncSender<BlockVerdict>>,
     status: Arc<Mutex<Status>>,
@@ -1140,6 +1391,7 @@ impl Supervisor {
                 release(r);
             }
             self.telemetry();
+            self.status_changes();
             self.meters();
             self.log_messages();
             self.jobs();
@@ -1229,6 +1481,20 @@ impl Supervisor {
             let mut st = self.status();
             for (o, l) in st.outputs.iter_mut().zip(&self.loudness) {
                 o.meters.clone_from(&l.meters);
+            }
+        }
+    }
+
+    /// Passes the RT thread's status changes on.
+    fn status_changes(&mut self) {
+        let Some(rx) = &mut self.change_rx else {
+            return;
+        };
+        while let Ok(c) = rx.pop() {
+            if let Some(tx) = &self.status_tx
+                && let Err(TrySendError::Full(_)) = tx.try_send(c)
+            {
+                self.counters.status_changes_dropped.fetch_add(1, Relaxed);
             }
         }
     }
@@ -1865,7 +2131,11 @@ impl Supervisor {
                 }
             }
             let instance = self.out_instances[d].as_ref().expect("created above");
-            let result = output::create(instance, &self.config.output_config(cfg));
+            let oc = output::OutputConfig {
+                batch: self.batch,
+                ..self.config.output_config(cfg)
+            };
+            let result = output::create(instance, &oc);
             let mut st = self.status.lock().expect("status lock");
             let s = &mut st.outputs[o];
             s.attempts += 1;
@@ -2134,6 +2404,162 @@ mod tests {
         assert!(!st.outputs[0].realised);
         assert!(!flow.exists(), "the released writer deletes its flow");
         engine.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// An overrun skip withholds the skipped blocks at the skip, in one
+    /// ranged change for every output, and withdraws the replica: no block
+    /// after it commits at once on any output.
+    #[test]
+    fn an_overrun_skip_withholds_the_skipped_blocks_and_withdraws() {
+        use crate::blocks::{Kind, PAGE};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let output = |id: &str| {
+            serde_json::json!({ "name": id, "domain": "d", "flowId": id, "label": "skip",
+                                "group": "skip", "role": "Audio", "channels": 1 })
+        };
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "domains": [{ "name": "d", "path": domain }],
+            "outputs": [output("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d11"),
+                        output("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d12")],
+            "matrix": [],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let process = rt::setup_process(&config.rt);
+        let (report_tx, _reports) = mpsc::sync_channel(1);
+        let (status_tx, changes) = mpsc::sync_channel(1 << 20);
+        let replication = Replication {
+            voters: 2,
+            reports: report_tx,
+            statuses: Some(status_tx),
+        };
+        let e = Engine::start_replicated(config, process, None, replication).unwrap();
+        let processed = || e.counters().processed.load(Acquire);
+        wait(&|| e.status().outputs.iter().all(|o| o.realised));
+        e.set_fence(u64::MAX).unwrap();
+        let from = processed() + 2;
+        for o in 0..2 {
+            e.commit_from(o, from).unwrap();
+        }
+        let kp = (from * 48).next_multiple_of(PAGE) / 48;
+        let committed = |o: usize| {
+            (kp..processed()).any(|k| {
+                e.block_status(o, k)
+                    .is_some_and(|s| s.kind == Kind::Committed)
+            })
+        };
+        wait(&|| committed(0) && committed(1));
+
+        crate::rt_loop::STALL_MS.store(40, Relaxed);
+        // The stall's skip, past any overrun skip under load.
+        let t = Instant::now();
+        let (skip_from, skip_to) = loop {
+            assert!(t.elapsed() < Duration::from_secs(5), "no skip");
+            match changes.recv_timeout(Duration::from_millis(100)) {
+                Ok(StatusChange::Skipped { from, to }) if to - from >= 20 => break (from, to),
+                _ => {}
+            }
+        };
+        assert!(skip_to - skip_from >= 20, "{skip_from}..{skip_to}");
+        assert!(e.counters().blocks_withheld.load(Relaxed) >= skip_to - skip_from);
+        wait(&|| processed() > skip_to + 40);
+        for o in 0..2 {
+            // A block without a status was skipped by an overrun under
+            // load as well.
+            for k in skip_to..skip_to + 40 {
+                let Some(st) = e.block_status(o, k) else {
+                    continue;
+                };
+                assert_ne!(st.kind, Kind::Committed, "output {o}: {st:?}");
+                assert!(
+                    st.kind == Kind::Withheld || st.digest.is_none(),
+                    "output {o}: {st:?} is neither withheld nor a fill"
+                );
+            }
+        }
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// A block withheld in the ring withdraws the replica before the next
+    /// block takes its status: after a stall, with F past the ring and
+    /// its newest block withheld, the blocks before it commit, and the
+    /// first block computed after it does not commit at once, nor does
+    /// any later one without evidence.
+    #[test]
+    fn a_block_after_a_withheld_one_does_not_commit_at_once() {
+        use crate::blocks::{Cause, Kind, PAGE};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let id = "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d31";
+        // A catch-up long enough that the stall below skips nothing.
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "maxCatchupBlocks": 200,
+            "holdMs": 100,
+            "domains": [{ "name": "d", "path": domain }],
+            "outputs": [{ "name": "out", "domain": "d", "flowId": id, "label": "order",
+                          "group": "order", "role": "Audio", "channels": 1 }],
+            "matrix": [],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let process = rt::setup_process(&config.rt);
+        let (report_tx, _reports) = mpsc::sync_channel(1);
+        let replication = Replication {
+            voters: 2,
+            reports: report_tx,
+            statuses: None,
+        };
+        let e = Engine::start_replicated(config, process, None, replication).unwrap();
+        let processed = || e.counters().processed.load(Acquire);
+        wait(&|| e.status().outputs[0].realised);
+        e.set_fence(u64::MAX).unwrap();
+        let from = processed() + 2;
+        e.commit_from(0, from).unwrap();
+        let kp = (from * 48).next_multiple_of(PAGE) / 48;
+        wait(&|| processed() > kp + 5);
+        // F frozen: blocks wait fenced in the ring.
+        let f = processed() + 1;
+        e.set_fence(f * 48).unwrap();
+        wait(&|| processed() > f + 10);
+        crate::rt_loop::STALL_MS.store(60, Relaxed);
+        std::thread::sleep(Duration::from_millis(10));
+        // During the stall: the newest block in the ring withheld, F past
+        // all.
+        let stalled = processed();
+        e.withhold(0, stalled - 1, Cause::HoldCap).unwrap();
+        e.set_fence(u64::MAX).unwrap();
+        assert_eq!(processed(), stalled, "the RT thread did not stall");
+        wait(&|| processed() > stalled + 40);
+        let c = e.counters();
+        if c.overrun_skipped_samples.load(Relaxed) > 0 || c.hold_overflows.load(Relaxed) > 0 {
+            // Under load a skip or an overflow withdrew the replica
+            // before the stall ended: nothing left to check.
+            eprintln!("an overrun skip or a ring overflow: the check is left out");
+            e.stop();
+            std::fs::remove_dir_all(&domain).unwrap();
+            return;
+        }
+        for k in f..stalled - 1 {
+            assert_eq!(e.block_status(0, k).unwrap().kind, Kind::Committed);
+        }
+        for k in stalled..stalled + 40 {
+            let st = e.block_status(0, k).unwrap();
+            assert_ne!(st.kind, Kind::Committed, "{st:?}");
+        }
+        e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
     }
 

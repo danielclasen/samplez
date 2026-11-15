@@ -17,8 +17,8 @@ mod rt_loop;
 
 pub use config::Config;
 pub use engine::{
-    Engine, Entry, EntryError, GainError, GenerationStatus, InputState, InputStatus, OutputStatus,
-    Report, ResetError, Status,
+    ControlError, Engine, Entry, EntryError, GainError, GenerationStatus, InputState, InputStatus,
+    OutputStatus, Replication, Report, ResetError, Status,
 };
 pub use meters::OutputMeters;
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};

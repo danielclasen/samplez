@@ -10,7 +10,9 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::Release};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release,
+};
 
 use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
 use rtrb::{Consumer, Producer};
@@ -18,6 +20,8 @@ use samplez_dsp::{KWeighting, Matrix, PlanarBuffer, Ramp, TruePeak};
 use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{FlowWriter, Write};
 use samplez_mxl::{MxlApi, time};
+
+use crate::blocks::{Cause, Changes, Ctx, Hold, Kind, Sink, StatusChange, Statuses};
 
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
@@ -74,6 +78,16 @@ pub struct Counters {
     pub process_time_max_ns: AtomicU64,
     /// Minor page faults of the RT thread, read by the supervisor.
     pub rt_minor_faults: AtomicU64,
+    /// The block after the last one whose statuses are set, published
+    /// after them: the processed block index plus one.
+    pub processed: AtomicU64,
+    /// Blocks the RT thread withheld: skipped, overflowing the hold
+    /// ring, unfillable, or below a commit start it computed.
+    pub blocks_withheld: AtomicU64,
+    /// Blocks withheld because the hold ring was full.
+    pub hold_overflows: AtomicU64,
+    /// Status changes not sent because the change ring was full.
+    pub status_changes_dropped: AtomicU64,
 }
 
 /// Makes the RT loop panic once, for the panic containment test.
@@ -227,6 +241,51 @@ pub(crate) enum Command {
     },
 }
 
+/// What the replicated state tells the RT thread about committing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Control {
+    /// Commit `output` from the first page boundary in a block at or
+    /// after `min_k`.
+    CommitFrom { output: usize, min_k: u64 },
+    /// Stop committing `output` at sample index `at`.
+    StopAt { output: usize, at: u64 },
+    /// The replica is withdrawn: every output commits through only.
+    Withdraw,
+    /// Entry `id`, at `at_index`, is unresolved: it degrades every block
+    /// from its index.
+    Unresolved { id: LogId, at_index: u64 },
+    /// Entry `id` is decided.
+    Resolved { id: LogId },
+}
+
+/// Unresolved entries the RT thread holds, and the capacity of the
+/// control ring.
+pub(crate) const UNRESOLVED: usize = 64;
+
+/// What the RT thread and the replicated state share.
+pub(crate) struct Shared {
+    /// F, the end of the highest block up to which every block is
+    /// B1-valid: blocks ending above it are fenced.
+    pub fence: AtomicU64,
+    /// This replica's rank, fixed into a block's status when F passes it.
+    pub rank: AtomicU64,
+    /// The kernel clock is unsynchronised: blocks carry no digest.
+    pub self_report: AtomicBool,
+    /// Per output.
+    pub statuses: Vec<Statuses>,
+}
+
+/// The RT thread's part of a replicated engine.
+pub(crate) struct Replica {
+    pub shared: Arc<Shared>,
+    pub changes: Producer<StatusChange>,
+    pub control: Consumer<Control>,
+    /// Unresolved entries, by log id. Capacity [`UNRESOLVED`].
+    pub unresolved: Vec<(LogId, u64)>,
+    /// The log ids of one block's digest.
+    pub ids: Vec<LogId>,
+}
+
 /// The index of a log entry in the log that orders it.
 pub type LogId = u64;
 
@@ -307,6 +366,8 @@ pub(crate) struct Out {
     /// The first block written: the newest due block at handover.
     pub first_k: u64,
     pub meter: OutMeter,
+    /// Statuses and the hold ring, in replicated mode.
+    pub hold: Hold,
 }
 
 /// Samples of a meter slice: 10 ms at 48 kHz.
@@ -693,6 +754,34 @@ pub(crate) struct Rt {
     pub meter_seq: u64,
     pub counters: Arc<Counters>,
     pub stop: Arc<AtomicBool>,
+    /// Statuses, hold rings and fence, in replicated mode.
+    pub replica: Option<Replica>,
+}
+
+/// A member flow's writer as the hold ring's sink.
+struct WriterSink<'a> {
+    writer: &'a mut FlowWriter,
+    counters: &'a Counters,
+    wrote: bool,
+}
+
+impl Sink for WriterSink<'_> {
+    fn write(&mut self, start: u64, len: usize, data: &[f32], stride: usize) -> bool {
+        match self.writer.write(start, len, data, stride) {
+            Write::Committed => {
+                self.wrote = true;
+                true
+            }
+            Write::Held => {
+                add(&self.counters.output_held_blocks, 1);
+                false
+            }
+            Write::Failed(_) => {
+                add(&self.counters.output_failed_writes, 1);
+                false
+            }
+        }
+    }
 }
 
 pub(crate) const EMPTY_STATS: SlotStats = SlotStats {
@@ -730,6 +819,53 @@ fn clock_now(api: &MxlApi) -> u64 {
     #[cfg(test)]
     let now = now.saturating_add_signed(CLOCK_SHIFT_NS.load(Relaxed));
     now
+}
+
+/// What a block's statuses are set from now.
+fn ctx(shared: &Shared) -> Ctx {
+    Ctx {
+        fence: shared.fence.load(Acquire),
+        rank: shared
+            .rank
+            .load(Relaxed)
+            .min(u64::from(crate::blocks::MAX_RANK)) as u8,
+    }
+}
+
+/// The degradation digest of the block starting at `start`, from the
+/// inputs whose wanted read failed, the entries applied without their
+/// generation and the unresolved entries at or below `start`; none under
+/// a clock self-report.
+fn digest(r: &mut Replica, awaiting: &[RtEntry], start: u64, failed: u64) -> Option<u64> {
+    if r.shared.self_report.load(Relaxed) {
+        return None;
+    }
+    r.ids.clear();
+    r.ids.extend(awaiting.iter().map(|e| e.id));
+    r.ids
+        .extend(r.unresolved.iter().filter(|u| u.1 <= start).map(|u| u.0));
+    if r.ids.is_empty() && failed == 0 {
+        return Some(crate::blocks::HEALTHY);
+    }
+    r.ids.sort_unstable();
+    Some(crate::blocks::degraded_digest(&r.ids, failed))
+}
+
+/// The replica is withdrawn on every output.
+fn withdraw_all(outs: &mut [Out], r: &mut Replica, counters: &Counters) {
+    for (o, out) in outs.iter_mut().enumerate() {
+        if out.writer.is_none() {
+            continue;
+        }
+        let mut changes = Changes {
+            ring: &mut r.changes,
+            dropped: &counters.status_changes_dropped,
+            output: o as u32,
+        };
+        let w0 = out.hold.withheld;
+        out.hold.withdraw(&r.shared.statuses[o], &mut changes);
+        add(&counters.blocks_withheld, out.hold.withheld - w0);
+    }
 }
 
 impl Rt {
@@ -833,6 +969,7 @@ impl Rt {
             // entry's commit finds the entry pending.
             self.take_entries();
             self.drain_commands(newest.unwrap_or(0));
+            self.control();
             // After a backward clock step writers hold until the clock
             // passes their last commit, and inputs never read below their
             // last range.
@@ -842,6 +979,9 @@ impl Rt {
                 k,
             } = plan(next, newest, self.max_catchup, self.block);
             add(&self.counters.overrun_skipped_samples, skipped);
+            if skipped > 0 {
+                self.skipped(catchup.start - skipped / self.block, catchup.start);
+            }
             if !catchup.is_empty() {
                 for s in &mut self.statuses {
                     *s = GroupWait::Skipped;
@@ -933,12 +1073,120 @@ impl Rt {
                 Command::Writer { output, writer } => {
                     let out = &mut self.outs[output];
                     out.first_k = newest;
-                    if let Some(old) = out.writer.replace(writer) {
+                    if let Some(mut old) = out.writer.replace(writer) {
+                        // A new flow: nothing in the ring belongs to it.
+                        // The committed blocks still in it go to the old
+                        // flow they were committed for.
+                        if let Some(r) = &mut self.replica {
+                            let mut changes = Changes {
+                                ring: &mut r.changes,
+                                dropped: &self.counters.status_changes_dropped,
+                                output: output as u32,
+                            };
+                            let mut sink = WriterSink {
+                                writer: &mut old,
+                                counters: &self.counters,
+                                wrote: false,
+                            };
+                            out.hold.idle(
+                                &r.shared.statuses[output],
+                                &mut changes,
+                                &mut sink,
+                                Cause::Released,
+                            );
+                        }
+                        // One replica commits from the newest due block on.
+                        if out.hold.alone() {
+                            out.hold.commit_from(newest);
+                        }
                         self.give_back(Returned::Writer(old));
+                    } else if out.hold.alone() {
+                        out.hold.commit_from(newest);
                     }
                 }
             }
         }
+    }
+
+    /// Takes the replicated state's control messages.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn control(&mut self) {
+        let Some(r) = self.replica.as_mut() else {
+            return;
+        };
+        while let Ok(c) = r.control.pop() {
+            match c {
+                Control::CommitFrom { output, min_k } => self.outs[output].hold.commit_from(min_k),
+                Control::StopAt { output, at } => self.outs[output].hold.stop_at(at),
+                Control::Withdraw => withdraw_all(&mut self.outs, r, &self.counters),
+                Control::Unresolved { id, at_index } => {
+                    let u = &mut r.unresolved;
+                    // The engine admits at most UNRESOLVED.
+                    if let Err(n) = u.binary_search_by_key(&id, |e| e.0)
+                        && u.len() < UNRESOLVED
+                    {
+                        u.insert(n, (id, at_index));
+                    }
+                }
+                Control::Resolved { id } => r.unresolved.retain(|e| e.0 != id),
+            }
+        }
+    }
+
+    /// Blocks `[from, to)` were skipped: withheld at the skip, which
+    /// withdraws the replica.
+    fn skipped(&mut self, from: u64, to: u64) {
+        let Some(r) = self.replica.as_mut() else {
+            return;
+        };
+        add(&self.counters.blocks_withheld, to - from);
+        if r.changes.push(StatusChange::Skipped { from, to }).is_err() {
+            add(&self.counters.status_changes_dropped, 1);
+        }
+        withdraw_all(&mut self.outs, r, &self.counters);
+    }
+
+    /// Moves the blocks held in every output's ring and writes those
+    /// committed; one bit per output written. A status the supervisor
+    /// gave block `next` before it is computed withdraws the replica as
+    /// well.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn advance_holds(&mut self, next: u64) -> u64 {
+        let Some(r) = self.replica.as_mut() else {
+            return 0;
+        };
+        let mut withdraw = false;
+        let mut written = 0;
+        for (o, out) in self.outs.iter_mut().enumerate() {
+            let Some(writer) = out.writer.as_deref_mut() else {
+                continue;
+            };
+            let mut changes = Changes {
+                ring: &mut r.changes,
+                dropped: &self.counters.status_changes_dropped,
+                output: o as u32,
+            };
+            let mut sink = WriterSink {
+                writer,
+                counters: &self.counters,
+                wrote: false,
+            };
+            let ctx = ctx(&r.shared);
+            let statuses = &r.shared.statuses[o];
+            withdraw |= out
+                .hold
+                .advance(ctx, statuses, &mut changes, &mut sink)
+                .withdraw;
+            withdraw |= out.hold.mode() != crate::blocks::Mode::Idle
+                && statuses.get(next).is_some_and(|s| s.kind == Kind::Withheld);
+            if sink.wrote {
+                written |= 1 << o;
+            }
+        }
+        if withdraw {
+            withdraw_all(&mut self.outs, r, &self.counters);
+        }
+        written
     }
 
     /// Makes `generation` the one of input domain `domain` and hands the
@@ -1088,6 +1336,10 @@ impl Rt {
         let start = k * self.block;
         let mut silenced = 0u64;
         let mut fading = 0u64;
+        // Inputs whose wanted read failed: an up slot not copied (late,
+        // invalid, pruned, or held for its generation), and the outgoing
+        // flow of a crossfade not copied. Self-known degradations.
+        let mut failed = 0u64;
         for (i, slot) in self.slots.iter_mut().enumerate() {
             let dst = &mut self.scratch[..slot.channels * b];
             let generation = self.gens[slot.domain].as_deref();
@@ -1154,6 +1406,9 @@ impl Rt {
                     false
                 }
             };
+            if slot.up && !copied {
+                failed |= 1 << i;
+            }
             if let Some(pos) = xfade {
                 // new * up + old * down, the old flow's reader absent or
                 // failing counting as silence.
@@ -1171,6 +1426,9 @@ impl Rt {
                         let group = &self.statuses[slot.domain];
                         input.read(&mut slot.prev, k, group, old) == Outcome::Copy
                     });
+                if !old_copied {
+                    failed |= 1 << i;
+                }
                 for (ch, o) in dst.chunks_exact_mut(b).zip(old.chunks_exact_mut(b)) {
                     let (mut up, mut down) = (up, down);
                     up.process(ch);
@@ -1220,7 +1478,15 @@ impl Rt {
         let ramping = self.mix.ramping(k);
         self.mix.matrix.process(&self.inbuf, &mut self.outbuf, b);
 
-        let mut written = 0u64;
+        let digest = self
+            .replica
+            .as_mut()
+            .and_then(|r| digest(r, &self.awaiting_gen, start, failed));
+        // The held blocks move first: one found withheld, or block k
+        // withheld before it was computed, withdraws the replica before
+        // block k takes its status.
+        let mut written = self.advance_holds(k);
+        let mut withdraw = false;
         for (o, out) in self.outs.iter_mut().enumerate() {
             let Some(writer) = out.writer.as_deref_mut() else {
                 continue;
@@ -1232,12 +1498,41 @@ impl Rt {
             for (c, ch) in src.chunks_exact_mut(b).enumerate() {
                 ch.copy_from_slice(&self.outbuf.channel(out.first_channel + c)[..b]);
             }
-            match writer.write_block(k, src) {
-                Write::Committed => written |= 1 << o,
-                Write::Held => add(&self.counters.output_held_blocks, 1),
-                Write::Failed(_) => add(&self.counters.output_failed_writes, 1),
+            let Some(r) = self.replica.as_mut() else {
+                match writer.write_block(k, src) {
+                    Write::Committed => written |= 1 << o,
+                    Write::Held => add(&self.counters.output_held_blocks, 1),
+                    Write::Failed(_) => add(&self.counters.output_failed_writes, 1),
+                }
+                continue;
+            };
+            let ctx = ctx(&r.shared);
+            let statuses = &r.shared.statuses[o];
+            let mut changes = Changes {
+                ring: &mut r.changes,
+                dropped: &self.counters.status_changes_dropped,
+                output: o as u32,
+            };
+            let mut sink = WriterSink {
+                writer,
+                counters: &self.counters,
+                wrote: false,
+            };
+            let hold = &mut out.hold;
+            let (w0, o0) = (hold.withheld, hold.overflows);
+            withdraw |= hold
+                .compute(k, src, digest, ctx, statuses, &mut changes, &mut sink)
+                .withdraw;
+            add(&self.counters.blocks_withheld, hold.withheld - w0);
+            add(&self.counters.hold_overflows, hold.overflows - o0);
+            if sink.wrote {
+                written |= 1 << o;
             }
         }
+        if withdraw && let Some(r) = self.replica.as_mut() {
+            withdraw_all(&mut self.outs, r, &self.counters);
+        }
+        self.counters.processed.store(k + 1, Release);
 
         while let Ok(r) = self.resets.pop() {
             self.outs[r.output].meter.reset_at = Some(r.at_index.div_ceil(WINDOW) * WINDOW);
@@ -1628,6 +1923,50 @@ mod tests {
         // Past the ramp: the later entry's target holds.
         to(&mut m, 30);
         assert_eq!(m.matrix.gain(0, 0), 0.25);
+    }
+
+    fn replica() -> Replica {
+        let (changes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        Replica {
+            shared: Arc::new(Shared {
+                fence: AtomicU64::new(0),
+                rank: AtomicU64::new(0),
+                self_report: AtomicBool::new(false),
+                statuses: Vec::new(),
+            }),
+            changes,
+            control,
+            unresolved: Vec::with_capacity(UNRESOLVED),
+            ids: Vec::with_capacity(UNRESOLVED + PENDING_CHANGES),
+        }
+    }
+
+    /// The digest covers the inputs whose read failed, the entries
+    /// applied without their generation and the unresolved entries at or
+    /// below the block's start, sorted; a healthy block has the empty
+    /// digest, a clock self-report none.
+    #[test]
+    fn the_digest_names_every_self_known_degradation() {
+        use crate::blocks::{HEALTHY, degraded_digest};
+        let mut r = replica();
+        assert_eq!(digest(&mut r, &[], 10 * B, 0), Some(HEALTHY));
+        assert_eq!(
+            digest(&mut r, &[], 10 * B, 0b101),
+            Some(degraded_digest(&[], 0b101))
+        );
+        r.unresolved = vec![(3, 10 * B), (9, 11 * B)];
+        let awaiting = [entry(Change::InputUp { slot: 0 }, 5 * B)];
+        let want = {
+            let mut ids = vec![3, awaiting[0].id];
+            ids.sort_unstable();
+            degraded_digest(&ids, 0)
+        };
+        // Entry 9 is not due in the block at 10B.
+        assert_eq!(digest(&mut r, &awaiting, 10 * B, 0), Some(want));
+        assert_ne!(digest(&mut r, &awaiting, 11 * B, 0), Some(want));
+        r.shared.self_report.store(true, Relaxed);
+        assert_eq!(digest(&mut r, &awaiting, 10 * B, 0), None);
     }
 
     /// Input entries leave the pending list at the block of their index,
