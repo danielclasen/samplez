@@ -7,7 +7,10 @@
 //! a CRC-32C of its body and the body, the records of that write. A tail
 //! that holds no whole frame, as a write cut short by a crash leaves, is
 //! cut on open; a damaged frame with a whole one after it is corruption,
-//! and the store does not open. `snapshot` is replaced by rename.
+//! and the store does not open. Damage in the last frame, fsynced or not,
+//! looks the same as a torn write, so bit rot there is cut too and drops
+//! the acknowledged entries or vote it held. `snapshot` is replaced by
+//! rename.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
