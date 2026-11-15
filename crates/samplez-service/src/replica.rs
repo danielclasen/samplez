@@ -20,6 +20,8 @@ use crate::ws::{Delta, Snapshot};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicaInfo {
+    /// A DNS label, as a pod name is: [`crate::Service::new`] refuses
+    /// others ([`crate::ws::Sessions::new`]).
     pub id: String,
     /// As the replication mechanism names it.
     pub role: String,
