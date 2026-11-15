@@ -1463,7 +1463,10 @@ impl Supervisor {
     /// Builds a new generation of input domain `d` with every attached and
     /// wanted slot and hands it to the RT thread. Waits while a
     /// generation-needing entry's generation for `d` is built or held by
-    /// the RT thread, which would replace this one at its index.
+    /// the RT thread, which would replace this one at its index: until the
+    /// entry is committed, then until the RT thread reaches its index or
+    /// hands it back. A slot of `d` pruned meanwhile stays in the live
+    /// generation until then, silent.
     fn rebuild(&mut self, d: usize) {
         if self
             .jobs
