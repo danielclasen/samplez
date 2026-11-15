@@ -1118,10 +1118,14 @@ impl Rt {
                 // Each midpoint lies within half its bracket of the read
                 // of libmxl's clock.
                 if step.unsigned_abs() > u128::from(period + width.max(width0)) {
-                    add(&self.counters.clock_steps, 1);
+                    let offset_before = self.counters.tai_offset_s.load(Relaxed);
+                    // The offset sampled after the step is stored before the
+                    // step is counted: a reader that sees the count sees it.
+                    self.counters.tai_offset_s.store(offset, Relaxed);
+                    self.counters.clock_steps.fetch_add(1, Release);
                     self.send(Telemetry::ClockStep {
                         delta_ns: step as i64,
-                        offset_before: self.counters.tai_offset_s.load(Relaxed),
+                        offset_before,
                         offset_after: offset,
                     });
                     self.clock_step(next.unwrap_or(0) * self.block, step < 0);
