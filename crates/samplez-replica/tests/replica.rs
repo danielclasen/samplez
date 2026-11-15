@@ -148,6 +148,55 @@ async fn a_queued_submit_times_out_at_its_own_deadline() {
     assert_eq!(first.await.expect("joins").reason, Reason::Unavailable);
 }
 
+/// A command whose deadline passes while it queues behind a write that
+/// cannot commit is never ordered: it does not apply once that write goes
+/// through.
+#[tokio::test(start_paused = true)]
+async fn a_command_past_its_deadline_while_queued_never_applies() {
+    let mut set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let followers: Vec<_> = set_.ids().filter(|&id| id != leader).collect();
+    for &id in &followers {
+        set_.crash(id).await;
+    }
+    let replica = set_.replica(leader).clone();
+    // Proposed, not committed: no quorum while the followers are down.
+    let first = tokio::spawn({
+        let replica = replica.clone();
+        async move {
+            replica
+                .submit(&owner("s"), "a", Bytes::from("gain=1@1"))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The writer takes this entry once the first write times out and
+    // waits for it past the deadline of the command queued behind it.
+    replica.append(Body::LeaseRenew(vec![SessionKey::from_parts(
+        "anonymous",
+        "s",
+    )]));
+    let queued = replica
+        .submit(&owner("s"), "b", Bytes::from("pan=1@1"))
+        .await
+        .expect_err("not committed");
+    assert_eq!(queued.reason, Reason::Unavailable);
+    first.await.expect("joins").expect_err("no quorum");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // One follower back: the leader's log is the longest, so what it
+    // proposed commits.
+    set_.restart(followers[0]).await;
+    let leader = set_.leader().await;
+    set(&**set_.replica(leader), "s", "c", "mute=1@1").await;
+    set_.replica(leader).store().with_state(|sm| {
+        assert!(sm.product.values.contains_key("gain"), "the stalled write");
+        assert!(
+            !sm.product.values.contains_key("pan"),
+            "the expired command"
+        );
+    });
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_resend_after_failover_and_election_resolves_to_the_stored_revision() {
     let mut set_ = Set::start(Options::default()).await;
@@ -171,7 +220,8 @@ async fn a_resend_after_failover_and_election_resolves_to_the_stored_revision() 
 /// Submitted before the writer runs, so they form one entry: every
 /// command is applied in order with its own body, the product refusing
 /// the older seq that came later, and a copy of a command in the same
-/// entry is answered as a duplicate of it.
+/// entry is answered as its first copy resolved: an applied one as a
+/// duplicate, a stale one as stale.
 #[tokio::test(start_paused = true)]
 async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
     let set_ = Set::start(Options::default()).await;
@@ -181,6 +231,7 @@ async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
         ("t", "1", "gain=3@3"),
         ("s", "1", "gain=5@5"),
         ("s", "2", "pan=0@4"),
+        ("t", "1", "gain=3@3"),
     ]
     .map(|(session, id, command)| replica.submit(&owner(session), id, Bytes::from(command)));
     let mut revisions = Vec::new();
@@ -196,7 +247,8 @@ async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
             Resolution::Applied,
             Resolution::Stale,
             Resolution::Duplicate,
-            Resolution::Applied
+            Resolution::Applied,
+            Resolution::Stale
         ]
     );
     assert!(
