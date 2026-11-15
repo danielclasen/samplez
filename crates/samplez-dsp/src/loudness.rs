@@ -169,7 +169,7 @@ impl Loudness {
     /// short-term loudness restart after it, and the integrated loudness
     /// and the loudness range are invalid until [`Loudness::reset`].
     pub fn push(&mut self, index: u64, power: Option<f64>) {
-        if self.last.is_some_and(|l| index != l + 1) {
+        if self.last.is_some_and(|l| l.checked_add(1) != Some(index)) {
             self.gap();
         }
         self.last = Some(index);
@@ -180,7 +180,7 @@ impl Loudness {
         self.recent[index as usize % SHORT] = power;
         self.contiguous = (self.contiguous + 1).min(SHORT);
         self.measured += 1;
-        let window_end = (index + 1).is_multiple_of(PER_WINDOW);
+        let window_end = index % PER_WINDOW == PER_WINDOW - 1;
         if let Some(m) = self.mean(index, BLOCK).filter(|_| self.measured >= BLOCK) {
             self.max_momentary = Some(self.max_momentary.map_or(m, |x| x.max(m)));
             if window_end && m > P_ABS {
@@ -209,10 +209,12 @@ impl Loudness {
         if self.contiguous < windows {
             return None;
         }
-        // Oldest first, the same order on every replica.
+        // Oldest first, the same order on every replica. Reduced first,
+        // so no index overflows.
+        let (at, short) = (index % SHORT as u64, SHORT as u64);
         let mut sum = 0.0;
         for i in (0..windows as u64).rev() {
-            sum += self.recent[((index + SHORT as u64 - i) % SHORT as u64) as usize];
+            sum += self.recent[((at + short - i) % short) as usize];
         }
         Some(sum / windows as f64)
     }
@@ -346,6 +348,23 @@ mod tests {
             assert!((v.unwrap() + 23.0).abs() < 1e-9, "{v:?}");
         }
         assert_eq!(l.range(), Some(0.0));
+    }
+
+    /// Every slice index is accepted: the last ones before `u64::MAX`
+    /// measure like any others, and one after `u64::MAX` is a gap.
+    #[test]
+    fn indices_up_to_the_largest_do_not_overflow() {
+        let mut l = Loudness::new();
+        let first = u64::MAX - 999;
+        for w in first..=u64::MAX {
+            l.push(w, Some(power(-23.0)));
+        }
+        for v in [l.momentary(), l.short_term(), l.max_short_term()] {
+            assert!((v.unwrap() + 23.0).abs() < 1e-9, "{v:?}");
+        }
+        assert!((l.integrated().unwrap() + 23.0).abs() < 1e-9);
+        l.push(0, Some(power(-23.0)));
+        assert!(!l.valid());
     }
 
     /// Blocks below -70 LUFS and those 10 LU below the absolute-gated
