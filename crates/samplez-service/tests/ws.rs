@@ -9,14 +9,17 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::ws::Message;
 use common::*;
+use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, Sink, Stream, StreamExt};
-use samplez_service::replica::{Ack, Begin, Commands};
+use samplez_service::replica::{Ack, Begin, Commands, NotApplied, Reason};
 use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
     ClientQueue, Delta, Ended, Frame, Hub, MAX_PAUSE, MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES,
-    PING_PERIOD, PONG_TIMEOUT, Popped, Pushed, Sessions, serve_client,
+    PING_PERIOD, PONG_TIMEOUT, Popped, Pushed, Reply, Sessions, serve_client,
 };
-use samplez_service::{Connect, Forbidden, Identity, Ops, Owner, Position, ReplicatedState, Role};
+use samplez_service::{
+    Connect, Forbidden, Identity, Ops, Owner, OwnerHandle, Position, ReplicatedState, Role,
+};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite;
@@ -150,7 +153,16 @@ impl Client {
         let task = tokio::spawn(async move {
             serve_client(socket, &connect, &q, &*state, |m| {
                 let q = q.clone();
-                async move {
+                match &m {
+                    Message::Text(t) if t.as_str() == "beat" => {
+                        return Reply::Now(Some(Message::Text("beat back".into())));
+                    }
+                    Message::Text(t) if t.as_str() == "hang" => {
+                        return Reply::Command(Box::pin(std::future::pending()) as BoxFuture<_>);
+                    }
+                    _ => {}
+                }
+                Reply::Command(Box::pin(async move {
                     match m {
                         Message::Text(t) if t.starts_with("slow") => {
                             tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -163,7 +175,7 @@ impl Client {
                         }
                         _ => None,
                     }
-                }
+                }) as BoxFuture<'static, Option<Message>>)
             })
             .await
         });
@@ -476,7 +488,7 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
             };
             serve_client(socket, &connect, &queue, &*state, |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
-                std::future::pending::<Option<Message>>()
+                Reply::Command(std::future::pending::<Option<Message>>())
             })
             .await
         }
@@ -487,6 +499,54 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(calls.load(Ordering::Relaxed), MAX_PENDING_REPLIES);
     task.abort();
+}
+
+/// Heartbeats count against nothing: with replies one short of the limit
+/// waiting, they are still read and answered ahead of those, and the next
+/// command is read as well; it reaches the limit, and nothing is read until
+/// one of them is ready.
+#[tokio::test(start_paused = true)]
+async fn replies_sent_at_once_do_not_count_against_the_limit() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let start = Instant::now();
+    for _ in 1..MAX_PENDING_REPLIES {
+        client.tx.send(Ok(Message::Text("slow".into()))).unwrap();
+    }
+    for _ in 0..2 * MAX_PENDING_REPLIES {
+        client.tx.send(Ok(Message::Text("beat".into()))).unwrap();
+    }
+    for _ in 0..2 * MAX_PENDING_REPLIES {
+        assert_eq!(client.next().await, "beat back");
+    }
+    assert_eq!(start.elapsed(), Duration::ZERO, "ahead of the slow replies");
+    client.tx.send(Ok(Message::Text("slow".into()))).unwrap();
+    client.tx.send(Ok(Message::Text("beat".into()))).unwrap();
+    assert_eq!(client.next().await, "slow done", "the limit reached");
+    assert_eq!(start.elapsed(), Duration::from_millis(1500));
+    let mut rest = Vec::new();
+    for _ in 0..MAX_PENDING_REPLIES {
+        rest.push(client.next().await);
+    }
+    rest.sort();
+    assert_eq!(rest.pop().as_deref(), Some("slow done"));
+    assert_eq!(rest.first().map(String::as_str), Some("beat back"));
+    assert!(rest[1..].iter().all(|m| m == "slow done"), "{rest:?}");
+}
+
+/// A heartbeat answer does not wait for the first catch-up, which can take
+/// longer than the client waits for one.
+#[tokio::test(start_paused = true)]
+async fn a_reply_sent_at_once_goes_out_before_the_first_catch_up() {
+    let state = FakeState::new("r1", "leader");
+    *state.snapshot_delay.lock().unwrap() = Duration::from_millis(500);
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    client.tx.send(Ok(Message::Text("beat".into()))).unwrap();
+    assert_eq!(client.next().await, "beat back");
+    assert_eq!(client.next().await, "snapshot@7:0");
 }
 
 /// Replies that never resolve, to a client that never answers a ping: a
@@ -506,7 +566,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
             from_client,
         };
         serve_client(socket, &connect, &queue, &*state, |_| {
-            std::future::pending::<Option<Message>>()
+            Reply::Command(std::future::pending::<Option<Message>>())
         })
         .await
     });
@@ -541,9 +601,11 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause()
             to_client,
             from_client,
         };
-        serve_client(socket, &connect, &queue, &*state, |_| async move {
-            tokio::time::sleep(reply).await;
-            Some(Message::Text("done".into()))
+        serve_client(socket, &connect, &queue, &*state, |_| {
+            Reply::Command(async move {
+                tokio::time::sleep(reply).await;
+                Some(Message::Text("done".into()))
+            })
         })
         .await
     });
@@ -880,9 +942,11 @@ async fn a_send_while_not_read_does_not_outlast_the_pause() {
             until: ready + Duration::from_millis(500),
             stall: None,
         };
-        serve_client(socket, &connect, &queue, &*state, |_| async move {
-            tokio::time::sleep_until(ready).await;
-            Some(Message::Text("done".into()))
+        serve_client(socket, &connect, &queue, &*state, |_| {
+            Reply::Command(async move {
+                tokio::time::sleep_until(ready).await;
+                Some(Message::Text("done".into()))
+            })
         })
         .await
     });
@@ -921,9 +985,11 @@ async fn a_reply_ready_as_the_pause_ends_does_not_resume_the_connection() {
                 to_client,
                 from_client,
             };
-            serve_client(socket, &connect, &queue, &*state, |_| async move {
-                tokio::time::sleep_until(end).await;
-                Some(Message::Text("done".into()))
+            serve_client(socket, &connect, &queue, &*state, |_| {
+                Reply::Command(async move {
+                    tokio::time::sleep_until(end).await;
+                    Some(Message::Text("done".into()))
+                })
             })
             .await
         });
@@ -1015,6 +1081,69 @@ fn owner(session: &str) -> Owner {
         role: Role::Operator,
         connection: "r1:1".into(),
     }
+}
+
+/// Records published to clients and logs name a session by its handle:
+/// base64url of the first 16 bytes of the SHA-256 of the session id, as
+/// faderz's client computes it to recognise its own.
+#[test]
+fn an_owner_shows_a_one_way_handle_of_its_session() {
+    let session = "Zm9yLXRoZS1oYW5kbGUtdGVzdA";
+    let owner = owner(session);
+    assert_eq!(owner.handle().as_str(), "x5EMvQbzpnhsqp4w__cJbQ");
+    assert_eq!(OwnerHandle::of("").to_string(), "47DEQpj8HBSa-_TImW-5JA");
+    assert_eq!(
+        serde_json::to_value(owner.handle()).unwrap(),
+        "x5EMvQbzpnhsqp4w__cJbQ"
+    );
+
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut connect = connect(&sessions, Role::Operator, None, 1);
+    connect.owner = owner.clone();
+    for logged in [format!("{owner:?}"), format!("{connect:?}")] {
+        assert!(!logged.contains(session), "{logged}");
+        assert!(logged.contains("x5EMvQbzpnhsqp4w__cJbQ"), "{logged}");
+    }
+}
+
+/// faderz's command ids are UUIDs in their text form.
+#[tokio::test]
+async fn uuid_command_ids_apply_once_as_faderz_sends_them() {
+    let state = FakeState::new("r1", "leader");
+    let commands = Commands::new(state.clone(), 2);
+    let s1 = owner("s1");
+    let id = "0b9c6f1e-3d5a-4c2b-9e8f-7a6b5c4d3e2f";
+    let Begin::New(pending) = commands.begin(&s1, id) else {
+        panic!("new");
+    };
+    let submitted = pending.submit(command());
+    state.commit();
+    let ack = submitted.await.unwrap();
+    assert_eq!(ack.command, id);
+    match commands.begin(&s1, id) {
+        Begin::Duplicate(again) => assert_eq!(again, ack),
+        _ => panic!("applied"),
+    }
+    assert!(matches!(
+        commands.begin(&s1, &id.to_uppercase()),
+        Begin::New(_)
+    ));
+}
+
+/// Every reason maps to the product's "not applied" answer.
+#[test]
+fn not_applied_is_503_with_its_reason() {
+    let expired = NotApplied::new(Reason::Expired, "first received 12 s ago");
+    assert_eq!(NotApplied::STATUS.as_u16(), 503);
+    assert_eq!(
+        expired.to_string(),
+        "not applied (expired): first received 12 s ago"
+    );
+    assert_eq!(
+        NotApplied::new(Reason::NotCommitable, "").to_string(),
+        "not applied (not_commitable)"
+    );
+    assert_eq!(Reason::Unavailable.as_str(), "unavailable");
 }
 
 #[tokio::test]
@@ -1225,7 +1354,10 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
                 assert_eq!(connect.owner.role, Role::Operator);
                 assert!(connect.owner.connection.starts_with("r1:"));
                 let queue = hub.subscribe();
-                serve_client(socket, &connect, &queue, &*state, |_| async { None }).await;
+                serve_client(socket, &connect, &queue, &*state, |_| {
+                    Reply::Command(async { None })
+                })
+                .await;
             }
         }
     });
@@ -1375,7 +1507,10 @@ async fn a_client_that_stops_reading_ends_one_second_after_it_connected() {
         let state = state.clone();
         async move {
             let socket = StuckSocket { sent: 0 };
-            serve_client(socket, &connect, &queue, &*state, |_| async { None }).await
+            serve_client(socket, &connect, &queue, &*state, |_| {
+                Reply::Command(async { None })
+            })
+            .await
         }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;

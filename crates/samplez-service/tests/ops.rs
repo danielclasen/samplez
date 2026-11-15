@@ -45,7 +45,7 @@ async fn healthz_follows_the_heartbeat_within_one_second() {
 }
 
 #[tokio::test]
-async fn readyz_is_api_serving_and_engine_started_whatever_the_role() {
+async fn readyz_is_api_serving_engine_started_and_the_replicated_term_whatever_the_role() {
     let ops = Ops::default();
     let state = FakeState::new("r2", "follower");
     let mut config = config("none", "readyz");
@@ -70,8 +70,25 @@ async fn readyz_is_api_serving_and_engine_started_whatever_the_role() {
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
         body["replica"],
-        serde_json::json!({ "id": "r2", "role": "follower", "leader": "r1", "inSync": true, "lag": 0 })
+        serde_json::json!({
+            "id": "r2", "role": "follower", "leader": "r1", "inSync": true, "lag": 0,
+            "ready": true, "commitable": true,
+        })
     );
+
+    state.replica.lock().unwrap().commitable = false;
+    let (code, _, body) = readyz().await;
+    assert_eq!(code, StatusCode::OK, "taking no writes does not enter it");
+    assert!(body.contains("\"commitable\":false"), "{body}");
+    state.replica.lock().unwrap().ready = false;
+    let (code, _, body) = readyz().await;
+    assert_eq!(
+        code,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the replicated term is false"
+    );
+    assert!(body.contains("\"ready\":false"), "{body}");
+    state.replica.lock().unwrap().ready = true;
 
     ops.set_engine_started(false);
     assert_eq!(

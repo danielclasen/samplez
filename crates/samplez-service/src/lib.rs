@@ -25,7 +25,7 @@ pub use auth::{Identity, Role};
 pub use config::ServiceConfig;
 pub use metrics::{Counter, Histogram, Metrics};
 pub use ops::{Heartbeat, Ops};
-pub use replica::{Owner, Position, ReplicaInfo, ReplicatedState};
+pub use replica::{Owner, OwnerHandle, Position, ReplicaInfo, ReplicatedState};
 pub use server::{
     Bound, Connect, Forbidden, Routers, SecretStatus, Service, ServiceStatus, StatusSource,
 };

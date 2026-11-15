@@ -218,7 +218,9 @@ impl Service {
     /// encoding and length only, not the randomness. It is taken as the
     /// client sends it and identifies nobody: a client can send another
     /// client's session id. Without it the session is the connection id,
-    /// new for every connection.
+    /// new for every connection. The service logs no request URI, and the
+    /// `Debug` output of [`Connect`] shows the session's [`Owner::handle`]
+    /// in place of the session.
     pub fn ws<F, Fut>(mut self, handler: F) -> Service
     where
         F: Fn(WebSocket, Connect) -> Fut + Send + Sync + 'static,
