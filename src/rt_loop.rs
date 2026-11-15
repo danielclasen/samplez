@@ -243,6 +243,8 @@ pub(crate) struct MeterRecord {
     pub true_peak: f32,
     /// Sum of squares of the K-weighted samples.
     pub sum_sq: f64,
+    /// Sum of squares of the samples, unweighted.
+    pub plain_sum_sq: f64,
     /// The loudness measurement restarts with this slice: the
     /// K-weighting started from silence at its first sample.
     pub reset: bool,
@@ -272,6 +274,7 @@ pub(crate) struct OutMeter {
     pub peak: Vec<f32>,
     pub true_peak: Vec<f32>,
     pub sum_sq: Vec<f64>,
+    pub plain_sum_sq: Vec<f64>,
 }
 
 impl OutMeter {
@@ -286,6 +289,7 @@ impl OutMeter {
             peak: vec![0.0; channels],
             true_peak: vec![0.0; channels],
             sum_sq: vec![0.0; channels],
+            plain_sum_sq: vec![0.0; channels],
         }
     }
 
@@ -324,11 +328,13 @@ impl OutMeter {
             for c in 0..self.peak.len() {
                 let x = &buf.channel(first + c)[n..n + len];
                 let peak = &mut self.peak[c];
+                let plain = &mut self.plain_sum_sq[c];
                 for &v in x {
                     let a = v.abs();
                     if a > *peak || a.is_nan() {
                         *peak = a;
                     }
+                    *plain += f64::from(v) * f64::from(v);
                 }
                 let tp = self.tp.process(c, x);
                 if tp > self.true_peak[c] || tp.is_nan() {
@@ -359,6 +365,7 @@ impl OutMeter {
                 peak: self.peak[c],
                 true_peak: self.true_peak[c],
                 sum_sq: self.sum_sq[c],
+                plain_sum_sq: self.plain_sum_sq[c],
                 reset: self.reset,
             };
             *sink.seq += 1;
@@ -371,6 +378,7 @@ impl OutMeter {
         self.peak.fill(0.0);
         self.true_peak.fill(0.0);
         self.sum_sq.fill(0.0);
+        self.plain_sum_sq.fill(0.0);
     }
 }
 

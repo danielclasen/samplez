@@ -21,6 +21,10 @@ pub struct OutputMeters {
     /// Per channel, the largest absolute sample value of that window,
     /// full scale 1.0.
     pub peak: Vec<f32>,
+    /// Per channel, the RMS level of that window referenced to a sine
+    /// as in AES17: the root mean square times the square root of 2, so
+    /// a full-scale sine reads 1.0 (0 dB FS).
+    pub rms: Vec<f32>,
     /// Per channel, the true peak of that window per ITU-R BS.1770-5
     /// Annex 2, full scale 1.0.
     pub true_peak: Vec<f32>,
@@ -52,6 +56,9 @@ pub(crate) struct OutputLoudness {
     slice: Option<(u64, f64, bool, usize)>,
     window_peak: Vec<f32>,
     window_true_peak: Vec<f32>,
+    /// Per channel, the unweighted sum of squares of the window so far
+    /// and the samples it covers.
+    window_power: Vec<(f64, u64)>,
     /// The integrated loudness and the loudness range may have changed:
     /// a window ended, or a reset cleared them. Evaluating them walks
     /// every histogram bin, so they are evaluated only then.
@@ -75,11 +82,13 @@ impl OutputLoudness {
             slice: None,
             window_peak: vec![0.0; n],
             window_true_peak: vec![0.0; n],
+            window_power: vec![(0.0, 0); n],
             dirty: false,
             #[cfg(test)]
             evaluations: 0,
             meters: OutputMeters {
                 peak: vec![0.0; n],
+                rms: vec![0.0; n],
                 true_peak: vec![0.0; n],
                 max_true_peak: vec![0.0; n],
                 valid: true,
@@ -123,6 +132,9 @@ impl OutputLoudness {
         *next += 1;
         self.window_peak[c] = max(self.window_peak[c], r.peak);
         self.window_true_peak[c] = max(self.window_true_peak[c], r.true_peak);
+        let (sum, frames) = &mut self.window_power[c];
+        *sum += r.plain_sum_sq;
+        *frames += u64::from(r.frames);
         let m = &mut self.meters.max_true_peak[c];
         *m = max(*m, r.true_peak);
         if *next < self.weights.len() {
@@ -138,8 +150,16 @@ impl OutputLoudness {
             self.meters
                 .true_peak
                 .copy_from_slice(&self.window_true_peak);
+            for (rms, &(sum, frames)) in self.meters.rms.iter_mut().zip(&self.window_power) {
+                *rms = if frames == 0 {
+                    0.0
+                } else {
+                    (2.0 * sum / frames as f64).sqrt() as f32
+                };
+            }
             self.window_peak.fill(0.0);
             self.window_true_peak.fill(0.0);
+            self.window_power.fill((0.0, 0));
         }
         self.publish();
     }
@@ -179,6 +199,7 @@ mod tests {
             peak: 0.5,
             true_peak: 0.6,
             sum_sq,
+            plain_sum_sq: 0.0,
             reset: false,
         }
     }
@@ -230,6 +251,28 @@ mod tests {
         );
         feed(&mut l, 101..141);
         assert!(l.meters.integrated.is_some());
+    }
+
+    /// RMS is per window and referenced to a sine: a full-scale sine,
+    /// mean square 0.5, reads 1.0, one at half scale 0.5. A slice with
+    /// fewer samples counts by the samples it has.
+    #[test]
+    fn rms_reads_a_full_scale_sine_as_one() {
+        let mut l = OutputLoudness::new(vec![1.0, 1.0]);
+        for s in 0..20 {
+            for (c, ms) in [(0, 0.5), (1, 0.125)] {
+                let mut r = rec(0, c, s, 0.0);
+                if s == 15 {
+                    r.frames = 240;
+                }
+                r.plain_sum_sq = ms * f64::from(r.frames);
+                l.record(&r);
+            }
+        }
+        assert_eq!(
+            (l.meters.window, l.meters.rms.clone()),
+            (Some(1), vec![1.0, 0.5])
+        );
     }
 
     /// Integrated loudness and loudness range are evaluated once per

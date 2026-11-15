@@ -206,6 +206,7 @@ impl Engine {
             peak: 0.0,
             true_peak: 0.0,
             sum_sq: 0.0,
+            plain_sum_sq: 0.0,
             reset: false,
         };
         while meter_tx.push(blank).is_ok() {}
