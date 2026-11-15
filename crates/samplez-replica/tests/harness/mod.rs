@@ -120,6 +120,7 @@ pub struct Clock {
     /// Told on the next read: a test's hook into the moment a replica
     /// stamps an entry, between its leadership check and the proposal.
     on_read: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    stall: Mutex<Option<(u32, Duration, tokio::sync::oneshot::Sender<()>)>>,
 }
 
 impl Clock {
@@ -127,8 +128,34 @@ impl Clock {
         if let Some(read) = self.on_read.lock().expect("clock lock poisoned").take() {
             let _ = read.send(());
         }
+        let stalled = {
+            let mut stall = self.stall.lock().expect("clock lock poisoned");
+            match stall.take() {
+                Some((0, by, read)) => Some((by, read)),
+                Some((skip, by, read)) => {
+                    *stall = Some((skip - 1, by, read));
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some((by, read)) = stalled {
+            let _ = read.send(());
+            std::thread::sleep(by);
+        }
         let elapsed = self.base.elapsed().as_nanos() as u64 * RATE / 1_000_000_000;
         elapsed.saturating_add_signed(self.offset.load(Ordering::Relaxed))
+    }
+
+    /// Blocks the thread of the read after the next `skip` ones for `by`,
+    /// as of a writer the operating system does not run between its
+    /// leadership check and its proposal; resolves as that read starts.
+    /// Only for a multi-threaded runtime: on the test's own thread it would
+    /// stop everything.
+    pub fn stall_read(&self, skip: u32, by: Duration) -> tokio::sync::oneshot::Receiver<()> {
+        let (read, stalled) = tokio::sync::oneshot::channel();
+        *self.stall.lock().expect("clock lock poisoned") = Some((skip, by, read));
+        stalled
     }
 
     /// Resolves at the next read.
@@ -377,6 +404,7 @@ pub struct Options {
     /// The voters the leader reconciles the membership with; `None` leaves
     /// it as it is.
     pub wanted: Option<samplez_replica::membership::Voters>,
+    pub write_timeout: Duration,
 }
 
 impl Default for Options {
@@ -386,6 +414,7 @@ impl Default for Options {
             limits: Limits::defaults(RATE),
             raft: raft_config("test"),
             wanted: None,
+            write_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -417,6 +446,7 @@ impl Set {
                     base,
                     offset: AtomicI64::new(0),
                     on_read: Mutex::new(None),
+                    stall: Mutex::new(None),
                 };
                 (id, Arc::new(clock))
             })
@@ -477,6 +507,7 @@ impl Set {
                     base,
                     offset: AtomicI64::new(0),
                     on_read: Mutex::new(None),
+                    stall: Mutex::new(None),
                 })
             })
             .clone();
@@ -485,7 +516,7 @@ impl Set {
             epoch: CLUSTER,
             limits: self.options.limits,
             block: BLOCK,
-            write_timeout: Duration::from_secs(2),
+            write_timeout: self.options.write_timeout,
             addr: id.to_string(),
             peers: self.ids().map(|id| id.to_string()).collect(),
             voters: self.options.wanted,

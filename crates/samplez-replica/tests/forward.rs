@@ -501,6 +501,52 @@ async fn quiesce_waits_for_a_proposal_that_raced_its_flag() {
     }
 }
 
+/// A proposal whose writer the operating system did not run for longer
+/// than quiesce takes to see two quiet checks, between its leadership
+/// check and its proposal, holds quiesce back until it is committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quiesce_waits_for_a_proposal_whose_writer_was_not_running() {
+    let mut options = Options {
+        // Real time on a host that may be loaded.
+        write_timeout: Duration::from_secs(10),
+        ..Options::default()
+    };
+    // No election while a worker thread is blocked.
+    options.raft.election_timeout_min = 4000;
+    options.raft.election_timeout_max = 5000;
+    let set_ = Set::start(options).await;
+    let leader = set_.leader().await;
+    let replica = set_.replica(leader).clone();
+    // The first read stamps the command at receipt, the second the entry.
+    let stamped = set_.clock(leader).stall_read(1, Duration::from_millis(500));
+    let submitted = tokio::spawn({
+        let replica = replica.clone();
+        async move {
+            let ack = replica
+                .submit(&owner("s"), "1", Bytes::from("gain=1@1"))
+                .await
+                .expect("committed");
+            (ack, Instant::now())
+        }
+    });
+    stamped.await.expect("stamped");
+    replica.quiesce(Duration::from_secs(5)).await;
+    let quiesced_at = Instant::now();
+    let (ack, committed_at) = submitted.await.expect("joins");
+    assert!(
+        committed_at <= quiesced_at,
+        "quiesce returned {:?} before the entry committed",
+        committed_at - quiesced_at
+    );
+    let metrics = replica.raft().metrics().borrow().clone();
+    let last = metrics.last_log_index.unwrap_or(0);
+    assert!(ack.revision > 0);
+    for id in others(&set_, leader) {
+        let matched = metrics.replication.as_ref().unwrap()[&id];
+        assert!(matched.is_some_and(|m| m.index >= last), "{id}");
+    }
+}
+
 /// A WebSocket made of two channels.
 struct ChannelSocket {
     to_client: tokio::sync::mpsc::UnboundedSender<Message>,
