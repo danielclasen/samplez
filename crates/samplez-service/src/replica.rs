@@ -350,6 +350,9 @@ pub enum Reason {
     /// still deduplicates, so it is refused and never applied; whether to
     /// send it afresh under a new id is the client's decision.
     Expired,
+    /// The command is larger than the replication orders; it was not
+    /// ordered, and a resend is refused alike.
+    TooLarge,
 }
 
 impl Reason {
@@ -358,6 +361,7 @@ impl Reason {
             Reason::Unavailable => "unavailable",
             Reason::NotCommitable => "not_commitable",
             Reason::Expired => "expired",
+            Reason::TooLarge => "too_large",
         }
     }
 }
