@@ -565,9 +565,17 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         };
         let stored: StoredSnapshot = serde_json::from_slice(&bytes).map_err(|e| read_error(&e))?;
         let _installing = self.snapshots.lock().await;
-        // The file first, so a failed write leaves the state as the file
-        // on disk holds it.
-        let dir = self.lock().dir.clone();
+        // Loaded beside the state, then written, then swapped in: a
+        // snapshot that does not load or a failed write leaves the state
+        // and the file as they were.
+        let (dir, limits) = {
+            let inner = self.lock();
+            (inner.dir.clone(), inner.limits)
+        };
+        let mut sm = StateMachine::new(P::default(), limits);
+        let at = stored.last_applied.map_or(0, |id| id.index);
+        sm.load(stored.state.clone(), limits, at)
+            .map_err(|e| read_error(&e))?;
         blocking(move || replace(&dir, "snapshot", &bytes))
             .await
             .map_err(|e| {
@@ -577,12 +585,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
                 )
             })?;
         let mut inner = self.lock();
-        let limits = inner.limits;
-        let at = stored.last_applied.map_or(0, |id| id.index);
-        inner
-            .sm
-            .load(stored.state.clone(), limits, at)
-            .map_err(|e| read_error(&e))?;
+        inner.sm = sm;
         inner.last_applied = stored.last_applied;
         inner.membership = stored.membership.clone();
         inner.snapshot = Some(stored);
@@ -916,6 +919,43 @@ mod tests {
         let second = store.build_snapshot().await.expect("build").meta;
         assert_eq!(first.last_log_id, second.last_log_id);
         assert_ne!(first.snapshot_id, second.snapshot_id);
+    }
+
+    /// A snapshot that decodes but does not load leaves the state and the
+    /// snapshot on disk as they were.
+    #[tokio::test]
+    async fn a_snapshot_that_does_not_load_leaves_the_file_alone() {
+        let mut store = open(&dir("snap-bad-from"));
+        let entries: Vec<_> = (1..=3).map(entry).collect();
+        store.append_to_log(entries.clone()).await.expect("append");
+        store.apply_to_state_machine(&entries).await.expect("apply");
+        let snapshot = store.build_snapshot().await.expect("build");
+        let mut stored: StoredSnapshot =
+            serde_json::from_slice(snapshot.snapshot.get_ref()).expect("decodes");
+        stored.state.product = b"not the product's state".to_vec();
+        let to = dir("snap-bad-to");
+        let mut other = open(&to);
+        other
+            .append_to_log(entries[..1].to_vec())
+            .await
+            .expect("append");
+        other
+            .apply_to_state_machine(&entries[..1])
+            .await
+            .expect("apply");
+        other.build_snapshot().await.expect("build");
+        let file = fs::read(to.join("snapshot")).expect("snapshot");
+        let before = other.with_state(|sm| sm.save());
+        let installed = other
+            .install_snapshot(
+                &snapshot.meta,
+                Box::new(Cursor::new(serde_json::to_vec(&stored).expect("encodes"))),
+            )
+            .await;
+        assert!(installed.is_err());
+        assert_eq!(fs::read(to.join("snapshot")).expect("snapshot"), file);
+        assert_eq!(other.applied_index(), 1);
+        assert_eq!(other.with_state(|sm| sm.save()), before);
     }
 
     /// An install whose file cannot be written leaves the state as it was,

@@ -10,8 +10,10 @@ use crate::entry::{
 };
 use crate::snapshot::Replicated;
 
-/// The product's state, applied in log order on every replica.
-pub trait Product: Send + 'static {
+/// The product's state, applied in log order on every replica. A
+/// snapshot install loads into a [`Default`] one before it replaces the
+/// state.
+pub trait Product: Default + Send + 'static {
     /// Applies one command. A command whose second application could undo
     /// a later one's effect carries the ordering its apply needs and is
     /// refused as [`Effect::Stale`] when older, with no effect: a copy can
