@@ -101,7 +101,9 @@ pub enum Reply<Fut> {
     /// Sent at once, ahead of replies still waiting and before the first
     /// catch-up, and counted against nothing; `None` sends nothing. For
     /// messages that carry no state, such as heartbeats, whose answer must
-    /// not wait on a commit or a snapshot. While [`MAX_PENDING_REPLIES`]
+    /// not wait on a commit or a snapshot; never for the answer to a
+    /// command, such as its refusal, which would overtake the answers to
+    /// the commands before it. While [`MAX_PENDING_REPLIES`]
     /// [`Reply::Command`] replies wait the connection is not read, so a
     /// message answered with `Now` waits as well.
     Now(Option<Message>),
