@@ -16,6 +16,7 @@ use std::io::{self, Cursor, Read, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use openraft::storage::{LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot};
 use openraft::{
@@ -384,9 +385,14 @@ impl<P: Product> RaftSnapshotBuilder<TypeConfig> for Store<P> {
             let mut inner = self.lock();
             inner.snapshots_built += 1;
             let last = inner.last_applied;
+            // The build time keeps ids apart across restarts, where the
+            // count starts again.
+            let started = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos());
             let snapshot = StoredSnapshot {
                 id: format!(
-                    "{}-{}",
+                    "{}-{started}-{}",
                     last.map_or(0, |id| id.index),
                     inner.snapshots_built
                 ),
@@ -864,6 +870,21 @@ mod tests {
             .expect("install");
         assert_eq!(other.with_state(|sm| sm.save()), saved);
         assert_eq!(other.applied_index(), 3);
+    }
+
+    #[tokio::test]
+    async fn snapshot_ids_do_not_repeat_after_a_restart() {
+        let dir = dir("snap-ids");
+        let mut store = open(&dir);
+        let entries: Vec<_> = (1..=3).map(entry).collect();
+        store.append_to_log(entries.clone()).await.expect("append");
+        store.apply_to_state_machine(&entries).await.expect("apply");
+        let first = store.build_snapshot().await.expect("build").meta;
+        drop(store);
+        let mut store = open(&dir);
+        let second = store.build_snapshot().await.expect("build").meta;
+        assert_eq!(first.last_log_id, second.last_log_id);
+        assert_ne!(first.snapshot_id, second.snapshot_id);
     }
 
     /// An install whose file cannot be written leaves the state as it was,
