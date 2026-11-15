@@ -3,11 +3,11 @@
 //! which [`openraft::storage::Adaptor`] splits into its log store and state
 //! machine (the split traits are sealed without the `storage-v2` feature).
 //!
-//! `log` is an append-only file of records, each a length, a CRC-32C of
-//! its body and the body. A tail that holds no whole record, as a write
-//! cut short by a crash leaves, is cut on open; a damaged record with a
-//! whole one after it is corruption, and the store does not open.
-//! `snapshot` is replaced by rename.
+//! `log` is an append-only file of frames, one per write, each a length,
+//! a CRC-32C of its body and the body, the records of that write. A tail
+//! that holds no whole frame, as a write cut short by a crash leaves, is
+//! cut on open; a damaged frame with a whole one after it is corruption,
+//! and the store does not open. `snapshot` is replaced by rename.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -127,20 +127,23 @@ fn crc32c(bytes: &[u8]) -> u32 {
     })
 }
 
-/// A record's length and checksum, before its body.
+/// A frame's length and checksum, before its body.
 const HEAD: usize = 8;
 
-fn encode(record: &Record, out: &mut Vec<u8>) {
-    let body = serde_json::to_vec(record).expect("records encode");
-    let len = u32::try_from(body.len()).expect("record under 4 GiB");
+/// Frames `records` as one, so a crash in the write that appends them
+/// leaves one damaged frame at the tail, whichever of its pages reached
+/// the disk.
+fn encode(records: &[Record], out: &mut Vec<u8>) {
+    let body = serde_json::to_vec(records).expect("records encode");
+    let len = u32::try_from(body.len()).expect("frame under 4 GiB");
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(&crc32c(&body).to_le_bytes());
     out.extend_from_slice(&body);
 }
 
-/// The body of the record at `at` when a whole one is there: it fits and
-/// its checksum matches. No record is empty, so zeroes are none.
-fn record_at(bytes: &[u8], at: usize) -> Option<&[u8]> {
+/// The body of the frame at `at` when a whole one is there: it fits and
+/// its checksum matches. No frame is empty, so zeroes are none.
+fn frame_at(bytes: &[u8], at: usize) -> Option<&[u8]> {
     let head = bytes.get(at..at + HEAD)?;
     let len = u32::from_le_bytes(head[..4].try_into().expect("4 bytes")) as usize;
     let crc = u32::from_le_bytes(head[4..].try_into().expect("4 bytes"));
@@ -148,37 +151,37 @@ fn record_at(bytes: &[u8], at: usize) -> Option<&[u8]> {
     (len > 0 && crc32c(body) == crc).then_some(body)
 }
 
-/// The records of `bytes` and the length they take. Only a crash in an
-/// unsynced write leaves a damaged record, and then nothing whole after
-/// it: a damaged record with a whole one after it is corruption that
+/// The records of `bytes` and the length their frames take. Only a crash
+/// in an unsynced write leaves a damaged frame, and then nothing whole
+/// after it: a damaged frame with a whole one after it is corruption that
 /// cutting would turn into lost fsynced entries and votes.
 fn decode(bytes: &[u8]) -> io::Result<(Vec<Record>, usize)> {
     let mut records = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
-        let Some(body) = record_at(bytes, at) else {
-            if let Some(next) = (at + 1..bytes.len()).find(|&n| record_at(bytes, n).is_some()) {
+        let Some(body) = frame_at(bytes, at) else {
+            if let Some(next) = (at + 1..bytes.len()).find(|&n| frame_at(bytes, n).is_some()) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "the log record at offset {at} is damaged, and of the {} bytes \
-                         from there a whole record starts at offset {next}",
+                        "the log frame at offset {at} is damaged, and of the {} bytes \
+                         from there a whole frame starts at offset {next}",
                         bytes.len() - at
                     ),
                 ));
             }
             break;
         };
-        let record = serde_json::from_slice(body).map_err(|e| {
+        let frame: Vec<Record> = serde_json::from_slice(body).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "the log record at offset {at}, {} bytes, does not decode: {e}",
+                    "the log frame at offset {at}, {} bytes, does not decode: {e}",
                     body.len()
                 ),
             )
         })?;
-        records.push(record);
+        records.extend(frame);
         at += HEAD + body.len();
     }
     Ok((records, at))
@@ -264,12 +267,10 @@ impl<P: Product> Store<P> {
         })
     }
 
-    /// Appends `records` to `log`, fsynced with `sync`.
+    /// Appends `records` to `log` as one frame, fsynced with `sync`.
     async fn write(&self, records: &[Record], sync: bool) -> io::Result<()> {
         let mut out = Vec::new();
-        for record in records {
-            encode(record, &mut out);
-        }
+        encode(records, &mut out);
         let file = self.lock().file.clone();
         blocking(move || {
             (&*file).write_all(&out)?;
@@ -348,9 +349,7 @@ impl<P> Inner<P> {
         records.extend(self.last_purged.map(Record::Purge));
         records.extend(self.log.values().cloned().map(Record::Entry));
         let mut out = Vec::new();
-        for record in &records {
-            encode(record, &mut out);
-        }
+        encode(&records, &mut out);
         out
     }
 
@@ -742,17 +741,16 @@ mod tests {
         );
     }
 
-    /// A damaged record with whole ones after it is not a torn tail:
+    /// A damaged frame with whole ones after it is not a torn tail:
     /// cutting it would drop fsynced entries, so the store does not open
     /// and leaves the file as it is.
     #[tokio::test]
-    async fn a_damaged_record_before_whole_ones_refuses_to_open() {
+    async fn a_damaged_frame_before_whole_ones_refuses_to_open() {
         let dir = dir("damaged");
         let mut store = open(&dir);
-        store
-            .append_to_log((1..=3).map(entry))
-            .await
-            .expect("append");
+        for index in 1..=3 {
+            store.append_to_log([entry(index)]).await.expect("append");
+        }
         drop(store);
         let mut bytes = fs::read(dir.join("log")).expect("log");
         let len = bytes.len();
@@ -769,16 +767,47 @@ mod tests {
         );
     }
 
-    /// A flipped bit that leaves the body valid JSON is caught by the
-    /// checksum, not read back as another entry.
+    /// A crash in a write of several records can leave a later page of
+    /// it on disk and not an earlier one. The write is one frame, so that
+    /// is a torn tail and cut, not a damaged frame before whole ones.
     #[tokio::test]
-    async fn a_record_that_still_parses_is_caught_by_its_checksum() {
-        let dir = dir("bitflip");
+    async fn a_torn_write_of_several_records_is_cut() {
+        let dir = dir("torn-batch");
         let mut store = open(&dir);
         store
             .append_to_log((1..=2).map(entry))
             .await
             .expect("append");
+        let synced = fs::metadata(dir.join("log")).expect("log").len() as usize;
+        store
+            .append_to_log((3..=6).map(entry))
+            .await
+            .expect("append");
+        drop(store);
+        let mut bytes = fs::read(dir.join("log")).expect("log");
+        bytes[synced + HEAD..synced + HEAD + 32].fill(0);
+        fs::write(dir.join("log"), &bytes).expect("tear");
+        let mut store = open(&dir);
+        assert_eq!(
+            fs::metadata(dir.join("log")).expect("log").len() as usize,
+            synced
+        );
+        let entries = store.try_get_log_entries(1..).await.expect("entries");
+        assert_eq!(
+            entries.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    /// A flipped bit that leaves the body valid JSON is caught by the
+    /// checksum, not read back as another entry.
+    #[tokio::test]
+    async fn a_frame_that_still_parses_is_caught_by_its_checksum() {
+        let dir = dir("bitflip");
+        let mut store = open(&dir);
+        for index in 1..=2 {
+            store.append_to_log([entry(index)]).await.expect("append");
+        }
         drop(store);
         let mut bytes = fs::read(dir.join("log")).expect("log");
         let at = bytes
@@ -789,7 +818,7 @@ mod tests {
         bytes[at] = b'5';
         fs::write(dir.join("log"), &bytes).expect("damage");
         let Err(e) = Store::open(&dir, Paths::default(), Limits::defaults(48_000)) else {
-            panic!("read a damaged record back");
+            panic!("read a damaged frame back");
         };
         assert!(e.to_string().contains("offset 0"), "{e}");
     }
