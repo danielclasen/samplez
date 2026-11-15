@@ -130,6 +130,7 @@ fn a_writer_refuses_in_the_real_time_context() {
         role: "Audio",
         channels: 2,
         block: B,
+        batch: B,
     };
     let Creation::Created { writer: mut w, .. } = output::create(&instance, &cfg).unwrap() else {
         panic!("flow not created");

@@ -789,6 +789,7 @@ fn foreign_writer() {
         role: "Audio",
         channels: 1,
         block: B,
+        batch: B,
     };
     let Creation::Created { writer, .. } = output::create(&instance, &foreign).unwrap() else {
         panic!("foreign writer not created");

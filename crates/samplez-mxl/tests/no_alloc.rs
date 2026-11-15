@@ -65,6 +65,7 @@ fn rt_functions_do_not_allocate() {
         role: "Audio",
         channels: 2,
         block: B,
+        batch: B,
     };
     let Creation::Created {
         writer: mut out, ..
