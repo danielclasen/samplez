@@ -16,10 +16,10 @@ use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
     Admission, Answer, CatchUp, ClientQueue, Delta, Encode, Ended, Frame, Hub, MAX_PAUSE,
     MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES, PING_PERIOD, PONG_TIMEOUT, Popped, Pushed,
-    READ_INDEX_HOLD, Reply, Sessions, serve_client,
+    READ_INDEX_HOLD, Reply, Sent, Sessions, Slot, To, serve_client,
 };
 use samplez_service::{
-    Connect, Forbidden, Identity, Ops, Owner, OwnerHandle, Position, ReplicatedState, Role,
+    Connect, Forbidden, Identity, Metrics, Ops, Owner, OwnerHandle, Position, ReplicatedState, Role,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -84,6 +84,188 @@ async fn meters_and_counters_keep_their_latest_frame_and_meters_need_credit() {
     assert_eq!(q.push(meters(b"m4")), Pushed::Queued);
     assert_eq!(popped(&q).await, Popped::Frame(meters(b"m4")));
     assert_eq!(q.push(meters(b"m5")), Pushed::Skipped, "credits used up");
+}
+
+/// Nothing is waiting in the queue.
+async fn nothing_queued(queue: &ClientQueue) {
+    let got = tokio::time::timeout(Duration::from_millis(10), queue.pop()).await;
+    assert!(got.is_err(), "unexpected {got:?}");
+}
+
+fn text_frame(t: &str) -> Frame {
+    Frame::Text(t.to_owned().into())
+}
+
+/// Deltas and text frames pop in the order pushed, so a text frame never
+/// goes out after a delta pushed after it, nor ahead of one pushed before
+/// it. A delta overflow discards the text frames with the deltas: the
+/// catch-up carries the state they went with, and none pushed before it
+/// goes out after it.
+#[tokio::test]
+async fn text_frames_pop_in_push_order_with_deltas_and_go_with_a_resync() {
+    let q = ClientQueue::new(2);
+    assert_eq!(q.push(text_frame("t0")), Pushed::Queued);
+    assert_eq!(q.push(delta(1)), Pushed::Queued);
+    assert_eq!(q.push(text_frame("t1")), Pushed::Queued);
+    assert_eq!(q.push(delta(2)), Pushed::Queued);
+    assert_eq!(q.push(Frame::Counters("c".into())), Pushed::Queued);
+    assert_eq!(popped(&q).await, Popped::Frame(text_frame("t0")));
+    assert_eq!(popped(&q).await, Popped::Frame(delta(1)));
+    assert_eq!(popped(&q).await, Popped::Frame(text_frame("t1")));
+    assert_eq!(popped(&q).await, Popped::Frame(delta(2)));
+    assert_eq!(popped(&q).await, Popped::Frame(Frame::Counters("c".into())));
+
+    q.push(delta(3));
+    q.push(text_frame("before"));
+    q.push(delta(4));
+    assert_eq!(q.push(delta(5)), Pushed::Resync, "full");
+    assert_eq!(q.push(text_frame("after")), Pushed::Queued);
+    assert_eq!(popped(&q).await, Popped::Resync);
+    assert_eq!(popped(&q).await, Popped::Frame(text_frame("after")));
+    nothing_queued(&q).await;
+}
+
+/// A text frame that would overflow the queue is dropped, empties it and
+/// ends the connection, so the loss is never silent: the client catches up
+/// on a new one. Text frames are bounded apart from the deltas.
+#[tokio::test]
+async fn a_text_overflow_empties_the_queue_and_ends_the_connection() {
+    let q = ClientQueue::new(2);
+    q.push(delta(1));
+    q.push(delta(2));
+    assert_eq!(
+        q.push(text_frame("t1")),
+        Pushed::Queued,
+        "not counted as deltas"
+    );
+    assert_eq!(q.push(text_frame("t2")), Pushed::Queued);
+    assert_eq!(q.push(text_frame("t3")), Pushed::Dropped, "full");
+    assert!(q.is_empty());
+    assert_eq!(q.push(delta(3)), Pushed::Dropped, "ending");
+    assert_eq!(popped(&q).await, Popped::Overflow);
+    assert_eq!(popped(&q).await, Popped::Overflow, "until it ends");
+}
+
+const PACED: Slot = Slot {
+    name: "paced",
+    every: Duration::from_millis(100),
+};
+const UNPACED: Slot = Slot {
+    name: "unpaced",
+    every: Duration::ZERO,
+};
+
+fn status(slot: Slot, t: &str) -> Frame {
+    Frame::Status(slot, t.to_owned().into())
+}
+
+/// A status slot keeps its latest frame only, and one paced at 100 ms
+/// sends a client at most one frame per 100 ms however often the product
+/// pushes: the latest waits for the time, the slots apart from it do not.
+#[tokio::test(start_paused = true)]
+async fn status_frames_keep_their_latest_per_slot_and_are_paced() {
+    let q = ClientQueue::new(2);
+    assert_eq!(q.push(status(PACED, "p1")), Pushed::Queued);
+    assert_eq!(q.push(status(PACED, "p2")), Pushed::Replaced);
+    assert_eq!(q.push(status(UNPACED, "u1")), Pushed::Queued);
+    assert_eq!(popped(&q).await, Popped::Frame(status(PACED, "p2")));
+    assert_eq!(popped(&q).await, Popped::Frame(status(UNPACED, "u1")));
+    nothing_queued(&q).await;
+
+    let sent = Instant::now() - Duration::from_millis(10);
+    assert_eq!(q.push(status(PACED, "p3")), Pushed::Queued);
+    assert_eq!(q.push(status(UNPACED, "u2")), Pushed::Queued);
+    assert_eq!(popped(&q).await, Popped::Frame(status(UNPACED, "u2")));
+    assert_eq!(q.push(status(PACED, "p4")), Pushed::Replaced);
+    assert_eq!(popped(&q).await, Popped::Frame(status(PACED, "p4")));
+    assert_eq!(sent.elapsed(), Duration::from_millis(100), "paced");
+    assert_eq!(q.push(status(UNPACED, "u3")), Pushed::Queued);
+    assert_eq!(popped(&q).await, Popped::Frame(status(UNPACED, "u3")));
+    assert_eq!(sent.elapsed(), Duration::from_millis(100), "not paced");
+}
+
+fn owner_of(principal: &str, session: &str, connection: &str) -> Owner {
+    Owner {
+        principal: principal.into(),
+        session: session.into(),
+        role: Role::Operator,
+        connection: connection.into(),
+    }
+}
+
+/// A frame for a session reaches its connections only, under its
+/// principal only; one for its primary connections skips the ones not
+/// marked primary; one for a connection reaches that one, under its
+/// principal only. A dropped queue is reached by nothing, and a text frame
+/// that overflows a queue is counted as dropped, not reached.
+#[tokio::test]
+async fn frames_reach_the_session_its_primary_connections_or_one_connection() {
+    let metrics = Metrics::default();
+    let hub = Hub::new(1, &metrics);
+    let primary = hub.subscribe(&owner_of("alice", "s1", "r1:1"));
+    primary.set_primary(true);
+    let standby = hub.subscribe(&owner_of("alice", "s1", "r1:2"));
+    let other_principal = hub.subscribe(&owner_of("bob", "s1", "r1:3"));
+    let other_session = hub.subscribe(&owner_of("alice", "s2", "r1:4"));
+    let all = [&primary, &standby, &other_principal, &other_session];
+    let reached = |reached| Sent {
+        reached,
+        dropped: 0,
+    };
+
+    let s1 = To::Session {
+        principal: "alice",
+        session: "s1",
+    };
+    assert_eq!(hub.send(s1, text_frame("session")), reached(2));
+    for q in [&primary, &standby] {
+        assert_eq!(popped(q).await, Popped::Frame(text_frame("session")));
+    }
+    let to = To::Primary {
+        principal: "alice",
+        session: "s1",
+    };
+    assert_eq!(hub.send(to, text_frame("primary")), reached(1));
+    assert_eq!(popped(&primary).await, Popped::Frame(text_frame("primary")));
+    let to = |principal| To::Connection {
+        principal,
+        connection: "r1:4",
+    };
+    assert_eq!(hub.send(to("bob"), text_frame("not bob's")), reached(0));
+    assert_eq!(hub.send(to("alice"), text_frame("one")), reached(1));
+    assert_eq!(
+        popped(&other_session).await,
+        Popped::Frame(text_frame("one"))
+    );
+    for q in all {
+        nothing_queued(q).await;
+    }
+
+    assert_eq!(hub.publish(text_frame("every")), reached(4));
+    for q in all {
+        assert_eq!(popped(q).await, Popped::Frame(text_frame("every")));
+    }
+
+    assert_eq!(hub.send(s1, text_frame("waits")), reached(2));
+    primary.push(delta(1));
+    assert_eq!(primary.push(delta(2)), Pushed::Resync);
+    let sent = hub.send(s1, text_frame("over"));
+    assert_eq!(
+        sent,
+        Sent {
+            reached: 1,
+            dropped: 1
+        },
+        "the standby's is full"
+    );
+    assert_eq!(popped(&standby).await, Popped::Overflow);
+    assert!(
+        metrics
+            .render()
+            .contains("samplez_ws_text_overflows_total 1")
+    );
+    drop(other_session);
+    assert_eq!(hub.send(to("alice"), text_frame("gone")), reached(0));
 }
 
 /// A WebSocket made of two channels.
@@ -240,7 +422,7 @@ impl Client {
     /// grants a meter credit for the binary message `credit`. Sends nothing
     /// for the client.
     fn open(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
-        let queue = hub.subscribe();
+        let queue = hub.subscribe(&connect.owner);
         let state = state.clone();
         let (to_client, rx) = mpsc::unbounded_channel();
         let (tx, from_client) = mpsc::unbounded_channel();
@@ -367,7 +549,7 @@ fn apply(state: &FakeState, hub: &Hub) -> Delta {
 #[tokio::test(start_paused = true)]
 async fn connect_catches_up_from_the_last_seen_position() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     for _ in 0..3 {
         apply(&state, &hub);
     }
@@ -403,6 +585,109 @@ async fn connect_catches_up_from_the_last_seen_position() {
     }
 }
 
+/// Product frames pushed before the first catch-up wait for its answer,
+/// as deltas do, and go out as text messages. A text frame goes out in
+/// push order with the deltas: never after a delta pushed after it, never
+/// ahead of one pushed before it.
+#[tokio::test(start_paused = true)]
+async fn product_frames_go_out_as_text_in_push_order_with_deltas() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8, &Metrics::default());
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
+    let to = To::Session {
+        principal: "anonymous",
+        session: "s1",
+    };
+    assert_eq!(hub.send(to, text_frame("early")).reached, 1);
+    hub.publish(status(UNPACED, "status"));
+    client.silent().await;
+    client.tx.send(sync(None)).unwrap();
+    assert_eq!(client.next().await, "snapshot@7:0");
+    assert_eq!(client.next().await, "early");
+    assert_eq!(client.next().await, "status");
+
+    let one = To::Connection {
+        principal: "anonymous",
+        connection: "r1:1",
+    };
+    hub.send(one, text_frame("before"));
+    apply(&state, &hub);
+    hub.send(one, text_frame("after"));
+    apply(&state, &hub);
+    for expected in ["before", "delta@1", "after", "delta@2"] {
+        assert_eq!(client.next().await, expected);
+    }
+    client.silent().await;
+}
+
+/// A text frame pushed before a delta overflow goes with the deltas the
+/// catch-up replaces: the client gets the state, never the text after it.
+#[tokio::test(start_paused = true)]
+async fn no_text_pushed_before_a_resync_goes_out_after_its_catch_up() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(2, &Metrics::default());
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    // No await in between, so the client cannot drain the queue.
+    hub.publish(text_frame("stale"));
+    for _ in 0..3 {
+        apply(&state, &hub);
+    }
+    for expected in ["delta@1", "delta@2", "delta@3"] {
+        assert_eq!(client.next().await, expected);
+    }
+    client.silent().await;
+}
+
+/// A text frame that overflows the queue closes the connection, so the
+/// client catches up on a new one rather than missing it unseen.
+#[tokio::test(start_paused = true)]
+async fn a_text_overflow_closes_the_connection() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(1, &Metrics::default());
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    hub.publish(text_frame("t1"));
+    let sent = hub.publish(text_frame("t2"));
+    assert_eq!(
+        sent,
+        Sent {
+            reached: 0,
+            dropped: 1
+        }
+    );
+    assert_eq!(client.ended().await, Ended::Overflow);
+    let mut last = None;
+    while let Ok(m) = client.rx.try_recv() {
+        assert!(ping_of(&m).is_some() || m == Message::Close(None), "{m:?}");
+        last = Some(m);
+    }
+    assert_eq!(last, Some(Message::Close(None)));
+}
+
+/// A client above the read index is sent no text frame, as it is sent no
+/// delta, and its status frames wait until it is answered with state.
+#[tokio::test(start_paused = true)]
+async fn a_client_ahead_gets_no_text_and_its_statuses_wait() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8, &Metrics::default());
+    for _ in 0..3 {
+        apply(&state, &hub);
+    }
+    let mut client = Client::connect(&hub, &state, Some((7, 5)));
+    assert_eq!(client.next().await, "ahead@7:3 below 5");
+    hub.publish(text_frame("text"));
+    hub.publish(status(UNPACED, "status"));
+    hub.publish(Frame::Counters("c".into()));
+    assert_eq!(client.next().await, "c");
+    client.silent().await;
+    client.tx.send(sync(None)).unwrap();
+    assert_eq!(client.next().await, "snapshot@7:3");
+    assert_eq!(client.next().await, "status");
+    client.silent().await;
+}
+
 /// A state initialised anew or restored has another epoch: every client
 /// answered in the old one is closed, whether a delta of the new epoch
 /// reaches it or not, and a client reconnecting with its old position gets
@@ -410,7 +695,7 @@ async fn connect_catches_up_from_the_last_seen_position() {
 #[tokio::test(start_paused = true)]
 async fn an_epoch_change_closes_every_connection() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     for _ in 0..5 {
         apply(&state, &hub);
     }
@@ -453,7 +738,7 @@ async fn an_epoch_change_closes_every_connection() {
 #[tokio::test(start_paused = true)]
 async fn an_answer_of_another_epoch_closes_the_connection() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     *state.read_index.lock().unwrap() = Reads::Committed(1);
@@ -470,7 +755,7 @@ async fn an_answer_of_another_epoch_closes_the_connection() {
 #[tokio::test(start_paused = true)]
 async fn a_gap_in_prev_catches_up_from_the_state() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, Some((7, 0)));
     client.silent().await;
 
@@ -490,7 +775,7 @@ async fn a_gap_in_prev_catches_up_from_the_state() {
 #[tokio::test(start_paused = true)]
 async fn a_lagging_replica_answers_once_it_applied_the_read_index() {
     let follower = FakeState::new("r2", "follower");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     apply(&follower, &hub);
     *follower.read_index.lock().unwrap() = Reads::Committed(4);
 
@@ -517,7 +802,7 @@ async fn a_lagging_replica_answers_once_it_applied_the_read_index() {
 #[tokio::test(start_paused = true)]
 async fn a_follower_answers_once_it_applied_the_clients_position() {
     let follower = FakeState::new("r2", "follower");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     apply(&follower, &hub);
     *follower.read_index.lock().unwrap() = Reads::NotLeader;
     let mut client = Client::connect(&hub, &follower, Some((7, 3)));
@@ -542,7 +827,7 @@ async fn a_follower_answers_once_it_applied_the_clients_position() {
 #[tokio::test(start_paused = true)]
 async fn a_catch_up_held_for_two_seconds_answers_stale() {
     let follower = FakeState::new("r2", "follower");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     for _ in 0..3 {
         apply(&follower, &hub);
     }
@@ -569,7 +854,7 @@ async fn a_catch_up_held_for_two_seconds_answers_stale() {
 #[tokio::test(start_paused = true)]
 async fn a_replica_cut_off_answers_stale_at_once() {
     let state = FakeState::new("r2", "follower");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     for _ in 0..3 {
         apply(&state, &hub);
     }
@@ -592,7 +877,7 @@ async fn a_replica_cut_off_answers_stale_at_once() {
 #[tokio::test(start_paused = true)]
 async fn a_position_above_the_read_index_is_answered_ahead() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     for _ in 0..3 {
         apply(&state, &hub);
     }
@@ -616,7 +901,7 @@ async fn a_position_above_the_read_index_is_answered_ahead() {
 #[tokio::test(start_paused = true)]
 async fn a_full_catch_up_is_a_snapshot() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     for _ in 0..3 {
         apply(&state, &hub);
     }
@@ -633,7 +918,7 @@ async fn a_full_catch_up_is_a_snapshot() {
 #[tokio::test(start_paused = true)]
 async fn nothing_after_a_catch_up_request_is_read_until_it_is_answered() {
     let state = FakeState::new("r2", "follower");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     apply(&state, &hub);
     *state.read_index.lock().unwrap() = Reads::Committed(2);
     let sessions = Arc::new(Sessions::new("r2").unwrap());
@@ -667,7 +952,7 @@ async fn nothing_after_a_catch_up_request_is_read_until_it_is_answered() {
 async fn commands_after_a_promote_wait_until_its_position_is_applied() {
     let state = FakeState::new("r2", "follower");
     *state.read_index.lock().unwrap() = Reads::NotLeader;
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     apply(&state, &hub);
     let mut client = Client::connect(&hub, &state, Some((7, 1)));
     client.silent().await;
@@ -696,7 +981,7 @@ async fn commands_after_a_promote_wait_until_its_position_is_applied() {
 #[tokio::test(start_paused = true)]
 async fn a_promote_above_the_read_index_then_resync_is_answered_ahead() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     for _ in 0..3 {
         apply(&state, &hub);
     }
@@ -718,7 +1003,7 @@ async fn a_promote_above_the_read_index_then_resync_is_answered_ahead() {
 #[tokio::test(start_paused = true)]
 async fn a_command_after_a_promote_above_the_read_index_is_not_applied() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     for _ in 0..3 {
         apply(&state, &hub);
     }
@@ -748,7 +1033,7 @@ async fn a_command_after_a_promote_above_the_read_index_is_not_applied() {
 async fn a_promote_never_applied_ends_the_connection() {
     let state = FakeState::new("r2", "follower");
     *state.read_index.lock().unwrap() = Reads::NotLeader;
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     let start = Instant::now();
@@ -771,7 +1056,7 @@ async fn a_promote_never_applied_ends_the_connection() {
 #[tokio::test(start_paused = true)]
 async fn pings_are_the_products_with_the_time_since_the_connection_opened() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     let (mut ts, mut others) = (Vec::new(), Vec::new());
     while ts.len() < 4 {
@@ -790,12 +1075,56 @@ async fn pings_are_the_products_with_the_time_since_the_connection_opened() {
     client.silent().await;
 }
 
+/// No ping goes out before the client's first catch-up request, its hello:
+/// the product's protocol has the client identify itself first. The first
+/// ping goes out with the request, and they follow every ping period.
+#[tokio::test(start_paused = true)]
+async fn pings_start_with_the_first_catch_up() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8, &Metrics::default());
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(client.rx.try_recv().is_err(), "a ping before the hello");
+    client.tx.send(sync(None)).unwrap();
+    let (mut ts, mut others) = (Vec::new(), Vec::new());
+    while ts.len() < 3 {
+        let m = client.rx.recv().await.expect("serving");
+        match ping_of(&m) {
+            Some(t) => {
+                client.tx.send(pong(t)).unwrap();
+                ts.push(t);
+            }
+            None => others.push(m),
+        }
+    }
+    assert_eq!(ts, [600, 850, 1100]);
+    assert_eq!(others, [Message::Text("snapshot@7:0".into())]);
+    assert_eq!(sessions.live().len(), 1);
+}
+
+/// A client that never asks to catch up is sent nothing and closed once
+/// [`PONG_TIMEOUT`] passed since it was accepted, as one that stops
+/// answering pings is.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_sends_no_catch_up_is_closed_after_the_pong_timeout() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8, &Metrics::default());
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
+    let start = Instant::now();
+    assert_eq!(client.ended().await, Ended::PongTimeout);
+    assert_eq!(start.elapsed(), PONG_TIMEOUT);
+    assert_eq!(client.rx.recv().await, Some(Message::Close(None)));
+    assert!(sessions.live().is_empty());
+}
+
 /// The bursts below run without an await, so the client cannot drain the
 /// two-delta queue in between.
 #[tokio::test(start_paused = true)]
 async fn overflow_catches_up_from_the_last_sent_revision() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(2);
+    let hub = Hub::new(2, &Metrics::default());
     for _ in 0..3 {
         apply(&state, &hub);
     }
@@ -823,7 +1152,7 @@ async fn overflow_catches_up_from_the_last_sent_revision() {
 #[tokio::test(start_paused = true)]
 async fn meters_go_out_as_binary_against_credits_and_messages_reach_the_product() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
 
@@ -850,7 +1179,7 @@ async fn meters_go_out_as_binary_against_credits_and_messages_reach_the_product(
 #[tokio::test(start_paused = true)]
 async fn a_client_that_stops_answering_pings_is_closed_after_one_second() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     client.pong = false;
     let start = Instant::now();
@@ -866,7 +1195,7 @@ async fn a_client_that_stops_answering_pings_is_closed_after_one_second() {
 #[tokio::test(start_paused = true)]
 async fn a_slow_reply_keeps_the_heartbeat_and_the_order_of_replies() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     let start = Instant::now();
@@ -884,7 +1213,7 @@ async fn a_slow_reply_keeps_the_heartbeat_and_the_order_of_replies() {
 #[tokio::test(start_paused = true)]
 async fn replies_at_the_limit_slower_than_the_pong_timeout_keep_the_connection() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     let start = Instant::now();
@@ -907,7 +1236,7 @@ async fn replies_at_the_limit_slower_than_the_pong_timeout_keep_the_connection()
 #[tokio::test(start_paused = true)]
 async fn a_message_answered_now_with_nothing_sends_nothing_and_counts_nothing() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     let start = Instant::now();
@@ -932,7 +1261,7 @@ async fn a_message_answered_now_with_nothing_sends_nothing_and_counts_nothing() 
 async fn no_reply_goes_out_before_the_first_catch_up() {
     let state = FakeState::new("r1", "leader");
     *state.snapshot_delay.lock().unwrap() = Duration::from_millis(500);
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
     client.tx.send(text("hello")).unwrap();
@@ -947,7 +1276,7 @@ async fn no_reply_goes_out_before_the_first_catch_up() {
 #[tokio::test(start_paused = true)]
 async fn a_slow_snapshot_keeps_the_heartbeat() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     *state.snapshot_delay.lock().unwrap() = Duration::from_millis(1500);
@@ -964,7 +1293,7 @@ async fn a_slow_snapshot_keeps_the_heartbeat() {
 #[tokio::test(start_paused = true)]
 async fn a_reply_waits_for_a_catch_up_under_way() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     *state.snapshot_delay.lock().unwrap() = Duration::from_millis(1000);
@@ -982,7 +1311,7 @@ async fn a_reply_waits_for_a_catch_up_under_way() {
 #[tokio::test(start_paused = true)]
 async fn a_reply_after_an_epoch_change_closes_the_connection() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     client.silent().await;
@@ -1005,7 +1334,7 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8, &Metrics::default()).subscribe(&connect.owner);
     let (to_client, _rx) = mpsc::unbounded_channel();
     let (tx, from_client) = mpsc::unbounded_channel();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1038,7 +1367,7 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
 #[tokio::test(start_paused = true)]
 async fn replies_sent_at_once_do_not_count_against_the_limit() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     let start = Instant::now();
@@ -1072,7 +1401,7 @@ async fn replies_sent_at_once_do_not_count_against_the_limit() {
 async fn a_reply_sent_at_once_goes_out_before_the_first_catch_up() {
     let state = FakeState::new("r1", "leader");
     *state.snapshot_delay.lock().unwrap() = Duration::from_millis(500);
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
     client.tx.send(text("beat")).unwrap();
@@ -1088,7 +1417,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8, &Metrics::default()).subscribe(&connect.owner);
     let (to_client, _rx) = mpsc::unbounded_channel();
     let (tx, from_client) = mpsc::unbounded_channel();
     let start = Instant::now();
@@ -1123,7 +1452,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause()
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8, &Metrics::default()).subscribe(&connect.owner);
     let (to_client, _rx) = mpsc::unbounded_channel();
     let (tx, from_client) = mpsc::unbounded_channel();
     let reply = MAX_PAUSE - Duration::from_millis(100);
@@ -1165,7 +1494,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause()
 #[tokio::test(start_paused = true)]
 async fn a_connection_that_answered_before_the_limit_stays_live_while_not_read() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
@@ -1189,7 +1518,7 @@ async fn a_connection_that_answered_before_the_limit_stays_live_while_not_read()
 #[tokio::test(start_paused = true)]
 async fn a_client_answering_every_ping_stays_live_through_repeated_pauses() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
@@ -1232,7 +1561,7 @@ async fn a_client_answering_every_ping_stays_live_through_repeated_pauses() {
 #[tokio::test(start_paused = true)]
 async fn a_pause_does_not_count_against_the_pong_timeout_after_it_ends() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
@@ -1261,7 +1590,7 @@ async fn a_pause_does_not_count_against_the_pong_timeout_after_it_ends() {
 #[tokio::test(start_paused = true)]
 async fn a_pong_read_after_a_pause_counts_the_pause() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
@@ -1303,7 +1632,7 @@ async fn a_pong_read_after_a_pause_counts_the_pause() {
 #[tokio::test(start_paused = true)]
 async fn pongs_left_behind_a_backlog_do_not_keep_a_gone_peer_live() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
@@ -1342,7 +1671,7 @@ async fn pongs_left_behind_a_backlog_do_not_keep_a_gone_peer_live() {
 #[tokio::test(start_paused = true)]
 async fn a_pong_that_echoes_no_ping_does_not_count() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     client.pong = false;
     let start = Instant::now();
@@ -1375,7 +1704,7 @@ async fn a_pong_that_echoes_no_ping_does_not_count() {
 #[tokio::test(start_paused = true)]
 async fn an_unsolicited_pong_does_not_drop_the_pings_outstanding() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     let start = Instant::now();
@@ -1399,7 +1728,7 @@ async fn an_unsolicited_pong_does_not_drop_the_pings_outstanding() {
 #[tokio::test(start_paused = true)]
 async fn a_client_answering_every_third_ping_stays_connected() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     let start = Instant::now();
@@ -1419,12 +1748,14 @@ async fn a_client_answering_every_third_ping_stays_connected() {
 /// Answers every ping `delay` after it was sent, for 4 s or until the
 /// connection is closed: how it ended and when, if it did, and whether it
 /// was live throughout.
-async fn pongs_delayed_by(delay: Duration) -> (Option<(Ended, Duration)>, bool) {
+async fn pongs_delayed_by(hello: Duration, delay: Duration) -> (Option<(Ended, Duration)>, bool) {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
     let start = Instant::now();
+    tokio::time::sleep(hello).await;
+    client.tx.send(sync(None)).unwrap();
     let mut always_live = true;
     while start.elapsed() < 4 * PONG_TIMEOUT {
         match tokio::time::timeout(Duration::from_millis(50), client.rx.recv()).await {
@@ -1453,9 +1784,24 @@ async fn pongs_delayed_by(delay: Duration) -> (Option<(Ended, Duration)>, bool) 
 async fn the_round_trip_has_to_stay_below_the_pong_timeout_less_a_ping_period() {
     let ceiling = PONG_TIMEOUT - PING_PERIOD;
     let margin = Duration::from_millis(50);
-    assert_eq!(pongs_delayed_by(ceiling - margin).await, (None, true));
-    let (ended, _) = pongs_delayed_by(ceiling + margin).await;
+    let hello = Duration::ZERO;
+    assert_eq!(
+        pongs_delayed_by(hello, ceiling - margin).await,
+        (None, true)
+    );
+    let (ended, _) = pongs_delayed_by(hello, ceiling + margin).await;
     assert_eq!(ended, Some((Ended::PongTimeout, PONG_TIMEOUT)));
+}
+
+/// The pong timeout counts from the hello, as no ping went out before it:
+/// a client whose hello is read just inside it keeps the connection, and
+/// stays live, with the slowest round trip allowed.
+#[tokio::test(start_paused = true)]
+async fn a_late_hello_has_the_whole_pong_timeout_for_its_first_pong() {
+    let margin = Duration::from_millis(50);
+    let hello = PONG_TIMEOUT - 2 * margin;
+    let slowest = PONG_TIMEOUT - PING_PERIOD - margin;
+    assert_eq!(pongs_delayed_by(hello, slowest).await, (None, true));
 }
 
 /// Yields what the client sends and takes messages at once, except
@@ -1507,7 +1853,7 @@ async fn a_send_while_not_read_does_not_outlast_the_pause() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8, &Metrics::default()).subscribe(&connect.owner);
     let (tx, from_client) = mpsc::unbounded_channel();
     let start = Instant::now();
     let ready = start + MAX_PAUSE - Duration::from_millis(100);
@@ -1553,7 +1899,7 @@ async fn a_reply_ready_as_the_pause_ends_does_not_resume_the_connection() {
     let mut clients = Vec::new();
     for n in 0..32 {
         let connect = connect(&sessions, Role::Operator, n);
-        let queue = Hub::new(8).subscribe();
+        let queue = Hub::new(8, &Metrics::default()).subscribe(&connect.owner);
         let state = state.clone();
         let (to_client, rx) = mpsc::unbounded_channel();
         let (tx, from_client) = mpsc::unbounded_channel();
@@ -1590,7 +1936,7 @@ async fn a_reply_ready_as_the_pause_ends_does_not_resume_the_connection() {
 #[tokio::test(start_paused = true)]
 async fn live_sessions_are_renewed_once_per_second_in_one_batch() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let renew = tokio::spawn({
         let (sessions, state) = (sessions.clone(), state.clone());
@@ -1637,7 +1983,7 @@ async fn live_sessions_are_renewed_once_per_second_in_one_batch() {
 #[tokio::test(start_paused = true)]
 async fn a_session_is_renewed_while_its_client_answers_and_not_after_it_disconnects() {
     let state = FakeState::new("r1", "leader");
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, &Metrics::default());
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let renew = tokio::spawn({
         let (sessions, state) = (sessions.clone(), state.clone());
@@ -1957,7 +2303,7 @@ const SESSION: &str = "q3Jx-Lh0_9TfWzKcVb2s1A";
 #[tokio::test]
 async fn loopback_upgrade_checks_origin_and_resumes_from_the_first_message() {
     let state = FakeState::new("r1", "leader");
-    let hub = Arc::new(Hub::new(8));
+    let hub = Arc::new(Hub::new(8, &Metrics::default()));
     for _ in 0..3 {
         apply(&state, &hub);
     }
@@ -1978,7 +2324,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_the_first_message() {
                 assert_eq!(connect.owner.principal, "anonymous");
                 assert_eq!(connect.owner.role, Role::Operator);
                 assert!(connect.owner.connection.starts_with("r1:"));
-                let queue = hub.subscribe();
+                let queue = hub.subscribe(&connect.owner);
                 serve_client(socket, &connect, &queue, &*state, Wire, |m, _| {
                     protocol(&m).unwrap_or(Reply::Command(async { None }))
                 })
@@ -2097,16 +2443,23 @@ async fn the_owner_carries_the_principal_and_role_from_the_proxy() {
     server.abort();
 }
 
-/// Takes the first message, then never accepts another and never yields
-/// one: the connection stays open while the server is stuck sending.
+/// Yields a catch-up request, takes the first message, then never accepts
+/// another and never yields one: the connection stays open while the
+/// server is stuck sending.
 struct StuckSocket {
     sent: usize,
+    synced: bool,
 }
 
 impl Stream for StuckSocket {
     type Item = Result<Message, ()>;
-    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Pending
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.synced {
+            Poll::Pending
+        } else {
+            self.synced = true;
+            Poll::Ready(Some(sync(None)))
+        }
     }
 }
 
@@ -2136,14 +2489,17 @@ async fn a_client_that_stops_reading_ends_one_second_after_it_connected() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8, &Metrics::default()).subscribe(&connect.owner);
     let start = Instant::now();
     let task = tokio::spawn({
         let state = state.clone();
         async move {
-            let socket = StuckSocket { sent: 0 };
-            serve_client(socket, &connect, &queue, &*state, Wire, |_, _| {
-                Reply::Command(async { None })
+            let socket = StuckSocket {
+                sent: 0,
+                synced: false,
+            };
+            serve_client(socket, &connect, &queue, &*state, Wire, |m, _| {
+                protocol(&m).unwrap_or(Reply::Command(async { None }))
             })
             .await
         }

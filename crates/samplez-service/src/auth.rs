@@ -234,7 +234,7 @@ impl Auth {
 
     /// `Ok(None)` lets the request through without an identity: the login
     /// route, which checks the token itself.
-    fn check(&self, listener: Listener, req: &Request) -> Result<Option<Identity>, StatusCode> {
+    fn check(&self, listener: Listener, req: &Request) -> Result<Option<Identity>, Refused> {
         let headers = req.headers();
         let bearer_secret = match (listener, self.mode) {
             (Listener::Machine, _) => self.machine_token.as_ref(),
@@ -245,31 +245,34 @@ impl Auth {
             Some(secret) => match single(headers, header::AUTHORIZATION.as_str())? {
                 Some(value) => match bearer_token(value) {
                     Some(t) if secret.matches(t) => true,
-                    _ => return Err(StatusCode::UNAUTHORIZED),
+                    _ => return Err(Refused::UNAUTHORIZED),
                 },
-                None if listener == Listener::Machine => return Err(StatusCode::UNAUTHORIZED),
+                None if listener == Listener::Machine => return Err(Refused::UNAUTHORIZED),
                 None => false,
             },
             None => false,
         };
 
         if !bearer && !self.host_allowed(req) {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(Refused(StatusCode::FORBIDDEN, "host not allowed"));
         }
         if is_upgrade(headers) || req.method() == Method::CONNECT || req.uri().path() == WS_PATH {
             match headers.get(header::ORIGIN) {
                 Some(o) if !self.origin_allowed(o.as_bytes()) => {
-                    return Err(StatusCode::FORBIDDEN);
+                    return Err(Refused(StatusCode::FORBIDDEN, "origin not allowed"));
                 }
                 None if !bearer && self.mode != AuthMode::None => {
-                    return Err(StatusCode::FORBIDDEN);
+                    return Err(Refused(StatusCode::FORBIDDEN, "origin required"));
                 }
                 _ => {}
             }
         }
         let writes = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
         if !bearer && writes && !csrf_ok(headers) {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(Refused(
+                StatusCode::FORBIDDEN,
+                "X-Samplez-Request: 1 and Content-Type: application/json required",
+            ));
         }
 
         let operator = Identity {
@@ -288,14 +291,14 @@ impl Auth {
                     if session_cookies(headers).any(|c| session_valid(&key, c, now())) {
                         operator
                     } else {
-                        return Err(StatusCode::UNAUTHORIZED);
+                        return Err(Refused::UNAUTHORIZED);
                     }
                 }
                 AuthMode::Proxy => self.proxy_identity(headers)?,
             }
         };
         if writes && identity.role == Role::Viewer {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(Refused(StatusCode::FORBIDDEN, "viewers may not write"));
         }
         Ok(Some(identity))
     }
@@ -321,11 +324,11 @@ impl Auth {
         self.hosts.iter().any(|h| h.eq_ignore_ascii_case(name))
     }
 
-    fn proxy_identity(&self, headers: &HeaderMap) -> Result<Identity, StatusCode> {
+    fn proxy_identity(&self, headers: &HeaderMap) -> Result<Identity, Refused> {
         let user = single(headers, &self.proxy.user_header)?
             .and_then(|v| std::str::from_utf8(v).ok())
             .filter(|u| !u.is_empty())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or(Refused::UNAUTHORIZED)?;
         let role = single(headers, &self.proxy.groups_header)?
             .and_then(|v| std::str::from_utf8(v).ok())
             .into_iter()
@@ -333,7 +336,7 @@ impl Auth {
             .filter_map(|g| self.proxy.group_roles.get(g.trim()))
             .max()
             .copied()
-            .ok_or(StatusCode::FORBIDDEN)?;
+            .ok_or(Refused(StatusCode::FORBIDDEN, "no group with a role"))?;
         Ok(Identity {
             user: Some(user.to_owned()),
             role,
@@ -344,11 +347,11 @@ impl Auth {
 /// The value of a header that may appear at most once; a repeated one is
 /// refused, since the parts in front of the service may disagree on which
 /// copy counts.
-fn single<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a [u8]>, StatusCode> {
+fn single<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a [u8]>, Refused> {
     let mut values = headers.get_all(name).iter();
     let first = values.next();
     if values.next().is_some() {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(Refused(StatusCode::UNAUTHORIZED, "repeated header"));
     }
     Ok(first.map(|v| v.as_bytes()))
 }
@@ -441,8 +444,20 @@ fn session_valid(token: &[u8], value: &str, now: u64) -> bool {
     tag.is_some_and(|t| session_mac(token, expiry).verify_slice(&t).is_ok())
 }
 
+/// A refusal of [`Auth::check`]: the status and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Refused(StatusCode, &'static str);
+
+impl Refused {
+    const UNAUTHORIZED: Refused = Refused(StatusCode::UNAUTHORIZED, "not authenticated");
+}
+
+/// Renders the response to a request the checks refuse, from its status
+/// and a short reason ([`crate::Service::refusal`]).
+pub(crate) type Refusal = Arc<dyn Fn(StatusCode, &'static str) -> Response + Send + Sync>;
+
 pub(crate) async fn middleware(
-    State((auth, listener)): State<(Arc<Auth>, Listener)>,
+    State((auth, listener, refusal)): State<(Arc<Auth>, Listener, Option<Refusal>)>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -453,12 +468,19 @@ pub(crate) async fn middleware(
             }
             next.run(req).await
         }
-        Err(StatusCode::UNAUTHORIZED) => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-        )
-            .into_response(),
-        Err(status) => status.into_response(),
+        Err(Refused(status, reason)) => {
+            let mut response = match &refusal {
+                Some(render) => render(status, reason),
+                None => status.into_response(),
+            };
+            if status == StatusCode::UNAUTHORIZED {
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    header::HeaderValue::from_static("Bearer"),
+                );
+            }
+            response
+        }
     }
 }
 
@@ -488,7 +510,11 @@ pub(crate) async fn login(
 ) -> Response {
     let token = auth.token.as_ref().expect("login is routed in token mode");
     if !token.matches(body.token.as_bytes()) {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response();
     }
     // A chain of proxies appends its schemes; the first is the client's.
     let secure = auth.tls

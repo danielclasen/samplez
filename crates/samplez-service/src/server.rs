@@ -125,6 +125,7 @@ pub struct Service {
     ws: Option<WsHandler>,
     nmos: Router,
     sessions: Arc<Sessions>,
+    refusal: Option<auth::Refusal>,
 }
 
 /// The routers of each listener, for serving or for driving in tests.
@@ -169,6 +170,7 @@ impl Service {
             ui: Router::new(),
             ws: None,
             nmos: Router::new(),
+            refusal: None,
         })
     }
 
@@ -176,6 +178,19 @@ impl Service {
     /// mode, the machine listener.
     pub fn api(mut self, router: Router) -> Service {
         self.api = router;
+        self
+    }
+
+    /// Renders the response to a request under `/api/v1` that the auth
+    /// and browser checks refuse, from its status, 401 or 403, and a short
+    /// reason in English, so a product answers it in the body its API
+    /// defines. A 401 gets `WWW-Authenticate: Bearer` on top. Without it,
+    /// the status alone.
+    pub fn refusal<F>(mut self, render: F) -> Service
+    where
+        F: Fn(StatusCode, &'static str) -> Response + Send + Sync + 'static,
+    {
+        self.refusal = Some(Arc::new(render));
         self
     }
 
@@ -310,7 +325,7 @@ impl Service {
                 inner.fallback(|| async { StatusCode::NOT_FOUND }),
             )
             .layer(middleware::from_fn_with_state(
-                (self.auth.clone(), listener),
+                (self.auth.clone(), listener, self.refusal.clone()),
                 auth::middleware,
             ));
         match listener {
