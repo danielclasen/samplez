@@ -867,6 +867,7 @@ impl Engine {
             change_rx,
             status_tx,
             shared: replica.as_ref().map(|r| Arc::clone(&r.0)),
+            alone,
             batch: if replica.is_some() && !alone {
                 hold_blocks as u64 * b
             } else {
@@ -1254,7 +1255,8 @@ impl Engine {
     /// Replicated mode: the clock check passed after the first `steps`
     /// clock steps the engine detected (`Counters::clock_steps`). A
     /// detected step lowers F below the next block until this covers it;
-    /// a later step fences again.
+    /// a later step fences again. With one voter the engine's own clean
+    /// self-report clears it as well.
     pub fn clear_step_fence(&self, steps: u64) -> Result<(), ControlError> {
         self.replica()?.0.steps_cleared.fetch_max(steps, Release);
         Ok(())
@@ -1414,6 +1416,9 @@ struct Supervisor {
     batch: u64,
     /// What the supervisor shares with the RT thread in replicated mode.
     shared: Option<Arc<Shared>>,
+    /// One voter: no peer checks its clock, so its own clean self-report
+    /// lifts a detected step's fence.
+    alone: bool,
     loudness: Vec<OutputLoudness>,
     verdicts: Option<SyncSender<BlockVerdict>>,
     status: Arc<Mutex<Status>>,
@@ -1537,6 +1542,12 @@ impl Supervisor {
         let unsynchronised = unsynchronised();
         if let (Some(shared), Some(u)) = (&self.shared, unsynchronised) {
             shared.self_report.store(u, Relaxed);
+            // A lone voter's clean self-report clears every step detected
+            // before it.
+            if self.alone && !u {
+                let steps = self.counters.clock_steps.load(Relaxed);
+                shared.steps_cleared.fetch_max(steps, Release);
+            }
         }
         let c = &self.counters;
         let offset = c.tai_offset_s.load(Relaxed);
@@ -2670,6 +2681,20 @@ mod tests {
         mpsc::Receiver<BlockVerdict>,
         std::path::PathBuf,
     ) {
+        outputs_of(name, outputs, 2)
+    }
+
+    /// [`outputs_only`] with `voters` voters.
+    fn outputs_of(
+        name: &str,
+        outputs: usize,
+        voters: usize,
+    ) -> (
+        Engine,
+        mpsc::Receiver<StatusChange>,
+        mpsc::Receiver<BlockVerdict>,
+        std::path::PathBuf,
+    ) {
         let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
             .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
         let domain = std::env::temp_dir().join(format!("samplez-{name}-{}", std::process::id()));
@@ -2695,7 +2720,7 @@ mod tests {
         let (status_tx, changes) = mpsc::sync_channel(1 << 20);
         let (verdict_tx, verdicts) = mpsc::sync_channel(1 << 20);
         let replication = Replication {
-            voters: 2,
+            voters,
             reports: report_tx,
             statuses: Some(status_tx),
         };
@@ -2722,6 +2747,7 @@ mod tests {
 
     impl Drop for Unshift {
         fn drop(&mut self) {
+            crate::rt_loop::CLOCK_STEP_NS.store(0, Relaxed);
             crate::rt_loop::CLOCK_SHIFT_NS.store(0, Relaxed);
         }
     }
@@ -2743,7 +2769,7 @@ mod tests {
 
         let steps = || e.counters().clock_steps.load(Relaxed);
         let before = steps();
-        crate::rt_loop::CLOCK_SHIFT_NS.store(60_000_000, Relaxed);
+        crate::rt_loop::CLOCK_STEP_NS.store(60_000_000, Relaxed);
         wait(&|| steps() > before);
         // The step's skip: the last one of 50 blocks or more by now; an
         // overrun under load can skip as well.
@@ -2796,6 +2822,45 @@ mod tests {
         std::fs::remove_dir_all(&domain).unwrap();
     }
 
+    /// One voter has no peer to clear a detected clock step: its next
+    /// clean self-report lifts the step's fence, and it commits again.
+    #[test]
+    fn a_lone_voter_lifts_its_step_fence_on_a_clean_self_report() {
+        use crate::blocks::{Cause, Kind};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let _unshift = Unshift;
+        let (e, _changes, _verdicts, domain) = outputs_of("lone", 1, 1);
+        let processed = || e.counters().processed.load(Acquire);
+        wait(&|| e.status().clock.unsynchronised.is_some());
+        assert_eq!(
+            e.status().clock.unsynchronised,
+            Some(false),
+            "the host's kernel clock is unsynchronised"
+        );
+        wait(&|| processed() > 0);
+        let before = processed();
+        let fenced = || e.counters().step_fenced.load(Relaxed);
+        crate::rt_loop::CLOCK_STEP_NS.store(60_000_000, Relaxed);
+        wait(&|| fenced());
+        let t = Instant::now();
+        wait(&|| !fenced());
+        // adjtimex is read once a second.
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let k = processed() + 2;
+        wait(&|| processed() > k);
+        assert_eq!(e.block_status(0, k).map(|s| s.kind), Some(Kind::Committed));
+        // One voter withholds the blocks the step fences.
+        assert!(
+            (before..k).any(|x| {
+                e.block_status(0, x)
+                    .is_some_and(|s| (s.kind, s.cause) == (Kind::Withheld, Cause::ClockStep))
+            }),
+            "no block was fenced"
+        );
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
     /// A backward step of libmxl's clock withholds every block not yet
     /// final in the hold ring, cause skip, and computes no block twice:
     /// the loop wakes without computing until the clock is due at the
@@ -2817,7 +2882,7 @@ mod tests {
         let open = processed() - 1;
         assert_eq!(e.block_status(0, open).unwrap().kind, Kind::Fenced);
 
-        crate::rt_loop::CLOCK_SHIFT_NS.store(-60_000_000, Relaxed);
+        crate::rt_loop::CLOCK_STEP_NS.store(-60_000_000, Relaxed);
         wait(&|| c.clock_behind_wakes.load(Relaxed) > 20);
         let st = e.block_status(0, open).unwrap();
         assert_eq!((st.kind, st.cause), (Kind::Withheld, Cause::Skip));

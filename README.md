@@ -101,8 +101,9 @@ is never computed twice: after a backward step the loop wakes once per
 block period without computing until the clock is due at the block
 after the last one again. In replicated mode a detected step fences the
 blocks after it until the replicated state clears it
-(`clear_step_fence`), a backward step also withholds every block held,
-and an unsynchronised kernel clock leaves blocks without a digest.
+(`clear_step_fence`), or with one voter until its next clean
+self-report; a backward step also withholds every block held, and an
+unsynchronised kernel clock leaves blocks without a digest.
 
 Real-time set-up reports each step and runs degraded rather than failing:
 effective capabilities raised from the permitted set, `mlockall` with
