@@ -134,14 +134,14 @@ uncontended std lock, which makes no libc call, nor
 and the other blocking std primitives listed in `clippy.toml` in the RT
 modules. `cargo bench --bench rt` in samplez, samplez-dsp and
 samplez-mxl fails when the instruction count of the hold ring's paths,
-the page hashes, a block's DSP or an output commit, gap zero-fill included, exceeds the
-limit in the benchmark. One failure path is excepted from the
-no-allocation rule, and its probe is allowed by call site under
-RealtimeSanitizer: while an input is late, libmxl's flow validity check,
-one `stat()` and path allocations, can run on the RT thread. It ends
-when the input is pruned, after `pruneAfterBlocks` blocks of a frozen
-head, or twice the producer's `maxCommitBatchSizeHint` plus
-`readerMarginSamples` when that is longer.
+the page hashes, a block's DSP or an output commit, gap zero-fill
+included, exceeds the limit in the benchmark. One failure path is
+excepted from the no-allocation rule, and its probe is allowed by call
+site under RealtimeSanitizer: while an input is late, libmxl's flow
+validity check, one `stat()` and path allocations, can run on the RT
+thread. It ends when the input is pruned, after `pruneAfterBlocks`
+blocks of a frozen head, or twice the producer's
+`maxCommitBatchSizeHint` plus `readerMarginSamples` when that is longer.
 
 The host needs swap off and `vm.compact_unevictable_allowed=0`, so that
 neither swapping nor compaction moves the locked pages of the RT
