@@ -957,7 +957,12 @@ impl Rt {
             Change::InputUp { slot } | Change::Route { slot } => slot,
         };
         if matches!(e.change, Change::InputUp { .. }) && !self.slots[slot].up {
-            self.slots[slot].up = true;
+            // The fade-in runs from the entry's index, also on an engine
+            // that skipped the blocks around it.
+            let s = &mut self.slots[slot];
+            s.up = true;
+            s.fade_start = Some(e.at_index);
+            s.silenced_last = false;
             self.send(Telemetry::Input { slot, up: true });
         }
         match self.pending_gen.take() {

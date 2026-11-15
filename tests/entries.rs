@@ -1,9 +1,14 @@
 //! Log entries on real libmxl flows: `InputDown` and `InputUp` at their
-//! index on two engines, re-route crossfades, entries applied again, and
-//! the one pending generation an engine builds at a time.
+//! index on two engines, also across a forward skip, re-route crossfades,
+//! entries applied again, the one pending generation an engine builds at a
+//! time, re-routes on an engine with its own log and reports sent again.
 
 mod common;
 
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Duration;
@@ -550,4 +555,159 @@ fn a_report_the_channel_had_no_room_for_is_sent_again() {
     assert_eq!(reports.recv().unwrap(), filler);
     report(&reports, Report::InputReadable { slot: 0 });
     common::stop(e);
+}
+
+/// The ramp of the forward-skip test: long enough that the skip ends
+/// inside it.
+const LONG_RAMP: u32 = 48_000;
+
+fn skip_config(domain: &Path, src: &str, out: &str) -> samplez::Config {
+    let mut c = config(domain, &[(src, 1)], &[(out, 1)], diagonal(1, 1.0), MARGIN);
+    c.ramp_samples = LONG_RAMP;
+    c
+}
+
+/// Engine a of `input_up_fades_in_from_its_index_across_a_forward_skip`,
+/// run in a process of its own so that process can be stopped. Started by
+/// that test with `SAMPLEZ_SKIP_CHILD` set to the domain and the input
+/// and output flow ids; without it there is nothing to run. It takes
+/// lines on stdin: `entries <down> <up>` appends and commits an
+/// `InputDown` and an `InputUp` at those indices, `report` prints the
+/// first block processed at or after `up` and its counters. It stops once
+/// stdin closes.
+#[test]
+fn forward_skip_child() {
+    let Ok(args) = std::env::var("SAMPLEZ_SKIP_CHILD") else {
+        return;
+    };
+    let a: Vec<&str> = args.split(' ').collect();
+    let (e, rx, _reports) = start_replicated(skip_config(Path::new(a[0]), a[1], a[2]));
+    running(&e);
+    println!("\nskip-child ready");
+    let mut up = 0;
+    for line in std::io::stdin().lines() {
+        let line = line.unwrap();
+        let w: Vec<&str> = line.split_whitespace().collect();
+        match w.as_slice() {
+            ["entries", down, u] => {
+                up = u.parse().unwrap();
+                e.append(1, down.parse().unwrap(), Entry::InputDown { slot: 0 })
+                    .unwrap();
+                e.append(2, up, Entry::InputUp { slot: 0 }).unwrap();
+                e.commit(2);
+                println!("\nskip-child appended");
+            }
+            ["report"] => {
+                let first = rx.try_iter().find(|v| v.k * B >= up).unwrap().k;
+                let c = e.counters();
+                println!(
+                    "\nskip-child first {first} skipped {} late {} diverged {}",
+                    c.overrun_skipped_samples.load(Relaxed),
+                    c.generation_late.load(Relaxed),
+                    e.status().diverged.is_some(),
+                );
+            }
+            _ => panic!("unknown line {line}"),
+        }
+    }
+    common::stop(e);
+}
+
+/// An engine that skips the blocks around an `InputUp`'s index fades the
+/// input in from that index like one that processed them: from its first
+/// block after the skip both engines' outputs are bit-identical. Engine a
+/// runs in a child process, stopped for 200 ms before the index, which
+/// makes it skip forward once it runs again.
+#[test]
+fn input_up_fades_in_from_its_index_across_a_forward_skip() {
+    let domain = Domain::new();
+    let (src, out_a, out_b) = (new_id(), new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "forward_skip_child", "--nocapture"])
+        .env(
+            "SAMPLEZ_SKIP_CHILD",
+            format!("{} {src} {out_a}", domain.0.display()),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut until = |marker: &str| -> Vec<String> {
+        for line in lines.by_ref() {
+            let line = line.unwrap();
+            if let Some(rest) = line.strip_prefix(marker) {
+                return rest.split_whitespace().map(str::to_owned).collect();
+            }
+        }
+        panic!("the child ended before {marker:?}");
+    };
+    until("skip-child ready");
+    let (b, rx_b, _rep_b) = start_replicated(skip_config(&domain.0, &src, &out_b));
+    running(&b);
+    let k0 = now(&rx_b);
+    let (down, up) = ((k0 + 150) * B, (k0 + 750) * B);
+    writeln!(stdin, "entries {down} {up}").unwrap();
+    until("skip-child appended");
+    b.append(1, down, Entry::InputDown { slot: 0 }).unwrap();
+    b.append(2, up, Entry::InputUp { slot: 0 }).unwrap();
+    b.commit(2);
+    let mut vb = Vec::new();
+    wait_for(10 * SECOND, "engine b near the index", || {
+        vb.extend(rx_b.try_iter());
+        vb.last().is_some_and(|v| v.k + 60 >= up / B)
+    });
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: kill has no memory preconditions; the pid is our child's.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let end = up / B + 400;
+    wait_past(&rx_b, end, &mut vb);
+    std::thread::sleep(Duration::from_millis(100));
+    writeln!(stdin, "report").unwrap();
+    let r = until("skip-child first");
+    let first: u64 = r[0].parse().unwrap();
+    assert!(
+        first > up / B + 20 && r[2] != "0",
+        "engine a did not skip over index {up}: {r:?}"
+    );
+    assert_eq!((r[4].as_str(), r[6].as_str()), ("0", "false"), "{r:?}");
+    let x = common::read_blocks(&domain.0, &out_a, 1, first..end);
+    let y = common::read_blocks(&domain.0, &out_b, 1, first..end);
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    // Blocks either engine skipped are zero-filled by libmxl; the pilot
+    // has no block of zeros.
+    let processed: HashSet<u64> = vb.iter().map(|v| v.k).collect();
+    let n = B as usize;
+    let mut compared = 0;
+    for (i, k) in (first..end).enumerate() {
+        let (p, q) = (&x[i * n..(i + 1) * n], &y[i * n..(i + 1) * n]);
+        if !processed.contains(&k) || p.iter().all(|&v| v == 0.0) {
+            continue;
+        }
+        let mut fade = Ramp::new(0.0);
+        let _ = fade.set_target(1.0, LONG_RAMP);
+        fade.advance((k * B - up) as usize);
+        let mut want: Vec<f32> = (0..B).map(|j| common::pilot(0, k * B + j)).collect();
+        fade.process(&mut want);
+        assert!(q == want, "engine b fades in from {up}: block {k}");
+        assert!(
+            p == want,
+            "engine a fades in from {up}: block {k}, first {first}"
+        );
+        compared += 1;
+    }
+    assert!(
+        compared * 4 > (end - first) * 3,
+        "{compared} blocks of {} compared",
+        end - first
+    );
+    assert_eq!(b.status().diverged, None);
+    assert_eq!(b.counters().generation_late.load(Relaxed), 0);
+    common::stop(b);
 }
