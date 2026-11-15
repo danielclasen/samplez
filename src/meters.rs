@@ -52,6 +52,13 @@ pub(crate) struct OutputLoudness {
     slice: Option<(u64, f64, bool, usize)>,
     window_peak: Vec<f32>,
     window_true_peak: Vec<f32>,
+    /// The integrated loudness and the loudness range may have changed:
+    /// a window ended, or a reset cleared them. Evaluating them walks
+    /// every histogram bin, so they are evaluated only then.
+    dirty: bool,
+    /// Evaluations of the integrated loudness and the loudness range.
+    #[cfg(test)]
+    evaluations: u64,
     pub meters: OutputMeters,
 }
 
@@ -68,6 +75,9 @@ impl OutputLoudness {
             slice: None,
             window_peak: vec![0.0; n],
             window_true_peak: vec![0.0; n],
+            dirty: false,
+            #[cfg(test)]
+            evaluations: 0,
             meters: OutputMeters {
                 peak: vec![0.0; n],
                 true_peak: vec![0.0; n],
@@ -94,6 +104,7 @@ impl OutputLoudness {
             }
             if r.reset {
                 self.loudness.reset();
+                self.dirty = true;
                 self.meters.max_true_peak.fill(0.0);
                 self.meters.since = Some(r.slice * SLICE);
             }
@@ -121,6 +132,7 @@ impl OutputLoudness {
         self.slice = None;
         self.loudness.push(slice, complete.then_some(power));
         if ((slice + 1) * SLICE).is_multiple_of(WINDOW) {
+            self.dirty = true;
             self.meters.window = Some(slice * SLICE / WINDOW);
             self.meters.peak.copy_from_slice(&self.window_peak);
             self.meters
@@ -139,9 +151,17 @@ impl OutputLoudness {
         m.short_term = l.short_term();
         m.max_momentary = l.max_momentary();
         m.max_short_term = l.max_short_term();
+        // A gap changes them too: they turn None with the validity.
+        if self.dirty || m.valid != l.valid() {
+            m.integrated = l.integrated();
+            m.range = l.range();
+            self.dirty = false;
+            #[cfg(test)]
+            {
+                self.evaluations += 1;
+            }
+        }
         m.valid = l.valid();
-        m.integrated = l.integrated();
-        m.range = l.range();
     }
 }
 
@@ -210,6 +230,31 @@ mod tests {
         );
         feed(&mut l, 101..141);
         assert!(l.meters.integrated.is_some());
+    }
+
+    /// Integrated loudness and loudness range are evaluated once per
+    /// 100 ms window, not per slice, and still follow a gap and a reset
+    /// within the slice that causes them.
+    #[test]
+    fn integrated_loudness_is_evaluated_per_window() {
+        let mut l = OutputLoudness::new(vec![1.0, 1.0]);
+        feed(&mut l, 0..400);
+        assert_eq!(l.evaluations, 40);
+        assert!(l.meters.integrated.is_some());
+        // An incomplete slice mid-window invalidates at once.
+        let mut short = rec(0, 0, 405, 0.0);
+        short.frames = 1;
+        feed(&mut l, 400..405);
+        l.record(&short);
+        l.record(&rec(0, 1, 405, 0.0));
+        assert_eq!((l.meters.valid, l.meters.integrated), (false, None));
+        // A reset mid-window clears them at once.
+        let mut r = rec(0, 0, 406, 0.0);
+        r.reset = true;
+        l.record(&r);
+        l.record(&rec(0, 1, 406, 0.0));
+        assert_eq!((l.meters.valid, l.meters.integrated), (true, None));
+        assert_eq!(l.evaluations, 42);
     }
 
     /// A slice with fewer samples than its length is a gap once the
