@@ -358,3 +358,46 @@ fn re_route_crossfades_at_its_index_and_leaves_other_inputs_exact() {
     assert_eq!(s.diverged, None);
     common::stop(e);
 }
+
+/// A generation built on append and handed over after its entry's commit
+/// is swapped in at the entry's index, however the RT thread's take of the
+/// entry and of the generation interleave.
+#[test]
+fn a_generation_handed_over_after_the_commit_is_swapped_in_on_time() {
+    let domain = Domain::new();
+    let (a, b, out) = (new_id(), new_id(), new_id());
+    let _pa = Pilot::start(&domain.0, &a, 1, B, 0);
+    let _pb = Pilot::start(&domain.0, &b, 1, B, 0);
+    let (e, rx, _reports) = start_replicated(config(
+        &domain.0,
+        &[(&a, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    ));
+    running(&e);
+    let mut late = Vec::new();
+    let mut seen = Vec::new();
+    for id in 1..=20u64 {
+        let at = (now(&rx) + 200) * B;
+        let flow_id = if id % 2 == 1 { b.clone() } else { a.clone() };
+        let before = e.counters().generation_late.load(Relaxed);
+        e.append(id, at, Entry::Route { slot: 0, flow_id }).unwrap();
+        wait_for(5 * SECOND, "generation built", || {
+            e.status().generation.ready
+        });
+        e.commit(id);
+        wait_past(&rx, at / B, &mut seen);
+        wait_for(5 * SECOND, "generation swapped in", || {
+            e.status().generation.pending.is_none()
+        });
+        if e.counters().generation_late.load(Relaxed) != before {
+            late.push(id);
+        }
+    }
+    assert!(late.is_empty(), "generations late for entries {late:?}");
+    let s = e.status();
+    assert_eq!(s.inputs[0].flow_id, a);
+    assert_eq!(s.diverged, None);
+    common::stop(e);
+}

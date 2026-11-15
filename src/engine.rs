@@ -581,6 +581,7 @@ impl Engine {
             scratch_out: vec![0.0; widest * b as usize],
             pending_gen: None,
             awaiting_gen: None,
+            last_entry: 0,
             cmd: cmd_rx,
             entries: entry_rx,
             ret: ret_tx,

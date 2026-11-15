@@ -656,6 +656,8 @@ pub(crate) struct Rt {
     pub pending_gen: Option<(LogId, usize, Box<Gen>)>,
     /// An entry applied before its generation arrived.
     pub awaiting_gen: Option<RtEntry>,
+    /// The highest log id taken from the entry ring.
+    pub last_entry: LogId,
     pub cmd: Consumer<Command>,
     pub entries: Consumer<RtEntry>,
     pub ret: Producer<Returned>,
@@ -765,12 +767,15 @@ impl Rt {
             }
             prev = Some((now, mono, width));
             let newest = time::newest_due_block(&self.api, now, self.block, self.margin);
-            self.drain_commands(newest.unwrap_or(0));
+            // Entries before commands: a generation handed over after its
+            // entry's commit finds the entry pending.
             while self.mix.pending.len() < PENDING_CHANGES
                 && let Ok(entry) = self.entries.pop()
             {
+                self.last_entry = self.last_entry.max(entry.id);
                 let _ = self.mix.push(entry);
             }
+            self.drain_commands(newest.unwrap_or(0));
             // After a backward clock step writers hold until the clock
             // passes their last commit, and inputs never read below their
             // last range.
@@ -843,7 +848,9 @@ impl Rt {
                         // once, the slot fading in from silence.
                         self.awaiting_gen = None;
                         self.swap_in(e, domain, generation, false);
-                    } else if self.mix.holds(id) {
+                    } else if id > self.last_entry || self.mix.holds(id) {
+                        // Its entry is pending, or still in the entry ring
+                        // behind a full pending list.
                         if let Some((old, _, g)) =
                             self.pending_gen.replace((id, domain, generation))
                         {
