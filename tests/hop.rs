@@ -253,7 +253,8 @@ fn replicas() {
     let x = common::read_blocks(&domain.0, &out_a, 2, range.clone());
     let y = common::read_blocks(&domain.0, &out_b, 2, range.clone());
     let bits = |v: &[f32]| v.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
-    assert!(bits(&x) == bits(&y), "replica outputs differ");
+    let both = || format!("a: {}; b: {}", timing(a.counters()), timing(b.counters()));
+    assert!(bits(&x) == bits(&y), "replica outputs differ; {}", both());
     // The ramp is in the compared range: channel 0 of the block at
     // at_index differs from the block before at the same pilot phase.
     let ramp = (at / B - range.start) as usize * 2 * B as usize;
@@ -276,10 +277,10 @@ fn replicas() {
     }
     let (sa, sb) = (a.status(), b.status());
     let (ma, mb) = (&sa.outputs[0].meters, &sb.outputs[0].meters);
-    assert!(ma.valid && mb.valid, "{ma:?} {mb:?}");
-    assert_eq!(ma.max_true_peak, mb.max_true_peak);
+    assert!(ma.valid && mb.valid, "{ma:?} {mb:?}; {}", both());
+    assert_eq!(ma.max_true_peak, mb.max_true_peak, "{}", both());
     let max_m = |m: &samplez::OutputMeters| m.max_momentary.map(f64::to_bits);
-    assert_eq!(max_m(ma), max_m(mb), "{ma:?} {mb:?}");
+    assert_eq!(max_m(ma), max_m(mb), "{ma:?} {mb:?}; {}", both());
     assert!(ma.max_momentary.is_some());
     common::stop(b);
     common::stop(a);
@@ -579,19 +580,23 @@ struct OutputA<'a> {
     skips: Vec<String>,
 }
 
-/// The counters that attribute a gap in the verdicts: the RT timing of an
-/// overrun skip, a forward clock step, which skips without a late wake,
-/// and dropped verdicts or telemetry, which look like a skip.
+/// The counters that attribute a gap in the verdicts or the meters: an
+/// overrun skip and the RT timing around it, a forward clock step, which
+/// skips without a late wake, and dropped verdicts, telemetry or meter
+/// records, which look like a skip.
 fn timing(c: &samplez::Counters) -> String {
     format!(
-        "deadline_miss {}, process_time_max {} ns, wake_jitter_max {} ns, \
-         clock_steps {}, telemetry_dropped {}, verdicts_dropped {}",
+        "overrun_skipped_samples {}, deadline_miss {}, process_time_max {} ns, \
+         wake_jitter_max {} ns, clock_steps {}, telemetry_dropped {}, \
+         verdicts_dropped {}, meter_dropped {}",
+        c.overrun_skipped_samples.load(Relaxed),
         c.deadline_miss.load(Relaxed),
         c.process_time_max_ns.load(Relaxed),
         c.wake_jitter_max_ns.load(Relaxed),
         c.clock_steps.load(Relaxed),
         c.telemetry_dropped.load(Relaxed),
-        c.verdicts_dropped.load(Relaxed)
+        c.verdicts_dropped.load(Relaxed),
+        c.meter_dropped.load(Relaxed)
     )
 }
 
