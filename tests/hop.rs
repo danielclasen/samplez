@@ -246,8 +246,10 @@ fn replicas() {
     assert_ne!(bits(&x[ramp..ramp + B as usize]), bits(&x[..B as usize]));
     // A loudness reset at one index on both: from the window it lands on,
     // both measure the same samples from the same filter state, so the
-    // maxima since then are the same bits.
-    let now = rx_a.try_iter().last().unwrap().k;
+    // maxima since then are the same bits. The channel was just drained
+    // and verdicts arrive once per supervisor tick, so wait for one.
+    let first = rx_a.recv_timeout(5 * SECOND).unwrap();
+    let now = rx_a.try_iter().last().unwrap_or(first).k;
     let reset = (now + 100) * B;
     a.reset_loudness(0, reset).unwrap();
     b.reset_loudness(0, reset).unwrap();
