@@ -298,13 +298,13 @@ impl<P: Product> Store<P> {
         self.view(|applied, _| applied)
     }
 
-    /// Whether the volume has joined a set, a vote or a committed id saved
-    /// on it, and every entry up to the saved committed id, capped at the
-    /// last entry held, is applied. An empty volume has learnt nothing yet,
-    /// so it is not.
+    /// Whether the volume has joined a set, a committed id saved on it, and
+    /// every entry up to that id, capped at the last entry held, is
+    /// applied. A vote alone is not joining: a wiped volume saves one on
+    /// first contact, before it holds any entry.
     pub fn caught_up(&self) -> bool {
         let inner = self.lock();
-        if inner.vote.is_none() && inner.committed.is_none() {
+        if inner.committed.is_none() {
             return false;
         }
         let committed = inner.capped_committed().map_or(0, |id| id.index);
@@ -821,11 +821,13 @@ mod tests {
         let dir = dir("caught-up");
         let mut store = open(&dir);
         assert!(!store.caught_up(), "an empty volume has joined nothing");
+        // A wiped volume saves the leader's vote on first contact, before
+        // any committed id reaches it.
         store
             .save_vote(&Vote::new_committed(1, 0))
             .await
             .expect("vote");
-        assert!(store.caught_up(), "nothing committed, nothing to apply");
+        assert!(!store.caught_up(), "a vote alone is not joining");
         let entries: Vec<_> = (1..=3).map(entry).collect();
         store.append_to_log(entries.clone()).await.expect("append");
         store.save_committed(Some(id(2))).await.expect("committed");
