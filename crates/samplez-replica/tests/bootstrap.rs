@@ -859,3 +859,31 @@ async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
     let revision = write(set.replica(Slot::Audio(2)), "2", "gain=2@2").await;
     set.applied(revision).await;
 }
+
+/// With the marker gone and the other voters, which hold the set's log,
+/// unreachable rather than up, ordinal 0 on an empty volume does not start
+/// a second set: they come back holding a quorum of the old one.
+#[tokio::test]
+async fn ordinal_0_does_not_start_a_set_while_its_peers_are_unreachable() {
+    let mut set = Set::new(Voters::new(3, false).unwrap()).await;
+    set.start_all().await;
+    set.settled().await;
+    set.api.delete();
+    set.crash(Slot::Audio(1)).await;
+    set.crash(Slot::Audio(2)).await;
+    set.crash(Slot::Audio(0)).await;
+    std::fs::remove_dir_all(set.dir(Slot::Audio(0))).unwrap();
+    let node = set.start(Slot::Audio(0)).await;
+    let replica = node.replica.clone();
+    set.nodes.insert(Slot::Audio(0), node);
+    tokio::time::sleep(PERIOD * 4).await;
+    assert_eq!(
+        set.api.marker(),
+        None,
+        "a marker was created beside the old set"
+    );
+    assert!(
+        !replica.raft().is_initialized().await.unwrap(),
+        "a second set was initialised"
+    );
+}

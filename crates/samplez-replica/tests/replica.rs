@@ -2,14 +2,18 @@
 
 mod harness;
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use axum::body::Bytes;
 use harness::{Options, Set, owner};
+use openraft::ChangeMembers;
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{Body, SessionKey};
+use samplez_replica::membership::Voters;
 use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::{Position, ReadIndex, ReplicatedState};
+use tokio::time::Instant;
 
 async fn set(replica: &impl ReplicatedState, session: &str, id: &str, command: &str) -> u64 {
     ack(replica, session, id, command).await.revision
@@ -639,4 +643,64 @@ async fn applied_waits_until_the_revision_is_applied() {
     tokio::time::timeout(Duration::from_secs(1), waiting)
         .await
         .expect("applied on the follower");
+}
+
+/// A leader elected between the two steps of a membership change, the
+/// joint configuration and the new one, finishes the change: openraft
+/// leaves the second step to the caller of the change, which was the old
+/// leader.
+#[tokio::test(start_paused = true)]
+async fn a_new_leader_finishes_an_inherited_joint_configuration() {
+    let options = Options {
+        wanted: Some(Voters::new(3, false).unwrap()),
+        ..Options::default()
+    };
+    let mut set_ = Set::start(options).await;
+    let old = set_.leader().await;
+    let rest: BTreeSet<u64> = set_.ids().filter(|&id| id != old).collect();
+    // The second step never leaves the old leader.
+    set_.net.hold_uniform_from(old);
+    let change = tokio::spawn({
+        let raft = set_.replica(old).raft().clone();
+        let rest = rest.clone();
+        async move {
+            raft.change_membership(ChangeMembers::ReplaceAllVoters(rest), false)
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rest.iter().all(|&id| {
+        let metrics = set_.replica(id).raft().metrics().borrow().clone();
+        metrics
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .len()
+            > 1
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "no joint configuration reached the followers"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    set_.crash(old).await;
+    change.abort();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let finished = rest.iter().all(|&id| {
+            let metrics = set_.replica(id).raft().metrics().borrow().clone();
+            let membership = metrics.membership_config.membership();
+            membership.get_joint_config().len() == 1
+                && membership.voter_ids().collect::<BTreeSet<_>>() == rest
+        });
+        if finished {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the set stayed in the joint configuration for 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

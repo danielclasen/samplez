@@ -155,6 +155,9 @@ struct Links {
     /// RPCs to a stalled replica wait this long before it handles them.
     stalled: BTreeMap<NodeId, Duration>,
     delivered: u64,
+    /// Appends from this node that carry the second step of a membership
+    /// change, a configuration out of joint, do not arrive.
+    hold_uniform_from: Option<NodeId>,
 }
 
 /// The links between the replicas of one set.
@@ -210,6 +213,12 @@ impl Net {
 
     pub fn unstall(&self, node: NodeId) {
         self.links().stalled.remove(&node);
+    }
+
+    /// Drops `from`'s appends that carry the second step of a membership
+    /// change, as a leader that goes down between the two steps leaves it.
+    pub fn hold_uniform_from(&self, from: NodeId) {
+        self.links().hold_uniform_from = Some(from);
     }
 
     /// RPCs delivered so far.
@@ -315,6 +324,16 @@ impl RaftNetwork<TypeConfig> for Link {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        let held = self.net.links().hold_uniform_from == Some(self.from)
+            && rpc.entries.iter().any(|e| {
+                matches!(&e.payload,
+                openraft::EntryPayload::Membership(m) if m.get_joint_config().len() == 1)
+            });
+        if held {
+            return Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
+                "held",
+            ))));
+        }
         let raft = self.net.route(self.from, self.to).await?;
         raft.append_entries(rpc)
             .await
@@ -355,6 +374,9 @@ pub struct Options {
     pub voters: u64,
     pub limits: Limits,
     pub raft: openraft::Config,
+    /// The voters the leader reconciles the membership with; `None` leaves
+    /// it as it is.
+    pub wanted: Option<samplez_replica::membership::Voters>,
 }
 
 impl Default for Options {
@@ -363,6 +385,7 @@ impl Default for Options {
             voters: 3,
             limits: Limits::defaults(RATE),
             raft: raft_config("test"),
+            wanted: None,
         }
     }
 }
@@ -465,7 +488,7 @@ impl Set {
             write_timeout: Duration::from_secs(2),
             addr: id.to_string(),
             peers: self.ids().map(|id| id.to_string()).collect(),
-            voters: None,
+            voters: self.options.wanted,
         };
         let replica = Replica::start(
             settings,
