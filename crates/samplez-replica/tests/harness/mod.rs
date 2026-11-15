@@ -67,9 +67,6 @@ impl Product for Paths {
         (self.values, self.applied) = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
         Ok(())
     }
-    fn coalesce_path(command: &[u8]) -> Option<String> {
-        Some(parse(command).0)
-    }
 }
 
 pub fn owner(session: &str) -> Owner {

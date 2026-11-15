@@ -67,8 +67,10 @@ pub struct Settings {
 /// This replica's estimate E of the set's processed index, in samples.
 pub type Estimate = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+type Reply = oneshot::Sender<Result<Ack, NotApplied>>;
+
 enum Queued {
-    Command(Command, oneshot::Sender<Result<Ack, NotApplied>>),
+    Command(Command, Reply),
     Entry(Body),
 }
 
@@ -105,7 +107,7 @@ impl<P: Product> Replica<P> {
             .await
             .map_err(|e| e.to_string())?;
         let (queue, queued) = mpsc::unbounded_channel();
-        tokio::spawn(write::<P>(raft.clone(), queued, estimate, settings.clone()));
+        tokio::spawn(write(raft.clone(), queued, estimate, settings.clone()));
         Ok(Replica {
             settings,
             raft,
@@ -150,9 +152,11 @@ impl<P: Product> Replica<P> {
 }
 
 /// The only writer: takes the queue in order, so commands commit in the
-/// order they were submitted, and folds what queued while the previous
-/// entry was written into the next one (group commit).
-async fn write<P: Product>(
+/// order they were submitted, and puts what queued while the previous
+/// entry was written into the next one (group commit). A copy of a
+/// command the batch holds already is folded into it and answered from
+/// its outcome, an applied one as a duplicate.
+async fn write(
     raft: Raft<TypeConfig>,
     mut queued: mpsc::UnboundedReceiver<Queued>,
     estimate: Estimate,
@@ -181,9 +185,8 @@ async fn write<P: Product>(
                 let mut batch = Batch::default();
                 let mut replies = Vec::new();
                 let mut push = |command: Command, reply| {
-                    let path = command.body.as_deref().and_then(P::coalesce_path);
-                    replies.push((command.id.clone(), reply));
-                    batch.push(command, path);
+                    let id = command.id.clone();
+                    replies.push((batch.push(command), id, reply));
                 };
                 push(command, reply);
                 while let Ok(item) = queued.try_recv() {
@@ -202,11 +205,21 @@ async fn write<P: Product>(
                 .await;
                 match written {
                     Ok(Ok(written)) => {
-                        for ((id, reply), outcome) in replies.into_iter().zip(written.data.0) {
+                        let outcomes = written.data.0;
+                        let mut answered = vec![false; outcomes.len()];
+                        for (at, id, reply) in replies {
+                            let outcome = outcomes[at];
+                            let resolution = match outcome.result {
+                                entry::Resolution::Applied if answered[at] => {
+                                    entry::Resolution::Duplicate
+                                }
+                                result => result,
+                            };
+                            answered[at] = true;
                             let _ = reply.send(Ok(Ack {
                                 command: id,
                                 revision: outcome.revision,
-                                resolution: resolution_of(outcome.result),
+                                resolution: resolution_of(resolution),
                             }));
                         }
                     }
@@ -227,17 +240,12 @@ fn resolution_of(resolution: entry::Resolution) -> Resolution {
     match resolution {
         entry::Resolution::Applied => Resolution::Applied,
         entry::Resolution::Duplicate => Resolution::Duplicate,
-        entry::Resolution::Superseded => Resolution::Superseded,
         entry::Resolution::Stale => Resolution::Stale,
     }
 }
 
-fn reply_all(
-    replies: Vec<(String, oneshot::Sender<Result<Ack, NotApplied>>)>,
-    reason: Reason,
-    detail: &str,
-) {
-    for (_, reply) in replies {
+fn reply_all(replies: Vec<(usize, String, Reply)>, reason: Reason, detail: &str) {
+    for (_, _, reply) in replies {
         let _ = reply.send(Err(NotApplied::new(reason, detail)));
     }
 }
@@ -328,7 +336,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                 origin: Origin::from(owner),
                 id: id.to_owned(),
                 at_index: None,
-                body: Some(command.to_vec()),
+                body: command.to_vec(),
             },
             reply,
         ));

@@ -29,13 +29,6 @@ pub trait Product: Send + 'static {
 
     /// Replaces the state with a saved one.
     fn load(&mut self, saved: &[u8]) -> Result<(), String>;
-
-    /// The path a command sets a continuous value on, so a later command
-    /// on the same path in one entry supersedes it; `None` for commands
-    /// that must each apply.
-    fn coalesce_path(_command: &[u8]) -> Option<String> {
-        None
-    }
 }
 
 /// How the product applied a command.
@@ -168,15 +161,7 @@ impl<P: Product> StateMachine<P> {
             let (revision, result) = self.dedup.answer(&session, &command.id).expect("held");
             return Outcome { revision, result };
         }
-        let Some(body) = &command.body else {
-            self.dedup
-                .resolve(&session, &command.id, Resolution::Superseded);
-            return Outcome {
-                revision,
-                result: Resolution::Superseded,
-            };
-        };
-        let result = match self.product.apply(&command.origin, body) {
+        let result = match self.product.apply(&command.origin, &command.body) {
             Effect::Changed(text) => {
                 if self.deltas.len() == DELTAS_HELD
                     && let Some(dropped) = self.deltas.pop_front()
@@ -284,9 +269,6 @@ pub(crate) mod tests {
                 serde_json::from_slice(saved).map_err(|e| e.to_string())?;
             Ok(())
         }
-        fn coalesce_path(command: &[u8]) -> Option<String> {
-            Some(parse(command).0)
-        }
     }
 
     pub fn origin(session: &str) -> Origin {
@@ -303,7 +285,7 @@ pub(crate) mod tests {
             origin: origin(session),
             id: id.into(),
             at_index: None,
-            body: Some(body.as_bytes().to_vec()),
+            body: body.as_bytes().to_vec(),
         }
     }
 
@@ -319,80 +301,84 @@ pub(crate) mod tests {
     }
 
     /// A copy resolves as its first copy did, from the table a snapshot
-    /// carries as well: stale stays stale at its revision, superseded stays
-    /// superseded and an applied command is a duplicate.
+    /// carries as well: stale stays stale at its revision and an applied
+    /// command is a duplicate.
     #[test]
     fn a_copy_resolves_as_its_first_copy_also_after_a_snapshot_load() {
         let mut sm = machine();
         sm.apply(1, &commands(48, vec![command("s", "8", "gain=8@8")]));
-        let mut batch = Batch::default();
-        for (id, body) in [("6", "pan=6@6"), ("9", "pan=9@9")] {
-            let c = command("s", id, body);
-            let path = Paths::coalesce_path(c.body.as_deref().expect("body"));
-            batch.push(c, path);
-        }
-        sm.apply(2, &commands(96, batch.into_commands()));
-        let first = sm.apply(3, &commands(144, vec![command("s", "7", "gain=7@7")]));
+        let first = sm.apply(2, &commands(96, vec![command("s", "7", "gain=7@7")]));
         assert_eq!(first.0[0].result, Resolution::Stale);
         let mut loaded = machine();
         loaded
-            .load(sm.save(), Limits::defaults(48_000), 3)
+            .load(sm.save(), Limits::defaults(48_000), 2)
             .expect("loads");
         for machine in [&mut sm, &mut loaded] {
             let copies = machine.apply(
-                4,
+                3,
                 &commands(
-                    192,
-                    vec![
-                        command("s", "7", "gain=7@7"),
-                        command("s", "8", "gain=8@8"),
-                        command("s", "6", "pan=6@6"),
-                    ],
+                    144,
+                    vec![command("s", "7", "gain=7@7"), command("s", "8", "gain=8@8")],
                 ),
             );
             let results: Vec<_> = copies.0.iter().map(|o| (o.revision, o.result)).collect();
             assert_eq!(
                 results,
-                [
-                    (3, Resolution::Stale),
-                    (1, Resolution::Duplicate),
-                    (2, Resolution::Superseded)
-                ]
+                [(2, Resolution::Stale), (1, Resolution::Duplicate)]
             );
         }
     }
 
-    #[test]
-    fn a_coalesced_entry_acknowledges_every_merged_id() {
+    fn batch(commands: &[(&str, &str, &str)]) -> (Vec<usize>, Vec<Command>) {
         let mut batch = Batch::default();
-        for (session, id, body) in [
-            ("s", "1", "gain=1@1"),
-            ("t", "1", "gain=2@2"),
-            ("s", "2", "pan=0@3"),
-        ] {
-            let c = command(session, id, body);
-            let path = Paths::coalesce_path(c.body.as_deref().expect("body"));
-            batch.push(c, path);
-        }
+        let at = commands
+            .iter()
+            .map(|(session, id, body)| batch.push(command(session, id, body)))
+            .collect();
+        (at, batch.into_commands())
+    }
+
+    /// A copy submitted while its first copy waits in the same batch is
+    /// folded into it: it is applied once, not dropped with it.
+    #[test]
+    fn a_copy_in_the_same_batch_is_applied_once() {
+        let (at, folded) = batch(&[("s", "x", "gain=5@5"), ("s", "x", "gain=5@5")]);
+        assert_eq!(at, [0, 0]);
         let mut sm = machine();
-        let response = sm.apply(5, &commands(48, batch.into_commands()));
-        let results: Vec<_> = response.0.iter().map(|o| (o.revision, o.result)).collect();
+        let response = sm.apply(1, &commands(48, folded));
         assert_eq!(
-            results,
-            [
-                (5, Resolution::Superseded),
-                (5, Resolution::Applied),
-                (5, Resolution::Applied)
-            ]
+            response.0,
+            [Outcome {
+                revision: 1,
+                result: Resolution::Applied
+            }]
         );
-        assert_eq!(sm.product.applied, 2);
-        assert_eq!(sm.product.values["gain"].0, "2");
-        // The superseded id is recorded: a resend of it changes nothing and
-        // is told it was superseded.
-        let resend = sm.apply(6, &commands(96, vec![command("s", "1", "gain=1@1")]));
-        assert_eq!(resend.0[0].result, Resolution::Superseded);
-        assert_eq!(resend.0[0].revision, 5);
-        assert_eq!(sm.product.values["gain"].0, "2");
+        assert_eq!(sm.product.values["gain"], ("5".into(), 5));
+        // The same id in another session is another command.
+        let (at, _) = batch(&[("s", "x", "gain=5@5"), ("t", "x", "gain=6@6")]);
+        assert_eq!(at, [0, 1]);
+    }
+
+    /// Commands of one batch apply in order with their bodies, so the
+    /// product's ordering decides: an older seq submitted after a newer
+    /// one is stale, as it would be in an entry of its own.
+    #[test]
+    fn a_batch_applies_like_its_commands_one_by_one() {
+        let sent = [("s", "a", "gain=5@5"), ("s", "b", "gain=3@3")];
+        let (_, batched) = batch(&sent);
+        let mut together = machine();
+        let response = together.apply(1, &commands(48, batched));
+        let results: Vec<_> = response.0.iter().map(|o| o.result).collect();
+        assert_eq!(results, [Resolution::Applied, Resolution::Stale]);
+        let mut apart = machine();
+        for (n, (session, id, body)) in sent.into_iter().enumerate() {
+            apart.apply(
+                n as u64 + 1,
+                &commands(48, vec![command(session, id, body)]),
+            );
+        }
+        assert_eq!(together.product.values, apart.product.values);
+        assert_eq!(together.product.values["gain"], ("5".into(), 5));
     }
 
     #[test]

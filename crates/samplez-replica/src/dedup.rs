@@ -41,7 +41,7 @@ pub struct Record {
     pub session: SessionKey,
     pub id: u128,
     pub revision: u64,
-    /// How the first copy resolved: applied, superseded or stale.
+    /// How the first copy resolved: applied or stale.
     pub resolution: Resolution,
     pub stamp: u64,
 }

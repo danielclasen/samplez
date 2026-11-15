@@ -70,29 +70,33 @@ pub struct Command {
     /// The index the client asked for, kept when later than the stamping
     /// index (scheduled); `None` applies at the earliest.
     pub at_index: Option<u64>,
-    /// The product's encoding; `None` once a later command in the same
-    /// entry replaced its value (coalesced), so only its id is recorded.
-    pub body: Option<Vec<u8>>,
+    /// The product's encoding.
+    pub body: Vec<u8>,
 }
 
-/// The commands of one entry, coalesced per path before commit.
+/// The commands of one entry, in the order they were submitted. Every
+/// command keeps its body: the product's own ordering decides what an
+/// older one does once applied after a newer one.
 #[derive(Debug, Default)]
 pub struct Batch {
     commands: Vec<Command>,
-    latest: BTreeMap<String, usize>,
+    held: BTreeMap<(SessionKey, String), usize>,
 }
 
 impl Batch {
-    /// Appends `command`. With a `path`, an earlier command of this batch
-    /// on the same path is superseded: its body is dropped and its id kept.
-    pub fn push(&mut self, command: Command, path: Option<String>) {
+    /// Appends `command` and returns its position in the entry, or the
+    /// position of the copy of it (same session and id) the batch holds
+    /// already, which it is folded into: one apply answers both.
+    pub fn push(&mut self, command: Command) -> usize {
         let at = self.commands.len();
-        if let Some(path) = path
-            && let Some(earlier) = self.latest.insert(path, at)
-        {
-            self.commands[earlier].body = None;
+        let at = *self
+            .held
+            .entry((command.origin.key(), command.id.clone()))
+            .or_insert(at);
+        if at == self.commands.len() {
+            self.commands.push(command);
         }
-        self.commands.push(command);
+        at
     }
 
     pub fn len(&self) -> usize {
@@ -203,9 +207,6 @@ pub enum Resolution {
     /// A copy of an applied command, its id in its session's table:
     /// nothing changed.
     Duplicate,
-    /// A later command in the entry replaced its value; a copy of it while
-    /// its id is held resolves so as well.
-    Superseded,
     /// The product refused it as older than what it already applied; a
     /// copy of it while its id is held resolves so as well.
     Stale,

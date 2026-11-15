@@ -116,16 +116,19 @@ async fn a_resend_after_failover_and_election_resolves_to_the_stored_revision() 
     assert_ne!(set(&**replica, "t", "cmd-1", "pan=1@1").await, revision);
 }
 
+/// Submitted before the writer runs, so they form one entry: every
+/// command is applied in order with its own body, the product refusing
+/// the older seq that came later, and a copy of a command in the same
+/// entry is answered as a duplicate of it.
 #[tokio::test(start_paused = true)]
-async fn a_coalesced_entry_acknowledges_every_merged_id() {
+async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
     let set_ = Set::start(Options::default()).await;
     let replica = set_.replica(set_.leader().await);
-    // Submitted before the writer runs, so they form one entry.
     let pending = [
-        ("s", "1", "gain=1@1"),
-        ("t", "1", "gain=2@2"),
-        ("s", "2", "gain=3@3"),
-        ("s", "3", "pan=0@4"),
+        ("s", "1", "gain=5@5"),
+        ("t", "1", "gain=3@3"),
+        ("s", "1", "gain=5@5"),
+        ("s", "2", "pan=0@4"),
     ]
     .map(|(session, id, command)| replica.submit(&owner(session), id, Bytes::from(command)));
     let mut revisions = Vec::new();
@@ -138,9 +141,9 @@ async fn a_coalesced_entry_acknowledges_every_merged_id() {
     assert_eq!(
         resolutions,
         [
-            Resolution::Superseded,
-            Resolution::Superseded,
             Resolution::Applied,
+            Resolution::Stale,
+            Resolution::Duplicate,
             Resolution::Applied
         ]
     );
@@ -150,17 +153,13 @@ async fn a_coalesced_entry_acknowledges_every_merged_id() {
     );
     replica.store().with_state(|sm| {
         assert_eq!(sm.product.applied, 2);
-        assert_eq!(sm.product.values["gain"].0, "3");
+        assert_eq!(sm.product.values["gain"].0, "5");
     });
-    // A superseded id is recorded: its resend changes nothing.
-    let resent = ack(&**replica, "s", "1", "gain=1@1").await;
-    assert_eq!(resent.revision, revisions[0]);
-    assert_eq!(resent.resolution, Resolution::Superseded);
+    // The stale command's id is recorded: its resend is stale again.
+    let resent = ack(&**replica, "t", "1", "gain=3@3").await;
     assert_eq!(
-        replica
-            .store()
-            .with_state(|sm| sm.product.values["gain"].0.clone()),
-        "3"
+        (resent.revision, resent.resolution),
+        (revisions[0], Resolution::Stale)
     );
 }
 
