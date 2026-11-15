@@ -20,10 +20,20 @@ samplez-dsp = { path = "crates/samplez-dsp", version = "0.1.0" }
 samplez-mxl = { path = "crates/samplez-mxl", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 
 # The end-to-end scenarios need SCHED_FIFO and mlockall to hold their
 # timing: `cargo test --workspace` leaves them out, CI runs them with
 # `--test hop` in a container with rtprio and memlock limits raised.
+[dev-dependencies]
+gungraun = "=0.20.0"
+
+# Instruction-count gates under Callgrind; CI runs them with
+# `cargo bench --bench rt` in the builder image.
+[[bench]]
+name = "rt"
+harness = false
+
 [[test]]
 name = "hop"
 harness = false
