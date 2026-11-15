@@ -59,9 +59,11 @@ pub enum Cause {
     /// Its status slot still held another block's open status, or a later
     /// block's.
     NoSlot,
+    /// Fenced by a detected clock step with no ring to hold it: one voter.
+    ClockStep,
 }
 
-const CAUSES: [Cause; 10] = [
+const CAUSES: [Cause; 11] = [
     Cause::None,
     Cause::Skip,
     Cause::Overflow,
@@ -72,6 +74,7 @@ const CAUSES: [Cause; 10] = [
     Cause::Silence,
     Cause::Released,
     Cause::NoSlot,
+    Cause::ClockStep,
 ];
 
 /// The samples of block k a status covers. A block split at P carries
@@ -715,6 +718,26 @@ impl Hold {
         }
     }
 
+    /// RT. Withholds every block in the ring not yet final for `cause`,
+    /// and writes the committed ones before them.
+    pub fn withhold_open(
+        &mut self,
+        statuses: &Statuses,
+        changes: &mut Changes,
+        sink: &mut impl Sink,
+        cause: Cause,
+    ) {
+        for n in 0..self.pending.len() {
+            let p = self.pending[n].status;
+            let cur = statuses.get(p.k).unwrap_or(p);
+            self.pending[n].status = match cur.kind {
+                Kind::Fenced | Kind::Held => self.withhold_rt(statuses, changes, cur, cause),
+                _ => cur,
+            };
+        }
+        self.flush(changes, sink);
+    }
+
     /// Moves `st` to `withheld` from the RT thread; the status the block
     /// ends with.
     fn withhold_rt(
@@ -882,7 +905,7 @@ impl Hold {
             // One replica cannot hold a fenced block.
             (true, Kind::Fenced) => BlockStatus {
                 kind: Kind::Withheld,
-                cause: Cause::Skip,
+                cause: Cause::ClockStep,
                 ..st
             },
             _ => st,
@@ -1586,9 +1609,44 @@ mod tests {
         t.sink.check();
     }
 
+    /// After a backward clock step every open block of the ring is
+    /// withheld at once and never written, one marked for commit through
+    /// included.
+    #[test]
+    fn open_blocks_are_withheld_at_a_backward_step() {
+        let mut t = T::committing(false, K0);
+        t.compute(K0, DEGRADED);
+        t.ctx.fence = 0;
+        t.compute(K0 + 1, Some(HEALTHY));
+        t.compute(K0 + 2, Some(HEALTHY));
+        assert!(t.statuses.commit_through(K0, 0));
+        let statuses = &t.statuses;
+        let mut changes = Changes {
+            ring: &mut t.tx,
+            dropped: &t.dropped,
+            output: 0,
+        };
+        t.hold
+            .withhold_open(statuses, &mut changes, &mut t.sink, Cause::Skip);
+        for k in [K0, K0 + 1, K0 + 2] {
+            let st = t.statuses.get(k).unwrap();
+            assert_eq!(
+                (st.kind, st.cause),
+                (Kind::Withheld, Cause::Skip),
+                "block {k}"
+            );
+        }
+        assert!(t.hold.is_empty());
+        assert!(!t.sink.wrote(K0 + 1) && !t.sink.wrote(K0 + 2));
+        // K0, marked for commit through but not committed when the step
+        // came, is withheld too.
+        assert_eq!(t.kind(K0), Some(Kind::Withheld));
+        assert!(t.sink.writes.is_empty());
+    }
+
     /// One replica commits every block at once, degraded ones too, and
-    /// holds nothing; a block it withholds withdraws nothing, so the next
-    /// block commits at once again.
+    /// holds nothing; a block it withholds (fenced by a clock step)
+    /// withdraws nothing, so the next block commits at once again.
     #[test]
     fn one_replica_commits_at_once() {
         let mut t = T::committing(true, K0);
@@ -1600,7 +1658,8 @@ mod tests {
         assert_eq!(t.sink.writes.len(), 2);
         t.ctx.fence = 0;
         assert!(t.compute(K0 + 2, Some(HEALTHY)).withdraw);
-        assert_eq!(t.kind(K0 + 2), Some(Kind::Withheld));
+        let st = t.statuses.get(K0 + 2).unwrap();
+        assert_eq!((st.kind, st.cause), (Kind::Withheld, Cause::ClockStep));
         t.withdraw();
         assert_eq!(t.hold.mode(), Mode::Committing);
         t.ctx.fence = u64::MAX;

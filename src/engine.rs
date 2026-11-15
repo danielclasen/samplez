@@ -123,9 +123,26 @@ pub struct GenerationStatus {
     pub build_lead: u64,
 }
 
+/// The clocks as the engine sees them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClockStatus {
+    /// The kernel TAI offset, CLOCK_TAI - CLOCK_REALTIME in whole seconds,
+    /// as the RT thread sampled it last.
+    pub tai_offset_s: Option<i64>,
+    /// The kernel clock is unsynchronised (`adjtimex`: `TIME_ERROR` or
+    /// `STA_UNSYNC`), sampled once a second; none when `adjtimex` failed.
+    /// In replicated mode blocks then carry no digest.
+    pub unsynchronised: Option<bool>,
+    /// Clock steps detected, and whether one still fences the blocks
+    /// after it (replicated mode).
+    pub steps: u64,
+    pub step_fenced: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Status {
     pub rt: RtStatus,
+    pub clock: ClockStatus,
     pub generation: GenerationStatus,
     /// Why the output no longer follows from the inputs and the changes
     /// sent: the first log entry that reached the RT thread after its
@@ -547,13 +564,19 @@ impl Engine {
         let b = u64::from(config.block_size);
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(Counters::default());
+        counters.tai_offset_s.store(i64::MIN, Relaxed);
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(COMMAND_RING);
         let (ret_tx, ret_rx) = rtrb::RingBuffer::new(RETURN_RING);
         let (mut tel_tx, mut tel_rx) = rtrb::RingBuffer::new(TELEMETRY_RING);
         // The ring is allocated after mlockall: without MCL_FUTURE its
         // pages would fault in on the RT thread's first pushes. Every slot
         // is written once here instead.
-        while tel_tx.push(Telemetry::ClockStep { delta_ns: 0 }).is_ok() {}
+        let blank = || Telemetry::ClockStep {
+            delta_ns: 0,
+            offset_before: 0,
+            offset_after: 0,
+        };
+        while tel_tx.push(blank()).is_ok() {}
         while tel_rx.pop().is_ok() {}
         let (entry_tx, entry_rx) = rtrb::RingBuffer::new(PENDING_CHANGES);
         let (log_tx, log_rx) = mpsc::channel();
@@ -598,6 +621,7 @@ impl Engine {
                 fence: AtomicU64::new(if alone { u64::MAX } else { 0 }),
                 rank: AtomicU64::new(0),
                 self_report: AtomicBool::new(false),
+                steps_cleared: AtomicU64::new(0),
                 statuses: (0..config.outputs.len())
                     .map(|_| Statuses::new(slots, b))
                     .collect(),
@@ -718,6 +742,7 @@ impl Engine {
             counters: Arc::clone(&counters),
             stop: Arc::clone(&stop),
             replica: rt_replica,
+            step_at: None,
         };
 
         let (thread_tx, thread_rx) = mpsc::sync_channel::<ThreadStatus>(1);
@@ -740,6 +765,7 @@ impl Engine {
                 process: process.clone(),
                 thread,
             },
+            clock: ClockStatus::default(),
             generation: GenerationStatus::default(),
             diverged: None,
             rt_panic: None,
@@ -840,6 +866,8 @@ impl Engine {
             next_meter_seq: 0,
             change_rx,
             status_tx,
+            shared: replica.as_ref().map(|r| Arc::clone(&r.0)),
+            alone,
             batch: if replica.is_some() && !alone {
                 hold_blocks as u64 * b
             } else {
@@ -1224,6 +1252,16 @@ impl Engine {
         self.control(Control::Resolved { id })
     }
 
+    /// Replicated mode: the clock check passed after the first `steps`
+    /// clock steps the engine detected (`Counters::clock_steps`). A
+    /// detected step lowers F below the next block until this covers it;
+    /// a later step fences again. With one voter the engine's own clean
+    /// self-report clears it as well.
+    pub fn clear_step_fence(&self, steps: u64) -> Result<(), ControlError> {
+        self.replica()?.0.steps_cleared.fetch_max(steps, Release);
+        Ok(())
+    }
+
     /// Restarts the loudness measurement of output `output` (the
     /// integrated loudness, the loudness range, the maxima and the
     /// validity) at the first 100 ms window starting at or after
@@ -1376,6 +1414,11 @@ struct Supervisor {
     /// The longest range a member flow's writer commits at once: B, or
     /// the hold ring.
     batch: u64,
+    /// What the supervisor shares with the RT thread in replicated mode.
+    shared: Option<Arc<Shared>>,
+    /// One voter: no peer checks its clock, so its own clean self-report
+    /// lifts a detected step's fence.
+    alone: bool,
     loudness: Vec<OutputLoudness>,
     verdicts: Option<SyncSender<BlockVerdict>>,
     status: Arc<Mutex<Status>>,
@@ -1429,6 +1472,7 @@ impl Supervisor {
                 if let Some(f) = minor_faults(tid) {
                     self.counters.rt_minor_faults.store(f, Relaxed);
                 }
+                self.clock();
             }
             if rt_thread.as_ref().is_some_and(JoinHandle::is_finished) {
                 self.rt_ended(rt_thread.take());
@@ -1492,6 +1536,30 @@ impl Supervisor {
         }
     }
 
+    /// Samples the kernel clock's synchronisation, for the clock
+    /// self-report, and the clock status.
+    fn clock(&mut self) {
+        let (unsynchronised, clean_after) = self_report(&self.counters.clock_steps, unsynchronised);
+        if let (Some(shared), Some(u)) = (&self.shared, unsynchronised) {
+            shared.self_report.store(u, Relaxed);
+            // A lone voter's clean self-report clears every step detected
+            // before it.
+            if self.alone
+                && let Some(steps) = clean_after
+            {
+                shared.steps_cleared.fetch_max(steps, Release);
+            }
+        }
+        let c = &self.counters;
+        let offset = c.tai_offset_s.load(Relaxed);
+        self.status().clock = ClockStatus {
+            tai_offset_s: (offset != i64::MIN).then_some(offset),
+            unsynchronised,
+            steps: c.clock_steps.load(Relaxed),
+            step_fenced: c.step_fenced.load(Relaxed),
+        };
+    }
+
     /// Passes the RT thread's status changes on.
     fn status_changes(&mut self) {
         let Some(rx) = &mut self.change_rx else {
@@ -1523,9 +1591,14 @@ impl Supervisor {
                     end,
                 } => self.prune(slot, invalid, head, end),
                 Telemetry::Stats { slot, stats } => self.stats(slot, stats),
-                Telemetry::ClockStep { delta_ns } => {
+                Telemetry::ClockStep {
+                    delta_ns,
+                    offset_before,
+                    offset_after,
+                } => {
                     log(format_args!(
-                        "clock step of {delta_ns} ns against CLOCK_MONOTONIC"
+                        "clock step of {delta_ns} ns against CLOCK_MONOTONIC; kernel TAI \
+                         offset {offset_before} s before, {offset_after} s after"
                     ));
                 }
                 Telemetry::LateEntry { entry, pos } => {
@@ -2204,6 +2277,31 @@ impl Supervisor {
     }
 }
 
+/// The kernel clock's self-report from `read`, and on a clean one the
+/// count of clock steps detected before the reading began: a step
+/// detected while it ran is not cleared by it.
+fn self_report(
+    steps: &AtomicU64,
+    read: impl FnOnce() -> Option<bool>,
+) -> (Option<bool>, Option<u64>) {
+    let before = steps.load(Acquire);
+    let unsynchronised = read();
+    (
+        unsynchronised,
+        (unsynchronised == Some(false)).then_some(before),
+    )
+}
+
+/// Whether the kernel clock is unsynchronised: `adjtimex` reading
+/// `TIME_ERROR` or `STA_UNSYNC`. None when the call failed.
+fn unsynchronised() -> Option<bool> {
+    // SAFETY: an all-zero timex is valid; modes 0 only reads.
+    let mut t: libc::timex = unsafe { std::mem::zeroed() };
+    // SAFETY: `t` is writable.
+    let state = unsafe { libc::adjtimex(&mut t) };
+    (state >= 0).then_some(state == libc::TIME_ERROR || t.status & libc::STA_UNSYNC != 0)
+}
+
 /// Releases what the RT thread handed back: a generation's readers,
 /// group and instance, or a writer, which deletes its flow.
 fn release(r: Returned) {
@@ -2588,6 +2686,255 @@ mod tests {
         panic!("every run was disturbed: {seen:?}");
     }
 
+    /// A replicated engine of two voters with `outputs` outputs and no
+    /// input, its status changes and verdicts, in a fresh domain.
+    fn outputs_only(
+        name: &str,
+        outputs: usize,
+    ) -> (
+        Engine,
+        mpsc::Receiver<StatusChange>,
+        mpsc::Receiver<BlockVerdict>,
+        std::path::PathBuf,
+    ) {
+        outputs_of(name, outputs, 2)
+    }
+
+    /// [`outputs_only`] with `voters` voters.
+    fn outputs_of(
+        name: &str,
+        outputs: usize,
+        voters: usize,
+    ) -> (
+        Engine,
+        mpsc::Receiver<StatusChange>,
+        mpsc::Receiver<BlockVerdict>,
+        std::path::PathBuf,
+    ) {
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let outs: Vec<_> = (0..outputs)
+            .map(|o| {
+                let id = format!("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d2{o}");
+                serde_json::json!({ "name": id, "domain": "d", "flowId": id, "label": name,
+                                    "group": name, "role": "Audio", "channels": 1 })
+            })
+            .collect();
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "domains": [{ "name": "d", "path": domain }],
+            "outputs": outs,
+            "matrix": [],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let process = rt::setup_process(&config.rt);
+        let (report_tx, _reports) = mpsc::sync_channel(1);
+        let (status_tx, changes) = mpsc::sync_channel(1 << 20);
+        let (verdict_tx, verdicts) = mpsc::sync_channel(1 << 20);
+        let replication = Replication {
+            voters,
+            reports: report_tx,
+            statuses: Some(status_tx),
+        };
+        let e = Engine::start_replicated(config, process, Some(verdict_tx), replication).unwrap();
+        wait(&|| e.status().outputs.iter().all(|o| o.realised));
+        (e, changes, verdicts, domain)
+    }
+
+    /// Commits every output from the next page boundary on, F past every
+    /// block; the block that boundary is in.
+    fn committing(e: &Engine, outputs: usize) -> u64 {
+        e.set_fence(u64::MAX).unwrap();
+        let from = e.counters().processed.load(Acquire) + 2;
+        for o in 0..outputs {
+            e.commit_from(o, from).unwrap();
+        }
+        let kp = (from * 48).next_multiple_of(crate::blocks::PAGE) / 48;
+        wait(&|| e.counters().processed.load(Acquire) > kp + 5);
+        kp
+    }
+
+    /// Takes the clock shift off again, also when a test fails.
+    struct Unshift;
+
+    impl Drop for Unshift {
+        fn drop(&mut self) {
+            crate::rt_loop::CLOCK_STEP_NS.store(0, Relaxed);
+            crate::rt_loop::CLOCK_SHIFT_NS.store(0, Relaxed);
+        }
+    }
+
+    /// A forward step of libmxl's clock withholds the blocks it skips at
+    /// the skip and fences the blocks after it: none commits until the
+    /// step is cleared and a commit start names the output again. The
+    /// TAI offset is sampled.
+    #[test]
+    fn a_forward_clock_step_withholds_the_skip_and_fences() {
+        use crate::blocks::Kind;
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let _unshift = Unshift;
+        let (e, changes, _verdicts, domain) = outputs_only("forward", 1);
+        let processed = || e.counters().processed.load(Acquire);
+        committing(&e, 1);
+        wait(&|| e.status().clock.tai_offset_s.is_some());
+        assert!(!e.status().clock.step_fenced);
+
+        let steps = || e.counters().clock_steps.load(Relaxed);
+        let before = steps();
+        crate::rt_loop::CLOCK_STEP_NS.store(60_000_000, Relaxed);
+        wait(&|| steps() > before);
+        // The step's skip: the last one of 50 blocks or more by now; an
+        // overrun under load can skip as well.
+        std::thread::sleep(Duration::from_millis(20));
+        let mut seen: Vec<_> = changes.try_iter().collect();
+        let (from, to) = seen
+            .iter()
+            .rev()
+            .find_map(|c| match *c {
+                StatusChange::Skipped { from, to } if to - from >= 50 => Some((from, to)),
+                _ => None,
+            })
+            .expect("no skip");
+        wait(&|| processed() > to + 100);
+        // From the skip on nothing commits while the step fences: blocks
+        // are withheld or wait fenced.
+        seen.extend(changes.try_iter());
+        let after: Vec<_> = seen
+            .into_iter()
+            .filter_map(|c| match c {
+                StatusChange::Block { status, .. } if status.k >= from => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert!(after.iter().all(|s| s.kind != Kind::Committed), "{after:?}");
+        assert!(after.iter().any(|s| s.kind == Kind::Fenced), "{after:?}");
+        wait(&|| e.status().clock.step_fenced);
+
+        e.clear_step_fence(1).unwrap();
+        wait(&|| !e.status().clock.step_fenced);
+        // A commit start names the output again; the fills the withdrawn
+        // replica held meanwhile commit on evidence, then the blocks
+        // after the start commit.
+        let start = processed() + 2;
+        e.commit_from(0, start).unwrap();
+        let kp = (start * 48).next_multiple_of(crate::blocks::PAGE) / 48;
+        let t = Instant::now();
+        while e.block_status(0, kp + 3).map(|s| s.kind) != Some(Kind::Committed) {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                e.block_status(0, kp + 3)
+            );
+            for k in to..processed() {
+                let _ = e.commit_through(0, k, 0);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// A clean self-report clears only the steps detected before its
+    /// reading began.
+    #[test]
+    fn a_step_during_the_reading_is_not_cleared_by_it() {
+        let steps = AtomicU64::new(3);
+        let (u, clear) = self_report(&steps, || {
+            steps.fetch_add(1, Relaxed);
+            Some(false)
+        });
+        assert_eq!((u, clear), (Some(false), Some(3)));
+        assert_eq!(self_report(&steps, || Some(true)), (Some(true), None));
+        assert_eq!(self_report(&steps, || None), (None, None));
+    }
+
+    /// One voter has no peer to clear a detected clock step: its next
+    /// clean self-report lifts the step's fence, and it commits again.
+    #[test]
+    fn a_lone_voter_lifts_its_step_fence_on_a_clean_self_report() {
+        use crate::blocks::{Cause, Kind};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let _unshift = Unshift;
+        let (e, _changes, _verdicts, domain) = outputs_of("lone", 1, 1);
+        let processed = || e.counters().processed.load(Acquire);
+        wait(&|| e.status().clock.unsynchronised.is_some());
+        assert_eq!(
+            e.status().clock.unsynchronised,
+            Some(false),
+            "the host's kernel clock is unsynchronised"
+        );
+        wait(&|| processed() > 0);
+        let before = processed();
+        let fenced = || e.counters().step_fenced.load(Relaxed);
+        crate::rt_loop::CLOCK_STEP_NS.store(60_000_000, Relaxed);
+        wait(&|| fenced());
+        let t = Instant::now();
+        wait(&|| !fenced());
+        // adjtimex is read once a second.
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let k = processed() + 2;
+        wait(&|| processed() > k);
+        assert_eq!(e.block_status(0, k).map(|s| s.kind), Some(Kind::Committed));
+        // One voter withholds the blocks the step fences.
+        assert!(
+            (before..k).any(|x| {
+                e.block_status(0, x)
+                    .is_some_and(|s| (s.kind, s.cause) == (Kind::Withheld, Cause::ClockStep))
+            }),
+            "no block was fenced"
+        );
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// A backward step of libmxl's clock withholds every block not yet
+    /// final in the hold ring, cause skip, and computes no block twice:
+    /// the loop wakes without computing until the clock is due at the
+    /// block after the last one again, and no output is written below
+    /// its last commit.
+    #[test]
+    fn a_backward_clock_step_withholds_the_ring_and_computes_nothing_twice() {
+        use crate::blocks::{Cause, Kind};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let _unshift = Unshift;
+        let (e, _changes, verdicts, domain) = outputs_only("backward", 1);
+        let c = e.counters();
+        let processed = || c.processed.load(Acquire);
+        committing(&e, 1);
+        // F frozen: blocks wait fenced in the ring.
+        let f = processed() + 2;
+        e.set_fence(f * 48).unwrap();
+        wait(&|| processed() > f + 10);
+        let open = processed() - 1;
+        assert_eq!(e.block_status(0, open).unwrap().kind, Kind::Fenced);
+
+        crate::rt_loop::CLOCK_STEP_NS.store(-60_000_000, Relaxed);
+        wait(&|| c.clock_behind_wakes.load(Relaxed) > 20);
+        let st = e.block_status(0, open).unwrap();
+        assert_eq!((st.kind, st.cause), (Kind::Withheld, Cause::Skip));
+        // The loop wakes but computes nothing while behind.
+        let (p0, h0) = (processed(), c.heartbeat_blocks.load(Relaxed));
+        std::thread::sleep(Duration::from_millis(10));
+        if c.clock_behind_wakes.load(Relaxed) < 50 {
+            assert_eq!(processed(), p0);
+        }
+        assert!(c.heartbeat_blocks.load(Relaxed) > h0);
+        wait(&|| processed() > p0 + 50);
+        let ks: Vec<u64> = verdicts.try_iter().map(|v| v.k).collect();
+        assert!(
+            ks.windows(2).all(|w| w[1] > w[0]),
+            "a block computed twice or out of order"
+        );
+        assert_eq!(c.output_held_blocks.load(Relaxed), 0);
+        wait(&|| e.status().clock.step_fenced);
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
     /// The engine's own log stamps an `InputDown` or `InputUp` that
     /// reached the RT thread late again, from the state the RT thread has:
     /// the input goes down once its flow is gone, and comes up once it is
@@ -2664,8 +3011,8 @@ mod tests {
 
     /// The RT loop's failure paths run, so that CI's RealtimeSanitizer
     /// run over the lib tests checks them: a stall's catch-up and skip, a
-    /// forward and a backward clock step with the held writes after it,
-    /// and a late input with its probe. Engine `p` writes the flow,
+    /// forward and a backward clock step with the wakes behind the last
+    /// block after it, and a late input with its probe. Engine `p` writes the flow,
     /// engine `e` reads it.
     #[test]
     fn the_failure_paths_run_on_the_rt_thread() {
@@ -2736,7 +3083,8 @@ mod tests {
         until("forward step", &|| n(&c.clock_steps) > steps);
         CLOCK_STEP_NS.store(-50_000_000, Relaxed);
         until("backward step", &|| n(&c.clock_steps) > steps + 1);
-        until("held block", &|| n(&c.output_held_blocks) > 0);
+        // Behind the last block computed, the loop wakes without computing.
+        until("wake behind", &|| n(&c.clock_behind_wakes) > 0);
         // The producer stops: the input is late, frozen and probed.
         p.stop();
         until("late block", &|| n(&c.input_late_blocks) > 0);

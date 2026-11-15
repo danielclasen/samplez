@@ -11,7 +11,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{
-    AtomicBool, AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release,
+    AtomicBool, AtomicI64, AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release,
 };
 
 use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
@@ -26,8 +26,12 @@ use crate::blocks::{Cause, Changes, Ctx, Hold, Kind, Sink, StatusChange, Statuse
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
 pub struct Counters {
-    /// Blocks processed (`rt_heartbeat_blocks_total`).
+    /// Loop wakes: blocks processed, and wakes while libmxl's clock is
+    /// behind the last block processed (`rt_heartbeat_blocks_total`).
     pub heartbeat_blocks: AtomicU64,
+    /// Wakes while libmxl's clock was behind the last block processed,
+    /// after a backward step: no block is computed twice.
+    pub clock_behind_wakes: AtomicU64,
     /// Blocks committed later than `T_k` plus a quarter block period.
     pub deadline_miss: AtomicU64,
     /// Samples skipped when the loop was more than `maxCatchupBlocks`
@@ -47,6 +51,13 @@ pub struct Counters {
     /// Clock steps: libmxl's clock moved by more than a block period
     /// against CLOCK_MONOTONIC between two wakes.
     pub clock_steps: AtomicU64,
+    /// The kernel TAI offset in seconds, CLOCK_TAI - CLOCK_REALTIME read
+    /// back to back at each wake's step check; `i64::MIN` before the
+    /// first.
+    pub tai_offset_s: AtomicI64,
+    /// Replicated mode: a detected clock step fences the blocks after it
+    /// until the replicated state clears it.
+    pub step_fenced: AtomicBool,
     /// Output blocks starting below the last commit, not written.
     pub output_held_blocks: AtomicU64,
     /// Output open or commit calls libmxl refused.
@@ -117,6 +128,24 @@ pub(crate) static CLOCK_SHIFT_NS: std::sync::atomic::AtomicI64 =
 #[cfg(test)]
 pub(crate) static CLOCK_STEP_NS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
+
+/// The kernel TAI offset, CLOCK_TAI - CLOCK_REALTIME read back to back,
+/// in whole seconds. Each read goes through the vDSO where the kernel has
+/// one for the clock, else it is a `clock_gettime` syscall.
+fn tai_offset() -> i64 {
+    let read = |clock| {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is writable; both clocks exist on Linux.
+        unsafe { libc::clock_gettime(clock, &mut ts) };
+        i128::from(ts.tv_sec) * 1_000_000_000 + i128::from(ts.tv_nsec)
+    };
+    let tai = read(libc::CLOCK_TAI);
+    let real = read(libc::CLOCK_REALTIME);
+    (tai - real + 500_000_000).div_euclid(1_000_000_000) as i64
+}
 
 fn add(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Relaxed);
@@ -194,6 +223,9 @@ pub(crate) enum Telemetry {
     },
     ClockStep {
         delta_ns: i64,
+        /// The TAI offset samples before and after the step.
+        offset_before: i64,
+        offset_after: i64,
     },
     /// A log entry reached the RT thread after the matrix produced its
     /// index; not applied.
@@ -279,6 +311,9 @@ pub(crate) struct Shared {
     pub rank: AtomicU64,
     /// The kernel clock is unsynchronised: blocks carry no digest.
     pub self_report: AtomicBool,
+    /// The clock steps the replicated state checked: a detected step
+    /// fences until this reaches the count of steps detected.
+    pub steps_cleared: AtomicU64,
     /// Per output.
     pub statuses: Vec<Statuses>,
 }
@@ -590,21 +625,49 @@ pub(crate) struct Plan {
     pub skipped: u64,
     /// The block waited for and processed next.
     pub k: u64,
+    /// libmxl's clock is behind the last block processed: nothing is
+    /// processed until it passes it again.
+    pub idle: bool,
 }
 
 /// The blocks to process after a wake, from `next`, the block after the
 /// last one processed, and `newest`, the newest block due. An overdue
 /// backlog of up to `max_catchup` blocks is processed in order, beyond
 /// that only the newest block. `k` is the block after the newest due one,
-/// so after a clock step either way it re-anchors to the clock.
+/// so after a forward clock step it re-anchors to the clock. No index is
+/// computed twice: a wake up to a block early (libmxl rounds the index to
+/// the nearest sample) waits for `next` as usual, and after a backward
+/// step further back no block is processed until the clock is due at
+/// `next` again.
 pub(crate) fn plan(next: Option<u64>, newest: Option<u64>, max_catchup: u64, block: u64) -> Plan {
+    let behind = |nx: u64| Plan {
+        catchup: nx..nx,
+        skipped: 0,
+        k: nx,
+        idle: true,
+    };
     let Some(n) = newest else {
-        return Plan {
-            catchup: 0..0,
-            skipped: 0,
-            k: 0,
+        return match next {
+            Some(nx) => behind(nx),
+            None => Plan {
+                catchup: 0..0,
+                skipped: 0,
+                k: 0,
+                idle: false,
+            },
         };
     };
+    if let Some(nx) = next
+        && n + 1 < nx
+    {
+        if n + 2 < nx {
+            return behind(nx);
+        }
+        return Plan {
+            idle: false,
+            ..behind(nx)
+        };
+    }
     let (first, skipped) = match next {
         Some(nx) if n >= nx && n - nx < max_catchup => (nx, 0),
         Some(nx) if n >= nx => (n, (n - nx) * block),
@@ -614,6 +677,7 @@ pub(crate) fn plan(next: Option<u64>, newest: Option<u64>, max_catchup: u64, blo
         catchup: first..n + 1,
         skipped,
         k: n + 1,
+        idle: false,
     }
 }
 
@@ -771,6 +835,9 @@ pub(crate) struct Rt {
     pub stop: Arc<AtomicBool>,
     /// Statuses, hold rings and fence, in replicated mode.
     pub replica: Option<Replica>,
+    /// The index below which a detected clock step lowered F, until the
+    /// step is cleared.
+    pub step_at: Option<u64>,
 }
 
 /// A member flow's writer as the hold ring's sink.
@@ -836,10 +903,12 @@ fn clock_now(api: &MxlApi) -> u64 {
     now
 }
 
-/// What a block's statuses are set from now.
-fn ctx(shared: &Shared) -> Ctx {
+/// What a block's statuses are set from now: F, lowered to `step_at`
+/// by a detected clock step not yet cleared.
+fn ctx(shared: &Shared, step_at: Option<u64>) -> Ctx {
+    let fence = shared.fence.load(Acquire);
     Ctx {
-        fence: shared.fence.load(Acquire),
+        fence: step_at.map_or(fence, |s| fence.min(s)),
         rank: shared
             .rank
             .load(Relaxed)
@@ -990,6 +1059,7 @@ impl Rt {
             let m0 = monotonic_ns();
             let now = self.now();
             let m1 = monotonic_ns();
+            let offset = tai_offset();
             let (mono, width) = (m0 + (m1 - m0) / 2, m1 - m0);
             if let Some((t0, mono0, width0)) = prev {
                 let step =
@@ -1000,10 +1070,14 @@ impl Rt {
                     add(&self.counters.clock_steps, 1);
                     self.send(Telemetry::ClockStep {
                         delta_ns: step as i64,
+                        offset_before: self.counters.tai_offset_s.load(Relaxed),
+                        offset_after: offset,
                     });
+                    self.clock_step(next.unwrap_or(0) * self.block, step < 0);
                 }
             }
             prev = Some((now, mono, width));
+            self.counters.tai_offset_s.store(offset, Relaxed);
             let newest = time::newest_due_block(&self.api, now, self.block, self.margin);
             // Entries before commands: a generation handed over after its
             // entry's commit finds the entry pending.
@@ -1013,11 +1087,22 @@ impl Rt {
             // After a backward clock step writers hold until the clock
             // passes their last commit, and inputs never read below their
             // last range.
+            self.clear_step();
             let Plan {
                 catchup,
                 skipped,
                 k,
+                idle,
             } = plan(next, newest, self.max_catchup, self.block);
+            if idle {
+                // Behind the last block processed, after a backward step:
+                // held blocks still move, nothing is computed.
+                add(&self.counters.heartbeat_blocks, 1);
+                add(&self.counters.clock_behind_wakes, 1);
+                self.advance_holds(None);
+                self.sleep_until(now + period);
+                continue;
+            }
             add(&self.counters.overrun_skipped_samples, skipped);
             if skipped > 0 {
                 self.skipped(catchup.start - skipped / self.block, catchup.start);
@@ -1039,6 +1124,99 @@ impl Rt {
             self.counters.wake_jitter_max_ns.fetch_max(late, Relaxed);
             next = Some(k + 1);
         }
+    }
+
+    /// A clock step was detected before the block starting at `next`: F
+    /// is lowered below it until the replicated state clears the step.
+    /// After a backward step every block not yet final in the hold rings
+    /// is withheld, cause skip, and the replica is withdrawn.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn clock_step(&mut self, next: u64, backward: bool) {
+        let Some(r) = self.replica.as_mut() else {
+            return;
+        };
+        self.step_at = Some(self.step_at.map_or(next, |s| s.min(next)));
+        self.counters.step_fenced.store(true, Relaxed);
+        if !backward {
+            return;
+        }
+        for (o, out) in self.outs.iter_mut().enumerate() {
+            let Some(writer) = out.writer.as_deref_mut() else {
+                continue;
+            };
+            let mut changes = Changes {
+                ring: &mut r.changes,
+                dropped: &self.counters.status_changes_dropped,
+                output: o as u32,
+            };
+            let mut sink = WriterSink {
+                writer,
+                counters: &self.counters,
+                wrote: false,
+            };
+            let w0 = out.hold.withheld;
+            out.hold
+                .withhold_open(&r.shared.statuses[o], &mut changes, &mut sink, Cause::Skip);
+            add(&self.counters.blocks_withheld, out.hold.withheld - w0);
+        }
+        withdraw_all(&mut self.outs, r, &self.counters);
+    }
+
+    /// Lifts the step fence once the replicated state cleared every step
+    /// detected.
+    fn clear_step(&mut self) {
+        if let Some(r) = &self.replica
+            && self.step_at.is_some()
+            && r.shared.steps_cleared.load(Acquire) >= self.counters.clock_steps.load(Relaxed)
+        {
+            self.step_at = None;
+            self.counters.step_fenced.store(false, Relaxed);
+        }
+    }
+
+    /// Moves the blocks held in every output's ring and writes those
+    /// committed; one bit per output written. Before block `next` is
+    /// computed, a status the supervisor gave it already withdraws the
+    /// replica as well.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn advance_holds(&mut self, next: Option<u64>) -> u64 {
+        let Some(r) = self.replica.as_mut() else {
+            return 0;
+        };
+        let mut withdraw = false;
+        let mut written = 0;
+        for (o, out) in self.outs.iter_mut().enumerate() {
+            let Some(writer) = out.writer.as_deref_mut() else {
+                continue;
+            };
+            let mut changes = Changes {
+                ring: &mut r.changes,
+                dropped: &self.counters.status_changes_dropped,
+                output: o as u32,
+            };
+            let mut sink = WriterSink {
+                writer,
+                counters: &self.counters,
+                wrote: false,
+            };
+            let ctx = ctx(&r.shared, self.step_at);
+            let statuses = &r.shared.statuses[o];
+            withdraw |= out
+                .hold
+                .advance(ctx, statuses, &mut changes, &mut sink)
+                .withdraw;
+            withdraw |= next.is_some_and(|k| {
+                out.hold.mode() != crate::blocks::Mode::Idle
+                    && statuses.get(k).is_some_and(|s| s.kind == Kind::Withheld)
+            });
+            if sink.wrote {
+                written |= 1 << o;
+            }
+        }
+        if withdraw {
+            withdraw_all(&mut self.outs, r, &self.counters);
+        }
+        written
     }
 
     /// Waits on each input domain's group for block `k`, until `deadline`.
@@ -1184,49 +1362,6 @@ impl Rt {
             add(&self.counters.status_changes_dropped, 1);
         }
         withdraw_all(&mut self.outs, r, &self.counters);
-    }
-
-    /// Moves the blocks held in every output's ring and writes those
-    /// committed; one bit per output written. A status the supervisor
-    /// gave block `next` before it is computed withdraws the replica as
-    /// well.
-    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    fn advance_holds(&mut self, next: u64) -> u64 {
-        let Some(r) = self.replica.as_mut() else {
-            return 0;
-        };
-        let mut withdraw = false;
-        let mut written = 0;
-        for (o, out) in self.outs.iter_mut().enumerate() {
-            let Some(writer) = out.writer.as_deref_mut() else {
-                continue;
-            };
-            let mut changes = Changes {
-                ring: &mut r.changes,
-                dropped: &self.counters.status_changes_dropped,
-                output: o as u32,
-            };
-            let mut sink = WriterSink {
-                writer,
-                counters: &self.counters,
-                wrote: false,
-            };
-            let ctx = ctx(&r.shared);
-            let statuses = &r.shared.statuses[o];
-            withdraw |= out
-                .hold
-                .advance(ctx, statuses, &mut changes, &mut sink)
-                .withdraw;
-            withdraw |= out.hold.mode() != crate::blocks::Mode::Idle
-                && statuses.get(next).is_some_and(|s| s.kind == Kind::Withheld);
-            if sink.wrote {
-                written |= 1 << o;
-            }
-        }
-        if withdraw {
-            withdraw_all(&mut self.outs, r, &self.counters);
-        }
-        written
     }
 
     /// Makes `generation` the one of input domain `domain` and hands the
@@ -1536,7 +1671,7 @@ impl Rt {
         // The held blocks move first: one found withheld, or block k
         // withheld before it was computed, withdraws the replica before
         // block k takes its status.
-        let mut written = self.advance_holds(k);
+        let mut written = self.advance_holds(Some(k));
         for o in 0..self.outs.len() {
             let out = &mut self.outs[o];
             let Some(writer) = out.writer.as_deref_mut() else {
@@ -1557,7 +1692,7 @@ impl Rt {
                 }
                 continue;
             };
-            let ctx = ctx(&r.shared);
+            let ctx = ctx(&r.shared, self.step_at);
             let statuses = &r.shared.statuses[o];
             let mut changes = Changes {
                 ring: &mut r.changes,
@@ -1860,6 +1995,7 @@ mod tests {
             catchup: k..k,
             skipped: 0,
             k,
+            idle: false,
         };
         assert_eq!(p(None, None), none(0));
         assert_eq!(p(None, Some(9)), none(10));
@@ -1871,7 +2007,8 @@ mod tests {
             Plan {
                 catchup: 10..12,
                 skipped: 0,
-                k: 12
+                k: 12,
+                idle: false,
             }
         );
         // Forward clock step: only the newest block, the rest skipped.
@@ -1880,11 +2017,23 @@ mod tests {
             Plan {
                 catchup: 100..101,
                 skipped: 90 * B,
-                k: 101
+                k: 101,
+                idle: false,
             }
         );
-        // Backward clock step: k re-anchors to the clock.
-        assert_eq!(p(Some(100), Some(49)), none(50));
+        // Backward clock step: nothing is processed until the clock is due
+        // at the block after the last one processed again.
+        let behind = Plan {
+            catchup: 100..100,
+            skipped: 0,
+            k: 100,
+            idle: true,
+        };
+        assert_eq!(p(Some(100), Some(49)), behind);
+        assert_eq!(p(Some(100), Some(97)), behind);
+        assert_eq!(p(Some(100), None), behind);
+        // A wake a block early waits for the next block as usual.
+        assert_eq!(p(Some(100), Some(98)), none(100));
     }
 
     #[test]
@@ -1985,6 +2134,7 @@ mod tests {
                 fence: AtomicU64::new(0),
                 rank: AtomicU64::new(0),
                 self_report: AtomicBool::new(false),
+                steps_cleared: AtomicU64::new(0),
                 statuses: Vec::new(),
             }),
             changes,

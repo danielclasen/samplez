@@ -93,6 +93,18 @@ entries (`unresolved`). A writer commits a range of up to the ring's
 length, and an output whose flow ring is not twice that is not
 realised.
 
+The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
+against CLOCK_MONOTONIC at each wake, when it also samples the kernel
+TAI offset (CLOCK_TAI - CLOCK_REALTIME); the status reports both, and
+whether `adjtimex` finds the kernel clock unsynchronised. A block index
+is never computed twice: after a backward step the loop wakes once per
+block period without computing until the clock is due at the block
+after the last one again. In replicated mode a detected step fences the
+blocks after it until the replicated state clears it
+(`clear_step_fence`), or with one voter until its next clean
+self-report; a backward step also withholds every block held, and an
+unsynchronised kernel clock leaves blocks without a digest.
+
 Real-time set-up reports each step and runs degraded rather than failing:
 effective capabilities raised from the permitted set, `mlockall` with
 `MCL_FUTURE` only under `CAP_IPC_LOCK` or an unlimited `RLIMIT_MEMLOCK`,
