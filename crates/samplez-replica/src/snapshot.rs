@@ -17,6 +17,7 @@ use crate::entry::{Baseline, Body, Disruption, NodeId, Request, SessionKey};
 /// installs a snapshot needs to apply the entries after it alike.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Replicated {
+    #[serde(with = "crate::entry::bytes")]
     pub product: Vec<u8>,
     /// Entries the engine applies at a future at_index, and the decisions
     /// on them (restamped, voided), by revision.

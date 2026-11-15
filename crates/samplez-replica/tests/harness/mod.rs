@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -29,6 +30,7 @@ use openraft::raft::{
 use openraft::{BasicNode, Raft, ServerState};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
+use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest};
 use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
 use samplez_service::{Owner, ReplicatedState, Role};
@@ -113,12 +115,25 @@ pub fn owner(session: &str) -> Owner {
 pub struct Clock {
     base: Instant,
     offset: AtomicI64,
+    /// Told on the next read: a test's hook into the moment a replica
+    /// stamps an entry, between its leadership check and the proposal.
+    on_read: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Clock {
     pub fn samples(&self) -> u64 {
+        if let Some(read) = self.on_read.lock().expect("clock lock poisoned").take() {
+            let _ = read.send(());
+        }
         let elapsed = self.base.elapsed().as_nanos() as u64 * RATE / 1_000_000_000;
         elapsed.saturating_add_signed(self.offset.load(Ordering::Relaxed))
+    }
+
+    /// Resolves at the next read.
+    pub fn next_read(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (read, next) = tokio::sync::oneshot::channel();
+        *self.on_read.lock().expect("clock lock poisoned") = Some(read);
+        next
     }
 
     pub fn set_offset(&self, samples: i64) {
@@ -129,8 +144,12 @@ impl Clock {
 #[derive(Default)]
 struct Links {
     rafts: BTreeMap<NodeId, Raft<TypeConfig>>,
+    replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
     /// (from, to): RPCs from `from` to `to` do not arrive.
     cut: BTreeSet<(NodeId, NodeId)>,
+    /// (from, to): RPCs from `from` to `to` get no answer, as through a
+    /// network that drops packets, until the caller's timeout.
+    hung: BTreeSet<(NodeId, NodeId)>,
     /// RPCs to a stalled replica wait this long before it handles them.
     stalled: BTreeMap<NodeId, Duration>,
     delivered: u64,
@@ -165,8 +184,22 @@ impl Net {
         }
     }
 
+    /// Makes every RPC between `node` and the others wait for an answer
+    /// that never comes.
+    pub fn hang(&self, node: NodeId, of: impl IntoIterator<Item = NodeId>) {
+        let mut links = self.links();
+        for other in of {
+            if other != node {
+                links.hung.insert((node, other));
+                links.hung.insert((other, node));
+            }
+        }
+    }
+
     pub fn heal(&self) {
-        self.links().cut.clear();
+        let mut links = self.links();
+        links.cut.clear();
+        links.hung.clear();
     }
 
     pub fn stall(&self, node: NodeId, by: Duration) {
@@ -187,6 +220,10 @@ impl Net {
         from: NodeId,
         to: NodeId,
     ) -> Result<Raft<TypeConfig>, RPCError<NodeId, BasicNode, E>> {
+        let hung = self.links().hung.contains(&(from, to));
+        if hung {
+            std::future::pending::<()>().await;
+        }
         let (raft, stall) = {
             let links = self.links();
             let raft = links
@@ -211,6 +248,39 @@ impl Net {
         }
         links.delivered += 1;
         Ok(raft)
+    }
+}
+
+/// The peer requests of one replica, over the same links as its RPCs; a
+/// harness address is the node id.
+pub struct Peers {
+    from: NodeId,
+    net: Net,
+}
+
+impl PeerClient for Peers {
+    fn call<'a>(
+        &'a self,
+        to: Option<NodeId>,
+        addr: &'a str,
+        request: PeerRequest,
+        within: Duration,
+    ) -> BoxFuture<'a, Result<PeerReply, String>> {
+        Box::pin(async move {
+            let target = addr.parse().expect("a harness address is a node id");
+            let call = async {
+                self.net
+                    .route::<io::Error>(self.from, target)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let replica = self.net.links().replicas.get(&target).cloned();
+                let replica = replica.ok_or_else(|| format!("{target} down"))?;
+                Ok(replica.handle(to, request).await)
+            };
+            tokio::time::timeout(within, call)
+                .await
+                .unwrap_or_else(|_| Err("timed out".into()))
+        })
     }
 }
 
@@ -318,6 +388,7 @@ impl Set {
                 let clock = Clock {
                     base,
                     offset: AtomicI64::new(0),
+                    on_read: Mutex::new(None),
                 };
                 (id, Arc::new(clock))
             })
@@ -333,7 +404,7 @@ impl Set {
             set.restart(id).await;
         }
         set.replica(0)
-            .initialize(0..set.options.voters)
+            .initialize((0..set.options.voters).map(|id| (id, id.to_string())))
             .await
             .expect("initializes");
         set.leader().await;
@@ -365,6 +436,7 @@ impl Set {
             limits: self.options.limits,
             block: BLOCK,
             write_timeout: Duration::from_secs(2),
+            addr: id.to_string(),
         };
         let replica = Replica::start(
             settings,
@@ -375,12 +447,20 @@ impl Set {
                 from: id,
                 net: self.net.clone(),
             },
+            Arc::new(Peers {
+                from: id,
+                net: self.net.clone(),
+            }),
             Arc::new(move || clock.samples()),
         )
         .await
         .expect("replica starts");
-        self.net.links().rafts.insert(id, replica.raft().clone());
-        self.replicas.insert(id, Arc::new(replica));
+        let replica = Arc::new(replica);
+        let mut links = self.net.links();
+        links.rafts.insert(id, replica.raft().clone());
+        links.replicas.insert(id, replica.clone());
+        drop(links);
+        self.replicas.insert(id, replica);
     }
 
     /// Stops `id` as a process crash would: its peers stop reaching it at
@@ -388,6 +468,7 @@ impl Set {
     /// graceful and in-process, so the volume keeps unsynced writes too.
     pub async fn crash(&mut self, id: NodeId) {
         self.net.links().rafts.remove(&id);
+        self.net.links().replicas.remove(&id);
         if let Some(replica) = self.replicas.remove(&id) {
             replica.shutdown().await;
         }

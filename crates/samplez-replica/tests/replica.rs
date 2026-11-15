@@ -55,9 +55,11 @@ async fn a_restarted_replica_is_back_at_its_last_applied_revision_before_any_ele
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(replica.raft().metrics().borrow().current_leader, None);
     assert_eq!(replica.revision(), last);
-    let info = replica.replica();
-    assert!(info.ready, "readiness does not wait for a leader");
-    assert!(!info.commitable, "no leader, so it orders nothing");
+    assert!(
+        replica.replica().ready,
+        "readiness does not wait for a leader"
+    );
+    assert!(!replica.quorum().await, "no leader, so it orders nothing");
 }
 
 /// A replica whose volume was lost starts at revision 0 in the set's
@@ -93,23 +95,16 @@ async fn refused(replica: &impl ReplicatedState, id: &str) -> NotApplied {
         .expect_err("not applied")
 }
 
+/// Every voter takes writes, forwarding what it does not order itself.
 #[tokio::test(start_paused = true)]
-async fn only_the_leader_is_commitable_and_every_refusal_names_its_reason() {
+async fn every_voter_is_commitable_and_every_refusal_names_its_reason() {
     let mut set_ = Set::start(Options::default()).await;
     let leader = set_.leader().await;
     for id in set_.ids() {
         let info = set_.replica(id).replica();
         assert!(info.ready);
-        assert_eq!(info.commitable, id == leader, "replica {id}");
+        assert!(info.commitable, "replica {id}");
     }
-    // A follower forwards nothing, so it orders nothing.
-    let follower = (leader + 1) % 3;
-    let not_ordered = refused(&**set_.replica(follower), "f").await;
-    assert_eq!(not_ordered.reason, Reason::NotCommitable);
-    assert_eq!(
-        set_.replica(follower).command_resolution(&owner("s"), "f"),
-        None
-    );
 
     // A leader cut off from its quorum appends but cannot commit.
     set_.net.isolate(leader, set_.ids());
@@ -124,11 +119,11 @@ async fn only_the_leader_is_commitable_and_every_refusal_names_its_reason() {
 }
 
 /// The leader's read index is what it committed, confirmed by a majority;
-/// a follower that knows the leader confirms none, and one cut off from
-/// the others says so. Asked again when an election moved the leadership
-/// meanwhile.
+/// a follower takes it from its leader and confirms it once applied; one
+/// cut off from the others says so. Asked again when an election moved
+/// leadership meanwhile.
 #[tokio::test(start_paused = true)]
-async fn the_leader_confirms_its_read_index_and_a_follower_answers_none() {
+async fn the_leader_and_a_follower_confirm_the_read_index() {
     let set_ = Set::start(Options::default()).await;
     let leader = set_.leader().await;
     let revision = set(&**set_.replica(leader), "s", "1", "gain=1@1").await;
@@ -138,7 +133,7 @@ async fn the_leader_confirms_its_read_index_and_a_follower_answers_none() {
         let follower = (leader + 1) % 3;
         let start = tokio::time::Instant::now();
         let confirmed = set_.replica(leader).read_index().await;
-        let unconfirmed = set_.replica(follower).read_index().await;
+        let through_leader = set_.replica(follower).read_index().await;
         let took = start.elapsed();
         if set_.leader().await != leader {
             continue;
@@ -148,11 +143,10 @@ async fn the_leader_confirms_its_read_index_and_a_follower_answers_none() {
             ReadIndex::Confirmed(revision),
             "a heartbeat round confirms it"
         );
-        assert_eq!(unconfirmed, ReadIndex::NotLeader);
-        assert!(took < Duration::from_millis(100), "at once: {took:?}");
+        assert_eq!(through_leader, ReadIndex::Confirmed(revision));
+        assert!(took < Duration::from_millis(200), "at once: {took:?}");
         break;
     }
-
     let follower = (set_.leader().await + 1) % 3;
     set_.net.isolate(follower, set_.ids());
     tokio::time::sleep(Duration::from_secs(2)).await;

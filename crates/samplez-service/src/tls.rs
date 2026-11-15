@@ -66,7 +66,7 @@ const ACCEPTED_QUEUE: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsStatus {
-    /// `api`, `machine`, `ops` or `nmos`.
+    /// `api`, `machine`, `ops`, `nmos` or `peer`.
     pub listener: &'static str,
     pub mode: TlsMode,
     /// SHA-256 of the certificate in use, as colon-separated hex pairs.
@@ -372,6 +372,73 @@ impl ListenerTls {
             accepted,
             task,
         })
+    }
+}
+
+/// Mutual TLS between the replicas of a set, from one certificate, its key
+/// and the CA that issued the set's certificates, in `files` mode with
+/// `clientCaFile`. The listener takes only clients presenting a
+/// certificate that CA issued; a client presents the replica's
+/// certificate and trusts that CA alone, so the certificate is used for
+/// both server and client authentication and names the replica's peer
+/// address. The files are re-read by [`PeerTls::reload`] as on the other
+/// listeners; a client configuration is built from what is in use when it
+/// is asked for.
+pub struct PeerTls(ListenerTls);
+
+impl PeerTls {
+    pub fn new(tls: &Tls, metrics: &Metrics) -> Result<PeerTls, Error> {
+        if tls.mode != TlsMode::Files || tls.client_ca_file.is_none() {
+            return Err(Error::Config(
+                "listeners.peer.tls needs files mode with clientCaFile".into(),
+            ));
+        }
+        let listener = ListenerTls::new("peer", tls, metrics)?.expect("files mode");
+        Ok(PeerTls(listener))
+    }
+
+    /// Starts accepting on `tcp`.
+    pub fn bind(&self, tcp: TcpListener) -> io::Result<TlsListener> {
+        self.0.bind(tcp)
+    }
+
+    /// See [`ListenerTls`]: a changed certificate, key or CA applies from
+    /// the next handshake, and to clients built after it.
+    pub fn reload(&self) -> Result<(), Error> {
+        self.0.reload()
+    }
+
+    pub fn status(&self) -> TlsStatus {
+        self.0.status()
+    }
+
+    /// The configuration of a connection to another replica.
+    pub fn client(&self) -> Result<Arc<rustls::ClientConfig>, Error> {
+        let ca = self.0.client_ca.as_ref().expect("checked in new");
+        let ca_path = ca.path.clone();
+        let ca = ca.loaded.lock().expect("client CA lock poisoned").clone();
+        let files = self.0.files.as_ref().expect("checked in new");
+        let (cert, key) = files
+            .loaded
+            .lock()
+            .expect("certificate lock poisoned")
+            .clone();
+        let mut roots = RootCertStore::empty();
+        for root in certs(&ca, &ca_path)? {
+            roots
+                .add(root)
+                .map_err(|e| Error::Config(format!("{}: {e}", ca_path.display())))?;
+        }
+        let key = PrivateKeyDer::from_pem_slice(&key)
+            .map_err(|e| Error::Config(format!("TLS key: {e}")))?;
+        let mut config = rustls::ClientConfig::builder_with_provider(self.0.provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Config(format!("TLS: {e}")))?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certs(&cert, &files.cert)?, key)
+            .map_err(|e| Error::Config(format!("{}: {e}", files.cert.display())))?;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(Arc::new(config))
     }
 }
 
@@ -1095,6 +1162,103 @@ mod tests {
         tls.reload().unwrap();
         let (response, _) = get(&issued_by_second(), addr, "localhost").await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// Two replicas' identities from one CA, written as `<name>-<n>.crt`
+    /// and `.key` beside the CA's `<name>-ca.crt`, and a stranger's from
+    /// another CA.
+    fn peer_set(name: &str) -> (Vec<Tls>, (CertificateDer<'static>, PrivateKeyDer<'static>)) {
+        let issue = |ca: &CertifiedIssuer<'_, KeyPair>| {
+            let key = KeyPair::generate().unwrap();
+            let cert = CertificateParams::new(vec!["localhost".into()])
+                .unwrap()
+                .signed_by(&key, ca)
+                .unwrap();
+            (cert, key)
+        };
+        let ca = || {
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap()
+        };
+        let (ours, theirs) = (ca(), ca());
+        let ca_file = dir().join(format!("{name}-ca.crt"));
+        std::fs::write(&ca_file, ours.pem()).unwrap();
+        let replicas = (0..2)
+            .map(|n| {
+                let (cert, key) = issue(&ours);
+                let (cert_file, key_file) = (
+                    dir().join(format!("{name}-{n}.crt")),
+                    dir().join(format!("{name}-{n}.key")),
+                );
+                std::fs::write(&cert_file, cert.pem()).unwrap();
+                std::fs::write(&key_file, key.serialize_pem()).unwrap();
+                Tls {
+                    client_ca_file: Some(ca_file.clone()),
+                    ..files(&cert_file, &key_file)
+                }
+            })
+            .collect();
+        let (cert, key) = issue(&theirs);
+        let stranger = (
+            cert.der().clone(),
+            PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        );
+        (replicas, stranger)
+    }
+
+    #[tokio::test]
+    async fn replicas_reach_each_other_and_nobody_else_on_the_peer_listener() {
+        let (replicas, (cert, key)) = peer_set("peer");
+        let metrics = Metrics::default();
+        let (server, client) = (
+            PeerTls::new(&replicas[0], &metrics).unwrap(),
+            PeerTls::new(&replicas[1], &metrics).unwrap(),
+        );
+        assert_eq!(server.status().listener, "peer");
+        let addr = serve(&server.0).await;
+        let replica = TlsConnector::from(client.client().unwrap());
+        let (response, presented) = get(&replica, addr, "localhost").await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(fingerprint_of(&presented), server.status().fingerprint);
+
+        // A client without a certificate, or with one another CA issued.
+        let ca = CertificateDer::pem_file_iter(replicas[0].client_ca_file.as_ref().unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            get(&connector(&[&ca], None), addr, "localhost")
+                .await
+                .is_err()
+        );
+        let stranger = connector(&[&ca], Some((cert, key)));
+        assert!(get(&stranger, addr, "localhost").await.is_err());
+        // A replica trusts the set's CA alone, not a server it did not issue.
+        let (other_cert, other_key, _) = write_pair("peer-other");
+        let outsider = listener_tls(&files(&other_cert, &other_key), &metrics);
+        let outsider = serve(&outsider).await;
+        assert!(get(&replica, outsider, "localhost").await.is_err());
+    }
+
+    #[test]
+    fn the_peer_listener_needs_a_certificate_and_a_ca() {
+        let (replicas, _) = peer_set("peer-config");
+        let metrics = Metrics::default();
+        let refused = |tls: Tls| PeerTls::new(&tls, &metrics).err().unwrap().to_string();
+        let without_ca = Tls {
+            client_ca_file: None,
+            ..replicas[0].clone()
+        };
+        assert!(refused(without_ca).contains("clientCaFile"));
+        let self_signed = Tls {
+            mode: TlsMode::SelfSigned,
+            sans: vec!["localhost".into()],
+            ..Tls::default()
+        };
+        assert!(refused(self_signed).contains("files mode"));
+        assert!(refused(Tls::default()).contains("files mode"));
     }
 
     /// Two reloads at once, the first reading the CA file before a rotation

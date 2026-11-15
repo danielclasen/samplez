@@ -29,7 +29,7 @@ pub use replica::{Owner, OwnerHandle, Position, ReadIndex, ReplicaInfo, Replicat
 pub use server::{
     Bound, Connect, Forbidden, Routers, SecretStatus, Service, ServiceStatus, StatusSource,
 };
-pub use tls::TlsStatus;
+pub use tls::{PeerTls, TlsStatus};
 
 #[derive(Debug)]
 pub enum Error {

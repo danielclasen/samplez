@@ -1774,6 +1774,7 @@ fn not_applied_is_503_with_its_reason() {
         "not applied (not_commitable)"
     );
     assert_eq!(Reason::Unavailable.as_str(), "unavailable");
+    assert_eq!(Reason::TooLarge.as_str(), "too_large");
 }
 
 #[tokio::test]
