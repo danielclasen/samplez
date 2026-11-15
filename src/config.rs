@@ -278,8 +278,6 @@ impl Config {
             if i.channels == 0 {
                 return fail(format!("input {}: channels must be at least 1", i.name));
             }
-            samplez_mxl::validate_id(&i.flow_id)
-                .map_err(|e| Error(format!("input {}: {e}", i.name)))?;
         }
         for o in &self.outputs {
             if self.domain(&o.domain).is_none() {
@@ -288,14 +286,9 @@ impl Config {
             samplez_mxl::output::flow_definition(&self.output_config(o))
                 .map_err(|e| Error(format!("output {}: {e}", o.name)))?;
             o.loudness_weights()?;
-            if let Some(i) = self.inputs.iter().find(|i| {
-                i.flow_id == o.flow_id && self.domain(&i.domain) == self.domain(&o.domain)
-            }) {
-                return fail(format!(
-                    "output {} writes flow {}, which input {} reads in the same domain",
-                    o.name, o.flow_id, i.name
-                ));
-            }
+        }
+        for (slot, i) in self.inputs.iter().enumerate() {
+            self.check_input_flow(slot, &i.flow_id)?;
         }
         let (n, m) = (self.input_channels(), self.output_channels());
         if self.matrix.len() != n || self.matrix.iter().any(|row| row.len() != m) {
@@ -315,6 +308,27 @@ impl Config {
     }
 
     /// The samplez-mxl creation parameters of `o`.
+    /// Whether input `slot` may read flow `flow_id`: a valid id, and no
+    /// output's flow in the input's domain.
+    pub fn check_input_flow(&self, slot: usize, flow_id: &str) -> Result<(), Error> {
+        let i = self
+            .inputs
+            .get(slot)
+            .ok_or_else(|| Error(format!("no input slot {slot}")))?;
+        samplez_mxl::validate_id(flow_id).map_err(|e| Error(format!("input {}: {e}", i.name)))?;
+        if let Some(o) = self
+            .outputs
+            .iter()
+            .find(|o| o.flow_id == flow_id && self.domain(&i.domain) == self.domain(&o.domain))
+        {
+            return Err(Error(format!(
+                "output {} writes flow {flow_id} in the domain of input {}",
+                o.name, i.name
+            )));
+        }
+        Ok(())
+    }
+
     pub fn output_config<'a>(&self, o: &'a Output) -> samplez_mxl::output::OutputConfig<'a> {
         samplez_mxl::output::OutputConfig {
             flow_id: &o.flow_id,

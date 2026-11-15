@@ -189,11 +189,11 @@ fn gain_change() {
     );
     checker.run(&[&rx], SECOND, |_, _| {});
     let c = engine.counters();
-    assert_eq!(c.gains_consumed.load(Relaxed), 1 + PENDING);
+    assert_eq!(c.entries_consumed.load(Relaxed), 1 + PENDING);
     let next = (checker.last_k().unwrap() + 100) * B;
     engine.set_gain(0, 0, 0.2, next).unwrap();
     checker.run(&[&rx], SECOND, |_, _| {});
-    assert_eq!(c.gains_consumed.load(Relaxed), 2 + PENDING);
+    assert_eq!(c.entries_consumed.load(Relaxed), 2 + PENDING);
     assert_eq!(c.command_late.load(Relaxed), 0);
     assert_eq!(checker.gain(), 0.2);
     assert_eq!(engine.status().diverged, None);

@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use samplez::rt::Step as RtStep;
-use samplez::{BlockVerdict, Config, Engine};
+use samplez::{BlockVerdict, Config, Engine, Report};
 use samplez_mxl::input::{Generation, GroupWait, InputConfig, Outcome, SlotState, Timing};
 use samplez_mxl::output::{self, Creation, OutputConfig};
 use samplez_mxl::{Instance, MxlApi, time};
@@ -596,6 +596,16 @@ pub fn start(config: Config) -> (Engine, Receiver<BlockVerdict>) {
         );
     }
     (engine, rx)
+}
+
+/// [`start`] for an engine that follows a replicated log, with its report
+/// stream.
+pub fn start_replicated(config: Config) -> (Engine, Receiver<BlockVerdict>, Receiver<Report>) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1 << 16);
+    let (report_tx, reports) = std::sync::mpsc::sync_channel(64);
+    let process = samplez::rt::setup_process(&config.rt);
+    let engine = Engine::start_replicated(config, process, Some(tx), report_tx).unwrap();
+    (engine, rx, reports)
 }
 
 /// Stops an engine whose verdicts were checked: every verdict was sent.

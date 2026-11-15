@@ -1,8 +1,9 @@
 //! The RT thread allocates and frees nothing through Rust's global
 //! allocator once it runs, over a run that includes input generation
-//! swaps, a prune, a re-add with fade-in, a gain ramp, output metering
-//! and a loudness reset. libmxl's own C++ allocations are not seen by
-//! this allocator.
+//! swaps, a prune and the `InputDown` it brings, an `InputUp` whose
+//! generation is swapped in at its index with a fade-in, a re-route
+//! crossfade, a gain ramp, output metering and a loudness reset. libmxl's
+//! own C++ allocations are not seen by this allocator.
 
 mod common;
 
@@ -103,12 +104,27 @@ fn rt_thread_allocates_nothing() {
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
     wait_for(Duration::from_secs(10), "input re-added", attached);
     std::thread::sleep(Duration::from_millis(500));
+    // A re-route: a generation holding both flows, then one without the
+    // old flow once the crossfade ended.
+    let next = new_id();
+    let _next = Pilot::start(&domain.0, &next, 2, B, 0);
+    let at = engine.route(0, &next, 0).unwrap();
+    wait_for(Duration::from_secs(5), "re-routed", || {
+        engine.status().inputs[0].flow_id == next
+    });
+    std::thread::sleep(Duration::from_millis(500));
 
     let c = engine.counters();
     assert!(c.input_silenced_blocks.load(Relaxed) > 0);
     assert!(c.heartbeat_blocks.load(Relaxed) > 1_000);
     let verdicts: Vec<_> = rx.try_iter().collect();
     assert!(verdicts.iter().any(|v| v.fading != 0), "no fade-in seen");
+    assert!(
+        verdicts.iter().any(|v| v.fading != 0 && v.k * B >= at),
+        "no crossfade seen"
+    );
+    assert_eq!(engine.status().generation.pending, None);
+    assert_eq!(engine.status().diverged, None);
     assert!(verdicts.iter().any(|v| v.ramping), "no gain ramp seen");
     let m = engine.status().outputs[0].meters.clone();
     assert_eq!(m.since, Some(reset.div_ceil(4800) * 4800), "{m:?}");

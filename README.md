@@ -55,6 +55,20 @@ and loudness range invalid until the next reset.
 After samples that were not metered, the true peak counts only
 interpolated values computed from samples after them.
 
+Every change to what the engine computes is a log entry applied at a
+sample index: a gain change, `InputDown` (the input is silent from the
+index on, whatever is readable), `InputUp` (it fades in from the index)
+and `Route` (it crossfades to another flow over the ramp length from
+the index). Each sets an absolute target, so an entry applied again
+changes nothing. `InputUp` and `Route` need a new input generation:
+the engine builds it when the entry is appended, one at a time, and
+swaps it in at the entry's index. The status reports the 99.99th
+percentile of the build times and buildLead, how far ahead such entries
+are stamped. `Engine::start` keeps the log itself, stamping `InputDown`
+when an input is pruned and `InputUp` once it has been on time for a
+second; `Engine::start_replicated` takes entries through `append`,
+`commit` and `truncate` and sends those reports out instead.
+
 Real-time set-up reports each step and runs degraded rather than failing:
 effective capabilities raised from the permitted set, `mlockall` with
 `MCL_FUTURE` only under `CAP_IPC_LOCK` or an unlimited `RLIMIT_MEMLOCK`,

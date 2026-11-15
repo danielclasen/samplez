@@ -249,6 +249,9 @@ pub enum GroupWait {
 pub struct Generation {
     group: SyncGroup,
     inputs: Vec<Option<Input>>,
+    /// Per slot, the reader of the flow a re-route leaves, read until its
+    /// crossfade ends.
+    outgoing: Vec<Option<Input>>,
     max_offset: i64,
     instance: Arc<Instance>,
 }
@@ -268,6 +271,7 @@ impl Generation {
         Ok(Generation {
             group: SyncGroup::new(&instance)?,
             inputs: (0..slots).map(|_| None).collect(),
+            outgoing: (0..slots).map(|_| None).collect(),
             max_offset: 0,
             instance,
         })
@@ -294,6 +298,27 @@ impl Generation {
         slot: usize,
         cfg: &InputConfig,
         timing: &Timing,
+    ) -> Result<Option<u64>> {
+        self.add(slot, cfg, timing, false)
+    }
+
+    /// [`Generation::attach`] for the flow `slot` leaves in a re-route: the
+    /// reader is in the group and read by [`Generation::outgoing`].
+    pub fn attach_outgoing(
+        &mut self,
+        slot: usize,
+        cfg: &InputConfig,
+        timing: &Timing,
+    ) -> Result<Option<u64>> {
+        self.add(slot, cfg, timing, true)
+    }
+
+    fn add(
+        &mut self,
+        slot: usize,
+        cfg: &InputConfig,
+        timing: &Timing,
+        outgoing: bool,
     ) -> Result<Option<u64>> {
         if slot >= self.inputs.len() {
             return Err(Error::Format(format!("no input slot {slot}")));
@@ -339,15 +364,21 @@ impl Generation {
         let short = (i128::from(timing.margin) < needed).then_some(needed as u64);
 
         self.group.add(&reader)?;
-        self.inputs[slot] = Some(Input {
+        let input = Some(Input {
             reader,
             block: timing.block,
             channels: cont.channelCount as usize,
             offset: cfg.offset,
         });
+        if outgoing {
+            self.outgoing[slot] = input;
+        } else {
+            self.inputs[slot] = input;
+        }
         self.max_offset = self
             .inputs
             .iter()
+            .chain(&self.outgoing)
             .flatten()
             .map(|i| i.offset)
             .max()
@@ -359,8 +390,16 @@ impl Generation {
         self.inputs.get(slot)?.as_ref()
     }
 
+    /// The reader of the flow `slot` leaves in a re-route.
+    pub fn outgoing(&self, slot: usize) -> Option<&Input> {
+        self.outgoing.get(slot)?.as_ref()
+    }
+
     pub fn has_inputs(&self) -> bool {
-        self.inputs.iter().any(Option::is_some)
+        self.inputs
+            .iter()
+            .chain(&self.outgoing)
+            .any(Option::is_some)
     }
 
     /// The largest `offsetSamples` of the attached inputs, 0 without any.
@@ -371,7 +410,12 @@ impl Generation {
     /// Supervisor side. [`Input::prefault`] on every attached input.
     /// Returns the pages touched.
     pub fn prefault(&self) -> Result<usize> {
-        self.inputs.iter().flatten().map(Input::prefault).sum()
+        self.inputs
+            .iter()
+            .chain(&self.outgoing)
+            .flatten()
+            .map(Input::prefault)
+            .sum()
     }
 
     /// RT. `mxlFlowSynchronizationGroupWaitForDataAt` on the generation's
