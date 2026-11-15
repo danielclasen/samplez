@@ -776,12 +776,7 @@ impl Rt {
             let newest = time::newest_due_block(&self.api, now, self.block, self.margin);
             // Entries before commands: a generation handed over after its
             // entry's commit finds the entry pending.
-            while self.mix.pending.len() < PENDING_CHANGES
-                && let Ok(entry) = self.entries.pop()
-            {
-                self.last_entry = self.last_entry.max(entry.id);
-                let _ = self.mix.push(entry);
-            }
+            self.take_entries();
             self.drain_commands(newest.unwrap_or(0));
             // After a backward clock step writers hold until the clock
             // passes their last commit, and inputs never read below their
@@ -836,6 +831,19 @@ impl Rt {
         }
     }
 
+    /// Moves committed entries from the entry ring to the pending list
+    /// while it has room.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn take_entries(&mut self) {
+        while self.mix.pending.len() < PENDING_CHANGES
+            && let Ok(entry) = self.entries.pop()
+        {
+            self.last_entry = self.last_entry.max(entry.id);
+            let _ = self.mix.push(entry);
+        }
+    }
+
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn drain_commands(&mut self, newest: u64) {
         loop {
             // Each command may return one object.
@@ -1004,6 +1012,7 @@ impl Rt {
     }
 
     /// Reads, mixes and writes block `k`, due at `deadline`.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn process(&mut self, k: u64, deadline: u64) {
         let t0 = time::now(&self.api);
         let b = self.block as usize;
@@ -1058,7 +1067,12 @@ impl Rt {
                             } else {
                                 s.min_slack.min(slack)
                             };
-                            input.identify(&mut slot.state, group, outcome);
+                            // The failure path (README): the probe runs
+                            // libmxl's flow validity check, a stat() and
+                            // path allocations.
+                            samplez_mxl::rtsan::allow(|| {
+                                input.identify(&mut slot.state, group, outcome)
+                            });
                         }
                         _ => {}
                     }

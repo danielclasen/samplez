@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub mod input;
 pub mod output;
+pub mod rtsan;
 pub mod time;
 
 pub use mxl::MxlApi;

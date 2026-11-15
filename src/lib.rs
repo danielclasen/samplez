@@ -3,6 +3,8 @@
 //! N input flows are read on libmxl's TAI timeline, mixed through a gain
 //! matrix and written to M output flows at the indices they were read at.
 
+#![cfg_attr(samplez_rtsan, feature(sanitize))]
+
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("samplez supports x86_64 only");
 

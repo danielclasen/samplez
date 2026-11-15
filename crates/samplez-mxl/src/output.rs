@@ -266,8 +266,9 @@ impl FlowWriter {
                 );
             }
         }
-        // SAFETY: live writer with samples open.
-        let status = unsafe { api.flow_writer_commit_samples(self.raw) };
+        // SAFETY: live writer with samples open. The commit wakes readers
+        // with a FUTEX_WAKE syscall, inherent to libmxl's model.
+        let status = crate::rtsan::allow(|| unsafe { api.flow_writer_commit_samples(self.raw) });
         if status != mxl_sys::MXL_STATUS_OK {
             return Write::Failed(status);
         }
