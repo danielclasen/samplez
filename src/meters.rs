@@ -30,7 +30,10 @@ pub struct OutputMeters {
     /// a full-scale sine reads 1.0 (0 dB FS).
     pub rms: Vec<f32>,
     /// Per channel, the true peak of that window per ITU-R BS.1770-5
-    /// Annex 2, full scale 1.0.
+    /// Annex 2, full scale 1.0, and never below the sample peak: no
+    /// phase of the Annex's interpolator is the input sample itself, and
+    /// two have a DC gain of 0.973, so the oversampled peak alone can
+    /// read below the sample peak.
     pub true_peak: Vec<f32>,
     /// Per channel, the largest true peak since the measurement started.
     pub max_true_peak: Vec<f32>,
@@ -135,12 +138,13 @@ impl OutputLoudness {
         *complete &= u64::from(r.frames) == SLICE;
         *next += 1;
         self.window_peak[c] = max(self.window_peak[c], r.peak);
-        self.window_true_peak[c] = max(self.window_true_peak[c], r.true_peak);
+        let true_peak = max(r.true_peak, r.peak);
+        self.window_true_peak[c] = max(self.window_true_peak[c], true_peak);
         let (sum, frames) = &mut self.window_power[c];
         *sum += r.plain_sum_sq;
         *frames += u64::from(r.frames);
         let m = &mut self.meters.max_true_peak[c];
-        *m = max(*m, r.true_peak);
+        *m = max(*m, true_peak);
         if *next < self.weights.len() {
             return;
         }
@@ -245,7 +249,7 @@ mod tests {
         assert_eq!((l.meters.integrated, l.meters.range), (None, None));
         let mut r = rec(0, 0, 100, 0.0);
         r.reset = true;
-        r.true_peak = 0.1;
+        (r.peak, r.true_peak) = (0.1, 0.1);
         l.record(&r);
         l.record(&rec(0, 1, 100, 0.0));
         assert!(l.meters.valid);
@@ -255,6 +259,23 @@ mod tests {
         );
         feed(&mut l, 101..141);
         assert!(l.meters.integrated.is_some());
+    }
+
+    /// The true peak is at least the sample peak, which the oversampled
+    /// peak alone may fall below.
+    #[test]
+    fn true_peak_is_never_below_the_sample_peak() {
+        let mut l = OutputLoudness::new(vec![1.0]);
+        for s in 0..10 {
+            let mut r = rec(0, 0, s, 0.0);
+            (r.peak, r.true_peak) = (0.7, 0.68);
+            l.record(&r);
+        }
+        let m = &l.meters;
+        assert_eq!(
+            (m.peak[0], m.true_peak[0], m.max_true_peak[0]),
+            (0.7, 0.7, 0.7)
+        );
     }
 
     /// RMS is per window and referenced to a sine: a full-scale sine,
