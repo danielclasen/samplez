@@ -43,6 +43,7 @@ fn start(domain: &Domain, src: &str, out: &str, hold_ms: u32) -> (Engine, Receiv
         voters: 2,
         reports: report_tx,
         statuses: Some(status_tx),
+        hashes: None,
     };
     let e = Engine::start_replicated(config, process, None, replication).unwrap();
     if attached {
@@ -544,6 +545,7 @@ fn a_late_route_degrades_its_whole_crossfade_window() {
             voters: 2,
             reports: report_tx,
             statuses: Some(status_tx),
+            hashes: None,
         };
         let e = Engine::start_replicated(config, process, None, replication).unwrap();
         let _guard = w.guard(&e, false);

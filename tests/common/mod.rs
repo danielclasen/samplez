@@ -609,6 +609,7 @@ pub fn start_replicated(config: Config) -> (Engine, Receiver<BlockVerdict>, Rece
         voters: 1,
         reports: report_tx,
         statuses: None,
+        hashes: None,
     };
     let engine = Engine::start_replicated(config, process, Some(tx), replication).unwrap();
     (engine, rx, reports)
@@ -624,8 +625,13 @@ pub fn stop(engine: Engine) {
 }
 
 /// A replicated engine of `voters` voters over one pilot input and one
-/// output, with gain 1.
-pub fn start_held(domain: &Path, src: &str, out: &str, voters: usize) -> Engine {
+/// output, with gain 1, and its page hashes.
+pub fn start_held(
+    domain: &Path,
+    src: &str,
+    out: &str,
+    voters: usize,
+) -> (Engine, Receiver<samplez::blocks::PageHash>) {
     let v = serde_json::json!({
         "blockSize": B,
         "readerMarginSamples": MARGIN,
@@ -639,17 +645,19 @@ pub fn start_held(domain: &Path, src: &str, out: &str, voters: usize) -> Engine 
     });
     let config = Config::parse(&v.to_string()).unwrap();
     let (report_tx, _reports) = std::sync::mpsc::sync_channel(64);
+    let (hash_tx, hashes) = std::sync::mpsc::sync_channel(1 << 16);
     let process = samplez::rt::setup_process(&config.rt);
     let replication = samplez::Replication {
         voters,
         reports: report_tx,
         statuses: None,
+        hashes: Some(hash_tx),
     };
     let e = Engine::start_replicated(config, process, None, replication).unwrap();
     wait_for(Duration::from_secs(5), "output realised", || {
         e.status().outputs[0].realised
     });
-    e
+    (e, hashes)
 }
 
 /// The block after the last one whose statuses are set.
@@ -662,8 +670,9 @@ pub fn processed(e: &Engine) -> u64 {
 /// degraded by an unresolved entry held and committed through, a frozen
 /// F filling the ring until it overflows and withdraws the replica,
 /// unfillable blocks, fills committed through, a block withheld before
-/// it is computed and a stop. It checks no outcome: an overrun skip under
-/// load changes which paths run, and tests/hold.rs checks outcomes.
+/// it is computed and a stop, with gain entries in three pages for their
+/// fingerprints. It checks no outcome: an overrun skip under load changes
+/// which paths run, and tests/hold.rs checks outcomes.
 pub fn hold_scenario(e: &Engine) {
     use samplez::blocks::{Cause, PAGE};
     let wait = |k: u64| {
@@ -681,6 +690,17 @@ pub fn hold_scenario(e: &Engine) {
     let from = processed(e) + 2;
     e.commit_from(0, from).unwrap();
     let kp = (from * B).next_multiple_of(PAGE) / B;
+    let at = (processed(e) + 100) * B;
+    for (id, page) in [(1, 0), (2, 2), (3, 4)] {
+        let gain = if id == 2 { 0.5 } else { 1.0 };
+        let entry = samplez::Entry::Gain {
+            input: 0,
+            output: 0,
+            gain,
+        };
+        e.append(id, at + page * PAGE / B * B, entry).unwrap();
+    }
+    e.commit(3);
     wait(kp + 10);
 
     // Degraded blocks, held, then committed through on evidence.

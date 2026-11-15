@@ -586,6 +586,7 @@ fn a_report_the_channel_had_no_room_for_is_sent_again() {
         voters: 1,
         reports: report_tx.clone(),
         statuses: None,
+        hashes: None,
     };
     let e = Engine::start_replicated(cfg, process, Some(verdict_tx), replication).unwrap();
     let dropped = || e.counters().reports_dropped.load(Relaxed);

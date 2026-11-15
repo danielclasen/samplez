@@ -8,7 +8,8 @@
 //! blocks for commit through on evidence. A block that cannot be
 //! committed at once stays in the output's hold ring, with every block
 //! computed after it, until it is final; committed blocks leave the ring
-//! in one write.
+//! in one write. Each output's pages are hashed as they are computed, and
+//! a page's hash is sent once every block overlapping it is final.
 //!
 //! Nothing here allocates once built.
 
@@ -1075,6 +1076,182 @@ impl Hold {
     }
 }
 
+/// One page of one output as this replica computed it: what replicas
+/// compare to find out whether their member flows are bit-identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageHash {
+    pub output: u32,
+    /// The samples `[page * PAGE, (page + 1) * PAGE)`.
+    pub page: u64,
+    /// XXH3-64 over the page's samples in index order, the channels of
+    /// one index interleaved, each sample's f32 bit pattern as 4 bytes
+    /// little endian.
+    pub hash: u64,
+    /// [`fingerprint`] of the log entries applied in the page.
+    pub fingerprint: u64,
+    /// Every sample of the page was committed.
+    pub committed: bool,
+}
+
+/// The entry fingerprint of a page: XXH3-64 over the `(log id,
+/// at_index)` pairs of the entries applied in it, sorted, each number as
+/// 8 bytes little endian. An entry belongs to the page holding its
+/// `at_index`. Sorts `entries`.
+pub fn fingerprint(entries: &mut [(u64, u64)]) -> u64 {
+    entries.sort_unstable();
+    let mut h = xxhash_rust::xxh3::Xxh3Default::new();
+    for (id, at) in entries.iter() {
+        h.update(&id.to_le_bytes());
+        h.update(&at.to_le_bytes());
+    }
+    h.digest()
+}
+
+/// A hashed page, until every block overlapping it is final.
+#[derive(Clone, Copy, Debug)]
+struct Waiting {
+    record: PageHash,
+    /// The page's first block not yet seen final, and its last block.
+    next: u64,
+    last: u64,
+}
+
+/// One output's page hashes, owned by the RT thread: the page being
+/// hashed, and the pages hashed whose blocks are not all final yet.
+pub struct Pages {
+    output: u32,
+    channels: usize,
+    block: u64,
+    hasher: xxhash_rust::xxh3::Xxh3Default,
+    /// The page being hashed and the index of the next sample it takes.
+    current: Option<(u64, u64)>,
+    /// One block's samples as hashed.
+    bytes: Vec<u8>,
+    waiting: std::collections::VecDeque<Waiting>,
+    /// Pages waiting at most.
+    cap: usize,
+}
+
+impl Pages {
+    /// The page hashes of output `output`, of `channels` channels, in
+    /// blocks of `block` samples, with a hold ring of `hold` blocks.
+    pub fn new(output: u32, channels: usize, block: u64, hold: usize) -> Pages {
+        // Only a block in the hold ring is not final, and it overlaps at
+        // most two pages.
+        let cap = 2 * hold + 2;
+        Pages {
+            output,
+            channels,
+            block,
+            hasher: xxhash_rust::xxh3::Xxh3Default::new(),
+            current: None,
+            bytes: vec![0; channels * block as usize * 4],
+            waiting: std::collections::VecDeque::with_capacity(cap),
+            cap,
+        }
+    }
+
+    /// RT. Hashes block `k`, planar in `data` with B samples per channel.
+    /// A page whose every sample was hashed, in order, waits for its
+    /// blocks to be final; a page missing one (a skip, a block not
+    /// computed for this output) gets no record. `fingerprint` is the
+    /// entry fingerprint of the page that ends in block `k`, none when
+    /// it is unknown: that page then gets no record, counted in
+    /// `dropped`, as is the oldest page waiting when too many wait.
+    pub fn hash(&mut self, k: u64, data: &[f32], fingerprint: Option<u64>, dropped: &AtomicU64) {
+        let b = self.block;
+        let (start, end) = (k * b, (k + 1) * b);
+        let mut from = start;
+        while from < end {
+            let page = from / PAGE;
+            let to = end.min((page + 1) * PAGE);
+            match self.current {
+                Some((p, next)) if p == page && next == from => {}
+                _ if from == page * PAGE => self.hasher.reset(),
+                _ => {
+                    self.current = None;
+                    from = to;
+                    continue;
+                }
+            }
+            let mut len = 0;
+            for i in (from - start) as usize..(to - start) as usize {
+                for c in 0..self.channels {
+                    let x = data[c * b as usize + i].to_bits().to_le_bytes();
+                    self.bytes[len..len + 4].copy_from_slice(&x);
+                    len += 4;
+                }
+            }
+            self.hasher.update(&self.bytes[..len]);
+            self.current = Some((page, to));
+            if to == (page + 1) * PAGE {
+                self.current = None;
+                match fingerprint {
+                    None => {
+                        dropped.fetch_add(1, Relaxed);
+                    }
+                    Some(fingerprint) => {
+                        if self.waiting.len() == self.cap {
+                            self.waiting.pop_front();
+                            dropped.fetch_add(1, Relaxed);
+                        }
+                        self.waiting.push_back(Waiting {
+                            record: PageHash {
+                                output: self.output,
+                                page,
+                                hash: self.hasher.digest(),
+                                fingerprint,
+                                committed: true,
+                            },
+                            next: page * PAGE / b,
+                            last: (to - 1) / b,
+                        });
+                    }
+                }
+            }
+            from = to;
+        }
+    }
+
+    /// RT. Sends the record of each waiting page whose every block is
+    /// final: committed, withheld, or without a status, computed while
+    /// the output committed nothing. A record `ring` has no room for is
+    /// counted in `dropped`.
+    pub fn settle(
+        &mut self,
+        statuses: &Statuses,
+        ring: &mut Producer<PageHash>,
+        dropped: &AtomicU64,
+    ) {
+        let b = self.block;
+        self.waiting.retain_mut(|w| {
+            let (start, end) = (w.record.page * PAGE, (w.record.page + 1) * PAGE);
+            while w.next <= w.last {
+                let k = w.next;
+                match statuses.get(k) {
+                    Some(s) if matches!(s.kind, Kind::Fenced | Kind::Held) => return true,
+                    Some(s) if s.kind == Kind::Committed => {
+                        let (from, to) = match s.range {
+                            Range::Whole => (k * b, (k + 1) * b),
+                            Range::From(p) => (p, (k + 1) * b),
+                            Range::UpTo(p) => (k * b, p),
+                        };
+                        // The block's samples in the page are committed.
+                        w.record.committed &=
+                            from <= start.max(k * b) && to >= end.min((k + 1) * b);
+                    }
+                    _ => w.record.committed = false,
+                }
+                w.next += 1;
+            }
+            if ring.push(w.record).is_err() {
+                dropped.fetch_add(1, Relaxed);
+            }
+            false
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1883,5 +2060,199 @@ mod tests {
             (Kind::Withheld, Cause::Unfillable),
             "the block after a committed one withheld as unfillable"
         );
+    }
+
+    /// One output's page hashes over [`T`]'s two channels, and their
+    /// ring.
+    struct H {
+        pages: Pages,
+        tx: Producer<PageHash>,
+        rx: rtrb::Consumer<PageHash>,
+        dropped: AtomicU64,
+    }
+
+    impl H {
+        fn new() -> H {
+            let (tx, rx) = rtrb::RingBuffer::new(64);
+            H {
+                pages: Pages::new(3, 2, B, CAP),
+                tx,
+                rx,
+                dropped: AtomicU64::new(0),
+            }
+        }
+
+        fn hash(&mut self, k: u64) {
+            self.pages.hash(k, &T::block(k), Some(FP), &self.dropped);
+        }
+
+        /// The records sent by a settle.
+        fn settle(&mut self, statuses: &Statuses) -> Vec<PageHash> {
+            self.pages.settle(statuses, &mut self.tx, &self.dropped);
+            let mut v = Vec::new();
+            while let Ok(h) = self.rx.pop() {
+                v.push(h);
+            }
+            v
+        }
+    }
+
+    const FP: u64 = 0x1234;
+    /// The page starting at block K0, the next one, and their last
+    /// blocks: K0 + 21 holds the boundary between them at P1.
+    const P0: u64 = K0 * B / PAGE;
+    const P1: u64 = (P0 + 1) * PAGE;
+    const LAST0: u64 = K0 + 21;
+    const LAST1: u64 = K0 + 42;
+
+    /// The hash covers the page's samples in index order with the
+    /// channels of one index interleaved, each f32's bit pattern little
+    /// endian; a page whose blocks have no status (computed while the
+    /// output committed nothing) is sent, not committed.
+    #[test]
+    fn a_page_hash_is_xxh3_over_its_samples_interleaved() {
+        let mut h = H::new();
+        let statuses = Statuses::new(64, B);
+        for k in K0..LAST0 {
+            h.hash(k);
+        }
+        assert_eq!(
+            h.settle(&statuses),
+            [],
+            "a page sent before it was hashed whole"
+        );
+        h.hash(LAST0);
+        let mut bytes = Vec::new();
+        for i in P0 * PAGE..P1 {
+            bytes.extend((i as f32).to_bits().to_le_bytes());
+            bytes.extend((-(i as f32)).to_bits().to_le_bytes());
+        }
+        let want = PageHash {
+            output: 3,
+            page: P0,
+            hash: xxhash_rust::xxh3::xxh3_64(&bytes),
+            fingerprint: FP,
+            committed: false,
+        };
+        assert_eq!(h.settle(&statuses), [want]);
+    }
+
+    /// A page is sent once every block overlapping it is final: not while
+    /// one is fenced, and committed once all are committed.
+    #[test]
+    fn a_page_hash_waits_for_every_block_to_be_final() {
+        let mut t = T::committing(false, K0);
+        let mut h = H::new();
+        for k in K0..=LAST0 {
+            if k == K0 + 16 {
+                t.ctx.fence = (K0 + 16) * B;
+            }
+            t.compute(k, Some(HEALTHY));
+            h.hash(k);
+        }
+        assert_eq!(t.kind(LAST0), Some(Kind::Fenced));
+        assert_eq!(h.settle(&t.statuses), [], "sent with fenced blocks");
+        t.ctx.fence = u64::MAX;
+        t.advance();
+        let got = h.settle(&t.statuses);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].committed && got[0].page == P0, "{got:?}");
+        assert_eq!(h.settle(&t.statuses), [], "sent twice");
+    }
+
+    /// A withheld block leaves its page not committed.
+    #[test]
+    fn a_page_with_a_withheld_block_is_not_committed() {
+        let mut t = T::committing(false, K0);
+        let mut h = H::new();
+        for k in K0..=LAST0 {
+            if k == K0 + 16 {
+                t.ctx.fence = (K0 + 16) * B;
+            }
+            t.compute(k, Some(HEALTHY));
+            h.hash(k);
+        }
+        t.statuses.withhold(LAST0, Cause::HoldCap).unwrap();
+        t.ctx.fence = u64::MAX;
+        t.advance();
+        assert_eq!(t.kind(LAST0 - 1), Some(Kind::Committed));
+        let got = h.settle(&t.statuses);
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].committed && got[0].page == P0, "{got:?}");
+    }
+
+    /// A commit start inside a block commits the page from it whole, and
+    /// the page before it in part: not committed.
+    #[test]
+    fn a_page_is_committed_from_a_commit_start_on() {
+        let mut t = T::committing(false, K0 + 1);
+        let mut h = H::new();
+        for k in K0..=LAST1 {
+            t.compute(k, Some(HEALTHY));
+            h.hash(k);
+        }
+        assert_eq!(t.statuses.get(LAST0).unwrap().range, Range::From(P1));
+        let got = h.settle(&t.statuses);
+        let pages: Vec<_> = got.iter().map(|g| (g.page, g.committed)).collect();
+        assert_eq!(pages, [(P0, false), (P0 + 1, true)]);
+    }
+
+    /// A stop inside a page leaves it not committed.
+    #[test]
+    fn a_page_with_a_stop_is_not_committed() {
+        let mut t = T::committing(false, K0);
+        t.hold.stop_at(P1 + PAGE - 18);
+        let mut h = H::new();
+        for k in K0..=LAST1 {
+            t.compute(k, Some(HEALTHY));
+            h.hash(k);
+        }
+        let st = t.statuses.get(LAST1).unwrap();
+        assert_eq!(
+            (st.kind, st.range),
+            (Kind::Committed, Range::UpTo(P1 + PAGE - 18))
+        );
+        let got = h.settle(&t.statuses);
+        let pages: Vec<_> = got.iter().map(|g| (g.page, g.committed)).collect();
+        assert_eq!(pages, [(P0, true), (P0 + 1, false)]);
+    }
+
+    /// A page missing a block gets no record; the next page whole does.
+    #[test]
+    fn a_page_not_computed_whole_gets_no_record() {
+        let mut h = H::new();
+        let statuses = Statuses::new(64, B);
+        for k in (K0..=LAST1).filter(|&k| k != K0 + 5) {
+            h.hash(k);
+        }
+        let pages: Vec<_> = h.settle(&statuses).iter().map(|g| g.page).collect();
+        assert_eq!(pages, [P0 + 1]);
+    }
+
+    /// A page whose fingerprint is unknown gets no record and is counted.
+    #[test]
+    fn a_page_without_a_fingerprint_is_counted() {
+        let mut h = H::new();
+        let statuses = Statuses::new(64, B);
+        for k in K0..=LAST0 {
+            let fp = (k != LAST0).then_some(FP);
+            h.pages.hash(k, &T::block(k), fp, &h.dropped);
+        }
+        assert_eq!(h.settle(&statuses), []);
+        assert_eq!(h.dropped.load(Relaxed), 1);
+    }
+
+    /// The fingerprint is XXH3-64 over the (log id, at_index) pairs in log
+    /// id order, whatever order they come in.
+    #[test]
+    fn the_fingerprint_is_xxh3_over_the_sorted_entries() {
+        let mut bytes = Vec::new();
+        for n in [2u64, 300, 5, 100] {
+            bytes.extend(n.to_le_bytes());
+        }
+        let want = xxhash_rust::xxh3::xxh3_64(&bytes);
+        assert_eq!(fingerprint(&mut [(5, 100), (2, 300)]), want);
+        assert_eq!(fingerprint(&mut [(2, 300), (5, 100)]), want);
+        assert_eq!(fingerprint(&mut []), HEALTHY);
     }
 }
