@@ -67,6 +67,17 @@ fn block(v: &[f32], channels: usize, i: usize, c: usize) -> &[f32] {
     &v[(i * channels + c) * b..(i * channels + c + 1) * b]
 }
 
+/// Whether both engines computed block `k`. A block an engine skipped
+/// after an overrun is zero-filled by libmxl, not computed.
+fn both(va: &[BlockVerdict], vb: &[BlockVerdict], k: u64) -> bool {
+    va.iter().any(|v| v.k == k) && vb.iter().any(|v| v.k == k)
+}
+
+/// Whether two blocks are bit-identical.
+fn same(x: &[f32], y: &[f32]) -> bool {
+    x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+}
+
 fn report(rx: &Receiver<Report>, want: Report) {
     let deadline = std::time::Instant::now() + 10 * SECOND;
     loop {
@@ -111,17 +122,29 @@ fn input_down_and_up_apply_at_their_index_on_every_engine() {
     let (mut va, mut vb) = (Vec::new(), Vec::new());
     wait_past(&rx_a, down / B + 50, &mut va);
     wait_past(&rx_b, down / B + 50, &mut vb);
-    let compare = |range: std::ops::Range<u64>, want: &dyn Fn(usize, u64) -> Vec<f32>| {
+    let compare = |range: std::ops::Range<u64>,
+                   va: &[BlockVerdict],
+                   vb: &[BlockVerdict],
+                   want: &dyn Fn(usize, u64) -> Vec<f32>| {
         let x = common::read_blocks(&domain.0, &out_a, 2, range.clone());
         let y = common::read_blocks(&domain.0, &out_b, 2, range.clone());
-        assert!(x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits()));
-        for (i, k) in range.enumerate() {
+        let mut compared = 0;
+        for (i, k) in range.clone().enumerate() {
+            if !both(va, vb, k) {
+                continue;
+            }
+            compared += 1;
             for c in 0..2 {
+                assert!(same(block(&x, 2, i, c), block(&y, 2, i, c)), "block {k}");
                 assert!(block(&x, 2, i, c) == want(c, k), "block {k} channel {c}");
             }
         }
+        assert!(
+            compared * 4 > range.count() * 3,
+            "{compared} blocks compared"
+        );
     };
-    compare(down / B - 20..down / B + 50, &|c, k| {
+    compare(down / B - 20..down / B + 50, &va, &vb, &|c, k| {
         if k * B < down {
             ramped(c, k, 1.0, 1.0, 0)
         } else {
@@ -139,7 +162,7 @@ fn input_down_and_up_apply_at_their_index_on_every_engine() {
     let end = up / B + 2 * u64::from(RAMP) / B;
     wait_past(&rx_a, end, &mut va);
     wait_past(&rx_b, end, &mut vb);
-    compare(up / B - 20..end, &|c, k| {
+    compare(up / B - 20..end, &va, &vb, &|c, k| {
         if k * B < up {
             vec![0.0; B as usize]
         } else {
@@ -211,8 +234,22 @@ fn an_entry_applied_again_starts_no_fade_crossfade_or_ramp() {
     }
     let range = k0 + 100..end;
     let x = common::read_blocks(&domain.0, &out_a, 2, range.clone());
-    let y = common::read_blocks(&domain.0, &out_b, 2, range);
-    assert!(x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits()));
+    let y = common::read_blocks(&domain.0, &out_b, 2, range.clone());
+    let mut compared = 0;
+    for (i, k) in range.clone().enumerate() {
+        if both(&va, &vb, k) {
+            compared += 1;
+            let n = 2 * B as usize;
+            assert!(
+                same(&x[i * n..(i + 1) * n], &y[i * n..(i + 1) * n]),
+                "block {k}"
+            );
+        }
+    }
+    assert!(
+        compared * 4 > range.count() * 3,
+        "{compared} blocks compared"
+    );
     let s = a.status();
     assert_eq!(s.generation.builds, builds + 2, "{:?}", s.generation);
     assert_eq!(s.generation.pending, None);
