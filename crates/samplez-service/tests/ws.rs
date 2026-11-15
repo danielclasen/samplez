@@ -16,7 +16,7 @@ use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
     Admission, Answer, CatchUp, ClientQueue, Delta, Encode, Ended, Frame, Hub, MAX_PAUSE,
     MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES, PING_PERIOD, PONG_TIMEOUT, Popped, Pushed,
-    READ_INDEX_HOLD, Reply, Sessions, serve_client,
+    READ_INDEX_HOLD, Reply, Sessions, Slot, To, serve_client,
 };
 use samplez_service::{
     Connect, Forbidden, Identity, Ops, Owner, OwnerHandle, Position, ReplicatedState, Role,
@@ -84,6 +84,136 @@ async fn meters_and_counters_keep_their_latest_frame_and_meters_need_credit() {
     assert_eq!(q.push(meters(b"m4")), Pushed::Queued);
     assert_eq!(popped(&q).await, Popped::Frame(meters(b"m4")));
     assert_eq!(q.push(meters(b"m5")), Pushed::Skipped, "credits used up");
+}
+
+/// Nothing is waiting in the queue.
+async fn nothing_queued(queue: &ClientQueue) {
+    let got = tokio::time::timeout(Duration::from_millis(10), queue.pop()).await;
+    assert!(got.is_err(), "unexpected {got:?}");
+}
+
+fn text_frame(t: &str) -> Frame {
+    Frame::Text(t.to_owned().into())
+}
+
+/// Text frames keep their order and are dropped, not queued without bound,
+/// once the queue's capacity of them wait. A text frame never goes out
+/// ahead of a delta pushed before it, nor ahead of the resync that
+/// discarded one: the client is to see no product message about a state
+/// older than what it was sent.
+#[tokio::test]
+async fn text_frames_queue_in_order_bounded_and_after_earlier_deltas() {
+    let q = ClientQueue::new(2);
+    assert_eq!(q.push(delta(1)), Pushed::Queued);
+    assert_eq!(q.push(text_frame("t1")), Pushed::Queued);
+    assert_eq!(q.push(text_frame("t2")), Pushed::Queued);
+    assert_eq!(q.push(text_frame("t3")), Pushed::Dropped, "full");
+    assert_eq!(popped(&q).await, Popped::Frame(delta(1)));
+    assert_eq!(popped(&q).await, Popped::Frame(text_frame("t1")));
+    assert_eq!(q.push(text_frame("t4")), Pushed::Queued, "room again");
+    assert_eq!(popped(&q).await, Popped::Frame(text_frame("t2")));
+    assert_eq!(popped(&q).await, Popped::Frame(text_frame("t4")));
+
+    for revision in 2..=4 {
+        q.push(delta(revision));
+    }
+    assert_eq!(q.push(text_frame("t5")), Pushed::Queued);
+    assert_eq!(popped(&q).await, Popped::Resync, "the resync first");
+    assert_eq!(popped(&q).await, Popped::Frame(text_frame("t5")));
+    nothing_queued(&q).await;
+}
+
+const PACED: Slot = Slot {
+    name: "paced",
+    every: Duration::from_millis(100),
+};
+const UNPACED: Slot = Slot {
+    name: "unpaced",
+    every: Duration::ZERO,
+};
+
+fn status(slot: Slot, t: &str) -> Frame {
+    Frame::Status(slot, t.to_owned().into())
+}
+
+/// A status slot keeps its latest frame only, and one paced at 100 ms
+/// sends a client at most one frame per 100 ms however often the product
+/// pushes: the latest waits for the time, the slots apart from it do not.
+#[tokio::test(start_paused = true)]
+async fn status_frames_keep_their_latest_per_slot_and_are_paced() {
+    let q = ClientQueue::new(2);
+    assert_eq!(q.push(status(PACED, "p1")), Pushed::Queued);
+    assert_eq!(q.push(status(PACED, "p2")), Pushed::Replaced);
+    assert_eq!(q.push(status(UNPACED, "u1")), Pushed::Queued);
+    assert_eq!(popped(&q).await, Popped::Frame(status(PACED, "p2")));
+    assert_eq!(popped(&q).await, Popped::Frame(status(UNPACED, "u1")));
+    nothing_queued(&q).await;
+
+    let sent = Instant::now() - Duration::from_millis(10);
+    assert_eq!(q.push(status(PACED, "p3")), Pushed::Queued);
+    assert_eq!(q.push(status(UNPACED, "u2")), Pushed::Queued);
+    assert_eq!(popped(&q).await, Popped::Frame(status(UNPACED, "u2")));
+    assert_eq!(q.push(status(PACED, "p4")), Pushed::Replaced);
+    assert_eq!(popped(&q).await, Popped::Frame(status(PACED, "p4")));
+    assert_eq!(sent.elapsed(), Duration::from_millis(100), "paced");
+    assert_eq!(q.push(status(UNPACED, "u3")), Pushed::Queued);
+    assert_eq!(popped(&q).await, Popped::Frame(status(UNPACED, "u3")));
+    assert_eq!(sent.elapsed(), Duration::from_millis(100), "not paced");
+}
+
+fn owner_of(principal: &str, session: &str, connection: &str) -> Owner {
+    Owner {
+        principal: principal.into(),
+        session: session.into(),
+        role: Role::Operator,
+        connection: connection.into(),
+    }
+}
+
+/// A frame for a session reaches its connections only, under its
+/// principal only; one for its primary connections skips the ones not
+/// marked primary; one for a connection reaches that one. A dropped queue
+/// is reached by nothing.
+#[tokio::test]
+async fn frames_reach_the_session_its_primary_connections_or_one_connection() {
+    let hub = Hub::new(8);
+    let primary = hub.subscribe(&owner_of("alice", "s1", "r1:1"));
+    primary.set_primary(true);
+    let standby = hub.subscribe(&owner_of("alice", "s1", "r1:2"));
+    let other_principal = hub.subscribe(&owner_of("bob", "s1", "r1:3"));
+    let other_session = hub.subscribe(&owner_of("alice", "s2", "r1:4"));
+    let all = [&primary, &standby, &other_principal, &other_session];
+    let s1 = ("alice", "s1");
+
+    let to = To::Session {
+        principal: s1.0,
+        session: s1.1,
+    };
+    assert_eq!(hub.send(to, text_frame("session")), 2);
+    for q in [&primary, &standby] {
+        assert_eq!(popped(q).await, Popped::Frame(text_frame("session")));
+    }
+    let to = To::Primary {
+        principal: s1.0,
+        session: s1.1,
+    };
+    assert_eq!(hub.send(to, text_frame("primary")), 1);
+    assert_eq!(popped(&primary).await, Popped::Frame(text_frame("primary")));
+    assert_eq!(hub.send(To::Connection("r1:4"), text_frame("one")), 1);
+    assert_eq!(
+        popped(&other_session).await,
+        Popped::Frame(text_frame("one"))
+    );
+    for q in all {
+        nothing_queued(q).await;
+    }
+
+    hub.publish(text_frame("every"));
+    for q in all {
+        assert_eq!(popped(q).await, Popped::Frame(text_frame("every")));
+    }
+    drop(other_session);
+    assert_eq!(hub.send(To::Connection("r1:4"), text_frame("gone")), 0);
 }
 
 /// A WebSocket made of two channels.
@@ -240,7 +370,7 @@ impl Client {
     /// grants a meter credit for the binary message `credit`. Sends nothing
     /// for the client.
     fn open(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
-        let queue = hub.subscribe();
+        let queue = hub.subscribe(&connect.owner);
         let state = state.clone();
         let (to_client, rx) = mpsc::unbounded_channel();
         let (tx, from_client) = mpsc::unbounded_channel();
@@ -401,6 +531,34 @@ async fn connect_catches_up_from_the_last_seen_position() {
         assert_eq!(client.next().await, "delta@4");
         assert_eq!(client.next().await, "c");
     }
+}
+
+/// Product frames pushed before the first catch-up wait for its answer,
+/// as deltas do, and go out as text messages; one pushed after a delta goes
+/// out after it.
+#[tokio::test(start_paused = true)]
+async fn product_frames_go_out_as_text_after_the_first_catch_up() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
+    let to = To::Session {
+        principal: "anonymous",
+        session: "s1",
+    };
+    assert_eq!(hub.send(to, text_frame("early")), 1);
+    hub.publish(status(UNPACED, "status"));
+    client.silent().await;
+    client.tx.send(sync(None)).unwrap();
+    assert_eq!(client.next().await, "snapshot@7:0");
+    assert_eq!(client.next().await, "early");
+    assert_eq!(client.next().await, "status");
+
+    apply(&state, &hub);
+    assert_eq!(hub.send(To::Connection("r1:1"), text_frame("late")), 1);
+    assert_eq!(client.next().await, "delta@1");
+    assert_eq!(client.next().await, "late");
+    client.silent().await;
 }
 
 /// A state initialised anew or restored has another epoch: every client
@@ -1005,7 +1163,7 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8).subscribe(&connect.owner);
     let (to_client, _rx) = mpsc::unbounded_channel();
     let (tx, from_client) = mpsc::unbounded_channel();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1088,7 +1246,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8).subscribe(&connect.owner);
     let (to_client, _rx) = mpsc::unbounded_channel();
     let (tx, from_client) = mpsc::unbounded_channel();
     let start = Instant::now();
@@ -1123,7 +1281,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause()
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8).subscribe(&connect.owner);
     let (to_client, _rx) = mpsc::unbounded_channel();
     let (tx, from_client) = mpsc::unbounded_channel();
     let reply = MAX_PAUSE - Duration::from_millis(100);
@@ -1507,7 +1665,7 @@ async fn a_send_while_not_read_does_not_outlast_the_pause() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8).subscribe(&connect.owner);
     let (tx, from_client) = mpsc::unbounded_channel();
     let start = Instant::now();
     let ready = start + MAX_PAUSE - Duration::from_millis(100);
@@ -1553,7 +1711,7 @@ async fn a_reply_ready_as_the_pause_ends_does_not_resume_the_connection() {
     let mut clients = Vec::new();
     for n in 0..32 {
         let connect = connect(&sessions, Role::Operator, n);
-        let queue = Hub::new(8).subscribe();
+        let queue = Hub::new(8).subscribe(&connect.owner);
         let state = state.clone();
         let (to_client, rx) = mpsc::unbounded_channel();
         let (tx, from_client) = mpsc::unbounded_channel();
@@ -1978,7 +2136,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_the_first_message() {
                 assert_eq!(connect.owner.principal, "anonymous");
                 assert_eq!(connect.owner.role, Role::Operator);
                 assert!(connect.owner.connection.starts_with("r1:"));
-                let queue = hub.subscribe();
+                let queue = hub.subscribe(&connect.owner);
                 serve_client(socket, &connect, &queue, &*state, Wire, |m, _| {
                     protocol(&m).unwrap_or(Reply::Command(async { None }))
                 })
@@ -2136,7 +2294,7 @@ async fn a_client_that_stops_reading_ends_one_second_after_it_connected() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     let connect = connect(&sessions, Role::Operator, 1);
-    let queue = Hub::new(8).subscribe();
+    let queue = Hub::new(8).subscribe(&connect.owner);
     let start = Instant::now();
     let task = tokio::spawn({
         let state = state.clone();

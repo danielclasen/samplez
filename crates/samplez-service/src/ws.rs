@@ -11,11 +11,15 @@
 //! catch up from there; so does a full delta queue. A replica whose epoch
 //! changes closes the connection. Meters and counters keep only their
 //! latest frame; a meter frame is sent only against a credit the product
-//! grants for the client.
+//! grants for the client. The product's own messages go to every client, to
+//! the connections of one session or to one connection ([`Hub::send`]):
+//! status messages keep only their latest frame per [`Slot`], other text
+//! frames queue in order, and neither goes out ahead of a delta published
+//! before it.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -258,6 +262,23 @@ pub enum Frame {
     Meters(Bytes),
     /// Sent as a text message; replaces a counters frame not sent yet.
     Counters(Utf8Bytes),
+    /// A product status message, sent as a text message: replaces the
+    /// frame of the same slot not sent yet, and goes out at most once per
+    /// [`Slot::every`].
+    Status(Slot, Utf8Bytes),
+    /// A product message sent as a text message, in the order pushed among
+    /// the other `Text` frames; dropped while as many of them wait as the
+    /// queue's capacity.
+    Text(Utf8Bytes),
+}
+
+/// A kind of [`Frame::Status`]: each queue keeps one frame per name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slot {
+    pub name: &'static str,
+    /// The least time between two frames of the slot sent to one client,
+    /// counted from when the queue hands the first out; `ZERO` for none.
+    pub every: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +291,8 @@ pub enum Pushed {
     /// The delta queue was emptied, or the delta discarded, because the
     /// client has to catch up.
     Resync,
+    /// A text frame while the queue's capacity of them wait.
+    Dropped,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -284,6 +307,7 @@ pub struct ClientQueue {
     capacity: usize,
     inner: Mutex<Inner>,
     notify: Notify,
+    primary: AtomicBool,
 }
 
 #[derive(Default)]
@@ -292,17 +316,28 @@ struct Inner {
     resync: bool,
     meters: Option<Bytes>,
     counters: Option<Utf8Bytes>,
+    texts: VecDeque<Utf8Bytes>,
+    /// One entry per slot pushed, kept after its frame is sent for when
+    /// that was.
+    statuses: Vec<StatusSlot>,
     credits: u64,
 }
 
+struct StatusSlot {
+    slot: Slot,
+    text: Option<Utf8Bytes>,
+    sent: Option<Instant>,
+}
+
 impl ClientQueue {
-    /// `capacity` bounds the deltas waiting.
+    /// `capacity` bounds the deltas waiting, and the text frames.
     pub fn new(capacity: usize) -> ClientQueue {
         assert!(capacity > 0, "a client queue needs room for one delta");
         ClientQueue {
             capacity,
             inner: Mutex::default(),
             notify: Notify::new(),
+            primary: AtomicBool::new(false),
         }
     }
 
@@ -327,6 +362,27 @@ impl ClientQueue {
             Frame::Meters(_) if q.credits == 0 => return Pushed::Skipped,
             Frame::Meters(m) => replace(&mut q.meters, m),
             Frame::Counters(c) => replace(&mut q.counters, c),
+            Frame::Text(_) if q.texts.len() >= self.capacity => return Pushed::Dropped,
+            Frame::Text(t) => {
+                q.texts.push_back(t);
+                Pushed::Queued
+            }
+            Frame::Status(slot, text) => {
+                match q.statuses.iter_mut().find(|s| s.slot.name == slot.name) {
+                    Some(s) => {
+                        s.slot = slot;
+                        replace(&mut s.text, text)
+                    }
+                    None => {
+                        q.statuses.push(StatusSlot {
+                            slot,
+                            text: Some(text),
+                            sent: None,
+                        });
+                        Pushed::Queued
+                    }
+                }
+            }
         };
         drop(q);
         self.notify.notify_one();
@@ -344,11 +400,25 @@ impl ClientQueue {
         self.lock().credits
     }
 
-    /// A resync first, then deltas in order, then counters, then meters;
-    /// each meter frame popped uses one credit.
+    /// Marks whether the client sends its commands on this connection, as
+    /// the product's protocol tells it; [`To::Primary`] reads it. `false`
+    /// until set.
+    pub fn set_primary(&self, primary: bool) {
+        self.primary.store(primary, Ordering::Relaxed);
+    }
+
+    pub fn is_primary(&self) -> bool {
+        self.primary.load(Ordering::Relaxed)
+    }
+
+    /// A resync first, then deltas in order, then counters, then text
+    /// frames in order, then status frames whose slot allows one now, then
+    /// meters; each meter frame popped uses one credit. A frame pushed
+    /// after a delta is therefore never popped ahead of it, nor ahead of
+    /// the resync that discarded it.
     pub async fn pop(&self) -> Popped {
         loop {
-            {
+            let wake = {
                 let mut q = self.lock();
                 if q.resync {
                     q.resync = false;
@@ -360,14 +430,40 @@ impl ClientQueue {
                 if let Some(c) = q.counters.take() {
                     return Popped::Frame(Frame::Counters(c));
                 }
+                if let Some(t) = q.texts.pop_front() {
+                    return Popped::Frame(Frame::Text(t));
+                }
+                let now = Instant::now();
+                let mut wake: Option<Instant> = None;
+                for s in q.statuses.iter_mut().filter(|s| s.text.is_some()) {
+                    match s.sent.map(|sent| sent + s.slot.every) {
+                        Some(next) if now < next => {
+                            wake = Some(wake.map_or(next, |w| w.min(next)));
+                        }
+                        _ => {
+                            s.sent = Some(now);
+                            let text = s.text.take().expect("filtered");
+                            return Popped::Frame(Frame::Status(s.slot, text));
+                        }
+                    }
+                }
                 if q.credits > 0
                     && let Some(m) = q.meters.take()
                 {
                     q.credits -= 1;
                     return Popped::Frame(Frame::Meters(m));
                 }
+                wake
+            };
+            match wake {
+                Some(at) => {
+                    tokio::select! {
+                        () = self.notify.notified() => {}
+                        () = tokio::time::sleep_until(at) => {}
+                    }
+                }
+                None => self.notify.notified().await,
             }
-            self.notify.notified().await;
         }
     }
 
@@ -388,10 +484,43 @@ fn replace<T>(slot: &mut Option<T>, value: T) -> Pushed {
     }
 }
 
-/// Fans frames out to every subscribed client queue.
+/// Fans frames out to the subscribed client queues.
 pub struct Hub {
     capacity: usize,
-    clients: Mutex<Vec<Weak<ClientQueue>>>,
+    clients: Mutex<Vec<(Owner, Weak<ClientQueue>)>>,
+}
+
+/// The connections [`Hub::send`] pushes a frame to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum To<'a> {
+    /// Every connection of a session: the same session id under another
+    /// principal is another session ([`Owner::session`]).
+    Session {
+        principal: &'a str,
+        session: &'a str,
+    },
+    /// The connections of a session marked primary
+    /// ([`ClientQueue::set_primary`]).
+    Primary {
+        principal: &'a str,
+        session: &'a str,
+    },
+    /// One connection, by [`Owner::connection`].
+    Connection(&'a str),
+}
+
+impl To<'_> {
+    fn matches(&self, owner: &Owner, queue: &ClientQueue) -> bool {
+        match *self {
+            To::Session { principal, session } => {
+                owner.principal == principal && owner.session == session
+            }
+            To::Primary { principal, session } => {
+                owner.principal == principal && owner.session == session && queue.is_primary()
+            }
+            To::Connection(connection) => owner.connection == connection,
+        }
+    }
 }
 
 impl Hub {
@@ -403,14 +532,15 @@ impl Hub {
         }
     }
 
-    /// The queue stays subscribed until it is dropped. Subscribe before
-    /// [`serve_client`] reads the state, so no delta falls between the two.
-    pub fn subscribe(&self) -> Arc<ClientQueue> {
+    /// The queue of `owner`'s connection, subscribed until it is dropped.
+    /// Subscribe before [`serve_client`] reads the state, so no delta falls
+    /// between the two.
+    pub fn subscribe(&self, owner: &Owner) -> Arc<ClientQueue> {
         let queue = Arc::new(ClientQueue::new(self.capacity));
         self.clients
             .lock()
             .expect("hub lock poisoned")
-            .push(Arc::downgrade(&queue));
+            .push((owner.clone(), Arc::downgrade(&queue)));
         queue
     }
 
@@ -419,16 +549,31 @@ impl Hub {
     /// replicas included, so a client catching up from the state in between
     /// gets it from there and skips the published copy by revision.
     pub fn publish(&self, frame: Frame) {
+        self.push(|_, _| true, &frame);
+    }
+
+    /// Pushes a frame to the connections `to` names, as [`Hub::publish`]
+    /// does to every one; returns how many it reached.
+    pub fn send(&self, to: To<'_>, frame: Frame) -> usize {
+        self.push(|owner, queue| to.matches(owner, queue), &frame)
+    }
+
+    fn push(&self, to: impl Fn(&Owner, &ClientQueue) -> bool, frame: &Frame) -> usize {
+        let mut reached = 0;
         self.clients
             .lock()
             .expect("hub lock poisoned")
-            .retain(|client| match client.upgrade() {
+            .retain(|(owner, client)| match client.upgrade() {
                 Some(queue) => {
-                    queue.push(frame.clone());
+                    if to(owner, &queue) {
+                        queue.push(frame.clone());
+                        reached += 1;
+                    }
                     true
                 }
                 None => false,
             });
+        reached
     }
 }
 
@@ -1001,7 +1146,12 @@ where
                         Vec::new()
                     }
                     (Popped::Frame(Frame::Meters(m)), _) => vec![Message::Binary(m)],
-                    (Popped::Frame(Frame::Counters(c)), _) => vec![Message::Text(c)],
+                    (
+                        Popped::Frame(
+                            Frame::Counters(t) | Frame::Text(t) | Frame::Status(_, t),
+                        ),
+                        _,
+                    ) => vec![Message::Text(t)],
                 },
             };
             // While paused, a send does not outlast the pause.
