@@ -114,6 +114,24 @@ async fn refusals_are_rendered_by_the_product() {
         assert_eq!(body, json!({ "code": 403, "message": csrf }));
     }
 
+    let twice = get_req(WHOAMI)
+        .header(header::AUTHORIZATION, bearer(API_TOKEN))
+        .header(header::AUTHORIZATION, bearer(API_TOKEN));
+    let (status, headers, body) = send(&api, twice).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
+    assert_eq!(body, r#"{"code":401,"message":"repeated header"}"#);
+
+    let wrong =
+        write_req("/api/v1/login").body(Body::from(json!({ "token": "wrong" }).to_string()));
+    let res = api.clone().oneshot(wrong.unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        res.headers()[header::WWW_AUTHENTICATE],
+        "Bearer",
+        "the login's too"
+    );
+
     let plain = service("token", "refusal-plain").routers().api;
     let no_marker = get_req(WHOAMI)
         .method("POST")

@@ -351,7 +351,7 @@ fn single<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a [u8]>, Re
     let mut values = headers.get_all(name).iter();
     let first = values.next();
     if values.next().is_some() {
-        return Err(Refused::UNAUTHORIZED);
+        return Err(Refused(StatusCode::UNAUTHORIZED, "repeated header"));
     }
     Ok(first.map(|v| v.as_bytes()))
 }
@@ -510,7 +510,11 @@ pub(crate) async fn login(
 ) -> Response {
     let token = auth.token.as_ref().expect("login is routed in token mode");
     if !token.matches(body.token.as_bytes()) {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response();
     }
     // A chain of proxies appends its schemes; the first is the client's.
     let secure = auth.tls
