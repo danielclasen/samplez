@@ -9,3 +9,4 @@ description = "Gain ramps, mixing matrix, meters and loudness for samplez"
 publish = false
 
 [dependencies]
+libm = "0.2.16"

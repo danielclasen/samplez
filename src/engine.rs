@@ -513,9 +513,12 @@ impl Engine {
     /// validity) at the first 100 ms window starting at or after
     /// `at_index`, a multiple of the block size; the K-weighting starts
     /// from silence there, and the true-peak interpolator keeps the 11
-    /// output samples before it. From that index on the measurement
-    /// depends only on the output samples from those 11 on, so replicas
-    /// that computed them and reset at the same index agree. `at_index`
+    /// output samples before it. From that index on the integrated
+    /// loudness, the loudness range and the maxima depend only on the
+    /// output samples from those 11 on, and so do the momentary and
+    /// short-term loudness once 0.4 s and 3 s past it: replicas that
+    /// computed those samples and reset at the same index agree there.
+    /// `at_index`
     /// is refused below the same earliest index as [`Engine::set_gain`].
     /// A reset replaces one still pending for the same output;
     /// [`GainError::Full`] when the reset ring is full.

@@ -53,8 +53,10 @@ pub mod weight {
 }
 
 /// Loudness in LKFS (LUFS) of a weighted mean-square power, equation (2).
+/// The logarithm is libm's, so the reported level does not depend on the
+/// host C library's variant of `log10`.
 pub fn lufs(power: f64) -> f64 {
-    -0.691 + 10.0 * power.log10()
+    -0.691 + 10.0 * libm::log10(power)
 }
 
 struct Histogram {
@@ -309,6 +311,14 @@ mod tests {
 
     fn power(lufs: f64) -> f64 {
         10f64.powf((lufs + 0.691) / 10.0)
+    }
+
+    /// glibc's `log10` gives this power a last bit different from
+    /// libm's; the level is libm's on every host.
+    #[test]
+    fn lufs_takes_the_libm_logarithm() {
+        let p = f64::from_bits(0x3f18_18f7_bcb2_d2ef);
+        assert_eq!(lufs(p), -41.056_673_893_056_626);
     }
 
     #[test]

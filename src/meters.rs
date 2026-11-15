@@ -2,11 +2,15 @@
 //! thread become per output peaks, true peaks and loudness.
 //!
 //! Meters do not feed the output, so they are outside the output hashes
-//! of plan 2.11. They are a pure function of the output samples since
-//! the last loudness reset, which applies at a sample index: replicas
-//! that compute the same output and lose no record report the same
-//! values from the reset on. Before the first reset each measures from
-//! its own start.
+//! of plan 2.11. A loudness reset applies at a sample index. From it on,
+//! the integrated loudness, the loudness range and the maxima are a pure
+//! function of the output samples from 11 before that index on, the
+//! history of the true-peak interpolator; the momentary and short-term
+//! loudness are once 0.4 s and 3 s past it, and until then still include
+//! slices from before the reset. Within those bounds, replicas that
+//! compute the same output and lose no record report the same values.
+//! Before the first reset each measures from its own start. Levels in
+//! LUFS come from libm's `log10`, not the host C library's.
 
 use samplez_dsp::{Loudness, WINDOW};
 
