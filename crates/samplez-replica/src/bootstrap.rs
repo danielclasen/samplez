@@ -5,7 +5,9 @@
 //! Ordinal 0 initialises a set only after creating the marker itself, or,
 //! after a crash between the two, when the marker names its own volume,
 //! and in both cases only while no other replica answers as a member of a
-//! set; never because its volume is empty. Every other empty volume joins
+//! set and a majority of the wanted voters answered that they are not, so
+//! a cold start needs that majority running at once; never because its
+//! volume is empty. Every other empty volume joins
 //! as a learner of the set the marker names, ordinal 0's after a volume
 //! loss included. The cluster id is the epoch: drawn with each new marker,
 //! so a state initialised empty starts a new history, and kept on the
