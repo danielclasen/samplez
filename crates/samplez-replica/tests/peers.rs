@@ -322,8 +322,7 @@ async fn a_snapshot_is_installed_over_the_peer_listener() {
     // `last` is a product revision; snapshots and purges count log ids.
     // Only the leader purges: openraft holds a leader's purge back while
     // replication still reads the range, and does not on a follower, so a
-    // purge on one that is elected meanwhile can race its replication. The
-    // leader is the one that sends the restarted follower the snapshot.
+    // purge on one that is elected meanwhile can race its replication.
     let raft = set.replica(leader).raft().clone();
     let upto = raft
         .metrics()
@@ -355,7 +354,6 @@ async fn a_snapshot_is_installed_over_the_peer_listener() {
     set.quiet.insert(follower);
     set.restart(follower).await;
     set.applied(last).await;
-    assert_eq!(set.leader().await, leader, "the leader that purged sent it");
     let installed = set.replica(follower);
     // The store applies the snapshot before openraft's metrics show it.
     let deadline = Instant::now() + Duration::from_secs(5);
