@@ -47,7 +47,7 @@ enum Record {
 
 struct Inner<P> {
     dir: PathBuf,
-    file: File,
+    file: Arc<File>,
     vote: Option<StoredVote>,
     committed: Option<StoredLogId>,
     log: BTreeMap<u64, StoredEntry>,
@@ -61,16 +61,33 @@ struct Inner<P> {
 }
 
 /// One replica's storage. Clones share it.
+///
+/// File writes and fsyncs run off the async worker, without the lock that
+/// readers of the state take; the in-memory state follows once a write
+/// is done. openraft's adaptor makes one log or state machine call at a
+/// time; a snapshot build runs beside them and `snapshots` orders it
+/// with an install.
 pub struct Store<P> {
     inner: Arc<Mutex<Inner<P>>>,
+    snapshots: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<P> Clone for Store<P> {
     fn clone(&self) -> Self {
         Store {
             inner: self.inner.clone(),
+            snapshots: self.snapshots.clone(),
         }
     }
+}
+
+/// Runs file work on tokio's blocking pool.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(io::Error::other)?
 }
 
 fn io_error<E: std::error::Error + 'static>(
@@ -224,7 +241,7 @@ impl<P: Product> Store<P> {
         }
         let mut inner = Inner {
             dir: dir.to_owned(),
-            file,
+            file: Arc::new(file),
             vote: None,
             committed: None,
             log: BTreeMap::new(),
@@ -242,7 +259,22 @@ impl<P: Product> Store<P> {
         sync_dir(dir)?;
         Ok(Store {
             inner: Arc::new(Mutex::new(inner)),
+            snapshots: Arc::default(),
         })
+    }
+
+    /// Appends `records` to `log`, fsynced with `sync`.
+    async fn write(&self, records: &[Record], sync: bool) -> io::Result<()> {
+        let mut out = Vec::new();
+        for record in records {
+            encode(record, &mut out);
+        }
+        let file = self.lock().file.clone();
+        blocking(move || {
+            (&*file).write_all(&out)?;
+            if sync { file.sync_data() } else { Ok(()) }
+        })
+        .await
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner<P>> {
@@ -302,17 +334,8 @@ impl<P> Inner<P> {
         self.last_purged = Some(upto);
     }
 
-    fn write(&mut self, records: &[Record], sync: bool) -> io::Result<()> {
-        let mut out = Vec::new();
-        for record in records {
-            encode(record, &mut out);
-        }
-        self.file.write_all(&out)?;
-        if sync { self.file.sync_data() } else { Ok(()) }
-    }
-
-    /// Rewrites `log` with what it holds now, dropping purged entries.
-    fn compact(&mut self) -> io::Result<()> {
+    /// `log` as it holds now, without purged entries.
+    fn compacted(&self) -> Vec<u8> {
         let mut records = Vec::new();
         records.extend(self.vote.map(Record::Vote));
         records.push(Record::Committed(self.committed));
@@ -322,9 +345,7 @@ impl<P> Inner<P> {
         for record in &records {
             encode(record, &mut out);
         }
-        replace(&self.dir, "log", &out)?;
-        self.file = OpenOptions::new().append(true).open(self.dir.join("log"))?;
-        Ok(())
+        out
     }
 
     fn last_log_id(&self) -> Option<StoredLogId> {
@@ -351,25 +372,31 @@ impl<P: Product> RaftLogReader<TypeConfig> for Store<P> {
 }
 
 impl<P: Product> RaftSnapshotBuilder<TypeConfig> for Store<P> {
+    /// Takes the state under the lock and encodes and writes it after.
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, Error> {
-        let mut inner = self.lock();
-        inner.snapshots_built += 1;
-        let last = inner.last_applied;
-        let snapshot = StoredSnapshot {
-            id: format!(
-                "{}-{}",
-                last.map_or(0, |id| id.index),
-                inner.snapshots_built
-            ),
-            last_applied: last,
-            membership: inner.membership.clone(),
-            state: inner.sm.save(),
+        let _building = self.snapshots.lock().await;
+        let (dir, snapshot) = {
+            let mut inner = self.lock();
+            inner.snapshots_built += 1;
+            let last = inner.last_applied;
+            let snapshot = StoredSnapshot {
+                id: format!(
+                    "{}-{}",
+                    last.map_or(0, |id| id.index),
+                    inner.snapshots_built
+                ),
+                last_applied: last,
+                membership: inner.membership.clone(),
+                state: inner.sm.save(),
+            };
+            (inner.dir.clone(), snapshot)
         };
         let bytes = serde_json::to_vec(&snapshot).expect("snapshots encode");
-        replace(&inner.dir, "snapshot", &bytes)
+        let bytes = blocking(move || replace(&dir, "snapshot", &bytes).map(|()| bytes))
+            .await
             .map_err(|e| io_error(|a| StorageIOError::write_snapshot(None, a), &e))?;
         let meta = meta(&snapshot);
-        inner.snapshot = Some(snapshot);
+        self.lock().snapshot = Some(snapshot);
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(bytes)),
@@ -390,12 +417,11 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
     type SnapshotBuilder = Self;
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), Error> {
-        let mut inner = self.lock();
         let vote = StoredVote::from(vote);
-        inner
-            .write(&[Record::Vote(vote)], true)
+        self.write(&[Record::Vote(vote)], true)
+            .await
             .map_err(|e| io_error(StorageIOError::write_vote, &e))?;
-        inner.vote = Some(vote);
+        self.lock().vote = Some(vote);
         Ok(())
     }
 
@@ -406,12 +432,11 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
     /// Written with no fsync of its own: the next log write's fsync covers
     /// it, and a process that dies before keeps it in the page cache.
     async fn save_committed(&mut self, committed: Option<LogId<NodeId>>) -> Result<(), Error> {
-        let mut inner = self.lock();
         let committed = committed.as_ref().map(StoredLogId::from);
-        inner
-            .write(&[Record::Committed(committed)], false)
+        self.write(&[Record::Committed(committed)], false)
+            .await
             .map_err(|e| io_error(StorageIOError::write_logs, &e))?;
-        inner.committed = committed;
+        self.lock().committed = committed;
         Ok(())
     }
 
@@ -437,13 +462,13 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
     where
         I: IntoIterator<Item = openraft::Entry<TypeConfig>> + OptionalSend,
     {
-        let mut inner = self.lock();
         let entries: Vec<StoredEntry> =
             entries.into_iter().map(|e| StoredEntry::from(&e)).collect();
         let records: Vec<Record> = entries.iter().cloned().map(Record::Entry).collect();
-        inner
-            .write(&records, true)
+        self.write(&records, true)
+            .await
             .map_err(|e| io_error(StorageIOError::write_logs, &e))?;
+        let mut inner = self.lock();
         for entry in entries {
             inner.log.insert(entry.log_id.index, entry);
         }
@@ -451,20 +476,27 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
     }
 
     async fn delete_conflict_logs_since(&mut self, log_id: LogId<NodeId>) -> Result<(), Error> {
-        let mut inner = self.lock();
-        inner
-            .write(&[Record::Truncate(log_id.index)], true)
+        self.write(&[Record::Truncate(log_id.index)], true)
+            .await
             .map_err(|e| io_error(StorageIOError::write_logs, &e))?;
-        inner.log.split_off(&log_id.index);
+        self.lock().log.split_off(&log_id.index);
         Ok(())
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), Error> {
-        let mut inner = self.lock();
-        inner.purge(StoredLogId::from(&log_id));
-        inner
-            .compact()
-            .map_err(|e| io_error(StorageIOError::write_logs, &e))
+        let (dir, out) = {
+            let mut inner = self.lock();
+            inner.purge(StoredLogId::from(&log_id));
+            (inner.dir.clone(), inner.compacted())
+        };
+        let file = blocking(move || {
+            replace(&dir, "log", &out)?;
+            OpenOptions::new().append(true).open(dir.join("log"))
+        })
+        .await
+        .map_err(|e| io_error(StorageIOError::write_logs, &e))?;
+        self.lock().file = Arc::new(file);
+        Ok(())
     }
 
     async fn last_applied_state(
@@ -522,31 +554,37 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
             ),
         };
         let stored: StoredSnapshot = serde_json::from_slice(&bytes).map_err(|e| read_error(&e))?;
-        let mut inner = self.lock();
-        let limits = inner.limits;
-        let at = stored.last_applied.map_or(0, |id| id.index);
-        inner
-            .sm
-            .load(stored.state.clone(), limits, at)
-            .map_err(|e| read_error(&e))?;
-        inner.last_applied = stored.last_applied;
-        inner.membership = stored.membership.clone();
-        replace(&inner.dir, "snapshot", &bytes).map_err(|e| {
-            io_error(
-                |a| StorageIOError::write_snapshot(Some(meta.signature()), a),
-                &e,
-            )
-        })?;
-        inner.snapshot = Some(stored);
+        let _installing = self.snapshots.lock().await;
+        let dir = {
+            let mut inner = self.lock();
+            let limits = inner.limits;
+            let at = stored.last_applied.map_or(0, |id| id.index);
+            inner
+                .sm
+                .load(stored.state.clone(), limits, at)
+                .map_err(|e| read_error(&e))?;
+            inner.last_applied = stored.last_applied;
+            inner.membership = stored.membership.clone();
+            inner.dir.clone()
+        };
+        blocking(move || replace(&dir, "snapshot", &bytes))
+            .await
+            .map_err(|e| {
+                io_error(
+                    |a| StorageIOError::write_snapshot(Some(meta.signature()), a),
+                    &e,
+                )
+            })?;
+        self.lock().snapshot = Some(stored);
         Ok(())
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, Error> {
-        let inner = self.lock();
-        Ok(inner.snapshot.as_ref().map(|snapshot| Snapshot {
-            meta: meta(snapshot),
+        let snapshot = self.lock().snapshot.clone();
+        Ok(snapshot.map(|snapshot| Snapshot {
+            meta: meta(&snapshot),
             snapshot: Box::new(Cursor::new(
-                serde_json::to_vec(snapshot).expect("snapshots encode"),
+                serde_json::to_vec(&snapshot).expect("snapshots encode"),
             )),
         }))
     }
