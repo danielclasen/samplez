@@ -23,7 +23,7 @@ pub mod ws;
 
 pub use auth::{Identity, Role};
 pub use config::ServiceConfig;
-pub use metrics::{Counter, Histogram, Metrics};
+pub use metrics::{Counter, Gauge, Histogram, Metrics};
 pub use ops::{Heartbeat, Ops};
 pub use replica::{Owner, OwnerHandle, Position, ReplicaInfo, ReplicatedState};
 pub use server::{

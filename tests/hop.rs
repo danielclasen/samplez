@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use common::{B, Checker, Domain, MARGIN, Pilot, config, diagonal, new_id, start, wait_for};
-use samplez::{GainError, InputState};
+use samplez::{GainError, InputState, ResetError};
 use samplez_mxl::Instance;
 use samplez_mxl::output::{self, Creation, OutputConfig};
 
@@ -159,6 +159,20 @@ fn gain_change() {
         engine.set_gain(0, 0, 0.9, late),
         Err(GainError::TooNear { .. })
     ));
+    // A loudness reset is validated the same way, with its own errors.
+    let ahead = at + 100 * B;
+    assert!(matches!(
+        engine.reset_loudness(1, ahead),
+        Err(ResetError::Invalid(_))
+    ));
+    assert!(matches!(
+        engine.reset_loudness(0, ahead + 1),
+        Err(ResetError::Invalid(_))
+    ));
+    assert!(matches!(
+        engine.reset_loudness(0, late),
+        Err(ResetError::TooNear { .. })
+    ));
 
     // 64 outstanding changes fit, the 65th is refused. They hold the gain,
     // so no block ramps.
@@ -239,11 +253,35 @@ fn replicas() {
     let x = common::read_blocks(&domain.0, &out_a, 2, range.clone());
     let y = common::read_blocks(&domain.0, &out_b, 2, range.clone());
     let bits = |v: &[f32]| v.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
-    assert!(bits(&x) == bits(&y), "replica outputs differ");
+    let both = || format!("a: {}; b: {}", timing(a.counters()), timing(b.counters()));
+    assert!(bits(&x) == bits(&y), "replica outputs differ; {}", both());
     // The ramp is in the compared range: channel 0 of the block at
     // at_index differs from the block before at the same pilot phase.
     let ramp = (at / B - range.start) as usize * 2 * B as usize;
     assert_ne!(bits(&x[ramp..ramp + B as usize]), bits(&x[..B as usize]));
+    // A loudness reset at one index on both: from the window it lands on,
+    // both measure the same samples from the same filter state, so the
+    // maxima since then are the same bits. The channel was just drained
+    // and verdicts arrive once per supervisor tick, so wait for one.
+    let first = rx_a.recv_timeout(5 * SECOND).unwrap();
+    let now = rx_a.try_iter().last().unwrap_or(first).k;
+    let reset = (now + 100) * B;
+    a.reset_loudness(0, reset).unwrap();
+    b.reset_loudness(0, reset).unwrap();
+    let since = Some(reset.div_ceil(4800) * 4800);
+    for e in [&a, &b] {
+        wait_for(5 * SECOND, "a second measured since the reset", || {
+            let m = &e.status().outputs[0].meters;
+            m.since == since && m.window.is_some_and(|w| w * 4800 > reset + 48_000)
+        });
+    }
+    let (sa, sb) = (a.status(), b.status());
+    let (ma, mb) = (&sa.outputs[0].meters, &sb.outputs[0].meters);
+    assert!(ma.valid && mb.valid, "{ma:?} {mb:?}; {}", both());
+    assert_eq!(ma.max_true_peak, mb.max_true_peak, "{}", both());
+    let max_m = |m: &samplez::OutputMeters| m.max_momentary.map(f64::to_bits);
+    assert_eq!(max_m(ma), max_m(mb), "{ma:?} {mb:?}; {}", both());
+    assert!(ma.max_momentary.is_some());
     common::stop(b);
     common::stop(a);
 }
@@ -542,19 +580,23 @@ struct OutputA<'a> {
     skips: Vec<String>,
 }
 
-/// The counters that attribute a gap in the verdicts: the RT timing of an
-/// overrun skip, a forward clock step, which skips without a late wake,
-/// and dropped verdicts or telemetry, which look like a skip.
+/// The counters that attribute a gap in the verdicts or the meters: an
+/// overrun skip and the RT timing around it, a forward clock step, which
+/// skips without a late wake, and dropped verdicts, telemetry or meter
+/// records, which look like a skip.
 fn timing(c: &samplez::Counters) -> String {
     format!(
-        "deadline_miss {}, process_time_max {} ns, wake_jitter_max {} ns, \
-         clock_steps {}, telemetry_dropped {}, verdicts_dropped {}",
+        "overrun_skipped_samples {}, deadline_miss {}, process_time_max {} ns, \
+         wake_jitter_max {} ns, clock_steps {}, telemetry_dropped {}, \
+         verdicts_dropped {}, meter_dropped {}",
+        c.overrun_skipped_samples.load(Relaxed),
         c.deadline_miss.load(Relaxed),
         c.process_time_max_ns.load(Relaxed),
         c.wake_jitter_max_ns.load(Relaxed),
         c.clock_steps.load(Relaxed),
         c.telemetry_dropped.load(Relaxed),
-        c.verdicts_dropped.load(Relaxed)
+        c.verdicts_dropped.load(Relaxed),
+        c.meter_dropped.load(Relaxed)
     )
 }
 

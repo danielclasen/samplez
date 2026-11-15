@@ -4,7 +4,10 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use samplez_dsp::{Matrix, Meters, Path, PlanarBuffer, Ramp, restore_mxcsr, set_ftz_daz};
+use samplez_dsp::{
+    KWeighting, Loudness, Matrix, Meters, Path, PlanarBuffer, Ramp, TruePeak, restore_mxcsr,
+    set_ftz_daz,
+};
 
 #[path = "../src/require.rs"]
 mod require;
@@ -53,6 +56,10 @@ fn process_calls_do_not_allocate() {
     }
     let mut output = PlanarBuffer::new(m, cap);
     let mut meters = Meters::new(m);
+    let mut true_peak = TruePeak::new(m, cap);
+    let mut kweighting = KWeighting::new(m);
+    let mut loudness = Loudness::new();
+    let mut slice = 0;
     let mut ramp = Ramp::new(1.0);
     let paths: Vec<Path> = Path::ALL
         .into_iter()
@@ -89,6 +96,14 @@ fn process_calls_do_not_allocate() {
             assert!(matrix.set(0, 1, 1.0, 0));
             matrix.process_on(*path, &input, &mut output, frames);
             meters.process(&output, frames);
+            let mut power = 0.0;
+            for ch in 0..m {
+                let x = &output.channel(ch)[..frames];
+                assert!(true_peak.process_on(*path, ch, x).is_finite());
+                power += kweighting.process(ch, x);
+            }
+            loudness.push(slice, Some(power / frames as f64));
+            slice += 1;
         }
         assert!(ramp.set_target(0.25 * round as f32, 100));
         ramp.process(&mut scratch[..frames]);

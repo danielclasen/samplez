@@ -1,7 +1,8 @@
 //! The RT thread allocates and frees nothing through Rust's global
 //! allocator once it runs, over a run that includes input generation
-//! swaps, a prune, a re-add with fade-in and a gain ramp. libmxl's own C++
-//! allocations are not seen by this allocator.
+//! swaps, a prune, a re-add with fade-in, a gain ramp, output metering
+//! and a loudness reset. libmxl's own C++ allocations are not seen by
+//! this allocator.
 
 mod common;
 
@@ -96,6 +97,8 @@ fn rt_thread_allocates_nothing() {
     let api = common::api();
     let index = samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
     engine.set_gain(0, 0, 0.25, (index / B + 20) * B).unwrap();
+    let reset = (index / B + 40) * B;
+    engine.reset_loudness(0, reset).unwrap();
     // The same id again: polled, re-added in a new generation, faded in.
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
     wait_for(Duration::from_secs(10), "input re-added", attached);
@@ -107,6 +110,12 @@ fn rt_thread_allocates_nothing() {
     let verdicts: Vec<_> = rx.try_iter().collect();
     assert!(verdicts.iter().any(|v| v.fading != 0), "no fade-in seen");
     assert!(verdicts.iter().any(|v| v.ramping), "no gain ramp seen");
+    let m = engine.status().outputs[0].meters.clone();
+    assert_eq!(m.since, Some(reset.div_ceil(4800) * 4800), "{m:?}");
+    assert!(
+        m.window.is_some() && m.max_true_peak.iter().all(|&t| t > 0.0),
+        "{m:?}"
+    );
     let calls = RT_CALLS.load(Relaxed);
     assert!(
         calls == 0,

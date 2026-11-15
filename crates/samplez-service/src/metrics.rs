@@ -1,7 +1,7 @@
 //! A metrics registry rendered in the Prometheus text format.
 //!
-//! [`Counter::add`] and [`Histogram::observe`] make no allocation and take
-//! no lock, so the RT thread may call them. Registration and rendering lock
+//! [`Counter::add`], [`Gauge::set`] and [`Histogram::observe`] make no
+//! allocation and take no lock, so the RT thread may call them. Registration and rendering lock
 //! the registry and allocate. Registering a series that exists returns it.
 
 use std::fmt::Write;
@@ -20,6 +20,7 @@ struct Family {
 #[derive(Clone)]
 enum Series {
     Counter(Counter),
+    Gauge(Gauge),
     Histogram(Histogram),
 }
 
@@ -27,6 +28,7 @@ impl Series {
     fn kind(&self) -> &'static str {
         match self {
             Series::Counter(_) => "counter",
+            Series::Gauge(_) => "gauge",
             Series::Histogram(_) => "histogram",
         }
     }
@@ -42,6 +44,20 @@ impl Counter {
 
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A value that goes up and down, an `f64`; 0 until set.
+#[derive(Clone)]
+pub struct Gauge(Arc<AtomicU64>);
+
+impl Gauge {
+    pub fn set(&self, v: f64) {
+        self.0.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::Relaxed))
     }
 }
 
@@ -97,7 +113,17 @@ impl Metrics {
         let counter = Counter(Arc::default());
         match self.register(name, help, labels, Series::Counter(counter.clone())) {
             Series::Counter(c) => c,
-            Series::Histogram(_) => unreachable!("register checks the type"),
+            _ => unreachable!("register checks the type"),
+        }
+    }
+
+    /// The gauge `name` with `labels`, created when absent. Panics like
+    /// [`Metrics::counter`].
+    pub fn gauge(&self, name: &str, help: &str, labels: &[(&str, &str)]) -> Gauge {
+        let gauge = Gauge(Arc::default());
+        match self.register(name, help, labels, Series::Gauge(gauge.clone())) {
+            Series::Gauge(g) => g,
+            _ => unreachable!("register checks the type"),
         }
     }
 
@@ -128,7 +154,7 @@ impl Metrics {
                 );
                 h
             }
-            Series::Counter(_) => unreachable!("register checks the type"),
+            _ => unreachable!("register checks the type"),
         }
     }
 
@@ -194,6 +220,10 @@ impl Metrics {
                 match series {
                     Series::Counter(c) => {
                         writeln!(out, "{name}{} {}", label_set(pairs(labels)), c.get()).unwrap();
+                    }
+                    Series::Gauge(g) => {
+                        let v = float(g.get());
+                        writeln!(out, "{name}{} {v}", label_set(pairs(labels))).unwrap();
                     }
                     Series::Histogram(Histogram(h)) => {
                         let mut cumulative = 0;

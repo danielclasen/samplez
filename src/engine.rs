@@ -23,15 +23,20 @@ use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
 
 use crate::config::Config;
+use crate::meters::{OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
-    BlockVerdict, Command, Counters, EMPTY_STATS, GainChange, Gen, Mix, Out, PENDING_CHANGES,
-    Returned, Rt, Slot, SlotStats, Telemetry,
+    BlockVerdict, Command, Counters, EMPTY_STATS, GainChange, Gen, LoudnessReset, MeterRecord, Mix,
+    Out, OutMeter, PENDING_CHANGES, Returned, Rt, SLICE, Slot, SlotStats, Telemetry,
 };
 
 const COMMAND_RING: usize = 64;
 const RETURN_RING: usize = 64;
 const TELEMETRY_RING: usize = 8192;
+/// Seconds of meter records the meter ring holds.
+const METER_RING_SECONDS: usize = 2;
+/// Loudness resets the reset ring holds per output.
+const RESETS_PER_OUTPUT: usize = 4;
 const SUPERVISOR_TICK: Duration = Duration::from_millis(5);
 const POLL_PERIOD: Duration = Duration::from_millis(100);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
@@ -78,6 +83,7 @@ pub struct OutputStatus {
     /// The flow's ring length and effective batch hints, once created.
     pub buffer_length: Option<u64>,
     pub hints: Option<(u32, u32)>,
+    pub meters: OutputMeters,
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +126,7 @@ pub enum GainError {
     Invalid(String),
     /// `at_index` is below `earliest`, the first index the engine accepts.
     TooNear { at_index: u64, earliest: u64 },
-    /// [`PENDING_CHANGES`] changes are outstanding.
+    /// [`PENDING_CHANGES`] gain changes are outstanding.
     Full,
 }
 
@@ -138,6 +144,33 @@ impl std::fmt::Display for GainError {
 }
 
 impl std::error::Error for GainError {}
+
+/// Why [`Engine::reset_loudness`] refused a reset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResetError {
+    /// No such output, or an index that is not a multiple of the block
+    /// size.
+    Invalid(String),
+    /// `at_index` is below `earliest`, the first index the engine accepts.
+    TooNear { at_index: u64, earliest: u64 },
+    /// The loudness reset ring is full.
+    Full,
+}
+
+impl std::fmt::Display for ResetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResetError::Invalid(m) => write!(f, "{m}"),
+            ResetError::TooNear { at_index, earliest } => write!(
+                f,
+                "at_index {at_index} is below the earliest accepted index {earliest}"
+            ),
+            ResetError::Full => write!(f, "the loudness reset ring is full"),
+        }
+    }
+}
+
+impl std::error::Error for ResetError {}
 
 /// The producer side of the gain ring and the changes pushed into it.
 struct GainTx {
@@ -160,6 +193,7 @@ pub struct Engine {
     /// and the earliest `at_index` accepted.
     lead: u64,
     shape: (usize, usize),
+    resets: Mutex<rtrb::Producer<LoudnessReset>>,
 }
 
 impl Engine {
@@ -185,6 +219,26 @@ impl Engine {
         while tel_tx.push(Telemetry::ClockStep { delta_ns: 0 }).is_ok() {}
         while tel_rx.pop().is_ok() {}
         let (gain_tx, gain_rx) = rtrb::RingBuffer::new(PENDING_CHANGES);
+        let records = METER_RING_SECONDS
+            * (samplez_mxl::SAMPLE_RATE as usize / SLICE as usize)
+            * config.output_channels();
+        let (mut meter_tx, mut meter_rx) = rtrb::RingBuffer::new(records.max(1));
+        let blank = MeterRecord {
+            seq: 0,
+            output: 0,
+            channel: 0,
+            slice: 0,
+            frames: 0,
+            peak: 0.0,
+            true_peak: 0.0,
+            sum_sq: 0.0,
+            plain_sum_sq: 0.0,
+            reset: false,
+        };
+        while meter_tx.push(blank).is_ok() {}
+        while meter_rx.pop().is_ok() {}
+        let (reset_tx, reset_rx) =
+            rtrb::RingBuffer::new((RESETS_PER_OUTPUT * config.outputs.len()).max(1));
 
         let mut in_domains: Vec<usize> = Vec::new();
         let mut slots = Vec::new();
@@ -216,6 +270,7 @@ impl Engine {
                 channels: o.channels as usize,
                 writer: None,
                 first_k: 0,
+                meter: OutMeter::new(o.channels as usize),
             });
             channel += o.channels as usize;
         }
@@ -251,6 +306,9 @@ impl Engine {
             gains: gain_rx,
             ret: ret_tx,
             tel: tel_tx,
+            meters: meter_tx,
+            resets: reset_rx,
+            meter_seq: 0,
             counters: Arc::clone(&counters),
             stop: Arc::clone(&stop),
         };
@@ -301,6 +359,7 @@ impl Engine {
                     create_failures: 0,
                     buffer_length: None,
                     hints: None,
+                    meters: OutputMeters::default(),
                 })
                 .collect(),
         }));
@@ -310,6 +369,16 @@ impl Engine {
         let prefault = !matches!(process.mlock, Step::Active(_));
         let margin = u64::from(config.reader_margin_samples);
         let lead = (u64::from(config.max_catchup_blocks) + 2) * b;
+        let config_loudness = config
+            .outputs
+            .iter()
+            .map(|o| {
+                let w = o
+                    .loudness_weights()
+                    .expect("output checked by Config::parse");
+                OutputLoudness::new(w)
+            })
+            .collect();
         let sup = Supervisor {
             api: Arc::clone(&api),
             timing: Timing {
@@ -341,6 +410,9 @@ impl Engine {
             cmd: cmd_tx,
             ret: ret_rx,
             tel: tel_rx,
+            meter_rx,
+            next_meter_seq: 0,
+            loudness: config_loudness,
             verdicts,
             status: Arc::clone(&status),
             counters: Arc::clone(&counters),
@@ -389,6 +461,7 @@ impl Engine {
             margin,
             lead,
             shape: (n, m),
+            resets: Mutex::new(reset_tx),
         })
     }
 
@@ -461,6 +534,41 @@ impl Engine {
         Ok(())
     }
 
+    /// Restarts the loudness measurement of output `output` (the
+    /// integrated loudness, the loudness range, the maxima and the
+    /// validity) at the first 100 ms window starting at or after
+    /// `at_index`, a multiple of the block size; the K-weighting starts
+    /// from silence there, and the true-peak interpolator keeps the 11
+    /// output samples before it. From that index on the integrated
+    /// loudness, the loudness range and the maxima depend only on the
+    /// output samples from those 11 on, and so do the momentary and
+    /// short-term loudness once 0.4 s and 3 s past it: replicas that
+    /// computed those samples and reset at the same index agree there.
+    /// `at_index`
+    /// is refused below the same earliest index as [`Engine::set_gain`].
+    /// A reset replaces one still pending for the same output;
+    /// [`ResetError::Full`] when the reset ring is full.
+    pub fn reset_loudness(&self, output: usize, at_index: u64) -> Result<(), ResetError> {
+        if output >= self.status.lock().expect("status lock").outputs.len() {
+            return Err(ResetError::Invalid(format!("no output {output}")));
+        }
+        if !at_index.is_multiple_of(self.block) {
+            return Err(ResetError::Invalid(format!(
+                "at_index {at_index} is not a multiple of the block size {}",
+                self.block
+            )));
+        }
+        let mut tx = self.resets.lock().expect("reset lock");
+        let produced = self.counters.produced.load(Acquire);
+        let clock = time::timestamp_to_index(&self.api, time::now(&self.api));
+        let earliest = produced.max(clock.saturating_sub(self.margin)) + self.lead;
+        if at_index < earliest {
+            return Err(ResetError::TooNear { at_index, earliest });
+        }
+        tx.push(LoudnessReset { output, at_index })
+            .map_err(|_| ResetError::Full)
+    }
+
     /// Stops the RT thread and the supervisor and releases every libmxl
     /// object.
     pub fn stop(mut self) {
@@ -531,6 +639,9 @@ struct Supervisor {
     cmd: rtrb::Producer<Command>,
     ret: rtrb::Consumer<Returned>,
     tel: rtrb::Consumer<Telemetry>,
+    meter_rx: rtrb::Consumer<MeterRecord>,
+    next_meter_seq: u64,
+    loudness: Vec<OutputLoudness>,
     verdicts: Option<SyncSender<BlockVerdict>>,
     status: Arc<Mutex<Status>>,
     counters: Arc<Counters>,
@@ -552,6 +663,7 @@ impl Supervisor {
                 release(r);
             }
             self.telemetry();
+            self.meters();
             if last_poll.elapsed() >= POLL_PERIOD {
                 last_poll = Instant::now();
                 self.poll();
@@ -608,6 +720,26 @@ impl Supervisor {
 
     fn status(&self) -> std::sync::MutexGuard<'_, Status> {
         self.status.lock().expect("status lock")
+    }
+
+    /// Turns the meter records into each output's meters. A gap in the
+    /// sequence numbers means records were lost, of any output.
+    fn meters(&mut self) {
+        let mut seen = false;
+        while let Ok(r) = self.meter_rx.pop() {
+            seen = true;
+            if r.seq != self.next_meter_seq {
+                self.loudness.iter_mut().for_each(OutputLoudness::gap);
+            }
+            self.next_meter_seq = r.seq + 1;
+            self.loudness[r.output as usize].record(&r);
+        }
+        if seen {
+            let mut st = self.status();
+            for (o, l) in st.outputs.iter_mut().zip(&self.loudness) {
+                o.meters.clone_from(&l.meters);
+            }
+        }
     }
 
     fn telemetry(&mut self) {
@@ -1037,6 +1169,15 @@ fn minor_faults(tid: i32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full reset ring says so, not that gain changes are outstanding.
+    #[test]
+    fn a_full_reset_ring_names_itself() {
+        assert_eq!(
+            ResetError::Full.to_string(),
+            "the loudness reset ring is full"
+        );
+    }
 
     /// A panic on the RT thread hands the state back: the supervisor
     /// releases the writer, which deletes the output flow, and records

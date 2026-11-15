@@ -39,7 +39,19 @@ releases its writers, which deletes the output flows.
 ```
 
 Further keys and their defaults: `maxCatchupBlocks` 2, `pruneAfterBlocks`
-50, `rampSamples` 480, per input `offsetSamples` 0.
+50, `rampSamples` 480, per input `offsetSamples` 0, per output
+`loudnessChannels` (one of `L`, `R`, `C`, `Ls`, `Rs`, `LFE` per channel,
+weighted per ITU-R BS.1770-5 Table 3; without it every channel weighs 1).
+
+Each output's status carries its meters: sample peak, RMS and true peak
+per channel over the last 100 ms, the largest true peak, and momentary,
+short-term and integrated loudness and loudness range per EBU R 128.
+RMS is referenced to a sine as in AES17: the root mean square times the
+square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
+`Engine::reset_loudness` restarts the measurement at a sample index. A
+meter record lost on the way from the RT thread, samples not metered
+after an overrun, or an infinite or NaN sample mark integrated loudness
+and loudness range invalid until the next reset.
 
 Real-time set-up reports each step and runs degraded rather than failing:
 effective capabilities raised from the permitted set, `mlockall` with

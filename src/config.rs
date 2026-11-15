@@ -71,6 +71,41 @@ pub struct Output {
     pub group: String,
     pub role: String,
     pub channels: u32,
+    /// The loudness role of each channel: `L`, `R`, `C`, `Ls`, `Rs` or
+    /// `LFE`, weighted per ITU-R BS.1770-5 Table 3 (the LFE channel is not
+    /// measured). Without it every channel is weighted 1.
+    #[serde(default)]
+    pub loudness_channels: Option<Vec<String>>,
+}
+
+impl Output {
+    /// The loudness weight of each channel.
+    pub fn loudness_weights(&self) -> Result<Vec<f64>, Error> {
+        use samplez_dsp::weight;
+        let Some(names) = &self.loudness_channels else {
+            return Ok(vec![weight::FRONT; self.channels as usize]);
+        };
+        if names.len() != self.channels as usize {
+            return Err(Error(format!(
+                "output {}: loudnessChannels names {} channels, the output has {}",
+                self.name,
+                names.len(),
+                self.channels
+            )));
+        }
+        names
+            .iter()
+            .map(|n| match n.as_str() {
+                "L" | "R" | "C" => Ok(weight::FRONT),
+                "Ls" | "Rs" => Ok(weight::SURROUND),
+                "LFE" => Ok(weight::LFE),
+                _ => Err(Error(format!(
+                    "output {}: loudness channel {n:?} is not one of L, R, C, Ls, Rs, LFE",
+                    self.name
+                ))),
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -252,6 +287,7 @@ impl Config {
             }
             samplez_mxl::output::flow_definition(&self.output_config(o))
                 .map_err(|e| Error(format!("output {}: {e}", o.name)))?;
+            o.loudness_weights()?;
             if let Some(i) = self.inputs.iter().find(|i| {
                 i.flow_id == o.flow_id && self.domain(&i.domain) == self.domain(&o.domain)
             }) {
@@ -355,9 +391,33 @@ mod tests {
         assert!(parse(&c).is_err());
     }
 
+    /// BS.1770-5 Table 3: surround channels 1.41, LFE left out, every
+    /// channel 1 without a layout.
+    #[test]
+    fn loudness_channels_give_the_weights() {
+        let mut c = base();
+        c["outputs"][0]["loudnessChannels"] = serde_json::json!(["LFE"]);
+        assert_eq!(
+            parse(&c).unwrap().outputs[0].loudness_weights().unwrap(),
+            [0.0]
+        );
+        let mut o = parse(&base()).unwrap().outputs.remove(0);
+        assert_eq!(o.loudness_weights().unwrap(), [1.0]);
+        o.channels = 6;
+        o.loudness_channels = Some(
+            ["L", "R", "C", "LFE", "Ls", "Rs"]
+                .map(String::from)
+                .to_vec(),
+        );
+        assert_eq!(
+            o.loudness_weights().unwrap(),
+            [1.0, 1.0, 1.0, 0.0, 1.41, 1.41]
+        );
+    }
+
     #[test]
     fn invalid_configurations_are_refused() {
-        let cases: [(&str, serde_json::Value); 13] = [
+        let cases: [(&str, serde_json::Value); 15] = [
             ("sampleRate", serde_json::json!(44_100)),
             ("blockSize", serde_json::json!(8)),
             ("blockSize", serde_json::json!(2048)),
@@ -387,6 +447,18 @@ mod tests {
                 "outputs",
                 serde_json::json!([{ "name": "out", "domain": "a", "flowId": OUT, "label": "l",
                                      "group": "a:b", "role": "Audio", "channels": 1 }]),
+            ),
+            (
+                "outputs",
+                serde_json::json!([{ "name": "out", "domain": "a", "flowId": OUT, "label": "l",
+                                     "group": "hop", "role": "Audio", "channels": 1,
+                                     "loudnessChannels": ["L", "R"] }]),
+            ),
+            (
+                "outputs",
+                serde_json::json!([{ "name": "out", "domain": "a", "flowId": OUT, "label": "l",
+                                     "group": "hop", "role": "Audio", "channels": 1,
+                                     "loudnessChannels": ["Lc"] }]),
             ),
         ];
         for (field, value) in cases {
