@@ -347,9 +347,13 @@ impl Log {
         self.committed = self.committed.max(up_to.min(self.last));
     }
 
+    /// Removes the uncommitted entries from `from` on. Committed entries
+    /// stay, and so do their generations: a `from` at or below the commit
+    /// point removes those above it.
     fn truncate(&mut self, from: LogId) {
+        let from = from.max(self.committed + 1);
         self.uncommitted.retain(|e| e.id < from);
-        self.last = self.last.min(from.saturating_sub(1)).max(self.committed);
+        self.last = self.last.min(from - 1);
         let _ = self.sup.send(LogMsg::Truncate { from });
     }
 }
@@ -958,7 +962,7 @@ impl Engine {
     }
 
     /// Removes the uncommitted entries from log id `from` on, and drops
-    /// the generations built for them.
+    /// the generations built for them; committed entries are kept.
     pub fn truncate(&self, from: LogId) {
         self.log.lock().expect("log lock").truncate(from);
     }
@@ -2035,8 +2039,10 @@ mod tests {
         assert!(rx.pop().is_err());
         log.commit(1);
         assert_eq!(rx.pop().unwrap().id, 1);
+        // A truncation at or below the commit point keeps what is
+        // committed, and the generations of its entries.
         log.truncate(1);
-        assert!(matches!(msgs.try_recv(), Ok(LogMsg::Truncate { from: 1 })));
+        assert!(matches!(msgs.try_recv(), Ok(LogMsg::Truncate { from: 2 })));
         assert_eq!((log.last, log.uncommitted.len()), (1, 0));
         log.append(e(2, down), None, 0).unwrap();
         log.commit(2);
