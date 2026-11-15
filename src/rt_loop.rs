@@ -225,6 +225,9 @@ pub(crate) struct Out {
 /// Samples of a meter slice: 10 ms at 48 kHz.
 pub(crate) const SLICE: u64 = samplez_dsp::SLICE;
 const WINDOW: u64 = samplez_dsp::WINDOW;
+/// Input samples before the current one in the true-peak interpolation
+/// window.
+const TP_HISTORY: usize = 11;
 
 /// One output channel's meter values over one slice, the samples
 /// `[slice * SLICE, (slice + 1) * SLICE)`.
@@ -270,6 +273,11 @@ pub(crate) struct OutMeter {
     pub reset_at: Option<u64>,
     /// The slice in progress started a new measurement.
     pub reset: bool,
+    /// The index after the last sample metered.
+    pub next: Option<u64>,
+    /// Samples whose interpolated outputs the true peak leaves out: those
+    /// whose interpolation window reaches back over a discontinuity.
+    pub tp_skip: usize,
     pub frames: u32,
     pub peak: Vec<f32>,
     pub true_peak: Vec<f32>,
@@ -285,6 +293,8 @@ impl OutMeter {
             slice: None,
             reset_at: None,
             reset: false,
+            next: None,
+            tp_skip: 0,
             frames: 0,
             peak: vec![0.0; channels],
             true_peak: vec![0.0; channels],
@@ -304,6 +314,16 @@ impl OutMeter {
         start: u64,
         frames: usize,
     ) {
+        // After samples went unmetered (an overrun skip, a clock step
+        // either way) the interpolator would mix samples from both sides
+        // of the discontinuity. Its history restarts from silence, and the
+        // outputs of the next 11 samples, which reach back into it, are
+        // not measured.
+        if self.next.is_some_and(|x| x != start) {
+            self.tp.reset();
+            self.tp_skip = TP_HISTORY;
+        }
+        self.next = Some(start + frames as u64);
         let mut n = 0;
         while n < frames {
             let index = start + n as u64;
@@ -336,12 +356,19 @@ impl OutMeter {
                     }
                     *plain += f64::from(v) * f64::from(v);
                 }
-                let tp = self.tp.process(c, x);
-                if tp > self.true_peak[c] || tp.is_nan() {
-                    self.true_peak[c] = tp;
+                let skip = self.tp_skip.min(len);
+                if skip > 0 {
+                    self.tp.process(c, &x[..skip]);
+                }
+                if skip < len {
+                    let tp = self.tp.process(c, &x[skip..]);
+                    if tp > self.true_peak[c] || tp.is_nan() {
+                        self.true_peak[c] = tp;
+                    }
                 }
                 self.sum_sq[c] += self.kw.process(c, x);
             }
+            self.tp_skip -= self.tp_skip.min(len);
             self.frames += len as u32;
             n += len;
             if (index + len as u64).is_multiple_of(SLICE) {
@@ -1055,6 +1082,43 @@ mod tests {
     }
 
     const B: u64 = 48;
+
+    /// After an overrun skip or a clock step either way, the true peak of
+    /// the first slice is that of the samples after the discontinuity
+    /// alone: a quiet cosine after a loud one reads the same bits as its
+    /// later slices.
+    #[test]
+    fn a_discontinuity_restarts_the_true_peak() {
+        for resume in [27, 15] {
+            let (mut tx, mut rx) = rtrb::RingBuffer::new(1 << 12);
+            let counters = Counters::default();
+            let mut seq = 0;
+            let mut m = OutMeter::new(1);
+            let mut buf = PlanarBuffer::new(1, B as usize);
+            let mut peaks = Vec::new();
+            for (i, k) in (0..20).chain(resume..resume + 40).enumerate() {
+                let a = if i < 20 { 0.8 } else { 0.1 };
+                for (n, s) in buf.channel_mut(0).iter_mut().enumerate() {
+                    *s = a * (std::f32::consts::TAU * n as f32 / B as f32).cos();
+                }
+                let mut sink = MeterSink {
+                    output: 0,
+                    ring: &mut tx,
+                    seq: &mut seq,
+                    counters: &counters,
+                };
+                m.add(&mut sink, 0, &buf, k * B, B as usize);
+                while let Ok(r) = rx.pop() {
+                    peaks.push(r.true_peak);
+                }
+            }
+            let after = &peaks[2..];
+            assert!(
+                after.iter().all(|p| p.to_bits() == after[0].to_bits()) && after[0] < 0.11,
+                "resumed at block {resume}: {peaks:?}"
+            );
+        }
+    }
 
     fn change(gain: f32, at_index: u64) -> GainChange {
         GainChange {

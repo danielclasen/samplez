@@ -52,6 +52,8 @@ square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
 meter record lost on the way from the RT thread, samples not metered
 after an overrun, or an infinite or NaN sample mark integrated loudness
 and loudness range invalid until the next reset.
+After samples that were not metered, the true peak counts only
+interpolated values computed from samples after them.
 
 Real-time set-up reports each step and runs degraded rather than failing:
 effective capabilities raised from the permitted set, `mlockall` with
