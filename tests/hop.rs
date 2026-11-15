@@ -189,11 +189,11 @@ fn gain_change() {
     );
     checker.run(&[&rx], SECOND, |_, _| {});
     let c = engine.counters();
-    assert_eq!(c.gains_consumed.load(Relaxed), 1 + PENDING);
+    assert_eq!(c.entries_consumed.load(Relaxed), 1 + PENDING);
     let next = (checker.last_k().unwrap() + 100) * B;
     engine.set_gain(0, 0, 0.2, next).unwrap();
     checker.run(&[&rx], SECOND, |_, _| {});
-    assert_eq!(c.gains_consumed.load(Relaxed), 2 + PENDING);
+    assert_eq!(c.entries_consumed.load(Relaxed), 2 + PENDING);
     assert_eq!(c.command_late.load(Relaxed), 0);
     assert_eq!(checker.gain(), 0.2);
     assert_eq!(engine.status().diverged, None);
@@ -202,7 +202,8 @@ fn gain_change() {
 
 /// Two engines on the same input, started at different times, given the
 /// same gain change at the same index at different times: their output
-/// flows are bit-identical at every index after both faded in.
+/// flows are bit-identical at every index after both faded in that both
+/// computed.
 fn replicas() {
     let domain = Domain::new();
     let (src, out_a, out_b) = (new_id(), new_id(), new_id());
@@ -239,13 +240,21 @@ fn replicas() {
     // margin; well within the 1 s history.
     std::thread::sleep(SECOND / 2);
     let (va, vb): (Vec<_>, Vec<_>) = (rx_a.try_iter().collect(), rx_b.try_iter().collect());
-    let applied =
-        |vs: &[samplez::BlockVerdict], k| vs.iter().find(|v| v.k == k).unwrap().commands_applied;
+    // A block a replica skipped after an overrun is zero-filled by libmxl,
+    // not computed: the replicas are compared on the blocks both computed.
+    let verdict = |vs: &[samplez::BlockVerdict], k| vs.iter().find(|v| v.k == k).copied();
+    let both = |k| verdict(&va, k).zip(verdict(&vb, k));
     let range = now + 50..now + 150;
-    for k in [range.start, at / B - 1] {
-        assert_eq!((applied(&va, k), applied(&vb, k)), (0, 0), "block {k}");
+    for k in range.clone() {
+        if let Some((x, y)) = both(k) {
+            let applied = u64::from(k >= at / B);
+            assert_eq!(
+                (x.commands_applied, y.commands_applied),
+                (applied, applied),
+                "block {k}"
+            );
+        }
     }
-    assert_eq!((applied(&va, at / B), applied(&vb, at / B)), (1, 1));
     for v in va.iter().chain(&vb).filter(|v| range.contains(&v.k)) {
         assert_eq!(v.silenced | v.fading, 0, "{v:?}");
         assert_eq!(v.written, 1, "{v:?}");
@@ -253,35 +262,86 @@ fn replicas() {
     let x = common::read_blocks(&domain.0, &out_a, 2, range.clone());
     let y = common::read_blocks(&domain.0, &out_b, 2, range.clone());
     let bits = |v: &[f32]| v.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
-    let both = || format!("a: {}; b: {}", timing(a.counters()), timing(b.counters()));
-    assert!(bits(&x) == bits(&y), "replica outputs differ; {}", both());
-    // The ramp is in the compared range: channel 0 of the block at
-    // at_index differs from the block before at the same pilot phase.
-    let ramp = (at / B - range.start) as usize * 2 * B as usize;
-    assert_ne!(bits(&x[ramp..ramp + B as usize]), bits(&x[..B as usize]));
+    let timings = || format!("a: {}; b: {}", timing(a.counters()), timing(b.counters()));
+    let n = 2 * B as usize;
+    let computed: Vec<usize> = (0..range.end - range.start)
+        .filter(|&i| both(range.start + i).is_some())
+        .map(|i| i as usize)
+        .collect();
+    assert!(
+        computed.len() * 4 > (range.end - range.start) as usize * 3,
+        "{} blocks computed by both; {}",
+        computed.len(),
+        timings()
+    );
+    for &i in &computed {
+        let (p, q) = (&x[i * n..(i + 1) * n], &y[i * n..(i + 1) * n]);
+        assert!(
+            bits(p) == bits(q),
+            "replica outputs differ at block {}; {}",
+            range.start + i as u64,
+            timings()
+        );
+    }
+    // The ramp is in the compared range: channel 0 of a block in it
+    // differs from a block before at_index at the same pilot phase.
+    let before = computed
+        .iter()
+        .find(|&&i| range.start + (i as u64) < at / B);
+    let ramping = computed.iter().find(|&&i| range.start + i as u64 >= at / B);
+    let (Some(&i), Some(&j)) = (before, ramping) else {
+        panic!(
+            "no block computed by both before and after {at}; {}",
+            timings()
+        );
+    };
+    assert_ne!(
+        bits(&x[j * n..j * n + B as usize]),
+        bits(&x[i * n..i * n + B as usize])
+    );
     // A loudness reset at one index on both: from the window it lands on,
     // both measure the same samples from the same filter state, so the
-    // maxima since then are the same bits. The channel was just drained
-    // and verdicts arrive once per supervisor tick, so wait for one.
-    let first = rx_a.recv_timeout(5 * SECOND).unwrap();
-    let now = rx_a.try_iter().last().unwrap_or(first).k;
-    let reset = (now + 100) * B;
-    a.reset_loudness(0, reset).unwrap();
-    b.reset_loudness(0, reset).unwrap();
-    let since = Some(reset.div_ceil(4800) * 4800);
-    for e in [&a, &b] {
-        wait_for(5 * SECOND, "a second measured since the reset", || {
-            let m = &e.status().outputs[0].meters;
-            m.since == since && m.window.is_some_and(|w| w * 4800 > reset + 48_000)
-        });
+    // maxima since then are the same bits. Samples a replica skipped after
+    // an overrun are not metered and leave its measurement invalid until
+    // the next reset; the reset is then made again, up to five times.
+    let skipped = || {
+        let c = |e: &samplez::Engine| e.counters().overrun_skipped_samples.load(Relaxed);
+        (c(&a), c(&b))
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let before = skipped();
+        // The channel was drained and verdicts arrive once per supervisor
+        // tick, so wait for one.
+        let first = rx_a.recv_timeout(5 * SECOND).unwrap();
+        let now = rx_a.try_iter().last().unwrap_or(first).k;
+        let reset = (now + 100) * B;
+        a.reset_loudness(0, reset).unwrap();
+        b.reset_loudness(0, reset).unwrap();
+        let since = Some(reset.div_ceil(4800) * 4800);
+        for e in [&a, &b] {
+            wait_for(5 * SECOND, "a second measured since the reset", || {
+                let m = &e.status().outputs[0].meters;
+                m.since == since && m.window.is_some_and(|w| w * 4800 > reset + 48_000)
+            });
+        }
+        let (sa, sb) = (a.status(), b.status());
+        let (ma, mb) = (&sa.outputs[0].meters, &sb.outputs[0].meters);
+        if !(ma.valid && mb.valid) && skipped() != before && attempt < 5 {
+            println!(
+                "replicas: overrun skips after the loudness reset; {}",
+                timings()
+            );
+            continue;
+        }
+        assert!(ma.valid && mb.valid, "{ma:?} {mb:?}; {}", timings());
+        assert_eq!(ma.max_true_peak, mb.max_true_peak, "{}", timings());
+        let max_m = |m: &samplez::OutputMeters| m.max_momentary.map(f64::to_bits);
+        assert_eq!(max_m(ma), max_m(mb), "{ma:?} {mb:?}; {}", timings());
+        assert!(ma.max_momentary.is_some());
+        break;
     }
-    let (sa, sb) = (a.status(), b.status());
-    let (ma, mb) = (&sa.outputs[0].meters, &sb.outputs[0].meters);
-    assert!(ma.valid && mb.valid, "{ma:?} {mb:?}; {}", both());
-    assert_eq!(ma.max_true_peak, mb.max_true_peak, "{}", both());
-    let max_m = |m: &samplez::OutputMeters| m.max_momentary.map(f64::to_bits);
-    assert_eq!(max_m(ma), max_m(mb), "{ma:?} {mb:?}; {}", both());
-    assert!(ma.max_momentary.is_some());
     common::stop(b);
     common::stop(a);
 }

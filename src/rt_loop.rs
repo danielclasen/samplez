@@ -45,22 +45,27 @@ pub struct Counters {
     pub output_held_blocks: AtomicU64,
     /// Output open or commit calls libmxl refused.
     pub output_failed_writes: AtomicU64,
-    /// Gain changes whose `at_index` lay in samples already produced
+    /// Log entries whose `at_index` lay in samples already produced
     /// when they reached the RT thread; not applied, and each one marks
     /// the engine diverged.
     pub command_late: AtomicU64,
+    /// Entries needing a generation that were due before their generation
+    /// arrived: applied, with the slot silent until it arrives.
+    pub generation_late: AtomicU64,
     /// The index of the next sample the matrix produces, published after
     /// each block.
     pub produced: AtomicU64,
-    /// Gain changes the RT thread took off its pending list: applied,
+    /// Log entries the RT thread took off its pending list: applied,
     /// refused by the matrix or late.
-    pub gains_consumed: AtomicU64,
+    pub entries_consumed: AtomicU64,
     /// Telemetry records not sent because the ring was full.
     pub telemetry_dropped: AtomicU64,
     /// Meter records not sent because the meter ring was full.
     pub meter_dropped: AtomicU64,
     /// Block verdicts not sent because the verdict channel was full.
     pub verdicts_dropped: AtomicU64,
+    /// Reports not sent because the report channel was full.
+    pub reports_dropped: AtomicU64,
     /// Largest wake lateness after `mxlSleepUntil(T_k)`, ns.
     pub wake_jitter_max_ns: AtomicU64,
     /// Largest block processing time, ns.
@@ -90,8 +95,8 @@ pub struct BlockVerdict {
     pub ramping: bool,
     /// One bit per output whose block was committed.
     pub written: u64,
-    /// Gain changes applied up to and including this block, in stream
-    /// order; with `k` the point a joining replica's parameter state is
+    /// Log entries applied up to and including this block, in log order
+    /// within an index; with `k` the point a joining replica's state is
     /// brought to.
     pub commands_applied: u64,
 }
@@ -150,12 +155,29 @@ pub(crate) enum Telemetry {
     ClockStep {
         delta_ns: i64,
     },
-    /// A gain change reached the RT thread after the matrix produced its
+    /// A log entry reached the RT thread after the matrix produced its
     /// index; not applied.
-    LateGain {
-        change: GainChange,
+    LateEntry {
+        entry: RtEntry,
         /// The index of the next sample the matrix produced.
         pos: u64,
+    },
+    /// An `InputDown` or `InputUp` entry changed the slot's state.
+    Input {
+        slot: usize,
+        up: bool,
+    },
+    /// The generation of entry `id` was swapped in, or handed back
+    /// unused because the entry was late.
+    GenerationDone {
+        id: LogId,
+        swapped: bool,
+    },
+    /// Entry `entry` was applied before its generation arrived while
+    /// [`PENDING_CHANGES`] others awaited theirs: its generation is not
+    /// swapped in, and its slot stays silent.
+    AwaitLost {
+        entry: RtEntry,
     },
 }
 
@@ -164,12 +186,22 @@ pub(crate) enum Telemetry {
 pub(crate) struct Gen {
     pub mxl: Generation,
     pub prune_after: Vec<u64>,
+    /// Built for a `Route` entry that changes the slot's flow: the slot's
+    /// reader is on the new flow, its outgoing reader on the old one.
+    pub rerouted: bool,
 }
 
 pub(crate) enum Command {
     /// Replaces the generation of an input domain; the old one is
     /// returned.
     Generation { domain: usize, generation: Box<Gen> },
+    /// The generation built for log entry `id`, swapped in at the entry's
+    /// index. At most one is held.
+    Pending {
+        id: LogId,
+        domain: usize,
+        generation: Box<Gen>,
+    },
     /// Hands an output's writer over; a replaced one is returned.
     Writer {
         output: usize,
@@ -177,19 +209,47 @@ pub(crate) enum Command {
     },
 }
 
-/// Ramps one matrix coefficient to `gain`, starting at sample index
-/// `at_index`, a multiple of B. Gain changes have a ring of their own, so
-/// a full pending list never holds back a generation or a writer.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GainChange {
-    pub input: usize,
-    pub output: usize,
-    pub gain: f32,
-    pub at_index: u64,
+/// The index of a log entry in the log that orders it.
+pub type LogId = u64;
+
+/// What a committed log entry changes. Each sets an absolute target, so
+/// one applied again changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Change {
+    /// Ramps one matrix coefficient to `gain`.
+    Gain {
+        input: usize,
+        output: usize,
+        gain: f32,
+    },
+    /// The input is silent from the index on, whatever is readable.
+    InputDown { slot: usize },
+    /// The input fades in from the index; needs a generation holding its
+    /// reader.
+    InputUp { slot: usize },
+    /// The slot crossfades to another flow from the index; needs a
+    /// generation holding both readers.
+    Route { slot: usize },
 }
 
-/// Gain changes the RT thread holds before their index, and the capacity
-/// of the gain ring.
+impl Change {
+    pub fn needs_generation(&self) -> bool {
+        matches!(self, Change::InputUp { .. } | Change::Route { .. })
+    }
+}
+
+/// A committed log entry, applied at sample index `at_index`, a multiple
+/// of B. Entries have a ring of their own, so a full pending list never
+/// holds back a generation or a writer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RtEntry {
+    pub id: LogId,
+    pub at_index: u64,
+    pub change: Change,
+}
+
+/// Entries the RT thread holds before their index, and the capacity of
+/// the entry ring.
 pub(crate) const PENDING_CHANGES: usize = 64;
 
 pub(crate) enum Returned {
@@ -209,6 +269,15 @@ pub(crate) struct Slot {
     /// The slot's last processed block was silenced; the next copied
     /// block starts a fade-in.
     pub silenced_last: bool,
+    /// The slot's state in the log: silent while down.
+    pub up: bool,
+    /// An entry for the slot was applied before its generation arrived:
+    /// silent until it does.
+    pub held: bool,
+    /// The index a re-route's crossfade started at.
+    pub xfade: Option<u64>,
+    /// The read state of the flow a re-route leaves.
+    pub prev: SlotState,
     pub prune_requested: bool,
     pub stats: SlotStats,
 }
@@ -225,6 +294,9 @@ pub(crate) struct Out {
 /// Samples of a meter slice: 10 ms at 48 kHz.
 pub(crate) const SLICE: u64 = samplez_dsp::SLICE;
 const WINDOW: u64 = samplez_dsp::WINDOW;
+/// Input samples before the current one in the true-peak interpolation
+/// window.
+const TP_HISTORY: usize = TruePeak::HISTORY;
 
 /// One output channel's meter values over one slice, the samples
 /// `[slice * SLICE, (slice + 1) * SLICE)`.
@@ -270,6 +342,11 @@ pub(crate) struct OutMeter {
     pub reset_at: Option<u64>,
     /// The slice in progress started a new measurement.
     pub reset: bool,
+    /// The index after the last sample metered.
+    pub next: Option<u64>,
+    /// Samples whose interpolated outputs the true peak leaves out: those
+    /// whose interpolation window reaches back over a discontinuity.
+    pub tp_skip: usize,
     pub frames: u32,
     pub peak: Vec<f32>,
     pub true_peak: Vec<f32>,
@@ -285,6 +362,8 @@ impl OutMeter {
             slice: None,
             reset_at: None,
             reset: false,
+            next: None,
+            tp_skip: 0,
             frames: 0,
             peak: vec![0.0; channels],
             true_peak: vec![0.0; channels],
@@ -304,6 +383,16 @@ impl OutMeter {
         start: u64,
         frames: usize,
     ) {
+        // After samples went unmetered (an overrun skip, a clock step
+        // either way) the interpolator would mix samples from both sides
+        // of the discontinuity. Its history restarts from silence, and the
+        // outputs of the next 11 samples, which reach back into it, are
+        // not measured.
+        if self.next.is_some_and(|x| x != start) {
+            self.tp.reset();
+            self.tp_skip = TP_HISTORY;
+        }
+        self.next = Some(start + frames as u64);
         let mut n = 0;
         while n < frames {
             let index = start + n as u64;
@@ -336,12 +425,19 @@ impl OutMeter {
                     }
                     *plain += f64::from(v) * f64::from(v);
                 }
-                let tp = self.tp.process(c, x);
-                if tp > self.true_peak[c] || tp.is_nan() {
-                    self.true_peak[c] = tp;
+                let skip = self.tp_skip.min(len);
+                if skip > 0 {
+                    self.tp.process(c, &x[..skip]);
+                }
+                if skip < len {
+                    let tp = self.tp.process(c, &x[skip..]);
+                    if tp > self.true_peak[c] || tp.is_nan() {
+                        self.true_peak[c] = tp;
+                    }
                 }
                 self.sum_sq[c] += self.kw.process(c, x);
             }
+            self.tp_skip -= self.tp_skip.min(len);
             self.frames += len as u32;
             n += len;
             if (index + len as u64).is_multiple_of(SLICE) {
@@ -438,12 +534,16 @@ pub(crate) struct Mix {
     pub pos: Option<u64>,
     /// The exclusive end index of the latest coefficient ramp.
     pub ramp_end: u64,
-    /// Pending gain changes, by `at_index`, in arrival order within one
-    /// index. Capacity [`PENDING_CHANGES`], never exceeded.
-    pub pending: Vec<GainChange>,
-    /// Gain changes the matrix took.
+    /// Pending entries, by `at_index`, in log order within one index.
+    /// Capacity [`PENDING_CHANGES`], never exceeded.
+    pub pending: Vec<RtEntry>,
+    /// Entries other than gain changes taken off the pending list by the
+    /// last [`Mix::to`], in order, each with whether it was late. They
+    /// are applied by the loop.
+    pub due: Vec<(RtEntry, bool)>,
+    /// Entries applied: gain changes the matrix took, and the others.
     pub applied: u64,
-    /// Gain changes taken off the pending list: applied, refused by the
+    /// Entries taken off the pending list: applied, refused by the
     /// matrix or late.
     pub consumed: u64,
 }
@@ -457,33 +557,41 @@ impl Mix {
             pos: None,
             ramp_end: 0,
             pending: Vec::with_capacity(PENDING_CHANGES),
+            due: Vec::with_capacity(PENDING_CHANGES),
             applied: 0,
             consumed: 0,
         }
     }
 
-    /// Queues `change` by its index. False, and not queued, when
-    /// [`PENDING_CHANGES`] are pending.
-    pub fn push(&mut self, change: GainChange) -> bool {
+    /// Queues `entry` by its index and log id. False, and not queued,
+    /// when [`PENDING_CHANGES`] are pending.
+    pub fn push(&mut self, entry: RtEntry) -> bool {
         if self.pending.len() >= PENDING_CHANGES {
             return false;
         }
         let at = self
             .pending
-            .partition_point(|c| c.at_index <= change.at_index);
-        self.pending.insert(at, change);
+            .partition_point(|c| (c.at_index, c.id) <= (entry.at_index, entry.id));
+        self.pending.insert(at, entry);
         true
     }
 
-    /// Brings the matrix to the start of block `k`: every pending change
-    /// due at or before `kB` is applied at its own index, and the ramps
-    /// advance over samples not mixed, so a coefficient's value depends on
-    /// the sample index and the ordered changes alone. A change whose
-    /// index the matrix has already produced is passed to `late` with the
-    /// matrix position, and not applied. A block below the position
-    /// follows a backward clock step: the position re-anchors to `kB` and
-    /// the ramps hold where they are, never rewound.
-    pub fn to(&mut self, k: u64, mut late: impl FnMut(GainChange, u64)) {
+    /// Whether entry `id` is pending.
+    pub fn holds(&self, id: LogId) -> bool {
+        self.pending.iter().any(|c| c.id == id)
+    }
+
+    /// Brings the matrix to the start of block `k`: every pending gain
+    /// change due at or before `kB` is applied at its own index, and the
+    /// ramps advance over samples not mixed, so a coefficient's value
+    /// depends on the sample index and the ordered changes alone. A gain
+    /// change whose index the matrix has already produced is passed to
+    /// `late` with the matrix position, and not applied. Other due entries
+    /// go to [`Mix::due`]. A block below the position follows a backward
+    /// clock step: the position re-anchors to `kB` and the ramps hold
+    /// where they are, never rewound.
+    pub fn to(&mut self, k: u64, mut late: impl FnMut(RtEntry, u64)) {
+        self.due.clear();
         let start = k * self.block;
         let mut pos = match self.pos {
             Some(p) if p > start => {
@@ -499,15 +607,24 @@ impl Mix {
         {
             self.pending.remove(0);
             self.consumed += 1;
+            let Change::Gain {
+                input,
+                output,
+                gain,
+            } = c.change
+            else {
+                self.due.push((c, c.at_index < pos));
+                continue;
+            };
             if c.at_index < pos {
                 late(c, pos);
                 continue;
             }
             self.matrix.advance((c.at_index - pos) as usize);
             pos = c.at_index;
-            if self.matrix.set(c.input, c.output, c.gain, self.ramp) {
+            if self.matrix.set(input, output, gain, self.ramp) {
                 self.applied += 1;
-                if self.matrix.is_ramping(c.input, c.output) {
+                if self.matrix.is_ramping(input, output) {
                     self.ramp_end = self.ramp_end.max(c.at_index + u64::from(self.ramp));
                 }
             }
@@ -538,8 +655,18 @@ pub(crate) struct Rt {
     pub outbuf: PlanarBuffer,
     /// One input's or one output's channels, planar.
     pub scratch: Vec<f32>,
+    /// The outgoing flow's channels during a re-route's crossfade.
+    pub scratch_out: Vec<f32>,
+    /// The generation built for a pending entry, with the entry's id and
+    /// the generation's input domain.
+    pub pending_gen: Option<(LogId, usize, Box<Gen>)>,
+    /// Entries applied before their generation arrived, in log order.
+    /// Capacity [`PENDING_CHANGES`], never exceeded.
+    pub awaiting_gen: Vec<RtEntry>,
+    /// The highest log id taken from the entry ring.
+    pub last_entry: LogId,
     pub cmd: Consumer<Command>,
-    pub gains: Consumer<GainChange>,
+    pub entries: Consumer<RtEntry>,
     pub ret: Producer<Returned>,
     pub tel: Producer<Telemetry>,
     pub meters: Producer<MeterRecord>,
@@ -647,12 +774,15 @@ impl Rt {
             }
             prev = Some((now, mono, width));
             let newest = time::newest_due_block(&self.api, now, self.block, self.margin);
-            self.drain_commands(newest.unwrap_or(0));
+            // Entries before commands: a generation handed over after its
+            // entry's commit finds the entry pending.
             while self.mix.pending.len() < PENDING_CHANGES
-                && let Ok(change) = self.gains.pop()
+                && let Ok(entry) = self.entries.pop()
             {
-                let _ = self.mix.push(change);
+                self.last_entry = self.last_entry.max(entry.id);
+                let _ = self.mix.push(entry);
             }
+            self.drain_commands(newest.unwrap_or(0));
             // After a backward clock step writers hold until the clock
             // passes their last commit, and inputs never read below their
             // last range.
@@ -714,25 +844,27 @@ impl Rt {
             }
             let Ok(cmd) = self.cmd.pop() else { return };
             match cmd {
-                Command::Generation { domain, generation } => {
-                    let old = self.gens[domain].take();
-                    for (i, slot) in self.slots.iter_mut().enumerate() {
-                        if slot.domain != domain {
-                            continue;
+                Command::Generation { domain, generation } => self.install(domain, generation),
+                Command::Pending {
+                    id,
+                    domain,
+                    generation,
+                } => {
+                    if let Some(n) = self.awaiting_gen.iter().position(|e| e.id == id) {
+                        // Its entry was applied without it: swapped in at
+                        // once, the slot fading in from silence.
+                        let e = self.awaiting_gen.remove(n);
+                        self.swap_in(e, domain, generation, false);
+                    } else if id > self.last_entry || self.mix.holds(id) {
+                        // Its entry is pending, or still in the entry ring
+                        // behind a full pending list.
+                        if let Some((old, _, g)) =
+                            self.pending_gen.replace((id, domain, generation))
+                        {
+                            self.gen_unused(old, g);
                         }
-                        let was = old.as_ref().is_some_and(|g| g.mxl.input(i).is_some());
-                        let is = generation.mxl.input(i).is_some();
-                        if is && !was {
-                            slot.state.invalid = false;
-                            slot.state.frozen_late_blocks = 0;
-                        }
-                        if is != was {
-                            slot.prune_requested = false;
-                        }
-                    }
-                    self.gens[domain] = Some(generation);
-                    if let Some(old) = old {
-                        self.give_back(Returned::Generation(old));
+                    } else {
+                        self.gen_unused(id, generation);
                     }
                 }
                 Command::Writer { output, writer } => {
@@ -746,16 +878,169 @@ impl Rt {
         }
     }
 
+    /// Makes `generation` the one of input domain `domain` and hands the
+    /// old one back. Slot state stays with the slots.
+    fn install(&mut self, domain: usize, generation: Box<Gen>) {
+        let old = self.gens[domain].take();
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.domain != domain {
+                continue;
+            }
+            let was = old.as_ref().is_some_and(|g| g.mxl.input(i).is_some());
+            let is = generation.mxl.input(i).is_some();
+            if is && !was {
+                slot.state.invalid = false;
+                slot.state.frozen_late_blocks = 0;
+            }
+            if is != was {
+                slot.prune_requested = false;
+            }
+        }
+        self.gens[domain] = Some(generation);
+        if let Some(old) = old {
+            self.give_back(Returned::Generation(old));
+        }
+    }
+
+    /// Hands back the generation of entry `id`, which was late.
+    fn gen_unused(&mut self, id: LogId, generation: Box<Gen>) {
+        self.give_back(Returned::Generation(generation));
+        self.send(Telemetry::GenerationDone { id, swapped: false });
+    }
+
+    /// Swaps in the generation of entry `e`, an `InputUp` or a `Route`.
+    /// A re-route on time starts its crossfade at the entry's index; one
+    /// whose generation came late starts the new flow from silence.
+    fn swap_in(&mut self, e: RtEntry, domain: usize, generation: Box<Gen>, on_time: bool) {
+        let rerouted = generation.rerouted;
+        self.install(domain, generation);
+        let (Change::InputUp { slot: i } | Change::Route { slot: i }) = e.change else {
+            unreachable!("only these entries need a generation")
+        };
+        // Silent while another entry for the slot awaits its generation.
+        let held = self.awaiting_gen.iter().any(
+            |a| matches!(a.change, Change::InputUp { slot } | Change::Route { slot } if slot == i),
+        );
+        let slot = &mut self.slots[i];
+        slot.held = held;
+        if rerouted {
+            slot.prev = slot.state.clone();
+            let s = &mut slot.state;
+            s.last_end = None;
+            s.head = 0;
+            s.frozen_late_blocks = 0;
+            s.invalid = false;
+            // Anchored at the index whatever the slot's last block was:
+            // an outgoing flow that is silent fades the new one in.
+            slot.xfade = on_time.then_some(e.at_index);
+        }
+        self.send(Telemetry::GenerationDone {
+            id: e.id,
+            swapped: true,
+        });
+    }
+
+    /// Applies entry `e`, other than a gain change, at the start of the
+    /// block at its index. An entry that sets what the slot already has
+    /// starts nothing.
+    fn apply(&mut self, e: RtEntry) {
+        self.mix.applied += 1;
+        let slot = match e.change {
+            Change::Gain { .. } => return,
+            Change::InputDown { slot } => {
+                let s = &mut self.slots[slot];
+                if s.up {
+                    s.up = false;
+                    s.xfade = None;
+                    self.send(Telemetry::Input { slot, up: false });
+                }
+                return;
+            }
+            Change::InputUp { slot } | Change::Route { slot } => slot,
+        };
+        if matches!(e.change, Change::InputUp { .. }) && !self.slots[slot].up {
+            // The fade-in runs from the entry's index, also on an engine
+            // that skipped the blocks around it.
+            let s = &mut self.slots[slot];
+            s.up = true;
+            s.fade_start = Some(e.at_index);
+            s.silenced_last = false;
+            self.send(Telemetry::Input { slot, up: true });
+        }
+        match self.pending_gen.take() {
+            Some((id, domain, g)) if id == e.id => self.swap_in(e, domain, g, true),
+            other => {
+                self.pending_gen = other;
+                add(&self.counters.generation_late, 1);
+                self.slots[slot].held = true;
+                if self.awaiting_gen.len() < PENDING_CHANGES {
+                    self.awaiting_gen.push(e);
+                } else {
+                    self.send(Telemetry::AwaitLost { entry: e });
+                }
+            }
+        }
+    }
+
+    /// The entries [`Mix::to`] took off for block `k`: applied, or
+    /// reported late.
+    fn apply_due(&mut self, k: u64) {
+        for n in 0..self.mix.due.len() {
+            let (e, late) = self.mix.due[n];
+            if !late {
+                self.apply(e);
+                continue;
+            }
+            add(&self.counters.command_late, 1);
+            self.send(Telemetry::LateEntry {
+                entry: e,
+                pos: k * self.block,
+            });
+            if let Some((id, _, g)) = self.pending_gen.take_if(|p| p.0 == e.id) {
+                self.gen_unused(id, g);
+            }
+        }
+        self.mix.due.clear();
+    }
+
     /// Reads, mixes and writes block `k`, due at `deadline`.
     fn process(&mut self, k: u64, deadline: u64) {
         let t0 = time::now(&self.api);
         let b = self.block as usize;
+        // Entries apply at the start of the block at their index, before
+        // its inputs are read.
+        let (counters, tel) = (&self.counters, &mut self.tel);
+        self.mix.to(k, |entry, pos| {
+            add(&counters.command_late, 1);
+            if tel.push(Telemetry::LateEntry { entry, pos }).is_err() {
+                add(&counters.telemetry_dropped, 1);
+            }
+        });
+        self.apply_due(k);
+        self.counters.produced.store((k + 1) * self.block, Release);
+        self.counters
+            .entries_consumed
+            .store(self.mix.consumed, Release);
+        let start = k * self.block;
         let mut silenced = 0u64;
         let mut fading = 0u64;
         for (i, slot) in self.slots.iter_mut().enumerate() {
             let dst = &mut self.scratch[..slot.channels * b];
             let generation = self.gens[slot.domain].as_deref();
-            let copied = match generation.and_then(|g| Some((g.mxl.input(i)?, g))) {
+            let readable = slot.up && !slot.held;
+            // A crossfade runs over the ramp from its index; a block below
+            // it follows a backward clock step.
+            let xfade = slot
+                .xfade
+                .map(|s| start.saturating_sub(s))
+                .filter(|&p| p < u64::from(self.ramp) && readable);
+            if xfade.is_none() {
+                slot.xfade = None;
+            }
+            let input = generation
+                .filter(|_| readable)
+                .and_then(|g| Some((g.mxl.input(i)?, g)));
+            let copied = match input {
                 Some((input, g)) => {
                     let group = &self.statuses[slot.domain];
                     let probes = slot.state.counters.probes;
@@ -802,11 +1087,42 @@ impl Rt {
                     false
                 }
             };
-            if copied {
+            if let Some(pos) = xfade {
+                // new * up + old * down, the old flow's reader absent or
+                // failing counting as silence.
+                fading |= 1 << i;
+                let mut up = Ramp::new(0.0);
+                let _ = up.set_target(1.0, self.ramp);
+                up.advance(pos as usize);
+                let mut down = Ramp::new(1.0);
+                let _ = down.set_target(0.0, self.ramp);
+                down.advance(pos as usize);
+                let old = &mut self.scratch_out[..slot.channels * b];
+                let old_copied = generation
+                    .and_then(|g| g.mxl.outgoing(i))
+                    .is_some_and(|input| {
+                        let group = &self.statuses[slot.domain];
+                        input.read(&mut slot.prev, k, group, old) == Outcome::Copy
+                    });
+                for (ch, o) in dst.chunks_exact_mut(b).zip(old.chunks_exact_mut(b)) {
+                    let (mut up, mut down) = (up, down);
+                    up.process(ch);
+                    if old_copied {
+                        down.process(o);
+                        for (d, s) in ch.iter_mut().zip(o.iter()) {
+                            *d += *s;
+                        }
+                    }
+                }
+                slot.silenced_last = !copied;
+                if !copied && !old_copied {
+                    silenced |= 1 << i;
+                    add(&self.counters.input_silenced_blocks, 1);
+                }
+            } else if copied {
                 // The fade-in after a silenced block starts at that
                 // block's first index; its gain at index n is the ramp's
                 // value at n - start.
-                let start = k * self.block;
                 if slot.silenced_last {
                     slot.fade_start = Some(start);
                     slot.silenced_last = false;
@@ -834,17 +1150,6 @@ impl Rt {
             }
         }
 
-        let (counters, tel) = (&self.counters, &mut self.tel);
-        self.mix.to(k, |change, pos| {
-            add(&counters.command_late, 1);
-            if tel.push(Telemetry::LateGain { change, pos }).is_err() {
-                add(&counters.telemetry_dropped, 1);
-            }
-        });
-        self.counters.produced.store((k + 1) * self.block, Release);
-        self.counters
-            .gains_consumed
-            .store(self.mix.consumed, Release);
         let ramping = self.mix.ramping(k);
         self.mix.matrix.process(&self.inbuf, &mut self.outbuf, b);
 
@@ -1056,13 +1361,59 @@ mod tests {
 
     const B: u64 = 48;
 
-    fn change(gain: f32, at_index: u64) -> GainChange {
-        GainChange {
+    /// After an overrun skip or a clock step either way, the true peak of
+    /// the first slice is that of the samples after the discontinuity
+    /// alone: a quiet cosine after a loud one reads the same bits as its
+    /// later slices.
+    #[test]
+    fn a_discontinuity_restarts_the_true_peak() {
+        for resume in [27, 15] {
+            let (mut tx, mut rx) = rtrb::RingBuffer::new(1 << 12);
+            let counters = Counters::default();
+            let mut seq = 0;
+            let mut m = OutMeter::new(1);
+            let mut buf = PlanarBuffer::new(1, B as usize);
+            let mut peaks = Vec::new();
+            for (i, k) in (0..20).chain(resume..resume + 40).enumerate() {
+                let a = if i < 20 { 0.8 } else { 0.1 };
+                for (n, s) in buf.channel_mut(0).iter_mut().enumerate() {
+                    *s = a * (std::f32::consts::TAU * n as f32 / B as f32).cos();
+                }
+                let mut sink = MeterSink {
+                    output: 0,
+                    ring: &mut tx,
+                    seq: &mut seq,
+                    counters: &counters,
+                };
+                m.add(&mut sink, 0, &buf, k * B, B as usize);
+                while let Ok(r) = rx.pop() {
+                    peaks.push(r.true_peak);
+                }
+            }
+            let after = &peaks[2..];
+            assert!(
+                after.iter().all(|p| p.to_bits() == after[0].to_bits()) && after[0] < 0.11,
+                "resumed at block {resume}: {peaks:?}"
+            );
+        }
+    }
+
+    fn entry(change: Change, at_index: u64) -> RtEntry {
+        static ID: AtomicU64 = AtomicU64::new(1);
+        RtEntry {
+            id: ID.fetch_add(1, Relaxed),
+            at_index,
+            change,
+        }
+    }
+
+    fn change(gain: f32, at_index: u64) -> RtEntry {
+        let change = Change::Gain {
             input: 0,
             output: 0,
             gain,
-            at_index,
-        }
+        };
+        entry(change, at_index)
     }
 
     fn mix() -> Mix {
@@ -1185,5 +1536,44 @@ mod tests {
         }
         assert!(!m.push(change(0.5, 200 * B)));
         assert!(m.pending.windows(2).all(|w| w[0].at_index <= w[1].at_index));
+    }
+
+    /// Entries at one index apply in log order, whatever order they
+    /// arrived in.
+    #[test]
+    fn entries_at_one_index_are_in_log_order() {
+        let mut m = mix();
+        let (a, b) = (change(0.5, 10 * B), change(0.25, 10 * B));
+        assert!(m.push(b) && m.push(a));
+        let ids: Vec<_> = m.pending.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [a.id, b.id]);
+        assert!(to(&mut m, 10).is_empty());
+        // Past the ramp: the later entry's target holds.
+        to(&mut m, 30);
+        assert_eq!(m.matrix.gain(0, 0), 0.25);
+    }
+
+    /// Input entries leave the pending list at the block of their index,
+    /// in order, flagged late when the matrix produced their index already.
+    #[test]
+    fn input_entries_are_due_at_their_block() {
+        let mut m = mix();
+        let down = entry(Change::InputDown { slot: 1 }, 10 * B);
+        let route = entry(Change::Route { slot: 0 }, 12 * B);
+        assert!(m.push(route) && m.push(down));
+        to(&mut m, 9);
+        assert!(m.due.is_empty());
+        to(&mut m, 10);
+        assert_eq!(m.due.len(), 1);
+        assert_eq!((m.due[0].0.id, m.due[0].1), (down.id, false));
+        // A forward step past its index applies it on the next block.
+        to(&mut m, 14);
+        assert_eq!((m.due[0].0.id, m.due[0].1), (route.id, false));
+        // One arriving after the matrix produced its index is late.
+        let up = entry(Change::InputUp { slot: 1 }, 14 * B);
+        assert!(m.push(up));
+        to(&mut m, 15);
+        assert_eq!((m.due[0].0.id, m.due[0].1), (up.id, true));
+        assert_eq!(m.consumed, 3);
     }
 }

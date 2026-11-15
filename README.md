@@ -52,6 +52,23 @@ square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
 meter record lost on the way from the RT thread, samples not metered
 after an overrun, or an infinite or NaN sample mark integrated loudness
 and loudness range invalid until the next reset.
+After samples that were not metered, the true peak counts only
+interpolated values computed from samples after them.
+
+Every change to what the engine computes is a log entry applied at a
+sample index: a gain change, `InputDown` (the input is silent from the
+index on, whatever is readable), `InputUp` (it fades in from the index)
+and `Route` (it crossfades to another flow over the ramp length from
+the index). Each sets an absolute target, so an entry applied again
+changes nothing. `InputUp` and `Route` need a new input generation:
+the engine builds it when the entry is appended, one at a time, and
+swaps it in at the entry's index. The status reports the 99.99th
+percentile of the build times and buildLead, how far ahead such entries
+are stamped. `Engine::start` keeps the log itself, stamping `InputDown`
+when an input is pruned and `InputUp` once it has been on time for a
+second, and each `InputUp` or `Route` at least buildLead after the one
+before; `Engine::start_replicated` takes entries through `append`,
+`commit` and `truncate` and sends those reports out instead.
 
 Real-time set-up reports each step and runs degraded rather than failing:
 effective capabilities raised from the permitted set, `mlockall` with

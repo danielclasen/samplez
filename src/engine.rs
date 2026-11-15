@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering::Acquire, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Acquire, Ordering::Relaxed};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -26,8 +26,8 @@ use crate::config::Config;
 use crate::meters::{OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
-    BlockVerdict, Command, Counters, EMPTY_STATS, GainChange, Gen, LoudnessReset, MeterRecord, Mix,
-    Out, OutMeter, PENDING_CHANGES, Returned, Rt, SLICE, Slot, SlotStats, Telemetry,
+    BlockVerdict, Change, Command, Counters, EMPTY_STATS, Gen, LogId, LoudnessReset, MeterRecord,
+    Mix, Out, OutMeter, PENDING_CHANGES, Returned, Rt, RtEntry, SLICE, Slot, SlotStats, Telemetry,
 };
 
 const COMMAND_RING: usize = 64;
@@ -43,6 +43,10 @@ const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Seconds of slot statistics the margin warning looks at, plus one.
 const MARGIN_WINDOW: usize = 11;
+/// The build time assumed before a generation was built.
+const UNMEASURED_BUILD: Duration = Duration::from_millis(100);
+/// Quarter-octave buckets of the build-time histogram, up to 2^64 ns.
+const BUILD_BUCKETS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputState {
@@ -56,6 +60,11 @@ pub enum InputState {
 pub struct InputStatus {
     pub name: String,
     pub state: InputState,
+    /// The input's state in the log: up from an `InputUp`, down from an
+    /// `InputDown` entry, applied by the RT thread.
+    pub up: bool,
+    /// The flow the input reads, changed by `Route` entries.
+    pub flow_id: String,
     /// Why the last attach failed.
     pub error: Option<String>,
     /// The margin the producer's `maxCommitBatchSizeHint` needs, when the
@@ -86,12 +95,33 @@ pub struct OutputStatus {
     pub meters: OutputMeters,
 }
 
+/// The generation-needing entry (`InputUp`, `Route`) the engine builds or
+/// holds, and the build times that set how far ahead such entries are
+/// stamped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenerationStatus {
+    /// The log id of the entry; at most one generation is pending.
+    pub pending: Option<LogId>,
+    /// Its generation is built.
+    pub ready: bool,
+    /// Generations built.
+    pub builds: u64,
+    /// The 99.99th percentile of their build times (new instance,
+    /// readers, ring pre-fault), ns.
+    pub build_p9999_ns: Option<u64>,
+    /// buildLead: samples a generation-needing entry is stamped ahead of
+    /// the earliest index a gain change could take, covering that
+    /// percentile and a supervisor tick.
+    pub build_lead: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Status {
     pub rt: RtStatus,
+    pub generation: GenerationStatus,
     /// Why the output no longer follows from the inputs and the changes
-    /// sent: the first gain change that reached the RT thread after its
-    /// index.
+    /// sent: the first log entry that reached the RT thread after its
+    /// index, or whose generation it could not wait for.
     pub diverged: Option<String>,
     /// The message of a panic on the RT thread. The engine then stops
     /// processing: its state was released on the supervisor and every
@@ -126,7 +156,7 @@ pub enum GainError {
     Invalid(String),
     /// `at_index` is below `earliest`, the first index the engine accepts.
     TooNear { at_index: u64, earliest: u64 },
-    /// [`PENDING_CHANGES`] gain changes are outstanding.
+    /// [`PENDING_CHANGES`] entries are outstanding.
     Full,
 }
 
@@ -138,12 +168,73 @@ impl std::fmt::Display for GainError {
                 f,
                 "at_index {at_index} is below the earliest accepted index {earliest}"
             ),
-            GainError::Full => write!(f, "{PENDING_CHANGES} gain changes are outstanding"),
+            GainError::Full => write!(f, "{PENDING_CHANGES} entries are outstanding"),
         }
     }
 }
 
 impl std::error::Error for GainError {}
+
+/// A log entry for the engine. Each sets an absolute target, so one
+/// applied again changes nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Entry {
+    /// Ramps the gain from input channel `input` to output channel
+    /// `output` to `gain` over the ramp length.
+    Gain {
+        input: usize,
+        output: usize,
+        gain: f32,
+    },
+    /// Input slot `slot` is silent from the entry's index on, whatever is
+    /// readable.
+    InputDown { slot: usize },
+    /// Input slot `slot` fades in from the entry's index, its reader
+    /// recreated in a new generation.
+    InputUp { slot: usize },
+    /// Input slot `slot` crossfades to flow `flow_id` over the ramp
+    /// length from the entry's index.
+    Route { slot: usize, flow_id: String },
+}
+
+/// Why the engine refused an entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryError {
+    /// No such slot or coefficient, a gain that is not finite within
+    /// `MAX_GAIN`, a flow an input may not read, an index that is not a
+    /// multiple of the block size, or an entry the engine's log mode does
+    /// not take.
+    Invalid(String),
+    /// [`PENDING_CHANGES`] entries are outstanding.
+    Full,
+    /// Log id `id` is not above the last one appended, `last`.
+    Order { id: LogId, last: LogId },
+}
+
+impl std::fmt::Display for EntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntryError::Invalid(m) => write!(f, "{m}"),
+            EntryError::Full => write!(f, "{PENDING_CHANGES} entries are outstanding"),
+            EntryError::Order { id, last } => {
+                write!(f, "log id {id} is not above the last one appended, {last}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EntryError {}
+
+/// What the supervisor reports to the log that stamps `InputDown` and
+/// `InputUp` entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Report {
+    /// The input left the RT thread's generation: pruned, or not
+    /// attachable when its generation was built.
+    InputPruned { slot: usize },
+    /// The input's head has been on time for a second while it is down.
+    InputReadable { slot: usize },
+}
 
 /// Why [`Engine::reset_loudness`] refused a reset.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,10 +263,163 @@ impl std::fmt::Display for ResetError {
 
 impl std::error::Error for ResetError {}
 
-/// The producer side of the gain ring and the changes pushed into it.
-struct GainTx {
-    ring: rtrb::Producer<GainChange>,
+/// What the supervisor learns of the log besides committed entries.
+enum LogMsg {
+    /// A generation-needing entry was appended: its generation is built
+    /// on receipt. `flow` is a `Route`'s flow.
+    Append {
+        id: LogId,
+        at_index: u64,
+        change: Change,
+        flow: Option<String>,
+    },
+    /// Uncommitted entries from `from` on were removed.
+    Truncate { from: LogId },
+}
+
+/// Appended entries not yet committed, and the producer of the RT
+/// thread's entry ring. Committed entries go to the RT thread by log id.
+struct Log {
+    ring: rtrb::Producer<RtEntry>,
+    sup: mpsc::Sender<LogMsg>,
+    uncommitted: VecDeque<RtEntry>,
+    last: LogId,
+    committed: LogId,
+    /// Entries pushed into the ring.
     submitted: u64,
+    /// The engine's own log, absent when it follows a replicated one.
+    local: Option<LocalLog>,
+}
+
+/// The engine's own log: per input slot whether its last `InputDown` or
+/// `InputUp` leaves it up, and the latest index of an entry for it.
+struct LocalLog {
+    up: Vec<bool>,
+    last_at: Vec<u64>,
+    /// The index of the last generation-needing entry. The next one is
+    /// stamped buildLead past it, as the replicated log's leader does, so
+    /// its generation is built once the RT thread swapped this one in.
+    gen_at: u64,
+}
+
+/// Makes the next `InputDown` or `InputUp` the engine's own log stamps
+/// late: at an index the RT thread has produced.
+#[cfg(test)]
+static STAMP_LATE: AtomicBool = AtomicBool::new(false);
+
+impl Log {
+    /// Appends `e`; `consumed` is the RT thread's count of entries taken
+    /// off its list, so committed entries never exceed what it holds.
+    fn append(
+        &mut self,
+        e: RtEntry,
+        flow: Option<String>,
+        consumed: u64,
+    ) -> Result<(), EntryError> {
+        if e.id <= self.last {
+            return Err(EntryError::Order {
+                id: e.id,
+                last: self.last,
+            });
+        }
+        let outstanding = self.submitted - consumed + self.uncommitted.len() as u64;
+        if outstanding >= PENDING_CHANGES as u64 {
+            return Err(EntryError::Full);
+        }
+        if e.change.needs_generation() {
+            // The supervisor outlives every caller.
+            let _ = self.sup.send(LogMsg::Append {
+                id: e.id,
+                at_index: e.at_index,
+                change: e.change,
+                flow,
+            });
+        }
+        self.uncommitted.push_back(e);
+        self.last = e.id;
+        Ok(())
+    }
+
+    fn commit(&mut self, up_to: LogId) {
+        while let Some(e) = self.uncommitted.front().filter(|e| e.id <= up_to) {
+            // append keeps the outstanding entries within the ring.
+            if self.ring.push(*e).is_err() {
+                unreachable!("the entry ring holds every outstanding entry");
+            }
+            self.submitted += 1;
+            self.uncommitted.pop_front();
+        }
+        self.committed = self.committed.max(up_to.min(self.last));
+    }
+
+    /// Removes the uncommitted entries from `from` on. Committed entries
+    /// stay, and so do their generations: a `from` at or below the commit
+    /// point removes those above it.
+    fn truncate(&mut self, from: LogId) {
+        let from = from.max(self.committed + 1);
+        self.uncommitted.retain(|e| e.id < from);
+        self.last = self.last.min(from - 1);
+        let _ = self.sup.send(LogMsg::Truncate { from });
+    }
+}
+
+/// Where the next generation-needing or other entry for a slot may be
+/// stamped: at `earliest`, after the latest one for the slot and its ramp.
+fn stamp(earliest: u64, last_at: u64, ramp: u64, block: u64) -> u64 {
+    earliest.max(last_at + ramp).next_multiple_of(block)
+}
+
+/// The first index an entry reaching the RT thread now is applied at, in
+/// order: past what it may have produced, after the newest due block and
+/// a backlog of `lead`.
+fn earliest(api: &MxlApi, counters: &Counters, margin: u64, lead: u64) -> u64 {
+    let produced = counters.produced.load(Acquire);
+    let clock = time::timestamp_to_index(api, time::now(api));
+    produced.max(clock.saturating_sub(margin)) + lead
+}
+
+/// buildLead: `lead` plus the 99.99th percentile of the build times, or
+/// [`UNMEASURED_BUILD`] before any build, and a supervisor tick, in
+/// samples, rounded up to a block.
+fn build_lead_samples(p9999_ns: Option<u64>, lead: u64, block: u64) -> u64 {
+    let ns =
+        p9999_ns.unwrap_or(UNMEASURED_BUILD.as_nanos() as u64) + SUPERVISOR_TICK.as_nanos() as u64;
+    let samples = (u128::from(ns) * samplez_mxl::SAMPLE_RATE as u128).div_ceil(1_000_000_000);
+    (samples as u64 + lead).next_multiple_of(block)
+}
+
+/// Generation build times in quarter-octave buckets of nanoseconds.
+struct BuildTimes {
+    counts: Vec<u64>,
+    total: u64,
+}
+
+impl BuildTimes {
+    fn new() -> BuildTimes {
+        BuildTimes {
+            counts: vec![0; BUILD_BUCKETS],
+            total: 0,
+        }
+    }
+
+    fn add(&mut self, ns: u64) {
+        let b = (4.0 * (ns.max(1) as f64).log2()) as usize;
+        self.counts[b.min(BUILD_BUCKETS - 1)] += 1;
+        self.total += 1;
+    }
+
+    /// The upper edge of the bucket holding the 99.99th percentile.
+    fn p9999(&self) -> Option<u64> {
+        let rank = (self.total as f64 * 0.9999).ceil() as u64;
+        let mut seen = 0;
+        for (b, &n) in self.counts.iter().enumerate() {
+            seen += n;
+            if n > 0 && seen >= rank {
+                return Some(2f64.powf((b + 1) as f64 / 4.0).ceil() as u64);
+            }
+        }
+        None
+    }
 }
 
 /// A running engine. Dropping it stops the engine and releases its
@@ -185,26 +429,54 @@ pub struct Engine {
     supervisor: Option<JoinHandle<()>>,
     counters: Arc<Counters>,
     status: Arc<Mutex<Status>>,
-    gains: Mutex<GainTx>,
+    log: Arc<Mutex<Log>>,
     api: Arc<MxlApi>,
     block: u64,
     margin: u64,
     /// Samples between the newest index the RT thread may have produced
     /// and the earliest `at_index` accepted.
     lead: u64,
+    /// buildLead in samples, kept by the supervisor.
+    build_lead: Arc<AtomicU64>,
     shape: (usize, usize),
     resets: Mutex<rtrb::Producer<LoudnessReset>>,
+    config: Config,
 }
 
 impl Engine {
-    /// Starts the RT thread and the supervisor. `process` is the outcome
-    /// of [`rt::setup_process`], run before any other thread. Each block's
-    /// verdict goes to `verdicts` when given; one the channel has no room
-    /// for is counted in `verdicts_dropped`.
+    /// Starts the RT thread and the supervisor with the engine's own log:
+    /// [`Engine::set_gain`] and [`Engine::route`] append and commit at
+    /// once, and so does the supervisor for its own [`Report`]s. `process`
+    /// is the outcome of [`rt::setup_process`], run before any other
+    /// thread. Each block's verdict goes to `verdicts` when given; one the
+    /// channel has no room for is counted in `verdicts_dropped`.
     pub fn start(
         config: Config,
         process: ProcessStatus,
         verdicts: Option<SyncSender<BlockVerdict>>,
+    ) -> Result<Engine, Error> {
+        Engine::start_with(config, process, verdicts, None)
+    }
+
+    /// [`Engine::start`] for an engine that follows a replicated log: its
+    /// entries come through [`Engine::append`], [`Engine::commit`] and
+    /// [`Engine::truncate`], and its [`Report`]s go to `reports` for the
+    /// log to stamp; one the channel has no room for is counted in
+    /// `reports_dropped`.
+    pub fn start_replicated(
+        config: Config,
+        process: ProcessStatus,
+        verdicts: Option<SyncSender<BlockVerdict>>,
+        reports: SyncSender<Report>,
+    ) -> Result<Engine, Error> {
+        Engine::start_with(config, process, verdicts, Some(reports))
+    }
+
+    fn start_with(
+        config: Config,
+        process: ProcessStatus,
+        verdicts: Option<SyncSender<BlockVerdict>>,
+        reports: Option<SyncSender<Report>>,
     ) -> Result<Engine, Error> {
         let api = samplez_mxl::load(&config.libmxl).map_err(Error::Mxl)?;
         let b = u64::from(config.block_size);
@@ -218,7 +490,21 @@ impl Engine {
         // is written once here instead.
         while tel_tx.push(Telemetry::ClockStep { delta_ns: 0 }).is_ok() {}
         while tel_rx.pop().is_ok() {}
-        let (gain_tx, gain_rx) = rtrb::RingBuffer::new(PENDING_CHANGES);
+        let (entry_tx, entry_rx) = rtrb::RingBuffer::new(PENDING_CHANGES);
+        let (log_tx, log_rx) = mpsc::channel();
+        let log = Arc::new(Mutex::new(Log {
+            ring: entry_tx,
+            sup: log_tx,
+            uncommitted: VecDeque::new(),
+            last: 0,
+            committed: 0,
+            submitted: 0,
+            local: reports.is_none().then(|| LocalLog {
+                up: vec![true; config.inputs.len()],
+                last_at: vec![0; config.inputs.len()],
+                gen_at: 0,
+            }),
+        }));
         let records = METER_RING_SECONDS
             * (samplez_mxl::SAMPLE_RATE as usize / SLICE as usize)
             * config.output_channels();
@@ -257,6 +543,10 @@ impl Engine {
                 state: SlotState::default(),
                 fade_start: None,
                 silenced_last: true,
+                up: true,
+                held: false,
+                xfade: None,
+                prev: SlotState::default(),
                 prune_requested: false,
                 stats: EMPTY_STATS,
             });
@@ -302,8 +592,12 @@ impl Engine {
             inbuf: PlanarBuffer::new(n, b as usize),
             outbuf: PlanarBuffer::new(m, b as usize),
             scratch: vec![0.0; widest * b as usize],
+            scratch_out: vec![0.0; widest * b as usize],
+            pending_gen: None,
+            awaiting_gen: Vec::with_capacity(PENDING_CHANGES),
+            last_entry: 0,
             cmd: cmd_rx,
-            gains: gain_rx,
+            entries: entry_rx,
             ret: ret_tx,
             tel: tel_tx,
             meters: meter_tx,
@@ -333,6 +627,7 @@ impl Engine {
                 process: process.clone(),
                 thread,
             },
+            generation: GenerationStatus::default(),
             diverged: None,
             rt_panic: None,
             inputs: config
@@ -341,6 +636,8 @@ impl Engine {
                 .map(|i| InputStatus {
                     name: i.name.clone(),
                     state: InputState::Pruned,
+                    up: true,
+                    flow_id: i.flow_id.clone(),
                     error: None,
                     margin_short: None,
                     margin_warning: None,
@@ -369,6 +666,7 @@ impl Engine {
         let prefault = !matches!(process.mlock, Step::Active(_));
         let margin = u64::from(config.reader_margin_samples);
         let lead = (u64::from(config.max_catchup_blocks) + 2) * b;
+        let build_lead = Arc::new(AtomicU64::new(build_lead_samples(None, lead, b)));
         let config_loudness = config
             .outputs
             .iter()
@@ -388,12 +686,27 @@ impl Engine {
             },
             prefault,
             in_domains: in_domains.clone(),
-            slots: (0..config.inputs.len())
-                .map(|_| SupSlot {
+            slots: config
+                .inputs
+                .iter()
+                .map(|i| SupSlot {
                     state: SupState::Wanted,
                     window: VecDeque::new(),
+                    flow: i.flow_id.clone(),
+                    up: true,
+                    reported: false,
+                    prune_unsent: false,
+                    routing: None,
                 })
                 .collect(),
+            jobs: VecDeque::new(),
+            log_rx,
+            log: Arc::clone(&log),
+            reports,
+            build_times: BuildTimes::new(),
+            build_lead: Arc::clone(&build_lead),
+            lead,
+            ramp: u64::from(config.ramp_samples),
             dirty: vec![true; in_domains.len()],
             pollers: (0..in_domains.len()).map(|_| None).collect(),
             poll_errors: vec![None; in_domains.len()],
@@ -406,7 +719,7 @@ impl Engine {
                 })
                 .collect(),
             out_instances: (0..config.domains.len()).map(|_| None).collect(),
-            config,
+            config: config.clone(),
             cmd: cmd_tx,
             ret: ret_rx,
             tel: tel_rx,
@@ -452,16 +765,15 @@ impl Engine {
             supervisor: Some(supervisor),
             counters,
             status,
-            gains: Mutex::new(GainTx {
-                ring: gain_tx,
-                submitted: 0,
-            }),
+            log,
             api,
             block: b,
             margin,
             lead,
+            build_lead,
             shape: (n, m),
             resets: Mutex::new(reset_tx),
+            config,
         })
     }
 
@@ -484,10 +796,12 @@ impl Engine {
     /// produces: the RT thread takes changes once per wake and may then
     /// process a backlog of up to `maxCatchupBlocks` blocks and the next
     /// one. It is refused with [`GainError::Full`] while
-    /// [`PENDING_CHANGES`] changes are outstanding, sent but not yet
+    /// [`PENDING_CHANGES`] entries are outstanding, sent but not yet
     /// applied. A change that still reaches the RT thread after its index,
     /// after an overrun or a clock step, is counted in `command_late`,
     /// not applied, and marks the engine diverged in [`Status`].
+    ///
+    /// An engine that follows a replicated log refuses it as invalid.
     pub fn set_gain(
         &self,
         input: usize,
@@ -511,27 +825,151 @@ impl Engine {
                 self.block
             )));
         }
-        let mut tx = self.gains.lock().expect("gain lock");
-        let consumed = self.counters.gains_consumed.load(Acquire);
-        if tx.submitted - consumed >= PENDING_CHANGES as u64 {
-            return Err(GainError::Full);
+        let mut log = self.log.lock().expect("log lock");
+        if log.local.is_none() {
+            return Err(GainError::Invalid(
+                "gain changes come from the replicated log".to_owned(),
+            ));
         }
-        let produced = self.counters.produced.load(Acquire);
-        let clock = time::timestamp_to_index(&self.api, time::now(&self.api));
-        let earliest = produced.max(clock.saturating_sub(self.margin)) + self.lead;
+        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead);
         if at_index < earliest {
             return Err(GainError::TooNear { at_index, earliest });
         }
-        let change = GainChange {
-            input,
-            output,
-            gain,
+        let e = RtEntry {
+            id: log.last + 1,
             at_index,
+            change: Change::Gain {
+                input,
+                output,
+                gain,
+            },
         };
-        // The ring holds PENDING_CHANGES, at least the outstanding count.
-        tx.ring.push(change).map_err(|_| GainError::Full)?;
-        tx.submitted += 1;
+        let consumed = self.counters.entries_consumed.load(Acquire);
+        log.append(e, None, consumed).map_err(|_| GainError::Full)?;
+        log.commit(e.id);
         Ok(())
+    }
+
+    /// Re-routes input slot `slot` to flow `flow_id`: a new generation
+    /// holding both flows' readers is built, and the slot crossfades from
+    /// the old flow to the new one over the ramp length from the returned
+    /// index, `at_index` or, when that is nearer, the earliest index a
+    /// generation-needing entry is stamped at: buildLead past the earliest
+    /// gain change and past the engine's last `InputUp` or `Route`, so one
+    /// generation is built at a time and each before its index. A flow
+    /// that cannot be read is silent and reported as pruned. Refused as
+    /// invalid on an engine that follows a replicated log.
+    pub fn route(&self, slot: usize, flow_id: &str, at_index: u64) -> Result<u64, EntryError> {
+        self.config
+            .check_input_flow(slot, flow_id)
+            .map_err(|e| EntryError::Invalid(e.0))?;
+        let mut log = self.log.lock().expect("log lock");
+        let (last_at, gen_at) = match &log.local {
+            Some(l) => (l.last_at[slot], l.gen_at),
+            None => {
+                return Err(EntryError::Invalid(
+                    "routes come from the replicated log".to_owned(),
+                ));
+            }
+        };
+        let build_lead = self.build_lead.load(Relaxed);
+        let earliest = (earliest(&self.api, &self.counters, self.margin, self.lead) - self.lead
+            + build_lead)
+            .max(gen_at + build_lead);
+        let ramp = u64::from(self.config.ramp_samples);
+        let at_index = at_index.max(stamp(earliest, last_at, ramp, self.block));
+        let e = RtEntry {
+            id: log.last + 1,
+            at_index,
+            change: Change::Route { slot },
+        };
+        let consumed = self.counters.entries_consumed.load(Acquire);
+        log.append(e, Some(flow_id.to_owned()), consumed)?;
+        log.commit(e.id);
+        if let Some(l) = &mut log.local {
+            l.last_at[slot] = at_index;
+            l.gen_at = at_index;
+        }
+        Ok(at_index)
+    }
+
+    /// Appends entry `entry` at log id `id`, above every id appended
+    /// before, to apply at `at_index`, a multiple of the block size. An
+    /// `InputUp` or `Route` has its generation built at once; at most one
+    /// is built at a time, the next once the RT thread swapped in the one
+    /// before. Committed entries go to the RT thread, which applies each
+    /// at its index or, past it, counts it in `command_late` and marks the
+    /// engine diverged. Refused as invalid on an engine with its own log.
+    pub fn append(&self, id: LogId, at_index: u64, entry: Entry) -> Result<(), EntryError> {
+        let invalid = |m: String| Err(EntryError::Invalid(m));
+        if !at_index.is_multiple_of(self.block) {
+            return invalid(format!(
+                "at_index {at_index} is not a multiple of the block size {}",
+                self.block
+            ));
+        }
+        let slots = self.config.inputs.len();
+        let (change, flow) = match entry {
+            Entry::Gain {
+                input,
+                output,
+                gain,
+            } => {
+                if input >= self.shape.0 || output >= self.shape.1 {
+                    return invalid(format!("no matrix coefficient {input} -> {output}"));
+                }
+                if !samplez_dsp::valid_gain(gain) {
+                    return invalid(format!("gain {gain} is not finite within MAX_GAIN"));
+                }
+                (
+                    Change::Gain {
+                        input,
+                        output,
+                        gain,
+                    },
+                    None,
+                )
+            }
+            Entry::InputDown { slot } | Entry::InputUp { slot } | Entry::Route { slot, .. }
+                if slot >= slots =>
+            {
+                return invalid(format!("no input slot {slot}"));
+            }
+            Entry::InputDown { slot } => (Change::InputDown { slot }, None),
+            Entry::InputUp { slot } => (Change::InputUp { slot }, None),
+            Entry::Route { slot, flow_id } => {
+                self.config
+                    .check_input_flow(slot, &flow_id)
+                    .map_err(|e| EntryError::Invalid(e.0))?;
+                (Change::Route { slot }, Some(flow_id))
+            }
+        };
+        let mut log = self.log.lock().expect("log lock");
+        if log.local.is_some() {
+            return invalid("the engine keeps its own log".to_owned());
+        }
+        let consumed = self.counters.entries_consumed.load(Acquire);
+        log.append(
+            RtEntry {
+                id,
+                at_index,
+                change,
+            },
+            flow,
+            consumed,
+        )
+    }
+
+    /// Commits the appended entries up to log id `up_to`: they go to the
+    /// RT thread, in log order.
+    pub fn commit(&self, up_to: LogId) {
+        self.log.lock().expect("log lock").commit(up_to);
+    }
+
+    /// Removes the uncommitted entries from log id `from` on, and drops
+    /// the generations built for them; committed entries are kept.
+    pub fn truncate(&self, from: LogId) {
+        self.log.lock().expect("log lock").truncate(from);
     }
 
     /// Restarts the loudness measurement of output `output` (the
@@ -559,9 +997,7 @@ impl Engine {
             )));
         }
         let mut tx = self.resets.lock().expect("reset lock");
-        let produced = self.counters.produced.load(Acquire);
-        let clock = time::timestamp_to_index(&self.api, time::now(&self.api));
-        let earliest = produced.max(clock.saturating_sub(self.margin)) + self.lead;
+        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead);
         if at_index < earliest {
             return Err(ResetError::TooNear { at_index, earliest });
         }
@@ -603,6 +1039,37 @@ enum SupState {
 struct SupSlot {
     state: SupState,
     window: VecDeque<SlotStats>,
+    /// The flow the slot reads.
+    flow: String,
+    /// The slot's state in the log, as the RT thread applied it.
+    up: bool,
+    /// `InputReadable` was reported since the polled head was last late.
+    reported: bool,
+    /// An `InputPruned` report did not go out.
+    prune_unsent: bool,
+    /// After a re-route: the index its crossfade ends at and the flow it
+    /// left, kept in rebuilt generations until the RT thread passed it.
+    routing: Option<(u64, String)>,
+}
+
+/// A generation-needing entry, from its append until the RT thread
+/// swapped its generation in or handed it back.
+struct Job {
+    id: LogId,
+    at_index: u64,
+    change: Change,
+    /// A `Route`'s flow.
+    flow: Option<String>,
+    domain: usize,
+    stage: Stage,
+}
+
+enum Stage {
+    /// Waits for the job before it.
+    Waiting,
+    Built(Box<Gen>, u64),
+    /// Handed to the RT thread, with the slots its generation holds.
+    Sent(u64),
 }
 
 struct SupOut {
@@ -636,6 +1103,16 @@ struct Supervisor {
     outs: Vec<SupOut>,
     /// Output instance per configuration domain.
     out_instances: Vec<Option<Arc<Instance>>>,
+    /// Generation-needing entries, oldest first; only the first is built.
+    jobs: VecDeque<Job>,
+    log_rx: mpsc::Receiver<LogMsg>,
+    log: Arc<Mutex<Log>>,
+    /// Where reports go; the engine's own log when absent.
+    reports: Option<SyncSender<Report>>,
+    build_times: BuildTimes,
+    build_lead: Arc<AtomicU64>,
+    lead: u64,
+    ramp: u64,
     cmd: rtrb::Producer<Command>,
     ret: rtrb::Consumer<Returned>,
     tel: rtrb::Consumer<Telemetry>,
@@ -664,9 +1141,23 @@ impl Supervisor {
             }
             self.telemetry();
             self.meters();
+            self.log_messages();
+            self.jobs();
             if last_poll.elapsed() >= POLL_PERIOD {
                 last_poll = Instant::now();
                 self.poll();
+            }
+            let produced = self.counters.produced.load(Acquire);
+            for slot in 0..self.slots.len() {
+                if self.slots[slot]
+                    .routing
+                    .as_ref()
+                    .is_some_and(|r| produced >= r.0)
+                {
+                    self.slots[slot].routing = None;
+                    let d = self.input_domain(slot);
+                    self.dirty[d] = true;
+                }
             }
             for d in 0..self.dirty.len() {
                 if self.dirty[d] && self.cmd.slots() > 0 {
@@ -764,11 +1255,44 @@ impl Supervisor {
                         "clock step of {delta_ns} ns against CLOCK_MONOTONIC"
                     ));
                 }
-                Telemetry::LateGain { change, pos } => {
+                Telemetry::LateEntry { entry, pos } => {
                     let reason = format!(
-                        "gain change {} -> {} to {} at index {} arrived after index {} \
-                         was produced; not applied",
-                        change.input, change.output, change.gain, change.at_index, pos
+                        "log entry {} ({:?}) at index {} arrived after index {pos} was \
+                         produced; not applied",
+                        entry.id, entry.change, entry.at_index
+                    );
+                    log(format_args!("diverged: {reason}"));
+                    self.status().diverged.get_or_insert(reason);
+                    // The engine's own log stamps a lost InputDown or
+                    // InputUp again: from the state the RT thread has, on
+                    // the next report.
+                    if let Change::InputDown { slot } | Change::InputUp { slot } = entry.change {
+                        let mut log = self.log.lock().expect("log lock");
+                        let Some(l) = &mut log.local else { continue };
+                        l.up[slot] = self.slots[slot].up;
+                        drop(log);
+                        self.slots[slot].reported = false;
+                        if matches!(entry.change, Change::InputDown { .. }) {
+                            self.report(Report::InputPruned { slot });
+                        }
+                    }
+                }
+                Telemetry::Input { slot, up } => {
+                    self.slots[slot].up = up;
+                    self.status().inputs[slot].up = up;
+                    if !up && !matches!(self.slots[slot].state, SupState::Pruned { .. }) {
+                        self.start_polling(slot, false);
+                        let d = self.input_domain(slot);
+                        self.dirty[d] = true;
+                    }
+                }
+                Telemetry::GenerationDone { id, swapped } => self.generation_done(id, swapped),
+                Telemetry::AwaitLost { entry } => {
+                    let reason = format!(
+                        "log entry {} ({:?}) at index {} was applied before its generation \
+                         arrived, with {PENDING_CHANGES} others awaiting theirs; its \
+                         generation is not swapped in",
+                        entry.id, entry.change, entry.at_index
                     );
                     log(format_args!("diverged: {reason}"));
                     self.status().diverged.get_or_insert(reason);
@@ -801,19 +1325,23 @@ impl Supervisor {
         log(format_args!(
             "input {name} pruned: {why} at head {head}, block end {end}"
         ));
-        self.start_polling(slot);
+        self.start_polling(slot, true);
         let d = self.input_domain(slot);
         self.dirty[d] = true;
     }
 
-    /// Moves `slot` to polling.
-    fn start_polling(&mut self, slot: usize) {
+    /// Moves `slot` to polling, reporting it pruned when `report`.
+    fn start_polling(&mut self, slot: usize, report: bool) {
         let held = self.hold_poll(slot);
         self.slots[slot].state = SupState::Pruned {
             recovery: Recovery::default(),
             held,
         };
+        self.slots[slot].reported = false;
         self.status().inputs[slot].state = InputState::Pruned;
+        if report {
+            self.report(Report::InputPruned { slot });
+        }
     }
 
     /// Takes one hold on the poll reader of `slot`'s flow, creating the
@@ -821,7 +1349,7 @@ impl Supervisor {
     /// either could not be created; `poll` tries again.
     fn hold_poll(&mut self, slot: usize) -> bool {
         let d = self.input_domain(slot);
-        let id = self.config.inputs[slot].flow_id.clone();
+        let id = self.slots[slot].flow.clone();
         if self.pollers[d].is_none() {
             let path = &self.config.domains[self.in_domains[d]].path;
             match Instance::new(&self.api, path) {
@@ -869,7 +1397,7 @@ impl Supervisor {
             return;
         };
         let d = self.input_domain(slot);
-        let id = &self.config.inputs[slot].flow_id;
+        let id = &self.slots[slot].flow;
         if let Some(p) = &mut self.pollers[d]
             && let Some(f) = p.flows.get_mut(id)
             && f.release() == 0
@@ -884,6 +1412,14 @@ impl Supervisor {
                 let held = self.hold_poll(slot);
                 if let SupState::Pruned { held: h, .. } = &mut self.slots[slot].state {
                     *h = held;
+                }
+            }
+            let s = &mut self.slots[slot];
+            if s.prune_unsent {
+                if s.up && matches!(s.state, SupState::Pruned { .. }) {
+                    self.report(Report::InputPruned { slot });
+                } else {
+                    s.prune_unsent = false;
                 }
             }
         }
@@ -902,22 +1438,62 @@ impl Supervisor {
         for slot in 0..self.slots.len() {
             let d = self.input_domain(slot);
             let cfg = &self.config.inputs[slot];
-            let head = heads.get(&(d, cfg.flow_id.clone())).copied().flatten();
-            let SupState::Pruned { recovery: r, .. } = &mut self.slots[slot].state else {
+            let s = &mut self.slots[slot];
+            let head = heads.get(&(d, s.flow.clone())).copied().flatten();
+            let SupState::Pruned { recovery: r, .. } = &mut s.state else {
                 continue;
             };
-            if r.update(&self.api, head, now, &self.timing, cfg.offset_samples) {
+            if !r.update(&self.api, head, now, &self.timing, cfg.offset_samples) {
+                s.reported = false;
+            } else if s.up {
+                // Up in the log, so it is read again at once: the blocks
+                // it was silent in were a degradation of this engine.
                 log(format_args!("input {} on time again, re-adding", cfg.name));
                 self.release_poll(slot);
                 self.slots[slot].state = SupState::Wanted;
                 self.dirty[d] = true;
+            } else if !s.reported && self.report(Report::InputReadable { slot }) {
+                let name = &self.config.inputs[slot].name;
+                log(format_args!("input {name} on time again, reported"));
+                self.slots[slot].reported = true;
             }
         }
     }
 
     /// Builds a new generation of input domain `d` with every attached and
-    /// wanted slot and hands it to the RT thread.
+    /// wanted slot and hands it to the RT thread. Waits while a
+    /// generation-needing entry's generation for `d` is built or held by
+    /// the RT thread, which would replace this one at its index: until the
+    /// entry is committed, then until the RT thread reaches its index or
+    /// hands it back. A slot of `d` pruned meanwhile stays in the live
+    /// generation until then, silent.
     fn rebuild(&mut self, d: usize) {
+        if self
+            .jobs
+            .front()
+            .is_some_and(|j| j.domain == d && !matches!(j.stage, Stage::Waiting))
+        {
+            return;
+        }
+        let Some((generation, held)) = self.build(d, None) else {
+            return;
+        };
+        let command = Command::Generation {
+            domain: d,
+            generation,
+        };
+        if self.cmd.push(command).is_ok() {
+            self.dirty[d] = false;
+            self.adopt(d, held, None);
+        }
+    }
+
+    /// A generation of input domain `d`, with the slots it holds: every
+    /// attached and wanted slot of `d`, the outgoing flow of a re-route
+    /// until its crossfade ended, and the change of `job`. A slot that
+    /// cannot be attached is left out and its error put in its status.
+    fn build(&mut self, d: usize, job: Option<&Job>) -> Option<(Box<Gen>, u64)> {
+        let started = Instant::now();
         let path: PathBuf = self.config.domains[self.in_domains[d]].path.clone();
         let n = self.slots.len();
         let mut generation = match Generation::new(&self.api, &path, n) {
@@ -930,25 +1506,52 @@ impl Supervisor {
                         self.rebuild_errors[d].as_deref().unwrap_or("")
                     ));
                 }
-                return;
+                return None;
             }
         };
         self.rebuild_errors[d] = None;
+        let produced = self.counters.produced.load(Acquire);
         let mut prune_after = vec![u64::MAX; n];
+        let mut held = 0u64;
+        let mut rerouted = false;
         for (slot, limit) in prune_after.iter_mut().enumerate() {
-            if self.input_domain(slot) != d
-                || matches!(self.slots[slot].state, SupState::Pruned { .. })
-            {
+            if self.input_domain(slot) != d {
                 continue;
             }
-            let cfg = &self.config.inputs[slot];
-            let input = InputConfig {
-                flow_id: &cfg.flow_id,
-                channels: cfg.channels,
-                offset: cfg.offset_samples,
+            let (target, flow) = match job.map(|j| (j.change, j.flow.as_deref())) {
+                Some((Change::InputUp { slot: s }, _)) if s == slot => (true, None),
+                Some((Change::Route { slot: s }, f)) if s == slot => (true, f),
+                _ => (false, None),
             };
-            match generation.attach(slot, &input, &self.timing) {
+            let current = self.slots[slot].flow.clone();
+            let wanted = !matches!(self.slots[slot].state, SupState::Pruned { .. });
+            let cfg = &self.config.inputs[slot];
+            fn input<'a>(cfg: &crate::config::Input, flow_id: &'a str) -> InputConfig<'a> {
+                InputConfig {
+                    flow_id,
+                    channels: cfg.channels,
+                    offset: cfg.offset_samples,
+                }
+            }
+            // The flow a re-route leaves is read until its crossfade ends.
+            let outgoing = match (flow, &self.slots[slot].routing) {
+                (Some(f), _) if f != current && wanted => Some(current.clone()),
+                (None, Some((end, old))) if produced < *end => Some(old.clone()),
+                _ => None,
+            };
+            if let Some(old) = outgoing
+                && let Err(e) = generation.attach_outgoing(slot, &input(cfg, &old), &self.timing)
+            {
+                log(format_args!("input {}: flow {old} left: {e}", cfg.name));
+            }
+            rerouted |= flow.is_some_and(|f| f != current);
+            if !wanted && !target {
+                continue;
+            }
+            let flow_id = flow.unwrap_or(&current);
+            match generation.attach(slot, &input(cfg, flow_id), &self.timing) {
                 Ok(short) => {
+                    held |= 1 << slot;
                     let hint = generation
                         .input(slot)
                         .and_then(|i| i.reader().config().ok())
@@ -962,22 +1565,14 @@ impl Supervisor {
                             cfg.name, self.timing.margin
                         ));
                     }
-                    if !matches!(self.slots[slot].state, SupState::Attached) {
-                        log(format_args!("input {} attached", cfg.name));
-                    }
-                    self.slots[slot].state = SupState::Attached;
                     let mut st = self.status();
-                    let s = &mut st.inputs[slot];
-                    s.state = InputState::Attached;
-                    s.error = None;
-                    s.margin_short = short;
+                    st.inputs[slot].error = None;
+                    st.inputs[slot].margin_short = short;
                 }
                 Err(e) => {
                     let message = e.to_string();
-                    let name = cfg.name.clone();
-                    log(format_args!("input {name} not attached: {message}"));
+                    log(format_args!("input {} not attached: {message}", cfg.name));
                     self.status().inputs[slot].error = Some(message);
-                    self.start_polling(slot);
                 }
             }
         }
@@ -989,16 +1584,241 @@ impl Supervisor {
                 path.display()
             ));
         }
-        let command = Command::Generation {
-            domain: d,
-            generation: Box::new(Gen {
-                mxl: generation,
-                prune_after,
-            }),
-        };
-        if self.cmd.push(command).is_ok() {
-            self.dirty[d] = false;
+        self.build_times.add(started.elapsed().as_nanos() as u64);
+        let p = self.build_times.p9999();
+        let lead = build_lead_samples(p, self.lead, self.timing.block);
+        self.build_lead.store(lead, Relaxed);
+        let mut st = self.status();
+        st.generation.builds = self.build_times.total;
+        st.generation.build_p9999_ns = p;
+        st.generation.build_lead = lead;
+        drop(st);
+        let generation = Box::new(Gen {
+            mxl: generation,
+            prune_after,
+            rerouted,
+        });
+        Some((generation, held))
+    }
+
+    /// Takes the slots of input domain `d` that the generation now live
+    /// on the RT thread holds, `held`, as attached, and moves the others
+    /// that were attached or wanted to polling, reported. `target` is the
+    /// slot of an `InputUp` or `Route` entry: reported when not held.
+    /// A held slot that was pruned meanwhile, or is down in the log, is
+    /// left out of the next generation instead.
+    fn adopt(&mut self, d: usize, held: u64, target: Option<usize>) {
+        for slot in 0..self.slots.len() {
+            if self.input_domain(slot) != d {
+                continue;
+            }
+            let pruned = matches!(self.slots[slot].state, SupState::Pruned { .. });
+            if held & (1 << slot) == 0 {
+                if !pruned {
+                    self.start_polling(slot, true);
+                } else if target == Some(slot) {
+                    self.slots[slot].reported = false;
+                    self.report(Report::InputPruned { slot });
+                }
+                continue;
+            }
+            if (pruned && target != Some(slot)) || !self.slots[slot].up {
+                if !pruned {
+                    self.start_polling(slot, false);
+                }
+                self.dirty[d] = true;
+                continue;
+            }
+            self.release_poll(slot);
+            if !matches!(self.slots[slot].state, SupState::Attached) {
+                log(format_args!(
+                    "input {} attached",
+                    self.config.inputs[slot].name
+                ));
+            }
+            self.slots[slot].state = SupState::Attached;
+            self.status().inputs[slot].state = InputState::Attached;
         }
+    }
+
+    /// Takes in what the log sent: generation-needing entries appended,
+    /// and truncations, which drop the entries' generations unless the RT
+    /// thread holds them (committed entries are never truncated).
+    fn log_messages(&mut self) {
+        while let Ok(m) = self.log_rx.try_recv() {
+            match m {
+                LogMsg::Append {
+                    id,
+                    at_index,
+                    change,
+                    flow,
+                } => {
+                    let (Change::InputUp { slot } | Change::Route { slot }) = change else {
+                        continue;
+                    };
+                    self.jobs.push_back(Job {
+                        id,
+                        at_index,
+                        change,
+                        flow,
+                        domain: self.input_domain(slot),
+                        stage: Stage::Waiting,
+                    });
+                }
+                LogMsg::Truncate { from } => self
+                    .jobs
+                    .retain(|j| j.id < from || matches!(j.stage, Stage::Sent(_))),
+            }
+        }
+    }
+
+    /// Builds the first job's generation, on top of the one live, and
+    /// hands it to the RT thread once its entry is committed. The next
+    /// job waits until the RT thread is done with this one, so it holds
+    /// at most one pending generation.
+    fn jobs(&mut self) {
+        if let Some(j) = self.jobs.pop_front() {
+            let j = match j.stage {
+                Stage::Waiting => match self.build(j.domain, Some(&j)) {
+                    Some((g, held)) => Job {
+                        stage: Stage::Built(g, held),
+                        ..j
+                    },
+                    None => j,
+                },
+                _ => j,
+            };
+            let committed = self.log.lock().expect("log lock").committed;
+            let j = match j.stage {
+                Stage::Built(generation, held) if j.id <= committed && self.cmd.slots() > 0 => {
+                    let command = Command::Pending {
+                        id: j.id,
+                        domain: j.domain,
+                        generation,
+                    };
+                    if self.cmd.push(command).is_err() {
+                        unreachable!("a free command slot was checked");
+                    }
+                    Job {
+                        stage: Stage::Sent(held),
+                        ..j
+                    }
+                }
+                _ => j,
+            };
+            self.jobs.push_front(j);
+        }
+        let mut st = self.status();
+        st.generation.pending = self.jobs.front().map(|j| j.id);
+        st.generation.ready = self
+            .jobs
+            .front()
+            .is_some_and(|j| !matches!(j.stage, Stage::Waiting));
+    }
+
+    /// The RT thread swapped in the generation of entry `id`, or handed
+    /// it back unused.
+    fn generation_done(&mut self, id: LogId, swapped: bool) {
+        let Some(j) = self.jobs.front().filter(|j| j.id == id) else {
+            return;
+        };
+        let Stage::Sent(held) = j.stage else {
+            return;
+        };
+        let j = self.jobs.pop_front().expect("checked above");
+        if !swapped {
+            return;
+        }
+        let slot = match j.change {
+            Change::InputUp { slot } => slot,
+            Change::Route { slot } => {
+                let flow = j.flow.expect("a route has a flow");
+                if flow != self.slots[slot].flow {
+                    // A polled slot polls the flow it reads: the hold on
+                    // the old one is released, `poll` takes one on the new.
+                    self.release_poll(slot);
+                    if let SupState::Pruned { recovery, held } = &mut self.slots[slot].state {
+                        *recovery = Recovery::default();
+                        *held = false;
+                    }
+                    self.slots[slot].reported = false;
+                    let old = std::mem::replace(&mut self.slots[slot].flow, flow.clone());
+                    self.slots[slot].routing = Some((j.at_index + self.ramp, old));
+                    self.status().inputs[slot].flow_id = flow;
+                }
+                slot
+            }
+            _ => return,
+        };
+        self.adopt(j.domain, held, Some(slot));
+    }
+
+    /// Sends `r` to the replicated log, or stamps it in the engine's own:
+    /// a pruned input that is up goes down at the earliest index, a
+    /// readable one that is down comes up at the earliest index a
+    /// generation-needing entry takes, each after the slot's last entry
+    /// and its ramp, and an `InputUp` buildLead after the log's last
+    /// generation-needing entry. False when it did not go out: the channel
+    /// was full or the log refused it. An `InputPruned` that did not go
+    /// out is sent again by `poll` while it holds.
+    fn report(&mut self, r: Report) -> bool {
+        let (slot, up) = match r {
+            Report::InputPruned { slot } => (slot, false),
+            Report::InputReadable { slot } => (slot, true),
+        };
+        let sent = 'sent: {
+            if let Some(tx) = &self.reports {
+                if tx.try_send(r).is_err() {
+                    self.counters.reports_dropped.fetch_add(1, Relaxed);
+                    break 'sent false;
+                }
+                break 'sent true;
+            }
+            let mut earliest = earliest(&self.api, &self.counters, self.timing.margin, self.lead);
+            let build_lead = self.build_lead.load(Relaxed);
+            let consumed = self.counters.entries_consumed.load(Acquire);
+            let mut log = self.log.lock().expect("log lock");
+            let Some(local) = &log.local else {
+                break 'sent true;
+            };
+            if local.up[slot] == up {
+                break 'sent true;
+            }
+            let change = if up {
+                earliest = (earliest - self.lead + build_lead).max(local.gen_at + build_lead);
+                Change::InputUp { slot }
+            } else {
+                Change::InputDown { slot }
+            };
+            let at_index = stamp(earliest, local.last_at[slot], self.ramp, self.timing.block);
+            #[cfg(test)]
+            let at_index = if STAMP_LATE.swap(false, Relaxed) {
+                let produced = self.counters.produced.load(Acquire) / self.timing.block;
+                produced.saturating_sub(10) * self.timing.block
+            } else {
+                at_index
+            };
+            let e = RtEntry {
+                id: log.last + 1,
+                at_index,
+                change,
+            };
+            if log.append(e, None, consumed).is_err() {
+                break 'sent false;
+            }
+            log.commit(e.id);
+            let local = log.local.as_mut().expect("checked above");
+            local.up[slot] = up;
+            local.last_at[slot] = at_index;
+            if up {
+                local.gen_at = at_index;
+            }
+            true
+        };
+        if !up {
+            self.slots[slot].prune_unsent = !sent;
+        }
+        sent
     }
 
     fn stats(&mut self, slot: usize, stats: SlotStats) {
@@ -1170,6 +1990,89 @@ fn minor_faults(tid: i32) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// The percentile follows the build times: every build below 10 000
+    /// counts, one slow build among 20 000 does not, and buildLead covers
+    /// it, a supervisor tick and the lead in whole blocks.
+    #[test]
+    fn build_lead_covers_the_p9999_build_time() {
+        let mut t = BuildTimes::new();
+        assert_eq!(t.p9999(), None);
+        for _ in 0..19_999 {
+            t.add(1_000_000);
+        }
+        let p = t.p9999().unwrap();
+        assert!((1_000_000..1_190_000).contains(&p), "{p}");
+        t.add(80_000_000);
+        assert_eq!(t.p9999(), Some(p));
+        t.add(80_000_000);
+        t.add(80_000_000);
+        assert!(t.p9999().unwrap() >= 80_000_000);
+        // 1 ms + 5 ms is 288 samples, plus a lead of 192: 480.
+        assert_eq!(build_lead_samples(Some(1_000_000), 192, 48), 480);
+        assert_eq!(build_lead_samples(Some(1_000_001), 192, 48), 528);
+        assert_eq!(build_lead_samples(None, 0, 48), 5040);
+    }
+
+    fn log() -> (Log, rtrb::Consumer<RtEntry>, mpsc::Receiver<LogMsg>) {
+        let (ring, rx) = rtrb::RingBuffer::new(PENDING_CHANGES);
+        let (sup, msgs) = mpsc::channel();
+        let log = Log {
+            ring,
+            sup,
+            uncommitted: VecDeque::new(),
+            last: 0,
+            committed: 0,
+            submitted: 0,
+            local: None,
+        };
+        (log, rx, msgs)
+    }
+
+    fn e(id: LogId, change: Change) -> RtEntry {
+        RtEntry {
+            id,
+            at_index: 48 * id,
+            change,
+        }
+    }
+
+    /// Entries reach the RT thread only once committed, in log order;
+    /// a truncation removes only uncommitted ones, and the outstanding
+    /// count stays within what the RT thread holds.
+    #[test]
+    fn the_log_hands_over_committed_entries_only() {
+        let (mut log, mut rx, msgs) = log();
+        let down = Change::InputDown { slot: 0 };
+        let up = Change::InputUp { slot: 0 };
+        log.append(e(1, down), None, 0).unwrap();
+        log.append(e(2, up), None, 0).unwrap();
+        assert!(matches!(msgs.try_recv(), Ok(LogMsg::Append { id: 2, .. })));
+        assert_eq!(
+            log.append(e(2, down), None, 0),
+            Err(EntryError::Order { id: 2, last: 2 })
+        );
+        assert!(rx.pop().is_err());
+        log.commit(1);
+        assert_eq!(rx.pop().unwrap().id, 1);
+        // A truncation at or below the commit point keeps what is
+        // committed, and the generations of its entries.
+        log.truncate(1);
+        assert!(matches!(msgs.try_recv(), Ok(LogMsg::Truncate { from: 2 })));
+        assert_eq!((log.last, log.uncommitted.len()), (1, 0));
+        log.append(e(2, down), None, 0).unwrap();
+        log.commit(2);
+        assert_eq!(rx.pop().unwrap().id, 2);
+        for id in 3..=PENDING_CHANGES as u64 {
+            log.append(e(id, down), None, 0).unwrap();
+        }
+        assert_eq!(
+            log.append(e(PENDING_CHANGES as u64 + 1, down), None, 0),
+            Err(EntryError::Full)
+        );
+        log.append(e(PENDING_CHANGES as u64 + 1, down), None, 1)
+            .unwrap();
+    }
+
     /// A full reset ring says so, not that gain changes are outstanding.
     #[test]
     fn a_full_reset_ring_names_itself() {
@@ -1179,11 +2082,16 @@ mod tests {
         );
     }
 
+    /// Held by each test that starts engines: the test hooks are process
+    /// wide, and any engine's RT thread or supervisor takes them.
+    static ENGINES: Mutex<()> = Mutex::new(());
+
     /// A panic on the RT thread hands the state back: the supervisor
     /// releases the writer, which deletes the output flow, and records
     /// the panic.
     #[test]
     fn a_panic_on_the_rt_thread_releases_its_state_on_the_supervisor() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
             .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
         let domain = std::env::temp_dir().join(format!("samplez-panic-{}", std::process::id()));
@@ -1223,6 +2131,88 @@ mod tests {
         assert!(!flow.exists(), "the released writer deletes its flow");
         engine.stop();
         std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// The engine's own log stamps an `InputDown` or `InputUp` that
+    /// reached the RT thread late again, from the state the RT thread has:
+    /// the input goes down once its flow is gone, and comes up once it is
+    /// there again. Engine `p` writes the flow, engine `e` reads it.
+    #[test]
+    fn a_late_input_entry_of_the_own_log_is_stamped_again() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let shm = std::path::Path::new("/dev/shm");
+        let base = if shm.is_dir() {
+            shm.to_owned()
+        } else {
+            std::env::temp_dir()
+        };
+        let domain = base.join(format!("samplez-restamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let (src, out) = (
+            "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d01",
+            "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d02",
+        );
+        let output = |id: &str| {
+            serde_json::json!({ "name": id, "domain": "d", "flowId": id, "label": "restamp",
+                                "group": "restamp", "role": "Audio", "channels": 1 })
+        };
+        // The reader's margin covers the producer's, which its head lags
+        // the clock by.
+        let start =
+            |inputs: serde_json::Value, out: &str, margin: u32, matrix: serde_json::Value| {
+                let v = serde_json::json!({
+                    "libmxl": libmxl,
+                    "readerMarginSamples": margin,
+                    "domains": [{ "name": "d", "path": domain }],
+                    "inputs": inputs,
+                    "outputs": [output(out)],
+                    "matrix": matrix,
+                    "rt": { "enabled": false, "rtCpu": "none" },
+                });
+                let config = Config::parse(&v.to_string()).unwrap();
+                let process = rt::setup_process(&config.rt);
+                Engine::start(config, process, None).unwrap()
+            };
+        let producer = || {
+            let p = start(serde_json::json!([]), src, 576, serde_json::json!([]));
+            wait(&|| p.status().outputs[0].realised);
+            p
+        };
+        let input = serde_json::json!([{ "name": "in", "domain": "d", "flowId": src,
+                                         "channels": 1 }]);
+        let p = producer();
+        let e = start(input, out, 3 * 576, serde_json::json!([[1.0]]));
+        let attached = || {
+            let s = e.status();
+            s.inputs[0].up && s.inputs[0].state == InputState::Attached
+        };
+        wait(&attached);
+        let late = || e.counters().command_late.load(Relaxed);
+
+        STAMP_LATE.store(true, Relaxed);
+        p.stop();
+        wait(&|| !e.status().inputs[0].up);
+        assert_eq!(late(), 1);
+        assert!(e.status().diverged.is_some());
+
+        STAMP_LATE.store(true, Relaxed);
+        let p = producer();
+        wait(&attached);
+        assert_eq!(late(), 2);
+        e.stop();
+        p.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    fn wait(f: &dyn Fn() -> bool) {
+        let t = Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(10), "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

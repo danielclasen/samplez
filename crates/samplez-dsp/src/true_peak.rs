@@ -88,6 +88,10 @@ pub struct TruePeak {
 }
 
 impl TruePeak {
+    /// Input samples before the current one that each interpolated output
+    /// depends on.
+    pub const HISTORY: usize = HISTORY;
+
     /// A detector for `channels` channels taking up to `capacity` samples
     /// per call, with a silent history.
     pub fn new(channels: usize, capacity: usize) -> Self {
