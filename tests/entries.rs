@@ -801,3 +801,109 @@ fn input_up_fades_in_from_its_index_across_a_forward_skip() {
     assert_eq!(b.counters().generation_late.load(Relaxed), 0);
     common::stop(b);
 }
+
+/// A pilot producer in a process of its own, so that process can be
+/// stopped: started by `a_re_route_crossfades_from_its_index_after_a_silent_block`
+/// with `SAMPLEZ_PILOT_CHILD` set to the domain and the flow id; without
+/// it there is nothing to run. It stops once stdin closes.
+#[test]
+fn pilot_child() {
+    let Ok(args) = std::env::var("SAMPLEZ_PILOT_CHILD") else {
+        return;
+    };
+    let a: Vec<&str> = args.split(' ').collect();
+    let _pilot = Pilot::start(Path::new(a[0]), a[1], 1, B, 0);
+    println!("\npilot-child ready");
+    for line in std::io::stdin().lines() {
+        line.unwrap();
+    }
+}
+
+/// A re-route on time crossfades from its index also on an engine whose
+/// input was silent in the block before it: engine a reads the old flow
+/// with a margin its producer's stall exceeds around the index, engine b
+/// with one it does not. From the old flow's return on, both engines
+/// compute the same crossfade, bit for bit.
+#[test]
+fn a_re_route_crossfades_from_its_index_after_a_silent_block() {
+    let domain = Domain::new();
+    let (old, new, out_a, out_b) = (new_id(), new_id(), new_id(), new_id());
+    let mut child = Child::spawn(
+        "pilot_child",
+        "SAMPLEZ_PILOT_CHILD",
+        format!("{} {old}", domain.0.display()),
+    );
+    let mut lines = BufReader::new(child.0.stdout.take().unwrap()).lines();
+    until(&mut lines, "pilot-child ready");
+    let _new = Pilot::start(&domain.0, &new, 1, B, 0);
+    // A one-second crossfade, and no prune while the old flow stalls.
+    let cfg = |out: &str, margin: u64| {
+        let mut c = config(
+            &domain.0,
+            &[(&old, 1)],
+            &[(out, 1)],
+            diagonal(1, 1.0),
+            margin,
+        );
+        c.ramp_samples = LONG_RAMP;
+        c.prune_after_blocks = 1000;
+        c
+    };
+    let (a, rx_a, _rep_a) = start_replicated(cfg(&out_a, MARGIN));
+    let (b, rx_b, _rep_b) = start_replicated(cfg(&out_b, 10 * MARGIN));
+    running(&a);
+    running(&b);
+    let api = common::api();
+    let clock = || samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
+    let at = (clock() / B + 500) * B;
+    for e in [&a, &b] {
+        let flow_id = new.clone();
+        e.append(1, at, Entry::Route { slot: 0, flow_id }).unwrap();
+        e.commit(1);
+    }
+    // The old flow stalls 80 ms from 30 ms before the index: engine a,
+    // 20 ms behind the clock, finds blocks from 30 ms before the index to
+    // 30 ms after it late; engine b, 200 ms behind, none.
+    wait_for(5 * SECOND, "30 ms before the index", || {
+        clock() + 1440 >= at
+    });
+    child.stall(Duration::from_millis(80));
+    // Within the crossfade and the flows' history.
+    let end = at / B + 400;
+    let (mut va, mut vb) = (Vec::new(), Vec::new());
+    wait_past(&rx_a, end, &mut va);
+    wait_past(&rx_b, end, &mut vb);
+    let verdict = |v: &[BlockVerdict], k| v.iter().find(|v| v.k == k).copied();
+    let k = at / B - 1;
+    assert_eq!(
+        (
+            verdict(&va, k).map(|v| v.silenced),
+            verdict(&vb, k).map(|v| v.silenced)
+        ),
+        (Some(1), Some(0)),
+        "engine a silent and engine b not in the block before the index"
+    );
+    let range = at / B + 100..end;
+    let x = common::read_blocks(&domain.0, &out_a, 1, range.clone());
+    let y = common::read_blocks(&domain.0, &out_b, 1, range.clone());
+    let n = B as usize;
+    let mut compared = 0;
+    for (i, k) in range.clone().enumerate() {
+        if both(&va, &vb, k) {
+            compared += 1;
+            let (p, q) = (&x[i * n..(i + 1) * n], &y[i * n..(i + 1) * n]);
+            assert!(same(p, q), "block {k}, {} after the index", k - at / B);
+        }
+    }
+    assert!(
+        compared * 4 > range.count() * 3,
+        "{compared} blocks compared"
+    );
+    child.finish();
+    for e in [&a, &b] {
+        assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+        assert_eq!(e.status().inputs[0].flow_id, new);
+    }
+    common::stop(b);
+    common::stop(a);
+}
