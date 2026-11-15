@@ -126,8 +126,7 @@ pub enum GainError {
     Invalid(String),
     /// `at_index` is below `earliest`, the first index the engine accepts.
     TooNear { at_index: u64, earliest: u64 },
-    /// [`PENDING_CHANGES`] gain changes are outstanding, or the loudness
-    /// reset ring is full.
+    /// [`PENDING_CHANGES`] gain changes are outstanding.
     Full,
 }
 
@@ -145,6 +144,33 @@ impl std::fmt::Display for GainError {
 }
 
 impl std::error::Error for GainError {}
+
+/// Why [`Engine::reset_loudness`] refused a reset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResetError {
+    /// No such output, or an index that is not a multiple of the block
+    /// size.
+    Invalid(String),
+    /// `at_index` is below `earliest`, the first index the engine accepts.
+    TooNear { at_index: u64, earliest: u64 },
+    /// The loudness reset ring is full.
+    Full,
+}
+
+impl std::fmt::Display for ResetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResetError::Invalid(m) => write!(f, "{m}"),
+            ResetError::TooNear { at_index, earliest } => write!(
+                f,
+                "at_index {at_index} is below the earliest accepted index {earliest}"
+            ),
+            ResetError::Full => write!(f, "the loudness reset ring is full"),
+        }
+    }
+}
+
+impl std::error::Error for ResetError {}
 
 /// The producer side of the gain ring and the changes pushed into it.
 struct GainTx {
@@ -521,13 +547,13 @@ impl Engine {
     /// `at_index`
     /// is refused below the same earliest index as [`Engine::set_gain`].
     /// A reset replaces one still pending for the same output;
-    /// [`GainError::Full`] when the reset ring is full.
-    pub fn reset_loudness(&self, output: usize, at_index: u64) -> Result<(), GainError> {
+    /// [`ResetError::Full`] when the reset ring is full.
+    pub fn reset_loudness(&self, output: usize, at_index: u64) -> Result<(), ResetError> {
         if output >= self.status.lock().expect("status lock").outputs.len() {
-            return Err(GainError::Invalid(format!("no output {output}")));
+            return Err(ResetError::Invalid(format!("no output {output}")));
         }
         if !at_index.is_multiple_of(self.block) {
-            return Err(GainError::Invalid(format!(
+            return Err(ResetError::Invalid(format!(
                 "at_index {at_index} is not a multiple of the block size {}",
                 self.block
             )));
@@ -537,10 +563,10 @@ impl Engine {
         let clock = time::timestamp_to_index(&self.api, time::now(&self.api));
         let earliest = produced.max(clock.saturating_sub(self.margin)) + self.lead;
         if at_index < earliest {
-            return Err(GainError::TooNear { at_index, earliest });
+            return Err(ResetError::TooNear { at_index, earliest });
         }
         tx.push(LoudnessReset { output, at_index })
-            .map_err(|_| GainError::Full)
+            .map_err(|_| ResetError::Full)
     }
 
     /// Stops the RT thread and the supervisor and releases every libmxl
@@ -1143,6 +1169,15 @@ fn minor_faults(tid: i32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full reset ring says so, not that gain changes are outstanding.
+    #[test]
+    fn a_full_reset_ring_names_itself() {
+        assert_eq!(
+            ResetError::Full.to_string(),
+            "the loudness reset ring is full"
+        );
+    }
 
     /// A panic on the RT thread hands the state back: the supervisor
     /// releases the writer, which deletes the output flow, and records

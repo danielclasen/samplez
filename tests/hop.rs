@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use common::{B, Checker, Domain, MARGIN, Pilot, config, diagonal, new_id, start, wait_for};
-use samplez::{GainError, InputState};
+use samplez::{GainError, InputState, ResetError};
 use samplez_mxl::Instance;
 use samplez_mxl::output::{self, Creation, OutputConfig};
 
@@ -158,6 +158,20 @@ fn gain_change() {
     assert!(matches!(
         engine.set_gain(0, 0, 0.9, late),
         Err(GainError::TooNear { .. })
+    ));
+    // A loudness reset is validated the same way, with its own errors.
+    let ahead = at + 100 * B;
+    assert!(matches!(
+        engine.reset_loudness(1, ahead),
+        Err(ResetError::Invalid(_))
+    ));
+    assert!(matches!(
+        engine.reset_loudness(0, ahead + 1),
+        Err(ResetError::Invalid(_))
+    ));
+    assert!(matches!(
+        engine.reset_loudness(0, late),
+        Err(ResetError::TooNear { .. })
     ));
 
     // 64 outstanding changes fit, the 65th is refused. They hold the gain,
