@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, Request, StatusCode, header, request};
 use axum::routing::get;
 use axum::{Extension, Router};
 use futures_util::future::BoxFuture;
-use samplez_service::replica::{Ack, NotApplied};
+use samplez_service::replica::{Ack, NotApplied, Reason};
 use samplez_service::ws::{Delta, Snapshot};
 use samplez_service::{
     Identity, Ops, Owner, Position, ReplicaInfo, ReplicatedState, Service, ServiceConfig,
@@ -51,6 +51,8 @@ impl FakeState {
                 leader: Some("r1".into()),
                 in_sync: true,
                 lag: Some(0),
+                ready: true,
+                commitable: true,
             }),
             epoch: Mutex::new(7),
             log: Mutex::default(),
@@ -182,7 +184,10 @@ impl ReplicatedState for FakeState {
         let (done, ack) = oneshot::channel();
         let command = (owner.clone(), id.to_owned(), done);
         self.submitted.lock().unwrap().push(command);
-        Box::pin(async move { ack.await.map_err(|_| NotApplied("not committed".into())) })
+        Box::pin(async move {
+            ack.await
+                .map_err(|_| NotApplied::new(Reason::Unavailable, "not committed"))
+        })
     }
 
     fn renew_sessions(&self, live: &[Owner]) {

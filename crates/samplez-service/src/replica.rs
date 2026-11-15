@@ -5,11 +5,14 @@
 //! revisions. The service layer never counts revisions itself: they come
 //! from [`ReplicatedState`] and from the deltas the product publishes.
 
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
+use axum::http::StatusCode;
 use futures_util::future::BoxFuture;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::auth::Role;
 use crate::ws::{Delta, Snapshot};
@@ -26,6 +29,16 @@ pub struct ReplicaInfo {
     pub in_sync: bool,
     /// Committed entries not yet applied here, when known.
     pub lag: Option<u64>,
+    /// The replicated state's term of `/readyz`, beside the API serving and
+    /// the engine started; the role does not enter it. Always true for a
+    /// single replica.
+    pub ready: bool,
+    /// Whether this replica takes client writes: false while the
+    /// replication refuses them here, which it answers with
+    /// [`Reason::NotCommitable`]. Products publish it per replica, so a
+    /// client served by one that is not commitable fails over. Always true
+    /// for a single replica.
+    pub commitable: bool,
 }
 
 /// A point in the history of one state: a revision within an epoch.
@@ -37,7 +50,12 @@ pub struct Position {
 
 /// A WebSocket client's claim on state that expires without renewal, such
 /// as touch ownership of a control.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+///
+/// Not serializable: the session is a credential of its client, so a
+/// record published to clients carries [`Owner::handle`] in its place. The
+/// `Debug` output shows the handle as well, so a log of an owner does not
+/// carry the session.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Owner {
     /// The user the proxy names, or `anonymous`.
     pub principal: String,
@@ -56,19 +74,81 @@ pub struct Owner {
     /// command forwarded to another replica carries it with the principal
     /// and session.
     pub role: Role,
-    /// `<replica id>:<nonce>:<n>`: the nonce is 128 random bits drawn when
-    /// the replica's [`crate::Service`] is created, `n` counts its
-    /// connections from 1, so the id does not recur after a restart.
+    /// `<replica id>:<nonce>:<n>`, at most
+    /// [`crate::ws::MAX_CONNECTION_ID`] characters: the nonce is 128 random
+    /// bits in 32 hexadecimal digits drawn when the replica's
+    /// [`crate::Service`] is created, `n` counts its connections from 1, so
+    /// the id does not recur after a restart.
     pub connection: String,
+}
+
+impl Owner {
+    /// The public handle of [`Owner::session`].
+    pub fn handle(&self) -> OwnerHandle {
+        OwnerHandle::of(&self.session)
+    }
+}
+
+impl fmt::Debug for Owner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Owner")
+            .field("principal", &self.principal)
+            .field("handle", &self.handle())
+            .field("role", &self.role)
+            .field("connection", &self.connection)
+            .finish()
+    }
+}
+
+/// The public handle of a session: the first 16 bytes of the SHA-256 digest
+/// of the session id in base64url without padding, 22 characters. It names
+/// the session in records published to clients; the session id cannot be
+/// derived from it, and a client computes the handle of its own session to
+/// recognise its own records.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct OwnerHandle(String);
+
+impl OwnerHandle {
+    pub fn of(session: &str) -> OwnerHandle {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let digest = Sha256::digest(session.as_bytes());
+        let mut bits: u32 = 0;
+        let mut held = 0;
+        let mut handle = String::with_capacity(22);
+        for &byte in &digest[..16] {
+            bits = bits << 8 | u32::from(byte);
+            held += 8;
+            while held >= 6 {
+                held -= 6;
+                handle.push(char::from(ALPHABET[(bits >> held) as usize & 63]));
+            }
+        }
+        handle.push(char::from(ALPHABET[(bits << (6 - held)) as usize & 63]));
+        OwnerHandle(handle)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OwnerHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Implemented by the product or by the replication mechanism.
 pub trait ReplicatedState: Send + Sync + 'static {
     fn replica(&self) -> ReplicaInfo;
 
-    /// The id of this state's history: the replication group's cluster id,
-    /// or a random id persisted with the state. A state that starts empty
-    /// gets a new epoch, so revisions from before it are not resumed from.
+    /// The id of this state's history, so a revision names one state only
+    /// together with it. Drawn anew whenever the state is initialised empty
+    /// or restored from a backup, and kept across a restart, a snapshot
+    /// install and a resync: a restored state continues from the backup's
+    /// revisions, which clients that saw the state after the backup also
+    /// hold for other changes, so they are not resumed from.
     fn epoch(&self) -> u64;
 
     /// The global revision this replica has applied.
@@ -136,7 +216,8 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// after the commands that superseded it.
     ///
     /// Must resolve in bounded time, with [`NotApplied`] when the command
-    /// cannot be ordered: a WebSocket connection with
+    /// cannot be ordered, [`Reason::NotCommitable`] while
+    /// [`ReplicaInfo::commitable`] is false: a WebSocket connection with
     /// [`crate::ws::MAX_PENDING_REPLIES`] replies waiting is not read until
     /// one of them is ready.
     fn submit(
@@ -165,11 +246,66 @@ pub struct Ack {
     pub revision: u64,
 }
 
-/// [`ReplicatedState::submit`] could not order the command, for example
-/// without a quorum. Whether it was applied is unknown; a resend with the
-/// same id is applied at most once.
+/// [`ReplicatedState::submit`] did not apply the command. Every reason is
+/// answered as not applied, [`NotApplied::STATUS`] in HTTP terms: the
+/// command changed nothing the client can see.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NotApplied(pub String);
+pub struct NotApplied {
+    pub reason: Reason,
+    /// For logs and status; not meant to be matched on.
+    pub detail: String,
+}
+
+/// Why a command was not applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Reason {
+    /// It could not be committed in bounded time, for example without a
+    /// leader or quorum. Whether it commits later is unknown; a resend with
+    /// the same id is applied at most once.
+    Unavailable,
+    /// This replica takes no client writes ([`ReplicaInfo::commitable`]);
+    /// the command was not ordered.
+    NotCommitable,
+    /// The command was first received longer ago than the replication
+    /// still deduplicates, so it is refused and never applied; whether to
+    /// send it afresh under a new id is the client's decision.
+    Expired,
+}
+
+impl Reason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reason::Unavailable => "unavailable",
+            Reason::NotCommitable => "not_commitable",
+            Reason::Expired => "expired",
+        }
+    }
+}
+
+impl NotApplied {
+    /// 503 for every reason.
+    pub const STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
+
+    pub fn new(reason: Reason, detail: impl Into<String>) -> NotApplied {
+        NotApplied {
+            reason,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl fmt::Display for NotApplied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "not applied ({})", self.reason.as_str())?;
+        if !self.detail.is_empty() {
+            write!(f, ": {}", self.detail)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for NotApplied {}
 
 pub enum Begin<'a> {
     /// Not applied as far as this replica has applied: submit it with

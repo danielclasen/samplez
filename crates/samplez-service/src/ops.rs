@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use tokio::time::Instant;
 
 use crate::metrics::{Metrics, label_set};
-use crate::replica::ReplicatedState;
+use crate::replica::{ReplicaInfo, ReplicatedState};
 
 /// `/healthz` fails once the heartbeat has not advanced for this long.
 pub const HEARTBEAT_WINDOW: Duration = Duration::from_secs(1);
@@ -83,13 +83,17 @@ impl Ops {
             .is_some_and(|t| t.elapsed() <= HEARTBEAT_WINDOW)
     }
 
-    fn ready(&self) -> bool {
-        self.0.api_serving.load(Ordering::Relaxed) && self.0.engine_started.load(Ordering::Relaxed)
+    /// API serving, engine started and the replicated state's term,
+    /// [`ReplicaInfo::ready`].
+    fn ready(&self, replica: &ReplicaInfo) -> bool {
+        self.0.api_serving.load(Ordering::Relaxed)
+            && self.0.engine_started.load(Ordering::Relaxed)
+            && replica.ready
     }
 
-    /// `/healthz` and `/readyz` answer with the replica's id and role;
-    /// `/metrics` adds them as `samplez_replica_info`. The role does not
-    /// enter readiness.
+    /// `/healthz` and `/readyz` answer with the replica's [`ReplicaInfo`];
+    /// `/metrics` adds its id and role as `samplez_replica_info`. The role
+    /// does not enter readiness.
     pub fn router(&self, state: Arc<dyn ReplicatedState>) -> Router {
         let health = self.clone();
         let ready = self.clone();
@@ -98,11 +102,14 @@ impl Ops {
         Router::new()
             .route(
                 "/healthz",
-                get(move || async move { status(health.healthy(), &*s1) }),
+                get(move || async move { status(health.healthy(), s1.replica()) }),
             )
             .route(
                 "/readyz",
-                get(move || async move { status(ready.ready(), &*s2) }),
+                get(move || async move {
+                    let replica = s2.replica();
+                    status(ready.ready(&replica), replica)
+                }),
             )
             .route(
                 "/metrics",
@@ -128,12 +135,12 @@ impl Ops {
     }
 }
 
-fn status(ok: bool, state: &dyn ReplicatedState) -> impl IntoResponse + use<> {
+fn status(ok: bool, replica: ReplicaInfo) -> impl IntoResponse + use<> {
     let code = if ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    let body = serde_json::json!({ "ok": ok, "replica": state.replica() });
+    let body = serde_json::json!({ "ok": ok, "replica": replica });
     (code, Json(body))
 }

@@ -43,8 +43,9 @@ pub const PING_PERIOD: Duration = Duration::from_millis(250);
 /// included, stays at 750 ms or more ends. A longer timeout would keep such
 /// connections, and keep a peer that is gone live for longer.
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(1);
-/// The replies [`serve_client`] waits for on one connection before it stops
-/// reading it. Its pongs then go unread as well, so the time until a reply
+/// The [`Reply::Command`] replies [`serve_client`] waits for on one
+/// connection before it stops reading it; a [`Reply::Now`] counts against
+/// nothing. Its pongs then go unread as well, so the time until a reply
 /// is ready does not count against [`PONG_TIMEOUT`], and the connection
 /// stays live in [`Sessions`] meanwhile when it answered a ping sent
 /// within [`PONG_TIMEOUT`] before. A connection not read for [`MAX_PAUSE`] at
@@ -80,6 +81,29 @@ pub const MAX_PAUSE: Duration = Duration::from_secs(2);
 /// renewal, 2 s in the replication this crate is sized for: up to 9 s after
 /// that ping.
 pub const MAX_PAUSE_TOTAL: Duration = Duration::from_secs(6);
+
+/// The longest replica id [`Sessions::new`] takes, a DNS label's length:
+/// with the nonce and the counter the connection id stays within
+/// [`MAX_CONNECTION_ID`].
+pub const MAX_REPLICA_ID: usize = 63;
+/// The longest connection id ([`crate::Owner::connection`]): a
+/// [`MAX_REPLICA_ID`] replica id, 32 hexadecimal digits and a decimal
+/// `u64`, with their two separators, take 117.
+pub const MAX_CONNECTION_ID: usize = 128;
+
+/// What [`serve_client`]'s `on_message` returns for a message.
+pub enum Reply<Fut> {
+    /// The reply to a command, or to another message whose answer has to
+    /// follow the commands received before it: counted against
+    /// [`MAX_PENDING_REPLIES`] until it resolves, and sent in the order
+    /// received among the others.
+    Command(Fut),
+    /// Sent at once, ahead of replies still waiting and before the first
+    /// catch-up, and counted against nothing; `None` sends nothing. For
+    /// messages that carry no state, such as heartbeats, whose answer must
+    /// not wait on a commit or a snapshot.
+    Now(Option<Message>),
+}
 
 /// A state change at a global revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,8 +335,16 @@ impl Sessions {
     ///
     /// # Errors
     ///
-    /// [`Error::Config`] when the operating system's random source fails.
+    /// [`Error::Config`] when `replica` is empty or longer than
+    /// [`MAX_REPLICA_ID`], or when the operating system's random source
+    /// fails.
     pub fn new(replica: &str) -> Result<Sessions, Error> {
+        if replica.is_empty() || replica.len() > MAX_REPLICA_ID {
+            return Err(Error::Config(format!(
+                "the replica id has to be 1 to {MAX_REPLICA_ID} bytes long, not {}",
+                replica.len()
+            )));
+        }
         let mut nonce = [0u8; 16];
         rustls::crypto::ring::default_provider()
             .secure_random
@@ -461,12 +493,13 @@ async fn send<T: Sink<Message> + Unpin>(
 /// message to `on_message`, sending the reply it returns. Subscribe `queue`
 /// before calling.
 ///
-/// `on_message` is called for each message in the order received, and the
-/// replies go out in that order, the first after the first catch-up. The
-/// futures it returns run beside the heartbeat and each other, so a reply
-/// that waits on a commit or an election does not stall the pings; work
-/// that must follow the order of the messages belongs in the call itself,
-/// before the future. With [`MAX_PENDING_REPLIES`] replies outstanding the
+/// `on_message` is called for each message in the order received. The
+/// [`Reply::Command`] replies go out in that order, the first after the
+/// first catch-up; a [`Reply::Now`] goes out at once. The futures run
+/// beside the heartbeat and each other, so a reply that waits on a commit
+/// or an election does not stall the pings; work that must follow the
+/// order of the messages belongs in the call itself, before the future.
+/// With [`MAX_PENDING_REPLIES`] [`Reply::Command`] replies outstanding the
 /// connection is not read, pongs included, until one is ready, and that
 /// time does not count against the client's [`PONG_TIMEOUT`]; when none is
 /// ready within [`MAX_PAUSE`], or the pauses since the last ping answered
@@ -483,7 +516,7 @@ async fn send<T: Sink<Message> + Unpin>(
 /// # use axum::body::Bytes;
 /// # use axum::extract::ws::{Message, WebSocket};
 /// # use samplez_service::replica::{Begin, Commands};
-/// # use samplez_service::ws::{ClientQueue, Ended, serve_client};
+/// # use samplez_service::ws::{ClientQueue, Ended, Reply, serve_client};
 /// # use samplez_service::{Connect, ReplicatedState};
 /// # async fn serve(
 /// #     socket: WebSocket,
@@ -493,8 +526,12 @@ async fn send<T: Sink<Message> + Unpin>(
 /// #     commands: &Commands,
 /// # ) -> Ended {
 /// serve_client(socket, connect, queue, state, |message| {
-///     // Here, in the order received: the message is the command's id.
+///     // Here, in the order received: the message is the command's id, or
+///     // `ping`, answered at once.
 ///     let submitted = match message {
+///         Message::Text(t) if t.as_str() == "ping" => {
+///             return Reply::Now(Some(Message::Text("pong".into())));
+///         }
 ///         Message::Text(id) if connect.require_operator().is_ok() => {
 ///             match commands.begin(&connect.owner, id.as_str()) {
 ///                 Begin::New(pending) => Some(pending.submit(Bytes::from(id.to_string()))),
@@ -504,10 +541,10 @@ async fn send<T: Sink<Message> + Unpin>(
 ///         _ => None,
 ///     };
 ///     // Only the wait for the reply is in the future.
-///     async move {
+///     Reply::Command(async move {
 ///         let ack = submitted?.await.ok()?;
 ///         Some(Message::Text(format!("{} {}", ack.command, ack.revision).into()))
-///     }
+///     })
 /// })
 /// .await
 /// # }
@@ -521,7 +558,7 @@ pub async fn serve_client<S, E, F, Fut>(
 ) -> Ended
 where
     S: Sink<Message> + Stream<Item = Result<Message, E>>,
-    F: FnMut(Message) -> Fut,
+    F: FnMut(Message) -> Reply<Fut>,
     Fut: Future<Output = Option<Message>>,
 {
     let (mut tx, mut rx) = socket.split();
@@ -623,10 +660,13 @@ where
                         Vec::new()
                     }
                     Some(Ok(Message::Ping(_))) => Vec::new(),
-                    Some(Ok(m)) => {
-                        replies.push_back(on_message(m));
-                        Vec::new()
-                    }
+                    Some(Ok(m)) => match on_message(m) {
+                        Reply::Command(reply) => {
+                            replies.push_back(reply);
+                            Vec::new()
+                        }
+                        Reply::Now(reply) => reply.into_iter().collect(),
+                    },
                 },
                 Some(reply) = replies.next(), if caught_up && !replies.is_empty() => {
                     reply.into_iter().collect()
@@ -762,6 +802,22 @@ mod tests {
         );
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(sessions.live().is_empty(), "over 1 s since the moved pong");
+    }
+
+    /// The connection id fits [`MAX_CONNECTION_ID`] with the longest
+    /// replica id and the largest counter; a longer replica id is refused.
+    #[test]
+    fn connection_ids_stay_within_128_characters() {
+        let longest = "r".repeat(MAX_REPLICA_ID);
+        let sessions = Sessions::new(&longest).unwrap();
+        sessions.next.store(u64::MAX, Ordering::Relaxed);
+        let id = sessions.connection_id();
+        assert!(id.ends_with(":18446744073709551615"), "{id}");
+        assert!(id.len() <= MAX_CONNECTION_ID, "{} characters", id.len());
+
+        for replica in [format!("{longest}r"), String::new()] {
+            assert!(matches!(Sessions::new(&replica), Err(Error::Config(_))));
+        }
     }
 
     /// The connection id is the session of a client that names none, and
