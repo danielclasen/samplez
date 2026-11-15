@@ -427,12 +427,20 @@ pub(crate) async fn reconcile(shared: Arc<Shared>, want: Voters) {
         }
         let metrics = shared.raft.metrics().borrow().clone();
         let membership = metrics.membership_config.membership();
-        if membership.get_joint_config().len() > 1 {
-            continue;
-        }
         let Some(_proposing) = shared.propose() else {
             continue;
         };
+        // A leader elected between the two steps of a change finds the
+        // joint configuration and has to make the second step itself.
+        if let [.., last] = &membership.get_joint_config()[..]
+            && membership.get_joint_config().len() > 1
+        {
+            let finish = ChangeMembers::ReplaceAllVoters(last.clone());
+            if let Err(e) = shared.raft.change_membership(finish, false).await {
+                tracing::warn!(error = %e, "leaving a joint configuration");
+            }
+            continue;
+        }
         let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
         let learners: BTreeSet<NodeId> = membership.learner_ids().collect();
         let applied = metrics.last_applied.map_or(0, |id| id.index);
