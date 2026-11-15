@@ -120,8 +120,8 @@ pub struct Status {
     pub rt: RtStatus,
     pub generation: GenerationStatus,
     /// Why the output no longer follows from the inputs and the changes
-    /// sent: the first gain change that reached the RT thread after its
-    /// index.
+    /// sent: the first log entry that reached the RT thread after its
+    /// index, or whose generation it could not wait for.
     pub diverged: Option<String>,
     /// The message of a panic on the RT thread. The engine then stops
     /// processing: its state was released on the supervisor and every
@@ -296,6 +296,10 @@ struct Log {
 struct LocalLog {
     up: Vec<bool>,
     last_at: Vec<u64>,
+    /// The index of the last generation-needing entry. The next one is
+    /// stamped buildLead past it, as the replicated log's leader does, so
+    /// its generation is built once the RT thread swapped this one in.
+    gen_at: u64,
 }
 
 impl Log {
@@ -489,6 +493,7 @@ impl Engine {
             local: reports.is_none().then(|| LocalLog {
                 up: vec![true; config.inputs.len()],
                 last_at: vec![0; config.inputs.len()],
+                gen_at: 0,
             }),
         }));
         let records = METER_RING_SECONDS
@@ -580,7 +585,7 @@ impl Engine {
             scratch: vec![0.0; widest * b as usize],
             scratch_out: vec![0.0; widest * b as usize],
             pending_gen: None,
-            awaiting_gen: None,
+            awaiting_gen: Vec::with_capacity(PENDING_CHANGES),
             last_entry: 0,
             cmd: cmd_rx,
             entries: entry_rx,
@@ -839,25 +844,28 @@ impl Engine {
     /// holding both flows' readers is built, and the slot crossfades from
     /// the old flow to the new one over the ramp length from the returned
     /// index, `at_index` or, when that is nearer, the earliest index a
-    /// generation-needing entry is stamped at (buildLead past the earliest
-    /// gain change). A flow that cannot be read is silent and reported as
-    /// pruned. Refused as invalid on an engine that follows a replicated
-    /// log.
+    /// generation-needing entry is stamped at: buildLead past the earliest
+    /// gain change and past the engine's last `InputUp` or `Route`, so one
+    /// generation is built at a time and each before its index. A flow
+    /// that cannot be read is silent and reported as pruned. Refused as
+    /// invalid on an engine that follows a replicated log.
     pub fn route(&self, slot: usize, flow_id: &str, at_index: u64) -> Result<u64, EntryError> {
         self.config
             .check_input_flow(slot, flow_id)
             .map_err(|e| EntryError::Invalid(e.0))?;
         let mut log = self.log.lock().expect("log lock");
-        let last_at = match &log.local {
-            Some(l) => l.last_at[slot],
+        let (last_at, gen_at) = match &log.local {
+            Some(l) => (l.last_at[slot], l.gen_at),
             None => {
                 return Err(EntryError::Invalid(
                     "routes come from the replicated log".to_owned(),
                 ));
             }
         };
-        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead) - self.lead
-            + self.build_lead.load(Relaxed);
+        let build_lead = self.build_lead.load(Relaxed);
+        let earliest = (earliest(&self.api, &self.counters, self.margin, self.lead) - self.lead
+            + build_lead)
+            .max(gen_at + build_lead);
         let ramp = u64::from(self.config.ramp_samples);
         let at_index = at_index.max(stamp(earliest, last_at, ramp, self.block));
         let e = RtEntry {
@@ -870,6 +878,7 @@ impl Engine {
         log.commit(e.id);
         if let Some(l) = &mut log.local {
             l.last_at[slot] = at_index;
+            l.gen_at = at_index;
         }
         Ok(at_index)
     }
@@ -1266,6 +1275,16 @@ impl Supervisor {
                     }
                 }
                 Telemetry::GenerationDone { id, swapped } => self.generation_done(id, swapped),
+                Telemetry::AwaitLost { entry } => {
+                    let reason = format!(
+                        "log entry {} ({:?}) at index {} was applied before its generation \
+                         arrived, with {PENDING_CHANGES} others awaiting theirs; its \
+                         generation is not swapped in",
+                        entry.id, entry.change, entry.at_index
+                    );
+                    log(format_args!("diverged: {reason}"));
+                    self.status().diverged.get_or_insert(reason);
+                }
             }
         }
     }
@@ -1707,7 +1726,8 @@ impl Supervisor {
     /// a pruned input that is up goes down at the earliest index, a
     /// readable one that is down comes up at the earliest index a
     /// generation-needing entry takes, each after the slot's last entry
-    /// and its ramp.
+    /// and its ramp, and an `InputUp` buildLead after the log's last
+    /// generation-needing entry.
     fn report(&mut self, r: Report) {
         if let Some(tx) = &self.reports {
             if tx.try_send(r).is_err() {
@@ -1720,18 +1740,19 @@ impl Supervisor {
             Report::InputReadable { slot } => (slot, true),
         };
         let mut earliest = earliest(&self.api, &self.counters, self.timing.margin, self.lead);
-        let change = if up {
-            earliest = earliest - self.lead + self.build_lead.load(Relaxed);
-            Change::InputUp { slot }
-        } else {
-            Change::InputDown { slot }
-        };
+        let build_lead = self.build_lead.load(Relaxed);
         let consumed = self.counters.entries_consumed.load(Acquire);
         let mut log = self.log.lock().expect("log lock");
         let Some(local) = &log.local else { return };
         if local.up[slot] == up {
             return;
         }
+        let change = if up {
+            earliest = (earliest - self.lead + build_lead).max(local.gen_at + build_lead);
+            Change::InputUp { slot }
+        } else {
+            Change::InputDown { slot }
+        };
         let at_index = stamp(earliest, local.last_at[slot], self.ramp, self.timing.block);
         let e = RtEntry {
             id: log.last + 1,
@@ -1746,6 +1767,9 @@ impl Supervisor {
         let local = log.local.as_mut().expect("checked above");
         local.up[slot] = up;
         local.last_at[slot] = at_index;
+        if up {
+            local.gen_at = at_index;
+        }
     }
 
     fn stats(&mut self, slot: usize, stats: SlotStats) {

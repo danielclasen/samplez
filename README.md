@@ -66,7 +66,8 @@ swaps it in at the entry's index. The status reports the 99.99th
 percentile of the build times and buildLead, how far ahead such entries
 are stamped. `Engine::start` keeps the log itself, stamping `InputDown`
 when an input is pruned and `InputUp` once it has been on time for a
-second; `Engine::start_replicated` takes entries through `append`,
+second, and each `InputUp` or `Route` at least buildLead after the one
+before; `Engine::start_replicated` takes entries through `append`,
 `commit` and `truncate` and sends those reports out instead.
 
 Real-time set-up reports each step and runs degraded rather than failing:

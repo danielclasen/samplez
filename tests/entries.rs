@@ -401,3 +401,91 @@ fn a_generation_handed_over_after_the_commit_is_swapped_in_on_time() {
     assert_eq!(s.diverged, None);
     common::stop(e);
 }
+
+/// Re-routes of several inputs sent together on an engine with its own
+/// log are stamped buildLead apart, so each generation is built before its
+/// index: every input crossfades to its new flow, none is left silent.
+#[test]
+fn routes_sent_together_on_an_engine_with_its_own_log_each_swap_in() {
+    let domain = Domain::new();
+    let src: Vec<String> = (0..3).map(|_| new_id()).collect();
+    let next: Vec<String> = (0..3).map(|_| new_id()).collect();
+    let out = new_id();
+    let _pilots: Vec<Pilot> = src
+        .iter()
+        .chain(&next)
+        .map(|id| Pilot::start(&domain.0, id, 1, B, 0))
+        .collect();
+    let ins: Vec<(&str, u32)> = src.iter().map(|s| (s.as_str(), 1)).collect();
+    let (e, rx) = common::start(config(
+        &domain.0,
+        &ins,
+        &[(&out, 3)],
+        diagonal(3, 1.0),
+        MARGIN,
+    ));
+    running(&e);
+    let ats: Vec<u64> = (0..3).map(|i| e.route(i, &next[i], 0).unwrap()).collect();
+    assert!(ats.windows(2).all(|w| w[1] > w[0]), "{ats:?}");
+    let mut seen = Vec::new();
+    let end = (ats[2] + u64::from(RAMP)) / B;
+    wait_past(&rx, end + 100, &mut seen);
+    for v in seen.iter().filter(|v| v.k > end) {
+        assert_eq!(v.silenced, 0, "{v:?}");
+    }
+    let s = e.status();
+    let flows: Vec<&str> = s.inputs.iter().map(|i| i.flow_id.as_str()).collect();
+    assert_eq!(flows, next.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+    assert_eq!(s.diverged, None);
+    common::stop(e);
+}
+
+/// Generation-needing entries at one index, as a replica that lagged the
+/// leader by more than buildLead gets them: the first swaps in on time,
+/// the others are applied before their generations and each is swapped
+/// in once it arrives. No input stays silent.
+#[test]
+fn entries_at_one_index_each_get_their_generation() {
+    let domain = Domain::new();
+    let src: Vec<String> = (0..3).map(|_| new_id()).collect();
+    let next: Vec<String> = (0..3).map(|_| new_id()).collect();
+    let out = new_id();
+    let _pilots: Vec<Pilot> = src
+        .iter()
+        .chain(&next)
+        .map(|id| Pilot::start(&domain.0, id, 1, B, 0))
+        .collect();
+    let ins: Vec<(&str, u32)> = src.iter().map(|s| (s.as_str(), 1)).collect();
+    let (e, rx, _reports) = start_replicated(config(
+        &domain.0,
+        &ins,
+        &[(&out, 3)],
+        diagonal(3, 1.0),
+        MARGIN,
+    ));
+    running(&e);
+    let at = (now(&rx) + 200) * B;
+    for (i, flow_id) in next.iter().enumerate() {
+        let entry = Entry::Route {
+            slot: i,
+            flow_id: flow_id.clone(),
+        };
+        e.append(i as u64 + 1, at, entry).unwrap();
+    }
+    e.commit(3);
+    wait_for(10 * SECOND, "every input on its new flow", || {
+        let s = e.status();
+        s.generation.pending.is_none() && s.inputs.iter().zip(&next).all(|(i, n)| &i.flow_id == n)
+    });
+    let mut seen = Vec::new();
+    let k = now(&rx) + u64::from(RAMP) / B;
+    wait_past(&rx, k + 100, &mut seen);
+    for v in seen.iter().filter(|v| v.k > k) {
+        assert_eq!(v.silenced, 0, "{v:?}");
+    }
+    let s = e.status();
+    assert!(e.counters().generation_late.load(Relaxed) >= 2);
+    assert_eq!(s.diverged, None);
+    common::stop(e);
+}

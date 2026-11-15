@@ -173,6 +173,12 @@ pub(crate) enum Telemetry {
         id: LogId,
         swapped: bool,
     },
+    /// Entry `entry` was applied before its generation arrived while
+    /// [`PENDING_CHANGES`] others awaited theirs: its generation is not
+    /// swapped in, and its slot stays silent.
+    AwaitLost {
+        entry: RtEntry,
+    },
 }
 
 /// An input generation of one domain and, per slot, the number of
@@ -654,8 +660,9 @@ pub(crate) struct Rt {
     /// The generation built for a pending entry, with the entry's id and
     /// the generation's input domain.
     pub pending_gen: Option<(LogId, usize, Box<Gen>)>,
-    /// An entry applied before its generation arrived.
-    pub awaiting_gen: Option<RtEntry>,
+    /// Entries applied before their generation arrived, in log order.
+    /// Capacity [`PENDING_CHANGES`], never exceeded.
+    pub awaiting_gen: Vec<RtEntry>,
     /// The highest log id taken from the entry ring.
     pub last_entry: LogId,
     pub cmd: Consumer<Command>,
@@ -843,10 +850,10 @@ impl Rt {
                     domain,
                     generation,
                 } => {
-                    if let Some(e) = self.awaiting_gen.filter(|e| e.id == id) {
+                    if let Some(n) = self.awaiting_gen.iter().position(|e| e.id == id) {
                         // Its entry was applied without it: swapped in at
                         // once, the slot fading in from silence.
-                        self.awaiting_gen = None;
+                        let e = self.awaiting_gen.remove(n);
                         self.swap_in(e, domain, generation, false);
                     } else if id > self.last_entry || self.mix.holds(id) {
                         // Its entry is pending, or still in the entry ring
@@ -910,8 +917,12 @@ impl Rt {
         let (Change::InputUp { slot: i } | Change::Route { slot: i }) = e.change else {
             unreachable!("only these entries need a generation")
         };
+        // Silent while another entry for the slot awaits its generation.
+        let held = self.awaiting_gen.iter().any(
+            |a| matches!(a.change, Change::InputUp { slot } | Change::Route { slot } if slot == i),
+        );
         let slot = &mut self.slots[i];
-        slot.held = false;
+        slot.held = held;
         if rerouted {
             slot.prev = slot.state.clone();
             let s = &mut slot.state;
@@ -955,7 +966,11 @@ impl Rt {
                 self.pending_gen = other;
                 add(&self.counters.generation_late, 1);
                 self.slots[slot].held = true;
-                self.awaiting_gen = Some(e);
+                if self.awaiting_gen.len() < PENDING_CHANGES {
+                    self.awaiting_gen.push(e);
+                } else {
+                    self.send(Telemetry::AwaitLost { entry: e });
+                }
             }
         }
     }
