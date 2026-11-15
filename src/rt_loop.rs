@@ -296,7 +296,7 @@ pub(crate) const SLICE: u64 = samplez_dsp::SLICE;
 const WINDOW: u64 = samplez_dsp::WINDOW;
 /// Input samples before the current one in the true-peak interpolation
 /// window.
-const TP_HISTORY: usize = 11;
+const TP_HISTORY: usize = TruePeak::HISTORY;
 
 /// One output channel's meter values over one slice, the samples
 /// `[slice * SLICE, (slice + 1) * SLICE)`.
