@@ -29,16 +29,17 @@ use openraft::raft::{
 use openraft::{BasicNode, Raft, ServerState};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
-use samplez_replica::state_machine::{Effect, Product};
+use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
-use samplez_service::{Owner, Role};
+use samplez_service::{Owner, ReplicatedState, Role};
 use tokio::time::Instant;
 
 pub const RATE: u64 = 48_000;
 pub const BLOCK: u64 = 48;
 
 /// One value per path, set by `path=value@seq`: a seq not above the last
-/// applied on its path is refused stale, as faderz orders its commands.
+/// applied on its path is refused stale, as faderz orders its commands, and
+/// the value a path holds already is unchanged.
 #[derive(Default)]
 pub struct Paths {
     pub values: BTreeMap<String, (String, u64)>,
@@ -53,16 +54,39 @@ fn parse(command: &[u8]) -> (String, String, u64) {
 }
 
 impl Product for Paths {
-    fn apply(&mut self, _origin: &Origin, command: &[u8]) -> Effect {
+    type Change = (String, String);
+
+    fn apply(&mut self, _origin: &Origin, command: &[u8]) -> Effect<(String, String)> {
         let (path, value, seq) = parse(command);
         if self.values.get(&path).is_some_and(|(_, last)| *last >= seq) {
             return Effect::Stale;
         }
         self.applied += 1;
-        self.values.insert(path.clone(), (value.clone(), seq));
-        Effect::Changed(format!("{path}={value}"))
+        let was = self.values.insert(path.clone(), (value.clone(), seq));
+        if was.is_some_and(|(was, _)| was == value) {
+            return Effect::Unchanged;
+        }
+        Effect::Changed((path, value))
     }
-    fn expire(&mut self, _session: &SessionKey) {}
+    fn expire(&mut self, _session: &SessionKey) -> Effect<(String, String)> {
+        Effect::Unchanged
+    }
+    fn forget(&mut self, _session: &SessionKey) {}
+    fn delta(&self, _stamp: u64, changes: &[Changed<'_, (String, String)>]) -> String {
+        // Later wins per path; every command that changed something is an
+        // origin.
+        let mut values = BTreeMap::new();
+        let mut origins = Vec::new();
+        for changed in changes {
+            let (path, value) = changed.change;
+            values.insert(path, value);
+            if let Some(command) = changed.command {
+                origins.push(format!("{}/{}", command.origin.session, command.id));
+            }
+        }
+        let values: Vec<String> = values.iter().map(|(p, v)| format!("{p}={v}")).collect();
+        format!("{} from {}", values.join(","), origins.join(","))
+    }
     fn text(&self) -> String {
         serde_json::to_string(&self.values).expect("encodes")
     }
@@ -396,17 +420,18 @@ impl Set {
         std::fs::remove_dir_all(self.root.join(id.to_string())).expect("wipes");
     }
 
-    /// Waits until every running replica applied `index`.
-    pub async fn applied(&self, index: u64) {
+    /// Waits until every running replica applied product revision
+    /// `revision`.
+    pub async fn applied(&self, revision: u64) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while self
             .replicas
             .values()
-            .any(|r| r.store().applied_index() < index)
+            .any(|r| ReplicatedState::revision(&**r) < revision)
         {
             assert!(
                 Instant::now() < deadline,
-                "index {index} not applied within 30 s"
+                "revision {revision} not applied within 30 s"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

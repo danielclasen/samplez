@@ -202,8 +202,11 @@ pub struct Request {
 /// How one command of an entry resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Resolution {
-    /// The product applied it.
+    /// The product applied it, and it changed the product.
     Applied,
+    /// The product applied it, and it changed nothing: the state held it
+    /// already.
+    Unchanged,
     /// A copy of an applied command, its id in its session's table:
     /// nothing changed.
     Duplicate,
@@ -214,8 +217,9 @@ pub enum Resolution {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
-    /// The revision whose delta carries the command's change: the stored
-    /// one for a duplicate, the entry's otherwise.
+    /// The product revision the command resolved at: the stored one for a
+    /// duplicate, otherwise the revision after its entry, which is the
+    /// entry's own when the entry changed the product.
     pub revision: u64,
     pub result: Resolution,
 }

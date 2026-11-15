@@ -141,6 +141,20 @@ impl fmt::Display for OwnerHandle {
     }
 }
 
+/// What [`ReplicatedState::read_index`] could establish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIndex {
+    /// Committed up to this revision, confirmed by a majority now.
+    Confirmed(u64),
+    /// This replica does not confirm read indices, as a follower that
+    /// knows a leader: the service waits, within the same bound, for this
+    /// replica to apply the client's position instead.
+    NotLeader,
+    /// This replica cannot reach the quorum: the service answers at once,
+    /// marked stale, without waiting. Resolve with it at once.
+    CutOff,
+}
+
 /// Implemented by the product or by the replication mechanism.
 pub trait ReplicatedState: Send + Sync + 'static {
     fn replica(&self) -> ReplicaInfo;
@@ -155,6 +169,17 @@ pub trait ReplicatedState: Send + Sync + 'static {
 
     /// The global revision this replica has applied.
     fn revision(&self) -> u64;
+
+    /// The revision up to which the replication has committed, as a
+    /// majority confirms it now: the read index a client naming its last
+    /// position is answered against ([`crate::ws::serve_client`]). The
+    /// service waits for it at most [`crate::ws::READ_INDEX_HOLD`]. A single
+    /// replica answers its own revision.
+    fn read_index(&self) -> BoxFuture<'_, ReadIndex>;
+
+    /// Resolves once this replica has applied `revision`; the service drops
+    /// it when it stops waiting.
+    fn applied(&self, revision: u64) -> BoxFuture<'_, ()>;
 
     /// The whole state as of the position in it.
     fn snapshot(&self) -> BoxFuture<'_, Snapshot>;
@@ -238,10 +263,32 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// owners whose connection to this replica is live
     /// ([`crate::ws::Sessions::live`]): it answered a ping sent within the
     /// last second, not counting up to [`crate::ws::MAX_PAUSE_TOTAL`] in
-    /// which it was not read at [`crate::ws::MAX_PENDING_REPLIES`], which
-    /// takes a round trip below 750 ms; not called when there are none.
-    /// Must not block: the renewal is passed on to the replication
+    /// which it was not read ([`crate::ws::serve_client`]), which takes a
+    /// round trip below 750 ms; not called when there are none. A new
+    /// connection is live from its upgrade, so its session is in the next
+    /// call. Must not block: the renewal is passed on to the replication
     /// mechanism.
+    ///
+    /// A session whose client is gone is renewed for up to
+    /// [`crate::ws::PONG_TIMEOUT`] plus [`crate::ws::MAX_PAUSE_TOTAL`], 7 s,
+    /// after the last ping it answered was sent, so what it holds under its
+    /// lease lasts that plus the lease: up to 9 s with the 2 s lease of the
+    /// replication this crate is sized for.
+    ///
+    /// The session's lifetime ends when the implementation ends its lease,
+    /// on every replica at the same point of the state's history: a lease
+    /// renewed again before the expiry is applied ends nothing. The
+    /// ordering state of the session's commands, such as the last sequence
+    /// number applied per target ([`Resolution::Stale`]), has to outlive
+    /// the lifetime by the retention of the session's table of command ids
+    /// ([`ReplicatedState::command_resolution`]) plus the longest a client
+    /// resends a command after it first sent it: a copy of a command can
+    /// apply that late after the original, and with the ordering state
+    /// dropped it could undo a later command. The implementation tells the
+    /// product when that time has passed, counted in the replicated
+    /// state's own time like the retention, so every replica drops it at
+    /// the same point of the history; a session that comes back before
+    /// then keeps it.
     fn renew_sessions(&self, live: &[Owner]);
 }
 
@@ -263,8 +310,12 @@ pub struct Ack {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Resolution {
-    /// The product applied it.
+    /// The product applied it, and it changed the state: the delta at the
+    /// revision lists it ([`crate::ws::Delta::commands`]).
     Applied,
+    /// The product applied it, and it changed nothing: the state held it
+    /// already. No delta lists it.
+    Unchanged,
     /// A copy of a command applied already, through any replica: nothing
     /// changed, and the revision is the one its session's table holds.
     Duplicate,

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,15 +14,30 @@ use futures_util::future::BoxFuture;
 use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::ws::{Delta, Snapshot};
 use samplez_service::{
-    Identity, Ops, Owner, Position, ReplicaInfo, ReplicatedState, Service, ServiceConfig,
+    Identity, Ops, Owner, Position, ReadIndex, ReplicaInfo, ReplicatedState, Service, ServiceConfig,
 };
 use serde_json::json;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tower::ServiceExt;
 
 pub const HOST: &str = "localhost:8080";
 pub const API_TOKEN: &str = "api-token";
 pub const MACHINE_TOKEN: &str = "machine-token";
+
+/// What [`FakeState::read_index`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reads {
+    /// Its own revision confirmed, as a leader or a single replica.
+    Applied,
+    /// This revision, committed elsewhere and applied here once received.
+    Committed(u64),
+    /// [`ReadIndex::NotLeader`], as a follower.
+    NotLeader,
+    /// [`ReadIndex::CutOff`] at once, as a replica cut off from the quorum.
+    CutOff,
+    /// Never, as a replica whose read index does not come back.
+    Hang,
+}
 
 /// A replicated state whose deltas are applied by hand; `receive` stands in
 /// for replication from another replica.
@@ -42,6 +58,11 @@ pub struct FakeState {
     pub snapshot_delay: Mutex<Duration>,
     /// Submitted commands, by owner and id, that `commit` applies.
     submitted: Mutex<Vec<(Owner, String, oneshot::Sender<Ack>)>>,
+    pub read_index: Mutex<Reads>,
+    /// Every `snapshot` and `deltas_since` call.
+    pub catch_ups: AtomicUsize,
+    /// Woken on every revision applied.
+    applied: Notify,
 }
 
 impl FakeState {
@@ -64,6 +85,9 @@ impl FakeState {
             renewals: Mutex::default(),
             snapshot_delay: Mutex::default(),
             submitted: Mutex::default(),
+            read_index: Mutex::new(Reads::Applied),
+            catch_ups: AtomicUsize::new(0),
+            applied: Notify::new(),
         })
     }
 
@@ -76,7 +100,7 @@ impl FakeState {
             epoch: self.epoch(),
             revision,
             prev,
-            command: command.map(|(_, id)| id.to_owned()),
+            commands: command.map(|(_, id)| id.to_owned()).into_iter().collect(),
             text: format!("delta@{revision}").into(),
         };
         self.receive(delta.clone(), command.map(|(owner, _)| owner));
@@ -86,13 +110,14 @@ impl FakeState {
     /// Takes a delta as replicated from another replica; `owner` is the
     /// owner of the command it names.
     pub fn receive(&self, delta: Delta, owner: Option<&Owner>) {
-        if let (Some(id), Some(owner)) = (&delta.command, owner) {
+        if let (Some(id), Some(owner)) = (delta.commands.first(), owner) {
             self.commands
                 .lock()
                 .unwrap()
                 .insert(key(owner, id), delta.revision);
         }
         self.log.lock().unwrap().push(delta);
+        self.applied.notify_waiters();
     }
 
     /// Applies the submitted commands in order, each id once per principal
@@ -163,6 +188,7 @@ impl ReplicatedState for FakeState {
     }
 
     fn snapshot(&self) -> BoxFuture<'_, Snapshot> {
+        self.catch_ups.fetch_add(1, Ordering::Relaxed);
         let (epoch, revision) = (self.epoch(), self.revision());
         let delay = *self.snapshot_delay.lock().unwrap();
         Box::pin(async move {
@@ -175,7 +201,36 @@ impl ReplicatedState for FakeState {
         })
     }
 
+    fn read_index(&self) -> BoxFuture<'_, ReadIndex> {
+        let reads = *self.read_index.lock().unwrap();
+        let revision = self.revision();
+        Box::pin(async move {
+            match reads {
+                Reads::Applied => ReadIndex::Confirmed(revision),
+                Reads::Committed(revision) => ReadIndex::Confirmed(revision),
+                Reads::NotLeader => ReadIndex::NotLeader,
+                Reads::CutOff => ReadIndex::CutOff,
+                Reads::Hang => std::future::pending().await,
+            }
+        })
+    }
+
+    fn applied(&self, revision: u64) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            loop {
+                let applied = self.applied.notified();
+                tokio::pin!(applied);
+                applied.as_mut().enable();
+                if self.revision() >= revision {
+                    return;
+                }
+                applied.await;
+            }
+        })
+    }
+
     fn deltas_since(&self, since: Position) -> BoxFuture<'_, Option<Vec<Delta>>> {
+        self.catch_ups.fetch_add(1, Ordering::Relaxed);
         let held = since.epoch == self.epoch() && since.revision >= *self.forgotten.lock().unwrap();
         let deltas: Vec<Delta> = self
             .log

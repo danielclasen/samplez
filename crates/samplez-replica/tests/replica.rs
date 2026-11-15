@@ -8,8 +8,8 @@ use axum::body::Bytes;
 use harness::{Options, Set, owner};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{Body, SessionKey};
-use samplez_service::ReplicatedState;
 use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
+use samplez_service::{Position, ReadIndex, ReplicatedState};
 
 async fn set(replica: &impl ReplicatedState, session: &str, id: &str, command: &str) -> u64 {
     ack(replica, session, id, command).await.revision
@@ -123,6 +123,143 @@ async fn only_the_leader_is_commitable_and_every_refusal_names_its_reason() {
     assert_eq!(refused(&*stopped, "x").await.reason, Reason::Unavailable);
 }
 
+/// The leader's read index is what it committed, confirmed by a majority;
+/// a follower that knows the leader confirms none, and one cut off from
+/// the others says so. Asked again when an election moved the leadership
+/// meanwhile.
+#[tokio::test(start_paused = true)]
+async fn the_leader_confirms_its_read_index_and_a_follower_answers_none() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let revision = set(&**set_.replica(leader), "s", "1", "gain=1@1").await;
+    set_.applied(revision).await;
+    loop {
+        let leader = set_.leader().await;
+        let follower = (leader + 1) % 3;
+        let start = tokio::time::Instant::now();
+        let confirmed = set_.replica(leader).read_index().await;
+        let unconfirmed = set_.replica(follower).read_index().await;
+        let took = start.elapsed();
+        if set_.leader().await != leader {
+            continue;
+        }
+        assert_eq!(
+            confirmed,
+            ReadIndex::Confirmed(revision),
+            "a heartbeat round confirms it"
+        );
+        assert_eq!(unconfirmed, ReadIndex::NotLeader);
+        assert!(took < Duration::from_millis(100), "at once: {took:?}");
+        break;
+    }
+
+    let follower = (set_.leader().await + 1) % 3;
+    set_.net.isolate(follower, set_.ids());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        set_.replica(follower).read_index().await,
+        ReadIndex::CutOff,
+        "no leader known"
+    );
+}
+
+/// Revisions count the product's changes, not log entries: lease
+/// renewals between two commands, and the leader's blank and membership
+/// entries before them, take no revision, so the second command's delta
+/// follows the first's, as a client checks.
+#[tokio::test(start_paused = true)]
+async fn lease_renewals_between_two_product_commands_give_consecutive_revisions() {
+    let set_ = Set::start(Options::default()).await;
+    let replica = set_.replica(set_.leader().await);
+    let first = set(&**replica, "s", "1", "gain=1@1").await;
+    assert_eq!(first, 1, "the first change");
+    let index = replica.store().applied_index();
+    for _ in 0..3 {
+        replica.renew_sessions(&[owner("s")]);
+    }
+    let second = set(&**replica, "s", "2", "pan=1@2").await;
+    assert_eq!(
+        replica.store().applied_index(),
+        index + 4,
+        "the renewals were written between the two"
+    );
+    assert_eq!(second, first + 1);
+    let since = Position {
+        epoch: replica.epoch(),
+        revision: first,
+    };
+    let deltas = replica.deltas_since(since).await.expect("held");
+    let steps: Vec<_> = deltas.iter().map(|d| (d.revision, d.prev)).collect();
+    assert_eq!(steps, [(second, first)]);
+    assert_eq!(replica.revision(), second);
+    assert_eq!(replica.snapshot().await.revision, second);
+    assert_eq!(replica.read_index().await, ReadIndex::Confirmed(second));
+}
+
+/// Every replica counts the same revisions from the same log, one that
+/// installed a snapshot of it included: the snapshot carries the count,
+/// and the next delta follows it on both.
+#[tokio::test(start_paused = true)]
+async fn replicas_report_the_same_revision_after_the_same_log_and_a_snapshot_install() {
+    let mut options = Options::default();
+    // One snapshot taken by hand, as in the caps row.
+    options.raft.snapshot_policy = openraft::SnapshotPolicy::Never;
+    options.raft.max_in_snapshot_log_to_keep = 0;
+    options.raft.purge_batch_size = 1;
+    let mut set_ = Set::start(options).await;
+    let leader = set_.leader().await;
+    let behind = (leader + 1) % 3;
+    set_.crash(behind).await;
+    let replica = set_.replica(leader).clone();
+    for n in 1..=4u64 {
+        set(&*replica, "s", &n.to_string(), &format!("gain={n}@{n}")).await;
+        replica.renew_sessions(&[owner("s")]);
+    }
+    // Refused as stale: no change, so no revision.
+    set(&*replica, "s", "5", "gain=0@1").await;
+    let index = replica.store().applied_index();
+    assert!(index > 5, "log index {index}");
+    let raft = replica.raft().clone();
+    raft.trigger().snapshot().await.expect("snapshot");
+    while raft.metrics().borrow().snapshot.map(|id| id.index) != Some(index) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    raft.trigger().purge_log(index).await.expect("purge");
+    while raft.metrics().borrow().purged.map(|id| id.index) != Some(index) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    set_.restart(behind).await;
+    set_.applied(4).await;
+    let installed = set_.replica(behind).clone();
+    assert!(
+        installed.raft().metrics().borrow().snapshot.is_some(),
+        "the restarted replica installed a snapshot"
+    );
+    for r in [&replica, &installed] {
+        assert_eq!(r.revision(), 4, "four changes");
+        assert_eq!(r.snapshot().await.revision, 4);
+    }
+    // It holds no delta at or below its snapshot, so a client below it is
+    // answered with a snapshot, never an empty resume.
+    let below = Position {
+        epoch: replica.epoch(),
+        revision: 2,
+    };
+    assert!(installed.deltas_since(below).await.is_none());
+    let fifth = set(&*replica, "s", "6", "pan=1@6").await;
+    assert_eq!(fifth, 5);
+    set_.applied(fifth).await;
+    let since = Position {
+        epoch: replica.epoch(),
+        revision: 4,
+    };
+    for r in [&replica, &installed] {
+        let deltas = r.deltas_since(since).await.expect("held");
+        let steps: Vec<_> = deltas.iter().map(|d| (d.revision, d.prev)).collect();
+        assert_eq!(steps, [(5, 4)]);
+    }
+}
+
 /// The write timeout counts from the submit: a command queued behind
 /// writes that cannot commit, a command and an entry of the set's own,
 /// waits no longer than one that is written at once.
@@ -220,8 +357,10 @@ async fn a_resend_after_failover_and_election_resolves_to_the_stored_revision() 
 /// Submitted before the writer runs, so they form one entry: every
 /// command is applied in order with its own body, the product refusing
 /// the older seq that came later, and a copy of a command in the same
-/// entry is answered as its first copy resolved: an applied one as a
-/// duplicate, a stale one as stale.
+/// entry is answered as its first copy resolved: an applied or unchanged
+/// one as a duplicate, a stale one as stale. The entry is one delta at one
+/// revision, every command resolving at it, with the changes of both
+/// commands that made one.
 #[tokio::test(start_paused = true)]
 async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
     let set_ = Set::start(Options::default()).await;
@@ -232,6 +371,8 @@ async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
         ("s", "1", "gain=5@5"),
         ("s", "2", "pan=0@4"),
         ("t", "1", "gain=3@3"),
+        ("u", "1", "pan=0@5"),
+        ("u", "1", "pan=0@5"),
     ]
     .map(|(session, id, command)| replica.submit(&owner(session), id, Bytes::from(command)));
     let mut revisions = Vec::new();
@@ -248,15 +389,25 @@ async fn one_entry_applies_every_command_and_answers_a_copy_as_a_duplicate() {
             Resolution::Stale,
             Resolution::Duplicate,
             Resolution::Applied,
-            Resolution::Stale
+            Resolution::Stale,
+            Resolution::Unchanged,
+            Resolution::Duplicate
         ]
     );
-    assert!(
-        revisions.iter().all(|r| *r == revisions[0]),
-        "{revisions:?}"
-    );
+    assert_eq!(revisions, [1; 7]);
+    let since = Position {
+        epoch: replica.epoch(),
+        revision: 0,
+    };
+    let deltas = replica.deltas_since(since).await.expect("held");
+    let deltas: Vec<_> = deltas
+        .iter()
+        .map(|d| (d.revision, d.prev, d.commands.clone(), d.text.as_str()))
+        .collect();
+    let ids = vec!["1".to_owned(), "2".to_owned()];
+    assert_eq!(deltas, [(1, 0, ids, "gain=5,pan=0 from s/1,s/2")]);
     replica.store().with_state(|sm| {
-        assert_eq!(sm.product.applied, 2);
+        assert_eq!(sm.product.applied, 3);
         assert_eq!(sm.product.values["gain"].0, "5");
     });
     // The stale command's id is recorded: its resend is stale again.
@@ -320,12 +471,13 @@ async fn tables_stay_identical_under_the_caps_and_after_a_snapshot_install() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let raft = set_.replica(leader).raft().clone();
+    let index = set_.replica(leader).store().applied_index();
     raft.trigger().snapshot().await.expect("snapshot");
-    while raft.metrics().borrow().snapshot.map(|id| id.index) != Some(last) {
+    while raft.metrics().borrow().snapshot.map(|id| id.index) != Some(index) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    raft.trigger().purge_log(last).await.expect("purge");
-    while raft.metrics().borrow().purged.map(|id| id.index) != Some(last) {
+    raft.trigger().purge_log(index).await.expect("purge");
+    while raft.metrics().borrow().purged.map(|id| id.index) != Some(index) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     set_.restart(behind).await;
@@ -403,7 +555,7 @@ async fn a_resend_answers_as_its_first_copy_resolved_also_after_a_snapshot_insta
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     set_.restart(behind).await;
-    set_.applied(last).await;
+    set_.applied(replica.revision()).await;
     let installed = set_.replica(behind);
     assert!(
         installed.raft().metrics().borrow().snapshot.is_some(),
@@ -427,4 +579,57 @@ async fn a_resend_answers_as_its_first_copy_resolved_also_after_a_snapshot_insta
         .map(|id| set_.replica(id).store().with_state(|sm| sm.dedup.save()))
         .collect();
     assert_eq!(tables[0], tables[1]);
+}
+
+/// A leader cut off from the others confirms no read index, even
+/// while its own metrics still name it leader, so a client holding a
+/// revision the new leader committed is never answered from it as ahead
+/// or as confirmed.
+#[tokio::test(start_paused = true)]
+async fn a_deposed_leader_confirms_no_read_index() {
+    let set_ = Set::start(Options::default()).await;
+    let old = set_.leader().await;
+    let first = set(&**set_.replica(old), "s", "1", "gain=1@1").await;
+    set_.applied(first).await;
+    set_.net.isolate(old, set_.ids());
+    let others: Vec<_> = set_.ids().filter(|&id| id != old).collect();
+    let new = loop {
+        if let Some(l) = others.iter().copied().find(|&id| {
+            set_.replica(id).raft().metrics().borrow().state == openraft::ServerState::Leader
+        }) {
+            break l;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let second = set(&**set_.replica(new), "s", "2", "gain=2@2").await;
+    assert_eq!(second, first + 1);
+    let still = set_.replica(old).raft().metrics().borrow().state == openraft::ServerState::Leader;
+    let read = set_.replica(old).read_index().await;
+    assert!(
+        !matches!(read, ReadIndex::Confirmed(r) if r < second),
+        "old leader (metrics say leader: {still}) answered {read:?}, new leader committed {second}"
+    );
+}
+
+/// `applied` resolves only once the revision is applied here.
+#[tokio::test(start_paused = true)]
+async fn applied_waits_until_the_revision_is_applied() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let first = set(&**set_.replica(leader), "s", "1", "gain=1@1").await;
+    set_.applied(first).await;
+    let follower = (leader + 1) % 3;
+    let mut waiting = set_.replica(follower).applied(first + 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut waiting)
+            .await
+            .is_err(),
+        "resolved before revision {} was applied",
+        first + 1
+    );
+    let second = set(&**set_.replica(leader), "s", "2", "gain=2@2").await;
+    assert_eq!(second, first + 1);
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("applied on the follower");
 }

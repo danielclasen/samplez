@@ -1,14 +1,17 @@
 //! Per-client WebSocket send queues, fan-out, the session registry and the
 //! loop that serves one client.
 //!
-//! A client connecting with the last position it saw gets the deltas after
-//! it, from whichever replica it reaches, when that replica holds them and
-//! the epoch is the same, and a snapshot otherwise; a client without one
-//! gets a snapshot. Live deltas follow in order. A delta whose `prev` is not
-//! the revision last sent to the client, or whose epoch differs, makes the
-//! client catch up the same way as on connect; so does a full delta queue.
-//! Meters and counters keep only their latest frame; a meter frame is sent
-//! only against a credit the product grants for the client.
+//! The product's protocol carries the client's position: a client that
+//! asks to catch up with the last position it saw ([`CatchUp`]) gets the
+//! deltas after it, from whichever replica it reaches, once that replica
+//! has applied what the replication committed (the read index), when it
+//! holds them and the epoch is the same, and a snapshot otherwise; a client
+//! without one gets a snapshot. Live deltas follow in order. A delta whose
+//! `prev` is not the revision last sent to the client makes the client
+//! catch up from there; so does a full delta queue. A replica whose epoch
+//! changes closes the connection. Meters and counters keep only their
+//! latest frame; a meter frame is sent only against a credit the product
+//! grants for the client.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -25,7 +28,7 @@ use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::Error;
-use crate::replica::{Owner, Position, ReplicatedState};
+use crate::replica::{Owner, Position, ReadIndex, ReplicatedState};
 use crate::server::Connect;
 
 /// How often [`serve_client`] pings.
@@ -33,7 +36,7 @@ pub const PING_PERIOD: Duration = Duration::from_millis(250);
 /// [`serve_client`] closes a connection that has answered no ping sent in
 /// this long, and only connections that answered one are renewed
 /// ([`Sessions::live`]); neither counts the time the connection was not
-/// read at [`MAX_PENDING_REPLIES`]. It is counted from when the ping was
+/// read ([`serve_client`]). It is counted from when the ping was
 /// sent, so the round trip counts against it and a pong that waited unread
 /// behind other messages is not taken as fresh.
 ///
@@ -65,8 +68,9 @@ pub const MAX_PENDING_REPLIES: usize = 64;
 /// [`MAX_PAUSE_TOTAL`].
 pub const MAX_PAUSE: Duration = Duration::from_secs(2);
 /// How long [`serve_client`] goes without reading a connection in all, over
-/// the pauses at [`MAX_PENDING_REPLIES`] since the last ping it answered
-/// was sent, before it ends it as [`Ended::Failed`]. A pong waits unread
+/// the pauses since the last ping it answered was sent, at
+/// [`MAX_PENDING_REPLIES`] or holding the answer to a [`CatchUp`] or the
+/// commands after a promote, before it ends it as [`Ended::Failed`]. A pong waits unread
 /// behind the messages sent before it, and each pause is taken off the
 /// client's [`PONG_TIMEOUT`], so without this bound a peer that is gone,
 /// with messages queued, would stay live for as long as they last.
@@ -81,6 +85,12 @@ pub const MAX_PAUSE: Duration = Duration::from_secs(2);
 /// renewal, 2 s in the replication this crate is sized for: up to 9 s after
 /// that ping.
 pub const MAX_PAUSE_TOTAL: Duration = Duration::from_secs(6);
+/// The longest [`serve_client`] holds the answer to a [`CatchUp`] naming a
+/// position of the state's epoch for the read index and this replica's
+/// applying it ([`ReplicatedState::read_index`]) before it answers with
+/// the state it has applied, marked stale. The connection is not read
+/// meanwhile, for at most this plus [`MAX_PAUSE`].
+pub const READ_INDEX_HOLD: Duration = Duration::from_secs(2);
 
 /// The longest replica id [`Sessions::new`] takes, a DNS label's length:
 /// with the nonce and the counter the connection id stays within
@@ -101,13 +111,120 @@ pub enum Reply<Fut> {
     Command(Fut),
     /// Sent at once, ahead of replies still waiting and before the first
     /// catch-up, and counted against nothing; `None` sends nothing. For
-    /// messages that carry no state, such as heartbeats, whose answer must
-    /// not wait on a commit or a snapshot; never for the answer to a
-    /// command, such as its refusal, which would overtake the answers to
-    /// the commands before it. While [`MAX_PENDING_REPLIES`]
-    /// [`Reply::Command`] replies wait the connection is not read, so a
-    /// message answered with `Now` waits as well.
+    /// messages that carry no state, such as the answer to a client's
+    /// heartbeat, which must not wait on a commit or a snapshot; never for
+    /// the answer to a command, such as its refusal, which would overtake
+    /// the answers to the commands before it. While the connection is not
+    /// read a message answered with `Now` waits as well.
     Now(Option<Message>),
+    /// The client asks to catch up, as with the first message of a
+    /// connection or after a gap: answered through [`Encode::answer`], and
+    /// nothing after it is read until the answer is sent.
+    CatchUp(CatchUp),
+    /// The client makes this connection the one it sends commands on, with
+    /// the last position it saw: when that is of the state's epoch, nothing
+    /// after it is read until this replica has applied it, so no command
+    /// the client sends next applies to a state older than the one it saw,
+    /// or until the read index is confirmed below it, so the catch-up the
+    /// client sends next is answered [`Answer::Ahead`]. Sends nothing.
+    Promote(Option<Position>),
+    /// The client's answer to the ping [`Encode::ping`] made with `t`.
+    /// Sends nothing.
+    Pong(u64),
+}
+
+/// Whether the product may submit a command [`serve_client`] passes it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Submit,
+    /// The client promoted this connection naming a position the
+    /// replication never committed, and has not taken state since: a
+    /// command now would apply to state older than the one the client saw.
+    /// Answer it not applied, at once and without submitting it, so the
+    /// client sends it again once it has taken the cluster's state.
+    NotApplied,
+}
+
+/// A client's request to catch up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatchUp {
+    /// The last position the client saw, `None` for a snapshot.
+    pub since: Option<Position>,
+    /// A snapshot even when this replica holds the deltas after `since`.
+    pub full: bool,
+}
+
+/// What brings a client up to date, for the product to encode
+/// ([`Encode::answer`]).
+#[derive(Debug, Clone)]
+pub enum Answer {
+    /// The deltas after the client's position, in order, up to `revision`
+    /// in `epoch`: the revision of the last of them, or the client's own
+    /// when there are none.
+    Resume {
+        epoch: u64,
+        revision: u64,
+        deltas: Vec<Delta>,
+        /// Not confirmed to be the latest committed state: the replica
+        /// could not get the read index, or did not apply it within
+        /// [`READ_INDEX_HOLD`]. Its revision may then be older than the
+        /// client's.
+        stale: bool,
+    },
+    Snapshot {
+        snapshot: Snapshot,
+        /// As for [`Answer::Resume`].
+        stale: bool,
+    },
+    /// The client's position is above the read index in the state's epoch:
+    /// it holds state the replication never committed. The connection is
+    /// sent no deltas until a later [`CatchUp`] is answered with state.
+    Ahead {
+        epoch: u64,
+        /// The read index.
+        committed: u64,
+        /// The revision of the client's position.
+        last_revision: u64,
+    },
+}
+
+impl Answer {
+    pub fn epoch(&self) -> u64 {
+        match self {
+            Answer::Resume { epoch, .. } | Answer::Ahead { epoch, .. } => *epoch,
+            Answer::Snapshot { snapshot, .. } => snapshot.epoch,
+        }
+    }
+
+    /// The position the client is at once it took the answer.
+    fn position(&self) -> Option<Position> {
+        match self {
+            Answer::Resume {
+                epoch, revision, ..
+            } => Some(Position {
+                epoch: *epoch,
+                revision: *revision,
+            }),
+            Answer::Snapshot { snapshot, .. } => Some(Position {
+                epoch: snapshot.epoch,
+                revision: snapshot.revision,
+            }),
+            Answer::Ahead { .. } => None,
+        }
+    }
+}
+
+/// The messages of the product's protocol that [`serve_client`] sends on
+/// its own.
+pub trait Encode {
+    /// A heartbeat carrying `t`, the milliseconds since the connection was
+    /// accepted, unique among the pings of the connection; the client's
+    /// answer to it is a [`Reply::Pong`] with `t`.
+    fn ping(&mut self, t: u64) -> Message;
+
+    /// The answer to a [`CatchUp`], or the catch-up after a gap or a full
+    /// delta queue.
+    fn answer(&mut self, answer: Answer) -> Vec<Message>;
 }
 
 /// A state change at a global revision.
@@ -118,8 +235,11 @@ pub struct Delta {
     /// The revision of the delta before this one in the same epoch, 0 for
     /// the first.
     pub prev: u64,
-    /// The id of the command that caused it; the text echoes it.
-    pub command: Option<String>,
+    /// The ids of the commands whose changes it carries, in the order
+    /// applied; empty for a change no command made, such as a lease
+    /// expiry. A command that changed nothing is in no delta
+    /// ([`crate::replica::Resolution::Unchanged`]).
+    pub commands: Vec<String>,
     pub text: Utf8Bytes,
 }
 
@@ -329,8 +449,8 @@ struct Connection {
     /// When the last ping it answered was sent, moved on by the pauses
     /// since.
     answered: Instant,
-    /// Since when it is not read at [`MAX_PENDING_REPLIES`], and when it
-    /// ends unless read again.
+    /// Since when it is not read ([`serve_client`]), and when it ends
+    /// unless read again.
     paused: Option<(Instant, Instant)>,
 }
 
@@ -418,9 +538,8 @@ impl Sessions {
     }
 
     /// The owners whose connection answered a ping sent within
-    /// [`PONG_TIMEOUT`], not counting the time it was not read at
-    /// [`MAX_PENDING_REPLIES`], and, while it is not read, until
-    /// [`serve_client`] ends it after [`MAX_PAUSE`] or [`MAX_PAUSE_TOTAL`]:
+    /// [`PONG_TIMEOUT`], not counting the time it was not read, and, while
+    /// it is not read, until [`serve_client`] ends the pause:
     /// its pongs wait unread, and a client answering them keeps its lease.
     /// A round trip of `PONG_TIMEOUT - PING_PERIOD` or more is not live.
     pub fn live(&self) -> Vec<Owner> {
@@ -445,41 +564,108 @@ pub enum Ended {
     /// The client closed the connection or the stream ended.
     Closed,
     /// No ping sent within [`PONG_TIMEOUT`] answered, not counting the time
-    /// the connection was not read at [`MAX_PENDING_REPLIES`]; a close frame
+    /// the connection was not read; a close frame
     /// was sent. A round trip of `PONG_TIMEOUT - PING_PERIOD` or more ends a
     /// connection this way.
     PongTimeout,
     /// Sending or receiving failed, a send did not finish within
     /// [`PONG_TIMEOUT`] of sending the last ping answered, counted the same
-    /// way, or the connection was not read at [`MAX_PENDING_REPLIES`] for
-    /// [`MAX_PAUSE`] at once or [`MAX_PAUSE_TOTAL`] since that ping was sent.
+    /// way, or the connection was not read for longer than a pause allows
+    /// ([`serve_client`]).
     Failed,
+    /// The state's epoch is no longer the one the client was answered in:
+    /// the state was initialised anew or restored, and the client's
+    /// revisions name nothing in it. A close frame was sent; the client
+    /// catches up on a new connection, with a snapshot of the new epoch.
+    EpochChanged,
 }
 
-/// The messages that bring a client from `since` to the state's position,
-/// and that position.
-async fn catch_up(
-    state: &dyn ReplicatedState,
-    since: Option<Position>,
-) -> (Position, Vec<Utf8Bytes>) {
-    if let Some(since) = since
+/// Answers a client's [`CatchUp`]. A position of the state's epoch waits up
+/// to [`READ_INDEX_HOLD`] for the read index and for this replica to apply
+/// it, so the answer is never older than what the client saw or what was
+/// committed before; one above the read index is [`Answer::Ahead`]. A
+/// replica that confirms no read index ([`ReadIndex::NotLeader`]) waits as
+/// long for applying the client's position. Without either in that time,
+/// or at once when the replica is [`ReadIndex::CutOff`], the answer is the
+/// state applied here, stale. Another epoch's position, or none, is
+/// answered at once.
+async fn answer(state: &dyn ReplicatedState, request: CatchUp) -> Answer {
+    let mut stale = false;
+    if let Some(since) = request.since
         && since.epoch == state.epoch()
+    {
+        let confirmed = tokio::time::timeout(READ_INDEX_HOLD, async {
+            let wait_for = match state.read_index().await {
+                ReadIndex::Confirmed(committed) if since.revision > committed => {
+                    return Some(Err(committed));
+                }
+                ReadIndex::Confirmed(committed) => committed,
+                ReadIndex::NotLeader => since.revision,
+                ReadIndex::CutOff => return None,
+            };
+            if state.revision() < wait_for {
+                state.applied(wait_for).await;
+            }
+            Some(Ok(()))
+        })
+        .await;
+        match confirmed {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(committed))) => {
+                return Answer::Ahead {
+                    epoch: since.epoch,
+                    committed,
+                    last_revision: since.revision,
+                };
+            }
+            Ok(None) | Err(_) => stale = true,
+        }
+    }
+    catch_up(state, request, stale).await
+}
+
+/// Resolves `true` once this replica has applied `revision`, the position
+/// of a promote, or `false` once the read index is confirmed below it: the
+/// client holds state the replication never committed, and the catch-up it
+/// sends next is answered [`Answer::Ahead`] rather than held.
+async fn promote_floor(state: &dyn ReplicatedState, revision: u64) -> bool {
+    let below = async {
+        match state.read_index().await {
+            ReadIndex::Confirmed(committed) if committed < revision => {}
+            _ => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        () = state.applied(revision) => true,
+        () = below => false,
+    }
+}
+
+/// The deltas after `request.since` when this replica holds them, has
+/// applied that position and the epoch is the same, and a snapshot
+/// otherwise.
+async fn catch_up(state: &dyn ReplicatedState, request: CatchUp, stale: bool) -> Answer {
+    if let Some(since) = request.since
+        && !request.full
+        && since.epoch == state.epoch()
+        && since.revision <= state.revision()
         && let Some(deltas) = state.deltas_since(since).await
     {
-        let mut position = since;
-        let mut texts = Vec::new();
-        for d in deltas.into_iter().filter(|d| d.revision > since.revision) {
-            position.revision = d.revision;
-            texts.push(d.text);
-        }
-        return (position, texts);
+        let deltas: Vec<Delta> = deltas
+            .into_iter()
+            .filter(|d| d.revision > since.revision)
+            .collect();
+        return Answer::Resume {
+            epoch: since.epoch,
+            revision: deltas.last().map_or(since.revision, |d| d.revision),
+            deltas,
+            stale,
+        };
     }
-    let snapshot = state.snapshot().await;
-    let position = Position {
-        epoch: snapshot.epoch,
-        revision: snapshot.revision,
-    };
-    (position, vec![snapshot.text])
+    Answer::Snapshot {
+        snapshot: state.snapshot().await,
+        stale,
+    }
 }
 
 /// When the client has to have answered a ping by: [`PONG_TIMEOUT`] after
@@ -503,27 +689,41 @@ async fn send<T: Sink<Message> + Unpin>(
     }
 }
 
-/// Serves one client until it closes, fails or stops answering pings:
-/// catches it up from `connect.since` (see the module docs), sends what
-/// `queue` holds, pings every [`PING_PERIOD`], keeps the connection in
-/// `connect.sessions` while it answers, and passes each text and binary
-/// message to `on_message`, sending the reply it returns. Subscribe `queue`
-/// before calling.
+/// Serves one client until it closes, fails, stops answering pings or the
+/// state's epoch changes: sends a ping made by `encode` every
+/// [`PING_PERIOD`], keeps the connection in `connect.sessions` while it
+/// answers, passes each text and binary message to `on_message` and acts on
+/// what it returns, answers each [`CatchUp`] (see the module docs) and then
+/// sends what `queue` holds. Subscribe `queue` before calling.
 ///
-/// `on_message` is called for each message in the order received. The
+/// `on_message` is called for each message in the order received, with
+/// whether the product may submit a command now ([`Admission`]). The
 /// [`Reply::Command`] replies go out in that order, the first after the
-/// first catch-up; a [`Reply::Now`] goes out at once. The futures run
-/// beside the heartbeat and each other, so a reply that waits on a commit
-/// or an election does not stall the pings; work that must follow the
-/// order of the messages belongs in the call itself, before the future.
-/// With [`MAX_PENDING_REPLIES`] [`Reply::Command`] replies outstanding the
-/// connection is not read, pongs included, until one is ready, and that
-/// time does not count against the client's [`PONG_TIMEOUT`]; when none is
-/// ready within [`MAX_PAUSE`], or the pauses since the last ping answered
-/// was sent reach [`MAX_PAUSE_TOTAL`], the connection ends. A catch-up
-/// runs beside the heartbeat as well, with `queue` waiting for it. Each
-/// ping carries an opaque payload; a pong answers it when it echoes the
-/// payload unchanged, as RFC 6455 requires, and other pongs are ignored.
+/// first answer to a [`CatchUp`], and none while a catch-up after a gap or
+/// a full delta queue is under way; a [`Reply::Now`] goes out at once. The
+/// futures run beside the heartbeat and each other, so a reply that waits
+/// on a commit or an election does not stall the pings; work that must
+/// follow the order of the messages belongs in the call itself, before the
+/// future. A [`Reply::Pong`] answers the ping made with its `t`, counted
+/// from when that ping was sent; a `t` of no ping outstanding does not
+/// count. WebSocket protocol pings and pongs are not heartbeats here.
+///
+/// The connection is not read, pongs included, while
+/// [`MAX_PENDING_REPLIES`] [`Reply::Command`] replies wait, until one is
+/// ready; while the answer to a [`CatchUp`] is held, until it is sent; and
+/// after a [`Reply::Promote`] of the state's epoch, until this replica has
+/// applied its position or the read index is confirmed below it. That time does not count against the client's
+/// [`PONG_TIMEOUT`]. A pause ends the connection as [`Ended::Failed`] when
+/// it lasts longer than [`MAX_PAUSE`] at the limit, or than
+/// [`READ_INDEX_HOLD`] plus [`MAX_PAUSE`] otherwise, or when the pauses
+/// since the last ping answered was sent reach [`MAX_PAUSE_TOTAL`].
+///
+/// Once the client was answered in an epoch, the connection is closed as
+/// [`Ended::EpochChanged`] when the state's epoch, a delta's or a later
+/// answer's is another, checked before each reply and at least every
+/// [`PING_PERIOD`]. A client
+/// answered [`Answer::Ahead`] is sent no deltas until it is answered with
+/// state again.
 ///
 /// A command is begun and submitted in the call, outside the `async`
 /// block, so commands commit in the order the client sent them; submitted
@@ -533,8 +733,29 @@ async fn send<T: Sink<Message> + Unpin>(
 /// # use axum::body::Bytes;
 /// # use axum::extract::ws::{Message, WebSocket};
 /// # use samplez_service::replica::{Begin, Commands};
-/// # use samplez_service::ws::{ClientQueue, Ended, Reply, serve_client};
+/// # use futures_util::future::BoxFuture;
+/// # use samplez_service::ws::{
+/// #     Admission, Answer, CatchUp, ClientQueue, Encode, Ended, Reply, serve_client,
+/// # };
 /// # use samplez_service::{Connect, ReplicatedState};
+/// struct Text;
+///
+/// impl Encode for Text {
+///     fn ping(&mut self, t: u64) -> Message {
+///         Message::Text(format!("ping {t}").into())
+///     }
+///
+///     fn answer(&mut self, answer: Answer) -> Vec<Message> {
+///         match answer {
+///             Answer::Snapshot { snapshot, .. } => vec![Message::Text(snapshot.text)],
+///             Answer::Resume { deltas, .. } => {
+///                 deltas.into_iter().map(|d| Message::Text(d.text)).collect()
+///             }
+///             Answer::Ahead { .. } => vec![Message::Text("ahead".into())],
+///         }
+///     }
+/// }
+///
 /// # async fn serve(
 /// #     socket: WebSocket,
 /// #     connect: &Connect,
@@ -542,12 +763,21 @@ async fn send<T: Sink<Message> + Unpin>(
 /// #     state: &dyn ReplicatedState,
 /// #     commands: &Commands,
 /// # ) -> Ended {
-/// serve_client(socket, connect, queue, state, |message| {
-///     // Here, in the order received: the message is the command's id, or
-///     // `ping`, answered at once.
+/// serve_client(socket, connect, queue, state, Text, |message, admission| {
+///     // Here, in the order received: `hello` asks for a snapshot,
+///     // `pong <t>` answers a ping, and other text is a command's id.
 ///     let submitted = match message {
-///         Message::Text(t) if t.as_str() == "ping" => {
-///             return Reply::Now(Some(Message::Text("pong".into())));
+///         Message::Text(t) if t.as_str() == "hello" => {
+///             let request = CatchUp { since: None, full: false };
+///             return Reply::CatchUp(request);
+///         }
+///         Message::Text(t) if t.starts_with("pong ") => {
+///             return t.as_str()[5..].parse().map_or(Reply::Now(None), Reply::Pong);
+///         }
+///         Message::Text(id) if admission == Admission::NotApplied => {
+///             let refused = format!("{id} not applied");
+///             let reply = async move { Some(Message::Text(refused.into())) };
+///             return Reply::Command(Box::pin(reply) as BoxFuture<'_, _>);
 ///         }
 ///         Message::Text(id) if connect.require_operator().is_ok() => {
 ///             match commands.begin(&connect.owner, id.as_str()) {
@@ -558,24 +788,26 @@ async fn send<T: Sink<Message> + Unpin>(
 ///         _ => None,
 ///     };
 ///     // Only the wait for the reply is in the future.
-///     Reply::Command(async move {
+///     Reply::Command(Box::pin(async move {
 ///         let ack = submitted?.await.ok()?;
 ///         Some(Message::Text(format!("{} {}", ack.command, ack.revision).into()))
-///     })
+///     }) as BoxFuture<'_, _>)
 /// })
 /// .await
 /// # }
 /// ```
-pub async fn serve_client<S, E, F, Fut>(
+pub async fn serve_client<S, E, P, F, Fut>(
     socket: S,
     connect: &Connect,
     queue: &ClientQueue,
     state: &dyn ReplicatedState,
+    mut encode: P,
     mut on_message: F,
 ) -> Ended
 where
     S: Sink<Message> + Stream<Item = Result<Message, E>>,
-    F: FnMut(Message) -> Reply<Fut>,
+    P: Encode,
+    F: FnMut(Message, Admission) -> Reply<Fut>,
     Fut: Future<Output = Option<Message>>,
 {
     let (mut tx, mut rx) = socket.split();
@@ -583,46 +815,61 @@ where
     let owner = &connect.owner;
     sessions.answered(owner, Instant::now());
     let ended = async {
+        let accepted = Instant::now();
         // When the last ping answered was sent, or the connection
         // accepted, moved on by the pauses since.
-        let mut answered = Instant::now();
+        let mut answered = accepted;
         // The time not read in the pauses since then, the current one not
         // included.
         let mut paused_before = Duration::ZERO;
         // The time not read in all the pauses that ended.
         let mut paused_total = Duration::ZERO;
-        // The pings not answered yet: the number each carries, when it was
+        // The pings not answered yet: the `t` each carries, when it was
         // sent, and the time not read until then.
         let mut pings: VecDeque<(u64, Instant, Duration)> = VecDeque::new();
-        let mut next_ping: u64 = 0;
-        // Since when the connection is not read for the replies at the
-        // limit, and when it ends unless read again.
+        // Since when the connection is not read, and when it ends unless
+        // read again.
         let mut paused: Option<(Instant, Instant)> = None;
         let mut ping = tokio::time::interval(PING_PERIOD);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut catching_up: Option<BoxFuture<'_, _>> =
-            Some(Box::pin(catch_up(state, connect.since)));
-        // Set by the first catch-up, before `queue` and replies are read.
+        // A catch-up being answered, and whether the client asked for it,
+        // which holds what it sends next.
+        let mut catching_up: Option<(BoxFuture<'_, Answer>, bool)> = None;
+        // Set by the first answer, before `queue` and replies are read.
         let mut caught_up = false;
-        let mut position = Position {
-            epoch: 0,
-            revision: 0,
-        };
+        // The epoch of the answers, once the client was answered.
+        let mut epoch: Option<u64> = None;
+        // The position last sent; `None` while the client holds a position
+        // the replication never committed.
+        let mut position: Option<Position> = None;
+        // This replica applying the position of a promote.
+        let mut floor: Option<BoxFuture<'_, bool>> = None;
+        // Set when a promote's position turned out above the read index,
+        // until a catch-up is answered with state.
+        let mut admission = Admission::Submit;
         let mut replies = FuturesOrdered::new();
         loop {
             let at_limit = replies.len() >= MAX_PENDING_REPLIES;
+            let held = matches!(catching_up, Some((_, true))) || floor.is_some();
             match paused {
-                None if at_limit => {
+                None if at_limit || held => {
                     let since = Instant::now();
-                    let end = since + MAX_PAUSE.min(MAX_PAUSE_TOTAL.saturating_sub(paused_before));
+                    let longest = if at_limit {
+                        MAX_PAUSE
+                    } else {
+                        READ_INDEX_HOLD + MAX_PAUSE
+                    };
+                    let end = since + longest.min(MAX_PAUSE_TOTAL.saturating_sub(paused_before));
                     paused = Some((since, end));
                     sessions.paused(owner, since, end);
                 }
                 // Ended even with a reply ready: one ready at the instant
                 // the pause ends can win the select over the end, and a
                 // send can finish at the end.
-                Some((_, end)) if !at_limit && Instant::now() >= end => return Ended::Failed,
-                Some((since, _)) if !at_limit => {
+                Some((_, end)) if !at_limit && !held && Instant::now() >= end => {
+                    return Ended::Failed;
+                }
+                Some((since, _)) if !at_limit && !held => {
                     let pause = since.elapsed();
                     answered += pause;
                     paused_before += pause;
@@ -645,75 +892,116 @@ where
                         let _ = send(&mut tx, Message::Close(None), deadline).await;
                         return Ended::PongTimeout;
                     }
+                    if epoch.is_some_and(|e| e != state.epoch()) {
+                        let _ = send(&mut tx, Message::Close(None), deadline).await;
+                        return Ended::EpochChanged;
+                    }
                     let unread = paused_since.map_or(Duration::ZERO, |since| since.elapsed());
-                    pings.push_back((next_ping, Instant::now(), paused_total + unread));
-                    let payload = Bytes::copy_from_slice(&next_ping.to_be_bytes());
-                    next_ping += 1;
-                    vec![Message::Ping(payload)]
+                    let ms = u64::try_from(accepted.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let t = pings.back().map_or(ms, |&(last, _, _)| ms.max(last + 1));
+                    pings.push_back((t, Instant::now(), paused_total + unread));
+                    vec![encode.ping(t)]
                 }
-                received = rx.next(), if !at_limit => match received {
+                received = rx.next(), if !at_limit && !held => match received {
                     None | Some(Ok(Message::Close(_))) => return Ended::Closed,
                     Some(Err(_)) => return Ended::Failed,
-                    Some(Ok(Message::Pong(payload))) => {
-                        // Counted from when its ping was sent, so pongs that
-                        // waited unread do not count as fresh; one that
-                        // echoes no ping sent and not answered yet does not
-                        // count, and leaves the pings outstanding. Their
-                        // numbers are consecutive, so the echoed one is at
-                        // its distance from the oldest.
-                        let echoed = <[u8; 8]>::try_from(&payload[..]).ok().map(u64::from_be_bytes);
-                        let at = echoed
-                            .zip(pings.front())
-                            .and_then(|(n, oldest)| n.checked_sub(oldest.0))
-                            .and_then(|i| usize::try_from(i).ok())
-                            .filter(|&i| i < pings.len());
-                        if let Some((_, sent, unread)) =
-                            at.and_then(|i| pings.drain(..=i).next_back())
-                        {
-                            paused_before = paused_total - unread;
-                            answered = sent + paused_before;
-                            sessions.answered(owner, answered);
-                        }
-                        Vec::new()
-                    }
-                    Some(Ok(Message::Ping(_))) => Vec::new(),
-                    Some(Ok(m)) => match on_message(m) {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => Vec::new(),
+                    Some(Ok(m)) => match on_message(m, admission) {
                         Reply::Command(reply) => {
                             replies.push_back(reply);
                             Vec::new()
                         }
                         Reply::Now(reply) => reply.into_iter().collect(),
+                        Reply::Pong(t) => {
+                            // Counted from when its ping was sent, so pongs
+                            // that waited unread do not count as fresh; one
+                            // that echoes no ping outstanding does not
+                            // count, and leaves the pings outstanding.
+                            if let Some(at) = pings.iter().position(|&(sent_t, _, _)| sent_t == t)
+                                && let Some((_, sent, unread)) = pings.drain(..=at).next_back()
+                            {
+                                paused_before = paused_total - unread;
+                                answered = sent + paused_before;
+                                sessions.answered(owner, answered);
+                            }
+                            Vec::new()
+                        }
+                        Reply::CatchUp(request) => {
+                            catching_up = Some((Box::pin(answer(state, request)), true));
+                            Vec::new()
+                        }
+                        Reply::Promote(Some(p))
+                            if p.epoch == state.epoch() && state.revision() < p.revision =>
+                        {
+                            floor = Some(Box::pin(promote_floor(state, p.revision)));
+                            Vec::new()
+                        }
+                        Reply::Promote(_) => Vec::new(),
                     },
                 },
-                Some(reply) = replies.next(), if caught_up && !replies.is_empty() => {
+                applied = async { floor.as_mut().expect("guarded").await }, if floor.is_some() => {
+                    floor = None;
+                    if !applied {
+                        admission = Admission::NotApplied;
+                    }
+                    Vec::new()
+                }
+                // Not while catching up, so no reply overtakes the state it
+                // refers to.
+                Some(reply) = replies.next(),
+                    if caught_up && catching_up.is_none() && !replies.is_empty() =>
+                {
+                    if epoch.is_some_and(|e| e != state.epoch()) {
+                        let deadline = pong_deadline(answered, paused_since);
+                        let _ = send(&mut tx, Message::Close(None), deadline).await;
+                        return Ended::EpochChanged;
+                    }
                     reply.into_iter().collect()
                 }
-                (p, texts) = async { catching_up.as_mut().expect("guarded").await },
+                a = async { catching_up.as_mut().expect("guarded").0.as_mut().await },
                     if catching_up.is_some() =>
                 {
                     catching_up = None;
+                    if epoch.is_some_and(|e| e != a.epoch()) {
+                        let deadline = pong_deadline(answered, paused_since);
+                        let _ = send(&mut tx, Message::Close(None), deadline).await;
+                        return Ended::EpochChanged;
+                    }
                     caught_up = true;
-                    position = p;
-                    texts.into_iter().map(Message::Text).collect()
+                    epoch = Some(a.epoch());
+                    position = a.position();
+                    if position.is_some() {
+                        admission = Admission::Submit;
+                    }
+                    encode.answer(a)
                 }
-                popped = queue.pop(), if catching_up.is_none() => match popped {
-                    Popped::Frame(Frame::Delta(d))
-                        if d.epoch == position.epoch && d.revision <= position.revision =>
-                    {
+                popped = queue.pop(), if caught_up && catching_up.is_none() => match (popped, position) {
+                    (Popped::Frame(Frame::Delta(d)), _) if epoch != Some(d.epoch) => {
+                        let deadline = pong_deadline(answered, paused_since);
+                        let _ = send(&mut tx, Message::Close(None), deadline).await;
+                        return Ended::EpochChanged;
+                    }
+                    (Popped::Frame(Frame::Delta(_)) | Popped::Resync, None) => Vec::new(),
+                    (Popped::Frame(Frame::Delta(d)), Some(p)) if d.revision <= p.revision => {
                         Vec::new()
                     }
-                    Popped::Frame(Frame::Delta(d))
-                        if d.epoch == position.epoch && d.prev == position.revision =>
-                    {
-                        position.revision = d.revision;
+                    (Popped::Frame(Frame::Delta(d)), Some(p)) if d.prev == p.revision => {
+                        position = Some(Position {
+                            revision: d.revision,
+                            ..p
+                        });
                         vec![Message::Text(d.text)]
                     }
-                    Popped::Frame(Frame::Delta(_)) | Popped::Resync => {
-                        catching_up = Some(Box::pin(catch_up(state, Some(position))));
+                    (Popped::Frame(Frame::Delta(_)) | Popped::Resync, Some(p)) => {
+                        let request = CatchUp {
+                            since: Some(p),
+                            full: false,
+                        };
+                        catching_up = Some((Box::pin(catch_up(state, request, false)), false));
                         Vec::new()
                     }
-                    Popped::Frame(Frame::Meters(m)) => vec![Message::Binary(m)],
-                    Popped::Frame(Frame::Counters(c)) => vec![Message::Text(c)],
+                    (Popped::Frame(Frame::Meters(m)), _) => vec![Message::Binary(m)],
+                    (Popped::Frame(Frame::Counters(c)), _) => vec![Message::Text(c)],
                 },
             };
             // While paused, a send does not outlast the pause.

@@ -1,8 +1,8 @@
 //! The replicated tables of applied command ids.
 //!
 //! Keyed by (principal, session, XXH3-128 of the client's id), each record
-//! holds the revision of the entry that carried the command, how the
-//! command resolved and that entry's stamping index. Every change happens in state-machine apply, in
+//! holds the product revision the command resolved at, how it resolved
+//! and the stamping index of the entry that carried it. Every change happens in state-machine apply, in
 //! apply order, and every container is ordered, so every replica and every
 //! snapshot install holds the same table.
 
@@ -26,15 +26,22 @@ pub struct Limits {
     pub max_session_commands: usize,
     /// `maxDedupEntries`: records in the set, oldest retired first.
     pub max_dedup_entries: usize,
+    /// The client's failover bound in samples: the longest it resends a
+    /// command after it first sent it. A session's ordering state is kept
+    /// this plus `retention` past its lifetime
+    /// ([`crate::state_machine::Product::forget`]).
+    pub failover: u64,
 }
 
 impl Limits {
-    /// The defaults at `rate` samples per second: 10 s, 1024 and 65536.
+    /// The defaults at `rate` samples per second: 10 s, 1024, 65536 and
+    /// 3 s.
     pub fn defaults(rate: u64) -> Limits {
         Limits {
             retention: 10 * rate,
             max_session_commands: 1024,
             max_dedup_entries: 65536,
+            failover: 3 * rate,
         }
     }
 }
@@ -101,24 +108,29 @@ impl Dedup {
         let seq = self.sessions.get(session)?.get(&hash_id(id))?;
         let record = &self.records[seq];
         let resolution = match record.resolution {
-            Resolution::Applied => Resolution::Duplicate,
+            Resolution::Applied | Resolution::Unchanged => Resolution::Duplicate,
             other => other,
         };
         Some((record.revision, resolution))
     }
 
     /// Sets how the command just recorded resolved, which its record holds
-    /// as applied until then.
-    pub fn resolve(&mut self, session: &SessionKey, id: &str, resolution: Resolution) {
+    /// as applied until then, and the revision it resolved at.
+    pub fn resolve(
+        &mut self,
+        session: &SessionKey,
+        id: &str,
+        resolution: Resolution,
+        revision: u64,
+    ) {
         if let Some(seq) = self
             .sessions
             .get(session)
             .and_then(|ids| ids.get(&hash_id(id)))
         {
-            self.records
-                .get_mut(seq)
-                .expect("indexed record")
-                .resolution = resolution;
+            let record = self.records.get_mut(seq).expect("indexed record");
+            record.resolution = resolution;
+            record.revision = revision;
         }
     }
 
@@ -265,6 +277,7 @@ mod tests {
             retention: 1000,
             max_session_commands: 1024,
             max_dedup_entries: 65536,
+            failover: 0,
         }
     }
 
@@ -321,6 +334,7 @@ mod tests {
             retention: u64::MAX,
             max_session_commands: 4,
             max_dedup_entries: 6,
+            failover: 0,
         });
         for n in 0..6 {
             dedup.record(&key("a"), &n.to_string(), n, n);
@@ -345,6 +359,7 @@ mod tests {
             retention: 100,
             max_session_commands: 3,
             max_dedup_entries: 5,
+            failover: 0,
         });
         for n in 0..20u64 {
             dedup.record(&key(&(n % 3).to_string()), &n.to_string(), n, n * 10);

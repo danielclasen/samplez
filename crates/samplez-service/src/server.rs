@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use crate::auth::{self, Auth, Identity, Listener, Role};
 use crate::config::{AuthMode, ServiceConfig};
 use crate::ops::Ops;
-use crate::replica::{Owner, Position, ReplicatedState};
+use crate::replica::{Owner, ReplicatedState};
 use crate::tls::{ListenerTls, TlsListener, TlsStatus};
 use crate::ws::Sessions;
 use crate::{Error, config};
@@ -46,8 +46,6 @@ type WsHandler =
 #[derive(Debug, Clone)]
 pub struct Connect {
     pub identity: Identity,
-    /// The last position the client saw, from `?since=<epoch>:<revision>`.
-    pub since: Option<Position>,
     /// The principal is the proxy's user or `anonymous`; the session is
     /// `?session=`, chosen by the client and not authenticated, or the
     /// connection id when absent (see [`Owner::session`]).
@@ -74,7 +72,6 @@ impl Connect {
 
 #[derive(Deserialize)]
 struct WsQuery {
-    since: Option<String>,
     session: Option<String>,
 }
 
@@ -84,18 +81,6 @@ fn session_id_valid(s: &str) -> bool {
     (MIN_SESSION_ID..=MAX_SESSION_ID).contains(&s.len())
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-fn parse_position(s: &str) -> Option<Position> {
-    let (epoch, revision) = s.split_once(':')?;
-    let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
-    if !digits(epoch) || !digits(revision) {
-        return None;
-    }
-    Some(Position {
-        epoch: epoch.parse().ok()?,
-        revision: revision.parse().ok()?,
-    })
 }
 
 /// The service's own state for a product's status report.
@@ -208,7 +193,8 @@ impl Service {
     }
 
     /// Serves WebSocket upgrades at `/api/v1/ws` once auth and the `Origin`
-    /// check pass. `?since=` other than `<epoch>:<revision>` gets 400.
+    /// check pass. The client's position is not part of the upgrade: the
+    /// product's protocol carries it ([`crate::ws::Reply::CatchUp`]).
     ///
     /// `?session=` is the client's session id, kept across its
     /// reconnects: at least 16 bytes from a cryptographic random source,
@@ -287,11 +273,6 @@ impl Service {
                         let handler = handler.clone();
                         let sessions = sessions.clone();
                         async move {
-                            let since = match query.since.as_deref().map(parse_position) {
-                                Some(None) => return StatusCode::BAD_REQUEST.into_response(),
-                                Some(p) => p,
-                                None => None,
-                            };
                             let connection = sessions.connection_id();
                             let session = match query.session {
                                 Some(s) if !session_id_valid(&s) => {
@@ -311,7 +292,6 @@ impl Service {
                             };
                             let connect = Connect {
                                 identity,
-                                since,
                                 owner,
                                 sessions,
                             };

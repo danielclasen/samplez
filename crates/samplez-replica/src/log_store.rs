@@ -217,8 +217,7 @@ impl<P: Product> Store<P> {
             Ok(bytes) => {
                 let snapshot: StoredSnapshot =
                     serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-                let at = snapshot.last_applied.map_or(0, |id| id.index);
-                sm.load(snapshot.state.clone(), limits, at)
+                sm.load(snapshot.state.clone(), limits)
                     .map_err(io::Error::other)?;
                 last_applied = snapshot.last_applied;
                 membership = snapshot.membership.clone();
@@ -582,8 +581,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
             (inner.dir.clone(), inner.limits)
         };
         let mut sm = StateMachine::new(P::default(), limits);
-        let at = stored.last_applied.map_or(0, |id| id.index);
-        sm.load(stored.state.clone(), limits, at)
+        sm.load(stored.state.clone(), limits)
             .map_err(|e| read_error(&e))?;
         blocking(move || replace(&dir, "snapshot", &bytes))
             .await
