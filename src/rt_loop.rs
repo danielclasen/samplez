@@ -745,6 +745,9 @@ impl Rt {
         (self, message)
     }
 
+    /// The loop body is real-time; the two calls that wait by design, the
+    /// sync-group wait and `mxlSleepUntil`, are allowed by call site.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn blocks(&mut self) {
         let mut next: Option<u64> = None;
         // libmxl's clock, the CLOCK_MONOTONIC midpoint of the two reads
@@ -799,7 +802,7 @@ impl Rt {
             let deadline = time::deadline(&self.api, k, self.block, self.margin);
             self.wait(k, deadline);
             self.process(k, deadline);
-            time::sleep_until(&self.api, deadline);
+            samplez_mxl::rtsan::allow(|| time::sleep_until(&self.api, deadline));
             let late = time::now(&self.api).saturating_sub(deadline);
             self.counters.wake_jitter_max_ns.fetch_max(late, Relaxed);
             next = Some(k + 1);
@@ -815,7 +818,7 @@ impl Rt {
                 Some(g) if g.mxl.has_inputs() => {
                     let ts = time::group_timestamp(&self.api, k, self.block, g.mxl.max_offset());
                     let timeout = deadline.saturating_sub(time::now(&self.api));
-                    let s = g.mxl.wait(ts, timeout);
+                    let s = samplez_mxl::rtsan::allow(|| g.mxl.wait(ts, timeout));
                     if matches!(s, GroupWait::Failed(MXL_ERR_OUT_OF_RANGE_TOO_EARLY)) {
                         add(&self.counters.input_wait_timeout, 1);
                     }

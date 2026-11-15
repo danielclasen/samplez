@@ -2090,6 +2090,10 @@ mod tests {
     /// releases the writer, which deletes the output flow, and records
     /// the panic.
     #[test]
+    #[cfg_attr(
+        samplez_rtsan,
+        ignore = "the panic allocates in the RT loop, which RealtimeSanitizer aborts"
+    )]
     fn a_panic_on_the_rt_thread_releases_its_state_on_the_supervisor() {
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")

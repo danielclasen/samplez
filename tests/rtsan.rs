@@ -1,11 +1,11 @@
-//! The RT thread's real-time functions under RealtimeSanitizer: built
-//! with `-Zsanitizer=realtime --cfg samplez_rtsan` (CI's RTSan step), any
-//! call RTSan counts as blocking (allocation, lock, sleep, blocking
-//! syscall) inside them aborts the process. The run covers input
-//! generation swaps, a re-route crossfade, a gain ramp, output commits,
-//! metering and a loudness reset. libmxl's sync-group wait and `mxlSleepUntil` lie
-//! outside the marked functions; the failure path's probe is allowed by
-//! call site. Other builds compile this file to nothing.
+//! The RT thread's loop under RealtimeSanitizer: built with
+//! `-Zsanitizer=realtime --cfg samplez_rtsan` (CI's RTSan step), any call
+//! RTSan counts as blocking (allocation, pthread lock, sleep, blocking
+//! syscall) inside it aborts the process. The run covers input generation
+//! swaps, a re-route crossfade, a gain ramp, output commits, metering and
+//! a loudness reset. libmxl's sync-group wait, `mxlSleepUntil`, the
+//! commit's `FUTEX_WAKE` and the failure path's probe are allowed by call
+//! site. Other builds compile this file to nothing.
 
 #![cfg(samplez_rtsan)]
 #![feature(sanitize)]
