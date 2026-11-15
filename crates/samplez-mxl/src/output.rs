@@ -19,9 +19,11 @@ pub struct OutputConfig<'a> {
     pub channels: u32,
     /// Block size B in samples.
     pub block: u64,
-    /// The largest range committed at once, both batch size hints: B, or
-    /// the hold ring of a replica. Creation fails when it is longer than
-    /// half the flow's ring.
+    /// The largest range committed at once: B, or the hold ring of a
+    /// replica. A longer write is refused, and creation fails when the
+    /// batch is longer than half the flow's ring. Both batch size hints
+    /// stay at B, so a reader waiting in a synchronization group wakes on
+    /// every block committed.
     pub batch: u64,
 }
 
@@ -79,8 +81,8 @@ pub enum Creation {
 ///
 /// samplez itself deletes and edits no file in the domain. The writer's
 /// create options set `maxCommitBatchSizeHint` and `maxSyncBatchSizeHint`
-/// to the batch; a new flow is zero-filled by libmxl, so nothing is
-/// written before the first block.
+/// to B; a new flow is zero-filled by libmxl, so nothing is written before
+/// the first block.
 ///
 /// libmxl v1.1.0's `mxlIsFlowActive` reports `MXL_ERR_FLOW_NOT_FOUND` for
 /// any failure to open the flow's data file. An existing flow this process
@@ -111,8 +113,11 @@ pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
     create_writer(instance, c, def, collected)
 }
 
-/// `mxlCreateFlowWriter` with the batch size hints at the batch; an existing flow
-/// it opens (`was_created == false`) is released as [`Creation::Raced`].
+/// `mxlCreateFlowWriter` with both batch size hints at B. libmxl wakes
+/// readers waiting in a synchronization group once per sync batch, so
+/// hints at a larger batch would leave the blocks committed one by one
+/// inside a batch unsignalled. An existing flow it opens
+/// (`was_created == false`) is released as [`Creation::Raced`].
 fn create_writer(
     instance: &Arc<Instance>,
     c: &OutputConfig,
@@ -121,8 +126,8 @@ fn create_writer(
 ) -> Result<Creation> {
     let c_def = CString::new(def).expect("JSON from serde_json has no NUL");
     let options = serde_json::json!({
-        "maxCommitBatchSizeHint": c.batch,
-        "maxSyncBatchSizeHint": c.batch,
+        "maxCommitBatchSizeHint": c.block,
+        "maxSyncBatchSizeHint": c.block,
     })
     .to_string();
     let c_options = CString::new(options).expect("JSON from serde_json has no NUL");
@@ -150,6 +155,7 @@ fn create_writer(
         buffer_length: u64::from(cont.bufferLength),
         channels: cont.channelCount as usize,
         block: c.block,
+        batch: c.batch,
         commit_hint: info.common.maxCommitBatchSizeHint,
         sync_hint: info.common.maxSyncBatchSizeHint,
         last_commit: None,
@@ -174,14 +180,15 @@ fn create_writer(
     Ok(Creation::Created { writer, collected })
 }
 
-/// The outcome of one [`FlowWriter::write_block`].
+/// The outcome of one [`FlowWriter::write`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Write {
     Committed,
-    /// The block starts below the last commit and is not written.
+    /// The range starts below the last commit and is not written.
     Held,
-    /// libmxl refused the open or the commit, or `data` is shorter than
-    /// channels x B (`MXL_ERR_INVALID_ARG`).
+    /// libmxl refused the open or the commit; or the range is empty,
+    /// longer than the batch or than its stride, or `data` is shorter than
+    /// (channels - 1) x stride + len (`MXL_ERR_INVALID_ARG`).
     Failed(Status),
 }
 
@@ -195,6 +202,8 @@ pub struct FlowWriter {
     buffer_length: u64,
     channels: usize,
     block: u64,
+    /// The longest range one write commits.
+    batch: u64,
     commit_hint: u32,
     sync_hint: u32,
     last_commit: Option<u64>,
@@ -226,6 +235,7 @@ impl FlowWriter {
         self.last_commit
     }
 
+    /// The writes held: blocks, or ranges for [`FlowWriter::write`].
     pub fn held_blocks(&self) -> u64 {
         self.held_blocks
     }
@@ -244,19 +254,24 @@ impl FlowWriter {
     /// `mxlFlowWriterOpenSamples(start + len, len)`, both fragments
     /// filled, `mxlFlowWriterCommitSamples`. A range starting below the
     /// last commit is held and counted; libmxl zero-fills a forward gap on
-    /// commit.
+    /// commit, so an empty range, which would publish that gap as
+    /// committed, is refused, as is one longer than the batch.
     pub fn write(&mut self, start: u64, len: usize, data: &[f32], stride: usize) -> Write {
         let Some(end) = start.checked_add(len as u64) else {
             return Write::Failed(mxl_sys::MXL_ERR_INVALID_ARG);
         };
+        if len == 0
+            || len as u64 > self.batch
+            || len > stride
+            || data.len() < (self.channels - 1) * stride + len
+        {
+            return Write::Failed(mxl_sys::MXL_ERR_INVALID_ARG);
+        }
         if self.last_commit.is_some_and(|last| start < last) {
             self.held_blocks += 1;
             return Write::Held;
         }
         let n = len;
-        if len > stride || data.len() < (self.channels - 1) * stride + len {
-            return Write::Failed(mxl_sys::MXL_ERR_INVALID_ARG);
-        }
         let api = self.instance.api();
         let mut slice = mxl_sys::MutableWrappedMultiBufferSlice::default();
         // SAFETY: live writer, writable slice.
@@ -272,8 +287,9 @@ impl FlowWriter {
             let second = (f1.size / width).min(rest.len());
             // SAFETY: libmxl returned two writable fragments of `f0.size`
             // and `f1.size` bytes inside channel 0 of the mapped ring, and
-            // channel `ch < slice.count` lies `ch * stride` bytes on. At most
-            // those sizes are copied, from `src`, which holds `n` samples.
+            // channel `ch < slice.count` lies `ch * slice.stride` bytes on.
+            // At most those sizes are copied, from `src`, which holds `n`
+            // samples.
             // Bytes are copied, so no alignment is assumed.
             unsafe {
                 std::ptr::copy_nonoverlapping(

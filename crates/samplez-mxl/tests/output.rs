@@ -156,7 +156,7 @@ fn a_live_writer_of_another_instance_is_left_alone() {
 
 /// A range of several blocks and a partial block, from a planar buffer
 /// with a longer stride, is read back at its indices in one commit; the
-/// batch hints are the batch.
+/// batch hints stay at B.
 #[test]
 fn a_range_is_written_in_one_commit() {
     let api = api();
@@ -170,7 +170,7 @@ fn a_range_is_written_in_one_commit() {
     let Creation::Created { writer: mut w, .. } = output::create(&instance, &cfg).unwrap() else {
         panic!("flow {id} not created");
     };
-    assert_eq!(w.hints(), (20 * B as u32, 20 * B as u32));
+    assert_eq!(w.hints(), (B as u32, B as u32));
     let stride = 20 * B as usize;
     let start = K0 * B + 7;
     let len = 3 * B as usize + 5;
@@ -196,8 +196,9 @@ fn a_range_is_written_in_one_commit() {
     ));
 }
 
-/// A batch longer than half the flow's ring is refused at creation, and
-/// the flow is released with its writer.
+/// A batch of exactly half the flow's ring is accepted and a write that
+/// long commits; one sample more is refused at creation, and the flow is
+/// released with its writer.
 #[test]
 fn a_batch_above_half_the_ring_is_refused() {
     let api = api();
@@ -205,8 +206,21 @@ fn a_batch_above_half_the_ring_is_refused() {
     let id = new_id();
     let instance = Instance::new(&api, &domain.0).unwrap();
     let len = created(&instance, &new_id(), 1).buffer_length();
+    let half = OutputConfig {
+        batch: len / 2,
+        ..config(&id, 1)
+    };
+    let Creation::Created { writer: mut w, .. } = output::create(&instance, &half).unwrap() else {
+        panic!("a batch of half the ring was refused");
+    };
+    let data = vec![0.5f32; (len / 2) as usize];
+    assert_eq!(
+        w.write(K0 * B, data.len(), &data, data.len()),
+        Write::Committed
+    );
+    drop(w);
     let cfg = OutputConfig {
-        batch: (len / 2 / B + 1) * B,
+        batch: len / 2 + 1,
         ..config(&id, 1)
     };
     let Err(samplez_mxl::Error::Batch {
@@ -218,4 +232,67 @@ fn a_batch_above_half_the_ring_is_refused() {
     };
     assert_eq!((batch, buffer_length), (cfg.batch, len));
     assert_eq!(instance.is_flow_active(&id).unwrap(), None);
+}
+
+/// A range across the ring's end, from a buffer whose stride is longer
+/// than the range, is read back at its indices.
+#[test]
+fn a_range_across_the_ring_end_is_read_back() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let instance = Instance::new(&api, &domain.0).unwrap();
+    let cfg = OutputConfig {
+        batch: 20 * B,
+        ..config(&id, 2)
+    };
+    let Creation::Created { writer: mut w, .. } = output::create(&instance, &cfg).unwrap() else {
+        panic!("flow {id} not created");
+    };
+    let ring = w.buffer_length();
+    let stride = 20 * B as usize;
+    let len = 3 * B as usize + 5;
+    // Starts 50 samples before a ring boundary.
+    let start = 5_000 * ring - 50;
+    let mut buf = vec![f32::NAN; 2 * stride];
+    for c in 0..2 {
+        for i in 0..len {
+            buf[c * stride + i] = sample(c, start + i as u64);
+        }
+    }
+    assert_eq!(w.write(start, len, &buf, stride), Write::Committed);
+    let r = RawReader::open(&api, &domain.0, &id);
+    let got = r.samples(start + len as u64, len).unwrap();
+    for (c, chan) in got.iter().enumerate() {
+        let want: Vec<f32> = (start..start + len as u64).map(|i| sample(c, i)).collect();
+        assert_eq!(chan, &want, "ch {c}");
+    }
+}
+
+/// An empty range and a range longer than the batch are refused and move
+/// nothing: libmxl would commit an empty range, zero-filling the gap
+/// before it and moving the head over it.
+#[test]
+fn an_empty_or_too_long_range_is_refused() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let instance = Instance::new(&api, &domain.0).unwrap();
+    let cfg = OutputConfig {
+        batch: 2 * B,
+        ..config(&id, 2)
+    };
+    let Creation::Created { writer: mut w, .. } = output::create(&instance, &cfg).unwrap() else {
+        panic!("flow {id} not created");
+    };
+    let data = vec![0.5f32; 2 * 3 * B as usize];
+    assert_eq!(w.write_block(K0, &data[..2 * B as usize]), Write::Committed);
+    let end = w.last_commit().unwrap();
+    let r = RawReader::open(&api, &domain.0, &id);
+    let stride = 3 * B as usize;
+    for (start, len) in [(end + 1_000, 0), (end, 3 * B as usize)] {
+        let result = w.write(start, len, &data, stride);
+        assert!(matches!(result, Write::Failed(_)), "{len}: {result:?}");
+        assert_eq!((w.last_commit(), r.head()), (Some(end), end), "{len}");
+    }
 }
