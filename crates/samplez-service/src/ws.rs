@@ -341,8 +341,9 @@ impl Sessions {
     /// # Errors
     ///
     /// [`Error::Config`] when `replica` is empty, longer than
-    /// [`MAX_REPLICA_ID`] or holds anything but lowercase ASCII letters,
-    /// digits and `-`, or when the operating system's random source fails.
+    /// [`MAX_REPLICA_ID`], holds anything but lowercase ASCII letters,
+    /// digits and `-` or starts or ends with `-`, or when the operating
+    /// system's random source fails.
     pub fn new(replica: &str) -> Result<Sessions, Error> {
         if replica.is_empty() || replica.len() > MAX_REPLICA_ID {
             return Err(Error::Config(format!(
@@ -353,9 +354,12 @@ impl Sessions {
         if !replica
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || replica.starts_with('-')
+            || replica.ends_with('-')
         {
             return Err(Error::Config(format!(
-                "the replica id {replica:?} has to be lowercase letters, digits and '-'"
+                "the replica id {replica:?} has to be lowercase letters, digits and '-', \
+                 starting and ending with a letter or digit"
             )));
         }
         let mut nonce = [0u8; 16];
@@ -838,7 +842,8 @@ mod tests {
     #[test]
     fn replica_ids_are_dns_labels() {
         assert!(Sessions::new("samplez-0").is_ok());
-        for replica in ["a:b", "R1", "r.1", "r_1", "r 1", "r\u{e9}"] {
+        assert!(Sessions::new("0").is_ok());
+        for replica in ["a:b", "R1", "r.1", "r_1", "r 1", "r\u{e9}", "-", "-a", "a-"] {
             assert!(
                 matches!(Sessions::new(replica), Err(Error::Config(_))),
                 "{replica:?}"
