@@ -5,7 +5,7 @@
 mod common;
 
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Duration;
 
 use common::{
@@ -511,5 +511,43 @@ fn a_down_input_re_routed_to_a_live_flow_comes_up() {
         s.inputs[0].up && s.inputs[0].state == InputState::Attached
     });
     assert_eq!(e.status().inputs[0].flow_id, live);
+    common::stop(e);
+}
+
+/// A report the log's channel had no room for is sent again: an input
+/// pruned while the channel was full is reported pruned once there is
+/// room, and so is one that became readable while it was full.
+#[test]
+fn a_report_the_channel_had_no_room_for_is_sent_again() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let filler = Report::InputReadable { slot: 1 };
+    let (report_tx, reports) = sync_channel(1);
+    report_tx.send(filler).unwrap();
+    let (verdict_tx, rx) = sync_channel(1 << 16);
+    let cfg = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    );
+    let process = samplez::rt::setup_process(&cfg.rt);
+    let e = Engine::start_replicated(cfg, process, Some(verdict_tx), report_tx.clone()).unwrap();
+    let dropped = || e.counters().reports_dropped.load(Relaxed);
+    wait_for(10 * SECOND, "a report dropped", || dropped() >= 1);
+    assert_eq!(reports.recv().unwrap(), filler);
+    report(&reports, Report::InputPruned { slot: 0 });
+
+    e.append(1, (now(&rx) + 20) * B, Entry::InputDown { slot: 0 })
+        .unwrap();
+    e.commit(1);
+    wait_for(5 * SECOND, "input down", || !e.status().inputs[0].up);
+    report_tx.send(filler).unwrap();
+    let before = dropped();
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    wait_for(10 * SECOND, "a report dropped", || dropped() > before);
+    assert_eq!(reports.recv().unwrap(), filler);
+    report(&reports, Report::InputReadable { slot: 0 });
     common::stop(e);
 }

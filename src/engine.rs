@@ -686,6 +686,7 @@ impl Engine {
                     flow: i.flow_id.clone(),
                     up: true,
                     reported: false,
+                    prune_unsent: false,
                     routing: None,
                 })
                 .collect(),
@@ -1035,6 +1036,8 @@ struct SupSlot {
     up: bool,
     /// `InputReadable` was reported since the polled head was last late.
     reported: bool,
+    /// An `InputPruned` report did not go out.
+    prune_unsent: bool,
     /// After a re-route: the index its crossfade ends at and the flow it
     /// left, kept in rebuilt generations until the RT thread passed it.
     routing: Option<(u64, String)>,
@@ -1402,6 +1405,14 @@ impl Supervisor {
                     *h = held;
                 }
             }
+            let s = &mut self.slots[slot];
+            if s.prune_unsent {
+                if s.up && matches!(s.state, SupState::Pruned { .. }) {
+                    self.report(Report::InputPruned { slot });
+                } else {
+                    s.prune_unsent = false;
+                }
+            }
         }
         let now = time::now(&self.api);
         let mut heads: HashMap<(usize, String), Option<u64>> = HashMap::new();
@@ -1432,10 +1443,10 @@ impl Supervisor {
                 self.release_poll(slot);
                 self.slots[slot].state = SupState::Wanted;
                 self.dirty[d] = true;
-            } else if !s.reported {
-                log(format_args!("input {} on time again, reported", cfg.name));
-                s.reported = true;
-                self.report(Report::InputReadable { slot });
+            } else if !s.reported && self.report(Report::InputReadable { slot }) {
+                let name = &self.config.inputs[slot].name;
+                log(format_args!("input {name} on time again, reported"));
+                self.slots[slot].reported = true;
             }
         }
     }
@@ -1735,49 +1746,60 @@ impl Supervisor {
     /// readable one that is down comes up at the earliest index a
     /// generation-needing entry takes, each after the slot's last entry
     /// and its ramp, and an `InputUp` buildLead after the log's last
-    /// generation-needing entry.
-    fn report(&mut self, r: Report) {
-        if let Some(tx) = &self.reports {
-            if tx.try_send(r).is_err() {
-                self.counters.reports_dropped.fetch_add(1, Relaxed);
-            }
-            return;
-        }
+    /// generation-needing entry. False when it did not go out: the channel
+    /// was full or the log refused it. An `InputPruned` that did not go
+    /// out is sent again by `poll` while it holds.
+    fn report(&mut self, r: Report) -> bool {
         let (slot, up) = match r {
             Report::InputPruned { slot } => (slot, false),
             Report::InputReadable { slot } => (slot, true),
         };
-        let mut earliest = earliest(&self.api, &self.counters, self.timing.margin, self.lead);
-        let build_lead = self.build_lead.load(Relaxed);
-        let consumed = self.counters.entries_consumed.load(Acquire);
-        let mut log = self.log.lock().expect("log lock");
-        let Some(local) = &log.local else { return };
-        if local.up[slot] == up {
-            return;
-        }
-        let change = if up {
-            earliest = (earliest - self.lead + build_lead).max(local.gen_at + build_lead);
-            Change::InputUp { slot }
-        } else {
-            Change::InputDown { slot }
+        let sent = 'sent: {
+            if let Some(tx) = &self.reports {
+                if tx.try_send(r).is_err() {
+                    self.counters.reports_dropped.fetch_add(1, Relaxed);
+                    break 'sent false;
+                }
+                break 'sent true;
+            }
+            let mut earliest = earliest(&self.api, &self.counters, self.timing.margin, self.lead);
+            let build_lead = self.build_lead.load(Relaxed);
+            let consumed = self.counters.entries_consumed.load(Acquire);
+            let mut log = self.log.lock().expect("log lock");
+            let Some(local) = &log.local else {
+                break 'sent true;
+            };
+            if local.up[slot] == up {
+                break 'sent true;
+            }
+            let change = if up {
+                earliest = (earliest - self.lead + build_lead).max(local.gen_at + build_lead);
+                Change::InputUp { slot }
+            } else {
+                Change::InputDown { slot }
+            };
+            let at_index = stamp(earliest, local.last_at[slot], self.ramp, self.timing.block);
+            let e = RtEntry {
+                id: log.last + 1,
+                at_index,
+                change,
+            };
+            if log.append(e, None, consumed).is_err() {
+                break 'sent false;
+            }
+            log.commit(e.id);
+            let local = log.local.as_mut().expect("checked above");
+            local.up[slot] = up;
+            local.last_at[slot] = at_index;
+            if up {
+                local.gen_at = at_index;
+            }
+            true
         };
-        let at_index = stamp(earliest, local.last_at[slot], self.ramp, self.timing.block);
-        let e = RtEntry {
-            id: log.last + 1,
-            at_index,
-            change,
-        };
-        if log.append(e, None, consumed).is_err() {
-            // Tried again on the next report.
-            return;
+        if !up {
+            self.slots[slot].prune_unsent = !sent;
         }
-        log.commit(e.id);
-        let local = log.local.as_mut().expect("checked above");
-        local.up[slot] = up;
-        local.last_at[slot] = at_index;
-        if up {
-            local.gen_at = at_index;
-        }
+        sent
     }
 
     fn stats(&mut self, slot: usize, stats: SlotStats) {
