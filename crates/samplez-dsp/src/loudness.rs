@@ -1,16 +1,17 @@
 //! Loudness per ITU-R BS.1770-5 and EBU R 128 from the K-weighted mean
-//! square of consecutive 100 ms windows: momentary (400 ms) and short-term
+//! square of consecutive 10 ms slices: momentary (400 ms) and short-term
 //! (3 s) loudness and their maxima (EBU Tech 3341), integrated loudness
 //! gated per BS.1770-5 equations (4) to (7), and the loudness range of
 //! EBU Tech 3342.
 //!
-//! The input is the power of consecutive 10 ms slices, ten to a window.
-//! A 400 ms gating block is four consecutive windows, so blocks overlap by
-//! 75 % as BS.1770-5 requires; the short-term loudness LRA is computed
-//! from is evaluated at every window, at 10 Hz as Tech 3342 requires. The
-//! momentary and short-term loudness slide by one slice: Tech 3341 cases
-//! 13 and 14 place 400 ms tones at multiples of 20 ms, which a 100 ms step
-//! would read up to 0.6 dB low.
+//! The input is the power of consecutive 10 ms slices, ten to a 100 ms
+//! window. A 400 ms gating block, four consecutive windows, is taken at
+//! the end of every window, so blocks overlap by 75 % as BS.1770-5
+//! requires; the loudness range takes the short-term loudness at the end
+//! of every window, at 10 Hz as Tech 3342 requires. The momentary and
+//! short-term loudness slide by one slice: Tech 3341 cases 13 and 14
+//! place 400 ms tones at multiples of 20 ms, which a 100 ms step would
+//! read up to 0.6 dB low.
 //!
 //! Gating blocks and short-term values are kept in histograms of 0.01 LU
 //! bins, with the exact sum of the powers in each bin, so memory is bounded
@@ -120,7 +121,7 @@ fn edges() -> Vec<f64> {
     e
 }
 
-/// Loudness measurement of one programme, fed one window at a time.
+/// Loudness measurement of one programme, fed one slice at a time.
 pub struct Loudness {
     edges: Vec<f64>,
     /// Weighted powers of the last [`SHORT`] slices, a ring indexed by the
@@ -222,8 +223,8 @@ impl Loudness {
 
     /// Restarts the integrated loudness, the loudness range and the
     /// maxima at the next slice; a caller resetting on a window boundary
-    /// keeps the gating blocks on the 100 ms grid. The momentary and short-term loudness
-    /// keep running.
+    /// keeps the gating blocks on the 100 ms grid. The momentary and
+    /// short-term loudness keep running.
     pub fn reset(&mut self) {
         self.measured = 0;
         self.valid = true;
@@ -233,7 +234,7 @@ impl Loudness {
         self.max_short_term = None;
     }
 
-    /// Whether no window went missing since the measurement started.
+    /// Whether no slice went missing since the measurement started.
     pub fn valid(&self) -> bool {
         self.valid
     }
