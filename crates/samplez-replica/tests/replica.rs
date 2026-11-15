@@ -64,6 +64,14 @@ async fn a_restarted_replica_is_back_at_its_last_applied_revision_before_any_ele
         "readiness does not wait for a leader"
     );
     assert!(!replica.quorum().await, "no leader, so it orders nothing");
+    assert_eq!(
+        replica.status().as_deref(),
+        Some("not counted as a voter yet"),
+        "within 3 s of the start"
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let status = replica.status().expect("a status");
+    assert!(status.contains("for 3 s; asking to join"), "{status}");
 }
 
 /// A replica whose volume was lost comes back as a new node at revision

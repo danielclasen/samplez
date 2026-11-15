@@ -306,42 +306,108 @@ const TICK: Duration = Duration::from_millis(100);
 /// status names the marker to delete.
 pub const NO_MEMBER_ROUNDS: u32 = 5;
 
+/// Whether a leader counts this replica as a voter, from one check per
+/// tick. A replica is counted from a check that finds it counted. Once
+/// counted it stays counted, while it leads or its membership has it as
+/// a voter, through ticks in which its applied index advanced: an entry
+/// committed, so a quorum took it whatever the age of the last
+/// acknowledgement or append openraft reports. Progress alone never
+/// counts a replica: one restarted from its volume applies its own log
+/// without any leader. It stops being counted only after
+/// [`UNCOUNTED`] of consecutive ticks that ran on time without either. A
+/// tick the runtime ran late saw state that went stale meanwhile, the
+/// replica's own heartbeats and acknowledgements held up with it, so it
+/// neither counts towards that nor resets it.
+#[derive(Debug, Default)]
+pub(crate) struct Counting {
+    counted: bool,
+    uncounted: u32,
+    applied: Option<u64>,
+}
+
+impl Counting {
+    const TICKS: u32 = (UNCOUNTED.as_millis() / TICK.as_millis()) as u32;
+
+    /// Takes one tick's check: `found` what [`Shared::counted_now`] found,
+    /// `late` whether the tick ran more than a tick after it was due,
+    /// `applied` the applied log index while this replica leads or is a
+    /// voter. Returns whether it is counted.
+    pub(crate) fn check(&mut self, found: bool, late: bool, applied: Option<u64>) -> bool {
+        let progressed = matches!((self.applied, applied), (Some(was), Some(now)) if now > was);
+        self.applied = applied;
+        if found || progressed && self.counted {
+            self.counted = true;
+            self.uncounted = 0;
+        } else if !late {
+            self.uncounted = self.uncounted.saturating_add(1);
+            if self.lapsed() {
+                self.counted = false;
+            }
+        }
+        self.counted
+    }
+
+    /// No check found it counted for [`UNCOUNTED`] of on-time ticks.
+    pub(crate) fn lapsed(&self) -> bool {
+        self.uncounted >= Self::TICKS
+    }
+}
+
 /// Keeps a replica in a set. An empty volume starts or joins the set the
 /// marker names (`bootstrap`) a round per [`PERIOD`], reading the marker
 /// every round, so a deleted or replaced marker takes effect without a
 /// restart. A replica with a log is commitable while a leader counts it
-/// as a voter, checked each 100 ms, and for [`UNCOUNTED`] after; past
-/// that it asks to join again under its own id each [`PERIOD`], as one
-/// removed from the voters while it was down must.
+/// as a voter ([`Counting`]), checked each 100 ms; once it was not
+/// counted for [`UNCOUNTED`] it asks to join again under its own id each
+/// [`PERIOD`], as one removed from the voters while it was down must.
 pub(crate) async fn watch(shared: Arc<Shared>, bootstrap: Bootstrap) {
     let mut empty_rounds = 0;
-    let mut counted_at: Option<Instant> = None;
+    let mut counting = Counting::default();
     let mut asked_at: Option<Instant> = None;
+    let mut due = Instant::now();
     loop {
-        let now = Instant::now();
         if shared.raft.is_initialized().await.unwrap_or(true) {
-            if shared.counted_now().await {
-                counted_at = Some(now);
-                shared.counted.store(true, Ordering::SeqCst);
+            let late = Instant::now() > due + TICK;
+            let metrics = shared.raft.metrics().borrow().clone();
+            let voter = metrics.state == ServerState::Leader
+                || metrics
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .any(|id| id == shared.settings.id);
+            let applied = voter.then(|| metrics.last_applied.map_or(0, |id| id.index));
+            let found = shared.counted_now().await;
+            let counted = counting.check(found, late, applied);
+            shared.counted.store(counted, Ordering::SeqCst);
+            if counted {
                 shared.set_status(None);
-            } else if counted_at.is_none_or(|at| now - at >= UNCOUNTED) {
-                shared.counted.store(false, Ordering::SeqCst);
-                if counted_at.is_some() || now - shared.started >= UNCOUNTED {
-                    shared.set_status(Some(
-                        "no leader counts this replica as a voter; asking to join as a learner"
-                            .into(),
-                    ));
-                    if asked_at.is_none_or(|at| now - at >= PERIOD) {
-                        asked_at = Some(now);
-                        shared.ask_to_join(shared.epoch()).await;
-                    }
+            } else {
+                let learner = metrics
+                    .membership_config
+                    .membership()
+                    .learner_ids()
+                    .any(|id| id == shared.settings.id);
+                let status = if learner {
+                    "a learner, catching up before a leader makes it a voter"
+                } else if counting.lapsed() {
+                    "no leader counted this replica as a voter for 3 s; asking to join as a learner"
+                } else {
+                    "not counted as a voter yet"
+                };
+                shared.set_status(Some(status.into()));
+                let now = Instant::now();
+                if counting.lapsed() && asked_at.is_none_or(|at| now - at >= PERIOD) {
+                    asked_at = Some(now);
+                    shared.ask_to_join(shared.epoch()).await;
                 }
             }
-            tokio::time::sleep(TICK).await;
+            due = Instant::now() + TICK;
+            tokio::time::sleep_until(due).await;
         } else {
             let started = start(&shared, &bootstrap, &mut empty_rounds).await;
             shared.set_status(started.err());
             tokio::time::sleep(PERIOD).await;
+            due = Instant::now();
         }
     }
 }
@@ -483,6 +549,75 @@ pub(crate) async fn reconcile(shared: Arc<Shared>, want: Voters) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One check per tick, all on time, with `found` and no leader
+    /// progress; the result of the last.
+    fn ticks(counting: &mut Counting, n: u32, found: bool) -> bool {
+        (0..n).fold(false, |_, _| counting.check(found, false, None))
+    }
+
+    #[test]
+    fn a_replica_is_uncounted_only_after_uncounted_of_on_time_ticks() {
+        let mut counting = Counting::default();
+        assert!(
+            !ticks(&mut counting, 1, false),
+            "not counted before a check finds it"
+        );
+        assert!(ticks(&mut counting, 1, true));
+        assert!(
+            ticks(&mut counting, Counting::TICKS - 1, false),
+            "still counted"
+        );
+        assert!(!counting.lapsed());
+        assert!(!ticks(&mut counting, 1, false));
+        assert!(counting.lapsed());
+        assert!(ticks(&mut counting, 1, true), "counted again at once");
+        assert!(!counting.lapsed());
+    }
+
+    #[test]
+    fn a_late_tick_neither_counts_towards_uncounted_nor_resets_it() {
+        let mut counting = Counting::default();
+        ticks(&mut counting, 1, true);
+        ticks(&mut counting, Counting::TICKS - 1, false);
+        for _ in 0..1000 {
+            assert!(
+                counting.check(false, true, None),
+                "a late tick saw stale state"
+            );
+        }
+        assert!(
+            !counting.check(false, false, None),
+            "the next on-time tick lapses"
+        );
+    }
+
+    #[test]
+    fn a_voter_whose_applied_index_advances_is_counted() {
+        let mut counting = Counting::default();
+        assert!(!counting.check(false, false, Some(0)));
+        assert!(
+            !counting.check(false, false, Some(5)),
+            "progress alone: a restart replaying its own log"
+        );
+        assert!(counting.check(true, false, Some(0)));
+        for tick in 1..10 * Counting::TICKS {
+            let applied = u64::from(tick / 10);
+            assert!(
+                counting.check(false, false, Some(applied)),
+                "an entry committed every 10 ticks, at tick {tick}"
+            );
+        }
+        let applied = u64::from(Counting::TICKS);
+        assert!(counting.check(true, false, Some(applied)));
+        for _ in 0..Counting::TICKS - 1 {
+            assert!(counting.check(false, false, Some(applied)));
+        }
+        assert!(
+            !counting.check(false, false, Some(applied)),
+            "no commit and no acknowledgement"
+        );
+    }
 
     fn audio(ordinal: u16, volume: u64) -> NodeId {
         node_id(Slot::Audio(ordinal), volume)
