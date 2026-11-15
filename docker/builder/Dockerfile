@@ -71,7 +71,7 @@ RUN curl -sSfo /tmp/rustup-init \
 ARG NIGHTLY=nightly-2026-09-20
 ARG GUNGRAUN_VERSION=0.20.0
 RUN apt-get update \
- && apt-get install -y --no-install-recommends valgrind \
+ && apt-get install -y --no-install-recommends valgrind=1:3.24.0-3 \
  && rm -rf /var/lib/apt/lists/* \
  && rustup toolchain install "${NIGHTLY}" --profile minimal --component rust-src \
  && cargo install --locked gungraun-runner --version "${GUNGRAUN_VERSION}" \

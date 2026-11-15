@@ -136,7 +136,9 @@ impl FlowReader {
             return MXL_ERR_INVALID_ARG;
         };
         let mut slice = WrappedMultiBufferSlice::default();
-        self.samples(end, 1, &mut slice)
+        // The validity check is the failure path's documented exception;
+        // RealtimeSanitizer allows this call only.
+        crate::rtsan::allow(|| self.samples(end, 1, &mut slice))
     }
 }
 

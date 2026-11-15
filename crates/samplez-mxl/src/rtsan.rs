@@ -1,7 +1,10 @@
 //! RealtimeSanitizer scopes. A build with `--cfg samplez_rtsan` and
 //! `-Zsanitizer=realtime` checks the functions samplez marks as real-time;
 //! [`allow`] takes the calls whose blocking is documented and bounded out
-//! of that check by call site. Any other build runs them unchanged.
+//! of that check by call site. Each scope is one libmxl call, and the
+//! whole call is unchecked: the output commit's gap zero-fill and header
+//! writes as well as its `FUTEX_WAKE`. Any other build runs them
+//! unchanged.
 
 #[cfg(samplez_rtsan)]
 unsafe extern "C" {

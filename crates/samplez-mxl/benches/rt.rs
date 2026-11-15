@@ -95,7 +95,7 @@ fn commit_gap((mut out, data): (Output, Vec<f32>)) -> (Output, Vec<f32>) {
     (out, data)
 }
 
-const COMMIT_NEXT: u64 = 1_600;
+const COMMIT_NEXT: u64 = 1_509;
 const COMMIT_GAP: u64 = 685_000;
 
 library_benchmark_group!(name = commit, benchmarks = [commit_next, commit_gap]);

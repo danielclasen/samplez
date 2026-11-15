@@ -1123,9 +1123,7 @@ impl Rt {
                             // The failure path (README): the probe runs
                             // libmxl's flow validity check, a stat() and
                             // path allocations.
-                            samplez_mxl::rtsan::allow(|| {
-                                input.identify(&mut slot.state, group, outcome)
-                            });
+                            input.identify(&mut slot.state, group, outcome);
                         }
                         _ => {}
                     }
