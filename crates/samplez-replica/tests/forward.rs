@@ -133,12 +133,23 @@ async fn quorum_loss_refuses_writes_and_serves_stale_reads_until_it_returns() {
             .submit(&owner("s"), &format!("q{id}"), Bytes::from("pan=1@1"))
             .await
             .expect_err("no quorum");
-        assert_eq!(refused.reason, Reason::Unavailable, "replica {id}");
+        // 503 either way: unavailable while a leader counted the replica
+        // within the last rounds, not commitable once none has for longer.
+        assert!(
+            matches!(refused.reason, Reason::Unavailable | Reason::NotCommitable),
+            "replica {id}: {refused}"
+        );
         assert!(asked.elapsed() <= Duration::from_secs(2));
     }
 
     set_.net.heal();
     set_.leader().await;
+    // Commitable again once a leader counts it, within a check.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !set_.replica(follower).replica().commitable {
+        assert!(Instant::now() < deadline, "not commitable again");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let after = set_
         .replica(follower)
         .submit(&owner("s"), "2", Bytes::from("gain=2@2"))

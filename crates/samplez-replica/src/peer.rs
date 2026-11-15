@@ -50,9 +50,16 @@ pub enum PeerRequest {
     /// An entry the sender orders on its own account: its lease renewals,
     /// the only entry a peer may have the leader append.
     Append { body: Body, within_ms: u64 },
-    /// A replica with an empty volume asks the leader to take it in as a
-    /// learner at `addr`.
-    Join { id: NodeId, addr: String },
+    /// A replica of the set `cluster` asks the leader to take it in as a
+    /// learner at `addr`: an empty volume, or one no leader counts as a
+    /// voter any more.
+    Join {
+        id: NodeId,
+        addr: String,
+        cluster: u64,
+    },
+    /// Whether the replica asked is a member of a set.
+    Member,
     /// The index a read must have applied to see every committed write,
     /// once the leader confirmed with a quorum that it still leads.
     ReadIndex,
@@ -64,6 +71,7 @@ pub enum PeerResponse {
     Forwarded(Vec<Result<Outcome, Refused>>),
     Appended,
     Joined,
+    Member(bool),
     ReadIndex(u64),
 }
 
@@ -82,6 +90,13 @@ pub enum Refused {
     Misaddressed,
     /// An entry a peer may not have the leader append.
     NotForwardable,
+    /// The replica asked is a member of no set.
+    NotMember,
+    /// A join under another cluster id than the set's, such as one read
+    /// from a marker deleted and created anew since.
+    OtherCluster,
+    /// A join for a slot the set does not want.
+    NotWanted,
 }
 
 pub type PeerReply = Result<PeerResponse, Refused>;

@@ -28,8 +28,10 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, Raft, ServerState};
+use samplez_replica::bootstrap::{Bootstrap, Marker, Markers, Volume};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
+use samplez_replica::membership::slot_of;
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest};
 use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
@@ -370,6 +372,9 @@ pub struct Set {
     root: PathBuf,
     pub net: Net,
     clocks: BTreeMap<NodeId, Arc<Clock>>,
+    base: Instant,
+    markers: Arc<FakeMarkers>,
+    _panics: PanicGuard,
     replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
 }
 
@@ -398,6 +403,9 @@ impl Set {
             root,
             net: Net::default(),
             clocks,
+            base,
+            markers: Arc::new(FakeMarkers),
+            _panics: PanicGuard::new(),
             replicas: BTreeMap::new(),
         };
         for id in 0..set.options.voters {
@@ -408,6 +416,14 @@ impl Set {
             .await
             .expect("initializes");
         set.leader().await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !set.replicas.values().all(|r| r.replica().commitable) {
+            assert!(
+                Instant::now() < deadline,
+                "not every replica commitable in 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         set
     }
 
@@ -429,15 +445,26 @@ impl Set {
 
     /// Starts `id` from what its volume holds.
     pub async fn restart(&mut self, id: NodeId) {
-        let clock = self.clocks[&id].clone();
+        let base = self.base;
+        let clock = self
+            .clocks
+            .entry(id)
+            .or_insert_with(|| {
+                Arc::new(Clock {
+                    base,
+                    offset: AtomicI64::new(0),
+                    on_read: Mutex::new(None),
+                })
+            })
+            .clone();
         let settings = Settings {
             id,
-            epoch: 1,
+            epoch: CLUSTER,
             limits: self.options.limits,
             block: BLOCK,
             write_timeout: Duration::from_secs(2),
             addr: id.to_string(),
-            peers: Vec::new(),
+            peers: self.ids().map(|id| id.to_string()).collect(),
             voters: None,
         };
         let replica = Replica::start(
@@ -458,6 +485,12 @@ impl Set {
         .await
         .expect("replica starts");
         let replica = Arc::new(replica);
+        let dir = self.root.join(id.to_string());
+        replica.begin(Bootstrap {
+            markers: self.markers.clone(),
+            volume: Volume::open(&dir).expect("volume opens"),
+            slot: slot_of(id),
+        });
         let mut links = self.net.links();
         links.rafts.insert(id, replica.raft().clone());
         links.replicas.insert(id, replica.clone());
@@ -524,5 +557,64 @@ impl Set {
 impl Drop for Set {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// The cluster id of every harness set, as its marker names it.
+pub const CLUSTER: u64 = 1;
+
+/// A marker naming a set that already runs: no harness replica is the
+/// volume it names, so an empty volume joins as a learner.
+pub struct FakeMarkers;
+
+impl Markers for FakeMarkers {
+    fn name(&self) -> &str {
+        "harness-replica-cluster"
+    }
+
+    fn get(&self) -> BoxFuture<'_, Result<Option<Marker>, String>> {
+        Box::pin(async {
+            Ok(Some(Marker {
+                cluster: CLUSTER,
+                volume: u64::MAX,
+            }))
+        })
+    }
+
+    fn create(&self, _: Marker) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async { Ok(false) })
+    }
+}
+
+thread_local! {
+    static PANICKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fails the test, when it is dropped, if a task on the test's thread
+/// panicked: the current-thread runtime of `#[tokio::test]` runs every
+/// spawned task there, openraft's core among them, and a panicking task
+/// does not fail the test by itself.
+pub struct PanicGuard(());
+
+impl PanicGuard {
+    pub fn new() -> PanicGuard {
+        static HOOK: std::sync::Once = std::sync::Once::new();
+        HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                PANICKED.with(|panicked| panicked.set(true));
+                previous(info);
+            }));
+        });
+        PANICKED.with(|panicked| panicked.set(false));
+        PanicGuard(())
+    }
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if !std::thread::panicking() && PANICKED.with(|panicked| panicked.get()) {
+            panic!("a task panicked during the test");
+        }
     }
 }

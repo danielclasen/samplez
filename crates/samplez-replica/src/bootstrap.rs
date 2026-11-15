@@ -3,18 +3,19 @@
 //! cluster id and ordinal 0's volume id.
 //!
 //! Ordinal 0 initialises a set only after creating the marker itself, or,
-//! after a crash between the two, when the marker names its own volume;
-//! never because its volume is empty. Every other empty volume joins as a
-//! learner of the set the marker names, ordinal 0's after a volume loss
-//! included. The cluster id is the epoch: drawn with each new marker, so a
-//! state initialised empty starts a new history, and kept on the volume, so
-//! a restart, a snapshot install and a resync keep it.
+//! after a crash between the two, when the marker names its own volume,
+//! and in both cases only while no other replica answers as a member of a
+//! set; never because its volume is empty. Every other empty volume joins
+//! as a learner of the set the marker names, ordinal 0's after a volume
+//! loss included. The cluster id is the epoch: drawn with each new marker,
+//! so a state initialised empty starts a new history, and kept on the
+//! volume, so a restart, a snapshot install and a resync keep it.
 
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::BoxFuture;
 use hyper::{Method, StatusCode};
@@ -50,18 +51,29 @@ pub trait Markers: Send + Sync {
 
 /// Draws a non-zero id from the system's random source.
 pub fn random_id() -> io::Result<u64> {
-    let provider = rustls::crypto::ring::default_provider();
     loop {
-        let mut bytes = [0; 8];
-        provider
-            .secure_random
-            .fill(&mut bytes)
-            .map_err(|_| io::Error::other("no random bits"))?;
-        let id = u64::from_be_bytes(bytes);
+        let id = u64::from_be_bytes(random()?);
         if id != 0 {
             return Ok(id);
         }
     }
+}
+
+fn random<const N: usize>() -> io::Result<[u8; N]> {
+    let mut bytes = [0; N];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut bytes)
+        .map_err(|_| io::Error::other("no random bits"))?;
+    Ok(bytes)
+}
+
+/// A volume id: the seconds since the Unix epoch it was created at in the
+/// high 32 of its 48 bits, 16 random bits below, so a newer volume of a
+/// slot has the higher id ([`crate::membership::plan`]) while clocks are
+/// within a second of each other.
+pub fn volume_id(created: u64, random: u16) -> u64 {
+    (created & 0xffff_ffff) << 16 | u64::from(random)
 }
 
 /// The ids a volume holds beside the log: its own, drawn when it is first
@@ -77,13 +89,11 @@ impl Volume {
         let id = match read_id(&dir.join("volume"))? {
             Some(id) => id,
             None => {
-                // 48 bits go into the node id; keep them non-zero.
-                let id = loop {
-                    let id = random_id()?;
-                    if id & 0xffff_ffff_ffff != 0 {
-                        break id;
-                    }
-                };
+                let created = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(io::Error::other)?
+                    .as_secs();
+                let id = volume_id(created, u16::from_be_bytes(random()?));
                 write_id(dir, "volume", id)?;
                 id
             }
@@ -131,77 +141,80 @@ fn write_id(dir: &Path, name: &str, id: u64) -> io::Result<()> {
 pub enum Plan {
     /// Its volume holds a log: go on from it.
     Resume,
-    /// Ordinal 0 of a new set: make itself the first voter.
-    Initialize,
-    /// Ask the set to take it in as a learner.
-    Join,
+    /// Its volume is empty: start or join the set the marker names
+    /// ([`step`]).
+    Bootstrap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepared {
     pub id: NodeId,
-    /// The cluster id.
+    /// The cluster id the volume holds; 0 for an empty volume that has not
+    /// read a marker yet.
     pub epoch: u64,
     pub plan: Plan,
 }
 
-/// Decides how the replica in `slot` on `volume` starts. `pristine` is
-/// whether its store holds nothing (no vote, log or snapshot). Needs the
-/// API server only for a pristine volume, and waits for it, and for
-/// ordinal 0's marker, as long as it takes.
-pub async fn prepare(
-    volume: &Volume,
-    slot: Slot,
-    pristine: bool,
-    markers: &dyn Markers,
-) -> io::Result<Prepared> {
+/// How the replica in `slot` on `volume` starts. `pristine` is whether its
+/// store holds nothing (no vote, log or snapshot). Reads nothing but the
+/// volume, so a replica with a log starts without the API server.
+pub fn prepare(volume: &Volume, slot: Slot, pristine: bool) -> io::Result<Prepared> {
     let id = node_id(slot, volume.id);
-    if !pristine {
-        let epoch = volume.cluster()?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the volume holds a log but no cluster id",
-            )
-        })?;
+    let cluster = volume.cluster()?;
+    if pristine {
         return Ok(Prepared {
             id,
-            epoch,
-            plan: Plan::Resume,
+            epoch: cluster.unwrap_or(0),
+            plan: Plan::Bootstrap,
         });
     }
-    let marker = loop {
-        let attempt = async {
-            match markers.get().await? {
-                Some(marker) => Ok::<_, String>(Some(marker)),
-                None if slot == Slot::Audio(0) => {
-                    let marker = Marker {
-                        cluster: random_id().map_err(|e| e.to_string())?,
-                        volume: volume.id,
-                    };
-                    // Lost to another creator: read theirs next round.
-                    Ok(markers.create(marker).await?.then_some(marker))
-                }
-                None => Ok(None),
-            }
-        };
-        match attempt.await {
-            Ok(Some(marker)) => break marker,
-            Ok(None) => tracing::info!(marker = markers.name(), "waiting for the marker"),
-            Err(e) => tracing::warn!(marker = markers.name(), error = %e, "reading the marker"),
-        }
-        tokio::time::sleep(RETRY).await;
-    };
-    volume.set_cluster(marker.cluster)?;
-    let plan = if slot == Slot::Audio(0) && marker.volume == volume.id {
-        Plan::Initialize
-    } else {
-        Plan::Join
-    };
+    let epoch = cluster.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the volume holds a log but no cluster id",
+        )
+    })?;
     Ok(Prepared {
         id,
-        epoch: marker.cluster,
-        plan,
+        epoch,
+        plan: Plan::Resume,
     })
+}
+
+/// What an empty volume does next, from the marker it read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Not ordinal 0 and no marker yet.
+    Wait,
+    /// Ordinal 0 and no marker: create one naming its volume, then
+    /// initialise, unless another replica answers as a member.
+    Create,
+    /// Ordinal 0 under a marker naming its own volume (a crash between the
+    /// marker and the initialisation): initialise, unless another replica
+    /// answers as a member.
+    Initialize { cluster: u64 },
+    /// Join the set `cluster` as a learner.
+    Join { cluster: u64 },
+}
+
+pub fn step(slot: Slot, volume: u64, marker: Option<Marker>) -> Step {
+    match marker {
+        None if slot == Slot::Audio(0) => Step::Create,
+        None => Step::Wait,
+        Some(marker) if slot == Slot::Audio(0) && marker.volume == volume => Step::Initialize {
+            cluster: marker.cluster,
+        },
+        Some(marker) => Step::Join {
+            cluster: marker.cluster,
+        },
+    }
+}
+
+/// What a replica with an empty volume needs to start or join a set.
+pub struct Bootstrap {
+    pub markers: Arc<dyn Markers>,
+    pub volume: Volume,
+    pub slot: Slot,
 }
 
 /// The marker in the Kubernetes API: create and get on one ConfigMap.
@@ -219,7 +232,8 @@ const SERVICE_ACCOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 impl Kube {
     /// The API server at `addr` (`host:port`), over TLS trusting `ca` (PEM)
     /// when given, authenticated by the bearer token in `token`, re-read
-    /// for every request since a projected token is rotated.
+    /// for every request since a projected token is rotated. A token
+    /// needs `ca`: it is never sent in plain text.
     pub fn new(
         addr: String,
         ca: Option<&[u8]>,
@@ -227,6 +241,12 @@ impl Kube {
         namespace: String,
         name: String,
     ) -> io::Result<Kube> {
+        if token.is_some() && ca.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a bearer token is sent over TLS only",
+            ));
+        }
         let tls = match ca {
             Some(pem) => {
                 let mut roots = RootCertStore::empty();
@@ -365,5 +385,47 @@ impl Markers for Kube {
                 status => Err(format!("POST {}: {status}", self.path())),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_volume_has_the_higher_id() {
+        assert!(volume_id(1_700_000_001, 0) > volume_id(1_700_000_000, 0xffff));
+        let id = volume_id(1_700_000_000, 7);
+        assert_eq!(id >> 48, 0, "48 bits");
+        assert_ne!(id, 0);
+    }
+
+    #[test]
+    fn the_marker_decides_what_an_empty_volume_does() {
+        let marker = |volume| Some(Marker { cluster: 9, volume });
+        assert_eq!(step(Slot::Audio(0), 1, None), Step::Create);
+        assert_eq!(step(Slot::Audio(1), 1, None), Step::Wait);
+        assert_eq!(step(Slot::Witness, 1, None), Step::Wait);
+        assert_eq!(
+            step(Slot::Audio(0), 1, marker(1)),
+            Step::Initialize { cluster: 9 }
+        );
+        assert_eq!(
+            step(Slot::Audio(0), 1, marker(2)),
+            Step::Join { cluster: 9 }
+        );
+        assert_eq!(
+            step(Slot::Audio(1), 1, marker(1)),
+            Step::Join { cluster: 9 }
+        );
+    }
+
+    #[test]
+    fn a_token_is_not_sent_in_plain_text() {
+        let kube = |token: Option<PathBuf>| {
+            Kube::new("127.0.0.1:1".into(), None, token, "ns".into(), "m".into())
+        };
+        assert!(kube(Some("/token".into())).is_err());
+        assert!(kube(None).is_ok());
     }
 }

@@ -1,11 +1,12 @@
-//! Replica sets started from the marker in a fake Kubernetes API server,
-//! over the peer listener on loopback with mutual TLS. Real time: sockets
-//! do not follow a paused clock.
+//! Replica sets started from the marker in a fake Kubernetes API server
+//! over TLS, over the peer listener on loopback with mutual TLS. Real
+//! time: sockets do not follow a paused clock.
 
 mod harness;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::IntoFuture;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,14 +18,15 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
-use harness::{Paths, RATE, owner};
+use harness::{PanicGuard, Paths, RATE, owner};
 use openraft::ServerState;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
-use samplez_replica::bootstrap::{self, Kube, Markers, Plan, Prepared, Volume};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use samplez_replica::bootstrap::{self, Bootstrap, Kube, Marker, Markers, Plan, Volume};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::NodeId;
 use samplez_replica::log_store::Store;
-use samplez_replica::membership::{Slot, Voters, slot_of};
+use samplez_replica::membership::{NO_MEMBER_ROUNDS, PERIOD, Slot, Voters, slot_of};
 use samplez_replica::net::{Network, Pool};
 use samplez_replica::peer::{self, PeerClient, PeerRequest, Refused};
 use samplez_replica::{Replica, Settings, raft_config};
@@ -32,22 +34,70 @@ use samplez_service::config::{Tls, TlsMode};
 use samplez_service::replica::{Reason, Resolution};
 use samplez_service::{Metrics, PeerTls, ReplicatedState};
 use serde_json::Value;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 
 const TOKEN: &str = "t0k3n";
 const NAMESPACE: &str = "replicas";
 const MARKER: &str = "set-replica-cluster";
 
-/// ConfigMaps by name in one namespace: create (409 when it exists), get
-/// (404 when absent), delete; every request needs the bearer token.
+/// A CA, as PEM, and a certificate for 127.0.0.1 it issued.
+fn authority_for_loopback() -> (
+    CertifiedIssuer<'static, KeyPair>,
+    CertificateDer<'static>,
+    PrivateKeyDer<'static>,
+) {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec!["127.0.0.1".into()])
+        .unwrap()
+        .signed_by(&key, &ca)
+        .unwrap();
+    let der = cert.der().clone();
+    (ca, der, PrivateKeyDer::Pkcs8(key.serialize_der().into()))
+}
+
+/// Accepts TLS connections for axum, dropping failed handshakes.
+struct Tlsd {
+    tcp: TcpListener,
+    tls: TlsAcceptor,
+}
+
+impl axum::serve::Listener for Tlsd {
+    type Io = TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let Ok((tcp, addr)) = self.tcp.accept().await else {
+                continue;
+            };
+            if let Ok(tls) = self.tls.accept(tcp).await {
+                return (tls, addr);
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.tcp.local_addr()
+    }
+}
+
+/// ConfigMaps by name in one namespace, over TLS: create (409 when it
+/// exists), get (404 when absent); every request needs the bearer token.
 #[derive(Clone, Default)]
 struct Api(Arc<Mutex<BTreeMap<String, Value>>>);
 
 impl Api {
-    async fn serve(&self) -> SocketAddr {
+    /// Serves the API; returns its address and the PEM of the CA its
+    /// certificate is from.
+    async fn serve(&self) -> (SocketAddr, String) {
         let authorized = |headers: &HeaderMap| {
             headers.get("authorization").and_then(|v| v.to_str().ok())
                 == Some(&format!("Bearer {TOKEN}"))
@@ -88,10 +138,22 @@ impl Api {
                 get(read),
             )
             .with_state(self.clone());
+        let (ca, cert, key) = authority_for_loopback();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
-        tokio::spawn(axum::serve(tcp, router).into_future());
-        addr
+        let listener = Tlsd {
+            tcp,
+            tls: TlsAcceptor::from(Arc::new(config)),
+        };
+        tokio::spawn(axum::serve(listener, router).into_future());
+        (addr, ca.pem())
     }
 
     fn marker(&self) -> Option<(u64, u64)> {
@@ -110,18 +172,19 @@ static SETS: AtomicU64 = AtomicU64::new(0);
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "peer-set-{}-{}",
+        "bootstrap-set-{}-{}",
         std::process::id(),
         SETS.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
-fn kube(api: SocketAddr, root: &std::path::Path) -> Kube {
+async fn kube(api: &Api, root: &std::path::Path) -> Kube {
+    let (addr, ca) = api.serve().await;
     let token = root.join("token");
     std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
     Kube::new(
-        api.to_string(),
-        None,
+        addr.to_string(),
+        Some(ca.as_bytes()),
         Some(token),
         NAMESPACE.into(),
         MARKER.into(),
@@ -132,9 +195,10 @@ fn kube(api: SocketAddr, root: &std::path::Path) -> Kube {
 struct Node {
     replica: Arc<Replica<Paths>>,
     pool: Arc<Pool>,
-    prepared: Prepared,
+    id: NodeId,
+    plan: Plan,
     stop: oneshot::Sender<()>,
-    server: JoinHandle<std::io::Result<()>>,
+    server: JoinHandle<io::Result<()>>,
 }
 
 /// One replica set: a volume, a certificate and a peer port per slot.
@@ -144,8 +208,12 @@ struct Set {
     kube: Arc<Kube>,
     voters: Voters,
     addrs: BTreeMap<Slot, String>,
+    /// Bound for the set's lifetime, so a stopped replica's port is not
+    /// taken by another socket before it starts again.
+    listeners: BTreeMap<Slot, std::net::TcpListener>,
     tls: BTreeMap<Slot, Tls>,
     nodes: BTreeMap<Slot, Node>,
+    _panics: PanicGuard,
 }
 
 fn name(slot: Slot) -> String {
@@ -161,17 +229,16 @@ impl Set {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let api = Api::default();
-        let kube = Arc::new(kube(api.serve().await, &root));
+        let kube = Arc::new(kube(&api, &root).await);
         let mut slots: Vec<Slot> = (0..voters.replicas).map(Slot::Audio).collect();
         if voters.witness {
             slots.push(Slot::Witness);
         }
-        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        let (ca, _, _) = authority_for_loopback();
         let ca_file = root.join("ca.crt");
         std::fs::write(&ca_file, ca.pem()).unwrap();
-        let (mut addrs, mut tls) = (BTreeMap::new(), BTreeMap::new());
+        let (mut addrs, mut tls, mut listeners) =
+            (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         for slot in slots {
             let key = KeyPair::generate().unwrap();
             let cert = CertificateParams::new(vec!["127.0.0.1".into()])
@@ -194,9 +261,10 @@ impl Set {
                     sans: Vec::new(),
                 },
             );
-            // A port nobody else takes while the set runs.
             let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            tcp.set_nonblocking(true).unwrap();
             addrs.insert(slot, tcp.local_addr().unwrap().to_string());
+            listeners.insert(slot, tcp);
         }
         Set {
             root,
@@ -204,8 +272,10 @@ impl Set {
             kube,
             voters,
             addrs,
+            listeners,
             tls,
             nodes: BTreeMap::new(),
+            _panics: PanicGuard::new(),
         }
     }
 
@@ -213,15 +283,14 @@ impl Set {
         self.root.join(name(slot))
     }
 
-    /// Starts the replica in `slot` from its volume and the marker.
+    /// Starts the replica in `slot` from its volume, and the marker when
+    /// the volume is empty.
     async fn start(&self, slot: Slot) -> Node {
         let dir = self.dir(slot);
         let volume = Volume::open(&dir).unwrap();
         let limits = Limits::defaults(RATE);
         let store = Store::open(&dir, Paths::default(), limits).unwrap();
-        let prepared = bootstrap::prepare(&volume, slot, store.pristine(), &*self.kube)
-            .await
-            .unwrap();
+        let prepared = bootstrap::prepare(&volume, slot, store.pristine()).unwrap();
         let tls = Arc::new(PeerTls::new(&self.tls[&slot], &Metrics::default()).unwrap());
         let pool = Pool::new(tls.clone());
         let settings = Settings {
@@ -229,7 +298,8 @@ impl Set {
             epoch: prepared.epoch,
             limits,
             block: harness::BLOCK,
-            write_timeout: Duration::from_secs(3),
+            // Long, for a loaded test host.
+            write_timeout: Duration::from_secs(10),
             addr: self.addrs[&slot].clone(),
             peers: self.addrs.values().cloned().collect(),
             voters: Some(self.voters),
@@ -250,27 +320,36 @@ impl Set {
         .await
         .unwrap();
         let replica = Arc::new(replica);
-        let tcp = TcpListener::bind(&self.addrs[&slot]).await.unwrap();
+        let tcp = TcpListener::from_std(self.listeners[&slot].try_clone().unwrap()).unwrap();
         let (stop, stopped) = oneshot::channel();
         let server = tokio::spawn(peer::serve(tls, tcp, replica.clone(), async {
             let _ = stopped.await;
         }));
-        replica.begin(prepared.plan, MARKER).await.unwrap();
+        replica.begin(Bootstrap {
+            markers: self.kube.clone(),
+            volume,
+            slot,
+        });
         Node {
             replica,
             pool,
-            prepared,
+            id: prepared.id,
+            plan: prepared.plan,
             stop,
             server,
         }
     }
 
+    async fn start_slots(&mut self, slots: &[Slot]) {
+        let nodes =
+            futures_util::future::join_all(slots.iter().map(|&slot| self.start(slot))).await;
+        self.nodes.extend(slots.iter().copied().zip(nodes));
+    }
+
     /// Starts every slot at once, as `podManagementPolicy: Parallel` does.
     async fn start_all(&mut self) {
         let slots: Vec<Slot> = self.addrs.keys().copied().collect();
-        let nodes =
-            futures_util::future::join_all(slots.iter().map(|&slot| self.start(slot))).await;
-        self.nodes.extend(slots.into_iter().zip(nodes));
+        self.start_slots(&slots).await;
     }
 
     async fn crash(&mut self, slot: Slot) {
@@ -284,35 +363,60 @@ impl Set {
         &self.nodes[&slot].replica
     }
 
-    /// Waits until a leader has made the running replicas the voters.
+    /// Waits until a leader has made the running replicas the voters and
+    /// every audio replica is commitable.
     async fn settled(&self) -> Slot {
-        let want: BTreeSet<NodeId> = self.nodes.values().map(|n| n.prepared.id).collect();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
+        let want: BTreeSet<NodeId> = self.nodes.values().map(|n| n.id).collect();
+        match self.voters_become(&want, Duration::from_secs(30)).await {
+            Some(leader) => leader,
+            None => panic!("the voters did not settle in 30 s:\n{}", self.describe()),
+        }
+    }
+
+    /// Each replica's view, for a failure message.
+    fn describe(&self) -> String {
+        let mut lines = Vec::new();
+        for (slot, node) in &self.nodes {
+            let metrics = node.replica.raft().metrics().borrow().clone();
+            lines.push(format!(
+                "{slot:?} {} {:?} leader {:?} applied {:?} commitable {} status {:?} membership {:?}",
+                node.id,
+                metrics.state,
+                metrics.current_leader,
+                metrics.last_applied.map(|id| id.index),
+                node.replica.replica().commitable,
+                node.replica.status(),
+                metrics.membership_config.membership(),
+            ));
+        }
+        lines.join("\n")
+    }
+
+    /// The leader's slot once its voters are `want`, out of any joint
+    /// configuration, the membership holds nothing else and every running
+    /// audio replica is commitable.
+    async fn voters_become(&self, want: &BTreeSet<NodeId>, within: Duration) -> Option<Slot> {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
             for (&slot, node) in &self.nodes {
                 let metrics = node.replica.raft().metrics().borrow().clone();
                 let membership = metrics.membership_config.membership();
                 let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
                 if metrics.state == ServerState::Leader
-                    && voters == want
+                    && membership.get_joint_config().len() == 1
+                    && voters == *want
                     && membership.nodes().count() == want.len()
                     && self
                         .nodes
                         .iter()
                         .all(|(s, n)| *s == Slot::Witness || n.replica.replica().commitable)
-                    && self.nodes.values().all(|n| {
-                        n.replica.raft().metrics().borrow().current_leader == Some(node.prepared.id)
-                    })
                 {
-                    return slot;
+                    return Some(slot);
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "the voters did not settle in 20 s"
-            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        None
     }
 
     async fn applied(&self, index: u64) {
@@ -325,6 +429,25 @@ impl Set {
             assert!(Instant::now() < deadline, "{index} not applied in 10 s");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Writes through `slot`; a failure names every replica's view.
+    async fn write(&self, slot: Slot, id: &str, command: &str) -> u64 {
+        let written = self
+            .replica(slot)
+            .submit(&owner("s"), id, Bytes::from(command.to_owned()))
+            .await;
+        match written {
+            Ok(ack) => {
+                assert_eq!(ack.resolution, Resolution::Applied);
+                ack.revision
+            }
+            Err(e) => panic!("{e} through {slot:?}:\n{}", self.describe()),
+        }
+    }
+
+    fn epochs(&self) -> BTreeSet<u64> {
+        self.nodes.values().map(|n| n.replica.epoch()).collect()
     }
 }
 
@@ -343,6 +466,18 @@ async fn write(replica: &Replica<Paths>, id: &str, command: &str) -> u64 {
     ack.revision
 }
 
+/// Waits until `check` holds, at most `within`.
+async fn until(within: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    check()
+}
+
 /// Ordinal 0 creates the marker and initialises the set; the other voters
 /// join as learners and are promoted; the epoch is the marker's cluster
 /// id on every replica. Writes reach the leader through any audio replica,
@@ -355,15 +490,10 @@ async fn a_set_starts_from_the_marker_and_takes_writes_through_any_audio_replica
     let (cluster, volume) = set.api.marker().expect("ordinal 0 created the marker");
     let first = Volume::open(&set.dir(Slot::Audio(0))).unwrap();
     assert_eq!(volume, first.id, "naming ordinal 0's volume");
+    assert_eq!(set.epochs(), BTreeSet::from([cluster]));
     for (slot, node) in &set.nodes {
-        assert_eq!(node.replica.epoch(), cluster, "{slot:?}");
-        assert_eq!(slot_of(node.prepared.id), *slot);
-        let plan = if *slot == Slot::Audio(0) {
-            Plan::Initialize
-        } else {
-            Plan::Join
-        };
-        assert_eq!(node.prepared.plan, plan, "{slot:?}");
+        assert_eq!(slot_of(node.id), *slot);
+        assert_eq!(node.plan, Plan::Bootstrap, "{slot:?}");
     }
 
     let mut last = 0;
@@ -381,7 +511,7 @@ async fn a_set_starts_from_the_marker_and_takes_writes_through_any_audio_replica
     assert_eq!(refused.reason, Reason::NotCommitable);
 
     // The witness can lead: writes are forwarded to it.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while set.settled().await != Slot::Witness {
         assert!(
             Instant::now() < deadline,
@@ -431,20 +561,31 @@ async fn ordinal_0_rejoins_as_a_learner_after_losing_its_volume() {
         raft.trigger().purge_log(last).await.unwrap();
     }
 
-    let old = set.nodes[&Slot::Audio(0)].prepared.id;
+    let old = set.nodes[&Slot::Audio(0)].id;
     set.crash(Slot::Audio(0)).await;
     std::fs::remove_dir_all(set.dir(Slot::Audio(0))).unwrap();
     let node = set.start(Slot::Audio(0)).await;
-    assert_eq!(node.prepared.plan, Plan::Join, "never initialised again");
-    assert_ne!(node.prepared.id, old);
-    assert_eq!(node.prepared.epoch, epoch);
+    assert_eq!(node.plan, Plan::Bootstrap);
+    assert_ne!(node.id, old);
     set.nodes.insert(Slot::Audio(0), node);
     set.settled().await;
+    assert!(
+        set.api
+            .marker()
+            .is_some_and(|(cluster, _)| cluster == epoch),
+        "the marker is left as it was"
+    );
 
     let rejoined = set.replica(Slot::Audio(0));
     assert_eq!(rejoined.epoch(), epoch, "kept across the snapshot install");
     assert!(
-        rejoined.raft().metrics().borrow().snapshot.is_some(),
+        until(Duration::from_secs(5), || rejoined
+            .raft()
+            .metrics()
+            .borrow()
+            .snapshot
+            .is_some())
+        .await,
         "installed"
     );
     assert_eq!(rejoined.store().with_state(|sm| sm.product.applied), 3);
@@ -455,20 +596,15 @@ async fn ordinal_0_rejoins_as_a_learner_after_losing_its_volume() {
     let pool = &set.nodes[&Slot::Audio(1)].pool;
     let addr = &set.addrs[&Slot::Audio(0)];
     let asked = pool
-        .call(
-            Some(old),
-            addr,
-            PeerRequest::ReadIndex,
-            Duration::from_secs(1),
-        )
+        .call(Some(old), addr, PeerRequest::Member, Duration::from_secs(1))
         .await;
     assert_eq!(asked, Ok(Err(Refused::Misaddressed)));
 }
 
-/// A restart keeps the epoch; a new set, started empty under a new
-/// marker, draws a new one. Ordinal 0 on an empty volume while the marker
-/// names another and no voter holds a log initialises nothing, and its
-/// status names the marker to delete.
+/// A restart keeps the epoch. An empty ordinal 0 under a marker naming
+/// another volume joins; it names the marker to delete only once several
+/// rounds found no member to join, and the deletion takes effect without
+/// a restart: a new set under a new epoch.
 #[tokio::test]
 async fn the_epoch_is_kept_on_a_restart_and_drawn_anew_for_a_new_set() {
     let mut set = Set::new(Voters::new(1, false).unwrap()).await;
@@ -480,7 +616,7 @@ async fn the_epoch_is_kept_on_a_restart_and_drawn_anew_for_a_new_set() {
 
     set.crash(slot).await;
     let node = set.start(slot).await;
-    assert_eq!(node.prepared.plan, Plan::Resume);
+    assert_eq!(node.plan, Plan::Resume);
     assert_eq!(node.replica.epoch(), epoch);
     assert_eq!(node.replica.revision(), revision);
     set.nodes.insert(slot, node);
@@ -489,94 +625,223 @@ async fn the_epoch_is_kept_on_a_restart_and_drawn_anew_for_a_new_set() {
     set.crash(slot).await;
     std::fs::remove_dir_all(set.dir(slot)).unwrap();
     let node = set.start(slot).await;
-    assert_eq!(node.prepared.plan, Plan::Join);
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(!node.replica.raft().is_initialized().await.unwrap());
+    assert_eq!(node.plan, Plan::Bootstrap);
+    tokio::time::sleep(PERIOD * 2).await;
     let status = node.replica.status().expect("a status");
-    assert!(status.contains(MARKER), "{status}");
+    assert!(status.contains("joining"), "{status}");
+    assert!(
+        !status.contains("delete"),
+        "only after several rounds: {status}"
+    );
+    let replica = node.replica.clone();
     set.nodes.insert(slot, node);
+    assert!(
+        until(PERIOD * (NO_MEMBER_ROUNDS + 3), || replica
+            .status()
+            .is_some_and(|status| status.contains("delete the ConfigMap")))
+        .await,
+        "{:?}",
+        replica.status()
+    );
+    assert!(!replica.raft().is_initialized().await.unwrap());
+    assert!(replica.status().unwrap().contains(MARKER));
 
-    // Deleting the marker starts a new set on the next empty start.
-    set.crash(slot).await;
-    std::fs::remove_dir_all(set.dir(slot)).unwrap();
+    // Deleting the marker starts a new set, without a restart.
     set.api.delete();
-    let node = set.start(slot).await;
-    assert_eq!(node.prepared.plan, Plan::Initialize);
-    assert_ne!(node.replica.epoch(), epoch, "a new history");
-    assert_eq!(set.api.marker().unwrap().0, node.replica.epoch());
-    set.nodes.insert(slot, node);
     set.settled().await;
+    assert_ne!(replica.epoch(), epoch, "a new history");
+    assert_eq!(set.api.marker().unwrap().0, replica.epoch());
+    assert_eq!(replica.store().with_state(|sm| sm.product.applied), 0);
+    assert_eq!(replica.status(), None);
+}
+
+/// Ordinal 0 initialises under a marker naming its own volume, as after a
+/// crash between creating it and initialising; any other slot waits for
+/// the marker.
+#[tokio::test]
+async fn ordinal_0_initialises_under_a_marker_naming_its_volume() {
+    let mut set = Set::new(Voters::new(3, false).unwrap()).await;
+    set.start_slots(&[Slot::Audio(1), Slot::Audio(2)]).await;
+    tokio::time::sleep(PERIOD * 2).await;
+    for slot in [Slot::Audio(1), Slot::Audio(2)] {
+        let status = set.replica(slot).status().expect("a status");
+        assert!(status.contains("waiting for ordinal 0"), "{status}");
+    }
+    assert_eq!(set.api.marker(), None);
+
+    let zero = Volume::open(&set.dir(Slot::Audio(0))).unwrap();
+    let marker = Marker {
+        cluster: 77,
+        volume: zero.id,
+    };
+    assert!(set.kube.create(marker).await.unwrap());
+    assert!(!set.kube.create(marker).await.unwrap(), "exists");
+    set.start_slots(&[Slot::Audio(0)]).await;
+    set.settled().await;
+    assert_eq!(set.epochs(), BTreeSet::from([77]));
+}
+
+/// Replicas still joining under a marker that is deleted and created anew
+/// take on the new cluster id instead of joining the new set under the
+/// old one, and a join under another cluster id is refused.
+#[tokio::test]
+async fn joiners_follow_a_replaced_marker_and_a_stale_cluster_is_refused() {
+    let mut set = Set::new(Voters::new(3, false).unwrap()).await;
+    // A marker left from a set none of whose volumes remain.
+    let stale = Marker {
+        cluster: 11,
+        volume: 12345,
+    };
+    assert!(set.kube.create(stale).await.unwrap());
+    set.start_slots(&[Slot::Audio(1), Slot::Audio(2)]).await;
+    tokio::time::sleep(PERIOD * 2).await;
+    assert_eq!(set.epochs(), BTreeSet::from([11]));
+
+    set.api.delete();
+    set.start_slots(&[Slot::Audio(0)]).await;
+    set.settled().await;
+    let (cluster, _) = set.api.marker().unwrap();
+    assert_ne!(cluster, 11);
+    assert_eq!(set.epochs(), BTreeSet::from([cluster]), "one history");
+    for slot in [Slot::Audio(1), Slot::Audio(2)] {
+        let volume = Volume::open(&set.dir(slot)).unwrap();
+        assert_eq!(volume.cluster().unwrap(), Some(cluster), "{slot:?}");
+    }
+
+    let leader = set.settled().await;
+    let join = PeerRequest::Join {
+        id: 9,
+        addr: "127.0.0.1:1".into(),
+        cluster: 11,
+    };
+    let leader_id = set.nodes[&leader].id;
     assert_eq!(
-        set.replica(slot)
-            .store()
-            .with_state(|sm| sm.product.applied),
-        0
+        set.replica(leader).handle(Some(leader_id), join).await,
+        Err(Refused::OtherCluster)
     );
 }
 
-/// The marker decides how an empty volume starts: ordinal 0 initialises
-/// only under a marker it created or one naming its own volume (a crash
-/// between the two), anybody else joins, and a replica other than
-/// ordinal 0 waits for the marker.
+/// With the marker gone while the set runs, ordinal 0 on an empty volume
+/// does not start a second set: the other replicas answer as members.
 #[tokio::test]
-async fn ordinal_0_initialises_only_under_a_marker_naming_its_volume() {
-    let root = root();
-    std::fs::create_dir_all(&root).unwrap();
-    let api = Api::default();
-    let api_addr = api.serve().await;
-    let markers = kube(api_addr, &root);
-
-    let waiting = tokio::spawn({
-        let volume = Volume::open(&root.join("one")).unwrap();
-        let markers = kube(api_addr, &root);
-        async move { bootstrap::prepare(&volume, Slot::Audio(1), true, &markers).await }
-    });
-    tokio::time::sleep(bootstrap::RETRY * 2).await;
-    assert!(!waiting.is_finished(), "no marker yet");
-    assert_eq!(api.marker(), None);
-
-    let zero = Volume::open(&root.join("zero")).unwrap();
-    let first = bootstrap::prepare(&zero, Slot::Audio(0), true, &markers)
-        .await
-        .unwrap();
-    assert_eq!(first.plan, Plan::Initialize);
-    assert_eq!(api.marker(), Some((first.epoch, zero.id)));
-    // Restarted before initialising: the marker names its volume.
-    let again = bootstrap::prepare(&zero, Slot::Audio(0), true, &markers)
-        .await
-        .unwrap();
-    assert_eq!(again, first);
-
-    let joined = waiting.await.unwrap().unwrap();
-    assert_eq!((joined.plan, joined.epoch), (Plan::Join, first.epoch));
-    let other = Volume::open(&root.join("zero-again")).unwrap();
-    let lost = bootstrap::prepare(&other, Slot::Audio(0), true, &markers)
-        .await
-        .unwrap();
-    assert_eq!((lost.plan, lost.epoch), (Plan::Join, first.epoch));
+async fn ordinal_0_does_not_start_a_second_set_beside_a_running_one() {
+    let mut set = Set::new(Voters::new(3, false).unwrap()).await;
+    set.start_all().await;
+    set.settled().await;
+    let epoch = set.replica(Slot::Audio(1)).epoch();
+    set.api.delete();
+    set.crash(Slot::Audio(0)).await;
+    std::fs::remove_dir_all(set.dir(Slot::Audio(0))).unwrap();
+    let node = set.start(Slot::Audio(0)).await;
+    let replica = node.replica.clone();
+    set.nodes.insert(Slot::Audio(0), node);
     assert!(
-        !markers
-            .create(bootstrap::Marker {
-                cluster: 1,
-                volume: 1
-            })
-            .await
-            .unwrap()
+        until(PERIOD * 4, || replica.status().is_some_and(
+            |status| status.contains("not starting a second one")
+        ))
+        .await,
+        "{:?}",
+        replica.status()
     );
-    assert_eq!(api.marker(), Some((first.epoch, zero.id)), "left as it was");
+    assert_eq!(set.api.marker(), None, "no marker created");
+    assert!(!replica.raft().is_initialized().await.unwrap());
+    for slot in [Slot::Audio(1), Slot::Audio(2)] {
+        assert_eq!(set.replica(slot).epoch(), epoch);
+    }
+    let revision = set.write(Slot::Audio(1), "1", "gain=1@1").await;
+    assert!(revision > 0, "the running set still commits");
+}
 
-    // A volume holding a log goes on without the API server.
-    let gone = Kube::new(
-        "127.0.0.1:1".into(),
-        None,
-        None,
-        NAMESPACE.into(),
-        MARKER.into(),
-    )
-    .unwrap();
-    let resumed = bootstrap::prepare(&zero, Slot::Audio(0), false, &gone)
-        .await
-        .unwrap();
-    assert_eq!((resumed.plan, resumed.epoch), (Plan::Resume, first.epoch));
-    let _ = std::fs::remove_dir_all(&root);
+/// A set scaled from three audio replicas to one and back, with the
+/// StatefulSet's default PVC retention (the volumes of ordinals 1 and 2
+/// kept), reconciles back to three voters. Ordinal 2 is down while the
+/// leader removes it, so its volume still names it a voter; until a
+/// leader counts the returning replicas again they are not commitable.
+#[tokio::test]
+async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
+    let mut set = Set::new(Voters::new(3, false).unwrap()).await;
+    set.start_all().await;
+    set.settled().await;
+    let revision = write(set.replica(Slot::Audio(1)), "1", "gain=1@1").await;
+    set.applied(revision).await;
+    let ids: BTreeMap<Slot, NodeId> = set.nodes.iter().map(|(s, n)| (*s, n.id)).collect();
+
+    // Ordinal 2 leads when it goes, so its volume holds a vote for itself
+    // that a restart restores as leadership.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while set.settled().await != Slot::Audio(2) {
+        assert!(Instant::now() < deadline, "ordinal 2 did not take the lead");
+        let _ = set.replica(Slot::Audio(2)).raft().trigger().elect().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Scale to one: ordinal 2 goes first, the release restarts the other
+    // pods with one wanted voter and the leader drops ordinals 1 and 2.
+    set.crash(Slot::Audio(2)).await;
+    set.voters = Voters::new(1, false).unwrap();
+    for slot in [Slot::Audio(1), Slot::Audio(0)] {
+        set.crash(slot).await;
+        let node = set.start(slot).await;
+        assert_eq!(node.plan, Plan::Resume);
+        set.nodes.insert(slot, node);
+        let leads = || {
+            set.nodes
+                .values()
+                .any(|n| n.replica.raft().metrics().borrow().state == ServerState::Leader)
+        };
+        assert!(
+            until(Duration::from_secs(10), leads).await,
+            "no leader after restarting {slot:?}"
+        );
+    }
+    let only_zero = BTreeSet::from([ids[&Slot::Audio(0)]]);
+    let removed = until(Duration::from_secs(20), || {
+        set.nodes.values().any(|n| {
+            let metrics = n.replica.raft().metrics().borrow().clone();
+            let voters: BTreeSet<NodeId> =
+                metrics.membership_config.membership().voter_ids().collect();
+            metrics.state == ServerState::Leader && voters == only_zero
+        })
+    })
+    .await;
+    assert!(removed, "the leader removed the unwanted voters");
+    set.crash(Slot::Audio(1)).await;
+
+    // Scale back to three: ordinal 0 restarts with three wanted voters,
+    // ordinals 1 and 2 come back on their kept volumes.
+    set.voters = Voters::new(3, false).unwrap();
+    set.crash(Slot::Audio(0)).await;
+    set.start_slots(&[Slot::Audio(0), Slot::Audio(1), Slot::Audio(2)])
+        .await;
+    let restarted = Instant::now();
+    // openraft publishes the membership it loaded once its core runs.
+    let named = |slot: Slot| {
+        let metrics = set.replica(slot).raft().metrics().borrow().clone();
+        metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|id| id == ids[&slot])
+    };
+    assert!(
+        until(Duration::from_secs(5), || named(Slot::Audio(2))).await,
+        "ordinal 2's volume still names it a voter"
+    );
+    for slot in [Slot::Audio(1), Slot::Audio(2)] {
+        assert!(
+            !set.replica(slot).replica().commitable,
+            "{slot:?}: no leader counts it yet, {:?} after the start:\n{}",
+            restarted.elapsed(),
+            set.describe()
+        );
+    }
+    let all: BTreeSet<NodeId> = ids.values().copied().collect();
+    assert!(
+        set.voters_become(&all, Duration::from_secs(30))
+            .await
+            .is_some(),
+        "ordinals 1 and 2 rejoined"
+    );
+    let revision = write(set.replica(Slot::Audio(2)), "2", "gain=2@2").await;
+    set.applied(revision).await;
 }

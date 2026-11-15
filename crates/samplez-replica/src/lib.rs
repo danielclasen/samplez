@@ -23,7 +23,7 @@ pub mod state_machine;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,7 +38,7 @@ use samplez_service::{Owner, Position, ReadIndex, ReplicaInfo, ReplicatedState};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
-use crate::bootstrap::Plan;
+use crate::bootstrap::Bootstrap;
 use crate::dedup::Limits;
 use crate::entry::{
     Batch, Body, Command, NodeId, Origin, Outcome, Request, Response, SessionKey, stamping_index,
@@ -89,7 +89,8 @@ pub fn raft_config(cluster: &str) -> openraft::Config {
 pub struct Settings {
     pub id: NodeId,
     /// The id of the state's history, which revisions are named within:
-    /// the cluster id ([`bootstrap`]).
+    /// the cluster id ([`bootstrap`]); 0 on an empty volume that has not
+    /// read the marker yet.
     pub epoch: u64,
     pub limits: Limits,
     /// The engine block size B the stamping index rounds to.
@@ -158,6 +159,13 @@ pub(crate) struct Shared {
     proposing: AtomicUsize,
     /// The product revision this replica applied.
     revision: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// The cluster id: [`Settings::epoch`] until an empty volume takes on
+    /// the marker's.
+    epoch: AtomicU64,
+    /// A leader counted this replica as a voter within the last
+    /// [`membership::UNCOUNTED`].
+    counted: AtomicBool,
+    started: Instant,
     status: Mutex<Option<String>>,
     reconcile: Notify,
 }
@@ -226,6 +234,7 @@ impl<P: Product> Replica<P> {
         .await
         .map_err(|e| e.to_string())?;
         let voters = settings.voters;
+        let settings_epoch = settings.epoch;
         let shared = Arc::new(Shared {
             settings,
             raft,
@@ -238,6 +247,9 @@ impl<P: Product> Replica<P> {
                 let store = store.clone();
                 Box::new(move || store.with_state(|sm| sm.revision))
             },
+            epoch: AtomicU64::new(settings_epoch),
+            counted: AtomicBool::new(false),
+            started: Instant::now(),
             status: Mutex::default(),
             reconcile: Notify::new(),
         });
@@ -303,21 +315,11 @@ impl<P: Product> Replica<P> {
             .map_err(|e| e.to_string())
     }
 
-    /// Carries out what [`bootstrap::prepare`] decided: ordinal 0 of a new
-    /// set initialises it with itself as its first voter, a new volume asks
-    /// to join (the status names `marker` meanwhile).
-    pub async fn begin(&self, plan: Plan, marker: &str) -> Result<(), String> {
-        match plan {
-            Plan::Resume => Ok(()),
-            Plan::Initialize => {
-                let own = (self.id(), self.shared.settings.addr.clone());
-                self.initialize([own]).await
-            }
-            Plan::Join => {
-                tokio::spawn(membership::join(self.shared.clone(), marker.to_owned()));
-                Ok(())
-            }
-        }
+    /// Keeps the replica in its set ([`membership::watch`]): an empty
+    /// volume starts or joins the set the marker names, a replica no
+    /// leader counts asks to join again.
+    pub fn begin(&self, bootstrap: Bootstrap) {
+        tokio::spawn(membership::watch(self.shared.clone(), bootstrap));
     }
 
     /// Whether this replica knows a quorum: as leader, one acknowledged it
@@ -425,7 +427,10 @@ impl<P: Product> Replica<P> {
                 replied.await.unwrap_or_else(|_| Err(stopped()))?;
                 Ok(PeerResponse::Appended)
             }
-            PeerRequest::Join { id, addr } => shared.admit(id, addr).await,
+            PeerRequest::Join { id, addr, cluster } => shared.admit(id, addr, cluster).await,
+            PeerRequest::Member => Ok(PeerResponse::Member(
+                shared.raft.is_initialized().await.unwrap_or(false),
+            )),
             PeerRequest::ReadIndex => match shared.raft.get_read_log_id().await {
                 Ok((read, _)) => Ok(PeerResponse::ReadIndex(read.map_or(0, |id| id.index))),
                 Err(RaftError::APIError(_)) => Err(Refused::NotLeader),
@@ -451,6 +456,10 @@ fn unavailable(e: &dyn std::fmt::Display) -> Refused {
 }
 
 impl Shared {
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
     fn quiescing(&self) -> bool {
         self.quiescing.load(Ordering::SeqCst)
     }
@@ -563,6 +572,12 @@ impl Shared {
             Ok(Ok(PeerResponse::ReadIndex(index))) => Ok(index),
             _ => Err(ReadIndex::NotLeader),
         }
+    }
+
+    /// Makes this replica the first voter of a new set.
+    async fn initialize_alone(&self) -> Result<(), String> {
+        let own = BTreeMap::from([(self.settings.id, BasicNode::new(&self.settings.addr))]);
+        self.raft.initialize(own).await.map_err(|e| e.to_string())
     }
 
     fn set_status(&self, status: Option<String>) {
@@ -842,9 +857,11 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     /// ready until it has joined, a saved vote alone included. The
     /// clock verification and the generations 2.11 adds to it are not
     /// known here. `commitable` once ready on a voter other than the
-    /// witness: it forwards what it does not order itself; a learner and
-    /// the witness, which serves no clients, answer
-    /// [`Reason::NotCommitable`].
+    /// witness that a leader counts as a voter, now or within the last
+    /// [`membership::UNCOUNTED`]: it forwards what it does not
+    /// order itself. A learner, the witness, which serves no clients, and
+    /// a replica no leader counts, such as one removed from the voters
+    /// while it was down, answer [`Reason::NotCommitable`].
     fn replica(&self) -> ReplicaInfo {
         let metrics = self.shared.raft.metrics().borrow().clone();
         let applied = metrics.last_applied.map_or(0, |id| id.index);
@@ -864,12 +881,15 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             in_sync: metrics.last_log_index.unwrap_or(0) <= applied,
             lag: None,
             ready,
-            commitable: ready && voter && slot_of(self.id()) != Slot::Witness,
+            commitable: ready
+                && voter
+                && slot_of(self.id()) != Slot::Witness
+                && self.shared.counted.load(Ordering::SeqCst),
         }
     }
 
     fn epoch(&self) -> u64 {
-        self.shared.settings.epoch
+        self.shared.epoch()
     }
 
     /// The product revision ([`state_machine::StateMachine::revision`]), not the log
@@ -987,7 +1007,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             let detail = if slot_of(self.id()) == Slot::Witness {
                 "the witness serves no clients"
             } else {
-                "not a voter yet"
+                "no leader counts this replica as a voter"
             };
             let refused = NotApplied::new(Reason::NotCommitable, detail);
             return Box::pin(async move { Err(refused) });

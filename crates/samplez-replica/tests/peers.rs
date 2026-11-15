@@ -13,8 +13,10 @@ use axum::body::Bytes;
 use harness::{Paths, RATE, owner};
 use openraft::ServerState;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+use samplez_replica::bootstrap::{Bootstrap, Volume};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::NodeId;
+use samplez_replica::membership::slot_of;
 use samplez_replica::net::MAX_IDLE;
 use samplez_replica::net::{Network, Pool};
 use samplez_replica::peer::{self, PeerClient, PeerRequest, Refused};
@@ -77,6 +79,7 @@ struct Set {
     listeners: BTreeMap<NodeId, std::net::TcpListener>,
     tls: BTreeMap<NodeId, Tls>,
     nodes: BTreeMap<NodeId, Node>,
+    _panics: harness::PanicGuard,
 }
 
 impl Set {
@@ -99,6 +102,7 @@ impl Set {
             listeners.insert(id, tcp);
         }
         let mut set = Set {
+            _panics: harness::PanicGuard::new(),
             root,
             listeners,
             addrs,
@@ -125,7 +129,7 @@ impl Set {
         let pool = Pool::new(tls.clone());
         let settings = Settings {
             id,
-            epoch: 1,
+            epoch: harness::CLUSTER,
             limits: Limits::defaults(RATE),
             block: harness::BLOCK,
             // Long, for a loaded test host.
@@ -158,6 +162,11 @@ impl Set {
         let server = tokio::spawn(peer::serve(tls, tcp, replica.clone(), async {
             let _ = stopped.await;
         }));
+        replica.begin(Bootstrap {
+            markers: Arc::new(harness::FakeMarkers),
+            volume: Volume::open(&self.root.join(id.to_string())).unwrap(),
+            slot: slot_of(id),
+        });
         self.nodes.insert(
             id,
             Node {

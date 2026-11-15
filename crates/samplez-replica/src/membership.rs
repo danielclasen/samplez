@@ -4,17 +4,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{BasicNode, ChangeMembers, ServerState};
 
 use crate::Shared;
+use crate::bootstrap::{self, Bootstrap, Marker, Step, Volume};
 use crate::entry::NodeId;
 use crate::peer::{PeerReply, PeerRequest, PeerResponse, Refused};
 
 /// How often the leader compares the voters with the wanted ones, beside
-/// each accepted join; and how often a new volume asks to join.
+/// each accepted join; and how often a replica checks that a leader
+/// counts it, or an empty volume reads the marker and asks to join.
 pub const PERIOD: Duration = Duration::from_secs(1);
 
 /// The low bits of a node id that come from its volume.
@@ -96,11 +101,12 @@ pub struct Change {
 /// nothing can be done yet.
 ///
 /// A learner of a wanted slot that has caught up takes the slot's place
-/// among the voters, and the slot's other nodes go: a learner only exists
-/// because its replica came back on a new volume, so the slot's voter is
-/// the lost volume. Several caught-up learners of one slot (a volume lost
-/// again before it was promoted) give the highest id the place; one of
-/// them that is gone is replaced in a later round. Voters of slots the set
+/// among the voters, and the slot's other nodes go: a learner of a slot
+/// that has a voter exists only because its replica came back on a new
+/// volume, so the slot's voter is the lost volume. Several caught-up
+/// learners of one slot (a volume lost again before it was promoted) give
+/// the highest id the place, the newest volume ([`bootstrap::volume_id`]);
+/// one of them that is gone is replaced in a later round. Voters of slots the set
 /// no longer wants go. The count stays odd: when it would be even, one
 /// learner filling an empty slot waits for the next round, or else one
 /// removal does, so a set starting from its first voter grows by two.
@@ -162,10 +168,28 @@ pub fn plan(
 }
 
 impl Shared {
-    /// Takes a new volume in as a learner; the leader only.
-    pub(crate) async fn admit(&self, id: NodeId, addr: String) -> PeerReply {
-        if !self.leads() {
-            return Err(Refused::NotLeader);
+    /// Takes a replica of the set `cluster` in as a learner; the leader
+    /// only. A replica the membership holds already is answered as joined.
+    pub(crate) async fn admit(&self, id: NodeId, addr: String, cluster: u64) -> PeerReply {
+        if !self.raft.is_initialized().await.unwrap_or(false) {
+            return Err(Refused::NotMember);
+        }
+        if cluster != self.epoch() {
+            return Err(Refused::OtherCluster);
+        }
+        if self
+            .settings
+            .voters
+            .is_some_and(|want| !want.wants(slot_of(id)))
+        {
+            return Err(Refused::NotWanted);
+        }
+        let Some(_proposing) = self.propose() else {
+            return Err(self.refusal());
+        };
+        let membership = self.raft.metrics().borrow().membership_config.clone();
+        if membership.membership().get_node(&id).is_some() {
+            return Ok(PeerResponse::Joined);
         }
         match self.raft.add_learner(id, BasicNode::new(addr), false).await {
             Ok(_) => {
@@ -175,38 +199,221 @@ impl Shared {
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
                 Err(Refused::NotLeader)
             }
-            Err(e) => Err(Refused::Unavailable(e.to_string())),
+            Err(e) => Err(crate::unavailable(&e)),
+        }
+    }
+
+    /// Asks every other wanted voter to take this replica in under
+    /// `cluster`; true when one of them answered as a member of a set.
+    async fn ask_to_join(&self, cluster: u64) -> bool {
+        let mut member = false;
+        for addr in self
+            .settings
+            .peers
+            .iter()
+            .filter(|a| **a != self.settings.addr)
+        {
+            let join = PeerRequest::Join {
+                id: self.settings.id,
+                addr: self.settings.addr.clone(),
+                cluster,
+            };
+            match self.peers.call(None, addr, join, PERIOD).await {
+                Ok(Ok(PeerResponse::Joined)) => return true,
+                Ok(Err(Refused::NotMember)) | Err(_) => {}
+                Ok(_) => member = true,
+            }
+        }
+        member
+    }
+
+    /// Whether this replica may start a new set: no other wanted voter
+    /// answers as a member of one, and a majority of the wanted voters,
+    /// this one included, answered that it is not.
+    async fn alone(&self) -> bool {
+        let others: Vec<&String> = self
+            .settings
+            .peers
+            .iter()
+            .filter(|a| **a != self.settings.addr)
+            .collect();
+        let mut answered = 1;
+        for addr in &others {
+            match self
+                .peers
+                .call(None, addr, PeerRequest::Member, PERIOD)
+                .await
+            {
+                Ok(Ok(PeerResponse::Member(true))) => return false,
+                Ok(Ok(PeerResponse::Member(false))) => answered += 1,
+                _ => {}
+            }
+        }
+        answered * 2 > others.len() + 1
+    }
+
+    /// Takes on `cluster` while the volume is empty: nothing was applied
+    /// under the previous one.
+    fn adopt(&self, cluster: u64, volume: &Volume) -> std::io::Result<()> {
+        if cluster != self.epoch() {
+            volume.set_cluster(cluster)?;
+            self.epoch.store(cluster, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Whether a leader counts this replica as a voter: it leads with a
+    /// quorum's acknowledgement within the lease, or it heard from its
+    /// leader within the lease, since it started, and its membership has
+    /// it as a voter. A vote saved before a restart names a leader the
+    /// replica has not heard since, itself included, and openraft dates it
+    /// to the start.
+    async fn counted_now(&self) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics.state == ServerState::Leader {
+            return self.quorum().await;
+        }
+        let voter = metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|id| id == self.settings.id);
+        let (lease, started) = (self.lease, self.started);
+        voter
+            && metrics.current_leader.is_some()
+            && self
+                .raft
+                .with_raft_state(move |state| {
+                    state.vote_ref().committed
+                        && state
+                            .vote_last_modified()
+                            .is_some_and(|at| at > started && at.elapsed() <= lease)
+                })
+                .await
+                .unwrap_or(false)
+    }
+}
+
+/// How long no leader counts a replica as a voter before it is not
+/// commitable and asks to join again: past an election, which takes
+/// about a second.
+pub const UNCOUNTED: Duration = Duration::from_secs(3);
+
+/// How often a replica checks that a leader counts it.
+const TICK: Duration = Duration::from_millis(100);
+
+/// Rounds in which an empty volume found no member of a set before its
+/// status names the marker to delete.
+pub const NO_MEMBER_ROUNDS: u32 = 5;
+
+/// Keeps a replica in a set. An empty volume starts or joins the set the
+/// marker names (`bootstrap`) a round per [`PERIOD`], reading the marker
+/// every round, so a deleted or replaced marker takes effect without a
+/// restart. A replica with a log is commitable while a leader counts it
+/// as a voter, checked each 100 ms, and for [`UNCOUNTED`] after; past
+/// that it asks to join again under its own id each [`PERIOD`], as one
+/// removed from the voters while it was down must.
+pub(crate) async fn watch(shared: Arc<Shared>, bootstrap: Bootstrap) {
+    let mut empty_rounds = 0;
+    let mut counted_at: Option<Instant> = None;
+    let mut asked_at: Option<Instant> = None;
+    loop {
+        let now = Instant::now();
+        if shared.raft.is_initialized().await.unwrap_or(true) {
+            if shared.counted_now().await {
+                counted_at = Some(now);
+                shared.counted.store(true, Ordering::SeqCst);
+                shared.set_status(None);
+            } else if counted_at.is_none_or(|at| now - at >= UNCOUNTED) {
+                shared.counted.store(false, Ordering::SeqCst);
+                if counted_at.is_some() || now - shared.started >= UNCOUNTED {
+                    shared.set_status(Some(
+                        "no leader counts this replica as a voter; asking to join as a learner"
+                            .into(),
+                    ));
+                    if asked_at.is_none_or(|at| now - at >= PERIOD) {
+                        asked_at = Some(now);
+                        shared.ask_to_join(shared.epoch()).await;
+                    }
+                }
+            }
+            tokio::time::sleep(TICK).await;
+        } else {
+            let started = start(&shared, &bootstrap, &mut empty_rounds).await;
+            shared.set_status(started.err());
+            tokio::time::sleep(PERIOD).await;
         }
     }
 }
 
-/// Asks the set's replicas to take this one in, until it holds the
-/// membership. The status names `marker`: with no voter left holding a
-/// log, nothing takes it in, and only deleting the marker lets ordinal 0
-/// start a new set.
-pub(crate) async fn join(shared: Arc<Shared>, marker: String) {
-    let settings = &shared.settings;
-    loop {
-        if shared.raft.is_initialized().await.unwrap_or(true) {
-            shared.set_status(None);
-            return;
-        }
-        shared.set_status(Some(format!(
-            "joining as a learner through {}; with no voter holding a log, nothing takes it in: \
-             delete ConfigMap {marker} to start a new set",
-            settings.peers.join(", ")
-        )));
-        for addr in settings.peers.iter().filter(|addr| **addr != settings.addr) {
-            let join = PeerRequest::Join {
-                id: settings.id,
-                addr: settings.addr.clone(),
-            };
-            if let Ok(Ok(PeerResponse::Joined)) = shared.peers.call(None, addr, join, PERIOD).await
-            {
-                break;
+/// One round of an empty volume: [`bootstrap::step`] on the marker.
+async fn start(
+    shared: &Shared,
+    bootstrap: &Bootstrap,
+    empty_rounds: &mut u32,
+) -> Result<(), String> {
+    let markers = &bootstrap.markers;
+    let marker = markers
+        .get()
+        .await
+        .map_err(|e| format!("reading ConfigMap {}: {e}", markers.name()))?;
+    let io = |e: std::io::Error| e.to_string();
+    let refuse = || {
+        format!(
+            "another replica answers as a member of a set, though ConfigMap {} names none \
+             to join; not starting a second one",
+            markers.name()
+        )
+    };
+    match bootstrap::step(bootstrap.slot, bootstrap.volume.id, marker) {
+        Step::Wait => Err(format!(
+            "waiting for ordinal 0 to create ConfigMap {}",
+            markers.name()
+        )),
+        Step::Create => {
+            if !shared.alone().await {
+                return Err(refuse());
             }
+            let cluster = bootstrap::random_id().map_err(io)?;
+            let marker = Marker {
+                cluster,
+                volume: bootstrap.volume.id,
+            };
+            // Lost to another creator: read theirs next round.
+            if markers.create(marker).await? {
+                shared.adopt(cluster, &bootstrap.volume).map_err(io)?;
+                shared.initialize_alone().await?;
+            }
+            Ok(())
         }
-        tokio::time::sleep(PERIOD).await;
+        Step::Initialize { cluster } => {
+            if !shared.alone().await {
+                return Err(refuse());
+            }
+            shared.adopt(cluster, &bootstrap.volume).map_err(io)?;
+            shared.initialize_alone().await
+        }
+        Step::Join { cluster } => {
+            shared.adopt(cluster, &bootstrap.volume).map_err(io)?;
+            if shared.ask_to_join(cluster).await {
+                *empty_rounds = 0;
+            } else {
+                *empty_rounds += 1;
+            }
+            if *empty_rounds >= NO_MEMBER_ROUNDS {
+                return Err(format!(
+                    "no replica answered as a member of the set ConfigMap {} names in {} \
+                     rounds; with no voter left holding a log, nothing takes this replica in: \
+                     delete the ConfigMap to start a new set",
+                    markers.name(),
+                    empty_rounds
+                ));
+            }
+            Err(format!(
+                "joining as a learner through {}",
+                shared.settings.peers.join(", ")
+            ))
+        }
     }
 }
 
@@ -220,12 +427,12 @@ pub(crate) async fn reconcile(shared: Arc<Shared>, want: Voters) {
         }
         let metrics = shared.raft.metrics().borrow().clone();
         let membership = metrics.membership_config.membership();
-        if metrics.state != ServerState::Leader
-            || shared.quiescing()
-            || membership.get_joint_config().len() > 1
-        {
+        if membership.get_joint_config().len() > 1 {
             continue;
         }
+        let Some(_proposing) = shared.propose() else {
+            continue;
+        };
         let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
         let learners: BTreeSet<NodeId> = membership.learner_ids().collect();
         let applied = metrics.last_applied.map_or(0, |id| id.index);
