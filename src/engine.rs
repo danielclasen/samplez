@@ -626,7 +626,14 @@ impl Engine {
         let alone = voters == 1;
         let hash_tx = hash_tx.filter(|_| reports.is_some() && !alone);
         let (replica, rt_replica, change_rx, hash_rx) = if reports.is_some() {
-            let slots = (4 * hold_blocks).next_power_of_two().max(MIN_STATUS_SLOTS);
+            // A page's first settle reads the status of each of its
+            // blocks, up to a page back, while the supervisor may set
+            // statuses ahead: the ring holds two pages of blocks.
+            let page_blocks = 2 * PAGE.div_ceil(b) as usize;
+            let slots = (4 * hold_blocks)
+                .max(page_blocks)
+                .next_power_of_two()
+                .max(MIN_STATUS_SLOTS);
             let shared = Arc::new(Shared {
                 fence: AtomicU64::new(if alone { u64::MAX } else { 0 }),
                 rank: AtomicU64::new(0),
@@ -2897,6 +2904,107 @@ mod tests {
         }
         e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// With 16-sample blocks and a short hold a page is 64 blocks, as
+    /// many as four times the hold ring: a block a page after the
+    /// first block of a page, withheld ahead by the supervisor, must not
+    /// take that block's status before the page settles, which reads it.
+    #[test]
+    fn a_status_set_ahead_keeps_a_page_committed_at_blocks_of_16() {
+        use crate::blocks::PAGE;
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let run = || -> Option<String> {
+            let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+            let domain = std::env::temp_dir().join(format!("samplez-b16-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&domain);
+            std::fs::create_dir(&domain).unwrap();
+            let id = "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d61";
+            let v = serde_json::json!({
+                "libmxl": libmxl,
+                "blockSize": 16,
+                // A stall under load is caught up rather than skipped.
+                "maxCatchupBlocks": 300,
+                "holdMs": 2,
+                "contactWindowMs": 2,
+                "domains": [{ "name": "d", "path": domain }],
+                "outputs": [{ "name": id, "domain": "d", "flowId": id, "label": "b16",
+                              "group": "b16", "role": "Audio", "channels": 1 }],
+                "matrix": [],
+                "rt": { "enabled": false, "rtCpu": "none" },
+            });
+            let config = Config::parse(&v.to_string()).unwrap();
+            assert!(4 * config.hold_blocks() <= 64, "{}", config.hold_blocks());
+            let process = rt::setup_process(&config.rt);
+            let (report_tx, _reports) = mpsc::sync_channel(64);
+            let (hash_tx, hashes) = mpsc::sync_channel(1 << 16);
+            let replication = Replication {
+                voters: 2,
+                reports: report_tx,
+                statuses: None,
+                hashes: Some(hash_tx),
+            };
+            let e = Engine::start_replicated(config, process, None, replication).unwrap();
+            let processed = || e.counters().processed.load(Acquire);
+            wait(&|| e.status().outputs[0].realised);
+            e.set_fence(u64::MAX).unwrap();
+            let c = e.counters();
+            // A skip or an overflow from the commit start on withdraws
+            // the replica.
+            let base = (
+                c.overrun_skipped_samples.load(Relaxed),
+                c.hold_overflows.load(Relaxed),
+            );
+            e.commit_from(0, processed() + 2).unwrap();
+            let per = PAGE / 16;
+            let k0 = (processed() + 4) / per * per + per;
+            wait(&|| processed() > k0);
+            let disturbed = if processed() > k0 + per / 2 {
+                Some(format!("block {k0} computed late"))
+            } else {
+                assert!(
+                    e.withhold(0, k0 + per, Cause::FenceDeadline)
+                        .unwrap()
+                        .is_some()
+                );
+                let page = k0 * 16 / PAGE;
+                let t = Instant::now();
+                let record = loop {
+                    assert!(
+                        t.elapsed() < Duration::from_secs(5),
+                        "page {page} not settled"
+                    );
+                    match hashes.recv_timeout(Duration::from_millis(100)) {
+                        Ok(h) if h.page >= page => break h,
+                        _ => {}
+                    }
+                };
+                let skipped = c.overrun_skipped_samples.load(Relaxed) - base.0;
+                let overflows = c.hold_overflows.load(Relaxed) - base.1;
+                if skipped > 0 || overflows > 0 {
+                    Some(format!("{skipped} samples skipped, {overflows} overflows"))
+                } else {
+                    assert_eq!(record.page, page, "{record:?}");
+                    assert!(record.committed, "{record:?}");
+                    None
+                }
+            };
+            e.stop();
+            std::fs::remove_dir_all(&domain).unwrap();
+            disturbed
+        };
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            match run() {
+                None => return,
+                Some(why) => {
+                    eprintln!("run disturbed ({why}): running it again");
+                    seen.push(why);
+                }
+            }
+        }
+        panic!("every run was disturbed: {seen:?}");
     }
 
     /// An `InputDown`, `InputUp` or `Route` entry that reaches the RT
