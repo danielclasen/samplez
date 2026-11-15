@@ -3,8 +3,11 @@
 //! which [`openraft::storage::Adaptor`] splits into its log store and state
 //! machine (the split traits are sealed without the `storage-v2` feature).
 //!
-//! `log` is an append-only file of length-prefixed records, read back to
-//! the last whole one; `snapshot` is replaced by rename.
+//! `log` is an append-only file of records, each a length, a CRC-32C of
+//! its body and the body. A tail that holds no whole record, as a write
+//! cut short by a crash leaves, is cut on open; a damaged record with a
+//! whole one after it is corruption, and the store does not open.
+//! `snapshot` is replaced by rename.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -79,30 +82,88 @@ fn io_error<E: std::error::Error + 'static>(
     }
 }
 
+/// The CRC-32C (Castagnoli) table, reflected.
+const CRC32C: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut n = 0;
+    while n < 256 {
+        let mut crc = n as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0x82f6_3b78
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[n] = crc;
+        n += 1;
+    }
+    table
+};
+
+fn crc32c(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(!0, |crc, &b| {
+        CRC32C[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8)
+    })
+}
+
+/// A record's length and checksum, before its body.
+const HEAD: usize = 8;
+
 fn encode(record: &Record, out: &mut Vec<u8>) {
     let body = serde_json::to_vec(record).expect("records encode");
     let len = u32::try_from(body.len()).expect("record under 4 GiB");
     out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&crc32c(&body).to_le_bytes());
     out.extend_from_slice(&body);
 }
 
-/// The whole records at the start of `bytes`, and the length they take: a
-/// write cut short by a crash leaves a tail that is not one.
-fn decode(bytes: &[u8]) -> (Vec<Record>, usize) {
+/// The body of the record at `at` when a whole one is there: it fits and
+/// its checksum matches. No record is empty, so zeroes are none.
+fn record_at(bytes: &[u8], at: usize) -> Option<&[u8]> {
+    let head = bytes.get(at..at + HEAD)?;
+    let len = u32::from_le_bytes(head[..4].try_into().expect("4 bytes")) as usize;
+    let crc = u32::from_le_bytes(head[4..].try_into().expect("4 bytes"));
+    let body = bytes.get(at + HEAD..at + HEAD + len)?;
+    (len > 0 && crc32c(body) == crc).then_some(body)
+}
+
+/// The records of `bytes` and the length they take. Only a crash in an
+/// unsynced write leaves a damaged record, and then nothing whole after
+/// it: a damaged record with a whole one after it is corruption that
+/// cutting would turn into lost fsynced entries and votes.
+fn decode(bytes: &[u8]) -> io::Result<(Vec<Record>, usize)> {
     let mut records = Vec::new();
     let mut at = 0;
-    while let Some(head) = bytes.get(at..at + 4) {
-        let len = u32::from_le_bytes(head.try_into().expect("4 bytes")) as usize;
-        let Some(body) = bytes.get(at + 4..at + 4 + len) else {
+    while at < bytes.len() {
+        let Some(body) = record_at(bytes, at) else {
+            if let Some(next) = (at + 1..bytes.len()).find(|&n| record_at(bytes, n).is_some()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the log record at offset {at} is damaged, and of the {} bytes \
+                         from there a whole record starts at offset {next}",
+                        bytes.len() - at
+                    ),
+                ));
+            }
             break;
         };
-        let Ok(record) = serde_json::from_slice(body) else {
-            break;
-        };
+        let record = serde_json::from_slice(body).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the log record at offset {at}, {} bytes, does not decode: {e}",
+                    body.len()
+                ),
+            )
+        })?;
         records.push(record);
-        at += 4 + len;
+        at += HEAD + body.len();
     }
-    (records, at)
+    Ok((records, at))
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -150,8 +211,14 @@ impl<P: Product> Store<P> {
             .open(&path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let (records, whole) = decode(&bytes);
+        let (records, whole) = decode(&bytes)?;
         if whole < bytes.len() {
+            tracing::warn!(
+                log = %path.display(),
+                offset = whole,
+                bytes = bytes.len() - whole,
+                "cutting a torn tail off the log"
+            );
             file.set_len(whole as u64)?;
             file.sync_all()?;
         }
@@ -595,6 +662,87 @@ mod tests {
             entries.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
             [1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn crc32c_matches_the_castagnoli_check_value() {
+        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+    }
+
+    #[tokio::test]
+    async fn a_zero_filled_tail_is_cut() {
+        let dir = dir("zeroes");
+        let mut store = open(&dir);
+        store
+            .append_to_log((1..=2).map(entry))
+            .await
+            .expect("append");
+        drop(store);
+        let len = fs::metadata(dir.join("log")).expect("log").len();
+        let log = OpenOptions::new()
+            .append(true)
+            .open(dir.join("log"))
+            .expect("log");
+        log.set_len(len + 4096).expect("extend");
+        drop(log);
+        let mut store = open(&dir);
+        assert_eq!(fs::metadata(dir.join("log")).expect("log").len(), len);
+        assert_eq!(
+            store.try_get_log_entries(1..).await.expect("entries").len(),
+            2
+        );
+    }
+
+    /// A damaged record with whole ones after it is not a torn tail:
+    /// cutting it would drop fsynced entries, so the store does not open
+    /// and leaves the file as it is.
+    #[tokio::test]
+    async fn a_damaged_record_before_whole_ones_refuses_to_open() {
+        let dir = dir("damaged");
+        let mut store = open(&dir);
+        store
+            .append_to_log((1..=3).map(entry))
+            .await
+            .expect("append");
+        drop(store);
+        let mut bytes = fs::read(dir.join("log")).expect("log");
+        let len = bytes.len();
+        bytes[HEAD + 2] ^= 0x20;
+        fs::write(dir.join("log"), &bytes).expect("damage");
+        let Err(e) = Store::open(&dir, Paths::default(), Limits::defaults(48_000)) else {
+            panic!("opened a damaged log");
+        };
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("offset 0"), "{e}");
+        assert_eq!(
+            fs::metadata(dir.join("log")).expect("log").len() as usize,
+            len
+        );
+    }
+
+    /// A flipped bit that leaves the body valid JSON is caught by the
+    /// checksum, not read back as another entry.
+    #[tokio::test]
+    async fn a_record_that_still_parses_is_caught_by_its_checksum() {
+        let dir = dir("bitflip");
+        let mut store = open(&dir);
+        store
+            .append_to_log((1..=2).map(entry))
+            .await
+            .expect("append");
+        drop(store);
+        let mut bytes = fs::read(dir.join("log")).expect("log");
+        let at = bytes
+            .windows(10)
+            .position(|w| w == b"\"stamp\":48")
+            .expect("first entry's stamp")
+            + 8;
+        bytes[at] = b'5';
+        fs::write(dir.join("log"), &bytes).expect("damage");
+        let Err(e) = Store::open(&dir, Paths::default(), Limits::defaults(48_000)) else {
+            panic!("read a damaged record back");
+        };
+        assert!(e.to_string().contains("offset 0"), "{e}");
     }
 
     #[tokio::test]
