@@ -57,6 +57,7 @@ fn setup_writer() -> (Output, Vec<f32>) {
         role: "Audio",
         channels: CHANNELS as u32,
         block: B,
+        batch: B,
     };
     let Ok(Creation::Created { mut writer, .. }) = output::create(&instance, &cfg) else {
         panic!("output not created");

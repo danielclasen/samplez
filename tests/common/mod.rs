@@ -139,6 +139,7 @@ impl Pilot {
             role: "Audio",
             channels,
             block: batch,
+            batch,
         };
         let Creation::Created { mut writer, .. } = output::create(&instance, &cfg).unwrap() else {
             panic!("pilot flow {id} not created");

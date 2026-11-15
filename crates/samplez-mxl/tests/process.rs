@@ -131,6 +131,7 @@ fn output_creation_over_a_live_stale_and_surviving_flow() {
         role: "Audio",
         channels: 2,
         block: B,
+        batch: B,
     };
 
     // A live writer in another process: not realised, the flow untouched.

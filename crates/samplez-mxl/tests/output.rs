@@ -18,6 +18,7 @@ fn config(flow_id: &str, channels: u32) -> OutputConfig<'_> {
         role: "Audio",
         channels,
         block: B,
+        batch: B,
     }
 }
 
@@ -151,4 +152,70 @@ fn a_live_writer_of_another_instance_is_left_alone() {
         r.samples((K0 + 3) * B, 1).unwrap()[1][0],
         sample(1, (K0 + 3) * B - 1)
     );
+}
+
+/// A range of several blocks and a partial block, from a planar buffer
+/// with a longer stride, is read back at its indices in one commit; the
+/// batch hints are the batch.
+#[test]
+fn a_range_is_written_in_one_commit() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let instance = Instance::new(&api, &domain.0).unwrap();
+    let cfg = OutputConfig {
+        batch: 20 * B,
+        ..config(&id, 2)
+    };
+    let Creation::Created { writer: mut w, .. } = output::create(&instance, &cfg).unwrap() else {
+        panic!("flow {id} not created");
+    };
+    assert_eq!(w.hints(), (20 * B as u32, 20 * B as u32));
+    let stride = 20 * B as usize;
+    let start = K0 * B + 7;
+    let len = 3 * B as usize + 5;
+    let mut buf = vec![f32::NAN; 2 * stride];
+    for c in 0..2 {
+        for i in 0..len {
+            buf[c * stride + i] = sample(c, start + i as u64);
+        }
+    }
+    assert_eq!(w.write(start, len, &buf, stride), Write::Committed);
+    assert_eq!(w.last_commit(), Some(start + len as u64));
+    let r = RawReader::open(&api, &domain.0, &id);
+    assert_eq!(r.head(), start + len as u64);
+    let got = r.samples(start + len as u64, len).unwrap();
+    for (c, chan) in got.iter().enumerate() {
+        let want: Vec<f32> = (start..start + len as u64).map(|i| sample(c, i)).collect();
+        assert_eq!(chan, &want, "ch {c}");
+    }
+    // A range longer than its stride is refused.
+    assert!(matches!(
+        w.write(start + len as u64, stride + 1, &buf, stride),
+        Write::Failed(_)
+    ));
+}
+
+/// A batch longer than half the flow's ring is refused at creation, and
+/// the flow is released with its writer.
+#[test]
+fn a_batch_above_half_the_ring_is_refused() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let instance = Instance::new(&api, &domain.0).unwrap();
+    let len = created(&instance, &new_id(), 1).buffer_length();
+    let cfg = OutputConfig {
+        batch: (len / 2 / B + 1) * B,
+        ..config(&id, 1)
+    };
+    let Err(samplez_mxl::Error::Batch {
+        batch,
+        buffer_length,
+    }) = output::create(&instance, &cfg)
+    else {
+        panic!("a batch of {} samples was accepted", cfg.batch);
+    };
+    assert_eq!((batch, buffer_length), (cfg.batch, len));
+    assert_eq!(instance.is_flow_active(&id).unwrap(), None);
 }

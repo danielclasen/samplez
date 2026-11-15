@@ -17,8 +17,12 @@ pub struct OutputConfig<'a> {
     pub group: &'a str,
     pub role: &'a str,
     pub channels: u32,
-    /// Block size B in samples, also both batch size hints.
+    /// Block size B in samples.
     pub block: u64,
+    /// The largest range committed at once, both batch size hints: B, or
+    /// the hold ring of a replica. Creation fails when it is longer than
+    /// half the flow's ring.
+    pub batch: u64,
 }
 
 /// The IS-04 Flow definition with the fields libmxl's flow parser reads for
@@ -75,8 +79,8 @@ pub enum Creation {
 ///
 /// samplez itself deletes and edits no file in the domain. The writer's
 /// create options set `maxCommitBatchSizeHint` and `maxSyncBatchSizeHint`
-/// to B; a new flow is zero-filled by libmxl, so nothing is written before
-/// the first block.
+/// to the batch; a new flow is zero-filled by libmxl, so nothing is
+/// written before the first block.
 ///
 /// libmxl v1.1.0's `mxlIsFlowActive` reports `MXL_ERR_FLOW_NOT_FOUND` for
 /// any failure to open the flow's data file. An existing flow this process
@@ -85,8 +89,11 @@ pub enum Creation {
 /// which the caller counts as a create failure.
 pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
     let def = flow_definition(c)?;
-    if c.block == 0 {
-        return Err(Error::Format(format!("output {}: block size 0", c.flow_id)));
+    if c.block == 0 || c.batch < c.block {
+        return Err(Error::Format(format!(
+            "output {}: block size 0, or a batch below it",
+            c.flow_id
+        )));
     }
     let mut collected = false;
     match instance.is_flow_active(c.flow_id)? {
@@ -104,7 +111,7 @@ pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
     create_writer(instance, c, def, collected)
 }
 
-/// `mxlCreateFlowWriter` with the batch size hints at B; an existing flow
+/// `mxlCreateFlowWriter` with the batch size hints at the batch; an existing flow
 /// it opens (`was_created == false`) is released as [`Creation::Raced`].
 fn create_writer(
     instance: &Arc<Instance>,
@@ -114,8 +121,8 @@ fn create_writer(
 ) -> Result<Creation> {
     let c_def = CString::new(def).expect("JSON from serde_json has no NUL");
     let options = serde_json::json!({
-        "maxCommitBatchSizeHint": c.block,
-        "maxSyncBatchSizeHint": c.block,
+        "maxCommitBatchSizeHint": c.batch,
+        "maxSyncBatchSizeHint": c.batch,
     })
     .to_string();
     let c_options = CString::new(options).expect("JSON from serde_json has no NUL");
@@ -155,6 +162,12 @@ fn create_writer(
     if c.block > writer.buffer_length / 2 {
         return Err(Error::Block {
             block: c.block,
+            buffer_length: writer.buffer_length,
+        });
+    }
+    if c.batch > writer.buffer_length / 2 {
+        return Err(Error::Batch {
+            batch: c.batch,
             buffer_length: writer.buffer_length,
         });
     }
@@ -218,24 +231,30 @@ impl FlowWriter {
     }
 
     /// RT. Writes block `k`, `[kB, (k + 1)B)`, from `data`, planar with B
-    /// samples per channel: `mxlFlowWriterOpenSamples((k + 1)B, B)`, both
-    /// fragments filled, `mxlFlowWriterCommitSamples`. A block starting
-    /// below the last commit is held and counted; libmxl zero-fills a
-    /// forward gap on commit.
+    /// samples per channel, as [`FlowWriter::write`].
     pub fn write_block(&mut self, k: u64, data: &[f32]) -> Write {
-        let b = self.block;
-        let Some((start, end)) = k
-            .checked_mul(b)
-            .and_then(|start| Some((start, start.checked_add(b)?)))
-        else {
+        match k.checked_mul(self.block) {
+            Some(start) => self.write(start, self.block as usize, data, self.block as usize),
+            None => Write::Failed(mxl_sys::MXL_ERR_INVALID_ARG),
+        }
+    }
+
+    /// RT. Writes `[start, start + len)` from `data`, planar with `stride`
+    /// samples per channel, in one commit:
+    /// `mxlFlowWriterOpenSamples(start + len, len)`, both fragments
+    /// filled, `mxlFlowWriterCommitSamples`. A range starting below the
+    /// last commit is held and counted; libmxl zero-fills a forward gap on
+    /// commit.
+    pub fn write(&mut self, start: u64, len: usize, data: &[f32], stride: usize) -> Write {
+        let Some(end) = start.checked_add(len as u64) else {
             return Write::Failed(mxl_sys::MXL_ERR_INVALID_ARG);
         };
         if self.last_commit.is_some_and(|last| start < last) {
             self.held_blocks += 1;
             return Write::Held;
         }
-        let n = b as usize;
-        if data.len() < self.channels * n {
+        let n = len;
+        if len > stride || data.len() < (self.channels - 1) * stride + len {
             return Write::Failed(mxl_sys::MXL_ERR_INVALID_ARG);
         }
         let api = self.instance.api();
@@ -247,7 +266,8 @@ impl FlowWriter {
         }
         let [f0, f1] = slice.base.fragments;
         let width = size_of::<f32>();
-        for (ch, src) in data.chunks_exact(n).take(slice.count).enumerate() {
+        for ch in 0..slice.count.min(self.channels) {
+            let src = &data[ch * stride..][..n];
             let (a, rest) = src.split_at((f0.size / width).min(n));
             let second = (f1.size / width).min(rest.len());
             // SAFETY: libmxl returned two writable fragments of `f0.size`
@@ -315,6 +335,7 @@ mod tests {
             role: "Audio 1",
             channels: 6,
             block: 48,
+            batch: 48,
         }
     }
 

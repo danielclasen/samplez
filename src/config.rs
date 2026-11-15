@@ -337,6 +337,7 @@ impl Config {
             role: &o.role,
             channels: o.channels,
             block: u64::from(self.block_size),
+            batch: u64::from(self.block_size),
         }
     }
 }

@@ -43,6 +43,8 @@ pub enum Error {
     /// The output's block size is longer than the `buffer_length / 2`
     /// samples libmxl lets a writer open at once.
     Block { block: u64, buffer_length: u64 },
+    /// The output's commit batch is longer than `buffer_length / 2`.
+    Batch { batch: u64, buffer_length: u64 },
 }
 
 impl fmt::Display for Error {
@@ -67,6 +69,14 @@ impl fmt::Display for Error {
                 f,
                 "block of {block} samples is longer than half the flow's ring of \
                  {buffer_length}"
+            ),
+            Error::Batch {
+                batch,
+                buffer_length,
+            } => write!(
+                f,
+                "commit batch of {batch} samples is longer than half the flow's ring \
+                 of {buffer_length}"
             ),
         }
     }
