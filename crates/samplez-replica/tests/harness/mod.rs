@@ -4,6 +4,12 @@
 //! tokio clock (`#[tokio::test(start_paused = true)]`) so openraft's
 //! timers and the replicas' clocks move only with the runtime's virtual
 //! time.
+//!
+//! openraft draws its election timeouts from an unseeded random source,
+//! so which replica leads differs between runs; tests assert what holds
+//! whichever one does. A "crash" ([`Set::crash`]) is a shutdown inside
+//! this process: what was written but not fsynced stays in the page
+//! cache, so nothing here models a power loss or a lost fsync.
 
 #![allow(dead_code)]
 
@@ -353,8 +359,9 @@ impl Set {
         self.replicas.insert(id, Arc::new(replica));
     }
 
-    /// Stops `id` as a crash would: its peers stop reaching it at once and
-    /// it keeps only what its volume holds.
+    /// Stops `id` as a process crash would: its peers stop reaching it at
+    /// once and it keeps only what its volume holds. The shutdown is
+    /// graceful and in-process, so the volume keeps unsynced writes too.
     pub async fn crash(&mut self, id: NodeId) {
         self.net.links().rafts.remove(&id);
         if let Some(replica) = self.replicas.remove(&id) {
