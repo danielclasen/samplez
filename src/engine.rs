@@ -1711,6 +1711,14 @@ impl Supervisor {
             Change::Route { slot } => {
                 let flow = j.flow.expect("a route has a flow");
                 if flow != self.slots[slot].flow {
+                    // A polled slot polls the flow it reads: the hold on
+                    // the old one is released, `poll` takes one on the new.
+                    self.release_poll(slot);
+                    if let SupState::Pruned { recovery, held } = &mut self.slots[slot].state {
+                        *recovery = Recovery::default();
+                        *held = false;
+                    }
+                    self.slots[slot].reported = false;
                     let old = std::mem::replace(&mut self.slots[slot].flow, flow.clone());
                     self.slots[slot].routing = Some((j.at_index + self.ramp, old));
                     self.status().inputs[slot].flow_id = flow;

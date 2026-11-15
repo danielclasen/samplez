@@ -489,3 +489,27 @@ fn entries_at_one_index_each_get_their_generation() {
     assert_eq!(s.diverged, None);
     common::stop(e);
 }
+
+/// An input that is down because its flow is gone, re-routed to a live
+/// flow, comes up on it: the supervisor polls the flow the input reads.
+#[test]
+fn a_down_input_re_routed_to_a_live_flow_comes_up() {
+    let domain = Domain::new();
+    let (dead, live, out) = (new_id(), new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &live, 1, B, 0);
+    let (e, _rx) = common::start(config(
+        &domain.0,
+        &[(&dead, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    ));
+    wait_for(10 * SECOND, "input down", || !e.status().inputs[0].up);
+    e.route(0, &live, 0).unwrap();
+    wait_for(10 * SECOND, "input up on the live flow", || {
+        let s = e.status();
+        s.inputs[0].up && s.inputs[0].state == InputState::Attached
+    });
+    assert_eq!(e.status().inputs[0].flow_id, live);
+    common::stop(e);
+}
