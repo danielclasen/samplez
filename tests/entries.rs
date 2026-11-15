@@ -601,6 +601,67 @@ fn a_report_the_channel_had_no_room_for_is_sent_again() {
     common::stop(e);
 }
 
+/// A child process of this test binary, continued and killed when the
+/// test ends before it was waited for: a panic between a SIGSTOP and its
+/// SIGCONT leaves no stopped process behind.
+struct Child(std::process::Child);
+
+impl Child {
+    /// Runs test `name` of this binary with `env` set to `value`.
+    fn spawn(name: &str, env: &str, value: String) -> Child {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(env, value)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Child(child)
+    }
+
+    /// Sends `signal` to the child.
+    fn signal(&self, signal: libc::c_int) {
+        // SAFETY: kill has no memory preconditions; the pid is our child's,
+        // not yet waited for.
+        assert_eq!(unsafe { libc::kill(self.0.id() as libc::pid_t, signal) }, 0);
+    }
+
+    /// Stops the child for `d`.
+    fn stall(&self, d: Duration) {
+        self.signal(libc::SIGSTOP);
+        std::thread::sleep(d);
+        self.signal(libc::SIGCONT);
+    }
+
+    /// Closes the child's stdin and waits for it to end successfully.
+    fn finish(&mut self) {
+        drop(self.0.stdin.take());
+        assert!(self.0.wait().unwrap().success());
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            self.signal(libc::SIGCONT);
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// The lines a child prints, read up to the next one starting with
+/// `marker`; returns the rest of that line, split at whitespace.
+fn until(lines: &mut impl Iterator<Item = std::io::Result<String>>, marker: &str) -> Vec<String> {
+    for line in lines {
+        let line = line.unwrap();
+        if let Some(rest) = line.strip_prefix(marker) {
+            return rest.split_whitespace().map(str::to_owned).collect();
+        }
+    }
+    panic!("the child ended before {marker:?}");
+}
+
 /// The ramp of the forward-skip test: long enough that the skip ends
 /// inside it.
 const LONG_RAMP: u32 = 48_000;
@@ -616,9 +677,9 @@ fn skip_config(domain: &Path, src: &str, out: &str) -> samplez::Config {
 /// that test with `SAMPLEZ_SKIP_CHILD` set to the domain and the input
 /// and output flow ids; without it there is nothing to run. It takes
 /// lines on stdin: `entries <down> <up>` appends and commits an
-/// `InputDown` and an `InputUp` at those indices, `report` prints the
-/// first block processed at or after `up` and its counters. It stops once
-/// stdin closes.
+/// `InputDown` and an `InputUp` at those indices, `report <end>` prints
+/// its counters and the blocks it processed from `up` to `end`. It stops
+/// once stdin closes.
 #[test]
 fn forward_skip_child() {
     let Ok(args) = std::env::var("SAMPLEZ_SKIP_CHILD") else {
@@ -641,14 +702,20 @@ fn forward_skip_child() {
                 e.commit(2);
                 println!("\nskip-child appended");
             }
-            ["report"] => {
-                let first = rx.try_iter().find(|v| v.k * B >= up).unwrap().k;
+            ["report", end] => {
+                let end: u64 = end.parse().unwrap();
+                let blocks: Vec<String> = rx
+                    .try_iter()
+                    .filter(|v| v.k * B >= up && v.k < end)
+                    .map(|v| v.k.to_string())
+                    .collect();
                 let c = e.counters();
                 println!(
-                    "\nskip-child first {first} skipped {} late {} diverged {}",
+                    "\nskip-child skipped {} late {} diverged {} blocks {}",
                     c.overrun_skipped_samples.load(Relaxed),
                     c.generation_late.load(Relaxed),
                     e.status().diverged.is_some(),
+                    blocks.join(" "),
                 );
             }
             _ => panic!("unknown line {line}"),
@@ -667,34 +734,20 @@ fn input_up_fades_in_from_its_index_across_a_forward_skip() {
     let domain = Domain::new();
     let (src, out_a, out_b) = (new_id(), new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "forward_skip_child", "--nocapture"])
-        .env(
-            "SAMPLEZ_SKIP_CHILD",
-            format!("{} {src} {out_a}", domain.0.display()),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let mut until = |marker: &str| -> Vec<String> {
-        for line in lines.by_ref() {
-            let line = line.unwrap();
-            if let Some(rest) = line.strip_prefix(marker) {
-                return rest.split_whitespace().map(str::to_owned).collect();
-            }
-        }
-        panic!("the child ended before {marker:?}");
-    };
-    until("skip-child ready");
+    let mut child = Child::spawn(
+        "forward_skip_child",
+        "SAMPLEZ_SKIP_CHILD",
+        format!("{} {src} {out_a}", domain.0.display()),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.0.stdout.take().unwrap()).lines();
+    until(&mut lines, "skip-child ready");
     let (b, rx_b, _rep_b) = start_replicated(skip_config(&domain.0, &src, &out_b));
     running(&b);
     let k0 = now(&rx_b);
     let (down, up) = ((k0 + 150) * B, (k0 + 750) * B);
     writeln!(stdin, "entries {down} {up}").unwrap();
-    until("skip-child appended");
+    until(&mut lines, "skip-child appended");
     b.append(1, down, Entry::InputDown { slot: 0 }).unwrap();
     b.append(2, up, Entry::InputUp { slot: 0 }).unwrap();
     b.commit(2);
@@ -703,48 +756,41 @@ fn input_up_fades_in_from_its_index_across_a_forward_skip() {
         vb.extend(rx_b.try_iter());
         vb.last().is_some_and(|v| v.k + 60 >= up / B)
     });
-    let pid = child.id() as libc::pid_t;
-    // SAFETY: kill has no memory preconditions; the pid is our child's.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
-    std::thread::sleep(Duration::from_millis(200));
-    // SAFETY: as above.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    child.stall(Duration::from_millis(200));
     let end = up / B + 400;
     wait_past(&rx_b, end, &mut vb);
     std::thread::sleep(Duration::from_millis(100));
-    writeln!(stdin, "report").unwrap();
-    let r = until("skip-child first");
-    let first: u64 = r[0].parse().unwrap();
+    writeln!(stdin, "report {end}").unwrap();
+    let r = until(&mut lines, "skip-child skipped");
+    assert_eq!((r[2].as_str(), r[4].as_str()), ("0", "false"), "{r:?}");
+    let va: HashSet<u64> = r[6..].iter().map(|k| k.parse().unwrap()).collect();
+    let first = va.iter().copied().min().unwrap();
     assert!(
-        first > up / B + 20 && r[2] != "0",
-        "engine a did not skip over index {up}: {r:?}"
+        first > up / B + 20 && r[0] != "0",
+        "engine a did not skip over index {up}: skipped {}, first block {first}",
+        r[0]
     );
-    assert_eq!((r[4].as_str(), r[6].as_str()), ("0", "false"), "{r:?}");
+    let vb: HashSet<u64> = vb.iter().map(|v| v.k).collect();
     let x = common::read_blocks(&domain.0, &out_a, 1, first..end);
     let y = common::read_blocks(&domain.0, &out_b, 1, first..end);
     drop(stdin);
-    assert!(child.wait().unwrap().success());
-    // Blocks either engine skipped are zero-filled by libmxl; the pilot
-    // has no block of zeros.
-    let processed: HashSet<u64> = vb.iter().map(|v| v.k).collect();
+    child.finish();
+    // Each engine against the fade from `up` on the blocks it computed,
+    // and the two bit-identical where both did.
     let n = B as usize;
     let mut compared = 0;
     for (i, k) in (first..end).enumerate() {
         let (p, q) = (&x[i * n..(i + 1) * n], &y[i * n..(i + 1) * n]);
-        if !processed.contains(&k) || p.iter().all(|&v| v == 0.0) {
-            continue;
-        }
         let mut fade = Ramp::new(0.0);
         let _ = fade.set_target(1.0, LONG_RAMP);
         fade.advance((k * B - up) as usize);
         let mut want: Vec<f32> = (0..B).map(|j| common::pilot(0, k * B + j)).collect();
         fade.process(&mut want);
-        assert!(q == want, "engine b fades in from {up}: block {k}");
-        assert!(
-            p == want,
-            "engine a fades in from {up}: block {k}, first {first}"
-        );
-        compared += 1;
+        let (in_a, in_b) = (va.contains(&k), vb.contains(&k));
+        assert!(!in_a || p == want, "engine a fades in from {up}: block {k}");
+        assert!(!in_b || q == want, "engine b fades in from {up}: block {k}");
+        assert!(!(in_a && in_b) || same(p, q), "block {k}");
+        compared += u64::from(in_a && in_b);
     }
     assert!(
         compared * 4 > (end - first) * 3,
