@@ -1,7 +1,8 @@
-//! AVX2 kernel of the matrix. It computes, per sample, the operations
-//! of [`mix_scalar`] in the same order: acc = +0.0, then
-//! acc = acc + g * x per term in ascending input order, with the gain
-//! g = c0 + k * step inside a ramp and g = target outside it.
+//! AVX2 kernels of the matrix and the true-peak filter. The matrix kernel
+//! computes, per sample, the operations of [`mix_scalar`] in the same
+//! order: acc = +0.0, then acc = acc + g * x per term in ascending input
+//! order, with the gain g = c0 + k * step inside a ramp and g = target
+//! outside it.
 
 use std::arch::x86_64::*;
 
@@ -62,4 +63,39 @@ fn block_avx2<const U: usize>(terms: &[Term], input: &PlanarBuffer, out: &mut [f
         // SAFETY: `o` holds 8 * U samples.
         unsafe { _mm256_storeu_ps(o.as_mut_ptr().add(8 * u), *a) };
     }
+}
+
+/// AVX2 kernel of [`crate::true_peak`]: 8 consecutive outputs of one phase
+/// per register, `acc = acc + h[j] * x[n - j]` for `j` ascending as in
+/// [`crate::true_peak::peak_scalar`], which computes the tail.
+#[target_feature(enable = "avx2")]
+pub(crate) fn true_peak_avx2(w: &[f32]) -> (f32, bool) {
+    use crate::true_peak::{COEFFICIENTS, TAPS, peak_scalar};
+    let history = TAPS - 1;
+    let frames = w.len() - history;
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(i32::MAX));
+    let mut peak = _mm256_setzero_ps();
+    let mut nan = _mm256_setzero_ps();
+    let mut n = 0;
+    while n + 8 <= frames {
+        for h in &COEFFICIENTS {
+            let mut acc = _mm256_setzero_ps();
+            for (j, &c) in h.iter().enumerate() {
+                // SAFETY: history + n - j >= 0 and history + n - j + 8 <=
+                // w.len(), since n + 8 <= frames and j <= history.
+                let x = unsafe { _mm256_loadu_ps(w.as_ptr().add(history + n - j)) };
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_set1_ps(c), x));
+            }
+            let a = _mm256_and_ps(acc, abs_mask);
+            nan = _mm256_or_ps(nan, _mm256_cmp_ps::<_CMP_UNORD_Q>(a, a));
+            peak = _mm256_max_ps(a, peak);
+        }
+        n += 8;
+    }
+    let mut lanes = [0.0f32; 8];
+    // SAFETY: `lanes` holds 8 floats.
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), peak) };
+    let (tail, tail_nan) = peak_scalar(w, n);
+    let peak = lanes.iter().fold(tail, |p, &a| if a > p { a } else { p });
+    (peak, tail_nan || _mm256_movemask_ps(nan) != 0)
 }

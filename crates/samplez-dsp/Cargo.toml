@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/danielclasen/samplez"
-description = "Gain ramps, mixing matrix and meters for samplez"
+description = "Gain ramps, mixing matrix, meters and loudness for samplez"
 publish = false
 
 [dependencies]
