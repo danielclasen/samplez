@@ -141,6 +141,26 @@ fn withdraw(mut o: Out) -> Out {
     o
 }
 
+// A backward clock step with a full ring: every block withheld at once,
+// none written.
+#[library_benchmark]
+#[bench::backward(setup = Out::full, config = limit(BACKWARD))]
+fn backward_step(mut o: Out) -> Out {
+    let mut changes = Changes {
+        ring: &mut o.tx,
+        dropped: &o.dropped,
+        output: 0,
+    };
+    o.hold.withhold_open(
+        black_box(&o.statuses),
+        &mut changes,
+        &mut Null,
+        samplez::blocks::Cause::Skip,
+    );
+    o
+}
+
+const BACKWARD: u64 = 8_300;
 const AT_ONCE: u64 = 437;
 const FLUSH: u64 = 18_154;
 const OVERFLOW: u64 = 12_012;
@@ -148,7 +168,13 @@ const WITHDRAW: u64 = 8_096;
 
 library_benchmark_group!(
     name = hold,
-    benchmarks = [commit_at_once, flush_full_ring, overflow, withdraw]
+    benchmarks = [
+        commit_at_once,
+        flush_full_ring,
+        overflow,
+        withdraw,
+        backward_step
+    ]
 );
 
 main!(library_benchmark_groups = hold);
