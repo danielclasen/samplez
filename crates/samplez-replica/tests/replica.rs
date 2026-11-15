@@ -739,3 +739,28 @@ async fn a_follower_of_a_leader_without_a_majority_is_cut_off() {
     assert!(asked.elapsed() < Duration::from_millis(500), "at once");
     assert_eq!(set_.replica(leader).read_index().await, ReadIndex::CutOff);
 }
+
+/// A follower cut off from the set is not commitable once its checks found
+/// no counting leader for 3 s of them, also when every check runs more
+/// than a tick late, as on a host that does not schedule the runtime on
+/// time: the lapse is bounded however late the checks run.
+#[tokio::test(start_paused = true)]
+async fn a_partitioned_follower_whose_checks_all_run_late() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let follower = set_.ids().find(|&id| id != leader).unwrap();
+    set_.net.isolate(follower, set_.ids());
+    // 40 jumps of 250 ms: 10 s in which no check runs within a tick of
+    // when it was due.
+    for _ in 0..40 {
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let replica = set_.replica(follower);
+    assert!(
+        !replica.replica().commitable,
+        "a cut-off follower stays commitable for 10 s while its checks run late: {:?} {:?}",
+        replica.raft().metrics().borrow().state,
+        replica.status()
+    );
+}
