@@ -132,6 +132,7 @@ fn head(domain: &Domain, flow_id: &str) -> u64 {
         block: B,
         margin: 0,
         max_catchup_blocks: 0,
+        resync_budget: 0,
     };
     g.attach(0, &cfg, &timing).unwrap();
     g.input(0).unwrap().reader().head().unwrap()

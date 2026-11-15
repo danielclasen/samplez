@@ -24,6 +24,7 @@ pub const TIMING: Timing = Timing {
     block: B,
     margin: 576,
     max_catchup_blocks: 2,
+    resync_budget: 0,
 };
 
 pub fn api() -> Arc<MxlApi> {

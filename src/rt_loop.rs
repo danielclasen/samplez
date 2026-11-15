@@ -17,7 +17,7 @@ use std::sync::atomic::{
 use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
 use rtrb::{Consumer, Producer};
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{KWeighting, Matrix, PlanarBuffer, Ramp, Strip, StripParam, TruePeak};
+use samplez_dsp::{KWeighting, Matrix, PlanarBuffer, Ramp, Started, Strip, StripParam, TruePeak};
 use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{FlowWriter, Write};
 use samplez_mxl::{MxlApi, time};
@@ -25,6 +25,7 @@ use samplez_mxl::{MxlApi, time};
 use crate::blocks::{
     Cause, Changes, Ctx, Hold, Kind, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
+use crate::transfer::{Core, CoreCopy, SlotCore};
 
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
@@ -334,6 +335,9 @@ pub(crate) struct Shared {
     pub steps_cleared: AtomicU64,
     /// Per output.
     pub statuses: Vec<Statuses>,
+    /// The block the RT thread computes, stored before any history sample
+    /// of it, for history copies.
+    pub started: Started,
 }
 
 /// The RT thread's part of a replicated engine.
@@ -354,6 +358,10 @@ pub(crate) struct Replica {
     pub late_lost_until: u64,
     /// Where the page hashes go.
     pub hashes: Producer<PageHash>,
+    /// Buffers for a copy of the core, allocated off the RT thread.
+    pub cores: Consumer<Box<Core>>,
+    /// The copies, back to the replicated state.
+    pub copies: Producer<CoreCopy>,
 }
 
 /// The index of a log entry in the log that orders it.
@@ -1649,6 +1657,9 @@ impl Rt {
     fn process(&mut self, k: u64, deadline: u64) {
         let t0 = self.now();
         let b = self.block as usize;
+        if let Some(r) = &self.replica {
+            r.shared.started.begin(k);
+        }
         // Entries apply at the start of the block at their index, before
         // its inputs are read.
         let (counters, tel) = (&self.counters, &mut self.tel);
@@ -1923,6 +1934,55 @@ impl Rt {
         if k.is_multiple_of(samplez_mxl::SAMPLE_RATE as u64 / self.block) {
             self.publish_stats(done);
         }
+        self.copy_core(k);
+    }
+
+    /// Copies the core after block `k` into the buffer the replicated
+    /// state handed over, if one waits and the copy has room to go back.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn copy_core(&mut self, k: u64) {
+        let Some(r) = self.replica.as_mut() else {
+            return;
+        };
+        if r.copies.slots() == 0 {
+            return;
+        }
+        let Ok(mut core) = r.cores.pop() else {
+            return;
+        };
+        let (c, m) = (&mut *core, &self.mix);
+        c.matrix.copy_from(&m.matrix);
+        c.pos = m.pos;
+        c.ramp_end = m.ramp_end;
+        c.pending.clear();
+        c.pending.extend_from_slice(&m.pending);
+        c.page_entries.clear();
+        c.page_entries.extend_from_slice(&m.page_entries);
+        c.entries_page = m.entries_page;
+        c.entries_lost = m.entries_lost;
+        for (d, s) in c.slots.iter_mut().zip(&self.slots) {
+            *d = SlotCore {
+                up: s.up,
+                held: s.held,
+                fade_start: s.fade_start,
+                silenced_last: s.silenced_last,
+                xfade: s.xfade,
+            };
+        }
+        c.awaiting_gen.clear();
+        c.awaiting_gen.extend_from_slice(&self.awaiting_gen);
+        c.pending_gen = self.pending_gen.as_ref().map(|p| p.0);
+        c.unresolved.clear();
+        c.unresolved.extend_from_slice(&r.unresolved);
+        c.late_routes.clear();
+        c.late_routes.extend_from_slice(&r.late_routes);
+        c.late_lost_until = r.late_lost_until;
+        // The ring had room: nothing is dropped here.
+        let _ = r.copies.push(CoreCopy {
+            k0: k,
+            last_id: self.last_entry,
+            core,
+        });
     }
 
     /// Sends each slot's statistics since the last call and starts new
@@ -2337,6 +2397,8 @@ mod tests {
         let (changes, _) = rtrb::RingBuffer::new(1);
         let (_, control) = rtrb::RingBuffer::new(1);
         let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, cores) = rtrb::RingBuffer::new(1);
+        let (copies, _) = rtrb::RingBuffer::new(1);
         Replica {
             shared: Arc::new(Shared {
                 fence: AtomicU64::new(0),
@@ -2344,6 +2406,7 @@ mod tests {
                 self_report: AtomicBool::new(false),
                 steps_cleared: AtomicU64::new(0),
                 statuses: Vec::new(),
+                started: Started::new(),
             }),
             changes,
             control,
@@ -2352,6 +2415,8 @@ mod tests {
             late_routes: Vec::with_capacity(PENDING_CHANGES),
             late_lost_until: 0,
             hashes,
+            cores,
+            copies,
         }
     }
 

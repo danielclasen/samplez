@@ -37,6 +37,15 @@ pub struct Config {
     /// withheld at `T_k + D + w`.
     #[serde(default = "default_contact_window_ms")]
     pub contact_window_ms: u32,
+    /// Replicated mode: the slack of every history ring past its delay, in
+    /// ms. A history copy is kept only while the RT thread has not
+    /// reached the slack's last block.
+    #[serde(default = "default_history_slack_ms")]
+    pub history_slack_ms: u32,
+    /// Replicated mode: the time a resync takes to hand over, in ms. Every
+    /// input flow must keep that much history beyond the read window.
+    #[serde(default = "default_resync_budget_ms")]
+    pub resync_budget_ms: u32,
     /// Path of the libmxl shared library.
     pub libmxl: PathBuf,
     pub domains: Vec<Domain>,
@@ -200,6 +209,12 @@ fn default_hold_ms() -> u32 {
 fn default_contact_window_ms() -> u32 {
     8
 }
+fn default_history_slack_ms() -> u32 {
+    50
+}
+fn default_resync_budget_ms() -> u32 {
+    50
+}
 fn default_ramp() -> u32 {
     480
 }
@@ -251,6 +266,18 @@ impl Config {
         samples.div_ceil(u64::from(self.block_size)) as usize + 2
     }
 
+    /// The slack of a history ring in whole blocks, rounded down.
+    pub fn history_slack_blocks(&self) -> u64 {
+        u64::from(self.history_slack_ms) * u64::from(self.sample_rate)
+            / 1000
+            / u64::from(self.block_size)
+    }
+
+    /// `resyncBudgetMs` in samples.
+    pub fn resync_budget_samples(&self) -> u64 {
+        u64::from(self.resync_budget_ms) * u64::from(self.sample_rate) / 1000
+    }
+
     /// The index of the domain named `name`.
     pub fn domain(&self, name: &str) -> Option<usize> {
         self.domains.iter().position(|d| d.name == name)
@@ -268,6 +295,19 @@ impl Config {
             return fail(format!(
                 "holdMs {} and contactWindowMs {} must be in 1..=1000",
                 self.hold_ms, self.contact_window_ms
+            ));
+        }
+        if !(1..=1000).contains(&self.resync_budget_ms) || self.history_slack_ms > 1000 {
+            return fail(format!(
+                "resyncBudgetMs {} must be in 1..=1000 and historySlackMs {} at most 1000",
+                self.resync_budget_ms, self.history_slack_ms
+            ));
+        }
+        // The block in progress and one guard block.
+        if self.history_slack_blocks() < 2 {
+            return fail(format!(
+                "historySlackMs {} is shorter than two blocks of {}",
+                self.history_slack_ms, self.block_size
             ));
         }
         if self.ramp_samples > samplez_dsp::MAX_RAMP_LEN {
@@ -415,6 +455,9 @@ mod tests {
         assert_eq!(c.rt.rt_cpu, RtCpu::Auto);
         assert_eq!(c.inputs[0].offset_samples, 0);
         assert_eq!((c.hold_ms, c.contact_window_ms), (10, 8));
+        assert_eq!((c.history_slack_ms, c.resync_budget_ms), (50, 50));
+        assert_eq!(c.history_slack_blocks(), 50);
+        assert_eq!(c.resync_budget_samples(), 2400);
         // D + w + 2B: 864 + 96 samples.
         assert_eq!(c.hold_blocks() as u64 * 48, 960);
     }
@@ -428,6 +471,19 @@ mod tests {
         // 96 samples of D + w take two blocks of 64, plus 2B.
         assert_eq!(parse(&v).unwrap().hold_blocks(), 4);
         v["holdMs"] = serde_json::json!(0);
+        assert!(parse(&v).is_err());
+    }
+
+    #[test]
+    fn the_history_slack_holds_two_whole_blocks() {
+        let mut v = base();
+        v["blockSize"] = serde_json::json!(1024);
+        // 50 ms is 2400 samples: two blocks of 1024.
+        assert_eq!(parse(&v).unwrap().history_slack_blocks(), 2);
+        v["historySlackMs"] = serde_json::json!(42);
+        assert!(parse(&v).is_err(), "2016 samples, one block");
+        v["blockSize"] = serde_json::json!(48);
+        v["resyncBudgetMs"] = serde_json::json!(0);
         assert!(parse(&v).is_err());
     }
 

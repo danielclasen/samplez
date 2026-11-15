@@ -450,6 +450,31 @@ fn attach_refuses_flows_that_do_not_fit() {
         })
     ));
     assert!(!g.has_inputs());
+    // A replicated engine's resync replay reads `resyncBudgetMs` past the
+    // window: one sample of it more than the flow offers is refused, and
+    // the error names the history_duration the flow needs.
+    let replay = Timing {
+        resync_budget: 1,
+        ..wide
+    };
+    let refused = g.attach(0, &input(&id, 2, 100), &replay).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            Error::History {
+                required: 9729,
+                buffer_length: 19456
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("history_duration of at least 406 ms"),
+        "{refused}"
+    );
+    assert!(!g.has_inputs());
     assert!(g.attach(0, &input(&id, 2, 100), &wide).is_ok());
 
     // libmxl's default commit batch hint is 10 ms, 480 samples.

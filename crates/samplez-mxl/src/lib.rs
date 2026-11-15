@@ -40,6 +40,10 @@ pub enum Error {
     /// The input's read window needs `required` samples of readable
     /// history, the flow offers `buffer_length / 2`.
     Window { required: u64, buffer_length: u64 },
+    /// Replicated mode: the read window plus the resync budget needs
+    /// `required` samples of readable history, the flow offers
+    /// `buffer_length / 2`.
+    History { required: u64, buffer_length: u64 },
     /// The output's block size is longer than the `buffer_length / 2`
     /// samples libmxl lets a writer open at once.
     Block { block: u64, buffer_length: u64 },
@@ -61,6 +65,16 @@ impl fmt::Display for Error {
                 f,
                 "read window needs {required} samples of history, the flow's ring of \
                  {buffer_length} offers half of it"
+            ),
+            Error::History {
+                required,
+                buffer_length,
+            } => write!(
+                f,
+                "a resync replay needs {required} samples of history: the flow needs a \
+                 history_duration of at least {} ms, its ring of {buffer_length} samples \
+                 offers half of it",
+                (2 * required * 1000).div_ceil(SAMPLE_RATE as u64)
             ),
             Error::Block {
                 block,

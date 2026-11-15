@@ -419,6 +419,7 @@ impl Checker {
                 block: B,
                 margin: 0,
                 max_catchup_blocks: 0,
+                resync_budget: 0,
             };
             g.attach(0, &cfg, &timing).ok()?;
             self.generation = Some(g);
@@ -561,6 +562,7 @@ pub fn read_blocks(domain: &Path, flow_id: &str, channels: usize, ks: Range<u64>
         block: B,
         margin: 0,
         max_catchup_blocks: 0,
+        resync_budget: 0,
     };
     g.attach(0, &cfg, &timing).unwrap();
     let input = g.input(0).unwrap();
@@ -660,6 +662,19 @@ pub fn start_held(
     (e, hashes)
 }
 
+/// A copy of the engine's core, taken again while the guard refuses it:
+/// the host may delay this thread past the history slack.
+pub fn copy_core(e: &Engine) -> samplez::CoreCopy {
+    for _ in 0..20 {
+        match e.copy_core(Duration::from_secs(2)) {
+            Ok(c) => return c,
+            Err(samplez::CopyError::Passed { .. }) => continue,
+            Err(err) => panic!("copy_core: {err}"),
+        }
+    }
+    panic!("every copy passed the history slack");
+}
+
 /// The block after the last one whose statuses are set.
 pub fn processed(e: &Engine) -> u64 {
     e.counters().processed.load(Ordering::Acquire)
@@ -714,6 +729,9 @@ pub fn hold_scenario(e: &Engine) {
     e.unresolved(7, processed(e) * B).unwrap();
     let k = processed(e) + 5;
     wait(k + 5);
+    // A core copy for a resync carries the unresolved entry.
+    let c = copy_core(e);
+    assert!(c.core.unresolved().iter().any(|u| u.0 == 7));
     through(e);
     wait(processed(e) + 5);
     e.resolved(7).unwrap();

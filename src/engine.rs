@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Matrix, PlanarBuffer, StripParam};
+use samplez_dsp::{Matrix, PlanarBuffer, Started, StripParam};
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, InputConfig, Poll, PolledFlow, Recovery,
     Timing,
@@ -34,6 +34,7 @@ use crate::rt_loop::{
     Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared, Slot, SlotStats,
     Telemetry, UNRESOLVED,
 };
+use crate::transfer::{CopyError, Core, CoreCopy};
 
 const COMMAND_RING: usize = 64;
 const RETURN_RING: usize = 64;
@@ -373,6 +374,20 @@ struct ReplicaControl {
     unresolved: Vec<LogId>,
 }
 
+/// The off-RT side of core copies: at most one buffer is with the RT
+/// thread at a time.
+struct Transfer {
+    cores: rtrb::Producer<Box<Core>>,
+    copies: rtrb::Consumer<CoreCopy>,
+    in_flight: bool,
+    /// The buffer of a copy refused by the guard, for the next one.
+    spare: Option<Box<Core>>,
+    /// Input and output channels, input slots and the room for one
+    /// page's entries: the shape of a core buffer.
+    shape: (usize, usize, usize, usize),
+    slack_blocks: u64,
+}
+
 /// What the supervisor learns of the log besides committed entries.
 enum LogMsg {
     /// A generation-needing entry was appended: its generation is built
@@ -582,6 +597,8 @@ pub struct Engine {
     config: Config,
     /// Replicated mode with more than one voter.
     replica: Option<(Arc<Shared>, Mutex<ReplicaControl>)>,
+    /// Core copies, in replicated mode with more than one voter.
+    transfer: Option<Mutex<Transfer>>,
 }
 
 impl Engine {
@@ -682,6 +699,7 @@ impl Engine {
         let hold_blocks = config.hold_blocks();
         let alone = voters == 1;
         let hash_tx = hash_tx.filter(|_| reports.is_some() && !alone);
+        let mut transfer = None;
         let (replica, rt_replica, change_rx, hash_rx) = if reports.is_some() {
             // A page's first settle reads the status of each of its
             // blocks, up to a page back, while the supervisor may set
@@ -699,6 +717,7 @@ impl Engine {
                 statuses: (0..config.outputs.len())
                     .map(|_| Statuses::new(slots, b))
                     .collect(),
+                started: Started::new(),
             });
             let changes = (CHANGES_PER_OUTPUT * config.outputs.len()).max(1);
             let (mut change_tx, mut change_rx) = rtrb::RingBuffer::new(changes);
@@ -724,6 +743,28 @@ impl Engine {
             while hashes_tx.push(blank).is_ok() {}
             while hashes_rx.pop().is_ok() {}
             let (control_tx, control_rx) = rtrb::RingBuffer::new(UNRESOLVED);
+            let (cores_tx, cores_rx) = rtrb::RingBuffer::new(1);
+            let (copies_tx, copies_rx) = rtrb::RingBuffer::new(1);
+            let page_entries = if hash_tx.is_some() {
+                PENDING_CHANGES * PAGE.div_ceil(b) as usize
+            } else {
+                0
+            };
+            transfer = (!alone).then(|| {
+                Mutex::new(Transfer {
+                    cores: cores_tx,
+                    copies: copies_rx,
+                    in_flight: false,
+                    spare: None,
+                    shape: (
+                        config.input_channels(),
+                        config.output_channels(),
+                        config.inputs.len(),
+                        page_entries,
+                    ),
+                    slack_blocks: config.history_slack_blocks(),
+                })
+            });
             let rt_replica = Replica {
                 shared: Arc::clone(&shared),
                 changes: change_tx,
@@ -733,6 +774,8 @@ impl Engine {
                 late_routes: Vec::with_capacity(PENDING_CHANGES),
                 late_lost_until: 0,
                 hashes: hashes_tx,
+                cores: cores_rx,
+                copies: copies_tx,
             };
             let control = ReplicaControl {
                 ring: control_tx,
@@ -915,6 +958,11 @@ impl Engine {
                 block: b,
                 margin: u64::from(config.reader_margin_samples),
                 max_catchup_blocks: u64::from(config.max_catchup_blocks),
+                resync_budget: if reports.is_some() {
+                    config.resync_budget_samples()
+                } else {
+                    0
+                },
             },
             prefault,
             in_domains: in_domains.clone(),
@@ -1018,6 +1066,7 @@ impl Engine {
             resets: Mutex::new(reset_tx),
             config,
             replica,
+            transfer,
         })
     }
 
@@ -1404,6 +1453,56 @@ impl Engine {
     /// Replicated mode: log entry `id` is decided.
     pub fn resolved(&self, id: LogId) -> Result<(), ControlError> {
         self.control(Control::Resolved { id })
+    }
+
+    /// Replicated mode with more than one voter: copies the engine's core
+    /// after the next block the RT thread computes, `k0`, into a buffer
+    /// allocated here, waiting up to `timeout` for it. The copy is kept
+    /// only while the RT thread has not started the guard block of the
+    /// history after `k0` (`historySlackMs`), which a copy of history
+    /// rings needs; the engine keeps no delay line, so it holds the core
+    /// alone. A copy left behind by a timeout is returned by the next
+    /// call.
+    pub fn copy_core(&self, timeout: Duration) -> Result<CoreCopy, CopyError> {
+        let (Some((shared, _)), Some(transfer)) = (&self.replica, &self.transfer) else {
+            return Err(CopyError::Invalid(
+                "the engine is not replicated with more than one voter".to_owned(),
+            ));
+        };
+        let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
+        if !t.in_flight {
+            let (n, m, slots, page) = t.shape;
+            let core = t
+                .spare
+                .take()
+                .unwrap_or_else(|| Box::new(Core::new(n, m, slots, page)));
+            if t.cores.push(core).is_err() {
+                unreachable!("one buffer is with the RT thread at most");
+            }
+            t.in_flight = true;
+        }
+        let deadline = Instant::now() + timeout;
+        let copy = loop {
+            if let Ok(copy) = t.copies.pop() {
+                t.in_flight = false;
+                break copy;
+            }
+            if Instant::now() >= deadline {
+                return Err(CopyError::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        // The span of history the replay needs ends with block k0.
+        match shared.started.confirms(copy.k0 + 1, t.slack_blocks) {
+            Ok(()) => Ok(copy),
+            Err(started) => {
+                t.spare = Some(copy.core);
+                Err(CopyError::Passed {
+                    k0: copy.k0,
+                    started,
+                })
+            }
+        }
     }
 
     /// Replicated mode: the clock check passed after the first `steps`
