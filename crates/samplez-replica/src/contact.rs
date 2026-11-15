@@ -405,16 +405,21 @@ impl Contact {
         let mut scheduled = BTreeMap::new();
         // Entries the engine applies later, purged ones included, for
         // listings.
+        // Collected first: the log's view is not re-entered from inside it.
+        let mut pending = Vec::new();
         log.pending(&mut |index, body| {
             if let Some(at) = body.at_index() {
-                let id = log.log_id_at(index).unwrap_or(StoredLogId {
-                    term: 0,
-                    node: 0,
-                    index,
-                });
-                scheduled.insert(index, (id, at));
+                pending.push((index, at));
             }
         });
+        for (index, at) in pending {
+            let id = log.log_id_at(index).unwrap_or(StoredLogId {
+                term: 0,
+                node: 0,
+                index,
+            });
+            scheduled.insert(index, (id, at));
+        }
         Contact {
             id,
             timing,
@@ -1104,6 +1109,7 @@ mod tests {
         log: BTreeMap<u64, (StoredLogId, Request)>,
         committed: Option<StoredLogId>,
         applied: u64,
+        pending: Vec<(u64, Body)>,
     }
 
     #[derive(Default)]
@@ -1145,7 +1151,11 @@ mod tests {
                 f(*id, r);
             }
         }
-        fn pending(&self, _: &mut dyn FnMut(u64, &Body)) {}
+        fn pending(&self, f: &mut dyn FnMut(u64, &Body)) {
+            for (index, body) in &self.0.lock().unwrap().pending {
+                f(*index, body);
+            }
+        }
     }
 
     /// Records what contact hands the engine. Its step flag shows once
@@ -1725,5 +1735,43 @@ mod tests {
             "the newer report is the one echoed"
         );
         assert_eq!(f.fence(), fence);
+    }
+
+    /// The log's view holds its lock while it walks the pending entries,
+    /// as the store does: a replica started with one lists it without
+    /// re-entering the view.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_started_with_pending_entries_lists_them() {
+        let f = fixture(&[&[1, 2]]);
+        let at = index_at(T0) + 20 * B;
+        f.log.push(1, 3, Some(at));
+        {
+            let mut log = f.log.0.lock().unwrap();
+            log.applied = 3;
+            log.pending.push((
+                3,
+                Body::InputDown {
+                    slot: 0,
+                    at_index: at,
+                },
+            ));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (clock, engine, log) = (f.clock.clone(), f.engine.clone(), f.log.clone());
+        std::thread::spawn(move || {
+            let contact = Contact::new(1, Timing::defaults(B), clock, Some(engine), log, 1);
+            let _ = tx.send(contact);
+        });
+        let contact = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Contact::new deadlocked on the log's view");
+        let (_, _, report) = contact.tick(f.members.clone()).pop().unwrap();
+        assert_eq!(
+            report.listed,
+            [Listed {
+                id: id(1, 3),
+                at_index: at
+            }]
+        );
     }
 }
