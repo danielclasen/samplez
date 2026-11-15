@@ -29,10 +29,13 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Raft, ServerState};
 use samplez_replica::bootstrap::{Bootstrap, Marker, Markers, Volume};
+use samplez_replica::contact::{self, Audio, Clocks, Sample, Timing};
 use samplez_replica::dedup::Limits;
+use samplez_replica::entry::Request;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
-use samplez_replica::membership::slot_of;
+use samplez_replica::membership::{Slot, slot_of};
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest};
+use samplez_replica::report::{ClockFlags, Own, Report};
 use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
 use samplez_service::{Owner, ReplicatedState, Role};
@@ -117,6 +120,8 @@ pub fn owner(session: &str) -> Owner {
 pub struct Clock {
     base: Instant,
     offset: AtomicI64,
+    /// Added to the TAI clock, ns.
+    tai_offset: AtomicI64,
     /// Told on the next read: a test's hook into the moment a replica
     /// stamps an entry, between its leadership check and the proposal.
     on_read: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -168,6 +173,139 @@ impl Clock {
     pub fn set_offset(&self, samples: i64) {
         self.offset.store(samples, Ordering::Relaxed);
     }
+
+    /// The replica's TAI clock, ns: [`TAI_BASE`] plus the runtime's
+    /// virtual time since the set started, plus an offset a test sets.
+    pub fn tai_ns(&self) -> u64 {
+        let elapsed = self.base.elapsed().as_nanos() as u64;
+        (TAI_BASE + elapsed).saturating_add_signed(self.tai_offset.load(Ordering::Relaxed))
+    }
+
+    pub fn set_tai_offset(&self, ns: i64) {
+        self.tai_offset.store(ns, Ordering::Relaxed);
+    }
+}
+
+/// Where every harness TAI clock starts, ns: a block boundary well past 0.
+pub const TAI_BASE: u64 = 1_000_000_000_000_000;
+
+/// A replica's TAI clock as contact reads it.
+pub struct Tai(pub Arc<Clock>);
+
+impl Clocks for Tai {
+    fn tai_ns(&self) -> u64 {
+        self.0.tai_ns()
+    }
+}
+
+/// The engine of one replica, in place of a real one: it computes every
+/// block as it falls due on the replica's TAI clock, unless stalled, and
+/// records what contact hands it.
+pub struct FakeAudio {
+    clock: Arc<Clock>,
+    timing: Timing,
+    pub state: Mutex<Fake>,
+}
+
+#[derive(Default)]
+pub struct Fake {
+    /// Entries appended, with their at_index.
+    pub appended: Vec<(u64, Option<u64>)>,
+    pub truncated: Vec<u64>,
+    /// Each commit point handed, with the TAI time it was handed at.
+    pub committed: Vec<(u64, u64)>,
+    /// F as published, with the TAI time, when it changed.
+    pub fences: Vec<(u64, u64)>,
+    pub unresolved: Vec<(u64, u64)>,
+    /// The processed block stands still from here.
+    pub stalled_at: Option<u64>,
+    pub flags: ClockFlags,
+}
+
+impl FakeAudio {
+    pub fn new(clock: Arc<Clock>, timing: Timing) -> FakeAudio {
+        FakeAudio {
+            clock,
+            timing,
+            state: Mutex::new(Fake::default()),
+        }
+    }
+
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Fake> {
+        self.state.lock().expect("fake lock poisoned")
+    }
+
+    /// The newest block due on the replica's clock.
+    pub fn due(&self) -> Option<u64> {
+        let index = contact::index_at(self.clock.tai_ns());
+        (index.saturating_sub(self.timing.margin) / self.timing.block).checked_sub(1)
+    }
+
+    /// The TAI time F first passed the end of block `k`.
+    pub fn passed(&self, k: u64) -> Option<u64> {
+        let end = (k + 1) * self.timing.block;
+        self.lock()
+            .fences
+            .iter()
+            .find(|&&(_, f)| f >= end)
+            .map(|&(t, _)| t)
+    }
+
+    /// The TAI time entry `index` was first handed as committed.
+    pub fn committed_at(&self, index: u64) -> Option<u64> {
+        self.lock()
+            .committed
+            .iter()
+            .find(|&&(up_to, _)| up_to >= index)
+            .map(|&(_, t)| t)
+    }
+}
+
+impl Audio for FakeAudio {
+    fn sample(&self) -> Sample {
+        let due = self.due();
+        let st = self.lock();
+        Sample {
+            own: Own {
+                processed: match (due, st.stalled_at) {
+                    (Some(d), Some(s)) => Some(d.min(s)),
+                    (due, _) => due,
+                },
+                clock: st.flags,
+                statuses: Vec::new(),
+                unwritten: Vec::new(),
+            },
+            status_changes_lost: 0,
+        }
+    }
+    fn fence(&self, end: u64) {
+        let tai = self.clock.tai_ns();
+        let mut st = self.lock();
+        if st.fences.last().is_none_or(|&(_, f)| f != end) {
+            st.fences.push((tai, end));
+        }
+    }
+    /// A block the engine computed leaves its hold ring, withheld when it
+    /// is still fenced, once `D + w + 2B` of later blocks were computed.
+    fn settled(&self, k: u64) -> bool {
+        let ring = (self.timing.hold + self.timing.contact_window).as_nanos() as u64;
+        let ring = contact::index_at(ring).div_ceil(self.timing.block) + 2;
+        self.sample().own.processed.is_some_and(|p| p >= k + ring)
+    }
+    fn appended(&self, index: u64, request: &Request) {
+        self.lock().appended.push((index, request.at_index()));
+    }
+    fn truncated(&self, from: u64) {
+        self.lock().truncated.push(from);
+    }
+    fn committed(&self, up_to: u64) {
+        let tai = self.clock.tai_ns();
+        self.lock().committed.push((up_to, tai));
+    }
+    fn unresolved(&self, index: u64, at_index: u64) -> bool {
+        self.lock().unresolved.push((index, at_index));
+        true
+    }
 }
 
 #[derive(Default)]
@@ -185,6 +323,17 @@ struct Links {
     /// Appends from this node that carry the second step of a membership
     /// change, a configuration out of joint, do not arrive.
     hold_uniform_from: Option<NodeId>,
+    /// (from, to): an append that carries an application entry arrives,
+    /// and its answer never does.
+    hold_replies: BTreeSet<(NodeId, NodeId)>,
+    /// Side reports delivered, when a test taps them.
+    reports: Option<Vec<(NodeId, Report)>>,
+    /// (from, to): appends that carry no entry, heartbeats and commit
+    /// advances, do not arrive.
+    drop_heartbeats: BTreeSet<(NodeId, NodeId)>,
+    /// (from, to): peer requests, side reports among them, do not
+    /// arrive; openraft's RPCs do.
+    cut_peer: BTreeSet<(NodeId, NodeId)>,
 }
 
 /// The links between the replicas of one set.
@@ -232,6 +381,57 @@ impl Net {
         let mut links = self.links();
         links.cut.clear();
         links.hung.clear();
+        links.hold_replies.clear();
+        links.drop_heartbeats.clear();
+        links.cut_peer.clear();
+    }
+
+    /// Joins `a` and `b` again in both directions.
+    pub fn join(&self, a: NodeId, b: NodeId) {
+        let mut links = self.links();
+        links.cut.remove(&(a, b));
+        links.cut.remove(&(b, a));
+    }
+
+    /// Cuts every link between the replicas in `ids`.
+    pub fn cut_all(&self, ids: impl IntoIterator<Item = NodeId>) {
+        let ids: Vec<NodeId> = ids.into_iter().collect();
+        for &a in &ids {
+            for &b in &ids {
+                if a != b {
+                    self.cut_one_way(a, b);
+                }
+            }
+        }
+    }
+
+    /// From now on, an append from `from` to `to` that carries an
+    /// application entry arrives and its answer never does, as openraft
+    /// waits for an AppendEntries response stalled on the way.
+    pub fn hold_replies(&self, from: NodeId, to: NodeId) {
+        self.links().hold_replies.insert((from, to));
+    }
+
+    /// From now on, appends from `from` to `to` that carry no entry do
+    /// not arrive: `to` takes entries and never learns their commit from
+    /// openraft.
+    pub fn drop_heartbeats(&self, from: NodeId, to: NodeId) {
+        self.links().drop_heartbeats.insert((from, to));
+    }
+
+    /// Peer requests from `from` to `to` do not arrive; openraft's RPCs do.
+    pub fn cut_peer(&self, from: NodeId, to: NodeId) {
+        self.links().cut_peer.insert((from, to));
+    }
+
+    /// Records every side report delivered from now on.
+    pub fn tap_reports(&self) {
+        self.links().reports = Some(Vec::new());
+    }
+
+    /// The side reports delivered since the tap, with their addressee.
+    pub fn reports(&self) -> Vec<(NodeId, Report)> {
+        self.links().reports.clone().unwrap_or_default()
     }
 
     pub fn stall(&self, node: NodeId, by: Duration) {
@@ -307,11 +507,22 @@ impl PeerClient for Peers {
         Box::pin(async move {
             let target = addr.parse().expect("a harness address is a node id");
             let call = async {
+                if self.net.links().cut_peer.contains(&(self.from, target)) {
+                    return Err(format!("{} -> {target} down", self.from));
+                }
                 self.net
                     .route::<io::Error>(self.from, target)
                     .await
                     .map_err(|e| e.to_string())?;
-                let replica = self.net.links().replicas.get(&target).cloned();
+                let replica = {
+                    let mut links = self.net.links();
+                    if let (Some(tap), PeerRequest::Report(report)) =
+                        (links.reports.as_mut(), &request)
+                    {
+                        tap.push((target, (**report).clone()));
+                    }
+                    links.replicas.get(&target).cloned()
+                };
                 let replica = replica.ok_or_else(|| format!("{target} down"))?;
                 Ok(replica.handle(to, request).await)
             };
@@ -356,15 +567,36 @@ impl RaftNetwork<TypeConfig> for Link {
                 matches!(&e.payload,
                 openraft::EntryPayload::Membership(m) if m.get_joint_config().len() == 1)
             });
-        if held {
+        let dropped = rpc.entries.is_empty()
+            && self
+                .net
+                .links()
+                .drop_heartbeats
+                .contains(&(self.from, self.to));
+        if held || dropped {
             return Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
                 "held",
             ))));
         }
+        let carries = rpc
+            .entries
+            .iter()
+            .any(|e| matches!(e.payload, openraft::EntryPayload::Normal(_)));
         let raft = self.net.route(self.from, self.to).await?;
-        raft.append_entries(rpc)
+        let reply = raft
+            .append_entries(rpc)
             .await
-            .map_err(|e| RPCError::RemoteError(RemoteError::new(self.to, e)))
+            .map_err(|e| RPCError::RemoteError(RemoteError::new(self.to, e)));
+        if carries
+            && self
+                .net
+                .links()
+                .hold_replies
+                .contains(&(self.from, self.to))
+        {
+            std::future::pending::<()>().await;
+        }
+        reply
     }
 
     async fn install_snapshot(
@@ -408,6 +640,12 @@ pub struct Options {
     /// Whether each replica starts `Replica::begin`, the marker bootstrap
     /// and the counting watch.
     pub begin: bool,
+    /// Starts contact on every replica, with a [`FakeAudio`] each but the
+    /// witness.
+    pub contact: Option<Timing>,
+    /// The node ids, in place of `0..voters`; a witness among them is
+    /// waited for as a voter, not as commitable.
+    pub ids: Option<Vec<NodeId>>,
 }
 
 impl Default for Options {
@@ -419,6 +657,8 @@ impl Default for Options {
             wanted: None,
             write_timeout: Duration::from_secs(2),
             begin: true,
+            contact: None,
+            ids: None,
         }
     }
 }
@@ -432,6 +672,7 @@ pub struct Set {
     markers: Arc<FakeMarkers>,
     _panics: PanicGuard,
     replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
+    audios: BTreeMap<NodeId, Arc<FakeAudio>>,
 }
 
 impl Set {
@@ -444,11 +685,17 @@ impl Set {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let base = Instant::now();
-        let clocks = (0..options.voters)
-            .map(|id| {
+        let ids: Vec<NodeId> = options
+            .ids
+            .clone()
+            .unwrap_or_else(|| (0..options.voters).collect());
+        let clocks = ids
+            .iter()
+            .map(|&id| {
                 let clock = Clock {
                     base,
                     offset: AtomicI64::new(0),
+                    tai_offset: AtomicI64::new(0),
                     on_read: Mutex::new(None),
                     stall: Mutex::new(None),
                 };
@@ -464,17 +711,21 @@ impl Set {
             markers: Arc::new(FakeMarkers),
             _panics: PanicGuard::new(),
             replicas: BTreeMap::new(),
+            audios: BTreeMap::new(),
         };
-        for id in 0..set.options.voters {
+        for id in set.ids() {
             set.restart(id).await;
         }
-        set.replica(0)
-            .initialize((0..set.options.voters).map(|id| (id, id.to_string())))
+        set.replica(ids[0])
+            .initialize(set.ids().map(|id| (id, id.to_string())))
             .await
             .expect("initializes");
         set.leader().await;
         let deadline = Instant::now() + Duration::from_secs(30);
-        while !set.replicas.values().all(|r| r.replica().commitable) {
+        while !set.replicas.iter().all(|(&id, r)| {
+            let info = r.replica();
+            info.ready && (slot_of(id) == Slot::Witness || info.commitable)
+        }) {
             assert!(
                 Instant::now() < deadline,
                 "not every replica commitable in 30 s"
@@ -485,11 +736,19 @@ impl Set {
     }
 
     pub fn ids(&self) -> impl Iterator<Item = NodeId> + use<> {
-        0..self.options.voters
+        self.options
+            .ids
+            .clone()
+            .unwrap_or_else(|| (0..self.options.voters).collect())
+            .into_iter()
     }
 
     pub fn clock(&self, id: NodeId) -> &Clock {
         &self.clocks[&id]
+    }
+
+    pub fn audio(&self, id: NodeId) -> &Arc<FakeAudio> {
+        self.audios.get(&id).expect("contact running")
     }
 
     pub fn replica(&self, id: NodeId) -> &Arc<Replica<Paths>> {
@@ -510,6 +769,7 @@ impl Set {
                 Arc::new(Clock {
                     base,
                     offset: AtomicI64::new(0),
+                    tai_offset: AtomicI64::new(0),
                     on_read: Mutex::new(None),
                     stall: Mutex::new(None),
                 })
@@ -543,6 +803,18 @@ impl Set {
         .await
         .expect("replica starts");
         let replica = Arc::new(replica);
+        if let Some(timing) = self.options.contact {
+            let clock = self.clocks[&id].clone();
+            let audio = (slot_of(id) != Slot::Witness)
+                .then(|| Arc::new(FakeAudio::new(clock.clone(), timing)));
+            let engine = audio.clone().map(|a| a as Arc<dyn Audio>);
+            replica
+                .contact(timing, Arc::new(Tai(clock)), engine)
+                .expect("contact starts");
+            if let Some(audio) = audio {
+                self.audios.insert(id, audio);
+            }
+        }
         if self.options.begin {
             let dir = self.root.join(id.to_string());
             replica.begin(Bootstrap {

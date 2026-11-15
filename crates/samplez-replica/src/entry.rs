@@ -213,6 +213,18 @@ pub struct Request {
     pub body: Body,
 }
 
+impl Request {
+    /// The index the entry takes effect at in the engine: an engine
+    /// body's, or the earliest of its commands' once stamped; none for an
+    /// entry the state machine alone applies.
+    pub fn at_index(&self) -> Option<u64> {
+        match &self.body {
+            Body::Commands(commands) => commands.iter().filter_map(|c| c.at_index).min(),
+            body => body.at_index(),
+        }
+    }
+}
+
 /// How one command of an entry resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Resolution {

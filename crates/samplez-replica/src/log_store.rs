@@ -30,9 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::TypeConfig;
 use crate::dedup::Limits;
-use crate::entry::{NodeId, Response};
+use crate::entry::{Body, NodeId, Request, Response};
 use crate::snapshot::{
-    StoredEntry, StoredLogId, StoredMembershipConfig, StoredSnapshot, StoredVote,
+    StoredEntry, StoredLogId, StoredMembershipConfig, StoredPayload, StoredSnapshot, StoredVote,
 };
 use crate::state_machine::{Product, StateMachine};
 
@@ -281,10 +281,6 @@ impl<P: Product> Store<P> {
         .await
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner<P>> {
-        self.inner.lock().expect("store lock poisoned")
-    }
-
     /// Reads the state machine.
     pub fn with_state<T>(&self, f: impl FnOnce(&StateMachine<P>) -> T) -> T {
         f(&self.lock().sm)
@@ -322,6 +318,44 @@ impl<P: Product> Store<P> {
         }
         let committed = inner.capped_committed().map_or(0, |id| id.index);
         inner.last_applied.map_or(0, |id| id.index) >= committed
+    }
+}
+
+impl<P> Store<P> {
+    /// The committed id saved, capped at the last entry held.
+    pub fn committed(&self) -> Option<StoredLogId> {
+        self.lock().capped_committed()
+    }
+
+    /// The id of the entry held at `index`; none for one purged or not
+    /// held.
+    pub fn log_id_at(&self, index: u64) -> Option<StoredLogId> {
+        self.lock().log.get(&index).map(|e| e.log_id)
+    }
+
+    /// Calls `f` with the id and request of every application entry held
+    /// above `index`, in log order.
+    pub fn entries_after(&self, index: u64, mut f: impl FnMut(StoredLogId, &Request)) {
+        let inner = self.lock();
+        for e in inner.log.range(index.saturating_add(1)..).map(|(_, e)| e) {
+            if let StoredPayload::Normal(request) = &e.payload {
+                f(e.log_id, request);
+            }
+        }
+    }
+
+    /// Calls `f` with the log index and body of every entry the engine
+    /// applies at a future index, as the state machine holds them, purged
+    /// ones included.
+    pub fn pending(&self, mut f: impl FnMut(u64, &Body)) {
+        let inner = self.lock();
+        for (index, body) in &inner.sm.pending {
+            f(*index, body);
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner<P>> {
+        self.inner.lock().expect("store lock poisoned")
     }
 }
 

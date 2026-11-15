@@ -11,12 +11,15 @@
 //! voters with the wanted ones ([`membership`]).
 
 pub mod bootstrap;
+pub mod bridge;
+pub mod contact;
 pub mod dedup;
 pub mod entry;
 pub mod log_store;
 pub mod membership;
 pub mod net;
 pub mod peer;
+pub mod report;
 pub mod snapshot;
 pub mod state_machine;
 
@@ -24,7 +27,7 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
@@ -175,6 +178,8 @@ pub(crate) struct Shared {
     started: Instant,
     status: Mutex<Option<String>>,
     reconcile: Notify,
+    /// Side reports and the contact fence, once started.
+    contact: OnceLock<Arc<contact::Contact>>,
 }
 
 /// Counts a proposal while it lives.
@@ -259,6 +264,7 @@ impl<P: Product> Replica<P> {
             started: Instant::now(),
             status: Mutex::default(),
             reconcile: Notify::new(),
+            contact: OnceLock::new(),
         });
         let (queue, queued) = mpsc::unbounded_channel();
         tokio::spawn(write(shared.clone(), queued, estimate.clone()));
@@ -329,6 +335,38 @@ impl<P: Product> Replica<P> {
         tokio::spawn(membership::watch(self.shared.clone(), bootstrap));
     }
 
+    /// Starts contact with the other voters ([`contact`]): side reports
+    /// each report period, F published to `audio`, entries handed to it as
+    /// they are appended and known committed, and unresolved ones once
+    /// their apply deadline passes. The witness passes no `audio`.
+    pub fn contact(
+        &self,
+        timing: contact::Timing,
+        clocks: Arc<dyn contact::Clocks>,
+        audio: Option<Arc<dyn contact::Audio>>,
+    ) -> Result<(), String> {
+        let first_seq = bootstrap::random_id().map_err(|e| e.to_string())? >> 1;
+        let contact = Arc::new(contact::Contact::new(
+            self.id(),
+            timing,
+            clocks,
+            audio,
+            Arc::new(self.store.clone()),
+            first_seq,
+        ));
+        self.shared
+            .contact
+            .set(contact.clone())
+            .map_err(|_| "contact runs already".to_owned())?;
+        tokio::spawn(contact::run(self.shared.clone(), contact));
+        Ok(())
+    }
+
+    /// Contact as status shows it, once started.
+    pub fn contact_metrics(&self) -> Option<contact::Metrics> {
+        self.shared.contact.get().map(|c| c.metrics())
+    }
+
     /// Whether this replica knows a quorum: as leader, one acknowledged it
     /// within the lease; else its leader's last append arrived within it.
     pub async fn quorum(&self) -> bool {
@@ -339,7 +377,8 @@ impl<P: Product> Replica<P> {
     /// refused [`Refused::Quiescing`], which their sender resends to the
     /// next leader, and local ones wait for that leader. A leader then
     /// waits until no proposal is in progress, every entry it appended is
-    /// committed and every voter holds it, and that still holds two
+    /// committed, every voter holds it and, with contact running, every
+    /// voter heard within `w + D` reports it committed, and that still holds two
     /// heartbeats later, at most `bound`; so its exit leaves no entry in
     /// flight on a live replica, and a voter that is down holds it up to
     /// `bound`.
@@ -364,7 +403,13 @@ impl<P: Product> Replica<P> {
                             .and_then(|matched| matched.get(&id).copied().flatten())
                             .is_some_and(|matched| matched.index >= last)
                 });
-            let quiet = shared.proposing.load(Ordering::SeqCst) == 0 && committed && held;
+            // Every voter heard within w + D reports the commit too.
+            let reported = shared.contact.get().is_none_or(|c| {
+                let t = c.timing();
+                c.heard_committed(last, t.contact_window + t.hold)
+            });
+            let quiet =
+                shared.proposing.load(Ordering::SeqCst) == 0 && committed && held && reported;
             if quiet && settled {
                 return;
             }
@@ -435,6 +480,12 @@ impl<P: Product> Replica<P> {
                 Ok(PeerResponse::Appended)
             }
             PeerRequest::Join { id, addr, cluster } => shared.admit(id, addr, cluster).await,
+            PeerRequest::Report(report) => {
+                if let Some(contact) = shared.contact.get() {
+                    contact.receive(*report);
+                }
+                Ok(PeerResponse::Reported)
+            }
             PeerRequest::Member => Ok(PeerResponse::Member(
                 shared.raft.is_initialized().await.unwrap_or(false),
             )),
@@ -867,7 +918,8 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     /// restart is the saved one; it stays set. An empty volume is not
     /// ready until it has joined, a saved vote alone included. The
     /// clock verification and the generations 2.11 adds to it are not
-    /// known here. `commitable` once ready on a voter other than the
+    /// known here. With contact running the witness is ready only while
+    /// it is in contact. `commitable` once ready on a voter other than the
     /// witness that a leader counts as a voter, now or within the last
     /// [`membership::UNCOUNTED`]: it forwards what it does not
     /// order itself. The only voter of its membership counts itself while
@@ -881,7 +933,11 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         if !self.ready.load(Ordering::Relaxed) && self.store.caught_up() {
             self.ready.store(true, Ordering::Relaxed);
         }
-        let ready = self.ready.load(Ordering::Relaxed);
+        // The witness is ready only while in contact, and never before
+        // its first contact.
+        let witness = slot_of(self.id()) == Slot::Witness;
+        let ready = self.ready.load(Ordering::Relaxed)
+            && !(witness && self.shared.contact.get().is_some_and(|c| !c.in_contact()));
         let voters: Vec<NodeId> = metrics.membership_config.membership().voter_ids().collect();
         let voter = voters.contains(&self.id());
         let alone = voters == [self.id()] && metrics.state == ServerState::Leader;
