@@ -126,7 +126,7 @@ impl<P: Product> StateMachine<P> {
             }
             Body::LeaseRenew(sessions) => {
                 for session in sessions {
-                    self.leases.insert(session.clone(), stamp);
+                    self.renew(session, stamp);
                 }
                 Response::default()
             }
@@ -152,7 +152,7 @@ impl<P: Product> StateMachine<P> {
     fn command(&mut self, revision: u64, stamp: u64, command: &Command) -> Outcome {
         let session = command.origin.key();
         // A command renews its session's lease.
-        self.leases.insert(session.clone(), stamp);
+        self.renew(&session, stamp);
         if self
             .dedup
             .record(&session, &command.id, revision, stamp)
@@ -182,6 +182,14 @@ impl<P: Product> StateMachine<P> {
         };
         self.dedup.resolve(&session, &command.id, result);
         Outcome { revision, result }
+    }
+
+    /// Renews `session`'s lease at `stamp`, keeping a later renewal: a
+    /// leader after a failover can stamp lower than the one before, and
+    /// an expiry decided on the higher renewal must not end a live lease.
+    fn renew(&mut self, session: &SessionKey, stamp: u64) {
+        let renewed = self.leases.entry(session.clone()).or_insert(stamp);
+        *renewed = (*renewed).max(stamp);
     }
 
     pub fn save(&self) -> Replicated {
@@ -470,6 +478,33 @@ pub(crate) mod tests {
         );
         assert_eq!(sm.leases.get(&key), None);
         assert_eq!(sm.product.expired, [key]);
+    }
+
+    #[test]
+    fn a_lower_stamp_does_not_move_a_lease_back() {
+        let mut sm = machine();
+        let key = SessionKey::from_parts("anonymous", "s");
+        let renew = |stamp| Request {
+            stamp,
+            body: Body::LeaseRenew(vec![SessionKey::from_parts("anonymous", "s")]),
+        };
+        sm.apply(1, &renew(192));
+        // A new leader whose estimate is behind the old one's.
+        sm.apply(2, &renew(96));
+        sm.apply(3, &commands(144, vec![command("s", "1", "a=1@1")]));
+        assert_eq!(sm.leases.get(&key), Some(&192));
+        sm.apply(
+            4,
+            &Request {
+                stamp: 240,
+                body: Body::LeaseExpiry {
+                    session: key.clone(),
+                    renewed: 144,
+                },
+            },
+        );
+        assert_eq!(sm.leases.get(&key), Some(&192));
+        assert!(sm.product.expired.is_empty());
     }
 
     #[test]
