@@ -2899,6 +2899,123 @@ mod tests {
         std::fs::remove_dir_all(&domain).unwrap();
     }
 
+    /// An `InputDown`, `InputUp` or `Route` entry that reaches the RT
+    /// thread after its index, while it still computes the page holding
+    /// that index, is reported late, not applied, and left out of the
+    /// page's fingerprint.
+    #[test]
+    fn a_late_input_entry_is_left_out_of_the_fingerprint() {
+        use crate::blocks::{HEALTHY, PAGE};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        // A run an overrun skip or a slow pickup disturbed is run again.
+        let run = || -> Option<String> {
+            let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+            let domain =
+                std::env::temp_dir().join(format!("samplez-latefp-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&domain);
+            std::fs::create_dir(&domain).unwrap();
+            let (src, next, out) = (
+                "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d51",
+                "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d52",
+                "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d53",
+            );
+            let v = serde_json::json!({
+                "libmxl": libmxl,
+                "domains": [{ "name": "d", "path": domain }],
+                "inputs": [{ "name": "in", "domain": "d", "flowId": src, "channels": 1 }],
+                "outputs": [{ "name": out, "domain": "d", "flowId": out, "label": "latefp",
+                              "group": "latefp", "role": "Audio", "channels": 1 }],
+                "matrix": [[1.0]],
+                "rt": { "enabled": false, "rtCpu": "none" },
+            });
+            let config = Config::parse(&v.to_string()).unwrap();
+            let process = rt::setup_process(&config.rt);
+            let (report_tx, _reports) = mpsc::sync_channel(64);
+            let (hash_tx, hashes) = mpsc::sync_channel(1 << 16);
+            let replication = Replication {
+                voters: 2,
+                reports: report_tx,
+                statuses: None,
+                hashes: Some(hash_tx),
+            };
+            let e = Engine::start_replicated(config, process, None, replication).unwrap();
+            let processed = || e.counters().processed.load(Acquire);
+            wait(&|| e.status().outputs[0].realised);
+            // Hashed from the writer's first block on: the page it falls
+            // in is not hashed whole.
+            let begun = processed() * 48 / PAGE;
+            // A few blocks into a later page, with room left in it.
+            let t = Instant::now();
+            let p0 = loop {
+                let p = processed();
+                let off = p * 48 % PAGE;
+                if p * 48 / PAGE > begun && off >= 4 * 48 && off + 10 * 48 < PAGE {
+                    break p;
+                }
+                assert!(t.elapsed() < Duration::from_secs(5), "no page entered");
+                std::thread::sleep(Duration::from_micros(200));
+            };
+            let page = p0 * 48 / PAGE;
+            let at = (page * PAGE).next_multiple_of(48);
+            assert!(at < p0 * 48);
+            e.append(1, at, Entry::InputDown { slot: 0 }).unwrap();
+            e.append(2, at, Entry::InputUp { slot: 0 }).unwrap();
+            let route = Entry::Route {
+                slot: 0,
+                flow_id: next.to_owned(),
+            };
+            e.append(3, at, route).unwrap();
+            e.commit(3);
+            wait(&|| e.counters().entries_consumed.load(Acquire) >= 3);
+            let p1 = processed();
+            let c = e.counters();
+            let disturbed = if p1 * 48 / PAGE != page {
+                Some(format!("entries taken in block {p1}, past page {page}"))
+            } else {
+                assert_eq!(c.command_late.load(Relaxed), 3);
+                let t = Instant::now();
+                let record = loop {
+                    assert!(
+                        t.elapsed() < Duration::from_secs(5),
+                        "page {page} not settled"
+                    );
+                    match hashes.recv_timeout(Duration::from_millis(100)) {
+                        Ok(h) if h.page >= page => break h,
+                        _ => {}
+                    }
+                };
+                if record.page != page {
+                    let skipped = c.overrun_skipped_samples.load(Relaxed);
+                    let dropped = c.page_hashes_dropped.load(Relaxed);
+                    assert!(
+                        skipped > 0,
+                        "no record for page {page} ({dropped} dropped, taken by block \
+                         {p1}, from {p0}): {record:?}"
+                    );
+                    Some(format!("{skipped} samples skipped"))
+                } else {
+                    assert_eq!(record.fingerprint, HEALTHY, "{record:?}");
+                    None
+                }
+            };
+            e.stop();
+            std::fs::remove_dir_all(&domain).unwrap();
+            disturbed
+        };
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            match run() {
+                None => return,
+                Some(why) => {
+                    eprintln!("run disturbed ({why}): running it again");
+                    seen.push(why);
+                }
+            }
+        }
+        panic!("every run was disturbed: {seen:?}");
+    }
+
     /// Page hashes through an overrun skip and clock steps either way:
     /// no page missing a skipped block gets a record, every page gets at
     /// most one, and pages before and after the skips get theirs. The
