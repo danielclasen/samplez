@@ -13,9 +13,11 @@
 //! latest frame; a meter frame is sent only against a credit the product
 //! grants for the client. The product's own messages go to every client, to
 //! the connections of one session or to one connection ([`Hub::send`]):
-//! status messages keep only their latest frame per [`Slot`], other text
-//! frames queue in order, and neither goes out ahead of a delta published
-//! before it.
+//! status messages keep only their latest frame per [`Slot`], and other text
+//! frames go out in push order with the deltas, discarded with the deltas a
+//! catch-up replaces. A text frame that would overflow the queue closes the
+//! connection. While the client is ahead, text frames are discarded and
+//! status frames held.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -32,6 +34,7 @@ use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::Error;
+use crate::metrics::{Counter, Metrics};
 use crate::replica::{Owner, Position, ReadIndex, ReplicatedState};
 use crate::server::Connect;
 
@@ -183,7 +186,9 @@ pub enum Answer {
     },
     /// The client's position is above the read index in the state's epoch:
     /// it holds state the replication never committed. The connection is
-    /// sent no deltas until a later [`CatchUp`] is answered with state.
+    /// sent no deltas and no [`Frame::Text`] until a later [`CatchUp`] is
+    /// answered with state, and its [`Frame::Status`] frames are held until
+    /// then.
     Ahead {
         epoch: u64,
         /// The read index.
@@ -265,11 +270,15 @@ pub enum Frame {
     Counters(Utf8Bytes),
     /// A product status message, sent as a text message: replaces the
     /// frame of the same slot not sent yet, and goes out at most once per
-    /// [`Slot::every`].
+    /// [`Slot::every`]. Held while the client is above the read index
+    /// ([`Answer::Ahead`]).
     Status(Slot, Utf8Bytes),
-    /// A product message sent as a text message, in the order pushed among
-    /// the other `Text` frames; dropped while as many of them wait as the
-    /// queue's capacity.
+    /// A product message sent as a text message, in push order with the
+    /// deltas. One that would overflow the queue ends the connection
+    /// ([`Ended::Overflow`]). Discarded with the deltas a catch-up replaces,
+    /// and while the client is above the read index: the client is then
+    /// brought up to date from the state, never from these messages, so
+    /// whatever has to survive belongs in the replicated state.
     Text(Utf8Bytes),
 }
 
@@ -292,7 +301,8 @@ pub enum Pushed {
     /// The delta queue was emptied, or the delta discarded, because the
     /// client has to catch up.
     Resync,
-    /// A text frame while the queue's capacity of them wait.
+    /// A text frame while the queue's capacity of them wait: the queue is
+    /// emptied and the connection ends ([`Popped::Overflow`]).
     Dropped,
 }
 
@@ -301,6 +311,9 @@ pub enum Popped {
     Frame(Frame),
     /// The client has to catch up from the last position it was sent.
     Resync,
+    /// A text frame was dropped: the connection ends, and the client
+    /// catches up on a new one.
+    Overflow,
 }
 
 /// The frames waiting for one client, with one consumer.
@@ -313,11 +326,14 @@ pub struct ClientQueue {
 
 #[derive(Default)]
 struct Inner {
-    deltas: VecDeque<Delta>,
+    /// Deltas and text frames, in the order pushed.
+    sequence: VecDeque<Frame>,
+    deltas: usize,
+    texts: usize,
     resync: bool,
+    overflow: bool,
     meters: Option<Bytes>,
     counters: Option<Utf8Bytes>,
-    texts: VecDeque<Utf8Bytes>,
     /// One entry per slot pushed, kept after its frame is sent for when
     /// that was.
     statuses: Vec<StatusSlot>,
@@ -331,7 +347,8 @@ struct StatusSlot {
 }
 
 impl ClientQueue {
-    /// `capacity` bounds the deltas waiting, and the text frames.
+    /// `capacity` bounds the deltas waiting, and apart from them the text
+    /// frames.
     pub fn new(capacity: usize) -> ClientQueue {
         assert!(capacity > 0, "a client queue needs room for one delta");
         ClientQueue {
@@ -349,23 +366,33 @@ impl ClientQueue {
     pub fn push(&self, frame: Frame) -> Pushed {
         let mut q = self.lock();
         let pushed = match frame {
+            _ if q.overflow => return Pushed::Dropped,
             // The pending catch-up reads the state after this delta.
             Frame::Delta(_) if q.resync => return Pushed::Resync,
-            Frame::Delta(d) if q.deltas.len() < self.capacity => {
-                q.deltas.push_back(d);
+            Frame::Delta(d) if q.deltas < self.capacity => {
+                q.sequence.push_back(Frame::Delta(d));
+                q.deltas += 1;
                 Pushed::Queued
             }
+            // The catch-up carries the state the texts went with.
             Frame::Delta(_) => {
-                q.deltas.clear();
+                q.sequence.clear();
+                (q.deltas, q.texts) = (0, 0);
                 q.resync = true;
                 Pushed::Resync
             }
             Frame::Meters(_) if q.credits == 0 => return Pushed::Skipped,
             Frame::Meters(m) => replace(&mut q.meters, m),
             Frame::Counters(c) => replace(&mut q.counters, c),
-            Frame::Text(_) if q.texts.len() >= self.capacity => return Pushed::Dropped,
+            Frame::Text(_) if q.texts >= self.capacity => {
+                q.sequence.clear();
+                (q.deltas, q.texts) = (0, 0);
+                q.overflow = true;
+                Pushed::Dropped
+            }
             Frame::Text(t) => {
-                q.texts.push_back(t);
+                q.sequence.push_back(Frame::Text(t));
+                q.texts += 1;
                 Pushed::Queued
             }
             Frame::Status(slot, text) => {
@@ -402,41 +429,59 @@ impl ClientQueue {
     }
 
     /// Marks whether the client sends its commands on this connection, as
-    /// the product's protocol tells it; [`To::Primary`] reads it. `false`
-    /// until set.
+    /// the product's protocol tells it, such as on its hello or a promote;
+    /// [`To::Primary`] reads it. The service never sets it, and it is per
+    /// connection, not exclusive: two connections of a session can both be
+    /// marked, as the old one of a failover until it ends. `false` until
+    /// set.
     pub fn set_primary(&self, primary: bool) {
         self.primary.store(primary, Ordering::Relaxed);
     }
 
+    /// What [`ClientQueue::set_primary`] last set, `false` before.
     pub fn is_primary(&self) -> bool {
         self.primary.load(Ordering::Relaxed)
     }
 
-    /// A resync first, then deltas in order, then counters, then text
-    /// frames in order, then status frames whose slot allows one now, then
-    /// meters; each meter frame popped uses one credit. A frame pushed
-    /// after a delta is therefore never popped ahead of it, nor ahead of
-    /// the resync that discarded it.
+    /// An overflow first, then a resync, then deltas and text frames in the
+    /// order pushed, then counters, then status frames whose slot allows
+    /// one now, then meters; each meter frame popped uses one credit. A
+    /// text frame is therefore never popped after a delta pushed after it,
+    /// nor ahead of one pushed before it, and none pushed before a resync
+    /// is popped after it.
     pub async fn pop(&self) -> Popped {
+        self.pop_held(false).await
+    }
+
+    /// [`ClientQueue::pop`], holding status frames when `hold_statuses`.
+    async fn pop_held(&self, hold_statuses: bool) -> Popped {
         loop {
             let wake = {
                 let mut q = self.lock();
+                if q.overflow {
+                    return Popped::Overflow;
+                }
                 if q.resync {
                     q.resync = false;
                     return Popped::Resync;
                 }
-                if let Some(d) = q.deltas.pop_front() {
-                    return Popped::Frame(Frame::Delta(d));
+                if let Some(frame) = q.sequence.pop_front() {
+                    match frame {
+                        Frame::Delta(_) => q.deltas -= 1,
+                        _ => q.texts -= 1,
+                    }
+                    return Popped::Frame(frame);
                 }
                 if let Some(c) = q.counters.take() {
                     return Popped::Frame(Frame::Counters(c));
                 }
-                if let Some(t) = q.texts.pop_front() {
-                    return Popped::Frame(Frame::Text(t));
-                }
                 let now = Instant::now();
                 let mut wake: Option<Instant> = None;
-                for s in q.statuses.iter_mut().filter(|s| s.text.is_some()) {
+                let due = q
+                    .statuses
+                    .iter_mut()
+                    .filter(|s| s.text.is_some() && !hold_statuses);
+                for s in due {
                     match s.sent.map(|sent| sent + s.slot.every) {
                         Some(next) if now < next => {
                             wake = Some(wake.map_or(next, |w| w.min(next)));
@@ -470,7 +515,7 @@ impl ClientQueue {
 
     /// The deltas waiting.
     pub fn len(&self) -> usize {
-        self.lock().deltas.len()
+        self.lock().deltas
     }
 
     pub fn is_empty(&self) -> bool {
@@ -489,9 +534,12 @@ fn replace<T>(slot: &mut Option<T>, value: T) -> Pushed {
 pub struct Hub {
     capacity: usize,
     clients: Mutex<Vec<(Owner, Weak<ClientQueue>)>>,
+    overflows: Counter,
 }
 
-/// The connections [`Hub::send`] pushes a frame to.
+/// The connections [`Hub::send`] pushes a frame to. Each names its
+/// principal, so a frame never reaches another principal's connection
+/// whatever session or connection id a client presents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum To<'a> {
     /// Every connection of a session: the same session id under another
@@ -507,7 +555,10 @@ pub enum To<'a> {
         session: &'a str,
     },
     /// One connection, by [`Owner::connection`].
-    Connection(&'a str),
+    Connection {
+        principal: &'a str,
+        connection: &'a str,
+    },
 }
 
 impl To<'_> {
@@ -519,17 +570,39 @@ impl To<'_> {
             To::Primary { principal, session } => {
                 owner.principal == principal && owner.session == session && queue.is_primary()
             }
-            To::Connection(connection) => owner.connection == connection,
+            To::Connection {
+                principal,
+                connection,
+            } => owner.principal == principal && owner.connection == connection,
         }
     }
 }
 
+/// What [`Hub::send`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sent {
+    /// The connections that queued the frame or replaced one of its kind
+    /// with it.
+    pub reached: usize,
+    /// The connections a text frame overflowed, which end
+    /// ([`Pushed::Dropped`]).
+    pub dropped: usize,
+}
+
 impl Hub {
-    /// `capacity` bounds the deltas waiting for each client.
-    pub fn new(capacity: usize) -> Hub {
+    /// `capacity` bounds the deltas waiting for each client, and apart from
+    /// them its text frames. Counts the text frames that overflowed a queue
+    /// in `samplez_ws_text_overflows_total` of `metrics`.
+    pub fn new(capacity: usize, metrics: &Metrics) -> Hub {
         Hub {
             capacity,
             clients: Mutex::default(),
+            overflows: metrics.counter(
+                "samplez_ws_text_overflows_total",
+                "Product text frames that overflowed a WebSocket client's queue, \
+                 ending the connection.",
+                &[],
+            ),
         }
     }
 
@@ -549,32 +622,48 @@ impl Hub {
     /// after the state has applied it, the ones replicated from other
     /// replicas included, so a client catching up from the state in between
     /// gets it from there and skips the published copy by revision.
-    pub fn publish(&self, frame: Frame) {
-        self.push(|_, _| true, &frame);
+    pub fn publish(&self, frame: Frame) -> Sent {
+        self.push(|_, _| true, &frame)
     }
 
     /// Pushes a frame to the connections `to` names, as [`Hub::publish`]
-    /// does to every one; returns how many it reached.
-    pub fn send(&self, to: To<'_>, frame: Frame) -> usize {
+    /// does to every one.
+    ///
+    /// Each queue holds deltas and text frames in the order pushed, and the
+    /// hub pushes to every queue under one lock: a text frame sent after
+    /// [`Hub::publish`] of a delta returned reaches each client after that
+    /// delta, and one sent before it ahead of it. A product that derives a
+    /// text frame from a state change sends it after publishing the delta
+    /// of that change. A text frame is not delivered when the client
+    /// catches up instead, is above the read index, or its queue overflows,
+    /// which ends the connection; what has to reach the client belongs in
+    /// the replicated state.
+    pub fn send(&self, to: To<'_>, frame: Frame) -> Sent {
         self.push(|owner, queue| to.matches(owner, queue), &frame)
     }
 
-    fn push(&self, to: impl Fn(&Owner, &ClientQueue) -> bool, frame: &Frame) -> usize {
-        let mut reached = 0;
+    fn push(&self, to: impl Fn(&Owner, &ClientQueue) -> bool, frame: &Frame) -> Sent {
+        let mut sent = Sent::default();
         self.clients
             .lock()
             .expect("hub lock poisoned")
             .retain(|(owner, client)| match client.upgrade() {
                 Some(queue) => {
                     if to(owner, &queue) {
-                        queue.push(frame.clone());
-                        reached += 1;
+                        match queue.push(frame.clone()) {
+                            Pushed::Queued | Pushed::Replaced => sent.reached += 1,
+                            Pushed::Dropped => sent.dropped += 1,
+                            Pushed::Skipped | Pushed::Resync => {}
+                        }
                     }
                     true
                 }
                 None => false,
             });
-        reached
+        if matches!(frame, Frame::Text(_)) {
+            self.overflows.add(sent.dropped as u64);
+        }
+        sent
     }
 }
 
@@ -724,6 +813,9 @@ pub enum Ended {
     /// revisions name nothing in it. A close frame was sent; the client
     /// catches up on a new connection, with a snapshot of the new epoch.
     EpochChanged,
+    /// A text frame overflowed the client's queue ([`Pushed::Dropped`]); a
+    /// close frame was sent. The client catches up on a new connection.
+    Overflow,
 }
 
 /// Answers a client's [`CatchUp`]. A position of the state's epoch waits up
@@ -873,8 +965,9 @@ async fn send<T: Sink<Message> + Unpin>(
 /// [`Ended::EpochChanged`] when the state's epoch, a delta's or a later
 /// answer's is another, checked before each reply and at least every
 /// [`PING_PERIOD`]. A client
-/// answered [`Answer::Ahead`] is sent no deltas until it is answered with
-/// state again.
+/// answered [`Answer::Ahead`] is sent no deltas and no text frames, and its
+/// status frames are held, until it is answered with state again. A text
+/// frame that overflows `queue` closes the connection as [`Ended::Overflow`].
 ///
 /// A command is begun and submitted in the call, outside the `async`
 /// block, so commands commit in the order the client sent them; submitted
@@ -1139,13 +1232,22 @@ where
                     }
                     encode.answer(a)
                 }
-                popped = queue.pop(), if caught_up && catching_up.is_none() => match (popped, position) {
+                // Statuses held while the client holds a position the
+                // replication never committed.
+                popped = queue.pop_held(position.is_none()), if caught_up && catching_up.is_none() => match (popped, position) {
+                    (Popped::Overflow, _) => {
+                        let deadline = pong_deadline(answered, paused_since);
+                        let _ = send(&mut tx, Message::Close(None), deadline).await;
+                        return Ended::Overflow;
+                    }
                     (Popped::Frame(Frame::Delta(d)), _) if epoch != Some(d.epoch) => {
                         let deadline = pong_deadline(answered, paused_since);
                         let _ = send(&mut tx, Message::Close(None), deadline).await;
                         return Ended::EpochChanged;
                     }
-                    (Popped::Frame(Frame::Delta(_)) | Popped::Resync, None) => Vec::new(),
+                    (Popped::Frame(Frame::Delta(_) | Frame::Text(_)) | Popped::Resync, None) => {
+                        Vec::new()
+                    }
                     (Popped::Frame(Frame::Delta(d)), Some(p)) if d.revision <= p.revision => {
                         Vec::new()
                     }
