@@ -5,8 +5,10 @@ Real-time multichannel audio engine with MXL I/O, written in Rust.
 ## Building
 
 `docker/builder` holds the build environment: Rust, clang and libclang for
-bindgen, and a Release build of libmxl (MXL v1.1.0) installed under
-`/opt/mxl`. CI builds and tests inside it.
+bindgen, a Release build of libmxl (MXL v1.1.0) installed under
+`/opt/mxl`, and the tools of the RT gates: a pinned nightly with
+`rust-src` (`$SAMPLEZ_NIGHTLY`), Valgrind and the Gungraun runner. CI
+builds and tests inside it.
 
 ```sh
 docker build -t samplez-builder docker/builder
@@ -84,7 +86,15 @@ The binary is `src/bin/samplez-hop.rs`, built with the library.
 ## Real-time requirements
 
 The RT thread does not allocate once its loop runs (`tests/no_alloc.rs`
-checks it), with one failure path excepted: while an input is late,
+checks it). Its real-time functions, which exclude libmxl's sync-group
+wait and `mxlSleepUntil`, also pass RealtimeSanitizer (`tests/rtsan.rs`,
+built with `-Zsanitizer=realtime --cfg samplez_rtsan` on the nightly):
+the one blocking call inside them is the `FUTEX_WAKE` of libmxl's output
+commit, allowed at that call site. `cargo bench --bench rt` in
+samplez-dsp and samplez-mxl fails when the instruction count of a block's
+DSP or of an output commit, gap zero-fill included, exceeds the limit in
+the benchmark. One failure path is excepted from the no-allocation rule,
+and its probe is allowed by call site under RealtimeSanitizer: while an input is late,
 libmxl's flow validity check, one `stat()` and path allocations, can
 run on the RT thread. It ends when the input is pruned, after
 `pruneAfterBlocks` blocks of a frozen head, or twice the producer's

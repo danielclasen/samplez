@@ -59,6 +59,23 @@ jobs:
               cargo test --locked --test hop
               cargo test --locked --release --test hop
             '
+      # RealtimeSanitizer over the RT thread's real-time functions on the
+      # builder's pinned nightly, and the Callgrind instruction-count
+      # limits of the RT benchmarks.
+      # Docker's seccomp profile refuses the personality call setarch -R
+      # makes, so Valgrind runs with ASLR on; the counts do not move with
+      # it (two runs give equal counts).
+      - name: RT gates
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e SAMPLEZ_REQUIRE_PATHS=avx2 -e GUNGRAUN_ALLOW_ASLR=yes \
+            -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
+            -w /w samplez-builder:ci bash -euo pipefail -c '
+              RUSTFLAGS="-Zsanitizer=realtime --cfg samplez_rtsan" \
+                cargo "+$SAMPLEZ_NIGHTLY" test --locked -Zbuild-std \
+                --target x86_64-unknown-linux-gnu --test rtsan
+              cargo bench --locked -p samplez-dsp -p samplez-mxl --bench rt
+            '
       # Saved from main only, so per-PR snapshots do not evict the builder
       # image layers from the shared Actions cache.
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
