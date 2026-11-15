@@ -256,3 +256,7 @@ mod tests {
         assert!(validate_id("5fbec3b1x1b0f-417d-9059-8b94a47197ed").is_err());
     }
 }
+
+/// The lint probe's lock on a static (CI): its users never name its type.
+#[cfg(samplez_lint_probe = "samplez-mxl")]
+pub static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

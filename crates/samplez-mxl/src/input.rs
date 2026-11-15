@@ -68,6 +68,7 @@ impl FlowReader {
     pub fn open(instance: &Arc<Instance>, flow_id: &str) -> Result<FlowReader> {
         let id = id_cstring(flow_id)?;
         let mut raw = std::ptr::null_mut();
+        #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = instance.lock();
         // SAFETY: valid instance, NUL-terminated id, a null options pointer
         // and a writable out pointer.
@@ -144,6 +145,7 @@ impl FlowReader {
 
 impl Drop for FlowReader {
     fn drop(&mut self) {
+        #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = self.instance.lock();
         // SAFETY: `raw` came from mxlCreateFlowReader on this instance and
         // this reference is released exactly once, here.
@@ -173,6 +175,7 @@ impl SyncGroup {
     /// `mxlCreateFlowSynchronizationGroup`.
     fn new(instance: &Arc<Instance>) -> Result<SyncGroup> {
         let mut raw = std::ptr::null_mut();
+        #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = instance.lock();
         // SAFETY: valid instance, writable out pointer.
         check("mxlCreateFlowSynchronizationGroup", unsafe {
@@ -222,6 +225,7 @@ impl SyncGroup {
 
 impl Drop for SyncGroup {
     fn drop(&mut self) {
+        #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = self.instance.lock();
         // SAFETY: `raw` came from mxlCreateFlowSynchronizationGroup on this
         // instance and is released exactly once, here.

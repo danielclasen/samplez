@@ -292,10 +292,12 @@ impl Drop for FlowWriter {
 }
 
 /// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez-mxl"`,
-/// clippy must refuse this lock and this sleep.
+/// clippy must refuse this lock and this sleep, and the lock on a static
+/// whose type it does not name.
 #[cfg(samplez_lint_probe = "samplez-mxl")]
 pub fn lint_probe(m: &std::sync::Mutex<()>) {
     let _guard = m.lock();
+    let _held = crate::PROBE_LOCK.lock();
     std::thread::sleep(std::time::Duration::from_millis(1));
 }
 

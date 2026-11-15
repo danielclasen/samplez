@@ -33,9 +33,17 @@ pub use ramp::{MAX_GAIN, MAX_RAMP_LEN, Ramp, valid_gain};
 pub use true_peak::TruePeak;
 
 /// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez-dsp"`,
-/// clippy must refuse this lock and this sleep.
+/// clippy must refuse this lock and this sleep, and the lock on a static
+/// whose type it does not name.
 #[cfg(samplez_lint_probe = "samplez-dsp")]
 pub fn lint_probe(m: &std::sync::Mutex<()>) {
     let _guard = m.lock();
+    let _held = crate::PROBE_LOCK.lock();
     std::thread::sleep(std::time::Duration::from_millis(1));
 }
+
+/// The lint probe's lock on a static (CI), declared where the types may be
+/// named: its users never name its type.
+#[cfg(samplez_lint_probe = "samplez-dsp")]
+#[allow(clippy::disallowed_types)]
+pub static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

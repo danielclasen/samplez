@@ -739,7 +739,9 @@ impl Rt {
     }
 
     /// `mxlSleepUntil(timestamp)` on the clock [`Rt::now`] reads; it waits
-    /// by design, so RealtimeSanitizer allows it.
+    /// by design, so RealtimeSanitizer allows it. The allow is not
+    /// exercised: libmxl sleeps with `clock_nanosleep`, which this
+    /// RealtimeSanitizer runtime does not intercept.
     fn sleep_until(&self, timestamp: u64) {
         #[cfg(test)]
         let timestamp = timestamp.saturating_add_signed(-CLOCK_SHIFT_NS.load(Relaxed));
@@ -1303,10 +1305,12 @@ impl Rt {
 }
 
 /// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez"`,
-/// clippy must refuse this lock and this sleep.
+/// clippy must refuse this lock and this sleep, and the lock on a static
+/// whose type it does not name.
 #[cfg(samplez_lint_probe = "samplez")]
 pub fn lint_probe(m: &std::sync::Mutex<()>) {
     let _guard = m.lock();
+    let _held = crate::PROBE_LOCK.lock();
     std::thread::sleep(std::time::Duration::from_millis(1));
 }
 

@@ -21,3 +21,7 @@ pub use engine::{
 };
 pub use meters::OutputMeters;
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};
+
+/// The lint probe's lock on a static (CI): its users never name its type.
+#[cfg(samplez_lint_probe = "samplez")]
+pub static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
