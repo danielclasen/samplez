@@ -1,13 +1,21 @@
 //! A samplez product's state replicated over openraft: the log and
 //! snapshots on the replica's volume, the per-session tables of applied
 //! command ids, and [`ReplicatedState`] over a [`Product`].
+//!
+//! Replicas reach each other on the peer listener ([`peer`]) with mutual
+//! TLS. A command a client sends to any replica is forwarded to the leader
+//! with its owner and the replica's E estimate at first receipt; the
+//! replica answers it once it applied the entry carrying it.
 
 pub mod dedup;
 pub mod entry;
 pub mod log_store;
+pub mod net;
+pub mod peer;
 pub mod snapshot;
 pub mod state_machine;
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
@@ -15,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use openraft::error::{CheckIsLeaderError, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::network::RaftNetworkFactory;
 use openraft::storage::Adaptor;
 use openraft::{BasicNode, Raft, ServerState};
@@ -27,9 +35,10 @@ use tokio::time::Instant;
 
 use crate::dedup::Limits;
 use crate::entry::{
-    Batch, Body, Command, NodeId, Origin, Request, Response, SessionKey, stamping_index,
+    Batch, Body, Command, NodeId, Origin, Outcome, Request, Response, SessionKey, stamping_index,
 };
 use crate::log_store::Store;
+use crate::peer::{Forwarded, PeerClient, PeerReply, PeerRequest, PeerResponse, Refused};
 use crate::state_machine::Product;
 
 openraft::declare_raft_types!(
@@ -62,68 +71,144 @@ pub struct Settings {
     /// The engine block size B the stamping index rounds to.
     pub block: u64,
     /// The longest a submit waits, from the call, for its command to apply
-    /// here, queueing behind earlier writes included, before it resolves
-    /// [`NotApplied`] with [`Reason::Unavailable`]. A command still queued
-    /// at its deadline is not ordered. An entry the replica set decides on
-    /// waits this long from the moment it is proposed.
+    /// here, queueing behind earlier writes and waiting for a leader
+    /// included, before it resolves [`NotApplied`] with
+    /// [`Reason::Unavailable`]. A command still queued at its deadline is
+    /// not ordered. An entry the replica set decides on waits this long
+    /// from the moment it is proposed.
     pub write_timeout: Duration,
+    /// This replica's peer address, `host:port`, as the others reach it.
+    pub addr: String,
 }
 
 /// This replica's estimate E of the set's processed index, in samples.
 pub type Estimate = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-type Reply = oneshot::Sender<Result<Ack, NotApplied>>;
+type Reply = oneshot::Sender<Result<Outcome, Refused>>;
+
+/// A command waiting for the writer.
+struct Item {
+    command: Command,
+    /// The E estimate of the replica that first received it.
+    received: u64,
+    deadline: Instant,
+    reply: Reply,
+    /// Forwarded by another replica: answered, never forwarded on.
+    forwarded: bool,
+}
 
 enum Queued {
-    Command(Command, Instant, Reply),
-    Entry(Body),
+    Command(Item),
+    Entry {
+        body: Body,
+        deadline: Instant,
+        reply: Option<oneshot::Sender<Result<(), Refused>>>,
+        forwarded: bool,
+    },
+}
+
+/// Whether a read sees every write committed before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Applied up to the leader's read index.
+    Current,
+    /// The locally applied state: no quorum, or no read index in time.
+    Stale,
+}
+
+/// What the writer and the peer handlers share.
+pub(crate) struct Shared {
+    settings: Settings,
+    raft: Raft<TypeConfig>,
+    peers: Arc<dyn PeerClient>,
+    /// The longest a leader goes without a quorum, and a follower without
+    /// its leader, before it counts the quorum as lost: the election
+    /// timeout's maximum.
+    lease: Duration,
+    /// The pause before a refused forward is resent.
+    heartbeat: Duration,
+    quiescing: AtomicBool,
 }
 
 /// One replica of a product's state.
 pub struct Replica<P> {
-    settings: Settings,
-    raft: Raft<TypeConfig>,
+    shared: Arc<Shared>,
     store: Store<P>,
     queue: mpsc::UnboundedSender<Queued>,
+    estimate: Estimate,
     /// Set once the replica applied the log up to the committed id it
     /// knows ([`ReplicaInfo::ready`]); nothing clears it yet.
     ready: AtomicBool,
 }
 
 impl<P: Product> Replica<P> {
-    /// Opens the storage in `dir` and starts the replica: a restarted one
-    /// applies its log up to the saved committed id before it hears from
-    /// any peer.
+    /// Opens the storage in `dir` and starts the replica, as
+    /// [`Replica::with_store`].
     pub async fn start<N>(
         settings: Settings,
         raft: openraft::Config,
         dir: &Path,
         product: P,
         network: N,
+        peers: Arc<dyn PeerClient>,
         estimate: Estimate,
     ) -> Result<Replica<P>, String>
     where
         N: RaftNetworkFactory<TypeConfig>,
     {
         let store = Store::open(dir, product, settings.limits).map_err(|e| e.to_string())?;
+        Replica::with_store(settings, raft, store, network, peers, estimate).await
+    }
+
+    /// Starts the replica on `store`: a restarted one applies its log up to
+    /// the saved committed id before it hears from any peer.
+    pub async fn with_store<N>(
+        settings: Settings,
+        raft: openraft::Config,
+        store: Store<P>,
+        network: N,
+        peers: Arc<dyn PeerClient>,
+        estimate: Estimate,
+    ) -> Result<Replica<P>, String>
+    where
+        N: RaftNetworkFactory<TypeConfig>,
+    {
         let raft_config = Arc::new(raft.validate().map_err(|e| e.to_string())?);
         let (log, state_machine) = Adaptor::new(store.clone());
-        let raft = Raft::new(settings.id, raft_config, network, log, state_machine)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (queue, queued) = mpsc::unbounded_channel();
-        tokio::spawn(write(raft.clone(), queued, estimate, settings.clone()));
-        Ok(Replica {
+        let raft = Raft::new(
+            settings.id,
+            raft_config.clone(),
+            network,
+            log,
+            state_machine,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let shared = Arc::new(Shared {
             settings,
             raft,
+            peers,
+            lease: Duration::from_millis(raft_config.election_timeout_max),
+            heartbeat: Duration::from_millis(raft_config.heartbeat_interval),
+            quiescing: AtomicBool::new(false),
+        });
+        let (queue, queued) = mpsc::unbounded_channel();
+        tokio::spawn(write(shared.clone(), queued, estimate.clone()));
+        Ok(Replica {
+            shared,
             store,
             queue,
+            estimate,
             ready: AtomicBool::new(false),
         })
     }
 
+    pub fn id(&self) -> NodeId {
+        self.shared.settings.id
+    }
+
     pub fn raft(&self) -> &Raft<TypeConfig> {
-        &self.raft
+        &self.shared.raft
     }
 
     pub fn store(&self) -> &Store<P> {
@@ -133,34 +218,431 @@ impl<P: Product> Replica<P> {
     /// Orders an entry the replica set decides on rather than a client,
     /// behind every command submitted before it.
     pub fn append(&self, body: Body) {
-        let _ = self.queue.send(Queued::Entry(body));
+        let _ = self.queue.send(Queued::Entry {
+            body,
+            deadline: Instant::now() + self.shared.settings.write_timeout,
+            reply: None,
+            forwarded: false,
+        });
     }
 
     /// Makes `members` the first voters; on one node of a new set only.
     pub async fn initialize(
         &self,
-        members: impl IntoIterator<Item = NodeId>,
+        members: impl IntoIterator<Item = (NodeId, String)>,
     ) -> Result<(), String> {
-        let members: std::collections::BTreeMap<NodeId, BasicNode> = members
+        let members: BTreeMap<NodeId, BasicNode> = members
             .into_iter()
-            .map(|id| (id, BasicNode::new(id.to_string())))
+            .map(|(id, addr)| (id, BasicNode::new(addr)))
             .collect();
-        self.raft
+        self.shared
+            .raft
             .initialize(members)
             .await
             .map_err(|e| e.to_string())
     }
 
-    pub async fn shutdown(&self) {
-        let _ = self.raft.shutdown().await;
+    /// Whether this replica knows a quorum: as leader, one acknowledged it
+    /// within the lease; else its leader's last append arrived within it.
+    pub async fn quorum(&self) -> bool {
+        self.shared.quorum().await
     }
+
+    /// Waits up to `within` until this replica applied every write
+    /// committed before the call, and says whether it did. Without a
+    /// quorum it answers [`Freshness::Stale`] at once, so a reader never
+    /// waits on a set that cannot answer.
+    pub async fn read(&self, within: Duration) -> Freshness {
+        let shared = &self.shared;
+        if !shared.quorum().await {
+            return Freshness::Stale;
+        }
+        let index = async {
+            if shared.leads() {
+                let (read, _) = shared.raft.get_read_log_id().await.ok()?;
+                return Some(read.map_or(0, |id| id.index));
+            }
+            let (leader, addr) = shared.leader()?;
+            match shared
+                .peers
+                .call(Some(leader), &addr, PeerRequest::ReadIndex, within)
+                .await
+            {
+                Ok(Ok(PeerResponse::ReadIndex(index))) => Some(index),
+                _ => None,
+            }
+        };
+        let deadline = Instant::now() + within;
+        match tokio::time::timeout_at(deadline, index).await {
+            Ok(Some(index)) if shared.applied(index, deadline).await => Freshness::Current,
+            _ => Freshness::Stale,
+        }
+    }
+
+    /// For a voter's preStop. Stops ordering commands: forwarded ones are
+    /// refused [`Refused::Quiescing`], which their sender resends to the
+    /// next leader, and local ones wait for that leader. A leader then
+    /// waits until every entry it appended is committed and every voter
+    /// holds it, at most `bound`, so its exit leaves no entry in flight on
+    /// a live replica; a voter that is down holds it up to `bound`.
+    pub async fn quiesce(&self, bound: Duration) {
+        let shared = &self.shared;
+        shared.quiescing.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + bound;
+        while shared.raft.metrics().borrow().state == ServerState::Leader {
+            let metrics = shared.raft.metrics().borrow().clone();
+            let last = metrics.last_log_index.unwrap_or(0);
+            let committed = metrics.last_applied.is_some_and(|id| id.index >= last);
+            let held = metrics
+                .membership_config
+                .membership()
+                .voter_ids()
+                .all(|id| {
+                    id == shared.settings.id
+                        || metrics
+                            .replication
+                            .as_ref()
+                            .and_then(|matched| matched.get(&id).copied().flatten())
+                            .is_some_and(|matched| matched.index >= last)
+                });
+            if committed && held {
+                // One more heartbeat carries the commit to the followers.
+                tokio::time::sleep(shared.heartbeat * 2).await;
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(shared.heartbeat / 5).await;
+        }
+    }
+
+    /// Answers another replica's request; the peer listener calls it.
+    pub async fn handle(&self, to: Option<NodeId>, request: PeerRequest) -> PeerReply {
+        let shared = &self.shared;
+        if to.is_some_and(|to| to != shared.settings.id) {
+            return Err(Refused::Misaddressed);
+        }
+        match request {
+            PeerRequest::Forward {
+                commands,
+                within_ms,
+            } => {
+                shared.refuse_unless_leading()?;
+                let deadline = Instant::now() + Duration::from_millis(within_ms);
+                let mut replies = Vec::with_capacity(commands.len());
+                for Forwarded { command, received } in commands {
+                    let (reply, replied) = oneshot::channel();
+                    let item = Item {
+                        command,
+                        received,
+                        deadline,
+                        reply,
+                        forwarded: true,
+                    };
+                    let _ = self.queue.send(Queued::Command(item));
+                    replies.push(replied);
+                }
+                let mut results = Vec::with_capacity(replies.len());
+                for replied in replies {
+                    results.push(replied.await.unwrap_or_else(|_| Err(stopped())));
+                }
+                Ok(PeerResponse::Forwarded(results))
+            }
+            PeerRequest::Append { body, within_ms } => {
+                shared.refuse_unless_leading()?;
+                let (reply, replied) = oneshot::channel();
+                let _ = self.queue.send(Queued::Entry {
+                    body,
+                    deadline: Instant::now() + Duration::from_millis(within_ms),
+                    reply: Some(reply),
+                    forwarded: true,
+                });
+                replied.await.unwrap_or_else(|_| Err(stopped()))?;
+                Ok(PeerResponse::Appended)
+            }
+            PeerRequest::ReadIndex => match shared.raft.get_read_log_id().await {
+                Ok((read, _)) => Ok(PeerResponse::ReadIndex(read.map_or(0, |id| id.index))),
+                Err(RaftError::APIError(_)) => Err(Refused::NotLeader),
+                Err(e) => Err(Refused::Unavailable(e.to_string())),
+            },
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.shared.raft.shutdown().await;
+    }
+}
+
+fn stopped() -> Refused {
+    Refused::Unavailable("replica stopped".into())
+}
+
+impl Shared {
+    fn quiescing(&self) -> bool {
+        self.quiescing.load(Ordering::Relaxed)
+    }
+
+    /// Leader and not quiescing: orders what it is given.
+    fn leads(&self) -> bool {
+        self.raft.metrics().borrow().state == ServerState::Leader && !self.quiescing()
+    }
+
+    fn refuse_unless_leading(&self) -> Result<(), Refused> {
+        match self.raft.metrics().borrow().state {
+            ServerState::Leader if self.quiescing() => Err(Refused::Quiescing),
+            ServerState::Leader => Ok(()),
+            _ => Err(Refused::NotLeader),
+        }
+    }
+
+    /// Another replica this one knows as leader, with its address.
+    fn leader(&self) -> Option<(NodeId, String)> {
+        let metrics = self.raft.metrics().borrow().clone();
+        let leader = metrics
+            .current_leader
+            .filter(|&id| id != self.settings.id)?;
+        let node = metrics
+            .membership_config
+            .membership()
+            .get_node(&leader)?
+            .clone();
+        Some((leader, node.addr))
+    }
+
+    async fn quorum(&self) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        match metrics.state {
+            ServerState::Leader => metrics
+                .millis_since_quorum_ack
+                .is_some_and(|ms| u128::from(ms) <= self.lease.as_millis()),
+            ServerState::Follower | ServerState::Learner if metrics.current_leader.is_some() => {
+                let lease = self.lease;
+                self.raft
+                    .with_raft_state(move |state| {
+                        state.vote_ref().committed
+                            && state
+                                .vote_last_modified()
+                                .is_some_and(|at| at.elapsed() <= lease)
+                    })
+                    .await
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Waits until this replica applied `index`; false at `deadline`.
+    async fn applied(&self, index: u64, deadline: Instant) -> bool {
+        let within = deadline.saturating_duration_since(Instant::now());
+        self.raft
+            .wait(Some(within))
+            .applied_index_at_least(Some(index), "applied")
+            .await
+            .is_ok()
+    }
+
+    /// Orders an entry: appends it as leader, else forwards it to the
+    /// leader, until `deadline`.
+    async fn order_entry(
+        &self,
+        body: Body,
+        deadline: Instant,
+        forwarded: bool,
+        estimate: &Estimate,
+    ) -> Result<(), Refused> {
+        loop {
+            if self.leads() {
+                let request = Request {
+                    stamp: stamping_index(estimate(), self.settings.block),
+                    body,
+                };
+                return match tokio::time::timeout_at(deadline, self.raft.client_write(request))
+                    .await
+                {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(e)) => Err(Refused::Unavailable(e.to_string())),
+                    Err(_) => Err(Refused::Unavailable("timed out".into())),
+                };
+            }
+            if forwarded {
+                return self.refuse_unless_leading();
+            }
+            if let Some((leader, addr)) = self.leader() {
+                let within = deadline.saturating_duration_since(Instant::now());
+                let request = PeerRequest::Append {
+                    body: body.clone(),
+                    within_ms: within.as_millis() as u64,
+                };
+                if let Ok(Ok(PeerResponse::Appended)) =
+                    self.peers.call(Some(leader), &addr, request, within).await
+                {
+                    return Ok(());
+                }
+            }
+            if Instant::now() + self.heartbeat >= deadline {
+                return Err(Refused::Unavailable("no leader".into()));
+            }
+            tokio::time::sleep(self.heartbeat).await;
+        }
+    }
+
+    /// Orders a group of commands: as leader in one entry, else by
+    /// forwarding them to the leader, resending what a leader change or a
+    /// quiescing leader refused, each until its deadline. Answers each
+    /// once this replica applied the entry carrying it.
+    async fn order_commands(&self, mut items: Vec<Item>, estimate: &Estimate) {
+        loop {
+            let now = Instant::now();
+            items.retain_mut(|item| {
+                let expired = item.deadline <= now;
+                if expired {
+                    let (reply, _) = oneshot::channel();
+                    let reply = std::mem::replace(&mut item.reply, reply);
+                    let _ = reply.send(Err(Refused::Unavailable("timed out".into())));
+                }
+                !expired
+            });
+            if items.is_empty() {
+                return;
+            }
+            if self.leads() {
+                match self.write_locally(items, estimate).await {
+                    Ok(()) => return,
+                    // Leadership moved before the entry committed: route
+                    // them again; a copy that commits after all resolves
+                    // as a duplicate.
+                    Err(again) => items = again,
+                }
+                continue;
+            }
+            let (forwarded, local): (Vec<Item>, Vec<Item>) =
+                items.into_iter().partition(|item| item.forwarded);
+            let refusal = self
+                .refuse_unless_leading()
+                .err()
+                .unwrap_or(Refused::NotLeader);
+            for item in forwarded {
+                let _ = item.reply.send(Err(refusal.clone()));
+            }
+            items = local;
+            if items.is_empty() {
+                return;
+            }
+            if let Some((leader, addr)) = self.leader() {
+                items = self.forward(leader, &addr, items).await;
+                if items.is_empty() {
+                    return;
+                }
+            }
+            tokio::time::sleep(self.heartbeat).await;
+        }
+    }
+
+    /// Appends `items` as one entry and answers them; gives them back when
+    /// this replica turned out not to lead.
+    async fn write_locally(&self, items: Vec<Item>, estimate: &Estimate) -> Result<(), Vec<Item>> {
+        let mut batch = Batch::default();
+        let latest = items
+            .iter()
+            .map(|item| item.deadline)
+            .max()
+            .expect("not empty");
+        let positions: Vec<usize> = items
+            .iter()
+            .map(|item| batch.push(item.command.clone()))
+            .collect();
+        let request = Request {
+            stamp: stamping_index(estimate(), self.settings.block),
+            body: Body::Commands(batch.into_commands()),
+        };
+        let written = tokio::time::timeout_at(latest, self.raft.client_write(request)).await;
+        let outcomes = match written {
+            Ok(Ok(written)) => written.data.0,
+            Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_)))) => {
+                return Err(items);
+            }
+            Ok(Err(e)) => return answer_all(items, Refused::Unavailable(e.to_string())),
+            Err(_) => return answer_all(items, Refused::Unavailable("timed out".into())),
+        };
+        let mut answered = vec![false; outcomes.len()];
+        for (item, at) in items.into_iter().zip(positions) {
+            let mut outcome = outcomes[at];
+            if answered[at]
+                && matches!(
+                    outcome.result,
+                    entry::Resolution::Applied | entry::Resolution::Unchanged
+                )
+            {
+                outcome.result = entry::Resolution::Duplicate;
+            }
+            answered[at] = true;
+            let _ = item.reply.send(Ok(outcome));
+        }
+        Ok(())
+    }
+
+    /// Forwards `items` to `leader` and answers what it ordered once
+    /// applied here; gives back what to resend.
+    async fn forward(&self, leader: NodeId, addr: &str, items: Vec<Item>) -> Vec<Item> {
+        let latest = items
+            .iter()
+            .map(|item| item.deadline)
+            .max()
+            .expect("not empty");
+        let within = latest.saturating_duration_since(Instant::now());
+        let request = PeerRequest::Forward {
+            commands: items
+                .iter()
+                .map(|item| Forwarded {
+                    command: item.command.clone(),
+                    received: item.received,
+                })
+                .collect(),
+            within_ms: within.as_millis() as u64,
+        };
+        let results = match self.peers.call(Some(leader), addr, request, within).await {
+            Ok(Ok(PeerResponse::Forwarded(results))) if results.len() == items.len() => results,
+            _ => return items,
+        };
+        let mut again = Vec::new();
+        for (item, result) in items.into_iter().zip(results) {
+            match result {
+                Ok(outcome) => {
+                    let applied = self.applied(outcome.revision, item.deadline).await;
+                    let result = if applied {
+                        Ok(outcome)
+                    } else {
+                        Err(Refused::Unavailable("timed out".into()))
+                    };
+                    let _ = item.reply.send(result);
+                }
+                Err(Refused::NotLeader | Refused::Quiescing | Refused::Misaddressed) => {
+                    again.push(item)
+                }
+                Err(refused) => {
+                    let _ = item.reply.send(Err(refused));
+                }
+            }
+        }
+        again
+    }
+}
+
+fn answer_all(items: Vec<Item>, refused: Refused) -> Result<(), Vec<Item>> {
+    for item in items {
+        let _ = item.reply.send(Err(refused.clone()));
+    }
+    Ok(())
 }
 
 /// The only writer: takes the queue in order, so commands commit in the
 /// order they were submitted, and puts what queued while the previous
 /// entry was written into the next one (group commit). A copy of a
 /// command the batch holds already is folded into it and answered from
-/// its outcome, an applied one as a duplicate.
+/// its outcome, an applied one as a duplicate. On a follower the group is
+/// forwarded to the leader instead, one group at a time, so the order
+/// holds there too.
 ///
 /// A first cut: one entry is in flight at a time and the writer waits for
 /// it to commit and apply here before it proposes the next, so the
@@ -168,10 +650,9 @@ impl<P: Product> Replica<P> {
 /// fsync, and a command that arrives just after a write starts waits for
 /// up to two commits.
 async fn write(
-    raft: Raft<TypeConfig>,
+    shared: Arc<Shared>,
     mut queued: mpsc::UnboundedReceiver<Queued>,
     estimate: Estimate,
-    settings: Settings,
 ) {
     let mut next = None;
     loop {
@@ -182,80 +663,32 @@ async fn write(
                 None => return,
             },
         };
-        let request = |body| Request {
-            stamp: stamping_index(estimate(), settings.block),
-            body,
-        };
         match first {
-            Queued::Entry(body) => {
-                let _ =
-                    tokio::time::timeout(settings.write_timeout, raft.client_write(request(body)))
-                        .await;
+            Queued::Entry {
+                body,
+                deadline,
+                reply,
+                forwarded,
+            } => {
+                let result = shared
+                    .order_entry(body, deadline, forwarded, &estimate)
+                    .await;
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
             }
-            Queued::Command(command, deadline, reply) => {
-                let mut batch = Batch::default();
-                let mut replies = Vec::new();
-                let mut latest = Instant::now();
-                let mut push = |command: Command, deadline: Instant, reply: Reply| {
-                    // Its submit timed out while it queued: not ordered.
-                    if deadline <= Instant::now() {
-                        let _ = reply.send(Err(NotApplied::new(Reason::Unavailable, "timed out")));
-                        return;
-                    }
-                    latest = latest.max(deadline);
-                    let id = command.id.clone();
-                    replies.push((batch.push(command), id, reply));
-                };
-                push(command, deadline, reply);
-                while let Ok(item) = queued.try_recv() {
-                    match item {
-                        Queued::Command(command, deadline, reply) => push(command, deadline, reply),
+            Queued::Command(item) => {
+                let mut items = vec![item];
+                while let Ok(queued) = queued.try_recv() {
+                    match queued {
+                        Queued::Command(item) => items.push(item),
                         entry => {
                             next = Some(entry);
                             break;
                         }
                     }
                 }
-                if batch.is_empty() {
-                    continue;
-                }
-                // Each submit times out at its own deadline; the writer
-                // waits for the latest of them.
-                let written = tokio::time::timeout_at(
-                    latest,
-                    raft.client_write(request(Body::Commands(batch.into_commands()))),
-                )
-                .await;
-                match written {
-                    Ok(Ok(written)) => {
-                        let outcomes = written.data.0;
-                        let mut answered = vec![false; outcomes.len()];
-                        for (at, id, reply) in replies {
-                            let outcome = outcomes[at];
-                            let resolution = match outcome.result {
-                                entry::Resolution::Applied | entry::Resolution::Unchanged
-                                    if answered[at] =>
-                                {
-                                    entry::Resolution::Duplicate
-                                }
-                                result => result,
-                            };
-                            answered[at] = true;
-                            let _ = reply.send(Ok(Ack::new(
-                                id,
-                                outcome.revision,
-                                resolution_of(resolution),
-                            )));
-                        }
-                    }
-                    // Not the leader, or no longer: the entry was not
-                    // appended here, or a new leader truncated it.
-                    Ok(Err(e)) if e.forward_to_leader::<BasicNode>().is_some() => {
-                        reply_all(replies, Reason::NotCommitable, &e.to_string())
-                    }
-                    Ok(Err(e)) => reply_all(replies, Reason::Unavailable, &e.to_string()),
-                    Err(_) => reply_all(replies, Reason::Unavailable, "timed out"),
-                }
+                shared.order_commands(items, &estimate).await;
             }
         }
     }
@@ -270,40 +703,40 @@ fn resolution_of(resolution: entry::Resolution) -> Resolution {
     }
 }
 
-fn reply_all(replies: Vec<(usize, String, Reply)>, reason: Reason, detail: &str) {
-    for (_, _, reply) in replies {
-        let _ = reply.send(Err(NotApplied::new(reason, detail)));
-    }
-}
-
 impl<P: Product + Sync> ReplicatedState for Replica<P> {
     /// `ready` once the replica has joined a set, a committed id saved on
     /// its volume, and applied the log up to that id, which after a
     /// restart is the saved one; it stays set. An empty volume is not
     /// ready until it has joined, a saved vote alone included. The
     /// clock verification and the generations 2.11 adds to it are not
-    /// known here. `commitable` while this replica is the leader: no
-    /// write is forwarded, so a follower orders nothing and answers
+    /// known here. `commitable` once ready on a voter: it forwards what
+    /// it does not order itself; a learner answers
     /// [`Reason::NotCommitable`].
     fn replica(&self) -> ReplicaInfo {
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.shared.raft.metrics().borrow().clone();
         let applied = metrics.last_applied.map_or(0, |id| id.index);
         if !self.ready.load(Ordering::Relaxed) && self.store.caught_up() {
             self.ready.store(true, Ordering::Relaxed);
         }
+        let ready = self.ready.load(Ordering::Relaxed);
+        let voter = metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|id| id == self.id());
         ReplicaInfo {
-            id: self.settings.id.to_string(),
+            id: self.id().to_string(),
             role: format!("{:?}", metrics.state).to_lowercase(),
             leader: metrics.current_leader.map(|id| id.to_string()),
             in_sync: metrics.last_log_index.unwrap_or(0) <= applied,
             lag: None,
-            ready: self.ready.load(Ordering::Relaxed),
-            commitable: metrics.state == ServerState::Leader,
+            ready,
+            commitable: ready && voter,
         }
     }
 
     fn epoch(&self) -> u64 {
-        self.settings.epoch
+        self.shared.settings.epoch
     }
 
     /// The product revision ([`state_machine::StateMachine::revision`]), not the log
@@ -320,7 +753,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     /// yet.
     fn read_index(&self) -> BoxFuture<'_, ReadIndex> {
         Box::pin(async move {
-            let read = match self.raft.get_read_log_id().await {
+            let read = match self.shared.raft.get_read_log_id().await {
                 Ok((read, _)) => read,
                 Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))
                     if forward.leader_id.is_some() =>
@@ -331,6 +764,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             };
             if let Some(read) = read
                 && self
+                    .shared
                     .raft
                     .wait(None)
                     .applied_index_at_least(Some(read.index), "read index")
@@ -349,6 +783,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             // machine took it.
             let applied = |_: &_| self.revision() >= revision;
             if self
+                .shared
                 .raft
                 .wait(None)
                 .metrics(applied, "applied")
@@ -362,8 +797,9 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     }
 
     fn snapshot(&self) -> BoxFuture<'_, Snapshot> {
+        let epoch = self.epoch();
         let snapshot = self.store.with_state(|sm| Snapshot {
-            epoch: self.settings.epoch,
+            epoch,
             revision: sm.revision,
             text: sm.product.text().into(),
         });
@@ -371,7 +807,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     }
 
     fn deltas_since(&self, since: Position) -> BoxFuture<'_, Option<Vec<Delta>>> {
-        let epoch = self.settings.epoch;
+        let epoch = self.epoch();
         let deltas = self.store.with_state(|sm| {
             if since.epoch != epoch || since.revision < sm.deltas_after {
                 return if since.epoch == epoch && since.revision >= sm.revision {
@@ -403,30 +839,52 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             .map(|(revision, resolution)| (revision, resolution_of(resolution)))
     }
 
+    /// The command is stamped with this replica's E estimate at receipt,
+    /// which travels with it when it is forwarded.
     fn submit(
         &self,
         owner: &Owner,
         id: &str,
         command: axum::body::Bytes,
     ) -> BoxFuture<'_, Result<Ack, NotApplied>> {
+        let info = self.replica();
+        if !info.commitable {
+            let refused = NotApplied::new(Reason::NotCommitable, "not a voter yet");
+            return Box::pin(async move { Err(refused) });
+        }
         let (reply, replied) = oneshot::channel();
-        let deadline = Instant::now() + self.settings.write_timeout;
-        let queued = self.queue.send(Queued::Command(
-            Command {
+        let deadline = Instant::now() + self.shared.settings.write_timeout;
+        let item = Item {
+            command: Command {
                 origin: Origin::from(owner),
                 id: id.to_owned(),
                 at_index: None,
                 body: command.to_vec(),
             },
+            received: (self.estimate)(),
             deadline,
             reply,
-        ));
+            forwarded: false,
+        };
+        let queued = self.queue.send(Queued::Command(item));
+        let id = id.to_owned();
         Box::pin(async move {
             let stopped = || NotApplied::new(Reason::Unavailable, "replica stopped");
             queued.map_err(|_| stopped())?;
-            match tokio::time::timeout_at(deadline, replied).await {
-                Ok(replied) => replied.unwrap_or_else(|_| Err(stopped())),
-                Err(_) => Err(NotApplied::new(Reason::Unavailable, "timed out")),
+            let replied = match tokio::time::timeout_at(deadline, replied).await {
+                Ok(replied) => replied.unwrap_or_else(|_| Err(self::stopped())),
+                Err(_) => Err(Refused::Unavailable("timed out".into())),
+            };
+            match replied {
+                Ok(outcome) => Ok(Ack::new(
+                    id,
+                    outcome.revision,
+                    resolution_of(outcome.result),
+                )),
+                Err(Refused::Unavailable(detail)) => {
+                    Err(NotApplied::new(Reason::Unavailable, detail))
+                }
+                Err(refused) => Err(NotApplied::new(Reason::Unavailable, format!("{refused:?}"))),
             }
         })
     }

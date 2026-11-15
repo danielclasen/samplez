@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -29,6 +30,7 @@ use openraft::raft::{
 use openraft::{BasicNode, Raft, ServerState};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
+use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest};
 use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
 use samplez_service::{Owner, ReplicatedState, Role};
@@ -129,6 +131,7 @@ impl Clock {
 #[derive(Default)]
 struct Links {
     rafts: BTreeMap<NodeId, Raft<TypeConfig>>,
+    replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
     /// (from, to): RPCs from `from` to `to` do not arrive.
     cut: BTreeSet<(NodeId, NodeId)>,
     /// RPCs to a stalled replica wait this long before it handles them.
@@ -211,6 +214,39 @@ impl Net {
         }
         links.delivered += 1;
         Ok(raft)
+    }
+}
+
+/// The peer requests of one replica, over the same links as its RPCs; a
+/// harness address is the node id.
+pub struct Peers {
+    from: NodeId,
+    net: Net,
+}
+
+impl PeerClient for Peers {
+    fn call<'a>(
+        &'a self,
+        to: Option<NodeId>,
+        addr: &'a str,
+        request: PeerRequest,
+        within: Duration,
+    ) -> BoxFuture<'a, Result<PeerReply, String>> {
+        Box::pin(async move {
+            let target = addr.parse().expect("a harness address is a node id");
+            let call = async {
+                self.net
+                    .route::<io::Error>(self.from, target)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let replica = self.net.links().replicas.get(&target).cloned();
+                let replica = replica.ok_or_else(|| format!("{target} down"))?;
+                Ok(replica.handle(to, request).await)
+            };
+            tokio::time::timeout(within, call)
+                .await
+                .unwrap_or_else(|_| Err("timed out".into()))
+        })
     }
 }
 
@@ -333,7 +369,7 @@ impl Set {
             set.restart(id).await;
         }
         set.replica(0)
-            .initialize(0..set.options.voters)
+            .initialize((0..set.options.voters).map(|id| (id, id.to_string())))
             .await
             .expect("initializes");
         set.leader().await;
@@ -365,6 +401,7 @@ impl Set {
             limits: self.options.limits,
             block: BLOCK,
             write_timeout: Duration::from_secs(2),
+            addr: id.to_string(),
         };
         let replica = Replica::start(
             settings,
@@ -375,12 +412,20 @@ impl Set {
                 from: id,
                 net: self.net.clone(),
             },
+            Arc::new(Peers {
+                from: id,
+                net: self.net.clone(),
+            }),
             Arc::new(move || clock.samples()),
         )
         .await
         .expect("replica starts");
-        self.net.links().rafts.insert(id, replica.raft().clone());
-        self.replicas.insert(id, Arc::new(replica));
+        let replica = Arc::new(replica);
+        let mut links = self.net.links();
+        links.rafts.insert(id, replica.raft().clone());
+        links.replicas.insert(id, replica.clone());
+        drop(links);
+        self.replicas.insert(id, replica);
     }
 
     /// Stops `id` as a process crash would: its peers stop reaching it at
@@ -388,6 +433,7 @@ impl Set {
     /// graceful and in-process, so the volume keeps unsynced writes too.
     pub async fn crash(&mut self, id: NodeId) {
         self.net.links().rafts.remove(&id);
+        self.net.links().replicas.remove(&id);
         if let Some(replica) = self.replicas.remove(&id) {
             replica.shutdown().await;
         }

@@ -55,9 +55,11 @@ async fn a_restarted_replica_is_back_at_its_last_applied_revision_before_any_ele
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(replica.raft().metrics().borrow().current_leader, None);
     assert_eq!(replica.revision(), last);
-    let info = replica.replica();
-    assert!(info.ready, "readiness does not wait for a leader");
-    assert!(!info.commitable, "no leader, so it orders nothing");
+    assert!(
+        replica.replica().ready,
+        "readiness does not wait for a leader"
+    );
+    assert!(!replica.quorum().await, "no leader, so it orders nothing");
 }
 
 /// A replica whose volume was lost starts at revision 0 in the set's
@@ -93,23 +95,16 @@ async fn refused(replica: &impl ReplicatedState, id: &str) -> NotApplied {
         .expect_err("not applied")
 }
 
+/// Every voter takes writes, forwarding what it does not order itself.
 #[tokio::test(start_paused = true)]
-async fn only_the_leader_is_commitable_and_every_refusal_names_its_reason() {
+async fn every_voter_is_commitable_and_every_refusal_names_its_reason() {
     let mut set_ = Set::start(Options::default()).await;
     let leader = set_.leader().await;
     for id in set_.ids() {
         let info = set_.replica(id).replica();
         assert!(info.ready);
-        assert_eq!(info.commitable, id == leader, "replica {id}");
+        assert!(info.commitable, "replica {id}");
     }
-    // A follower forwards nothing, so it orders nothing.
-    let follower = (leader + 1) % 3;
-    let not_ordered = refused(&**set_.replica(follower), "f").await;
-    assert_eq!(not_ordered.reason, Reason::NotCommitable);
-    assert_eq!(
-        set_.replica(follower).command_resolution(&owner("s"), "f"),
-        None
-    );
 
     // A leader cut off from its quorum appends but cannot commit.
     set_.net.isolate(leader, set_.ids());
