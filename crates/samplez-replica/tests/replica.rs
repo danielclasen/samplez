@@ -2,14 +2,18 @@
 
 mod harness;
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use axum::body::Bytes;
 use harness::{Options, Set, owner};
+use openraft::ChangeMembers;
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{Body, SessionKey};
+use samplez_replica::membership::Voters;
 use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::{Position, ReadIndex, ReplicatedState};
+use tokio::time::Instant;
 
 async fn set(replica: &impl ReplicatedState, session: &str, id: &str, command: &str) -> u64 {
     ack(replica, session, id, command).await.revision
@@ -60,11 +64,19 @@ async fn a_restarted_replica_is_back_at_its_last_applied_revision_before_any_ele
         "readiness does not wait for a leader"
     );
     assert!(!replica.quorum().await, "no leader, so it orders nothing");
+    assert_eq!(
+        replica.status().as_deref(),
+        Some("not counted as a voter yet"),
+        "within 3 s of the start"
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let status = replica.status().expect("a status");
+    assert!(status.contains("for 3 s; asking to join"), "{status}");
 }
 
-/// A replica whose volume was lost starts at revision 0 in the set's
-/// epoch: it is not ready, so clients do not see the state go back,
-/// until it has joined and applied what was committed.
+/// A replica whose volume was lost comes back as a new node at revision
+/// 0: it is not ready, so clients do not see the state go back, until it
+/// has joined as a learner and applied what was committed.
 #[tokio::test(start_paused = true)]
 async fn an_empty_volume_is_ready_only_once_it_has_joined() {
     let mut set_ = Set::start(Options::default()).await;
@@ -74,10 +86,11 @@ async fn an_empty_volume_is_ready_only_once_it_has_joined() {
     let follower = (leader + 1) % 3;
     set_.crash(follower).await;
     set_.wipe(follower);
-    set_.net.isolate(follower, set_.ids());
-    set_.restart(follower).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let replica = set_.replica(follower).clone();
+    let new = 10;
+    set_.net.isolate(new, set_.ids());
+    set_.restart(new).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let replica = set_.replica(new).clone();
     assert_eq!(replica.revision(), 0);
     assert!(
         !replica.replica().ready,
@@ -86,6 +99,17 @@ async fn an_empty_volume_is_ready_only_once_it_has_joined() {
     set_.net.heal();
     set_.applied(revision).await;
     assert!(replica.replica().ready);
+    let membership = set_
+        .replica(leader)
+        .raft()
+        .metrics()
+        .borrow()
+        .membership_config
+        .clone();
+    assert!(
+        membership.membership().learner_ids().any(|id| id == new),
+        "taken in as a learner"
+    );
 }
 
 async fn refused(replica: &impl ReplicatedState, id: &str) -> NotApplied {
@@ -318,6 +342,7 @@ async fn a_command_past_its_deadline_while_queued_never_applies() {
     // proposed commits.
     set_.restart(followers[0]).await;
     let leader = set_.leader().await;
+    set_.commitable(leader).await;
     set(&**set_.replica(leader), "s", "c", "mute=1@1").await;
     set_.replica(leader).store().with_state(|sm| {
         assert!(sm.product.values.contains_key("gain"), "the stalled write");
@@ -626,4 +651,116 @@ async fn applied_waits_until_the_revision_is_applied() {
     tokio::time::timeout(Duration::from_secs(1), waiting)
         .await
         .expect("applied on the follower");
+}
+
+/// A leader elected between the two steps of a membership change, the
+/// joint configuration and the new one, finishes the change: openraft
+/// leaves the second step to the caller of the change, which was the old
+/// leader.
+#[tokio::test(start_paused = true)]
+async fn a_new_leader_finishes_an_inherited_joint_configuration() {
+    let options = Options {
+        wanted: Some(Voters::new(3, false).unwrap()),
+        ..Options::default()
+    };
+    let mut set_ = Set::start(options).await;
+    let old = set_.leader().await;
+    let rest: BTreeSet<u64> = set_.ids().filter(|&id| id != old).collect();
+    // The second step never leaves the old leader.
+    set_.net.hold_uniform_from(old);
+    let change = tokio::spawn({
+        let raft = set_.replica(old).raft().clone();
+        let rest = rest.clone();
+        async move {
+            raft.change_membership(ChangeMembers::ReplaceAllVoters(rest), false)
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rest.iter().all(|&id| {
+        let metrics = set_.replica(id).raft().metrics().borrow().clone();
+        metrics
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .len()
+            > 1
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "no joint configuration reached the followers"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    set_.crash(old).await;
+    change.abort();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let finished = rest.iter().all(|&id| {
+            let metrics = set_.replica(id).raft().metrics().borrow().clone();
+            let membership = metrics.membership_config.membership();
+            membership.get_joint_config().len() == 1
+                && membership.voter_ids().collect::<BTreeSet<_>>() == rest
+        });
+        if finished {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the set stayed in the joint configuration for 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A follower whose leader lost its majority, though not the follower,
+/// is cut off, as the leader is: a reader there gets the state applied
+/// here at once, marked stale, rather than waiting for its own position.
+#[tokio::test(start_paused = true)]
+async fn a_follower_of_a_leader_without_a_majority_is_cut_off() {
+    let set_ = Set::start(Options {
+        voters: 5,
+        ..Options::default()
+    })
+    .await;
+    let leader = set_.leader().await;
+    let follower = (leader + 1) % 5;
+    for id in set_.ids().filter(|&id| id != leader && id != follower) {
+        set_.net.cut(leader, id);
+        set_.net.cut(follower, id);
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        set_.replica(follower).quorum().await,
+        "the follower still hears its leader"
+    );
+    let asked = Instant::now();
+    assert_eq!(set_.replica(follower).read_index().await, ReadIndex::CutOff);
+    assert!(asked.elapsed() < Duration::from_millis(500), "at once");
+    assert_eq!(set_.replica(leader).read_index().await, ReadIndex::CutOff);
+}
+
+/// A follower cut off from the set is not commitable once its checks found
+/// no counting leader for 3 s of them, also when every check runs more
+/// than a tick late, as on a host that does not schedule the runtime on
+/// time: the lapse is bounded however late the checks run.
+#[tokio::test(start_paused = true)]
+async fn a_partitioned_follower_whose_checks_all_run_late() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let follower = set_.ids().find(|&id| id != leader).unwrap();
+    set_.net.isolate(follower, set_.ids());
+    // 40 jumps of 250 ms: 10 s in which no check runs within a tick of
+    // when it was due.
+    for _ in 0..40 {
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let replica = set_.replica(follower);
+    assert!(
+        !replica.replica().commitable,
+        "a cut-off follower stays commitable for 10 s while its checks run late: {:?} {:?}",
+        replica.raft().metrics().borrow().state,
+        replica.status()
+    );
 }

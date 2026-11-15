@@ -248,17 +248,30 @@ pub struct Response(pub Vec<Outcome>);
 pub mod bytes {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::de::{Error, Visitor};
+    use serde::{Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&STANDARD.encode(bytes))
     }
 
+    /// Decodes the text where the deserializer holds it, without a copy.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let text = <std::borrow::Cow<'de, str>>::deserialize(d)?;
-        STANDARD
-            .decode(text.as_bytes())
-            .map_err(serde::de::Error::custom)
+        struct Base64;
+
+        impl Visitor<'_> for Base64 {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("base64 text")
+            }
+
+            fn visit_str<E: Error>(self, text: &str) -> Result<Vec<u8>, E> {
+                STANDARD.decode(text).map_err(E::custom)
+            }
+        }
+
+        d.deserialize_str(Base64)
     }
 }
 

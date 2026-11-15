@@ -28,8 +28,10 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, Raft, ServerState};
+use samplez_replica::bootstrap::{Bootstrap, Marker, Markers, Volume};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
+use samplez_replica::membership::slot_of;
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest};
 use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
@@ -118,6 +120,7 @@ pub struct Clock {
     /// Told on the next read: a test's hook into the moment a replica
     /// stamps an entry, between its leadership check and the proposal.
     on_read: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    stall: Mutex<Option<(u32, Duration, tokio::sync::oneshot::Sender<()>)>>,
 }
 
 impl Clock {
@@ -125,8 +128,34 @@ impl Clock {
         if let Some(read) = self.on_read.lock().expect("clock lock poisoned").take() {
             let _ = read.send(());
         }
+        let stalled = {
+            let mut stall = self.stall.lock().expect("clock lock poisoned");
+            match stall.take() {
+                Some((0, by, read)) => Some((by, read)),
+                Some((skip, by, read)) => {
+                    *stall = Some((skip - 1, by, read));
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some((by, read)) = stalled {
+            let _ = read.send(());
+            std::thread::sleep(by);
+        }
         let elapsed = self.base.elapsed().as_nanos() as u64 * RATE / 1_000_000_000;
         elapsed.saturating_add_signed(self.offset.load(Ordering::Relaxed))
+    }
+
+    /// Blocks the thread of the read after the next `skip` ones for `by`,
+    /// as of a writer the operating system does not run between its
+    /// leadership check and its proposal; resolves as that read starts.
+    /// Only for a multi-threaded runtime: on the test's own thread it would
+    /// stop everything.
+    pub fn stall_read(&self, skip: u32, by: Duration) -> tokio::sync::oneshot::Receiver<()> {
+        let (read, stalled) = tokio::sync::oneshot::channel();
+        *self.stall.lock().expect("clock lock poisoned") = Some((skip, by, read));
+        stalled
     }
 
     /// Resolves at the next read.
@@ -153,6 +182,9 @@ struct Links {
     /// RPCs to a stalled replica wait this long before it handles them.
     stalled: BTreeMap<NodeId, Duration>,
     delivered: u64,
+    /// Appends from this node that carry the second step of a membership
+    /// change, a configuration out of joint, do not arrive.
+    hold_uniform_from: Option<NodeId>,
 }
 
 /// The links between the replicas of one set.
@@ -208,6 +240,12 @@ impl Net {
 
     pub fn unstall(&self, node: NodeId) {
         self.links().stalled.remove(&node);
+    }
+
+    /// Drops `from`'s appends that carry the second step of a membership
+    /// change, as a leader that goes down between the two steps leaves it.
+    pub fn hold_uniform_from(&self, from: NodeId) {
+        self.links().hold_uniform_from = Some(from);
     }
 
     /// RPCs delivered so far.
@@ -313,6 +351,16 @@ impl RaftNetwork<TypeConfig> for Link {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        let held = self.net.links().hold_uniform_from == Some(self.from)
+            && rpc.entries.iter().any(|e| {
+                matches!(&e.payload,
+                openraft::EntryPayload::Membership(m) if m.get_joint_config().len() == 1)
+            });
+        if held {
+            return Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
+                "held",
+            ))));
+        }
         let raft = self.net.route(self.from, self.to).await?;
         raft.append_entries(rpc)
             .await
@@ -353,6 +401,10 @@ pub struct Options {
     pub voters: u64,
     pub limits: Limits,
     pub raft: openraft::Config,
+    /// The voters the leader reconciles the membership with; `None` leaves
+    /// it as it is.
+    pub wanted: Option<samplez_replica::membership::Voters>,
+    pub write_timeout: Duration,
 }
 
 impl Default for Options {
@@ -361,6 +413,8 @@ impl Default for Options {
             voters: 3,
             limits: Limits::defaults(RATE),
             raft: raft_config("test"),
+            wanted: None,
+            write_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -370,6 +424,9 @@ pub struct Set {
     root: PathBuf,
     pub net: Net,
     clocks: BTreeMap<NodeId, Arc<Clock>>,
+    base: Instant,
+    markers: Arc<FakeMarkers>,
+    _panics: PanicGuard,
     replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
 }
 
@@ -389,6 +446,7 @@ impl Set {
                     base,
                     offset: AtomicI64::new(0),
                     on_read: Mutex::new(None),
+                    stall: Mutex::new(None),
                 };
                 (id, Arc::new(clock))
             })
@@ -398,6 +456,9 @@ impl Set {
             root,
             net: Net::default(),
             clocks,
+            base,
+            markers: Arc::new(FakeMarkers),
+            _panics: PanicGuard::new(),
             replicas: BTreeMap::new(),
         };
         for id in 0..set.options.voters {
@@ -408,6 +469,14 @@ impl Set {
             .await
             .expect("initializes");
         set.leader().await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !set.replicas.values().all(|r| r.replica().commitable) {
+            assert!(
+                Instant::now() < deadline,
+                "not every replica commitable in 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         set
     }
 
@@ -429,14 +498,28 @@ impl Set {
 
     /// Starts `id` from what its volume holds.
     pub async fn restart(&mut self, id: NodeId) {
-        let clock = self.clocks[&id].clone();
+        let base = self.base;
+        let clock = self
+            .clocks
+            .entry(id)
+            .or_insert_with(|| {
+                Arc::new(Clock {
+                    base,
+                    offset: AtomicI64::new(0),
+                    on_read: Mutex::new(None),
+                    stall: Mutex::new(None),
+                })
+            })
+            .clone();
         let settings = Settings {
             id,
-            epoch: 1,
+            epoch: CLUSTER,
             limits: self.options.limits,
             block: BLOCK,
-            write_timeout: Duration::from_secs(2),
+            write_timeout: self.options.write_timeout,
             addr: id.to_string(),
+            peers: self.ids().map(|id| id.to_string()).collect(),
+            voters: self.options.wanted,
         };
         let replica = Replica::start(
             settings,
@@ -456,6 +539,12 @@ impl Set {
         .await
         .expect("replica starts");
         let replica = Arc::new(replica);
+        let dir = self.root.join(id.to_string());
+        replica.begin(Bootstrap {
+            markers: self.markers.clone(),
+            volume: Volume::open(&dir).expect("volume opens"),
+            slot: slot_of(id),
+        });
         let mut links = self.net.links();
         links.rafts.insert(id, replica.raft().clone());
         links.replicas.insert(id, replica.clone());
@@ -496,6 +585,16 @@ impl Set {
         }
     }
 
+    /// Waits until `id` takes client writes again: within a check of a
+    /// leader counting it.
+    pub async fn commitable(&self, id: NodeId) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.replica(id).replica().commitable {
+            assert!(Instant::now() < deadline, "{id} not commitable within 5 s");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Removes what `id`'s volume holds; for a stopped replica.
     pub fn wipe(&self, id: NodeId) {
         std::fs::remove_dir_all(self.root.join(id.to_string())).expect("wipes");
@@ -522,5 +621,64 @@ impl Set {
 impl Drop for Set {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// The cluster id of every harness set, as its marker names it.
+pub const CLUSTER: u64 = 1;
+
+/// A marker naming a set that already runs: no harness replica is the
+/// volume it names, so an empty volume joins as a learner.
+pub struct FakeMarkers;
+
+impl Markers for FakeMarkers {
+    fn name(&self) -> &str {
+        "harness-replica-cluster"
+    }
+
+    fn get(&self) -> BoxFuture<'_, Result<Option<Marker>, String>> {
+        Box::pin(async {
+            Ok(Some(Marker {
+                cluster: CLUSTER,
+                volume: u64::MAX,
+            }))
+        })
+    }
+
+    fn create(&self, _: Marker) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async { Ok(false) })
+    }
+}
+
+thread_local! {
+    static PANICKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fails the test, when it is dropped, if a task on the test's thread
+/// panicked: the current-thread runtime of `#[tokio::test]` runs every
+/// spawned task there, openraft's core among them, and a panicking task
+/// does not fail the test by itself.
+pub struct PanicGuard(());
+
+impl PanicGuard {
+    pub fn new() -> PanicGuard {
+        static HOOK: std::sync::Once = std::sync::Once::new();
+        HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                PANICKED.with(|panicked| panicked.set(true));
+                previous(info);
+            }));
+        });
+        PANICKED.with(|panicked| panicked.set(false));
+        PanicGuard(())
+    }
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if !std::thread::panicking() && PANICKED.with(|panicked| panicked.get()) {
+            panic!("a task panicked during the test");
+        }
     }
 }

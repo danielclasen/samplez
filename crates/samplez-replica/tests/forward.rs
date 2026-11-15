@@ -133,12 +133,23 @@ async fn quorum_loss_refuses_writes_and_serves_stale_reads_until_it_returns() {
             .submit(&owner("s"), &format!("q{id}"), Bytes::from("pan=1@1"))
             .await
             .expect_err("no quorum");
-        assert_eq!(refused.reason, Reason::Unavailable, "replica {id}");
+        // 503 either way: unavailable while a leader counted the replica
+        // within the last rounds, not commitable once none has for longer.
+        assert!(
+            matches!(refused.reason, Reason::Unavailable | Reason::NotCommitable),
+            "replica {id}: {refused}"
+        );
         assert!(asked.elapsed() <= Duration::from_secs(2));
     }
 
     set_.net.heal();
     set_.leader().await;
+    // Commitable again once a leader counts it, within a check.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !set_.replica(follower).replica().commitable {
+        assert!(Instant::now() < deadline, "not commitable again");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let after = set_
         .replica(follower)
         .submit(&owner("s"), "2", Bytes::from("gain=2@2"))
@@ -487,6 +498,52 @@ async fn quiesce_waits_for_a_proposal_that_raced_its_flag() {
     for id in others(&set_, leader) {
         let matched = metrics.replication.as_ref().unwrap()[&id];
         assert!(matched.is_some_and(|m| m.index >= ack.revision), "{id}");
+    }
+}
+
+/// A proposal whose writer the operating system did not run for longer
+/// than quiesce takes to see two quiet checks, between its leadership
+/// check and its proposal, holds quiesce back until it is committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quiesce_waits_for_a_proposal_whose_writer_was_not_running() {
+    let mut options = Options {
+        // Real time on a host that may be loaded.
+        write_timeout: Duration::from_secs(10),
+        ..Options::default()
+    };
+    // No election while a worker thread is blocked.
+    options.raft.election_timeout_min = 4000;
+    options.raft.election_timeout_max = 5000;
+    let set_ = Set::start(options).await;
+    let leader = set_.leader().await;
+    let replica = set_.replica(leader).clone();
+    // The first read stamps the command at receipt, the second the entry.
+    let stamped = set_.clock(leader).stall_read(1, Duration::from_millis(500));
+    let submitted = tokio::spawn({
+        let replica = replica.clone();
+        async move {
+            let ack = replica
+                .submit(&owner("s"), "1", Bytes::from("gain=1@1"))
+                .await
+                .expect("committed");
+            (ack, Instant::now())
+        }
+    });
+    stamped.await.expect("stamped");
+    replica.quiesce(Duration::from_secs(5)).await;
+    let quiesced_at = Instant::now();
+    let (ack, committed_at) = submitted.await.expect("joins");
+    assert!(
+        committed_at <= quiesced_at,
+        "quiesce returned {:?} before the entry committed",
+        committed_at - quiesced_at
+    );
+    let metrics = replica.raft().metrics().borrow().clone();
+    let last = metrics.last_log_index.unwrap_or(0);
+    assert!(ack.revision > 0);
+    for id in others(&set_, leader) {
+        let matched = metrics.replication.as_ref().unwrap()[&id];
+        assert!(matched.is_some_and(|m| m.index >= last), "{id}");
     }
 }
 
