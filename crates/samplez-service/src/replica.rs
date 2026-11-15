@@ -20,6 +20,8 @@ use crate::ws::{Delta, Snapshot};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicaInfo {
+    /// A DNS label, as a pod name is: [`crate::Service::new`] refuses
+    /// others ([`crate::ws::Sessions::new`]).
     pub id: String,
     /// As the replication mechanism names it.
     pub role: String,
@@ -164,9 +166,13 @@ pub trait ReplicatedState: Send + Sync + 'static {
     fn deltas_since(&self, since: Position) -> BoxFuture<'_, Option<Vec<Delta>>>;
 
     /// The revision at which the command with this client-generated id was
-    /// applied for `owner.principal` and `owner.session`, from the
-    /// replicated per-session tables of applied command ids that snapshots
-    /// carry; `None` when this replica has not applied it.
+    /// committed for `owner.principal` and `owner.session`, and the
+    /// [`Resolution`] a copy of it gets, from the replicated per-session
+    /// tables of committed command ids that snapshots carry; `None` when
+    /// this replica has not applied it. A copy of an applied command is a
+    /// [`Resolution::Duplicate`]; one of a stale command resolves as its
+    /// first copy did, so a client resending a command it
+    /// got no answer for learns what happened to it.
     ///
     /// A session's table is kept as long as a client may resend a command
     /// of it that it got no [`Ack`] for, which is longer than the session's
@@ -175,7 +181,7 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// expiry the resend is applied twice. The service sets no bound on
     /// that time; the implementation sets the retention after which a
     /// session's table is dropped, and a resend after it is applied again.
-    fn command_revision(&self, owner: &Owner, id: &str) -> Option<u64>;
+    fn command_resolution(&self, owner: &Owner, id: &str) -> Option<(u64, Resolution)>;
 
     /// Orders `command`, the product's encoding of it, under the
     /// client-generated `id` for `owner`, and resolves once this replica has
@@ -185,11 +191,13 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// The state machine dedups by `owner.principal`, `owner.session` and
     /// `id` when it applies an entry: an entry whose id the table of the
     /// principal's session holds changes nothing and resolves with the
-    /// revision the table holds. An id is unique within its session only,
+    /// revision and resolution the table holds
+    /// ([`ReplicatedState::command_resolution`]). An id is unique within its session only,
     /// so the same id from two sessions, or from two principals presenting
     /// the same session, is two commands. A command resent through another
     /// replica while the first copy is still being committed is so applied
-    /// once, and both submits resolve to the same [`Ack`]. A check before
+    /// once, and both submits resolve to the same revision, the copy
+    /// applied second with [`Resolution::Duplicate`]. A check before
     /// ordering, such as [`Commands::begin`], cannot give that: both copies
     /// pass it before either is applied.
     ///
@@ -209,11 +217,10 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// the leader that resends what it did not get acknowledged in the
     /// same order.
     ///
-    /// A command folded into a later one before it is ordered, such as a
-    /// continuous control coalesced to its latest value, still has its id
-    /// recorded in its session's table, with the revision of the entry
-    /// that carries the later one; otherwise a resend of it is applied
-    /// after the commands that superseded it.
+    /// Commands that share an entry are applied one by one, each with its
+    /// own body: dropping one for a later command on the same value would
+    /// let an older command, such as a resend after [`NotApplied`], undo a
+    /// newer one that the product's own ordering keeps.
     ///
     /// Must resolve in bounded time, with [`NotApplied`] when the command
     /// cannot be ordered, [`Reason::NotCommitable`] while
@@ -240,15 +247,36 @@ pub trait ReplicatedState: Send + Sync + 'static {
 
 /// The answer to a command, echoing its id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct Ack {
     pub command: String,
-    /// The revision whose delta carries the command's change.
+    /// The revision the command resolved at; its delta carries the
+    /// command's change when there is one.
     pub revision: u64,
+    pub resolution: Resolution,
 }
 
-/// [`ReplicatedState::submit`] did not apply the command. Every reason is
-/// answered as not applied, [`NotApplied::STATUS`] in HTTP terms: the
-/// command changed nothing the client can see.
+/// How a committed command resolved. A product answers each in its own
+/// protocol: a client told only that its command committed cannot tell
+/// a refused one from an applied one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Resolution {
+    /// The product applied it.
+    Applied,
+    /// A copy of a command applied already, through any replica: nothing
+    /// changed, and the revision is the one its session's table holds.
+    Duplicate,
+    /// The product refused it as older than what it applied already;
+    /// nothing changed, and a copy of it resolves so as well.
+    Stale,
+}
+
+/// [`ReplicatedState::submit`] has not applied the command when it
+/// resolves; with [`Reason::Unavailable`] it may still commit later, and a
+/// resend with the same id applies once. Every reason is answered as not
+/// applied, [`NotApplied::STATUS`] in HTTP terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotApplied {
     pub reason: Reason,
@@ -283,6 +311,16 @@ impl Reason {
     }
 }
 
+impl Ack {
+    pub fn new(command: impl Into<String>, revision: u64, resolution: Resolution) -> Ack {
+        Ack {
+            command: command.into(),
+            revision,
+            resolution,
+        }
+    }
+}
+
 impl NotApplied {
     /// 503 for every reason.
     pub const STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
@@ -311,11 +349,12 @@ pub enum Begin<'a> {
     /// Not applied as far as this replica has applied: submit it with
     /// [`Pending::submit`]. A resend while an earlier copy is still being
     /// submitted, through this replica or another, is new as well; the
-    /// state machine applies it once and both copies get the same [`Ack`]
+    /// state machine applies it once and both copies get the same revision
     /// ([`ReplicatedState::submit`]).
     New(Pending<'a>),
-    /// Applied already, through any replica; acknowledge it again without
-    /// submitting it.
+    /// Committed already, through any replica; answer it again without
+    /// submitting it, with the resolution a copy gets
+    /// ([`ReplicatedState::command_resolution`]).
     Duplicate(Ack),
     /// As many commands as the limit are being submitted from this replica.
     Busy,
@@ -345,10 +384,11 @@ impl Commands {
     }
 
     pub fn begin(&self, owner: &Owner, id: &str) -> Begin<'_> {
-        if let Some(revision) = self.state.command_revision(owner, id) {
+        if let Some((revision, resolution)) = self.state.command_resolution(owner, id) {
             return Begin::Duplicate(Ack {
                 command: id.to_owned(),
                 revision,
+                resolution,
             });
         }
         let mut in_flight = self.lock();

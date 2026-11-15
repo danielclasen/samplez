@@ -84,7 +84,8 @@ pub const MAX_PAUSE_TOTAL: Duration = Duration::from_secs(6);
 
 /// The longest replica id [`Sessions::new`] takes, a DNS label's length:
 /// with the nonce and the counter the connection id stays within
-/// [`MAX_CONNECTION_ID`].
+/// [`MAX_CONNECTION_ID`]. It takes a DNS label's characters as well, so
+/// the id never holds the `:` that separates it from the nonce.
 pub const MAX_REPLICA_ID: usize = 63;
 /// The longest connection id ([`crate::Owner::connection`]): a
 /// [`MAX_REPLICA_ID`] replica id, 32 hexadecimal digits and a decimal
@@ -101,7 +102,11 @@ pub enum Reply<Fut> {
     /// Sent at once, ahead of replies still waiting and before the first
     /// catch-up, and counted against nothing; `None` sends nothing. For
     /// messages that carry no state, such as heartbeats, whose answer must
-    /// not wait on a commit or a snapshot.
+    /// not wait on a commit or a snapshot; never for the answer to a
+    /// command, such as its refusal, which would overtake the answers to
+    /// the commands before it. While [`MAX_PENDING_REPLIES`]
+    /// [`Reply::Command`] replies wait the connection is not read, so a
+    /// message answered with `Now` waits as well.
     Now(Option<Message>),
 }
 
@@ -335,14 +340,26 @@ impl Sessions {
     ///
     /// # Errors
     ///
-    /// [`Error::Config`] when `replica` is empty or longer than
-    /// [`MAX_REPLICA_ID`], or when the operating system's random source
-    /// fails.
+    /// [`Error::Config`] when `replica` is empty, longer than
+    /// [`MAX_REPLICA_ID`], holds anything but lowercase ASCII letters,
+    /// digits and `-` or starts or ends with `-`, or when the operating
+    /// system's random source fails.
     pub fn new(replica: &str) -> Result<Sessions, Error> {
         if replica.is_empty() || replica.len() > MAX_REPLICA_ID {
             return Err(Error::Config(format!(
                 "the replica id has to be 1 to {MAX_REPLICA_ID} bytes long, not {}",
                 replica.len()
+            )));
+        }
+        if !replica
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || replica.starts_with('-')
+            || replica.ends_with('-')
+        {
+            return Err(Error::Config(format!(
+                "the replica id {replica:?} has to be lowercase letters, digits and '-', \
+                 starting and ending with a letter or digit"
             )));
         }
         let mut nonce = [0u8; 16];
@@ -817,6 +834,20 @@ mod tests {
 
         for replica in [format!("{longest}r"), String::new()] {
             assert!(matches!(Sessions::new(&replica), Err(Error::Config(_))));
+        }
+    }
+
+    /// A connection id splits at its first `:`, so a replica id holding
+    /// one would name another replica; ids are DNS labels, as pod names.
+    #[test]
+    fn replica_ids_are_dns_labels() {
+        assert!(Sessions::new("samplez-0").is_ok());
+        assert!(Sessions::new("0").is_ok());
+        for replica in ["a:b", "R1", "r.1", "r_1", "r 1", "r\u{e9}", "-", "-a", "a-"] {
+            assert!(
+                matches!(Sessions::new(replica), Err(Error::Config(_))),
+                "{replica:?}"
+            );
         }
     }
 

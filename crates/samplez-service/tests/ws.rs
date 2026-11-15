@@ -11,7 +11,7 @@ use axum::extract::ws::Message;
 use common::*;
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, Sink, Stream, StreamExt};
-use samplez_service::replica::{Ack, Begin, Commands, NotApplied, Reason};
+use samplez_service::replica::{Ack, Begin, Commands, NotApplied, Reason, Resolution};
 use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
     ClientQueue, Delta, Ended, Frame, Hub, MAX_PAUSE, MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES,
@@ -138,8 +138,9 @@ struct Client {
 
 impl Client {
     /// Runs `serve_client` over channels; the product callback echoes text,
-    /// answers text starting with `slow` after 1.5 s and grants a meter credit for the binary
-    /// message `credit`.
+    /// answers text starting with `slow` after 1.5 s, `beat` at once,
+    /// `quiet` with nothing at once and grants a meter credit for the
+    /// binary message `credit`.
     fn start(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
         let queue = hub.subscribe();
         let state = state.clone();
@@ -157,6 +158,7 @@ impl Client {
                     Message::Text(t) if t.as_str() == "beat" => {
                         return Reply::Now(Some(Message::Text("beat back".into())));
                     }
+                    Message::Text(t) if t.as_str() == "quiet" => return Reply::Now(None),
                     Message::Text(t) if t.as_str() == "hang" => {
                         return Reply::Command(Box::pin(std::future::pending()) as BoxFuture<_>);
                     }
@@ -441,6 +443,30 @@ async fn replies_at_the_limit_slower_than_the_pong_timeout_keep_the_connection()
     assert_eq!(client.next().await, "echo hello", "read again");
     apply(&state, &hub);
     assert_eq!(client.next().await, "delta@1", "still served");
+}
+
+/// `Reply::Now(None)` sends nothing and takes no place among the replies
+/// waiting: one place short of the limit, the connection is still read.
+#[tokio::test(start_paused = true)]
+async fn a_message_answered_now_with_nothing_sends_nothing_and_counts_nothing() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let start = Instant::now();
+    for n in 1..MAX_PENDING_REPLIES {
+        let slow = format!("slow {n}");
+        client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
+    }
+    client.tx.send(Ok(Message::Text("quiet".into()))).unwrap();
+    client.tx.send(Ok(Message::Text("beat".into()))).unwrap();
+    assert_eq!(client.next().await, "beat back");
+    assert_eq!(start.elapsed(), Duration::ZERO, "read below the limit");
+    for n in 1..MAX_PENDING_REPLIES {
+        assert_eq!(client.next().await, format!("slow {n} done"));
+    }
+    client.tx.send(Ok(Message::Text("hello".into()))).unwrap();
+    assert_eq!(client.next().await, "echo hello", "nothing for quiet");
 }
 
 /// A client resending its unacknowledged commands at once after
@@ -1106,6 +1132,20 @@ fn an_owner_shows_a_one_way_handle_of_its_session() {
     }
 }
 
+/// A resend of a command the product refused as stale is answered stale
+/// again from the table, not as a duplicate of an applied one.
+#[test]
+fn a_resend_of_a_stale_command_is_answered_stale() {
+    let state = FakeState::new("r1", "leader");
+    let commands = Commands::new(state.clone(), 2);
+    let s1 = owner("s1");
+    state.refused_stale(&s1, "c7", 4);
+    match commands.begin(&s1, "c7") {
+        Begin::Duplicate(ack) => assert_eq!(ack, Ack::new("c7", 4, Resolution::Stale)),
+        _ => panic!("c7 is committed"),
+    }
+}
+
 /// faderz's command ids are UUIDs in their text form.
 #[tokio::test]
 async fn uuid_command_ids_apply_once_as_faderz_sends_them() {
@@ -1121,7 +1161,7 @@ async fn uuid_command_ids_apply_once_as_faderz_sends_them() {
     let ack = submitted.await.unwrap();
     assert_eq!(ack.command, id);
     match commands.begin(&s1, id) {
-        Begin::Duplicate(again) => assert_eq!(again, ack),
+        Begin::Duplicate(again) => assert_eq!(again.revision, ack.revision),
         _ => panic!("applied"),
     }
     assert!(matches!(
@@ -1165,17 +1205,16 @@ async fn commands_apply_once_per_id_from_the_replicated_table() {
     assert!(resent.as_mut().now_or_never().is_none(), "committing");
     state.commit();
     let ack = submitted.await.unwrap();
+    assert_eq!(ack, Ack::new("c1", 1, Resolution::Applied));
+    let duplicate = Ack::new(ack.command.clone(), ack.revision, Resolution::Duplicate);
     assert_eq!(
-        ack,
-        Ack {
-            command: "c1".into(),
-            revision: 1
-        }
+        resent.await.unwrap(),
+        duplicate,
+        "the resend gets the revision too"
     );
-    assert_eq!(resent.await.unwrap(), ack, "the resend gets the answer too");
     assert_eq!(state.revision(), 1, "applied once");
     match commands.begin(&s1, "c1") {
-        Begin::Duplicate(again) => assert_eq!(again, ack),
+        Begin::Duplicate(again) => assert_eq!(again, duplicate, "a duplicate, not applied again"),
         _ => panic!("c1 is applied"),
     }
 
@@ -1218,14 +1257,9 @@ async fn a_command_resent_through_another_replica_while_pending_applies_once() {
     assert!(second.as_mut().now_or_never().is_none(), "committing");
     state.commit();
     let (first, second) = (first.await.unwrap(), second.await.unwrap());
-    assert_eq!(
-        first,
-        Ack {
-            command: "cmd-1".into(),
-            revision: 1
-        }
-    );
-    assert_eq!(second, first, "the same result");
+    assert_eq!(first, Ack::new("cmd-1", 1, Resolution::Applied));
+    assert_eq!(second.revision, first.revision, "the same revision");
+    assert_eq!(second.resolution, Resolution::Duplicate, "applied once");
     assert_eq!(state.revision(), 1, "applied once");
 }
 
