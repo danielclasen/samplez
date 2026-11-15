@@ -86,8 +86,12 @@ pub struct Counters {
     pub blocks_withheld: AtomicU64,
     /// Blocks withheld because the hold ring was full.
     pub hold_overflows: AtomicU64,
-    /// Status changes not sent because the change ring was full.
+    /// Status changes the RT thread could not send: its change ring to
+    /// the supervisor was full.
     pub status_changes_dropped: AtomicU64,
+    /// Status changes the supervisor could not pass on: the replicated
+    /// state's channel was full.
+    pub status_changes_unsent: AtomicU64,
 }
 
 /// Makes the RT loop panic once, for the panic containment test.
@@ -284,6 +288,10 @@ pub(crate) struct Replica {
     pub unresolved: Vec<(LogId, u64)>,
     /// The log ids of one block's digest.
     pub ids: Vec<LogId>,
+    /// Re-routes swapped in after their index, with the end of the
+    /// crossfade an on-time engine runs: their blocks differ from its
+    /// until then. Capacity [`PENDING_CHANGES`].
+    pub late_routes: Vec<(LogId, u64)>,
 }
 
 /// The index of a log entry in the log that orders it.
@@ -833,22 +841,31 @@ fn ctx(shared: &Shared) -> Ctx {
 }
 
 /// The degradation digest of the block starting at `start`, from the
-/// inputs whose wanted read failed, the entries applied without their
-/// generation and the unresolved entries at or below `start`; none under
-/// a clock self-report.
-fn digest(r: &mut Replica, awaiting: &[RtEntry], start: u64, failed: u64) -> Option<u64> {
+/// inputs whose wanted read failed, by crossfade leg, the entries applied
+/// without their generation, the re-routes swapped in late until the end
+/// of the crossfade they skipped, and the unresolved entries at or below
+/// `start`; none under a clock self-report.
+fn digest(
+    r: &mut Replica,
+    awaiting: &[RtEntry],
+    start: u64,
+    incoming: u64,
+    outgoing: u64,
+) -> Option<u64> {
+    r.late_routes.retain(|&(_, until)| start < until);
     if r.shared.self_report.load(Relaxed) {
         return None;
     }
     r.ids.clear();
     r.ids.extend(awaiting.iter().map(|e| e.id));
+    r.ids.extend(r.late_routes.iter().map(|l| l.0));
     r.ids
         .extend(r.unresolved.iter().filter(|u| u.1 <= start).map(|u| u.0));
-    if r.ids.is_empty() && failed == 0 {
+    if r.ids.is_empty() && incoming == 0 && outgoing == 0 {
         return Some(crate::blocks::HEALTHY);
     }
     r.ids.sort_unstable();
-    Some(crate::blocks::degraded_digest(&r.ids, failed))
+    Some(crate::blocks::degraded_digest(&r.ids, incoming, outgoing))
 }
 
 /// The replica is withdrawn on every output.
@@ -1244,6 +1261,16 @@ impl Rt {
             // Anchored at the index whatever the slot's last block was:
             // an outgoing flow that is silent fades the new one in.
             slot.xfade = on_time.then_some(e.at_index);
+            // Late, it skips that crossfade: its blocks differ from an
+            // on-time engine's until the crossfade's end.
+            if !on_time
+                && matches!(e.change, Change::Route { .. })
+                && let Some(r) = self.replica.as_mut()
+                && r.late_routes.len() < PENDING_CHANGES
+            {
+                r.late_routes
+                    .push((e.id, e.at_index.saturating_add(u64::from(self.ramp))));
+            }
         }
         self.send(Telemetry::GenerationDone {
             id: e.id,
@@ -1337,9 +1364,11 @@ impl Rt {
         let mut silenced = 0u64;
         let mut fading = 0u64;
         // Inputs whose wanted read failed: an up slot not copied (late,
-        // invalid, pruned, or held for its generation), and the outgoing
-        // flow of a crossfade not copied. Self-known degradations.
+        // invalid, pruned, or held for its generation), and apart from it
+        // the outgoing flow of a crossfade not copied. Self-known
+        // degradations.
         let mut failed = 0u64;
+        let mut failed_out = 0u64;
         for (i, slot) in self.slots.iter_mut().enumerate() {
             let dst = &mut self.scratch[..slot.channels * b];
             let generation = self.gens[slot.domain].as_deref();
@@ -1427,7 +1456,7 @@ impl Rt {
                         input.read(&mut slot.prev, k, group, old) == Outcome::Copy
                     });
                 if !old_copied {
-                    failed |= 1 << i;
+                    failed_out |= 1 << i;
                 }
                 for (ch, o) in dst.chunks_exact_mut(b).zip(old.chunks_exact_mut(b)) {
                     let (mut up, mut down) = (up, down);
@@ -1481,13 +1510,13 @@ impl Rt {
         let digest = self
             .replica
             .as_mut()
-            .and_then(|r| digest(r, &self.awaiting_gen, start, failed));
+            .and_then(|r| digest(r, &self.awaiting_gen, start, failed, failed_out));
         // The held blocks move first: one found withheld, or block k
         // withheld before it was computed, withdraws the replica before
         // block k takes its status.
         let mut written = self.advance_holds(k);
-        let mut withdraw = false;
-        for (o, out) in self.outs.iter_mut().enumerate() {
+        for o in 0..self.outs.len() {
+            let out = &mut self.outs[o];
             let Some(writer) = out.writer.as_deref_mut() else {
                 continue;
             };
@@ -1520,7 +1549,7 @@ impl Rt {
             };
             let hold = &mut out.hold;
             let (w0, o0) = (hold.withheld, hold.overflows);
-            withdraw |= hold
+            let withdraw = hold
                 .compute(k, src, digest, ctx, statuses, &mut changes, &mut sink)
                 .withdraw;
             add(&self.counters.blocks_withheld, hold.withheld - w0);
@@ -1528,9 +1557,10 @@ impl Rt {
             if sink.wrote {
                 written |= 1 << o;
             }
-        }
-        if withdraw && let Some(r) = self.replica.as_mut() {
-            withdraw_all(&mut self.outs, r, &self.counters);
+            // Before the next output decides block k.
+            if withdraw {
+                withdraw_all(&mut self.outs, r, &self.counters);
+            }
         }
         self.counters.processed.store(k + 1, Release);
 
@@ -1939,34 +1969,47 @@ mod tests {
             control,
             unresolved: Vec::with_capacity(UNRESOLVED),
             ids: Vec::with_capacity(UNRESOLVED + PENDING_CHANGES),
+            late_routes: Vec::with_capacity(PENDING_CHANGES),
         }
     }
 
-    /// The digest covers the inputs whose read failed, the entries
-    /// applied without their generation and the unresolved entries at or
-    /// below the block's start, sorted; a healthy block has the empty
-    /// digest, a clock self-report none.
+    /// The digest covers the inputs whose read failed, by crossfade leg,
+    /// the entries applied without their generation, a late re-route until
+    /// its crossfade's end and the unresolved entries at or below the
+    /// block's start, sorted; a healthy block has the empty digest, a
+    /// clock self-report none.
     #[test]
     fn the_digest_names_every_self_known_degradation() {
         use crate::blocks::{HEALTHY, degraded_digest};
         let mut r = replica();
-        assert_eq!(digest(&mut r, &[], 10 * B, 0), Some(HEALTHY));
+        assert_eq!(digest(&mut r, &[], 10 * B, 0, 0), Some(HEALTHY));
         assert_eq!(
-            digest(&mut r, &[], 10 * B, 0b101),
-            Some(degraded_digest(&[], 0b101))
+            digest(&mut r, &[], 10 * B, 0b101, 0),
+            Some(degraded_digest(&[], 0b101, 0))
         );
+        assert_eq!(
+            digest(&mut r, &[], 10 * B, 0, 0b1),
+            Some(degraded_digest(&[], 0, 0b1))
+        );
+        r.late_routes.push((5, 12 * B));
+        assert_eq!(
+            digest(&mut r, &[], 11 * B, 0, 0),
+            Some(degraded_digest(&[5], 0, 0))
+        );
+        assert_eq!(digest(&mut r, &[], 12 * B, 0, 0), Some(HEALTHY));
+        assert!(r.late_routes.is_empty());
         r.unresolved = vec![(3, 10 * B), (9, 11 * B)];
         let awaiting = [entry(Change::InputUp { slot: 0 }, 5 * B)];
         let want = {
             let mut ids = vec![3, awaiting[0].id];
             ids.sort_unstable();
-            degraded_digest(&ids, 0)
+            degraded_digest(&ids, 0, 0)
         };
         // Entry 9 is not due in the block at 10B.
-        assert_eq!(digest(&mut r, &awaiting, 10 * B, 0), Some(want));
-        assert_ne!(digest(&mut r, &awaiting, 11 * B, 0), Some(want));
+        assert_eq!(digest(&mut r, &awaiting, 10 * B, 0, 0), Some(want));
+        assert_ne!(digest(&mut r, &awaiting, 11 * B, 0, 0), Some(want));
         r.shared.self_report.store(true, Relaxed);
-        assert_eq!(digest(&mut r, &awaiting, 10 * B, 0), None);
+        assert_eq!(digest(&mut r, &awaiting, 10 * B, 0, 0), None);
     }
 
     /// Input entries leave the pending list at the block of their index,

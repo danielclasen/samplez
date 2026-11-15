@@ -276,14 +276,18 @@ pub struct Replication {
     /// Voters of the set, the witness included. With one the engine
     /// commits each block at once and holds nothing; with more, every
     /// output starts committing nothing, holds blocks it cannot commit
-    /// at once in a ring of `D + w + 2B` samples, and creates its member
-    /// flow with that ring as the commit batch.
+    /// at once in a ring of `D + w + 2B` samples, commits them later in
+    /// one write of at most that ring, and refuses a member flow whose
+    /// ring is not twice that. A held block resolves on evidence
+    /// (`commit_through`), when the replicated state withholds it, or by
+    /// the ring's overflow: nothing in the engine sweeps it.
     pub voters: usize,
     /// Where [`Report`]s go, for the log to stamp; one the channel has no
     /// room for is counted in `reports_dropped`.
     pub reports: SyncSender<Report>,
     /// Where the block-status changes go, in the order the RT thread made
     /// them; one the channel has no room for is counted in
+    /// `status_changes_unsent`, one the RT thread's ring had no room for in
     /// `status_changes_dropped`.
     pub statuses: Option<SyncSender<StatusChange>>,
 }
@@ -613,6 +617,7 @@ impl Engine {
                 control: control_rx,
                 unresolved: Vec::with_capacity(UNRESOLVED),
                 ids: Vec::with_capacity(UNRESOLVED + PENDING_CHANGES),
+                late_routes: Vec::with_capacity(PENDING_CHANGES),
             };
             let control = ReplicaControl {
                 ring: control_tx,
@@ -1367,7 +1372,8 @@ struct Supervisor {
     /// The RT thread's status changes and where they go.
     change_rx: Option<rtrb::Consumer<StatusChange>>,
     status_tx: Option<SyncSender<StatusChange>>,
-    /// Both batch hints of a member flow: B, or the hold ring.
+    /// The longest range a member flow's writer commits at once: B, or
+    /// the hold ring.
     batch: u64,
     loudness: Vec<OutputLoudness>,
     verdicts: Option<SyncSender<BlockVerdict>>,
@@ -1494,7 +1500,7 @@ impl Supervisor {
             if let Some(tx) = &self.status_tx
                 && let Err(TrySendError::Full(_)) = tx.try_send(c)
             {
-                self.counters.status_changes_dropped.fetch_add(1, Relaxed);
+                self.counters.status_changes_unsent.fetch_add(1, Relaxed);
             }
         }
     }
@@ -2497,70 +2503,88 @@ mod tests {
     fn a_block_after_a_withheld_one_does_not_commit_at_once() {
         use crate::blocks::{Cause, Kind, PAGE};
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
-        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
-            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
-        let domain = std::env::temp_dir().join(format!("samplez-order-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&domain);
-        std::fs::create_dir(&domain).unwrap();
-        let id = "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d31";
-        // A catch-up long enough that the stall below skips nothing.
-        let v = serde_json::json!({
-            "libmxl": libmxl,
-            "maxCatchupBlocks": 200,
-            "holdMs": 100,
-            "domains": [{ "name": "d", "path": domain }],
-            "outputs": [{ "name": "out", "domain": "d", "flowId": id, "label": "order",
-                          "group": "order", "role": "Audio", "channels": 1 }],
-            "matrix": [],
-            "rt": { "enabled": false, "rtCpu": "none" },
-        });
-        let config = Config::parse(&v.to_string()).unwrap();
-        let process = rt::setup_process(&config.rt);
-        let (report_tx, _reports) = mpsc::sync_channel(1);
-        let replication = Replication {
-            voters: 2,
-            reports: report_tx,
-            statuses: None,
-        };
-        let e = Engine::start_replicated(config, process, None, replication).unwrap();
-        let processed = || e.counters().processed.load(Acquire);
-        wait(&|| e.status().outputs[0].realised);
-        e.set_fence(u64::MAX).unwrap();
-        let from = processed() + 2;
-        e.commit_from(0, from).unwrap();
-        let kp = (from * 48).next_multiple_of(PAGE) / 48;
-        wait(&|| processed() > kp + 5);
-        // F frozen: blocks wait fenced in the ring.
-        let f = processed() + 1;
-        e.set_fence(f * 48).unwrap();
-        wait(&|| processed() > f + 10);
-        crate::rt_loop::STALL_MS.store(60, Relaxed);
-        std::thread::sleep(Duration::from_millis(10));
-        // During the stall: the newest block in the ring withheld, F past
-        // all.
-        let stalled = processed();
-        e.withhold(0, stalled - 1, Cause::HoldCap).unwrap();
-        e.set_fence(u64::MAX).unwrap();
-        assert_eq!(processed(), stalled, "the RT thread did not stall");
-        wait(&|| processed() > stalled + 40);
-        let c = e.counters();
-        if c.overrun_skipped_samples.load(Relaxed) > 0 || c.hold_overflows.load(Relaxed) > 0 {
-            // Under load a skip or an overflow withdrew the replica
-            // before the stall ended: nothing left to check.
-            eprintln!("an overrun skip or a ring overflow: the check is left out");
+        // A run an overrun skip or an overflow disturbed is run again.
+        let run = || -> Option<String> {
+            let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+            let domain = std::env::temp_dir().join(format!("samplez-order-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&domain);
+            std::fs::create_dir(&domain).unwrap();
+            let id = "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d31";
+            // A catch-up long enough that the stall below skips nothing.
+            let v = serde_json::json!({
+                "libmxl": libmxl,
+                "maxCatchupBlocks": 200,
+                "holdMs": 100,
+                "domains": [{ "name": "d", "path": domain }],
+                "outputs": [{ "name": "out", "domain": "d", "flowId": id, "label": "order",
+                              "group": "order", "role": "Audio", "channels": 1 }],
+                "matrix": [],
+                "rt": { "enabled": false, "rtCpu": "none" },
+            });
+            let config = Config::parse(&v.to_string()).unwrap();
+            let process = rt::setup_process(&config.rt);
+            let (report_tx, _reports) = mpsc::sync_channel(1);
+            let replication = Replication {
+                voters: 2,
+                reports: report_tx,
+                statuses: None,
+            };
+            let e = Engine::start_replicated(config, process, None, replication).unwrap();
+            let processed = || e.counters().processed.load(Acquire);
+            wait(&|| e.status().outputs[0].realised);
+            e.set_fence(u64::MAX).unwrap();
+            let from = processed() + 2;
+            e.commit_from(0, from).unwrap();
+            let kp = (from * 48).next_multiple_of(PAGE) / 48;
+            wait(&|| processed() > kp + 5);
+            // F frozen: blocks wait fenced in the ring.
+            let f = processed() + 1;
+            e.set_fence(f * 48).unwrap();
+            wait(&|| processed() > f + 10);
+            crate::rt_loop::STALL_MS.store(60, Relaxed);
+            std::thread::sleep(Duration::from_millis(10));
+            // During the stall: the newest block in the ring withheld, F past
+            // all.
+            let stalled = processed();
+            e.withhold(0, stalled - 1, Cause::HoldCap).unwrap();
+            e.set_fence(u64::MAX).unwrap();
+            assert_eq!(processed(), stalled, "the RT thread did not stall");
+            wait(&|| processed() > stalled + 40);
+            let c = e.counters();
+            let (skipped, overflows) = (
+                c.overrun_skipped_samples.load(Relaxed),
+                c.hold_overflows.load(Relaxed),
+            );
+            if skipped > 0 || overflows > 0 {
+                // A skip or an overflow under load withdrew the replica
+                // before the stall ended: the run proves nothing.
+                e.stop();
+                std::fs::remove_dir_all(&domain).unwrap();
+                return Some(format!("{skipped} samples skipped, {overflows} overflows"));
+            }
+            for k in f..stalled - 1 {
+                assert_eq!(e.block_status(0, k).unwrap().kind, Kind::Committed);
+            }
+            for k in stalled..stalled + 40 {
+                let st = e.block_status(0, k).unwrap();
+                assert_ne!(st.kind, Kind::Committed, "{st:?}");
+            }
             e.stop();
             std::fs::remove_dir_all(&domain).unwrap();
-            return;
+            None
+        };
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            match run() {
+                None => return,
+                Some(why) => {
+                    eprintln!("run disturbed ({why}): running it again");
+                    seen.push(why);
+                }
+            }
         }
-        for k in f..stalled - 1 {
-            assert_eq!(e.block_status(0, k).unwrap().kind, Kind::Committed);
-        }
-        for k in stalled..stalled + 40 {
-            let st = e.block_status(0, k).unwrap();
-            assert_ne!(st.kind, Kind::Committed, "{st:?}");
-        }
-        e.stop();
-        std::fs::remove_dir_all(&domain).unwrap();
+        panic!("every run was disturbed: {seen:?}");
     }
 
     /// The engine's own log stamps an `InputDown` or `InputUp` that
