@@ -11,7 +11,9 @@ use std::sync::atomic::AtomicU64;
 
 use gungraun::prelude::*;
 use gungraun::{Callgrind, EventKind};
-use samplez::blocks::{Changes, Ctx, HEALTHY, Hold, PageHash, Pages, Sink, StatusChange, Statuses};
+use samplez::blocks::{
+    Changes, Ctx, HEALTHY, Hold, PageHash, Pages, Sink, StatusChange, Statuses, fingerprint,
+};
 
 const B: u64 = 48;
 const CHANNELS: usize = 8;
@@ -234,6 +236,29 @@ fn settle_page(mut h: Hashed) -> Hashed {
     h
 }
 
+/// The most entries one page's fingerprint covers at B = 48: 64 pending
+/// entries applied at each of the 22 blocks starting in a page.
+const PAGE_ENTRIES: u64 = 64 * 22;
+
+/// A full page's entries out of order, as `(log id, at_index)`.
+fn page_entries() -> Vec<(u64, u64)> {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..PAGE_ENTRIES)
+        .map(|n| {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (x >> 40, K0 * B + n / 64 * B)
+        })
+        .collect()
+}
+
+// The fingerprint of a page holding the most entries it can: sorted and
+// hashed.
+#[library_benchmark]
+#[bench::full(setup = page_entries, config = limit(FINGERPRINT_FULL))]
+fn fingerprint_full(mut entries: Vec<(u64, u64)>) -> u64 {
+    fingerprint(black_box(&mut entries))
+}
+
 const BACKWARD: u64 = 8_300;
 const AT_ONCE: u64 = 437;
 const FLUSH: u64 = 18_154;
@@ -242,10 +267,11 @@ const WITHDRAW: u64 = 8_096;
 const HASH_BLOCK: u64 = 8_274;
 const HASH_PAGE_END: u64 = 8_511;
 const SETTLE_PAGE: u64 = 2_090;
+const FINGERPRINT_FULL: u64 = 501_769;
 
 library_benchmark_group!(
     name = pages,
-    benchmarks = [hash_block, hash_page_end, settle_page]
+    benchmarks = [hash_block, hash_page_end, settle_page, fingerprint_full]
 );
 
 library_benchmark_group!(
