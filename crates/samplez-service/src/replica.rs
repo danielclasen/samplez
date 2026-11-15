@@ -156,6 +156,20 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// The global revision this replica has applied.
     fn revision(&self) -> u64;
 
+    /// The revision up to which the replication has committed, as a
+    /// majority confirms it now: the read index a client naming its last
+    /// position is answered against ([`crate::ws::serve_client`]). `None`
+    /// once it is clear this replica cannot have it confirmed, such as while
+    /// it is cut off from the quorum: resolve at once then, so such a client
+    /// is answered without waiting. The service waits for it at most
+    /// [`crate::ws::READ_INDEX_HOLD`]. A single replica answers its own
+    /// revision.
+    fn read_index(&self) -> BoxFuture<'_, Option<u64>>;
+
+    /// Resolves once this replica has applied `revision`; the service drops
+    /// it when it stops waiting.
+    fn applied(&self, revision: u64) -> BoxFuture<'_, ()>;
+
     /// The whole state as of the position in it.
     fn snapshot(&self) -> BoxFuture<'_, Snapshot>;
 
@@ -238,10 +252,9 @@ pub trait ReplicatedState: Send + Sync + 'static {
     /// owners whose connection to this replica is live
     /// ([`crate::ws::Sessions::live`]): it answered a ping sent within the
     /// last second, not counting up to [`crate::ws::MAX_PAUSE_TOTAL`] in
-    /// which it was not read at [`crate::ws::MAX_PENDING_REPLIES`], which
-    /// takes a round trip below 750 ms; not called when there are none.
-    /// Must not block: the renewal is passed on to the replication
-    /// mechanism.
+    /// which it was not read ([`crate::ws::serve_client`]), which takes a
+    /// round trip below 750 ms; not called when there are none. Must not
+    /// block: the renewal is passed on to the replication mechanism.
     fn renew_sessions(&self, live: &[Owner]);
 }
 

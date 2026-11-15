@@ -306,6 +306,34 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         self.store.applied_index()
     }
 
+    /// The leader's read index, confirmed by a round of heartbeats to a
+    /// majority. A follower answers `None` at once, judged by its own state:
+    /// openraft 0.9.21's check answered a follower's call in the replica
+    /// tests. Nothing is forwarded to the leader yet.
+    fn read_index(&self) -> BoxFuture<'_, Option<u64>> {
+        Box::pin(async move {
+            if self.raft.metrics().borrow().state != ServerState::Leader {
+                return None;
+            }
+            let (read, _) = self.raft.get_read_log_id().await.ok()?;
+            Some(read.map_or(0, |id| id.index))
+        })
+    }
+
+    fn applied(&self, revision: u64) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let wait = self.raft.wait(None);
+            if wait
+                .applied_index_at_least(Some(revision), "applied")
+                .await
+                .is_err()
+            {
+                // Stopped: it never applies the revision.
+                std::future::pending::<()>().await;
+            }
+        })
+    }
+
     fn snapshot(&self) -> BoxFuture<'_, Snapshot> {
         let snapshot = self.store.view(|revision, sm| Snapshot {
             epoch: self.settings.epoch,

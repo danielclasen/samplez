@@ -16,12 +16,25 @@ use samplez_service::{
     Identity, Ops, Owner, Position, ReplicaInfo, ReplicatedState, Service, ServiceConfig,
 };
 use serde_json::json;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tower::ServiceExt;
 
 pub const HOST: &str = "localhost:8080";
 pub const API_TOKEN: &str = "api-token";
 pub const MACHINE_TOKEN: &str = "machine-token";
+
+/// What [`FakeState::read_index`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIndex {
+    /// Its own revision, as a leader or a single replica.
+    Applied,
+    /// This revision, committed elsewhere and applied here once received.
+    Committed(u64),
+    /// `None` at once, as a replica cut off from the quorum.
+    CutOff,
+    /// Never, as a replica whose read index does not come back.
+    Hang,
+}
 
 /// A replicated state whose deltas are applied by hand; `receive` stands in
 /// for replication from another replica.
@@ -42,6 +55,9 @@ pub struct FakeState {
     pub snapshot_delay: Mutex<Duration>,
     /// Submitted commands, by owner and id, that `commit` applies.
     submitted: Mutex<Vec<(Owner, String, oneshot::Sender<Ack>)>>,
+    pub read_index: Mutex<ReadIndex>,
+    /// Woken on every revision applied.
+    applied: Notify,
 }
 
 impl FakeState {
@@ -64,6 +80,8 @@ impl FakeState {
             renewals: Mutex::default(),
             snapshot_delay: Mutex::default(),
             submitted: Mutex::default(),
+            read_index: Mutex::new(ReadIndex::Applied),
+            applied: Notify::new(),
         })
     }
 
@@ -93,6 +111,7 @@ impl FakeState {
                 .insert(key(owner, id), delta.revision);
         }
         self.log.lock().unwrap().push(delta);
+        self.applied.notify_waiters();
     }
 
     /// Applies the submitted commands in order, each id once per principal
@@ -171,6 +190,33 @@ impl ReplicatedState for FakeState {
                 epoch,
                 revision,
                 text: format!("snapshot@{epoch}:{revision}").into(),
+            }
+        })
+    }
+
+    fn read_index(&self) -> BoxFuture<'_, Option<u64>> {
+        let read_index = *self.read_index.lock().unwrap();
+        let revision = self.revision();
+        Box::pin(async move {
+            match read_index {
+                ReadIndex::Applied => Some(revision),
+                ReadIndex::Committed(revision) => Some(revision),
+                ReadIndex::CutOff => None,
+                ReadIndex::Hang => std::future::pending().await,
+            }
+        })
+    }
+
+    fn applied(&self, revision: u64) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            loop {
+                let applied = self.applied.notified();
+                tokio::pin!(applied);
+                applied.as_mut().enable();
+                if self.revision() >= revision {
+                    return;
+                }
+                applied.await;
             }
         })
     }

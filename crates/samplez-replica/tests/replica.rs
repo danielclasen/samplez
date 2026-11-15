@@ -123,6 +123,42 @@ async fn only_the_leader_is_commitable_and_every_refusal_names_its_reason() {
     assert_eq!(refused(&*stopped, "x").await.reason, Reason::Unavailable);
 }
 
+/// The leader's read index is what it committed, confirmed by a majority;
+/// a follower cannot confirm one yet and says so at once. A replica's
+/// wait for a revision ends once it applied it. Asked again when an
+/// election moved the leadership meanwhile.
+#[tokio::test(start_paused = true)]
+async fn the_leader_confirms_its_read_index_and_a_follower_answers_none() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let revision = set(&**set_.replica(leader), "s", "1", "gain=1@1").await;
+    set_.applied(revision).await;
+    loop {
+        let leader = set_.leader().await;
+        let follower = (leader + 1) % 3;
+        let start = tokio::time::Instant::now();
+        let confirmed = set_.replica(leader).read_index().await;
+        let unconfirmed = set_.replica(follower).read_index().await;
+        let took = start.elapsed();
+        if set_.leader().await != leader {
+            continue;
+        }
+        assert_eq!(confirmed, Some(revision), "a heartbeat round confirms it");
+        assert_eq!(unconfirmed, None);
+        assert!(took < Duration::from_millis(100), "at once: {took:?}");
+        break;
+    }
+
+    let follower = (set_.leader().await + 1) % 3;
+    let waiting = set_.replica(follower).applied(revision + 1);
+    let leader = set_.leader().await;
+    let next = set(&**set_.replica(leader), "s", "2", "gain=2@2").await;
+    assert_eq!(next, revision + 1);
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("applied on the follower");
+}
+
 /// The write timeout counts from the submit: a command queued behind
 /// writes that cannot commit, a command and an entry of the set's own,
 /// waits no longer than one that is written at once.

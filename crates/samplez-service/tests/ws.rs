@@ -10,12 +10,13 @@ use axum::body::Bytes;
 use axum::extract::ws::Message;
 use common::*;
 use futures_util::future::BoxFuture;
-use futures_util::{FutureExt, Sink, Stream, StreamExt};
+use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use samplez_service::replica::{Ack, Begin, Commands, NotApplied, Reason, Resolution};
 use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
-    ClientQueue, Delta, Ended, Frame, Hub, MAX_PAUSE, MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES,
-    PING_PERIOD, PONG_TIMEOUT, Popped, Pushed, Reply, Sessions, serve_client,
+    Answer, CatchUp, ClientQueue, Delta, Encode, Ended, Frame, Hub, MAX_PAUSE, MAX_PAUSE_TOTAL,
+    MAX_PENDING_REPLIES, PING_PERIOD, PONG_TIMEOUT, Popped, Pushed, READ_INDEX_HOLD, Reply,
+    Sessions, serve_client,
 };
 use samplez_service::{
     Connect, Forbidden, Identity, Ops, Owner, OwnerHandle, Position, ReplicatedState, Role,
@@ -114,10 +115,9 @@ impl Sink<Message> for ChannelSocket {
     }
 }
 
-fn connect(sessions: &Arc<Sessions>, role: Role, since: Option<(u64, u64)>, n: u32) -> Connect {
+fn connect(sessions: &Arc<Sessions>, role: Role, n: u32) -> Connect {
     Connect {
         identity: Identity { user: None, role },
-        since: since.map(|(epoch, revision)| Position { epoch, revision }),
         owner: Owner {
             principal: "anonymous".into(),
             session: format!("s{n}"),
@@ -125,6 +125,102 @@ fn connect(sessions: &Arc<Sessions>, role: Role, since: Option<(u64, u64)>, n: u
             connection: format!("r1:{n}"),
         },
         sessions: sessions.clone(),
+    }
+}
+
+/// The test protocol: `sync [full] [<epoch>:<revision>]` catches up,
+/// `promote [<epoch>:<revision>]` promotes and `pong <t>` answers the
+/// server's `ping <t>`. A stale resume is marked by a message of its own
+/// ahead of its deltas.
+struct Wire;
+
+impl Encode for Wire {
+    fn ping(&mut self, t: u64) -> Message {
+        Message::Text(format!("ping {t}").into())
+    }
+
+    fn answer(&mut self, answer: Answer) -> Vec<Message> {
+        let text = |t: String| Message::Text(t.into());
+        match answer {
+            Answer::Snapshot {
+                snapshot,
+                stale: false,
+            } => vec![Message::Text(snapshot.text)],
+            Answer::Snapshot {
+                snapshot,
+                stale: true,
+            } => vec![text(format!("{} stale", snapshot.text))],
+            Answer::Resume {
+                epoch,
+                revision,
+                deltas,
+                stale,
+            } => stale
+                .then(|| text(format!("resume@{epoch}:{revision} stale")))
+                .into_iter()
+                .chain(deltas.into_iter().map(|d| Message::Text(d.text)))
+                .collect(),
+            Answer::Ahead {
+                epoch,
+                committed,
+                last_revision,
+            } => vec![text(format!(
+                "ahead@{epoch}:{committed} below {last_revision}"
+            ))],
+        }
+    }
+}
+
+fn position(s: &str) -> Option<Position> {
+    let (epoch, revision) = s.split_once(':')?;
+    Some(Position {
+        epoch: epoch.parse().ok()?,
+        revision: revision.parse().ok()?,
+    })
+}
+
+/// The [`Wire`] protocol messages as the product answers them; `None` for
+/// the others.
+fn protocol<Fut>(message: &Message) -> Option<Reply<Fut>> {
+    let Message::Text(t) = message else {
+        return None;
+    };
+    let mut words = t.split(' ');
+    match words.next()? {
+        "sync" => {
+            let rest: Vec<&str> = words.collect();
+            Some(Reply::CatchUp(CatchUp {
+                since: rest.last().and_then(|p| position(p)),
+                full: rest.first() == Some(&"full"),
+            }))
+        }
+        "promote" => Some(Reply::Promote(words.next().and_then(position))),
+        "pong" => Some(Reply::Pong(words.next()?.parse().ok()?)),
+        _ => None,
+    }
+}
+
+/// The `t` of a ping.
+fn ping_of(message: &Message) -> Option<u64> {
+    match message {
+        Message::Text(t) => t.strip_prefix("ping ")?.parse().ok(),
+        _ => None,
+    }
+}
+
+fn pong(t: u64) -> Result<Message, ()> {
+    Ok(Message::Text(format!("pong {t}").into()))
+}
+
+fn text(t: &str) -> Result<Message, ()> {
+    Ok(Message::Text(t.to_owned().into()))
+}
+
+/// The first message of a connection: catch up from `since`.
+fn sync(since: Option<(u64, u64)>) -> Result<Message, ()> {
+    match since {
+        Some((epoch, revision)) => text(&format!("sync {epoch}:{revision}")),
+        None => text("sync"),
     }
 }
 
@@ -137,11 +233,12 @@ struct Client {
 }
 
 impl Client {
-    /// Runs `serve_client` over channels; the product callback echoes text,
-    /// answers text starting with `slow` after 1.5 s, `beat` at once,
-    /// `quiet` with nothing at once and grants a meter credit for the
-    /// binary message `credit`.
-    fn start(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
+    /// Runs `serve_client` over channels with the [`Wire`] protocol; the
+    /// product callback echoes other text, answers text starting with
+    /// `slow` after 1.5 s, `beat` at once, `quiet` with nothing at once and
+    /// grants a meter credit for the binary message `credit`. Sends nothing
+    /// for the client.
+    fn open(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
         let queue = hub.subscribe();
         let state = state.clone();
         let (to_client, rx) = mpsc::unbounded_channel();
@@ -152,7 +249,10 @@ impl Client {
         };
         let q = queue.clone();
         let task = tokio::spawn(async move {
-            serve_client(socket, &connect, &q, &*state, |m| {
+            serve_client(socket, &connect, &q, &*state, Wire, |m| {
+                if let Some(reply) = protocol(&m) {
+                    return reply;
+                }
                 let q = q.clone();
                 match &m {
                     Message::Text(t) if t.as_str() == "beat" => {
@@ -190,28 +290,40 @@ impl Client {
         }
     }
 
+    /// [`Client::open`], catching up without a position.
+    fn start(hub: &Hub, state: &Arc<FakeState>, connect: Connect) -> Client {
+        let client = Client::open(hub, state, connect);
+        client.tx.send(sync(None)).unwrap();
+        client
+    }
+
+    /// [`Client::open`], catching up from `since`.
     fn connect(hub: &Hub, state: &Arc<FakeState>, since: Option<(u64, u64)>) -> Client {
         let sessions = Arc::new(Sessions::new("r1").unwrap());
-        Client::start(hub, state, connect(&sessions, Role::Operator, since, 1))
+        let client = Client::open(hub, state, connect(&sessions, Role::Operator, 1));
+        client.tx.send(sync(since)).unwrap();
+        client
     }
 
     /// The next message other than a ping, answering pings when `pong`.
-    /// Within 2 s in all, so pings arriving meanwhile cannot extend it.
+    /// Within 3 s in all, so pings arriving meanwhile cannot extend it: an
+    /// answer held for the read index takes 2 s.
     async fn next_message(&mut self) -> Message {
         let wait = async {
             loop {
-                match self.rx.recv().await.expect("serving") {
-                    Message::Ping(p) if self.pong => {
-                        let _ = self.tx.send(Ok(Message::Pong(p)));
+                let message = self.rx.recv().await.expect("serving");
+                match ping_of(&message) {
+                    Some(t) if self.pong => {
+                        let _ = self.tx.send(pong(t));
                     }
-                    Message::Ping(_) => {}
-                    other => return other,
+                    Some(_) => {}
+                    None => return message,
                 }
             }
         };
-        tokio::time::timeout(Duration::from_secs(2), wait)
+        tokio::time::timeout(Duration::from_secs(3), wait)
             .await
-            .expect("a message within 2 s")
+            .expect("a message within 3 s")
     }
 
     async fn ended(&mut self) -> Ended {
@@ -286,21 +398,68 @@ async fn connect_catches_up_from_the_last_seen_position() {
     }
 }
 
+/// A state initialised anew or restored has another epoch: every client
+/// answered in the old one is closed, whether a delta of the new epoch
+/// reaches it or not, and a client reconnecting with its old position gets
+/// a snapshot of the new epoch at once, never held for a read index.
 #[tokio::test(start_paused = true)]
-async fn a_new_epoch_sends_a_snapshot() {
+async fn an_epoch_change_closes_every_connection() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     for _ in 0..5 {
         apply(&state, &hub);
     }
-    let mut client = Client::connect(&hub, &state, Some((7, 5)));
-    client.silent().await;
+    let mut resumed = Client::connect(&hub, &state, Some((7, 5)));
+    let mut fresh = Client::connect(&hub, &state, None);
+    resumed.silent().await;
+    assert_eq!(fresh.next().await, "snapshot@7:5");
 
+    let start = Instant::now();
     state.reset(8);
+    for client in [&mut resumed, &mut fresh] {
+        assert_eq!(client.next_message().await, Message::Close(None));
+        assert_eq!(client.ended().await, Ended::EpochChanged);
+    }
+    assert!(start.elapsed() <= PING_PERIOD, "{:?}", start.elapsed());
+
+    let mut delta = Client::connect(&hub, &state, None);
+    assert_eq!(delta.next().await, "snapshot@8:0");
+    state.reset(9);
     apply(&state, &hub);
-    assert_eq!(client.next().await, "snapshot@8:1", "revision 1 is below 5");
+    assert_eq!(delta.next_message().await, Message::Close(None));
+    assert_eq!(delta.ended().await, Ended::EpochChanged);
+
+    *state.read_index.lock().unwrap() = ReadIndex::Hang;
+    let start = Instant::now();
+    let mut reconnected = Client::connect(&hub, &state, Some((7, 5)));
+    assert_eq!(
+        reconnected.next().await,
+        "snapshot@9:1",
+        "revision 1 is below 5"
+    );
+    assert_eq!(start.elapsed(), Duration::ZERO);
     apply(&state, &hub);
-    assert_eq!(client.next().await, "delta@2");
+    assert_eq!(reconnected.next().await, "delta@2");
+}
+
+/// A catch-up held when the epoch changes answers with the new epoch's
+/// state, which the client's revisions do not name: the connection is
+/// closed instead, before the next ping would find the change.
+#[tokio::test(start_paused = true)]
+async fn an_answer_of_another_epoch_closes_the_connection() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    *state.read_index.lock().unwrap() = ReadIndex::Committed(1);
+    client.tx.send(sync(Some((7, 0)))).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let start = Instant::now();
+    state.reset(8);
+    state.apply(None);
+    assert_eq!(client.next_message().await, Message::Close(None));
+    assert_eq!(client.ended().await, Ended::EpochChanged);
+    assert_eq!(start.elapsed(), Duration::ZERO);
 }
 
 #[tokio::test(start_paused = true)]
@@ -319,18 +478,227 @@ async fn a_gap_in_prev_catches_up_from_the_state() {
     client.silent().await;
 }
 
+/// A client that saw revision 3 on another replica reaches one that has
+/// applied 1: the answer waits until this replica has applied what was
+/// committed, so it never goes back, and the deltas the client saw are
+/// skipped.
 #[tokio::test(start_paused = true)]
-async fn a_lagging_replica_skips_what_the_client_saw_on_another() {
+async fn a_lagging_replica_answers_once_it_applied_the_read_index() {
     let follower = FakeState::new("r2", "follower");
     let hub = Hub::new(8);
     apply(&follower, &hub);
+    *follower.read_index.lock().unwrap() = ReadIndex::Committed(4);
 
     let mut client = Client::connect(&hub, &follower, Some((7, 3)));
     client.silent().await;
+    apply(&follower, &hub);
+    apply(&follower, &hub);
+    client.silent().await;
+    apply(&follower, &hub);
+    assert_eq!(client.next().await, "delta@4", "2 and 3 skipped");
+    client.silent().await;
+    apply(&follower, &hub);
+    assert_eq!(client.next().await, "delta@5");
+}
+
+/// Held up to [`READ_INDEX_HOLD`]: a replica that does not get the read
+/// index, or does not apply it, by then answers with what it has applied,
+/// marked stale, even when that is older than the client's position.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_held_for_two_seconds_answers_stale() {
+    let follower = FakeState::new("r2", "follower");
+    let hub = Hub::new(8);
     for _ in 0..3 {
         apply(&follower, &hub);
     }
-    assert_eq!(client.next().await, "delta@4", "2 and 3 skipped");
+    for (read_index, since, answer) in [
+        (ReadIndex::Committed(9), (7, 1), "resume@7:3 stale"),
+        (ReadIndex::Hang, (7, 3), "resume@7:3 stale"),
+        (ReadIndex::Hang, (7, 5), "snapshot@7:3 stale"),
+    ] {
+        *follower.read_index.lock().unwrap() = read_index;
+        let start = Instant::now();
+        let mut client = Client::connect(&hub, &follower, Some(since));
+        assert_eq!(client.next().await, answer, "{read_index:?} {since:?}");
+        assert_eq!(start.elapsed(), READ_INDEX_HOLD);
+        if since.1 == 1 {
+            assert_eq!(client.next().await, "delta@2");
+            assert_eq!(client.next().await, "delta@3");
+        }
+        client.silent().await;
+    }
+}
+
+/// A replica cut off from the quorum cannot confirm its state and says so
+/// at once, rather than holding the client for two seconds.
+#[tokio::test(start_paused = true)]
+async fn a_replica_cut_off_answers_stale_at_once() {
+    let state = FakeState::new("r2", "follower");
+    let hub = Hub::new(8);
+    for _ in 0..3 {
+        apply(&state, &hub);
+    }
+    *state.read_index.lock().unwrap() = ReadIndex::CutOff;
+    let start = Instant::now();
+    let mut resumed = Client::connect(&hub, &state, Some((7, 1)));
+    assert_eq!(resumed.next().await, "resume@7:3 stale");
+    assert_eq!(resumed.next().await, "delta@2");
+    assert_eq!(resumed.next().await, "delta@3");
+    let mut behind = Client::connect(&hub, &state, Some((7, 5)));
+    assert_eq!(behind.next().await, "snapshot@7:3 stale");
+    let mut fresh = Client::connect(&hub, &state, None);
+    assert_eq!(fresh.next().await, "snapshot@7:3", "nothing to confirm");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+/// A position above what was committed in the state's epoch is state the
+/// replication never had: the client is told so and sent no deltas until
+/// it takes the state again.
+#[tokio::test(start_paused = true)]
+async fn a_position_above_the_read_index_is_answered_ahead() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    for _ in 0..3 {
+        apply(&state, &hub);
+    }
+    let mut client = Client::connect(&hub, &state, Some((7, 5)));
+    assert_eq!(client.next().await, "ahead@7:3 below 5");
+    client.tx.send(text("sync full 7:5")).unwrap();
+    assert_eq!(client.next().await, "ahead@7:3 below 5", "full or not");
+    // Revision 6 follows the client's 5, but names other changes.
+    for _ in 0..3 {
+        apply(&state, &hub);
+    }
+    hub.publish(Frame::Counters("c".into()));
+    assert_eq!(client.next().await, "c", "no delta while ahead");
+    client.tx.send(sync(None)).unwrap();
+    assert_eq!(client.next().await, "snapshot@7:6");
+    apply(&state, &hub);
+    assert_eq!(client.next().await, "delta@7");
+}
+
+/// `full` takes a snapshot where a resume would do, after the same hold.
+#[tokio::test(start_paused = true)]
+async fn a_full_catch_up_is_a_snapshot() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    for _ in 0..3 {
+        apply(&state, &hub);
+    }
+    let mut client = Client::connect(&hub, &state, Some((7, 3)));
+    client.silent().await;
+    client.tx.send(text("sync full 7:3")).unwrap();
+    assert_eq!(client.next().await, "snapshot@7:3");
+}
+
+/// The messages after a catch-up request are read once it is answered, so
+/// a command sent after it is applied and answered after the state it
+/// answers with. The pause does not count against the client's pong
+/// timeout, and the server's pings go on meanwhile.
+#[tokio::test(start_paused = true)]
+async fn nothing_after_a_catch_up_request_is_read_until_it_is_answered() {
+    let state = FakeState::new("r2", "follower");
+    let hub = Hub::new(8);
+    apply(&state, &hub);
+    *state.read_index.lock().unwrap() = ReadIndex::Committed(2);
+    let sessions = Arc::new(Sessions::new("r2").unwrap());
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
+    client.pong = false;
+    for message in [sync(Some((7, 1))), text("beat"), text("hello")] {
+        client.tx.send(message).unwrap();
+    }
+    let mut pings = 0;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(1500) {
+        match tokio::time::timeout(Duration::from_millis(100), client.rx.recv()).await {
+            Ok(Some(m)) if ping_of(&m).is_some() => pings += 1,
+            Ok(other) => panic!("unexpected {other:?}"),
+            Err(_) => {}
+        }
+    }
+    assert!(pings >= 5, "{pings} pings");
+    assert_eq!(sessions.live().len(), 1, "not read, so not timed out");
+    apply(&state, &hub);
+    assert_eq!(client.next().await, "delta@2");
+    assert_eq!(client.next().await, "beat back");
+    assert_eq!(client.next().await, "echo hello");
+}
+
+/// After a promote of the state's epoch, nothing is read until this
+/// replica has applied the client's position, so a command the client
+/// sends next never applies to older state than it saw. Another epoch's
+/// position, or none, holds nothing.
+#[tokio::test(start_paused = true)]
+async fn commands_after_a_promote_wait_until_its_position_is_applied() {
+    let state = FakeState::new("r2", "follower");
+    let hub = Hub::new(8);
+    apply(&state, &hub);
+    let mut client = Client::connect(&hub, &state, Some((7, 1)));
+    client.silent().await;
+    for message in [text("promote 7:3"), text("hello")] {
+        client.tx.send(message).unwrap();
+    }
+    client.silent().await;
+    apply(&state, &hub);
+    assert_eq!(client.next().await, "delta@2");
+    client.silent().await;
+    apply(&state, &hub);
+    let mut got = [client.next().await, client.next().await];
+    got.sort();
+    assert_eq!(got, ["delta@3", "echo hello"]);
+
+    for promote in ["promote 6:9", "promote", "promote 7:2"] {
+        client.tx.send(text(promote)).unwrap();
+        client.tx.send(text("hello")).unwrap();
+        assert_eq!(client.next().await, "echo hello", "{promote}");
+    }
+}
+
+/// A position this replica never applies holds the client's next commands
+/// for no longer than the read index hold plus [`MAX_PAUSE`].
+#[tokio::test(start_paused = true)]
+async fn a_promote_never_applied_ends_the_connection() {
+    let state = FakeState::new("r2", "follower");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    assert_eq!(client.next().await, "snapshot@7:0");
+    let start = Instant::now();
+    client.tx.send(text("promote 7:3")).unwrap();
+    client.tx.send(text("hello")).unwrap();
+    let ended = loop {
+        match tokio::time::timeout(Duration::from_secs(10), client.rx.recv()).await {
+            Ok(Some(m)) if ping_of(&m).is_some() => {}
+            Ok(None) => break client.ended().await,
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    assert_eq!(ended, Ended::Failed);
+    assert_eq!(start.elapsed(), READ_INDEX_HOLD + MAX_PAUSE);
+}
+
+/// The product makes the pings, each carrying the milliseconds since the
+/// connection was accepted; WebSocket protocol pings and pongs from the
+/// client are not heartbeats.
+#[tokio::test(start_paused = true)]
+async fn pings_are_the_products_with_the_time_since_the_connection_opened() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let mut client = Client::connect(&hub, &state, None);
+    let (mut ts, mut others) = (Vec::new(), Vec::new());
+    while ts.len() < 4 {
+        let m = client.rx.recv().await.expect("serving");
+        match ping_of(&m) {
+            Some(t) => {
+                client.tx.send(Ok(Message::Ping(Bytes::new()))).unwrap();
+                client.tx.send(pong(t)).unwrap();
+                ts.push(t);
+            }
+            None => others.push(m),
+        }
+    }
+    assert_eq!(ts, [0, 250, 500, 750]);
+    assert_eq!(others, [Message::Text("snapshot@7:0".into())]);
+    client.silent().await;
 }
 
 /// The bursts below run without an await, so the client cannot drain the
@@ -469,19 +837,24 @@ async fn a_message_answered_now_with_nothing_sends_nothing_and_counts_nothing() 
     assert_eq!(client.next().await, "echo hello", "nothing for quiet");
 }
 
-/// A client resending its unacknowledged commands at once after
-/// connecting reads the answers against the state they refer to.
+/// A command a client sends ahead of its first catch-up request is
+/// answered after the state the answer brings it to.
 #[tokio::test(start_paused = true)]
 async fn no_reply_goes_out_before_the_first_catch_up() {
     let state = FakeState::new("r1", "leader");
     *state.snapshot_delay.lock().unwrap() = Duration::from_millis(500);
     let hub = Hub::new(8);
-    let mut client = Client::connect(&hub, &state, None);
-    client.tx.send(Ok(Message::Text("hello".into()))).unwrap();
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
+    client.tx.send(text("hello")).unwrap();
+    client.silent().await;
+    client.tx.send(sync(None)).unwrap();
     assert_eq!(client.next().await, "snapshot@7:0");
     assert_eq!(client.next().await, "echo hello");
 }
 
+/// A catch-up after a gap the client did not ask for does not hold its
+/// messages, so its pongs are read during a slow snapshot.
 #[tokio::test(start_paused = true)]
 async fn a_slow_snapshot_keeps_the_heartbeat() {
     let state = FakeState::new("r1", "leader");
@@ -489,18 +862,19 @@ async fn a_slow_snapshot_keeps_the_heartbeat() {
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
     *state.snapshot_delay.lock().unwrap() = Duration::from_millis(1500);
-    state.reset(8);
+    state.apply(None);
+    state.forget_through(1);
     apply(&state, &hub);
-    assert_eq!(client.next().await, "snapshot@8:1");
+    assert_eq!(client.next().await, "snapshot@7:2");
     apply(&state, &hub);
-    assert_eq!(client.next().await, "delta@2", "still served");
+    assert_eq!(client.next().await, "delta@3", "still served");
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let connect = connect(&sessions, Role::Operator, None, 1);
+    let connect = connect(&sessions, Role::Operator, 1);
     let queue = Hub::new(8).subscribe();
     let (to_client, _rx) = mpsc::unbounded_channel();
     let (tx, from_client) = mpsc::unbounded_channel();
@@ -512,7 +886,7 @@ async fn a_connection_is_not_read_while_its_replies_are_at_the_limit() {
                 to_client,
                 from_client,
             };
-            serve_client(socket, &connect, &queue, &*state, |_| {
+            serve_client(socket, &connect, &queue, &*state, Wire, |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Reply::Command(std::future::pending::<Option<Message>>())
             })
@@ -562,15 +936,17 @@ async fn replies_sent_at_once_do_not_count_against_the_limit() {
     assert!(rest[1..].iter().all(|m| m == "slow done"), "{rest:?}");
 }
 
-/// A heartbeat answer does not wait for the first catch-up, which can take
-/// longer than the client waits for one.
+/// A heartbeat answer to a message read before the first catch-up does
+/// not wait for it.
 #[tokio::test(start_paused = true)]
 async fn a_reply_sent_at_once_goes_out_before_the_first_catch_up() {
     let state = FakeState::new("r1", "leader");
     *state.snapshot_delay.lock().unwrap() = Duration::from_millis(500);
     let hub = Hub::new(8);
-    let mut client = Client::connect(&hub, &state, None);
-    client.tx.send(Ok(Message::Text("beat".into()))).unwrap();
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut client = Client::open(&hub, &state, connect(&sessions, Role::Operator, 1));
+    client.tx.send(text("beat")).unwrap();
+    client.tx.send(sync(None)).unwrap();
     assert_eq!(client.next().await, "beat back");
     assert_eq!(client.next().await, "snapshot@7:0");
 }
@@ -581,7 +957,7 @@ async fn a_reply_sent_at_once_goes_out_before_the_first_catch_up() {
 async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let connect = connect(&sessions, Role::Operator, None, 1);
+    let connect = connect(&sessions, Role::Operator, 1);
     let queue = Hub::new(8).subscribe();
     let (to_client, _rx) = mpsc::unbounded_channel();
     let (tx, from_client) = mpsc::unbounded_channel();
@@ -591,7 +967,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
             to_client,
             from_client,
         };
-        serve_client(socket, &connect, &queue, &*state, |_| {
+        serve_client(socket, &connect, &queue, &*state, Wire, |_| {
             Reply::Command(std::future::pending::<Option<Message>>())
         })
         .await
@@ -616,7 +992,7 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_pause() {
 async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let connect = connect(&sessions, Role::Operator, None, 1);
+    let connect = connect(&sessions, Role::Operator, 1);
     let queue = Hub::new(8).subscribe();
     let (to_client, _rx) = mpsc::unbounded_channel();
     let (tx, from_client) = mpsc::unbounded_channel();
@@ -627,14 +1003,15 @@ async fn a_connection_not_read_at_the_limit_ends_after_the_longest_total_pause()
             to_client,
             from_client,
         };
-        serve_client(socket, &connect, &queue, &*state, |_| {
-            Reply::Command(async move {
+        serve_client(socket, &connect, &queue, &*state, Wire, |m| {
+            protocol(&m).unwrap_or(Reply::Command(Box::pin(async move {
                 tokio::time::sleep(reply).await;
                 Some(Message::Text("done".into()))
-            })
+            }) as BoxFuture<_>))
         })
         .await
     });
+    tx.send(sync(None)).unwrap();
     for _ in 0..5 * MAX_PENDING_REPLIES {
         tx.send(Ok(Message::Text("queued".into()))).unwrap();
     }
@@ -660,7 +1037,7 @@ async fn a_connection_that_answered_before_the_limit_stays_live_while_not_read()
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
     for n in 0..MAX_PENDING_REPLIES {
         let slow = format!("slow {n}");
@@ -684,7 +1061,7 @@ async fn a_client_answering_every_ping_stays_live_through_repeated_pauses() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
     let round = 3 * MAX_PENDING_REPLIES;
     let (mut sent, mut replies, mut not_live) = (0, 0, Vec::new());
@@ -701,8 +1078,8 @@ async fn a_client_answering_every_ping_stays_live_through_repeated_pauses() {
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             loop {
                 match client.rx.recv().await {
-                    Some(Message::Ping(p)) => {
-                        let _ = client.tx.send(Ok(Message::Pong(p)));
+                    Some(m) if ping_of(&m).is_some() => {
+                        let _ = client.tx.send(pong(ping_of(&m).unwrap()));
                     }
                     Some(Message::Text(_)) => replies += 1,
                     Some(_) => {}
@@ -727,7 +1104,7 @@ async fn a_pause_does_not_count_against_the_pong_timeout_after_it_ends() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
     client.pong = false;
     let start = Instant::now();
@@ -757,17 +1134,17 @@ async fn pongs_left_behind_a_backlog_do_not_keep_a_gone_peer_live() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     assert_eq!(client.next().await, "snapshot@7:0");
     let start = Instant::now();
     let mut last_ping = start;
     while start.elapsed() < Duration::from_secs(2) {
-        if let Message::Ping(p) = client.rx.recv().await.expect("serving") {
+        if let Some(t) = ping_of(&client.rx.recv().await.expect("serving")) {
             for n in 0..MAX_PENDING_REPLIES {
                 let slow = format!("slow {n}");
                 client.tx.send(Ok(Message::Text(slow.into()))).unwrap();
             }
-            client.tx.send(Ok(Message::Pong(p))).unwrap();
+            client.tx.send(pong(t)).unwrap();
             last_ping = Instant::now();
         }
     }
@@ -788,8 +1165,9 @@ async fn pongs_left_behind_a_backlog_do_not_keep_a_gone_peer_live() {
     );
 }
 
-/// A pong counts only when it echoes a ping's payload: an empty or made-up
-/// one does not keep the connection.
+/// A pong counts only when it echoes the `t` of a ping: a made-up one, or
+/// a WebSocket protocol pong echoing the ping's encoding, does not keep the
+/// connection.
 #[tokio::test(start_paused = true)]
 async fn a_pong_that_echoes_no_ping_does_not_count() {
     let state = FakeState::new("r1", "leader");
@@ -800,10 +1178,13 @@ async fn a_pong_that_echoes_no_ping_does_not_count() {
     let answer = async {
         loop {
             match client.rx.recv().await {
-                Some(Message::Ping(_)) => {
-                    let _ = client.tx.send(Ok(Message::Pong(Bytes::new())));
-                    let forged = Bytes::copy_from_slice(&u64::MAX.to_be_bytes());
-                    let _ = client.tx.send(Ok(Message::Pong(forged)));
+                Some(m) if ping_of(&m).is_some() => {
+                    let t = ping_of(&m).unwrap();
+                    let _ = client.tx.send(pong(t + 1));
+                    let _ = client.tx.send(pong(u64::MAX));
+                    let _ = client
+                        .tx
+                        .send(Ok(Message::Pong(Bytes::from(format!("pong {t}")))));
                 }
                 Some(Message::Close(_)) | None => break,
                 Some(_) => {}
@@ -817,33 +1198,31 @@ async fn a_pong_that_echoes_no_ping_does_not_count() {
     assert_eq!(start.elapsed(), PONG_TIMEOUT);
 }
 
-/// An unsolicited pong (RFC 6455 5.5.3) carrying 8 bytes that read as a
-/// number above every ping outstanding, including the number of the next
-/// ping not yet sent, does not drop those pings: the pong that echoes one
-/// still counts.
+/// An unsolicited pong carrying a `t` above every ping outstanding,
+/// including the `t` of the next ping not yet sent, does not drop those
+/// pings: the pong that echoes one still counts.
 #[tokio::test(start_paused = true)]
 async fn an_unsolicited_pong_does_not_drop_the_pings_outstanding() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     let start = Instant::now();
     while start.elapsed() < 4 * PONG_TIMEOUT {
-        if let Message::Ping(p) = client.rx.recv().await.expect("serving") {
-            let next = u64::from_be_bytes(p[..].try_into().unwrap()) + 1;
+        if let Some(t) = ping_of(&client.rx.recv().await.expect("serving")) {
+            let next = t + PING_PERIOD.as_millis() as u64;
             for unsolicited in [1_700_000_000_000u64, next] {
-                let unsolicited = Bytes::copy_from_slice(&unsolicited.to_be_bytes());
-                client.tx.send(Ok(Message::Pong(unsolicited))).unwrap();
+                client.tx.send(pong(unsolicited)).unwrap();
             }
-            client.tx.send(Ok(Message::Pong(p))).unwrap();
+            client.tx.send(pong(t)).unwrap();
         }
     }
     assert!(!client.task.is_finished());
     assert_eq!(sessions.live().len(), 1);
 }
 
-/// A client may answer only the most recent of several pings (RFC 6455
-/// 5.5.3): answering every third one keeps the connection, because
+/// A client may answer only the most recent of several pings: answering
+/// every third one keeps the connection, because
 /// liveness counts from the ping answered, not from the oldest one the
 /// answer drops.
 #[tokio::test(start_paused = true)]
@@ -851,13 +1230,13 @@ async fn a_client_answering_every_third_ping_stays_connected() {
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     let start = Instant::now();
     let mut n = 0u32;
     while start.elapsed() < 4 * PONG_TIMEOUT {
-        if let Message::Ping(p) = client.rx.recv().await.expect("serving") {
+        if let Some(t) = ping_of(&client.rx.recv().await.expect("serving")) {
             if n % 3 == 2 {
-                client.tx.send(Ok(Message::Pong(p))).unwrap();
+                client.tx.send(pong(t)).unwrap();
             }
             n += 1;
         }
@@ -873,16 +1252,16 @@ async fn pongs_delayed_by(delay: Duration) -> (Option<(Ended, Duration)>, bool) 
     let state = FakeState::new("r1", "leader");
     let hub = Hub::new(8);
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
     let start = Instant::now();
     let mut always_live = true;
     while start.elapsed() < 4 * PONG_TIMEOUT {
         match tokio::time::timeout(Duration::from_millis(50), client.rx.recv()).await {
-            Ok(Some(Message::Ping(p))) => {
-                let tx = client.tx.clone();
+            Ok(Some(m)) if ping_of(&m).is_some() => {
+                let (tx, t) = (client.tx.clone(), ping_of(&m).unwrap());
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let _ = tx.send(Ok(Message::Pong(p)));
+                    let _ = tx.send(pong(t));
                 });
             }
             Ok(Some(Message::Close(_)) | None) => {
@@ -956,7 +1335,7 @@ impl Sink<Message> for StallingSocket {
 async fn a_send_while_not_read_does_not_outlast_the_pause() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let connect = connect(&sessions, Role::Operator, None, 1);
+    let connect = connect(&sessions, Role::Operator, 1);
     let queue = Hub::new(8).subscribe();
     let (tx, from_client) = mpsc::unbounded_channel();
     let start = Instant::now();
@@ -968,14 +1347,15 @@ async fn a_send_while_not_read_does_not_outlast_the_pause() {
             until: ready + Duration::from_millis(500),
             stall: None,
         };
-        serve_client(socket, &connect, &queue, &*state, |_| {
-            Reply::Command(async move {
+        serve_client(socket, &connect, &queue, &*state, Wire, |m| {
+            protocol(&m).unwrap_or(Reply::Command(Box::pin(async move {
                 tokio::time::sleep_until(ready).await;
                 Some(Message::Text("done".into()))
-            })
+            }) as BoxFuture<_>))
         })
         .await
     });
+    tx.send(sync(None)).unwrap();
     for _ in 0..MAX_PENDING_REPLIES {
         tx.send(Ok(Message::Text("queued".into()))).unwrap();
     }
@@ -1001,7 +1381,7 @@ async fn a_reply_ready_as_the_pause_ends_does_not_resume_the_connection() {
     let end = start + MAX_PAUSE;
     let mut clients = Vec::new();
     for n in 0..32 {
-        let connect = connect(&sessions, Role::Operator, None, n);
+        let connect = connect(&sessions, Role::Operator, n);
         let queue = Hub::new(8).subscribe();
         let state = state.clone();
         let (to_client, rx) = mpsc::unbounded_channel();
@@ -1011,14 +1391,15 @@ async fn a_reply_ready_as_the_pause_ends_does_not_resume_the_connection() {
                 to_client,
                 from_client,
             };
-            serve_client(socket, &connect, &queue, &*state, |_| {
-                Reply::Command(async move {
+            serve_client(socket, &connect, &queue, &*state, Wire, |m| {
+                protocol(&m).unwrap_or(Reply::Command(Box::pin(async move {
                     tokio::time::sleep_until(end).await;
                     Some(Message::Text("done".into()))
-                })
+                }) as BoxFuture<_>))
             })
             .await
         });
+        tx.send(sync(None)).unwrap();
         for _ in 0..MAX_PENDING_REPLIES {
             tx.send(Ok(Message::Text("queued".into()))).unwrap();
         }
@@ -1047,9 +1428,9 @@ async fn live_sessions_are_renewed_once_per_second_in_one_batch() {
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert!(state.renewals.lock().unwrap().is_empty(), "nobody to renew");
 
-    let mut a = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 1));
-    let mut b = Client::start(&hub, &state, connect(&sessions, Role::Viewer, None, 2));
-    let mut silent = Client::start(&hub, &state, connect(&sessions, Role::Operator, None, 3));
+    let mut a = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
+    let mut b = Client::start(&hub, &state, connect(&sessions, Role::Viewer, 2));
+    let mut silent = Client::start(&hub, &state, connect(&sessions, Role::Operator, 3));
     silent.pong = false;
     for c in [&mut a, &mut b, &mut silent] {
         c.next().await;
@@ -1078,6 +1459,44 @@ async fn live_sessions_are_renewed_once_per_second_in_one_batch() {
     renew.abort();
 }
 
+/// A session is renewed from the first renewal after its connection
+/// opens, through its pongs while it answers, and no more once the
+/// connection closed: a touch as its first command, then a disconnect,
+/// leaves the lease to run out from there.
+#[tokio::test(start_paused = true)]
+async fn a_session_is_renewed_while_its_client_answers_and_not_after_it_disconnects() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8);
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let renew = tokio::spawn({
+        let (sessions, state) = (sessions.clone(), state.clone());
+        async move { samplez_service::server::renew_sessions(&sessions, &*state).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut client = Client::start(&hub, &state, connect(&sessions, Role::Operator, 1));
+    assert_eq!(client.next().await, "snapshot@7:0");
+    client.tx.send(text("touch")).unwrap();
+    assert_eq!(client.next().await, "echo touch");
+    for _ in 0..7 {
+        client.silent().await;
+    }
+    let renewed = |renewals: &[Vec<Owner>]| {
+        renewals
+            .iter()
+            .filter(|r| r.iter().any(|o| o.session == "s1"))
+            .count()
+    };
+    let renewals = state.renewals.lock().unwrap().clone();
+    assert_eq!(renewed(&renewals), 2, "at 1 s and 2 s: {renewals:?}");
+
+    client.tx.send(Ok(Message::Close(None))).unwrap();
+    assert_eq!(client.ended().await, Ended::Closed);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = state.renewals.lock().unwrap().clone();
+    assert_eq!(renewed(&after), 2, "none after the disconnect: {after:?}");
+    renew.abort();
+}
+
 async fn wait_both(a: &mut Client, b: &mut Client) {
     tokio::join!(a.silent(), b.silent());
 }
@@ -1086,11 +1505,11 @@ async fn wait_both(a: &mut Client, b: &mut Client) {
 fn require_operator_refuses_a_viewer() {
     let sessions = Arc::new(Sessions::new("r1").unwrap());
     assert_eq!(
-        connect(&sessions, Role::Operator, None, 1).require_operator(),
+        connect(&sessions, Role::Operator, 1).require_operator(),
         Ok(())
     );
     assert_eq!(
-        connect(&sessions, Role::Viewer, None, 1).require_operator(),
+        connect(&sessions, Role::Viewer, 1).require_operator(),
         Err(Forbidden)
     );
 }
@@ -1124,7 +1543,7 @@ fn an_owner_shows_a_one_way_handle_of_its_session() {
     );
 
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let mut connect = connect(&sessions, Role::Operator, None, 1);
+    let mut connect = connect(&sessions, Role::Operator, 1);
     connect.owner = owner.clone();
     for logged in [format!("{owner:?}"), format!("{connect:?}")] {
         assert!(!logged.contains(session), "{logged}");
@@ -1364,7 +1783,7 @@ async fn another_principal_with_the_same_session_cannot_pre_empt_its_commands() 
 const SESSION: &str = "q3Jx-Lh0_9TfWzKcVb2s1A";
 
 #[tokio::test]
-async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
+async fn loopback_upgrade_checks_origin_and_resumes_from_the_first_message() {
     let state = FakeState::new("r1", "leader");
     let hub = Arc::new(Hub::new(8));
     for _ in 0..3 {
@@ -1388,8 +1807,8 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
                 assert_eq!(connect.owner.role, Role::Operator);
                 assert!(connect.owner.connection.starts_with("r1:"));
                 let queue = hub.subscribe();
-                serve_client(socket, &connect, &queue, &*state, |_| {
-                    Reply::Command(async { None })
+                serve_client(socket, &connect, &queue, &*state, Wire, |m| {
+                    protocol(&m).unwrap_or(Reply::Command(async { None }))
                 })
                 .await;
             }
@@ -1399,7 +1818,7 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     let addr = bound.api_addr().unwrap();
     let server = tokio::spawn(bound.serve());
 
-    let url = format!("ws://{addr}/api/v1/ws?since=7:2&session={SESSION}");
+    let url = format!("ws://{addr}/api/v1/ws?session={SESSION}");
     let mut foreign = url.as_str().into_client_request().unwrap();
     foreign
         .headers_mut()
@@ -1410,9 +1829,6 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
     }
     let short = &SESSION[1..];
     let bad = [
-        "since=2".to_owned(),
-        "since=7:".to_owned(),
-        "since=%2B7:2".to_owned(),
         "session=".to_owned(),
         "session=tab-1".to_owned(),
         format!("session={short}"),
@@ -1432,30 +1848,43 @@ async fn loopback_upgrade_checks_origin_and_resumes_from_since() {
         .await
         .unwrap();
     assert_eq!(res.status(), 101);
-    let mut next = async || loop {
-        match ws.next().await {
-            Some(Ok(tungstenite::Message::Text(t))) => return t.to_string(),
-            Some(Ok(tungstenite::Message::Ping(_))) => {}
-            other => panic!("unexpected {other:?}"),
-        }
-    };
-    assert_eq!(next().await, "delta@3");
+    ws.send("sync 7:2".into()).await.unwrap();
+    assert_eq!(next_text(&mut ws).await, "delta@3");
     apply(&state, &hub);
-    assert_eq!(next().await, "delta@4");
+    assert_eq!(next_text(&mut ws).await, "delta@4");
 
     let url = format!("ws://{addr}/api/v1/ws?since=7:3&session={longest}");
     let (mut ws, res) = tokio_tungstenite::connect_async(url.as_str())
         .await
         .unwrap();
-    assert_eq!(res.status(), 101, "the longest session id");
+    assert_eq!(
+        res.status(),
+        101,
+        "the longest session id; `since` is not read"
+    );
+    ws.send("sync".into()).await.unwrap();
+    assert_eq!(next_text(&mut ws).await, "snapshot@7:4");
+    server.abort();
+}
+
+/// The next text message other than a ping, answering pings.
+async fn next_text<S>(ws: &mut S) -> String
+where
+    S: Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
+        + Sink<tungstenite::Message>
+        + Unpin,
+    <S as Sink<tungstenite::Message>>::Error: std::fmt::Debug,
+{
     loop {
         match ws.next().await {
-            Some(Ok(tungstenite::Message::Text(t))) => break assert_eq!(t.as_str(), "delta@4"),
+            Some(Ok(tungstenite::Message::Text(t))) => match t.strip_prefix("ping ") {
+                Some(t) => ws.send(format!("pong {t}").into()).await.unwrap(),
+                None => return t.to_string(),
+            },
             Some(Ok(tungstenite::Message::Ping(_))) => {}
             other => panic!("unexpected {other:?}"),
         }
     }
-    server.abort();
 }
 
 /// A forwarded command names who sent it, with the role it was allowed.
@@ -1534,14 +1963,14 @@ impl Sink<Message> for StuckSocket {
 async fn a_client_that_stops_reading_ends_one_second_after_it_connected() {
     let state = FakeState::new("r1", "leader");
     let sessions = Arc::new(Sessions::new("r1").unwrap());
-    let connect = connect(&sessions, Role::Operator, None, 1);
+    let connect = connect(&sessions, Role::Operator, 1);
     let queue = Hub::new(8).subscribe();
     let start = Instant::now();
     let task = tokio::spawn({
         let state = state.clone();
         async move {
             let socket = StuckSocket { sent: 0 };
-            serve_client(socket, &connect, &queue, &*state, |_| {
+            serve_client(socket, &connect, &queue, &*state, Wire, |_| {
                 Reply::Command(async { None })
             })
             .await
