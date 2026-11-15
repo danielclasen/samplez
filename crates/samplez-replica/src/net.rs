@@ -106,7 +106,12 @@ pub(crate) fn request(
         .expect("a valid request")
 }
 
-/// Connections to the other replicas, kept open between requests.
+/// Idle connections kept per peer; one more is closed once its request
+/// is answered.
+pub const MAX_IDLE: usize = 4;
+
+/// Connections to the other replicas, kept open between requests, at
+/// most [`MAX_IDLE`] idle ones per peer.
 pub struct Pool {
     tls: Arc<PeerTls>,
     idle: Mutex<HashMap<String, Vec<Sender>>>,
@@ -147,12 +152,11 @@ impl Pool {
             };
             let (status, body) =
                 send(&mut sender, request(Method::POST, host(addr), path, body)).await?;
-            self.idle
-                .lock()
-                .expect("pool lock poisoned")
-                .entry(addr.to_owned())
-                .or_default()
-                .push(sender);
+            let mut idle = self.idle.lock().expect("pool lock poisoned");
+            let idle = idle.entry(addr.to_owned()).or_default();
+            if idle.len() < MAX_IDLE {
+                idle.push(sender);
+            }
             if status != StatusCode::OK {
                 return Err(io::Error::other(format!("{addr}{path}: {status}")));
             }
@@ -161,6 +165,17 @@ impl Pool {
         tokio::time::timeout(within, exchange)
             .await
             .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")))
+    }
+}
+
+impl Pool {
+    /// The idle connections kept to `addr`.
+    pub fn idle(&self, addr: &str) -> usize {
+        self.idle
+            .lock()
+            .expect("pool lock poisoned")
+            .get(addr)
+            .map_or(0, Vec::len)
     }
 }
 
@@ -376,7 +391,13 @@ impl RaftNetwork<TypeConfig> for Link {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let body = serde_json::to_vec(&AppendWire::from(&rpc)).expect("encodes");
+        // Up to MAX_PAYLOAD_ENTRIES entries: encoded off the async worker.
+        let encoded =
+            tokio::task::spawn_blocking(move || serde_json::to_vec(&AppendWire::from(&rpc)));
+        let body = encoded
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
+            .expect("encodes");
         let reply: AppendReplyWire = self.call("append", body, &option).await?.map_err(refused)?;
         Ok(reply.into())
     }

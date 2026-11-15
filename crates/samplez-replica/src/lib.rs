@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
@@ -48,15 +48,31 @@ openraft::declare_raft_types!(
         R = Response,
 );
 
+/// The largest command body a replica orders; a larger one is refused
+/// with [`Reason::TooLarge`].
+pub const MAX_COMMAND_BYTES: usize = 32 << 10;
+
+/// The command bytes ([`Command::size`]) one entry carries at most: a
+/// group commit closes before the command that would pass it, so only a
+/// single command can exceed it, by its id and owner.
+pub const MAX_ENTRY_BYTES: usize = 32 << 10;
+
+/// The entries one AppendEntries carries at most. openraft gives an
+/// AppendEntries the heartbeat interval to complete; at this count and
+/// [`MAX_ENTRY_BYTES`] one carries about 128 KiB of commands, a third
+/// more encoded.
+pub const MAX_PAYLOAD_ENTRIES: u64 = 4;
+
 /// openraft's timers as the chart pins them (`replica.raft`): its 0.9.21
 /// defaults, so the election figures do not move with a dependency
-/// update.
+/// update; and [`MAX_PAYLOAD_ENTRIES`].
 pub fn raft_config(cluster: &str) -> openraft::Config {
     openraft::Config {
         cluster_name: cluster.to_owned(),
         election_timeout_min: 150,
         election_timeout_max: 300,
         heartbeat_interval: 50,
+        max_payload_entries: MAX_PAYLOAD_ENTRIES,
         ..openraft::Config::default()
     }
 }
@@ -73,9 +89,10 @@ pub struct Settings {
     /// The longest a submit waits, from the call, for its command to apply
     /// here, queueing behind earlier writes and waiting for a leader
     /// included, before it resolves [`NotApplied`] with
-    /// [`Reason::Unavailable`]. A command still queued at its deadline is
-    /// not ordered. An entry the replica set decides on waits this long
-    /// from the moment it is proposed.
+    /// [`Reason::Unavailable`]. A command still queued at its deadline,
+    /// here or on the leader it was forwarded to, is not ordered. An entry
+    /// the replica set decides on waits this long from the moment it is
+    /// proposed.
     pub write_timeout: Duration,
     /// This replica's peer address, `host:port`, as the others reach it.
     pub addr: String,
@@ -128,6 +145,17 @@ pub(crate) struct Shared {
     /// The pause before a refused forward is resent.
     heartbeat: Duration,
     quiescing: AtomicBool,
+    /// Proposals between the leadership check and openraft's answer.
+    proposing: AtomicUsize,
+}
+
+/// Counts a proposal while it lives.
+struct Proposing<'a>(&'a AtomicUsize);
+
+impl Drop for Proposing<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// One replica of a product's state.
@@ -191,6 +219,7 @@ impl<P: Product> Replica<P> {
             lease: Duration::from_millis(raft_config.election_timeout_max),
             heartbeat: Duration::from_millis(raft_config.heartbeat_interval),
             quiescing: AtomicBool::new(false),
+            proposing: AtomicUsize::new(0),
         });
         let (queue, queued) = mpsc::unbounded_channel();
         tokio::spawn(write(shared.clone(), queued, estimate.clone()));
@@ -282,13 +311,16 @@ impl<P: Product> Replica<P> {
     /// For a voter's preStop. Stops ordering commands: forwarded ones are
     /// refused [`Refused::Quiescing`], which their sender resends to the
     /// next leader, and local ones wait for that leader. A leader then
-    /// waits until every entry it appended is committed and every voter
-    /// holds it, at most `bound`, so its exit leaves no entry in flight on
-    /// a live replica; a voter that is down holds it up to `bound`.
+    /// waits until no proposal is in progress, every entry it appended is
+    /// committed and every voter holds it, and that still holds two
+    /// heartbeats later, at most `bound`; so its exit leaves no entry in
+    /// flight on a live replica, and a voter that is down holds it up to
+    /// `bound`.
     pub async fn quiesce(&self, bound: Duration) {
         let shared = &self.shared;
-        shared.quiescing.store(true, Ordering::Relaxed);
+        shared.quiescing.store(true, Ordering::SeqCst);
         let deadline = Instant::now() + bound;
+        let mut settled = false;
         while shared.raft.metrics().borrow().state == ServerState::Leader {
             let metrics = shared.raft.metrics().borrow().clone();
             let last = metrics.last_log_index.unwrap_or(0);
@@ -305,15 +337,22 @@ impl<P: Product> Replica<P> {
                             .and_then(|matched| matched.get(&id).copied().flatten())
                             .is_some_and(|matched| matched.index >= last)
                 });
-            if committed && held {
-                // One more heartbeat carries the commit to the followers.
-                tokio::time::sleep(shared.heartbeat * 2).await;
+            let quiet = shared.proposing.load(Ordering::SeqCst) == 0 && committed && held;
+            if quiet && settled {
                 return;
             }
+            settled = quiet;
             if Instant::now() >= deadline {
                 return;
             }
-            tokio::time::sleep(shared.heartbeat / 5).await;
+            // Quiet: one more heartbeat carries the commit to the
+            // followers, and a proposal racing the flag shows by then.
+            let pause = if quiet {
+                shared.heartbeat * 2
+            } else {
+                shared.heartbeat / 5
+            };
+            tokio::time::sleep(pause.min(deadline.saturating_duration_since(Instant::now()))).await;
         }
     }
 
@@ -324,19 +363,21 @@ impl<P: Product> Replica<P> {
             return Err(Refused::Misaddressed);
         }
         match request {
-            PeerRequest::Forward {
-                commands,
-                within_ms,
-            } => {
+            PeerRequest::Forward { commands } => {
                 shared.refuse_unless_leading()?;
-                let deadline = Instant::now() + Duration::from_millis(within_ms);
+                let now = Instant::now();
                 let mut replies = Vec::with_capacity(commands.len());
-                for Forwarded { command, received } in commands {
+                for Forwarded {
+                    command,
+                    received,
+                    within_ms,
+                } in commands
+                {
                     let (reply, replied) = oneshot::channel();
                     let item = Item {
                         command,
                         received,
-                        deadline,
+                        deadline: now + Duration::from_millis(within_ms),
                         reply,
                         forwarded: true,
                     };
@@ -350,6 +391,11 @@ impl<P: Product> Replica<P> {
                 Ok(PeerResponse::Forwarded(results))
             }
             PeerRequest::Append { body, within_ms } => {
+                // A peer orders its lease renewals; every other entry is
+                // the leader's own decision.
+                if !matches!(body, Body::LeaseRenew(_)) {
+                    return Err(Refused::NotForwardable);
+                }
                 shared.refuse_unless_leading()?;
                 let (reply, replied) = oneshot::channel();
                 let _ = self.queue.send(Queued::Entry {
@@ -364,7 +410,7 @@ impl<P: Product> Replica<P> {
             PeerRequest::ReadIndex => match shared.raft.get_read_log_id().await {
                 Ok((read, _)) => Ok(PeerResponse::ReadIndex(read.map_or(0, |id| id.index))),
                 Err(RaftError::APIError(_)) => Err(Refused::NotLeader),
-                Err(e) => Err(Refused::Unavailable(e.to_string())),
+                Err(e) => Err(unavailable(&e)),
             },
         }
     }
@@ -378,9 +424,35 @@ fn stopped() -> Refused {
     Refused::Unavailable("replica stopped".into())
 }
 
+/// openraft's error, logged; its text names nodes and addresses, so it
+/// stays out of what a client is told.
+fn unavailable(e: &dyn std::fmt::Display) -> Refused {
+    tracing::debug!(error = %e, "not committed");
+    Refused::Unavailable("not committed".into())
+}
+
 impl Shared {
     fn quiescing(&self) -> bool {
-        self.quiescing.load(Ordering::Relaxed)
+        self.quiescing.load(Ordering::SeqCst)
+    }
+
+    /// Counts a proposal and says whether this replica leads; the count
+    /// is taken first, so a [`Replica::quiesce`] that set its flag after
+    /// this check sees the proposal.
+    fn propose(&self) -> Option<Proposing<'_>> {
+        self.proposing.fetch_add(1, Ordering::SeqCst);
+        let proposing = Proposing(&self.proposing);
+        self.leads().then_some(proposing)
+    }
+
+    /// Why a replica that does not lead refuses: the leader quiescing, or
+    /// not the leader.
+    fn refusal(&self) -> Refused {
+        if self.quiescing() {
+            Refused::Quiescing
+        } else {
+            Refused::NotLeader
+        }
     }
 
     /// Leader and not quiescing: orders what it is given.
@@ -452,7 +524,7 @@ impl Shared {
         estimate: &Estimate,
     ) -> Result<(), Refused> {
         loop {
-            if self.leads() {
+            if let Some(_proposing) = self.propose() {
                 let request = Request {
                     stamp: stamping_index(estimate(), self.settings.block),
                     body,
@@ -461,12 +533,12 @@ impl Shared {
                     .await
                 {
                     Ok(Ok(_)) => Ok(()),
-                    Ok(Err(e)) => Err(Refused::Unavailable(e.to_string())),
+                    Ok(Err(e)) => Err(unavailable(&e)),
                     Err(_) => Err(Refused::Unavailable("timed out".into())),
                 };
             }
             if forwarded {
-                return self.refuse_unless_leading();
+                return Err(self.refusal());
             }
             if let Some((leader, addr)) = self.leader() {
                 let within = deadline.saturating_duration_since(Instant::now());
@@ -506,8 +578,10 @@ impl Shared {
             if items.is_empty() {
                 return;
             }
-            if self.leads() {
-                match self.write_locally(items, estimate).await {
+            if let Some(proposing) = self.propose() {
+                let written = self.write_locally(items, estimate).await;
+                drop(proposing);
+                match written {
                     Ok(()) => return,
                     // Leadership moved before the entry committed: route
                     // them again; a copy that commits after all resolves
@@ -518,10 +592,7 @@ impl Shared {
             }
             let (forwarded, local): (Vec<Item>, Vec<Item>) =
                 items.into_iter().partition(|item| item.forwarded);
-            let refusal = self
-                .refuse_unless_leading()
-                .err()
-                .unwrap_or(Refused::NotLeader);
+            let refusal = self.refusal();
             for item in forwarded {
                 let _ = item.reply.send(Err(refusal.clone()));
             }
@@ -562,7 +633,7 @@ impl Shared {
             Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_)))) => {
                 return Err(items);
             }
-            Ok(Err(e)) => return answer_all(items, Refused::Unavailable(e.to_string())),
+            Ok(Err(e)) => return answer_all(items, unavailable(&e)),
             Err(_) => return answer_all(items, Refused::Unavailable("timed out".into())),
         };
         let mut answered = vec![false; outcomes.len()];
@@ -590,16 +661,17 @@ impl Shared {
             .map(|item| item.deadline)
             .max()
             .expect("not empty");
-        let within = latest.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let within = latest.saturating_duration_since(now);
         let request = PeerRequest::Forward {
             commands: items
                 .iter()
                 .map(|item| Forwarded {
                     command: item.command.clone(),
                     received: item.received,
+                    within_ms: item.deadline.saturating_duration_since(now).as_millis() as u64,
                 })
                 .collect(),
-            within_ms: within.as_millis() as u64,
         };
         let results = match self.peers.call(Some(leader), addr, request, within).await {
             Ok(Ok(PeerResponse::Forwarded(results))) if results.len() == items.len() => results,
@@ -640,7 +712,8 @@ fn answer_all(items: Vec<Item>, refused: Refused) -> Result<(), Vec<Item>> {
 /// order they were submitted, and puts what queued while the previous
 /// entry was written into the next one (group commit). A copy of a
 /// command the batch holds already is folded into it and answered from
-/// its outcome, an applied one as a duplicate. On a follower the group is
+/// its outcome, an applied one as a duplicate. An entry carries at most
+/// [`MAX_ENTRY_BYTES`] of commands. On a follower the group is
 /// forwarded to the leader instead, one group at a time, so the order
 /// holds there too.
 ///
@@ -678,12 +751,16 @@ async fn write(
                 }
             }
             Queued::Command(item) => {
+                let mut bytes = item.command.size();
                 let mut items = vec![item];
                 while let Ok(queued) = queued.try_recv() {
                     match queued {
-                        Queued::Command(item) => items.push(item),
-                        entry => {
-                            next = Some(entry);
+                        Queued::Command(item) if bytes + item.command.size() <= MAX_ENTRY_BYTES => {
+                            bytes += item.command.size();
+                            items.push(item);
+                        }
+                        other => {
+                            next = Some(other);
                             break;
                         }
                     }
@@ -847,6 +924,13 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         id: &str,
         command: axum::body::Bytes,
     ) -> BoxFuture<'_, Result<Ack, NotApplied>> {
+        if command.len() > MAX_COMMAND_BYTES {
+            let refused = NotApplied::new(
+                Reason::TooLarge,
+                format!("{} bytes, at most {MAX_COMMAND_BYTES}", command.len()),
+            );
+            return Box::pin(async move { Err(refused) });
+        }
         let info = self.replica();
         if !info.commitable {
             let refused = NotApplied::new(Reason::NotCommitable, "not a voter yet");
@@ -884,7 +968,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                 Err(Refused::Unavailable(detail)) => {
                     Err(NotApplied::new(Reason::Unavailable, detail))
                 }
-                Err(refused) => Err(NotApplied::new(Reason::Unavailable, format!("{refused:?}"))),
+                Err(_) => Err(NotApplied::new(Reason::Unavailable, "no leader")),
             }
         })
     }

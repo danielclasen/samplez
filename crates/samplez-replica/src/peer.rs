@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::future::BoxFuture;
-use openraft::raft::InstallSnapshotRequest;
+use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest};
 use samplez_service::PeerTls;
 use samplez_service::server::SECRET_RELOAD_PERIOD;
 use serde::{Deserialize, Serialize};
@@ -27,8 +27,9 @@ use crate::state_machine::Product;
 use crate::{Replica, net};
 
 /// The largest request the peer listener takes: above openraft's 3 MiB
-/// snapshot chunks and its batches of up to 300 entries.
-pub const MAX_BODY: usize = 32 << 20;
+/// snapshot chunks and an AppendEntries of [`crate::MAX_PAYLOAD_ENTRIES`]
+/// entries of [`crate::MAX_ENTRY_BYTES`].
+pub const MAX_BODY: usize = 8 << 20;
 
 /// A client command as the replica that first received it forwards it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,18 +37,18 @@ pub struct Forwarded {
     pub command: Command,
     /// The receiving replica's E estimate at first receipt, in samples.
     pub received: u64,
+    /// What is left of the command's write timeout: the leader does not
+    /// order it later.
+    pub within_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PeerRequest {
     /// Client commands for the leader to order, in the order the sender
-    /// received them, each answered within `within_ms`.
-    Forward {
-        commands: Vec<Forwarded>,
-        within_ms: u64,
-    },
-    /// An entry the sender orders on its own account, such as its lease
-    /// renewals.
+    /// received them.
+    Forward { commands: Vec<Forwarded> },
+    /// An entry the sender orders on its own account: its lease renewals,
+    /// the only entry a peer may have the leader append.
     Append { body: Body, within_ms: u64 },
     /// The index a read must have applied to see every committed write,
     /// once the leader confirmed with a quorum that it still leads.
@@ -75,6 +76,8 @@ pub enum Refused {
     /// Another node id answers at this address, such as a replica that
     /// lost its volume and has not joined as the new node yet.
     Misaddressed,
+    /// An entry a peer may not have the leader append.
+    NotForwardable,
 }
 
 pub type PeerReply = Result<PeerResponse, Refused>;
@@ -146,10 +149,14 @@ async fn raft<P: Product + Sync>(
     let bad = || StatusCode::BAD_REQUEST.into_response();
     match rpc.as_str() {
         "append" => {
-            let Ok(wire) = serde_json::from_slice::<AppendWire>(&body) else {
+            // Up to MAX_BODY of JSON: decoded off the async worker.
+            let decoded = tokio::task::spawn_blocking(move || {
+                serde_json::from_slice::<AppendWire>(&body).map(AppendEntriesRequest::from)
+            });
+            let Ok(Ok(rpc)) = decoded.await else {
                 return bad();
             };
-            let reply = raft.append_entries(wire.into()).await;
+            let reply = raft.append_entries(rpc).await;
             json(
                 &reply
                     .as_ref()

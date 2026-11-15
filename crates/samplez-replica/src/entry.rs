@@ -71,7 +71,20 @@ pub struct Command {
     /// index (scheduled); `None` applies at the earliest.
     pub at_index: Option<u64>,
     /// The product's encoding.
+    #[serde(with = "bytes")]
     pub body: Vec<u8>,
+}
+
+impl Command {
+    /// What the command adds to an entry, for the bytes-per-entry cap.
+    pub fn size(&self) -> usize {
+        let origin = &self.origin;
+        self.body.len()
+            + self.id.len()
+            + origin.principal.len()
+            + origin.session.len()
+            + origin.connection.len()
+    }
 }
 
 /// The commands of one entry, in the order they were submitted. Every
@@ -168,6 +181,7 @@ pub enum Body {
     /// The product's encoding of a re-route.
     Route {
         at_index: u64,
+        #[serde(with = "bytes")]
         body: Vec<u8>,
     },
     MasterEnable {
@@ -228,6 +242,25 @@ pub struct Outcome {
 /// empty for every other entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response(pub Vec<Outcome>);
+
+/// Bytes as base64 text, a third above their length, where serde_json
+/// would write an array of numbers, up to four times it.
+pub mod bytes {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(d)?;
+        STANDARD
+            .decode(text.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 /// `ceil(e / block) * block`: an estimate rounded up to a block boundary.
 pub fn stamping_index(e: u64, block: u64) -> u64 {

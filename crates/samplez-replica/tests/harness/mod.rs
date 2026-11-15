@@ -115,12 +115,25 @@ pub fn owner(session: &str) -> Owner {
 pub struct Clock {
     base: Instant,
     offset: AtomicI64,
+    /// Told on the next read: a test's hook into the moment a replica
+    /// stamps an entry, between its leadership check and the proposal.
+    on_read: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Clock {
     pub fn samples(&self) -> u64 {
+        if let Some(read) = self.on_read.lock().expect("clock lock poisoned").take() {
+            let _ = read.send(());
+        }
         let elapsed = self.base.elapsed().as_nanos() as u64 * RATE / 1_000_000_000;
         elapsed.saturating_add_signed(self.offset.load(Ordering::Relaxed))
+    }
+
+    /// Resolves at the next read.
+    pub fn next_read(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (read, next) = tokio::sync::oneshot::channel();
+        *self.on_read.lock().expect("clock lock poisoned") = Some(read);
+        next
     }
 
     pub fn set_offset(&self, samples: i64) {
@@ -134,6 +147,9 @@ struct Links {
     replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
     /// (from, to): RPCs from `from` to `to` do not arrive.
     cut: BTreeSet<(NodeId, NodeId)>,
+    /// (from, to): RPCs from `from` to `to` get no answer, as through a
+    /// network that drops packets, until the caller's timeout.
+    hung: BTreeSet<(NodeId, NodeId)>,
     /// RPCs to a stalled replica wait this long before it handles them.
     stalled: BTreeMap<NodeId, Duration>,
     delivered: u64,
@@ -168,8 +184,22 @@ impl Net {
         }
     }
 
+    /// Makes every RPC between `node` and the others wait for an answer
+    /// that never comes.
+    pub fn hang(&self, node: NodeId, of: impl IntoIterator<Item = NodeId>) {
+        let mut links = self.links();
+        for other in of {
+            if other != node {
+                links.hung.insert((node, other));
+                links.hung.insert((other, node));
+            }
+        }
+    }
+
     pub fn heal(&self) {
-        self.links().cut.clear();
+        let mut links = self.links();
+        links.cut.clear();
+        links.hung.clear();
     }
 
     pub fn stall(&self, node: NodeId, by: Duration) {
@@ -190,6 +220,10 @@ impl Net {
         from: NodeId,
         to: NodeId,
     ) -> Result<Raft<TypeConfig>, RPCError<NodeId, BasicNode, E>> {
+        let hung = self.links().hung.contains(&(from, to));
+        if hung {
+            std::future::pending::<()>().await;
+        }
         let (raft, stall) = {
             let links = self.links();
             let raft = links
@@ -354,6 +388,7 @@ impl Set {
                 let clock = Clock {
                     base,
                     offset: AtomicI64::new(0),
+                    on_read: Mutex::new(None),
                 };
                 (id, Arc::new(clock))
             })

@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use harness::{Options, Set, owner};
-use samplez_replica::Freshness;
-use samplez_replica::entry::{Command, Origin, SessionKey};
-use samplez_replica::peer::{Forwarded, PeerRequest, Refused};
+use samplez_replica::entry::{Body, Command, Origin, SessionKey};
+use samplez_replica::peer::{Forwarded, PeerRequest, PeerResponse, Refused};
+use samplez_replica::{Freshness, MAX_COMMAND_BYTES, MAX_ENTRY_BYTES};
 use samplez_service::ReplicatedState;
 use samplez_service::replica::{Reason, Resolution};
 use tokio::time::Instant;
@@ -102,8 +102,10 @@ async fn quorum_loss_refuses_writes_and_serves_stale_reads_until_it_returns() {
         Freshness::Current
     );
 
+    // Links that drop what they carry: a read that asked for a read
+    // index would wait for its whole timeout.
     for id in set_.ids() {
-        set_.net.isolate(id, set_.ids());
+        set_.net.hang(id, set_.ids());
     }
     // Past the lease, every replica knows it has no quorum.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -184,8 +186,8 @@ async fn a_quiescing_leader_hands_forwarded_commands_to_the_next_leader() {
                 body: b"pan=1@1".to_vec(),
             },
             received: 0,
+            within_ms: 1000,
         }],
-        within_ms: 1000,
     };
     let refused = set_.replica(leader).handle(Some(leader), forward).await;
     assert_eq!(refused, Err(Refused::Quiescing));
@@ -212,5 +214,264 @@ async fn a_quiescing_leader_hands_forwarded_commands_to_the_next_leader() {
     for id in set_.running().collect::<Vec<_>>() {
         let applied = set_.replica(id).store().with_state(|sm| sm.product.applied);
         assert_eq!(applied, 2, "replica {id}: each command applied once");
+    }
+}
+
+fn forwarded(session: &str, id: &str, body: &str, within_ms: u64) -> Forwarded {
+    Forwarded {
+        command: Command {
+            origin: Origin::from(&owner(session)),
+            id: id.into(),
+            at_index: None,
+            body: body.as_bytes().to_vec(),
+        },
+        received: 0,
+        within_ms,
+    }
+}
+
+/// Holds the leader's writer on an entry whose commit waits for the
+/// stalled followers, so what is queued behind it waits too.
+fn hold_the_writer(set_: &Set, leader: u64) -> tokio::task::JoinHandle<()> {
+    for id in others(set_, leader) {
+        set_.net.stall(id, Duration::from_millis(40));
+    }
+    let replica = set_.replica(leader).clone();
+    tokio::spawn(async move {
+        replica
+            .submit(&owner("w"), "hold", Bytes::from("hold=1@1"))
+            .await
+            .expect("committed");
+    })
+}
+
+/// A leader that starts quiescing after it accepted a forward refuses its
+/// commands one by one; the follower resends them to the next leader,
+/// which applies each once.
+#[tokio::test(start_paused = true)]
+async fn commands_refused_one_by_one_by_a_quiescing_leader_reach_the_next_one() {
+    let mut set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let follower = others(&set_, leader)[0];
+    let held = hold_the_writer(&set_, leader);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let sent = tokio::spawn({
+        let replica = set_.replica(follower).clone();
+        async move {
+            replica
+                .submit(&owner("s"), "1", Bytes::from("gain=1@1"))
+                .await
+        }
+    });
+    // Accepted by the leader, queued behind the held entry.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let quiesced = tokio::spawn({
+        let replica = set_.replica(leader).clone();
+        async move { replica.quiesce(Duration::from_secs(1)).await }
+    });
+    held.await.expect("joins");
+    quiesced.await.expect("joins");
+    for id in others(&set_, leader) {
+        set_.net.unstall(id);
+    }
+    assert!(!sent.is_finished(), "held for the next leader");
+    set_.crash(leader).await;
+    let ack = sent
+        .await
+        .expect("joins")
+        .expect("ordered by the next leader");
+    assert_eq!(ack.resolution, Resolution::Applied);
+    set_.applied(ack.revision).await;
+    for id in set_.running().collect::<Vec<_>>() {
+        let values = set_
+            .replica(id)
+            .store()
+            .with_state(|sm| sm.product.values.clone());
+        assert_eq!(values["gain"].1, 1, "replica {id}");
+    }
+}
+
+/// A command answered through a follower is visible on that follower,
+/// also when the leader committed it with another one first.
+#[tokio::test(start_paused = true)]
+async fn a_follower_answers_a_forwarded_command_once_it_applied_it() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let [slow, _] = others(&set_, leader)[..] else {
+        unreachable!()
+    };
+    set_.net.stall(slow, Duration::from_millis(40));
+    let ack = set_
+        .replica(slow)
+        .submit(&owner("s"), "1", Bytes::from("gain=1@1"))
+        .await
+        .expect("committed");
+    let replica = set_.replica(slow);
+    assert!(replica.revision() >= ack.revision, "read your writes");
+    let values = replica.store().with_state(|sm| sm.product.values.clone());
+    assert_eq!(values["gain"].0, "1");
+}
+
+/// The leader orders a forwarded command only within what was left of its
+/// own write timeout, not the group's longest.
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_command_is_not_ordered_after_its_own_deadline() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let held = hold_the_writer(&set_, leader);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let forward = PeerRequest::Forward {
+        commands: vec![
+            forwarded("s", "short", "pan=1@1", 10),
+            forwarded("s", "long", "gain=1@1", 2000),
+        ],
+    };
+    let answered = set_.replica(leader).handle(Some(leader), forward).await;
+    held.await.expect("joins");
+    let Ok(PeerResponse::Forwarded(results)) = answered else {
+        panic!("{answered:?}");
+    };
+    assert_eq!(
+        results[0],
+        Err(Refused::Unavailable("timed out".into())),
+        "its deadline passed while it queued"
+    );
+    assert!(results[1].is_ok());
+    let replica = set_.replica(leader);
+    assert_eq!(replica.command_resolution(&owner("s"), "short"), None);
+    let values = replica.store().with_state(|sm| sm.product.values.clone());
+    assert!(!values.contains_key("pan"));
+}
+
+/// A peer has the leader append its lease renewals and nothing else.
+#[tokio::test(start_paused = true)]
+async fn a_peer_appends_only_lease_renewals() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let append = |body| PeerRequest::Append {
+        body,
+        within_ms: 1000,
+    };
+    let replica = set_.replica(leader);
+    let verdict = Body::ClockVerdict {
+        replica: 1,
+        judged: true,
+    };
+    assert_eq!(
+        replica.handle(Some(leader), append(verdict)).await,
+        Err(Refused::NotForwardable)
+    );
+    assert!(replica.store().with_state(|sm| sm.verdicts.is_empty()));
+    let renewal = Body::LeaseRenew(vec![SessionKey::from_parts("anonymous", "s")]);
+    assert_eq!(
+        replica.handle(Some(leader), append(renewal)).await,
+        Ok(PeerResponse::Appended)
+    );
+}
+
+/// A command too large for the log is refused before it is ordered, and
+/// commands queued together are split into entries of bounded size.
+#[tokio::test(start_paused = true)]
+async fn entries_are_bounded_in_size() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let replica = set_.replica(leader);
+    let big = format!("big={}@1", "x".repeat(MAX_COMMAND_BYTES));
+    let refused = replica
+        .submit(&owner("s"), "big", Bytes::from(big))
+        .await
+        .expect_err("too large");
+    assert_eq!(refused.reason, Reason::TooLarge);
+    assert_eq!(replica.command_resolution(&owner("s"), "big"), None);
+
+    // Queued before the writer runs: without the cap one entry.
+    let half = |n: u64| format!("p{n}={}@1", "x".repeat(MAX_ENTRY_BYTES / 2));
+    let submitted: Vec<_> = (0..3)
+        .map(|n| replica.submit(&owner("s"), &n.to_string(), Bytes::from(half(n))))
+        .collect();
+    let mut revisions = Vec::new();
+    for submit in submitted {
+        revisions.push(submit.await.expect("committed").revision);
+    }
+    revisions.dedup();
+    assert_eq!(revisions.len(), 3, "one entry each: {revisions:?}");
+}
+
+/// openraft's error text names nodes and addresses; a client is told only
+/// that its command was not committed.
+#[tokio::test(start_paused = true)]
+async fn a_client_is_not_shown_openraft_errors() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let replica = set_.replica(leader).clone();
+    // In flight when openraft stops: its proposal fails with openraft's
+    // own error.
+    for id in others(&set_, leader) {
+        set_.net.cut_one_way(leader, id);
+    }
+    let submitted = tokio::spawn({
+        let replica = replica.clone();
+        async move {
+            replica
+                .submit(&owner("s"), "x", Bytes::from("gain=1@1"))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    replica.shutdown().await;
+    let refused = submitted.await.expect("joins").expect_err("stopped");
+    assert_eq!(refused.reason, Reason::Unavailable);
+    assert_eq!(refused.detail, "not committed");
+}
+
+/// A proposal the leader checked its leadership for just before quiesce
+/// set its flag is committed and held by every voter before quiesce
+/// returns.
+#[tokio::test(start_paused = true)]
+async fn quiesce_waits_for_a_proposal_that_raced_its_flag() {
+    let mut options = Options::default();
+    // Followers that do not hear the leader for a while do not call an
+    // election meanwhile.
+    options.raft.election_timeout_min = 4000;
+    options.raft.election_timeout_max = 5000;
+    let set_ = Set::start(options).await;
+    let leader = set_.leader().await;
+    let replica = set_.replica(leader).clone();
+    // The writer stamps the entry after its leadership check; quiesce
+    // starts right there, before the proposal reaches openraft.
+    let submitted = replica.submit(&owner("s"), "1", Bytes::from("gain=1@1"));
+    let stamped = set_.clock(leader).next_read();
+    let quiesce = tokio::spawn({
+        let replica = replica.clone();
+        async move {
+            let _ = stamped.await;
+            replica.quiesce(Duration::from_secs(5)).await
+        }
+    });
+    // The entry reaches the followers only after quiesce has looked.
+    for id in others(&set_, leader) {
+        set_.net.cut_one_way(leader, id);
+    }
+    let committed = async {
+        let ack = submitted.await.expect("committed");
+        (ack, Instant::now())
+    };
+    let heal = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        set_.net.heal();
+    };
+    let quiesced = async {
+        quiesce.await.expect("joins");
+        Instant::now()
+    };
+    let ((ack, committed_at), (), quiesced_at) = tokio::join!(committed, heal, quiesced);
+    assert!(
+        committed_at <= quiesced_at,
+        "quiesce returned before the entry committed"
+    );
+    let metrics = replica.raft().metrics().borrow().clone();
+    for id in others(&set_, leader) {
+        let matched = metrics.replication.as_ref().unwrap()[&id];
+        assert!(matched.is_some_and(|m| m.index >= ack.revision), "{id}");
     }
 }

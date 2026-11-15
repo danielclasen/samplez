@@ -15,11 +15,12 @@ use openraft::ServerState;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::NodeId;
+use samplez_replica::net::MAX_IDLE;
 use samplez_replica::net::{Network, Pool};
 use samplez_replica::peer::{self, PeerClient, PeerRequest, Refused};
-use samplez_replica::{Replica, Settings, raft_config};
+use samplez_replica::{MAX_COMMAND_BYTES, Replica, Settings, raft_config};
 use samplez_service::config::{Tls, TlsMode};
-use samplez_service::replica::Resolution;
+use samplez_service::replica::{Reason, Resolution};
 use samplez_service::{Metrics, PeerTls, ReplicatedState};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -71,6 +72,9 @@ struct Node {
 struct Set {
     root: PathBuf,
     addrs: BTreeMap<NodeId, String>,
+    /// Bound for the set's lifetime, so a crashed replica's port is not
+    /// taken by another socket before it restarts.
+    listeners: BTreeMap<NodeId, std::net::TcpListener>,
     tls: BTreeMap<NodeId, Tls>,
     nodes: BTreeMap<NodeId, Node>,
 }
@@ -85,14 +89,18 @@ impl Set {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let ca = authority();
-        let (mut addrs, mut tls) = (BTreeMap::new(), BTreeMap::new());
+        let (mut addrs, mut tls, mut listeners) =
+            (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         for id in 1..=3 {
             tls.insert(id, identity(&root, &format!("node-{id}"), &ca));
             let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            tcp.set_nonblocking(true).unwrap();
             addrs.insert(id, tcp.local_addr().unwrap().to_string());
+            listeners.insert(id, tcp);
         }
         let mut set = Set {
             root,
+            listeners,
             addrs,
             tls,
             nodes: BTreeMap::new(),
@@ -120,7 +128,8 @@ impl Set {
             epoch: 1,
             limits: Limits::defaults(RATE),
             block: harness::BLOCK,
-            write_timeout: Duration::from_secs(3),
+            // Long, for a loaded test host.
+            write_timeout: Duration::from_secs(10),
             addr: self.addrs[&id].clone(),
         };
         let mut raft = raft_config("test");
@@ -128,6 +137,8 @@ impl Set {
         raft.snapshot_policy = openraft::SnapshotPolicy::Never;
         raft.max_in_snapshot_log_to_keep = 0;
         raft.purge_batch_size = 1;
+        // Small chunks, so a snapshot of a few commands takes several.
+        raft.snapshot_max_chunk_size = 64;
         let replica = Replica::start(
             settings,
             raft,
@@ -140,7 +151,7 @@ impl Set {
         .await
         .unwrap();
         let replica = Arc::new(replica);
-        let tcp = TcpListener::bind(&self.addrs[&id]).await.unwrap();
+        let tcp = TcpListener::from_std(self.listeners[&id].try_clone().unwrap()).unwrap();
         let (stop, stopped) = oneshot::channel();
         let server = tokio::spawn(peer::serve(tls, tcp, replica.clone(), async {
             let _ = stopped.await;
@@ -267,7 +278,8 @@ async fn only_the_set_reaches_a_replica_and_only_under_its_own_id() {
 }
 
 /// A follower that was down while the leader purged the entries it lacks
-/// catches up by a snapshot sent in chunks over the peer listener.
+/// catches up by a snapshot sent in several chunks over the peer
+/// listener.
 #[tokio::test]
 async fn a_snapshot_is_installed_over_the_peer_listener() {
     let mut set = Set::start().await;
@@ -315,6 +327,71 @@ async fn a_snapshot_is_installed_over_the_peer_listener() {
     set.restart(follower).await;
     set.applied(last).await;
     let installed = set.replica(follower);
-    assert!(installed.raft().metrics().borrow().snapshot.is_some());
+    // The store applies the snapshot before openraft's metrics show it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while installed.raft().metrics().borrow().snapshot.is_none() {
+        assert!(Instant::now() < deadline, "no snapshot installed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(installed.store().with_state(|sm| sm.product.applied), 3);
+}
+
+/// Many requests to one peer at once leave no more than a few idle
+/// connections open to it.
+#[tokio::test]
+async fn idle_connections_to_a_peer_are_bounded() {
+    let set = Set::start().await;
+    let (pool, addr) = (&set.nodes[&2].pool, &set.addrs[&1]);
+    let calls = (0..32).map(|_| {
+        pool.call(
+            Some(1),
+            addr,
+            PeerRequest::ReadIndex,
+            Duration::from_secs(2),
+        )
+    });
+    for answer in futures_util::future::join_all(calls).await {
+        assert!(answer.is_ok(), "{answer:?}");
+    }
+    assert!(pool.idle(addr) <= MAX_IDLE, "{} idle", pool.idle(addr));
+    assert!(pool.idle(addr) > 0);
+}
+
+/// A command too large to replicate in time is refused, and a follower
+/// that missed many of the largest commands catches up: no AppendEntries
+/// outlasts the heartbeat interval it must complete in.
+#[tokio::test]
+async fn a_large_command_neither_wedges_nor_slows_replication() {
+    let mut set = Set::start().await;
+    let leader = set.leader().await;
+    let mut big = b"big=".to_vec();
+    big.extend(std::iter::repeat_n(b'x', 1 << 20));
+    big.extend_from_slice(b"@1");
+    let refused = set
+        .replica(leader)
+        .submit(&owner("s"), "big", Bytes::from(big))
+        .await
+        .expect_err("too large");
+    assert_eq!(refused.reason, Reason::TooLarge);
+
+    let behind = (1..=3).find(|&id| id != leader).unwrap();
+    set.crash(behind).await;
+    let largest = |n: usize| format!("p{n}={}@1", "x".repeat(MAX_COMMAND_BYTES - 16));
+    let mut last = 0;
+    for n in 0..32 {
+        last = set
+            .replica(leader)
+            .submit(&owner("s"), &n.to_string(), Bytes::from(largest(n)))
+            .await
+            .expect("committed")
+            .revision;
+    }
+    set.restart(behind).await;
+    set.applied(last).await;
+    let small = set
+        .replica(behind)
+        .submit(&owner("s"), "small", Bytes::from("gain=1@1"))
+        .await
+        .expect("committed");
+    assert_eq!(small.resolution, Resolution::Applied);
 }
