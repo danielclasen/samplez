@@ -6,6 +6,8 @@
 //! return ring; the whole state goes back to the supervisor when the loop
 //! ends, also when it panics.
 
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::Release};
@@ -1252,6 +1254,14 @@ impl Rt {
             }
         }
     }
+}
+
+/// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez"`,
+/// clippy must refuse this lock and this sleep.
+#[cfg(samplez_lint_probe = "samplez")]
+pub fn lint_probe(m: &std::sync::Mutex<()>) {
+    let _guard = m.lock();
+    std::thread::sleep(std::time::Duration::from_millis(1));
 }
 
 #[cfg(test)]

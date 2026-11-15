@@ -4,6 +4,8 @@
 //! Every `process` function works on state and scratch allocated at
 //! construction and does not allocate.
 
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("samplez-dsp supports x86_64 only");
 
@@ -29,3 +31,11 @@ pub use meter::Meters;
 pub use mxcsr::{DAZ, FTZ, SavedMxcsr, mxcsr, restore_mxcsr, set_ftz_daz};
 pub use ramp::{MAX_GAIN, MAX_RAMP_LEN, Ramp, valid_gain};
 pub use true_peak::TruePeak;
+
+/// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez-dsp"`,
+/// clippy must refuse this lock and this sleep.
+#[cfg(samplez_lint_probe = "samplez-dsp")]
+pub fn lint_probe(m: &std::sync::Mutex<()>) {
+    let _guard = m.lock();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+}

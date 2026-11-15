@@ -6,6 +6,8 @@
 //! reader or group releases it in libmxl (munmap, instance mutex), and
 //! dropping a generation destroys its instance.
 
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::sync::Arc;
 
 use mxl_sys::{

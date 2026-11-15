@@ -86,18 +86,23 @@ The binary is `src/bin/samplez-hop.rs`, built with the library.
 ## Real-time requirements
 
 The RT thread does not allocate once its loop runs (`tests/no_alloc.rs`
-checks it). Its real-time functions, which exclude libmxl's sync-group
-wait and `mxlSleepUntil`, also pass RealtimeSanitizer (`tests/rtsan.rs`,
-built with `-Zsanitizer=realtime --cfg samplez_rtsan` on the nightly):
-the one blocking call inside them is the `FUTEX_WAKE` of libmxl's output
-commit, allowed at that call site. `cargo bench --bench rt` in
-samplez-dsp and samplez-mxl fails when the instruction count of a block's
-DSP or of an output commit, gap zero-fill included, exceeds the limit in
-the benchmark. One failure path is excepted from the no-allocation rule,
-and its probe is allowed by call site under RealtimeSanitizer: while an input is late,
-libmxl's flow validity check, one `stat()` and path allocations, can
-run on the RT thread. It ends when the input is pruned, after
-`pruneAfterBlocks` blocks of a frozen head, or twice the producer's
+checks it). The loop also passes RealtimeSanitizer (`tests/rtsan.rs`,
+built with `-Zsanitizer=realtime --cfg samplez_rtsan` on the nightly),
+which aborts on allocations, pthread locks, blocking syscalls and the
+sleeps its runtime intercepts. Allowed by call site are the calls that
+block by design: libmxl's sync-group wait, `mxlSleepUntil` and the
+`FUTEX_WAKE` of the output commit. RealtimeSanitizer does not see an
+uncontended std lock, which makes no libc call, nor
+`std::thread::sleep`, which calls `clock_nanosleep`; clippy denies those
+and the other blocking std primitives listed in `clippy.toml` in the RT
+modules. `cargo bench --bench rt` in samplez-dsp and samplez-mxl fails
+when the instruction count of a block's DSP or of an output commit, gap
+zero-fill included, exceeds the limit in the benchmark. One failure path
+is excepted from the no-allocation rule, and its probe is allowed by
+call site under RealtimeSanitizer: while an input is late, libmxl's flow
+validity check, one `stat()` and path allocations, can run on the RT
+thread. It ends when the input is pruned, after `pruneAfterBlocks`
+blocks of a frozen head, or twice the producer's
 `maxCommitBatchSizeHint` plus `readerMarginSamples` when that is longer.
 
 The host needs swap off and `vm.compact_unevictable_allowed=0`, so that

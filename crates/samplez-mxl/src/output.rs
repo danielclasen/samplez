@@ -1,6 +1,8 @@
 //! Writing MXL audio flows: the flow definition, creation on the
 //! supervisor side and the RT block write.
 
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::ffi::CString;
 use std::sync::Arc;
 
@@ -287,6 +289,14 @@ impl Drop for FlowWriter {
                 .release_flow_writer(self.instance.raw(), self.raw)
         };
     }
+}
+
+/// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez-mxl"`,
+/// clippy must refuse this lock and this sleep.
+#[cfg(samplez_lint_probe = "samplez-mxl")]
+pub fn lint_probe(m: &std::sync::Mutex<()>) {
+    let _guard = m.lock();
+    std::thread::sleep(std::time::Duration::from_millis(1));
 }
 
 #[cfg(test)]

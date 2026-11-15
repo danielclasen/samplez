@@ -5,6 +5,8 @@
 //! Block `k` covers the indices `[kB, (k + 1)B)`. Index arithmetic
 //! saturates at `u64::MAX` instead of overflowing.
 
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use mxl_sys::Rational;
 
 use crate::{MxlApi, SAMPLE_RATE};

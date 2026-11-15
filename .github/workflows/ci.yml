@@ -46,6 +46,21 @@ jobs:
             -w /w samplez-builder:ci bash -euo pipefail -c '
               cargo fmt --all --check
               cargo clippy --workspace --all-targets --locked -- -D warnings
+              # The lint probe: a lock and a sleep in each RT crate must fail
+              # clippy (clippy.toml).
+              for probe in samplez:src/rt_loop.rs \
+                samplez-mxl:crates/samplez-mxl/src/output.rs \
+                samplez-dsp:crates/samplez-dsp/src/lib.rs; do
+                if cargo clippy -p "${probe%%:*}" --lib --locked -- -D warnings \
+                  --cfg "samplez_lint_probe=\"${probe%%:*}\"" 2> lint-probe.log; then
+                  echo "the lint probe in ${probe#*:} passed clippy" >&2
+                  exit 1
+                fi
+                for what in "disallowed type" "disallowed method"; do
+                  grep -A1 "$what" lint-probe.log | grep -q -- "--> ${probe#*:}" \
+                    || { cat lint-probe.log >&2; echo "no $what in ${probe#*:}" >&2; exit 1; }
+                done
+              done
               cargo test --workspace --locked
               cargo test --workspace --locked --release
             '
