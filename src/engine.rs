@@ -24,7 +24,7 @@ use samplez_mxl::input::{
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
 
-use crate::blocks::{BlockStatus, Cause, Hold, StatusChange, Statuses};
+use crate::blocks::{BlockStatus, Cause, Hold, PAGE, PageHash, Pages, StatusChange, Statuses};
 use crate::config::Config;
 use crate::meters::{OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
@@ -44,6 +44,8 @@ const RESETS_PER_OUTPUT: usize = 4;
 /// Status changes the change ring holds per output, and the fewest
 /// status words per output.
 const CHANGES_PER_OUTPUT: usize = 1024;
+/// Page hashes the hash ring holds per output: 1.4 s of pages at 48 kHz.
+const HASHES_PER_OUTPUT: usize = 64;
 const MIN_STATUS_SLOTS: usize = 64;
 const SUPERVISOR_TICK: Duration = Duration::from_millis(5);
 const POLL_PERIOD: Duration = Duration::from_millis(100);
@@ -307,6 +309,13 @@ pub struct Replication {
     /// `status_changes_unsent`, one the RT thread's ring had no room for in
     /// `status_changes_dropped`.
     pub statuses: Option<SyncSender<StatusChange>>,
+    /// Where the page hashes go: with more than one voter, each page of
+    /// each realised output the engine computed wholly, in every commit
+    /// mode, once every block overlapping it is final. One the channel
+    /// has no room for is counted in `page_hashes_unsent`, one the RT
+    /// thread could not send in `page_hashes_dropped`. None, or one
+    /// voter: no page is hashed.
+    pub hashes: Option<SyncSender<PageHash>>,
 }
 
 /// Why the engine refused a replication control.
@@ -556,9 +565,9 @@ impl Engine {
         verdicts: Option<SyncSender<BlockVerdict>>,
         replication: Option<Replication>,
     ) -> Result<Engine, Error> {
-        let (reports, status_tx, voters) = match replication {
-            Some(r) => (Some(r.reports), r.statuses, r.voters),
-            None => (None, None, 0),
+        let (reports, status_tx, voters, hash_tx) = match replication {
+            Some(r) => (Some(r.reports), r.statuses, r.voters, r.hashes),
+            None => (None, None, 0, None),
         };
         let api = samplez_mxl::load(&config.libmxl).map_err(Error::Mxl)?;
         let b = u64::from(config.block_size);
@@ -615,8 +624,16 @@ impl Engine {
             rtrb::RingBuffer::new((RESETS_PER_OUTPUT * config.outputs.len()).max(1));
         let hold_blocks = config.hold_blocks();
         let alone = voters == 1;
-        let (replica, rt_replica, change_rx) = if reports.is_some() {
-            let slots = (4 * hold_blocks).next_power_of_two().max(MIN_STATUS_SLOTS);
+        let hash_tx = hash_tx.filter(|_| reports.is_some() && !alone);
+        let (replica, rt_replica, change_rx, hash_rx) = if reports.is_some() {
+            // A page's first settle reads the status of each of its
+            // blocks, up to a page back, while the supervisor may set
+            // statuses ahead: the ring holds two pages of blocks.
+            let page_blocks = 2 * PAGE.div_ceil(b) as usize;
+            let slots = (4 * hold_blocks)
+                .max(page_blocks)
+                .next_power_of_two()
+                .max(MIN_STATUS_SLOTS);
             let shared = Arc::new(Shared {
                 fence: AtomicU64::new(if alone { u64::MAX } else { 0 }),
                 rank: AtomicU64::new(0),
@@ -634,6 +651,21 @@ impl Engine {
                 .is_ok()
             {}
             while change_rx.pop().is_ok() {}
+            let hashes = if hash_tx.is_some() {
+                HASHES_PER_OUTPUT * config.outputs.len()
+            } else {
+                0
+            };
+            let (mut hashes_tx, mut hashes_rx) = rtrb::RingBuffer::new(hashes.max(1));
+            let blank = PageHash {
+                output: 0,
+                page: 0,
+                hash: 0,
+                fingerprint: 0,
+                committed: false,
+            };
+            while hashes_tx.push(blank).is_ok() {}
+            while hashes_rx.pop().is_ok() {}
             let (control_tx, control_rx) = rtrb::RingBuffer::new(UNRESOLVED);
             let rt_replica = Replica {
                 shared: Arc::clone(&shared),
@@ -643,6 +675,7 @@ impl Engine {
                 ids: Vec::with_capacity(UNRESOLVED + PENDING_CHANGES),
                 late_routes: Vec::with_capacity(PENDING_CHANGES),
                 late_lost_until: 0,
+                hashes: hashes_tx,
             };
             let control = ReplicaControl {
                 ring: control_tx,
@@ -652,9 +685,10 @@ impl Engine {
                 Some((shared, Mutex::new(control))),
                 Some(rt_replica),
                 Some(change_rx),
+                hash_tx.is_some().then_some(hashes_rx),
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let mut in_domains: Vec<usize> = Vec::new();
@@ -685,7 +719,7 @@ impl Engine {
         }
         let mut outs = Vec::new();
         let mut channel = 0;
-        for o in &config.outputs {
+        for (n, o) in config.outputs.iter().enumerate() {
             outs.push(Out {
                 first_channel: channel,
                 channels: o.channels as usize,
@@ -697,6 +731,9 @@ impl Engine {
                 } else {
                     Hold::new(o.channels as usize, b, 0, true)
                 },
+                pages: hash_tx
+                    .is_some()
+                    .then(|| Pages::new(n as u32, o.channels as usize, b, hold_blocks)),
             });
             channel += o.channels as usize;
         }
@@ -724,7 +761,14 @@ impl Engine {
             statuses: (0..in_domains.len()).map(|_| GroupWait::Skipped).collect(),
             slots,
             outs,
-            mix: Mix::new(matrix, b, config.ramp_samples),
+            mix: Mix {
+                page_entries: Vec::with_capacity(if hash_tx.is_some() {
+                    PENDING_CHANGES * PAGE.div_ceil(b) as usize
+                } else {
+                    0
+                }),
+                ..Mix::new(matrix, b, config.ramp_samples)
+            },
             inbuf: PlanarBuffer::new(n, b as usize),
             outbuf: PlanarBuffer::new(m, b as usize),
             scratch: vec![0.0; widest * b as usize],
@@ -866,6 +910,8 @@ impl Engine {
             next_meter_seq: 0,
             change_rx,
             status_tx,
+            hash_rx,
+            hash_tx,
             shared: replica.as_ref().map(|r| Arc::clone(&r.0)),
             alone,
             batch: if replica.is_some() && !alone {
@@ -1411,6 +1457,9 @@ struct Supervisor {
     /// The RT thread's status changes and where they go.
     change_rx: Option<rtrb::Consumer<StatusChange>>,
     status_tx: Option<SyncSender<StatusChange>>,
+    /// The RT thread's page hashes and where they go.
+    hash_rx: Option<rtrb::Consumer<PageHash>>,
+    hash_tx: Option<SyncSender<PageHash>>,
     /// The longest range a member flow's writer commits at once: B, or
     /// the hold ring.
     batch: u64,
@@ -1442,6 +1491,7 @@ impl Supervisor {
             }
             self.telemetry();
             self.status_changes();
+            self.page_hashes();
             self.meters();
             self.log_messages();
             self.jobs();
@@ -1570,6 +1620,18 @@ impl Supervisor {
                 && let Err(TrySendError::Full(_)) = tx.try_send(c)
             {
                 self.counters.status_changes_unsent.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// Passes the RT thread's page hashes on.
+    fn page_hashes(&mut self) {
+        let (Some(rx), Some(tx)) = (&mut self.hash_rx, &self.hash_tx) else {
+            return;
+        };
+        while let Ok(h) = rx.pop() {
+            if let Err(TrySendError::Full(_)) = tx.try_send(h) {
+                self.counters.page_hashes_unsent.fetch_add(1, Relaxed);
             }
         }
     }
@@ -2544,6 +2606,7 @@ mod tests {
             voters: 2,
             reports: report_tx,
             statuses: Some(status_tx),
+            hashes: None,
         };
         let e = Engine::start_replicated(config, process, None, replication).unwrap();
         let processed = || e.counters().processed.load(Acquire);
@@ -2628,6 +2691,7 @@ mod tests {
                 voters: 2,
                 reports: report_tx,
                 statuses: None,
+                hashes: None,
             };
             let e = Engine::start_replicated(config, process, None, replication).unwrap();
             let processed = || e.counters().processed.load(Acquire);
@@ -2735,10 +2799,14 @@ mod tests {
         let (report_tx, _reports) = mpsc::sync_channel(1);
         let (status_tx, changes) = mpsc::sync_channel(1 << 20);
         let (verdict_tx, verdicts) = mpsc::sync_channel(1 << 20);
+        // Hashed, so the clock-step and skip paths run through the page
+        // hashes too (also under RealtimeSanitizer); nobody reads them.
+        let (hash_tx, _) = mpsc::sync_channel(1);
         let replication = Replication {
             voters,
             reports: report_tx,
             statuses: Some(status_tx),
+            hashes: Some(hash_tx),
         };
         let e = Engine::start_replicated(config, process, Some(verdict_tx), replication).unwrap();
         wait(&|| e.status().outputs.iter().all(|o| o.realised));
@@ -2834,6 +2902,342 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// With 16-sample blocks and a short hold a page is 64 blocks, as
+    /// many as four times the hold ring: a block a page after the
+    /// first block of a page, withheld ahead by the supervisor, must not
+    /// take that block's status before the page settles, which reads it.
+    #[test]
+    fn a_status_set_ahead_keeps_a_page_committed_at_blocks_of_16() {
+        use crate::blocks::PAGE;
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let run = || -> Option<String> {
+            let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+            let domain = std::env::temp_dir().join(format!("samplez-b16-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&domain);
+            std::fs::create_dir(&domain).unwrap();
+            let id = "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d61";
+            let v = serde_json::json!({
+                "libmxl": libmxl,
+                "blockSize": 16,
+                // A stall under load is caught up rather than skipped.
+                "maxCatchupBlocks": 300,
+                "holdMs": 2,
+                "contactWindowMs": 2,
+                "domains": [{ "name": "d", "path": domain }],
+                "outputs": [{ "name": id, "domain": "d", "flowId": id, "label": "b16",
+                              "group": "b16", "role": "Audio", "channels": 1 }],
+                "matrix": [],
+                "rt": { "enabled": false, "rtCpu": "none" },
+            });
+            let config = Config::parse(&v.to_string()).unwrap();
+            assert!(4 * config.hold_blocks() <= 64, "{}", config.hold_blocks());
+            let process = rt::setup_process(&config.rt);
+            let (report_tx, _reports) = mpsc::sync_channel(64);
+            let (hash_tx, hashes) = mpsc::sync_channel(1 << 16);
+            let replication = Replication {
+                voters: 2,
+                reports: report_tx,
+                statuses: None,
+                hashes: Some(hash_tx),
+            };
+            let e = Engine::start_replicated(config, process, None, replication).unwrap();
+            let processed = || e.counters().processed.load(Acquire);
+            wait(&|| e.status().outputs[0].realised);
+            e.set_fence(u64::MAX).unwrap();
+            let c = e.counters();
+            // A skip or an overflow from the commit start on withdraws
+            // the replica.
+            let base = (
+                c.overrun_skipped_samples.load(Relaxed),
+                c.hold_overflows.load(Relaxed),
+            );
+            e.commit_from(0, processed() + 2).unwrap();
+            let per = PAGE / 16;
+            let k0 = (processed() + 4) / per * per + per;
+            wait(&|| processed() > k0);
+            let disturbed = if processed() > k0 + per / 2 {
+                Some(format!("block {k0} computed late"))
+            } else {
+                assert!(
+                    e.withhold(0, k0 + per, Cause::FenceDeadline)
+                        .unwrap()
+                        .is_some()
+                );
+                let page = k0 * 16 / PAGE;
+                let t = Instant::now();
+                let record = loop {
+                    assert!(
+                        t.elapsed() < Duration::from_secs(5),
+                        "page {page} not settled"
+                    );
+                    match hashes.recv_timeout(Duration::from_millis(100)) {
+                        Ok(h) if h.page >= page => break h,
+                        _ => {}
+                    }
+                };
+                let skipped = c.overrun_skipped_samples.load(Relaxed) - base.0;
+                let overflows = c.hold_overflows.load(Relaxed) - base.1;
+                if skipped > 0 || overflows > 0 {
+                    Some(format!("{skipped} samples skipped, {overflows} overflows"))
+                } else {
+                    assert_eq!(record.page, page, "{record:?}");
+                    assert!(record.committed, "{record:?}");
+                    None
+                }
+            };
+            e.stop();
+            std::fs::remove_dir_all(&domain).unwrap();
+            disturbed
+        };
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            match run() {
+                None => return,
+                Some(why) => {
+                    eprintln!("run disturbed ({why}): running it again");
+                    seen.push(why);
+                }
+            }
+        }
+        panic!("every run was disturbed: {seen:?}");
+    }
+
+    /// An `InputDown`, `InputUp` or `Route` entry that reaches the RT
+    /// thread after its index, while it still computes the page holding
+    /// that index, is reported late, not applied, and left out of the
+    /// page's fingerprint.
+    #[test]
+    fn a_late_input_entry_is_left_out_of_the_fingerprint() {
+        use crate::blocks::{HEALTHY, PAGE};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        // A run an overrun skip or a slow pickup disturbed is run again.
+        let run = || -> Option<String> {
+            let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+            let domain =
+                std::env::temp_dir().join(format!("samplez-latefp-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&domain);
+            std::fs::create_dir(&domain).unwrap();
+            let (src, next, out) = (
+                "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d51",
+                "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d52",
+                "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d53",
+            );
+            let v = serde_json::json!({
+                "libmxl": libmxl,
+                "domains": [{ "name": "d", "path": domain }],
+                "inputs": [{ "name": "in", "domain": "d", "flowId": src, "channels": 1 }],
+                "outputs": [{ "name": out, "domain": "d", "flowId": out, "label": "latefp",
+                              "group": "latefp", "role": "Audio", "channels": 1 }],
+                "matrix": [[1.0]],
+                "rt": { "enabled": false, "rtCpu": "none" },
+            });
+            let config = Config::parse(&v.to_string()).unwrap();
+            let process = rt::setup_process(&config.rt);
+            let (report_tx, _reports) = mpsc::sync_channel(64);
+            let (hash_tx, hashes) = mpsc::sync_channel(1 << 16);
+            let replication = Replication {
+                voters: 2,
+                reports: report_tx,
+                statuses: None,
+                hashes: Some(hash_tx),
+            };
+            let e = Engine::start_replicated(config, process, None, replication).unwrap();
+            let processed = || e.counters().processed.load(Acquire);
+            wait(&|| e.status().outputs[0].realised);
+            // Hashed from the writer's first block on: the page it falls
+            // in is not hashed whole.
+            let begun = processed() * 48 / PAGE;
+            // A few blocks into a later page, with room left in it.
+            let t = Instant::now();
+            let p0 = loop {
+                let p = processed();
+                let off = p * 48 % PAGE;
+                if p * 48 / PAGE > begun && off >= 4 * 48 && off + 10 * 48 < PAGE {
+                    break p;
+                }
+                assert!(t.elapsed() < Duration::from_secs(5), "no page entered");
+                std::thread::sleep(Duration::from_micros(200));
+            };
+            let page = p0 * 48 / PAGE;
+            let at = (page * PAGE).next_multiple_of(48);
+            assert!(at < p0 * 48);
+            e.append(1, at, Entry::InputDown { slot: 0 }).unwrap();
+            e.append(2, at, Entry::InputUp { slot: 0 }).unwrap();
+            let route = Entry::Route {
+                slot: 0,
+                flow_id: next.to_owned(),
+            };
+            e.append(3, at, route).unwrap();
+            e.commit(3);
+            wait(&|| e.counters().entries_consumed.load(Acquire) >= 3);
+            let p1 = processed();
+            let c = e.counters();
+            let disturbed = if p1 * 48 / PAGE != page {
+                Some(format!("entries taken in block {p1}, past page {page}"))
+            } else {
+                assert_eq!(c.command_late.load(Relaxed), 3);
+                let t = Instant::now();
+                let record = loop {
+                    assert!(
+                        t.elapsed() < Duration::from_secs(5),
+                        "page {page} not settled"
+                    );
+                    match hashes.recv_timeout(Duration::from_millis(100)) {
+                        Ok(h) if h.page >= page => break h,
+                        _ => {}
+                    }
+                };
+                if record.page != page {
+                    let skipped = c.overrun_skipped_samples.load(Relaxed);
+                    let dropped = c.page_hashes_dropped.load(Relaxed);
+                    assert!(
+                        skipped > 0,
+                        "no record for page {page} ({dropped} dropped, taken by block \
+                         {p1}, from {p0}): {record:?}"
+                    );
+                    Some(format!("{skipped} samples skipped"))
+                } else {
+                    assert_eq!(record.fingerprint, HEALTHY, "{record:?}");
+                    None
+                }
+            };
+            e.stop();
+            std::fs::remove_dir_all(&domain).unwrap();
+            disturbed
+        };
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            match run() {
+                None => return,
+                Some(why) => {
+                    eprintln!("run disturbed ({why}): running it again");
+                    seen.push(why);
+                }
+            }
+        }
+        panic!("every run was disturbed: {seen:?}");
+    }
+
+    /// Page hashes through an overrun skip and clock steps either way:
+    /// no page missing a skipped block gets a record, every page gets at
+    /// most one, and pages before and after the skips get theirs. The
+    /// RealtimeSanitizer gate runs it as well.
+    #[test]
+    fn page_hashes_leave_out_the_pages_a_skip_cut() {
+        use crate::blocks::PAGE;
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let _unshift = Unshift;
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-hashes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let id = "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d41";
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "domains": [{ "name": "d", "path": domain }],
+            "outputs": [{ "name": id, "domain": "d", "flowId": id, "label": "hashes",
+                          "group": "hashes", "role": "Audio", "channels": 1 }],
+            "matrix": [],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let process = rt::setup_process(&config.rt);
+        let (report_tx, _reports) = mpsc::sync_channel(1);
+        let (status_tx, changes) = mpsc::sync_channel(1 << 20);
+        let (hash_tx, hashes) = mpsc::sync_channel(1 << 20);
+        let replication = Replication {
+            voters: 2,
+            reports: report_tx,
+            statuses: Some(status_tx),
+            hashes: Some(hash_tx),
+        };
+        let e = Engine::start_replicated(config, process, None, replication).unwrap();
+        let processed = || e.counters().processed.load(Acquire);
+        wait(&|| e.status().outputs[0].realised);
+        committing(&e, 1);
+        let first = processed();
+        // A page hashed whole from the commit start on, before the stall.
+        let mut pages: Vec<u64> = Vec::new();
+        let t = Instant::now();
+        while pages.last().is_none_or(|&p| p * PAGE < first * 48) {
+            assert!(t.elapsed() < Duration::from_secs(10), "no page hashed");
+            pages.extend(
+                hashes
+                    .recv_timeout(Duration::from_millis(100))
+                    .map(|h| h.page),
+            );
+        }
+        let stalled = processed();
+
+        crate::rt_loop::STALL_MS.store(40, Relaxed);
+        let mut seen = Vec::new();
+        let t = Instant::now();
+        while !seen
+            .iter()
+            .any(|c| matches!(c, StatusChange::Skipped { from, to } if to - from >= 20 && *from >= stalled))
+        {
+            assert!(t.elapsed() < Duration::from_secs(5), "no skip");
+            seen.extend(changes.recv_timeout(Duration::from_millis(100)));
+        }
+        let steps = || e.counters().clock_steps.load(Relaxed);
+        let before = steps();
+        crate::rt_loop::CLOCK_STEP_NS.store(60_000_000, Relaxed);
+        wait(&|| steps() > before);
+        crate::rt_loop::CLOCK_STEP_NS.store(-60_000_000, Relaxed);
+        wait(&|| steps() > before + 1);
+        // A page hashed whole after the steps; an overrun skip under load
+        // only delays it.
+        let last = processed() * 48 / PAGE;
+        let t = Instant::now();
+        while pages.last().is_none_or(|&p| p <= last) {
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "no page after the steps"
+            );
+            pages.extend(
+                hashes
+                    .recv_timeout(Duration::from_millis(100))
+                    .map(|h| h.page),
+            );
+        }
+        // Every skip before that page's record was sent first.
+        seen.extend(changes.try_iter());
+
+        let skips: Vec<(u64, u64)> = seen
+            .iter()
+            .filter_map(|c| match *c {
+                StatusChange::Skipped { from, to } if to > from => Some((from * 48, to * 48)),
+                _ => None,
+            })
+            .collect();
+        assert!(skips.len() >= 2, "{skips:?}");
+        for &p in &pages {
+            let (start, end) = (p * PAGE, (p + 1) * PAGE);
+            assert!(
+                !skips.iter().any(|&(f, t)| f < end && start < t),
+                "page {p} hashed over a skip: {skips:?}"
+            );
+        }
+        assert!(pages.windows(2).all(|w| w[0] < w[1]), "{pages:?}");
+        // A page hashed whole between the commit start and the stall.
+        let stall = skips
+            .iter()
+            .find(|s| s.1 - s.0 >= 20 * 48 && s.0 >= stalled * 48)
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|&p| p * PAGE >= first * 48 && (p + 1) * PAGE <= stall.0),
+            "{pages:?}"
+        );
+        assert_eq!(e.counters().page_hashes_dropped.load(Relaxed), 0);
         e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
     }

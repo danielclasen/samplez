@@ -4,8 +4,8 @@
 //! generation is swapped in at its index with a fade-in, a re-route
 //! crossfade, a gain ramp, output metering and a loudness reset, and,
 //! for a replicated engine, every path of the hold ring (see
-//! `common::hold_scenario`). libmxl's own C++ allocations are not seen by
-//! this allocator.
+//! `common::hold_scenario`) with its pages hashed. libmxl's own C++
+//! allocations are not seen by this allocator.
 
 mod common;
 
@@ -93,13 +93,22 @@ fn rt_thread_allocates_nothing_holding_blocks() {
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
-    let engine = common::start_held(&domain.0, &src, &dst, 2);
+    let (engine, hashes) = common::start_held(&domain.0, &src, &dst, 2);
     RT_TID.store(engine.status().rt.thread.tid, Relaxed);
     common::hold_scenario(&engine);
     RT_TID.store(0, Relaxed);
     let c = engine.counters();
     assert!(c.hold_overflows.load(Relaxed) > 0);
     assert!(c.blocks_withheld.load(Relaxed) > 0);
+    // Pages were hashed, entries fingerprinted.
+    let hashes: Vec<_> = hashes.try_iter().collect();
+    assert!(
+        hashes
+            .iter()
+            .any(|h| h.fingerprint != samplez::blocks::HEALTHY),
+        "no page with an entry hashed of {}",
+        hashes.len()
+    );
     assert_no_rt_calls();
     engine.stop();
 }

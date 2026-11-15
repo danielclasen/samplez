@@ -91,7 +91,11 @@ boundary. Each block carries a digest of what degraded it: inputs whose
 read failed, entries applied without their generation and unresolved
 entries (`unresolved`). A writer commits a range of up to the ring's
 length, and an output whose flow ring is not twice that is not
-realised.
+realised. Each page of each realised output the engine computes whole,
+in every commit mode, is hashed (XXH3-64 over its samples' f32 bit
+patterns, channels interleaved per index) and sent as a `PageHash`
+once every block overlapping it is final, with the fingerprint of the
+log entries applied in it and whether the page was committed whole.
 
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
 against CLOCK_MONOTONIC at each wake, when it also samples the kernel
@@ -129,15 +133,15 @@ uncontended std lock, which makes no libc call, nor
 `std::thread::sleep`, which calls `clock_nanosleep`; clippy denies those
 and the other blocking std primitives listed in `clippy.toml` in the RT
 modules. `cargo bench --bench rt` in samplez, samplez-dsp and
-samplez-mxl fails when the instruction count of the hold ring's paths, a
-block's DSP or an output commit, gap zero-fill included, exceeds the
-limit in the benchmark. One failure path is excepted from the
-no-allocation rule, and its probe is allowed by call site under
-RealtimeSanitizer: while an input is late, libmxl's flow validity check,
-one `stat()` and path allocations, can run on the RT thread. It ends
-when the input is pruned, after `pruneAfterBlocks` blocks of a frozen
-head, or twice the producer's `maxCommitBatchSizeHint` plus
-`readerMarginSamples` when that is longer.
+samplez-mxl fails when the instruction count of the hold ring's paths,
+the page hashes, a block's DSP or an output commit, gap zero-fill
+included, exceeds the limit in the benchmark. One failure path is
+excepted from the no-allocation rule, and its probe is allowed by call
+site under RealtimeSanitizer: while an input is late, libmxl's flow
+validity check, one `stat()` and path allocations, can run on the RT
+thread. It ends when the input is pruned, after `pruneAfterBlocks`
+blocks of a frozen head, or twice the producer's
+`maxCommitBatchSizeHint` plus `readerMarginSamples` when that is longer.
 
 The host needs swap off and `vm.compact_unevictable_allowed=0`, so that
 neither swapping nor compaction moves the locked pages of the RT

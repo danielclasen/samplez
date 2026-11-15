@@ -21,7 +21,9 @@ use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outco
 use samplez_mxl::output::{FlowWriter, Write};
 use samplez_mxl::{MxlApi, time};
 
-use crate::blocks::{Cause, Changes, Ctx, Hold, Kind, Sink, StatusChange, Statuses};
+use crate::blocks::{
+    Cause, Changes, Ctx, Hold, Kind, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
+};
 
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
@@ -107,6 +109,13 @@ pub struct Counters {
     /// [`PENDING_CHANGES`] crossfades at once. Their blocks carry a
     /// degraded digest naming no entry.
     pub late_routes_lost: AtomicU64,
+    /// Page hashes the RT thread could not send: its hash ring to the
+    /// supervisor was full, more pages waited for their blocks than it
+    /// keeps, or the page's entries did not fit its fingerprint list.
+    pub page_hashes_dropped: AtomicU64,
+    /// Page hashes the supervisor could not pass on: the replicated
+    /// state's channel was full.
+    pub page_hashes_unsent: AtomicU64,
 }
 
 /// Makes the RT loop panic once, for the panic containment test.
@@ -334,6 +343,8 @@ pub(crate) struct Replica {
     /// The latest crossfade end of the late re-routes `late_routes` had
     /// no room for: blocks before it stay degraded.
     pub late_lost_until: u64,
+    /// Where the page hashes go.
+    pub hashes: Producer<PageHash>,
 }
 
 /// The index of a log entry in the log that orders it.
@@ -418,6 +429,8 @@ pub(crate) struct Out {
     pub meter: OutMeter,
     /// Statuses and the hold ring, in replicated mode.
     pub hold: Hold,
+    /// The page hashes, in replicated mode with more than one voter.
+    pub pages: Option<Pages>,
 }
 
 /// Samples of a meter slice: 10 ms at 48 kHz.
@@ -704,6 +717,14 @@ pub(crate) struct Mix {
     /// Entries taken off the pending list: applied, refused by the
     /// matrix or late.
     pub consumed: u64,
+    /// The `(log id, at_index)` of the entries applied whose index lies
+    /// in page `entries_page`, for its fingerprint. Empty capacity when
+    /// no page is hashed; else room for every entry one page can take:
+    /// [`PENDING_CHANGES`] per wake, one wake per block starting in it.
+    pub page_entries: Vec<(LogId, u64)>,
+    pub entries_page: Option<u64>,
+    /// An entry of `entries_page` found the list full.
+    pub entries_lost: bool,
 }
 
 impl Mix {
@@ -718,7 +739,31 @@ impl Mix {
             due: Vec::with_capacity(PENDING_CHANGES),
             applied: 0,
             consumed: 0,
+            page_entries: Vec::new(),
+            entries_page: None,
+            entries_lost: false,
         }
+    }
+
+    /// Counts entry `e` applied and lists it for the fingerprint of the
+    /// page holding its index. An entry reported late is not applied.
+    pub fn applied_entry(&mut self, e: &RtEntry) {
+        self.applied += 1;
+        let list = &mut self.page_entries;
+        if list.capacity() == 0 || Some(e.at_index / PAGE) != self.entries_page {
+            return;
+        }
+        if list.len() < list.capacity() {
+            list.push((e.id, e.at_index));
+        } else {
+            self.entries_lost = true;
+        }
+    }
+
+    /// The entry fingerprint of page `entries_page`, once every entry in
+    /// it was applied; none when one did not fit the list.
+    pub fn fingerprint(&mut self) -> Option<u64> {
+        (!self.entries_lost).then(|| crate::blocks::fingerprint(&mut self.page_entries))
     }
 
     /// Queues `entry` by its index and log id. False, and not queued,
@@ -751,6 +796,12 @@ impl Mix {
     pub fn to(&mut self, k: u64, mut late: impl FnMut(RtEntry, u64)) {
         self.due.clear();
         let start = k * self.block;
+        // A page's entries apply in blocks starting in it.
+        if self.entries_page != Some(start / PAGE) {
+            self.page_entries.clear();
+            self.entries_page = Some(start / PAGE);
+            self.entries_lost = false;
+        }
         let mut pos = match self.pos {
             Some(p) if p > start => {
                 // The remaining ramp length is kept.
@@ -781,7 +832,7 @@ impl Mix {
             self.matrix.advance((c.at_index - pos) as usize);
             pos = c.at_index;
             if self.matrix.set(input, output, gain, self.ramp) {
-                self.applied += 1;
+                self.applied_entry(&c);
                 if self.matrix.is_ramping(input, output) {
                     self.ramp_end = self.ramp_end.max(c.at_index + u64::from(self.ramp));
                 }
@@ -1205,6 +1256,9 @@ impl Rt {
                 .hold
                 .advance(ctx, statuses, &mut changes, &mut sink)
                 .withdraw;
+            if let Some(p) = out.pages.as_mut() {
+                p.settle(statuses, &mut r.hashes, &self.counters.page_hashes_dropped);
+            }
             withdraw |= next.is_some_and(|k| {
                 out.hold.mode() != crate::blocks::Mode::Idle
                     && statuses.get(k).is_some_and(|s| s.kind == Kind::Withheld)
@@ -1439,7 +1493,7 @@ impl Rt {
     /// block at its index. An entry that sets what the slot already has
     /// starts nothing.
     fn apply(&mut self, e: RtEntry) {
-        self.mix.applied += 1;
+        self.mix.applied_entry(&e);
         let slot = match e.change {
             Change::Gain { .. } => return,
             Change::InputDown { slot } => {
@@ -1668,6 +1722,14 @@ impl Rt {
             .replica
             .as_mut()
             .and_then(|r| digest(r, &self.awaiting_gen, start, failed, failed_out));
+        // The fingerprint of the page that ends in block k: its entries
+        // were all applied by now.
+        let ends = (start / PAGE + 1) * PAGE <= start + self.block;
+        let fingerprint = if ends && self.mix.page_entries.capacity() > 0 {
+            self.mix.fingerprint()
+        } else {
+            None
+        };
         // The held blocks move first: one found withheld, or block k
         // withheld before it was computed, withdraws the replica before
         // block k takes its status.
@@ -1713,6 +1775,10 @@ impl Rt {
             add(&self.counters.hold_overflows, hold.overflows - o0);
             if sink.wrote {
                 written |= 1 << o;
+            }
+            // Every block computed is hashed, in every mode.
+            if let Some(p) = out.pages.as_mut() {
+                p.hash(k, src, fingerprint, &self.counters.page_hashes_dropped);
             }
             // Before the next output decides block k.
             if withdraw {
@@ -2111,6 +2177,52 @@ mod tests {
         assert!(m.pending.windows(2).all(|w| w[0].at_index <= w[1].at_index));
     }
 
+    /// A page's fingerprint covers the entries applied at an index in
+    /// it, whatever order they arrived in: not one reported late, nor one
+    /// of the next page.
+    #[test]
+    fn a_page_fingerprints_the_entries_applied_in_it() {
+        let mut m = mix();
+        m.page_entries = Vec::with_capacity(PENDING_CHANGES * PAGE.div_ceil(B) as usize);
+        // Page 3 is blocks 64 to 85; block 86 starts in page 4.
+        let (a, b, c) = (
+            change(0.5, 66 * B),
+            change(0.25, 70 * B),
+            change(0.75, 86 * B),
+        );
+        assert!(m.push(c) && m.push(b) && m.push(a));
+        for k in 64..=70 {
+            assert!(to(&mut m, k).is_empty());
+        }
+        let late = change(1.0, 65 * B);
+        assert!(m.push(late));
+        assert_eq!(to(&mut m, 71), [(65 * B, 71 * B)]);
+        for k in 72..=85 {
+            to(&mut m, k);
+        }
+        let want = crate::blocks::fingerprint(&mut [(a.id, a.at_index), (b.id, b.at_index)]);
+        assert_eq!(m.fingerprint(), Some(want));
+        for k in 86..=106 {
+            to(&mut m, k);
+        }
+        let want = crate::blocks::fingerprint(&mut [(c.id, c.at_index)]);
+        assert_eq!(m.fingerprint(), Some(want));
+    }
+
+    /// A page with more entries than its list holds has no fingerprint.
+    #[test]
+    fn a_page_with_entries_lost_has_no_fingerprint() {
+        let mut m = mix();
+        m.page_entries = Vec::with_capacity(1);
+        assert!(m.push(change(0.5, 66 * B)) && m.push(change(0.25, 67 * B)));
+        for k in 64..=85 {
+            to(&mut m, k);
+        }
+        assert_eq!(m.fingerprint(), None);
+        to(&mut m, 86);
+        assert_eq!(m.fingerprint(), Some(crate::blocks::HEALTHY));
+    }
+
     /// Entries at one index apply in log order, whatever order they
     /// arrived in.
     #[test]
@@ -2129,6 +2241,7 @@ mod tests {
     fn replica() -> Replica {
         let (changes, _) = rtrb::RingBuffer::new(1);
         let (_, control) = rtrb::RingBuffer::new(1);
+        let (hashes, _) = rtrb::RingBuffer::new(1);
         Replica {
             shared: Arc::new(Shared {
                 fence: AtomicU64::new(0),
@@ -2143,6 +2256,7 @@ mod tests {
             ids: Vec::with_capacity(UNRESOLVED + PENDING_CHANGES),
             late_routes: Vec::with_capacity(PENDING_CHANGES),
             late_lost_until: 0,
+            hashes,
         }
     }
 

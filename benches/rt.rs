@@ -1,16 +1,19 @@
-//! Instruction-count gates on the hold ring of a replicated output, run
-//! under Callgrind by Gungraun (`cargo bench --bench rt`): 8 channels,
-//! B = 48 and the default ring of `D + w + 2B` = 20 blocks, with a sink
-//! that writes nothing, so the counts are the ring's own. The hard
-//! limits are the instruction counts measured in the builder image plus
-//! 10 %, rounded up; a run above a limit fails.
+//! Instruction-count gates on the hold ring and the page hashes of a
+//! replicated output, run under Callgrind by Gungraun (`cargo bench
+//! --bench rt`): 8 channels, B = 48 and the default ring of `D + w + 2B`
+//! = 20 blocks, with a sink that writes nothing, so the counts are the
+//! ring's and the hashes' own. The hard limits are the instruction
+//! counts measured in the builder image plus 10 %, rounded up; a run
+//! above a limit fails.
 
 use std::hint::black_box;
 use std::sync::atomic::AtomicU64;
 
 use gungraun::prelude::*;
 use gungraun::{Callgrind, EventKind};
-use samplez::blocks::{Changes, Ctx, HEALTHY, Hold, Sink, StatusChange, Statuses};
+use samplez::blocks::{
+    Changes, Ctx, HEALTHY, Hold, PageHash, Pages, Sink, StatusChange, Statuses, fingerprint,
+};
 
 const B: u64 = 48;
 const CHANNELS: usize = 8;
@@ -160,11 +163,116 @@ fn backward_step(mut o: Out) -> Out {
     o
 }
 
+/// An output's page hashes, its statuses and its hash ring.
+struct Hashed {
+    out: Out,
+    pages: Pages,
+    tx: rtrb::Producer<PageHash>,
+    _rx: rtrb::Consumer<PageHash>,
+}
+
+impl Hashed {
+    /// The page starting at K0 hashed up to block `k`, each block
+    /// committed at once.
+    fn upto(k: u64) -> Hashed {
+        let (tx, rx) = rtrb::RingBuffer::new(64);
+        let mut h = Hashed {
+            out: Out::new(),
+            pages: Pages::new(0, CHANNELS, B, CAP),
+            tx,
+            _rx: rx,
+        };
+        for k in K0..k {
+            h.out.compute(k, u64::MAX);
+            h.hash(k);
+        }
+        h
+    }
+
+    fn hash(&mut self, k: u64) {
+        self.pages
+            .hash(k, &self.out.data, Some(HEALTHY), &self.out.dropped);
+    }
+
+    fn mid_page() -> Hashed {
+        Hashed::upto(K0 + 1)
+    }
+
+    /// Every block of the page but the last, which straddles the next.
+    fn page_end() -> Hashed {
+        Hashed::upto(K0 + 21)
+    }
+
+    /// The page hashed whole and every block of it committed.
+    fn settled() -> Hashed {
+        Hashed::upto(K0 + 22)
+    }
+}
+
+// One block hashed inside a page.
+#[library_benchmark]
+#[bench::block(setup = Hashed::mid_page, config = limit(HASH_BLOCK))]
+fn hash_block(mut h: Hashed) -> Hashed {
+    h.hash(black_box(K0 + 1));
+    h
+}
+
+// The block ending a page and starting the next: the page's hash taken
+// and its record put to wait.
+#[library_benchmark]
+#[bench::end(setup = Hashed::page_end, config = limit(HASH_PAGE_END))]
+fn hash_page_end(mut h: Hashed) -> Hashed {
+    h.hash(black_box(K0 + 21));
+    h
+}
+
+// A waiting page whose 22 blocks are all committed: each block's status
+// read, the record sent.
+#[library_benchmark]
+#[bench::settle(setup = Hashed::settled, config = limit(SETTLE_PAGE))]
+fn settle_page(mut h: Hashed) -> Hashed {
+    h.pages
+        .settle(black_box(&h.out.statuses), &mut h.tx, &h.out.dropped);
+    h
+}
+
+/// The most entries one page's fingerprint covers at B = 48: 64 pending
+/// entries applied at each of the 22 blocks starting in a page.
+const PAGE_ENTRIES: u64 = 64 * 22;
+
+/// A full page's entries out of order, as `(log id, at_index)`.
+fn page_entries() -> Vec<(u64, u64)> {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..PAGE_ENTRIES)
+        .map(|n| {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (x >> 40, K0 * B + n / 64 * B)
+        })
+        .collect()
+}
+
+// The fingerprint of a page holding the most entries it can: sorted and
+// hashed.
+#[library_benchmark]
+#[bench::full(setup = page_entries, config = limit(FINGERPRINT_FULL))]
+fn fingerprint_full(mut entries: Vec<(u64, u64)>) -> u64 {
+    fingerprint(black_box(&mut entries))
+}
+
 const BACKWARD: u64 = 8_300;
 const AT_ONCE: u64 = 437;
 const FLUSH: u64 = 18_154;
 const OVERFLOW: u64 = 12_012;
 const WITHDRAW: u64 = 8_096;
+const HASH_BLOCK: u64 = 8_274;
+const HASH_PAGE_END: u64 = 8_511;
+const SETTLE_PAGE: u64 = 2_090;
+const FINGERPRINT_FULL: u64 = 501_769;
+
+library_benchmark_group!(
+    name = pages,
+    benchmarks = [hash_block, hash_page_end, settle_page, fingerprint_full]
+);
 
 library_benchmark_group!(
     name = hold,
@@ -177,4 +285,4 @@ library_benchmark_group!(
     ]
 );
 
-main!(library_benchmark_groups = hold);
+main!(library_benchmark_groups = hold, pages);
