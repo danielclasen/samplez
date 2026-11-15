@@ -1,5 +1,6 @@
 //! openraft's RPCs and the peer requests over HTTP/1.1 on the peer
-//! listener's mutual TLS.
+//! listener's mutual TLS, and the one-shot HTTP requests the bootstrap
+//! makes to the Kubernetes API.
 //!
 //! Every request names the node id it is meant for, and a replica answers
 //! only those meant for itself: after a volume loss a new node id answers

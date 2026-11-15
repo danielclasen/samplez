@@ -131,6 +131,8 @@ impl Set {
             // Long, for a loaded test host.
             write_timeout: Duration::from_secs(10),
             addr: self.addrs[&id].clone(),
+            peers: Vec::new(),
+            voters: None,
         };
         let mut raft = raft_config("test");
         // The snapshot an install needs is taken by hand.

@@ -5,11 +5,16 @@
 //! Replicas reach each other on the peer listener ([`peer`]) with mutual
 //! TLS. A command a client sends to any replica is forwarded to the leader
 //! with its owner and the replica's E estimate at first receipt; the
-//! replica answers it once it applied the entry carrying it.
+//! replica answers it once it applied the entry carrying it. A set starts
+//! from the marker ConfigMap ([`bootstrap`]): ordinal 0 initialises it,
+//! every other volume joins as a learner, and the leader reconciles the
+//! voters with the wanted ones ([`membership`]).
 
+pub mod bootstrap;
 pub mod dedup;
 pub mod entry;
 pub mod log_store;
+pub mod membership;
 pub mod net;
 pub mod peer;
 pub mod snapshot;
@@ -18,8 +23,8 @@ pub mod state_machine;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
@@ -30,14 +35,16 @@ use openraft::{BasicNode, Raft, ServerState};
 use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::ws::{Delta, Snapshot};
 use samplez_service::{Owner, Position, ReadIndex, ReplicaInfo, ReplicatedState};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
+use crate::bootstrap::Plan;
 use crate::dedup::Limits;
 use crate::entry::{
     Batch, Body, Command, NodeId, Origin, Outcome, Request, Response, SessionKey, stamping_index,
 };
 use crate::log_store::Store;
+use crate::membership::{Slot, Voters, slot_of};
 use crate::peer::{Forwarded, PeerClient, PeerReply, PeerRequest, PeerResponse, Refused};
 use crate::state_machine::Product;
 
@@ -81,7 +88,8 @@ pub fn raft_config(cluster: &str) -> openraft::Config {
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub id: NodeId,
-    /// The id of the state's history, which revisions are named within.
+    /// The id of the state's history, which revisions are named within:
+    /// the cluster id ([`bootstrap`]).
     pub epoch: u64,
     pub limits: Limits,
     /// The engine block size B the stamping index rounds to.
@@ -96,6 +104,12 @@ pub struct Settings {
     pub write_timeout: Duration,
     /// This replica's peer address, `host:port`, as the others reach it.
     pub addr: String,
+    /// The peer addresses of every voter the set wants, which a new volume
+    /// asks to take it in.
+    pub peers: Vec<String>,
+    /// The voters the set wants, which the leader reconciles the
+    /// membership with; `None` leaves the membership as it is.
+    pub voters: Option<Voters>,
 }
 
 /// The longest a follower waits for its leader's read index before it
@@ -144,6 +158,8 @@ pub(crate) struct Shared {
     proposing: AtomicUsize,
     /// The product revision this replica applied.
     revision: Box<dyn Fn() -> u64 + Send + Sync>,
+    status: Mutex<Option<String>>,
+    reconcile: Notify,
 }
 
 /// Counts a proposal while it lives.
@@ -209,6 +225,7 @@ impl<P: Product> Replica<P> {
         )
         .await
         .map_err(|e| e.to_string())?;
+        let voters = settings.voters;
         let shared = Arc::new(Shared {
             settings,
             raft,
@@ -221,9 +238,14 @@ impl<P: Product> Replica<P> {
                 let store = store.clone();
                 Box::new(move || store.with_state(|sm| sm.revision))
             },
+            status: Mutex::default(),
+            reconcile: Notify::new(),
         });
         let (queue, queued) = mpsc::unbounded_channel();
         tokio::spawn(write(shared.clone(), queued, estimate.clone()));
+        if let Some(voters) = voters {
+            tokio::spawn(membership::reconcile(shared.clone(), voters));
+        }
         Ok(Replica {
             shared,
             store,
@@ -243,6 +265,15 @@ impl<P: Product> Replica<P> {
 
     pub fn store(&self) -> &Store<P> {
         &self.store
+    }
+
+    /// Why the replica is not part of a set yet, when it is not.
+    pub fn status(&self) -> Option<String> {
+        self.shared
+            .status
+            .lock()
+            .expect("status lock poisoned")
+            .clone()
     }
 
     /// Orders an entry the replica set decides on rather than a client,
@@ -270,6 +301,23 @@ impl<P: Product> Replica<P> {
             .initialize(members)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Carries out what [`bootstrap::prepare`] decided: ordinal 0 of a new
+    /// set initialises it with itself as its first voter, a new volume asks
+    /// to join (the status names `marker` meanwhile).
+    pub async fn begin(&self, plan: Plan, marker: &str) -> Result<(), String> {
+        match plan {
+            Plan::Resume => Ok(()),
+            Plan::Initialize => {
+                let own = (self.id(), self.shared.settings.addr.clone());
+                self.initialize([own]).await
+            }
+            Plan::Join => {
+                tokio::spawn(membership::join(self.shared.clone(), marker.to_owned()));
+                Ok(())
+            }
+        }
     }
 
     /// Whether this replica knows a quorum: as leader, one acknowledged it
@@ -377,6 +425,7 @@ impl<P: Product> Replica<P> {
                 replied.await.unwrap_or_else(|_| Err(stopped()))?;
                 Ok(PeerResponse::Appended)
             }
+            PeerRequest::Join { id, addr } => shared.admit(id, addr).await,
             PeerRequest::ReadIndex => match shared.raft.get_read_log_id().await {
                 Ok((read, _)) => Ok(PeerResponse::ReadIndex(read.map_or(0, |id| id.index))),
                 Err(RaftError::APIError(_)) => Err(Refused::NotLeader),
@@ -514,6 +563,10 @@ impl Shared {
             Ok(Ok(PeerResponse::ReadIndex(index))) => Ok(index),
             _ => Err(ReadIndex::NotLeader),
         }
+    }
+
+    fn set_status(&self, status: Option<String>) {
+        *self.status.lock().expect("status lock poisoned") = status;
     }
 
     /// Orders an entry: appends it as leader, else forwards it to the
@@ -788,8 +841,9 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     /// restart is the saved one; it stays set. An empty volume is not
     /// ready until it has joined, a saved vote alone included. The
     /// clock verification and the generations 2.11 adds to it are not
-    /// known here. `commitable` once ready on a voter: it forwards what
-    /// it does not order itself; a learner answers
+    /// known here. `commitable` once ready on a voter other than the
+    /// witness: it forwards what it does not order itself; a learner and
+    /// the witness, which serves no clients, answer
     /// [`Reason::NotCommitable`].
     fn replica(&self) -> ReplicaInfo {
         let metrics = self.shared.raft.metrics().borrow().clone();
@@ -810,7 +864,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             in_sync: metrics.last_log_index.unwrap_or(0) <= applied,
             lag: None,
             ready,
-            commitable: ready && voter,
+            commitable: ready && voter && slot_of(self.id()) != Slot::Witness,
         }
     }
 
@@ -930,7 +984,12 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         }
         let info = self.replica();
         if !info.commitable {
-            let refused = NotApplied::new(Reason::NotCommitable, "not a voter yet");
+            let detail = if slot_of(self.id()) == Slot::Witness {
+                "the witness serves no clients"
+            } else {
+                "not a voter yet"
+            };
+            let refused = NotApplied::new(Reason::NotCommitable, detail);
             return Box::pin(async move { Err(refused) });
         }
         let (reply, replied) = oneshot::channel();

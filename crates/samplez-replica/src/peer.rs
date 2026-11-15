@@ -50,6 +50,9 @@ pub enum PeerRequest {
     /// An entry the sender orders on its own account: its lease renewals,
     /// the only entry a peer may have the leader append.
     Append { body: Body, within_ms: u64 },
+    /// A replica with an empty volume asks the leader to take it in as a
+    /// learner at `addr`.
+    Join { id: NodeId, addr: String },
     /// The index a read must have applied to see every committed write,
     /// once the leader confirmed with a quorum that it still leads.
     ReadIndex,
@@ -60,6 +63,7 @@ pub enum PeerResponse {
     /// One result per forwarded command, in order.
     Forwarded(Vec<Result<Outcome, Refused>>),
     Appended,
+    Joined,
     ReadIndex(u64),
 }
 

@@ -437,6 +437,8 @@ impl Set {
             block: BLOCK,
             write_timeout: Duration::from_secs(2),
             addr: id.to_string(),
+            peers: Vec::new(),
+            voters: None,
         };
         let replica = Replica::start(
             settings,

@@ -301,6 +301,16 @@ impl<P: Product> Store<P> {
         self.view(|applied, _| applied)
     }
 
+    /// Whether the volume holds nothing of a set: no vote, entry or
+    /// snapshot, as openraft finds a node it may initialise.
+    pub fn pristine(&self) -> bool {
+        let inner = self.lock();
+        inner.vote.is_none()
+            && inner.log.is_empty()
+            && inner.last_purged.is_none()
+            && inner.snapshot.is_none()
+    }
+
     /// Whether the volume has joined a set, a committed id saved on it, and
     /// every entry up to that id, capped at the last entry held, is
     /// applied. A vote alone is not joining: a wiped volume saves one on
