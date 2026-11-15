@@ -10,3 +10,22 @@ publish = false
 
 [dependencies]
 libm = "0.2.16"
+
+[dev-dependencies]
+gungraun = "=0.20.0"
+
+# Instruction-count gates under Callgrind; CI runs them with
+# `cargo bench --bench rt` in the builder image.
+[[bench]]
+name = "rt"
+harness = false
+
+# Set by CI: samplez_lint_probe by the lint probe.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(samplez_lint_probe, values("samplez", "samplez-mxl", "samplez-dsp"))'] }
+
+# clippy.toml's blocking primitives: allowed here, denied in the RT
+# modules.
+[lints.clippy]
+disallowed_methods = "allow"
+disallowed_types = "allow"

@@ -6,6 +6,8 @@
 //! reader or group releases it in libmxl (munmap, instance mutex), and
 //! dropping a generation destroys its instance.
 
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::sync::Arc;
 
 use mxl_sys::{
@@ -66,6 +68,7 @@ impl FlowReader {
     pub fn open(instance: &Arc<Instance>, flow_id: &str) -> Result<FlowReader> {
         let id = id_cstring(flow_id)?;
         let mut raw = std::ptr::null_mut();
+        #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = instance.lock();
         // SAFETY: valid instance, NUL-terminated id, a null options pointer
         // and a writable out pointer.
@@ -134,12 +137,15 @@ impl FlowReader {
             return MXL_ERR_INVALID_ARG;
         };
         let mut slice = WrappedMultiBufferSlice::default();
-        self.samples(end, 1, &mut slice)
+        // The validity check is the failure path's documented exception;
+        // RealtimeSanitizer allows this call only.
+        crate::rtsan::allow(|| self.samples(end, 1, &mut slice))
     }
 }
 
 impl Drop for FlowReader {
     fn drop(&mut self) {
+        #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = self.instance.lock();
         // SAFETY: `raw` came from mxlCreateFlowReader on this instance and
         // this reference is released exactly once, here.
@@ -169,6 +175,7 @@ impl SyncGroup {
     /// `mxlCreateFlowSynchronizationGroup`.
     fn new(instance: &Arc<Instance>) -> Result<SyncGroup> {
         let mut raw = std::ptr::null_mut();
+        #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = instance.lock();
         // SAFETY: valid instance, writable out pointer.
         check("mxlCreateFlowSynchronizationGroup", unsafe {
@@ -218,6 +225,7 @@ impl SyncGroup {
 
 impl Drop for SyncGroup {
     fn drop(&mut self) {
+        #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = self.instance.lock();
         // SAFETY: `raw` came from mxlCreateFlowSynchronizationGroup on this
         // instance and is released exactly once, here.

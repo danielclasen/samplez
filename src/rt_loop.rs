@@ -6,6 +6,8 @@
 //! return ring; the whole state goes back to the supervisor when the loop
 //! ends, also when it panics.
 
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::Release};
@@ -77,6 +79,22 @@ pub struct Counters {
 /// Makes the RT loop panic once, for the panic containment test.
 #[cfg(test)]
 pub(crate) static PANIC: AtomicBool = AtomicBool::new(false);
+
+/// Stalls the RT loop once for this many ms, for the overrun tests.
+#[cfg(test)]
+pub(crate) static STALL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Shifts libmxl's clock as the RT loop reads it, for the clock-step
+/// tests: its waits and sleeps take the shift off again.
+#[cfg(test)]
+pub(crate) static CLOCK_SHIFT_NS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Added to [`CLOCK_SHIFT_NS`] at the RT loop's next wake, so that the
+/// step lands between two blocks, not between a deadline and its sleep.
+#[cfg(test)]
+pub(crate) static CLOCK_STEP_NS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
 
 fn add(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Relaxed);
@@ -705,7 +723,31 @@ fn monotonic_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// libmxl's clock as the RT loop reads it, shifted in the clock-step
+/// tests.
+fn clock_now(api: &MxlApi) -> u64 {
+    let now = time::now(api);
+    #[cfg(test)]
+    let now = now.saturating_add_signed(CLOCK_SHIFT_NS.load(Relaxed));
+    now
+}
+
 impl Rt {
+    /// libmxl's clock as the loop reads it.
+    fn now(&self) -> u64 {
+        clock_now(&self.api)
+    }
+
+    /// `mxlSleepUntil(timestamp)` on the clock [`Rt::now`] reads; it waits
+    /// by design, so RealtimeSanitizer allows it. The allow is not
+    /// exercised: libmxl sleeps with `clock_nanosleep`, which this
+    /// RealtimeSanitizer runtime does not intercept.
+    fn sleep_until(&self, timestamp: u64) {
+        #[cfg(test)]
+        let timestamp = timestamp.saturating_add_signed(-CLOCK_SHIFT_NS.load(Relaxed));
+        samplez_mxl::rtsan::allow(|| time::sleep_until(&self.api, timestamp));
+    }
+
     fn period_ns(&self) -> u64 {
         self.block * 1_000_000_000 / samplez_mxl::SAMPLE_RATE as u64
     }
@@ -745,6 +787,9 @@ impl Rt {
         (self, message)
     }
 
+    /// The loop body is real-time; the two calls that wait by design, the
+    /// sync-group wait and `mxlSleepUntil`, are allowed by call site.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn blocks(&mut self) {
         let mut next: Option<u64> = None;
         // libmxl's clock, the CLOCK_MONOTONIC midpoint of the two reads
@@ -756,8 +801,18 @@ impl Rt {
             if PANIC.swap(false, Relaxed) {
                 panic!("the panic test hook");
             }
+            #[cfg(test)]
+            #[allow(clippy::disallowed_methods, reason = "a test hook")]
+            match STALL_MS.swap(0, Relaxed) {
+                0 => {}
+                ms => samplez_mxl::rtsan::allow(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(ms))
+                }),
+            }
+            #[cfg(test)]
+            CLOCK_SHIFT_NS.fetch_add(CLOCK_STEP_NS.swap(0, Relaxed), Relaxed);
             let m0 = monotonic_ns();
-            let now = time::now(&self.api);
+            let now = self.now();
             let m1 = monotonic_ns();
             let (mono, width) = (m0 + (m1 - m0) / 2, m1 - m0);
             if let Some((t0, mono0, width0)) = prev {
@@ -776,12 +831,7 @@ impl Rt {
             let newest = time::newest_due_block(&self.api, now, self.block, self.margin);
             // Entries before commands: a generation handed over after its
             // entry's commit finds the entry pending.
-            while self.mix.pending.len() < PENDING_CHANGES
-                && let Ok(entry) = self.entries.pop()
-            {
-                self.last_entry = self.last_entry.max(entry.id);
-                let _ = self.mix.push(entry);
-            }
+            self.take_entries();
             self.drain_commands(newest.unwrap_or(0));
             // After a backward clock step writers hold until the clock
             // passes their last commit, and inputs never read below their
@@ -804,8 +854,8 @@ impl Rt {
             let deadline = time::deadline(&self.api, k, self.block, self.margin);
             self.wait(k, deadline);
             self.process(k, deadline);
-            time::sleep_until(&self.api, deadline);
-            let late = time::now(&self.api).saturating_sub(deadline);
+            self.sleep_until(deadline);
+            let late = self.now().saturating_sub(deadline);
             self.counters.wake_jitter_max_ns.fetch_max(late, Relaxed);
             next = Some(k + 1);
         }
@@ -819,8 +869,8 @@ impl Rt {
             *status = match g {
                 Some(g) if g.mxl.has_inputs() => {
                     let ts = time::group_timestamp(&self.api, k, self.block, g.mxl.max_offset());
-                    let timeout = deadline.saturating_sub(time::now(&self.api));
-                    let s = g.mxl.wait(ts, timeout);
+                    let timeout = deadline.saturating_sub(clock_now(&self.api));
+                    let s = samplez_mxl::rtsan::allow(|| g.mxl.wait(ts, timeout));
                     if matches!(s, GroupWait::Failed(MXL_ERR_OUT_OF_RANGE_TOO_EARLY)) {
                         add(&self.counters.input_wait_timeout, 1);
                     }
@@ -831,11 +881,24 @@ impl Rt {
             };
             all_ok &= matches!(status, GroupWait::Ok);
         }
-        if waited && all_ok && time::now(&self.api) < deadline {
+        if waited && all_ok && self.now() < deadline {
             add(&self.counters.wait_early, 1);
         }
     }
 
+    /// Moves committed entries from the entry ring to the pending list
+    /// while it has room.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn take_entries(&mut self) {
+        while self.mix.pending.len() < PENDING_CHANGES
+            && let Ok(entry) = self.entries.pop()
+        {
+            self.last_entry = self.last_entry.max(entry.id);
+            let _ = self.mix.push(entry);
+        }
+    }
+
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn drain_commands(&mut self, newest: u64) {
         loop {
             // Each command may return one object.
@@ -1004,8 +1067,9 @@ impl Rt {
     }
 
     /// Reads, mixes and writes block `k`, due at `deadline`.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn process(&mut self, k: u64, deadline: u64) {
-        let t0 = time::now(&self.api);
+        let t0 = self.now();
         let b = self.block as usize;
         // Entries apply at the start of the block at their index, before
         // its inputs are read.
@@ -1058,6 +1122,9 @@ impl Rt {
                             } else {
                                 s.min_slack.min(slack)
                             };
+                            // The failure path (README): the probe runs
+                            // libmxl's flow validity check, a stat() and
+                            // path allocations.
                             input.identify(&mut slot.state, group, outcome);
                         }
                         _ => {}
@@ -1194,7 +1261,7 @@ impl Rt {
             );
         }
 
-        let done = time::now(&self.api);
+        let done = self.now();
         if done > deadline + self.period_ns() / 4 {
             add(&self.counters.deadline_miss, 1);
         }
@@ -1235,6 +1302,16 @@ impl Rt {
             }
         }
     }
+}
+
+/// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez"`,
+/// clippy must refuse this lock and this sleep, and the lock on a static
+/// whose type it does not name.
+#[cfg(samplez_lint_probe = "samplez")]
+pub fn lint_probe(m: &std::sync::Mutex<()>) {
+    let _guard = m.lock();
+    let _held = crate::PROBE_LOCK.lock();
+    std::thread::sleep(std::time::Duration::from_millis(1));
 }
 
 #[cfg(test)]

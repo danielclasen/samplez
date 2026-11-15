@@ -2090,6 +2090,10 @@ mod tests {
     /// releases the writer, which deletes the output flow, and records
     /// the panic.
     #[test]
+    #[cfg_attr(
+        samplez_rtsan,
+        ignore = "the panic allocates in the RT loop, which RealtimeSanitizer aborts"
+    )]
     fn a_panic_on_the_rt_thread_releases_its_state_on_the_supervisor() {
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -2204,6 +2208,90 @@ mod tests {
         assert_eq!(late(), 2);
         e.stop();
         p.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// The RT loop's failure paths run, so that CI's RealtimeSanitizer
+    /// run over the lib tests checks them: a stall's catch-up and skip, a
+    /// forward and a backward clock step with the held writes after it,
+    /// and a late input with its probe. Engine `p` writes the flow,
+    /// engine `e` reads it.
+    #[test]
+    fn the_failure_paths_run_on_the_rt_thread() {
+        use crate::rt_loop::{CLOCK_SHIFT_NS, CLOCK_STEP_NS, STALL_MS};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        /// Takes the clock shift off again, also when the test fails.
+        struct Unshift;
+        impl Drop for Unshift {
+            fn drop(&mut self) {
+                CLOCK_STEP_NS.store(0, Relaxed);
+                CLOCK_SHIFT_NS.store(0, Relaxed);
+            }
+        }
+        let _unshift = Unshift;
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-failures-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let (src, out) = (
+            "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d05",
+            "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d06",
+        );
+        let start = |inputs: serde_json::Value, out: &str, margin: u32, matrix| {
+            let v = serde_json::json!({
+                "libmxl": libmxl,
+                "readerMarginSamples": margin,
+                "domains": [{ "name": "d", "path": domain }],
+                "inputs": inputs,
+                "outputs": [{ "name": out, "domain": "d", "flowId": out, "label": "failures",
+                              "group": "failures", "role": "Audio", "channels": 1 }],
+                "matrix": matrix,
+                "rt": { "enabled": false, "rtCpu": "none" },
+            });
+            let config = Config::parse(&v.to_string()).unwrap();
+            let process = rt::setup_process(&config.rt);
+            Engine::start(config, process, None).unwrap()
+        };
+        let p = start(serde_json::json!([]), src, 576, serde_json::json!([]));
+        wait(&|| p.status().outputs[0].realised);
+        let input = serde_json::json!([{ "name": "in", "domain": "d", "flowId": src,
+                                         "channels": 1 }]);
+        let e = start(input, out, 3 * 576, serde_json::json!([[1.0]]));
+        wait(&|| e.status().inputs[0].state == InputState::Attached);
+        let c = e.counters();
+        let n = |a: &AtomicU64| a.load(Relaxed);
+        let until = |what: &str, f: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !f() {
+                assert!(t.elapsed() < Duration::from_secs(10), "no {what}: {c:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // A stall: the overdue blocks are caught up, the rest skipped.
+        // Both engines' loops take the stall hook, so it is set again
+        // until this engine's loop took one.
+        until("skip", &|| {
+            STALL_MS.store(30, Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+            n(&c.overrun_skipped_samples) > 0
+        });
+        STALL_MS.store(0, Relaxed);
+        // A forward and a backward step of libmxl's clock: after the
+        // backward one the output holds the blocks below its last commit.
+        let steps = n(&c.clock_steps);
+        CLOCK_STEP_NS.store(50_000_000, Relaxed);
+        until("forward step", &|| n(&c.clock_steps) > steps);
+        CLOCK_STEP_NS.store(-50_000_000, Relaxed);
+        until("backward step", &|| n(&c.clock_steps) > steps + 1);
+        until("held block", &|| n(&c.output_held_blocks) > 0);
+        // The producer stops: the input is late, frozen and probed.
+        p.stop();
+        until("late block", &|| n(&c.input_late_blocks) > 0);
+        until("probe", &|| n(&c.input_probes) > 0);
+        assert_eq!(e.status().rt_panic, None);
+        e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
     }
 

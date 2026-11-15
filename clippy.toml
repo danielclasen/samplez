@@ -1,0 +1,39 @@
+# Blocking primitives RealtimeSanitizer does not see: an uncontended std
+# lock makes no libc call, and std::thread::sleep calls clock_nanosleep,
+# which its runtime does not intercept. Every crate allows these lints
+# (Cargo.toml); the RT modules deny them.
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "a lock blocks the RT thread" },
+    { path = "std::sync::RwLock", reason = "a lock blocks the RT thread" },
+    { path = "std::sync::Condvar", reason = "a wait blocks the RT thread" },
+    { path = "std::sync::Barrier", reason = "a wait blocks the RT thread" },
+]
+# The methods catch what the types miss: a lock on a static, a field or
+# a value a helper returns, whose type the RT module never names.
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "a sleep blocks the RT thread" },
+    { path = "std::thread::park", reason = "a park blocks the RT thread" },
+    { path = "std::thread::park_timeout", reason = "a park blocks the RT thread" },
+    { path = "std::thread::yield_now", reason = "a yield gives up the RT thread" },
+    { path = "std::thread::JoinHandle::join", reason = "a join blocks the RT thread" },
+    { path = "std::sync::Mutex::lock", reason = "a lock blocks the RT thread" },
+    { path = "std::sync::RwLock::read", reason = "a lock blocks the RT thread" },
+    { path = "std::sync::RwLock::write", reason = "a lock blocks the RT thread" },
+    { path = "std::sync::Condvar::wait", reason = "a wait blocks the RT thread" },
+    { path = "std::sync::Condvar::wait_while", reason = "a wait blocks the RT thread" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "a wait blocks the RT thread" },
+    { path = "std::sync::Condvar::wait_timeout_ms", reason = "a wait blocks the RT thread" },
+    { path = "std::sync::Condvar::wait_timeout_while", reason = "a wait blocks the RT thread" },
+    { path = "std::sync::Barrier::wait", reason = "a wait blocks the RT thread" },
+    { path = "std::sync::OnceLock::get_or_init", reason = "an init blocks the RT thread" },
+    { path = "std::sync::OnceLock::wait", reason = "a wait blocks the RT thread" },
+    { path = "std::sync::LazyLock::force", reason = "an init blocks the RT thread" },
+    { path = "std::sync::mpsc::Receiver::recv", reason = "a receive blocks the RT thread" },
+    { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "a receive blocks the RT thread" },
+    { path = "samplez_mxl::Instance::lock", reason = "the instance lock is the supervisor's" },
+    { path = "libc::sleep", reason = "a sleep blocks the RT thread" },
+    { path = "libc::usleep", reason = "a sleep blocks the RT thread" },
+    { path = "libc::nanosleep", reason = "a sleep blocks the RT thread" },
+    { path = "libc::clock_nanosleep", reason = "a sleep blocks the RT thread" },
+    { path = "libc::sched_yield", reason = "a yield gives up the RT thread" },
+]

@@ -1,5 +1,6 @@
-# Build environment for samplez: Rust, clang and libclang for bindgen, and a
-# Release build of libmxl (MXL v1.1.0) installed under /opt/mxl.
+# Build environment for samplez: Rust, clang and libclang for bindgen, a
+# Release build of libmxl (MXL v1.1.0) installed under /opt/mxl, and the
+# tools of the RT gates.
 FROM debian:trixie-20261027@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1 AS libmxl
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
@@ -63,6 +64,22 @@ RUN curl -sSfo /tmp/rustup-init \
  && rm /tmp/rustup-init \
  && chmod -R a+w "${RUSTUP_HOME}" "${CARGO_HOME}" \
  && rustc -V && cargo -V && cargo clippy -V && cargo fmt --version
+
+# The RT gates: a pinned nightly with rust-src for RealtimeSanitizer
+# (-Zsanitizer=realtime with -Zbuild-std), and valgrind with the Gungraun
+# (formerly iai-callgrind) runner for the instruction-count benchmarks.
+ARG NIGHTLY=nightly-2026-09-20
+ARG GUNGRAUN_VERSION=0.20.0
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends valgrind=1:3.24.0-3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && rustup toolchain install "${NIGHTLY}" --profile minimal --component rust-src \
+ && cargo install --locked gungraun-runner --version "${GUNGRAUN_VERSION}" \
+ && rm -rf "${CARGO_HOME}/registry" "${CARGO_HOME}/git" \
+ && chmod -R a+w "${RUSTUP_HOME}" "${CARGO_HOME}" \
+ && valgrind --version && gungraun-runner --version \
+ && rustc "+${NIGHTLY}" -V
+ENV SAMPLEZ_NIGHTLY=${NIGHTLY}
 
 COPY --from=libmxl /opt/mxl /opt/mxl
 RUN echo /opt/mxl/lib > /etc/ld.so.conf.d/mxl.conf && ldconfig

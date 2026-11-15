@@ -27,3 +27,9 @@ utoipa = "=6.0.0"
 tokio = { version = "=1.54.1", features = ["io-util", "macros", "net", "rt", "sync", "test-util", "time"] }
 tokio-tungstenite = "=0.29.0"
 tower = { version = "=0.5.3", features = ["util"] }
+
+# clippy.toml's blocking primitives: allowed here, denied in the RT
+# modules.
+[lints.clippy]
+disallowed_methods = "allow"
+disallowed_types = "allow"

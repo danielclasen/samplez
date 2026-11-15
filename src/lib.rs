@@ -3,6 +3,8 @@
 //! N input flows are read on libmxl's TAI timeline, mixed through a gain
 //! matrix and written to M output flows at the indices they were read at.
 
+#![cfg_attr(samplez_rtsan, feature(sanitize))]
+
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("samplez supports x86_64 only");
 
@@ -19,3 +21,7 @@ pub use engine::{
 };
 pub use meters::OutputMeters;
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};
+
+/// The lint probe's lock on a static (CI): its users never name its type.
+#[cfg(samplez_lint_probe = "samplez")]
+pub static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
