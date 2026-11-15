@@ -3,6 +3,7 @@ mod common;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
 use common::*;
 use samplez_service::config::AuthMode;
 use samplez_service::{Ops, Service, ServiceConfig};
@@ -76,6 +77,49 @@ async fn none_mode_api_listener() {
         status(&api, write_req("/api/v1/login")).await,
         StatusCode::NOT_FOUND
     );
+}
+
+/// A product answers refusals in the error body its API defines: a write
+/// without the browser-protection headers gets the product's JSON body
+/// with the reason, not an empty 403, and a 401 keeps its challenge.
+/// Without a renderer the body stays empty.
+#[tokio::test]
+async fn refusals_are_rendered_by_the_product() {
+    let api = service("token", "refusal")
+        .refusal(|status, reason| {
+            let body = json!({ "code": status.as_u16(), "message": reason });
+            (status, axum::Json(body)).into_response()
+        })
+        .routers()
+        .api;
+    let cookie_less = write_req(WHOAMI);
+    let (status, headers, body) = send(&api, cookie_less).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
+    assert_eq!(body, r#"{"code":401,"message":"not authenticated"}"#);
+
+    let csrf = "X-Samplez-Request: 1 and Content-Type: application/json required";
+    let no_marker = get_req(WHOAMI)
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json");
+    let not_json = get_req(WHOAMI)
+        .method("POST")
+        .header("x-samplez-request", "1")
+        .header(header::CONTENT_TYPE, "text/plain");
+    for req in [no_marker, not_json] {
+        let (status, headers, body) = send(&api, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body, json!({ "code": 403, "message": csrf }));
+    }
+
+    let plain = service("token", "refusal-plain").routers().api;
+    let no_marker = get_req(WHOAMI)
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json");
+    let (status, _, body) = send(&plain, no_marker).await;
+    assert_eq!((status, body.as_str()), (StatusCode::FORBIDDEN, ""));
 }
 
 #[tokio::test]
