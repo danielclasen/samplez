@@ -4,7 +4,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::{B, Domain, Pilot, copy_core as copy, new_id, processed, start_held, wait_for};
+use common::{
+    B, Domain, Pilot, copy_core as copy, new_id, processed, start_held, start_held_with, wait_for,
+};
 use samplez::{CopyError, Entry, InputState};
 
 /// The copy holds the state after block k0: entries due by then applied
@@ -65,4 +67,31 @@ fn a_single_voter_copies_no_core() {
         Err(CopyError::Invalid(_))
     ));
     e.stop();
+}
+
+/// A resync replay reads `resyncBudgetMs` past the read window: with more
+/// than one voter an input whose flow keeps less history is refused,
+/// naming the history_duration it needs. A lone voter has no donor and
+/// attaches it.
+#[test]
+fn only_a_set_of_voters_needs_the_replay_history() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    // A second of budget: more than half the flow's ring of 19456.
+    let budget = serde_json::json!({ "resyncBudgetMs": 1000 });
+    let (two, _) = start_held_with(&domain.0, &src, &new_id(), 2, budget.clone());
+    wait_for(Duration::from_secs(5), "attach refused", || {
+        two.status().inputs[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("history_duration of at least"))
+    });
+    assert_eq!(two.status().inputs[0].state, InputState::Pruned);
+    two.stop();
+    let (one, _) = start_held_with(&domain.0, &src, &new_id(), 1, budget);
+    wait_for(Duration::from_secs(5), "input attached", || {
+        one.status().inputs[0].state == InputState::Attached
+    });
+    one.stop();
 }

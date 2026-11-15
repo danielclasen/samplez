@@ -127,10 +127,10 @@ History rings (`History` in samplez-dsp) hold a delay plus
 publishes the block it starts before it stores any history sample, and a
 copy is kept only while the RT thread has not started the last block of
 the slack after k0. The engine keeps no delay line yet, so a copy holds
-the core alone. In replicated mode every input flow must offer
+the core alone. With more than one voter every input flow must offer
 `resyncBudgetMs` of history beyond the read window; an input whose flow
 is shorter is refused with an error naming the `history_duration` it
-needs.
+needs. A lone voter has no donor to resync from and needs none.
 
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
 against CLOCK_MONOTONIC at each wake, when it also samples the kernel

@@ -634,7 +634,18 @@ pub fn start_held(
     out: &str,
     voters: usize,
 ) -> (Engine, Receiver<samplez::blocks::PageHash>) {
-    let v = serde_json::json!({
+    start_held_with(domain, src, out, voters, serde_json::json!({}))
+}
+
+/// [`start_held`] with the configuration keys in `extra` set as well.
+pub fn start_held_with(
+    domain: &Path,
+    src: &str,
+    out: &str,
+    voters: usize,
+    extra: serde_json::Value,
+) -> (Engine, Receiver<samplez::blocks::PageHash>) {
+    let mut v = serde_json::json!({
         "blockSize": B,
         "readerMarginSamples": MARGIN,
         "libmxl": libmxl(),
@@ -645,6 +656,9 @@ pub fn start_held(
         "matrix": [[1.0]],
         "rt": { "rtCpu": "none" },
     });
+    for (k, x) in extra.as_object().expect("an object") {
+        v[k] = x.clone();
+    }
     let config = Config::parse(&v.to_string()).unwrap();
     let (report_tx, _reports) = std::sync::mpsc::sync_channel(64);
     let (hash_tx, hashes) = std::sync::mpsc::sync_channel(1 << 16);

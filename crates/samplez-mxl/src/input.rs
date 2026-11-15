@@ -37,8 +37,8 @@ pub struct Timing {
     /// Read delay `readerMarginSamples`.
     pub margin: u64,
     pub max_catchup_blocks: u64,
-    /// Replicated mode: `resyncBudgetMs` in samples, which a resync replay
-    /// reads past the read window; 0 outside it.
+    /// `resyncBudgetMs` in samples, which a resync replay reads past the
+    /// read window, with more than one voter; else 0.
     pub resync_budget: u64,
 }
 

@@ -958,7 +958,8 @@ impl Engine {
                 block: b,
                 margin: u64::from(config.reader_margin_samples),
                 max_catchup_blocks: u64::from(config.max_catchup_blocks),
-                resync_budget: if reports.is_some() {
+                // A lone voter has no donor to resync from.
+                resync_budget: if reports.is_some() && !alone {
                     config.resync_budget_samples()
                 } else {
                     0

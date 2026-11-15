@@ -42,8 +42,9 @@ pub struct Config {
     /// reached the slack's last block.
     #[serde(default = "default_history_slack_ms")]
     pub history_slack_ms: u32,
-    /// Replicated mode: the time a resync takes to hand over, in ms. Every
-    /// input flow must keep that much history beyond the read window.
+    /// Replicated mode with more than one voter: the time a resync takes
+    /// to hand over, in ms. Every input flow must keep that much history
+    /// beyond the read window.
     #[serde(default = "default_resync_budget_ms")]
     pub resync_budget_ms: u32,
     /// Path of the libmxl shared library.
