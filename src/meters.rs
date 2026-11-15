@@ -35,8 +35,8 @@ pub struct OutputMeters {
     pub integrated: Option<f64>,
     /// Loudness range per EBU Tech 3342, LU; `None` while not `valid`.
     pub range: Option<f64>,
-    /// No meter record lost and no samples left unmeasured since the
-    /// measurement started.
+    /// No meter record lost, no samples left unmeasured and no infinite
+    /// or NaN loudness power since the measurement started.
     pub valid: bool,
     /// The sample index the measurement started at: the first slice
     /// metered, or the window a reset applied at.

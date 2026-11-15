@@ -47,9 +47,9 @@ Each output's status carries its meters: sample peak and true peak per
 channel over the last 100 ms, the largest true peak, and momentary,
 short-term and integrated loudness and loudness range per EBU R 128.
 `Engine::reset_loudness` restarts the measurement at a sample index. A
-meter record lost on the way from the RT thread, or samples not metered
-after an overrun, mark integrated loudness and loudness range invalid
-until the next reset.
+meter record lost on the way from the RT thread, samples not metered
+after an overrun, or an infinite or NaN sample mark integrated loudness
+and loudness range invalid until the next reset.
 
 Real-time set-up reports each step and runs degraded rather than failing:
 effective capabilities raised from the permitted set, `mlockall` with

@@ -38,7 +38,8 @@ const P_ABS: f64 = 1.1724653045822964e-07;
 const STEP: f64 = 1.0023052380778996;
 /// Square root of [`STEP`]: the centre of a bin over its lower edge.
 const HALF_STEP: f64 = 1.001151955538169;
-/// Bins from -70 to +20 LKFS. Powers above go into the last bin.
+/// Bins from -70 to +20 LKFS. Powers at or above +20 LKFS go into the
+/// last bin.
 const BINS: usize = 9000;
 
 /// Channel weights of ITU-R BS.1770-5 Table 3.
@@ -77,8 +78,12 @@ impl Histogram {
         self.total = 0;
     }
 
+    /// Adds a finite `power` to its bin; powers at or above the top edge
+    /// go into the last bin.
     fn add(&mut self, edges: &[f64], power: f64) {
-        let bin = edges.partition_point(|&e| e <= power).saturating_sub(1);
+        let bin = edges[..BINS]
+            .partition_point(|&e| e <= power)
+            .saturating_sub(1);
         self.count[bin] += 1;
         self.sum[bin] += power;
         self.total += 1;
@@ -156,7 +161,8 @@ impl Loudness {
     /// Adds slice `index`, the samples `[index * SLICE, (index + 1) *
     /// SLICE)`, with its weighted mean square `sum_i G_i z_i`; `None`
     /// when not all of its samples were measured. A missing slice, one
-    /// out of order or an incomplete one is a gap: the momentary and
+    /// out of order, an incomplete one or one whose power is not finite
+    /// (an infinite or NaN sample) is a gap: the momentary and
     /// short-term loudness restart after it, and the integrated loudness
     /// and the loudness range are invalid until [`Loudness::reset`].
     pub fn push(&mut self, index: u64, power: Option<f64>) {
@@ -164,7 +170,7 @@ impl Loudness {
             self.gap();
         }
         self.last = Some(index);
-        let Some(power) = power else {
+        let Some(power) = power.filter(|p| p.is_finite()) else {
             self.gap();
             return;
         };
@@ -348,6 +354,45 @@ mod tests {
             "{:?}",
             l.integrated()
         );
+    }
+
+    /// Powers at or above the +20 LKFS top edge go into the last bin,
+    /// whose exact sum still gives their level.
+    #[test]
+    fn loudness_above_the_top_bin_is_measured() {
+        let mut l = Loudness::new();
+        for w in 0..1000 {
+            l.push(w, Some(power(21.0)));
+        }
+        assert!((l.integrated().unwrap() - 21.0).abs() < 1e-9);
+        assert!((l.max_short_term().unwrap() - 21.0).abs() < 1e-9);
+        assert_eq!(l.range(), Some(0.0));
+    }
+
+    /// A slice whose power is not finite, from an infinite or NaN sample,
+    /// is a gap: it invalidates the measurement rather than poisoning the
+    /// sums.
+    #[test]
+    fn a_non_finite_slice_is_a_gap() {
+        for bad in [f64::INFINITY, f64::NAN] {
+            let mut l = Loudness::new();
+            for w in 0..500 {
+                l.push(w, Some(power(-23.0)));
+            }
+            l.push(500, Some(bad));
+            assert!(!l.valid(), "{bad}");
+            assert_eq!(
+                (l.integrated(), l.range(), l.momentary()),
+                (None, None, None)
+            );
+            l.reset();
+            for w in 501..900 {
+                l.push(w, Some(power(-23.0)));
+            }
+            assert!(l.valid());
+            assert!((l.integrated().unwrap() + 23.0).abs() < 1e-9);
+            assert!((l.short_term().unwrap() + 23.0).abs() < 1e-9);
+        }
     }
 
     #[test]
