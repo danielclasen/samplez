@@ -238,11 +238,11 @@ async fn write(
                                 result => result,
                             };
                             answered[at] = true;
-                            let _ = reply.send(Ok(Ack {
-                                command: id,
-                                revision: outcome.revision,
-                                resolution: resolution_of(resolution),
-                            }));
+                            let _ = reply.send(Ok(Ack::new(
+                                id,
+                                outcome.revision,
+                                resolution_of(resolution),
+                            )));
                         }
                     }
                     // Not the leader, or no longer: the entry was not

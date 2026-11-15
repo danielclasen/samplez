@@ -1141,14 +1141,7 @@ fn a_resend_of_a_stale_command_is_answered_stale() {
     let s1 = owner("s1");
     state.refused_stale(&s1, "c7", 4);
     match commands.begin(&s1, "c7") {
-        Begin::Duplicate(ack) => assert_eq!(
-            ack,
-            Ack {
-                command: "c7".into(),
-                revision: 4,
-                resolution: Resolution::Stale,
-            }
-        ),
+        Begin::Duplicate(ack) => assert_eq!(ack, Ack::new("c7", 4, Resolution::Stale)),
         _ => panic!("c7 is committed"),
     }
 }
@@ -1212,18 +1205,8 @@ async fn commands_apply_once_per_id_from_the_replicated_table() {
     assert!(resent.as_mut().now_or_never().is_none(), "committing");
     state.commit();
     let ack = submitted.await.unwrap();
-    assert_eq!(
-        ack,
-        Ack {
-            command: "c1".into(),
-            revision: 1,
-            resolution: Resolution::Applied,
-        }
-    );
-    let duplicate = Ack {
-        resolution: Resolution::Duplicate,
-        ..ack.clone()
-    };
+    assert_eq!(ack, Ack::new("c1", 1, Resolution::Applied));
+    let duplicate = Ack::new(ack.command.clone(), ack.revision, Resolution::Duplicate);
     assert_eq!(
         resent.await.unwrap(),
         duplicate,
@@ -1274,14 +1257,7 @@ async fn a_command_resent_through_another_replica_while_pending_applies_once() {
     assert!(second.as_mut().now_or_never().is_none(), "committing");
     state.commit();
     let (first, second) = (first.await.unwrap(), second.await.unwrap());
-    assert_eq!(
-        first,
-        Ack {
-            command: "cmd-1".into(),
-            revision: 1,
-            resolution: Resolution::Applied,
-        }
-    );
+    assert_eq!(first, Ack::new("cmd-1", 1, Resolution::Applied));
     assert_eq!(second.revision, first.revision, "the same revision");
     assert_eq!(second.resolution, Resolution::Duplicate, "applied once");
     assert_eq!(state.revision(), 1, "applied once");

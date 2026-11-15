@@ -114,11 +114,7 @@ impl FakeState {
                     Resolution::Applied,
                 ),
             };
-            let _ = done.send(Ack {
-                command: id,
-                revision,
-                resolution,
-            });
+            let _ = done.send(Ack::new(id, revision, resolution));
         }
     }
 

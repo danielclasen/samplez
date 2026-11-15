@@ -247,6 +247,7 @@ pub trait ReplicatedState: Send + Sync + 'static {
 
 /// The answer to a command, echoing its id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct Ack {
     pub command: String,
     /// The revision the command resolved at; its delta carries the
@@ -306,6 +307,16 @@ impl Reason {
             Reason::Unavailable => "unavailable",
             Reason::NotCommitable => "not_commitable",
             Reason::Expired => "expired",
+        }
+    }
+}
+
+impl Ack {
+    pub fn new(command: impl Into<String>, revision: u64, resolution: Resolution) -> Ack {
+        Ack {
+            command: command.into(),
+            revision,
+            resolution,
         }
     }
 }
