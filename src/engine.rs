@@ -302,6 +302,11 @@ struct LocalLog {
     gen_at: u64,
 }
 
+/// Makes the next `InputDown` or `InputUp` the engine's own log stamps
+/// late: at an index the RT thread has produced.
+#[cfg(test)]
+static STAMP_LATE: AtomicBool = AtomicBool::new(false);
+
 impl Log {
     /// Appends `e`; `consumed` is the RT thread's count of entries taken
     /// off its list, so committed entries never exceed what it holds.
@@ -1783,6 +1788,13 @@ impl Supervisor {
                 Change::InputDown { slot }
             };
             let at_index = stamp(earliest, local.last_at[slot], self.ramp, self.timing.block);
+            #[cfg(test)]
+            let at_index = if STAMP_LATE.swap(false, Relaxed) {
+                let produced = self.counters.produced.load(Acquire) / self.timing.block;
+                produced.saturating_sub(10) * self.timing.block
+            } else {
+                at_index
+            };
             let e = RtEntry {
                 id: log.last + 1,
                 at_index,
@@ -2067,11 +2079,16 @@ mod tests {
         );
     }
 
+    /// Held by each test that starts engines: the test hooks are process
+    /// wide, and any engine's RT thread or supervisor takes them.
+    static ENGINES: Mutex<()> = Mutex::new(());
+
     /// A panic on the RT thread hands the state back: the supervisor
     /// releases the writer, which deletes the output flow, and records
     /// the panic.
     #[test]
     fn a_panic_on_the_rt_thread_releases_its_state_on_the_supervisor() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
             .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
         let domain = std::env::temp_dir().join(format!("samplez-panic-{}", std::process::id()));
@@ -2111,6 +2128,88 @@ mod tests {
         assert!(!flow.exists(), "the released writer deletes its flow");
         engine.stop();
         std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// The engine's own log stamps an `InputDown` or `InputUp` that
+    /// reached the RT thread late again, from the state the RT thread has:
+    /// the input goes down once its flow is gone, and comes up once it is
+    /// there again. Engine `p` writes the flow, engine `e` reads it.
+    #[test]
+    fn a_late_input_entry_of_the_own_log_is_stamped_again() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let shm = std::path::Path::new("/dev/shm");
+        let base = if shm.is_dir() {
+            shm.to_owned()
+        } else {
+            std::env::temp_dir()
+        };
+        let domain = base.join(format!("samplez-restamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let (src, out) = (
+            "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d01",
+            "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d02",
+        );
+        let output = |id: &str| {
+            serde_json::json!({ "name": id, "domain": "d", "flowId": id, "label": "restamp",
+                                "group": "restamp", "role": "Audio", "channels": 1 })
+        };
+        // The reader's margin covers the producer's, which its head lags
+        // the clock by.
+        let start =
+            |inputs: serde_json::Value, out: &str, margin: u32, matrix: serde_json::Value| {
+                let v = serde_json::json!({
+                    "libmxl": libmxl,
+                    "readerMarginSamples": margin,
+                    "domains": [{ "name": "d", "path": domain }],
+                    "inputs": inputs,
+                    "outputs": [output(out)],
+                    "matrix": matrix,
+                    "rt": { "enabled": false, "rtCpu": "none" },
+                });
+                let config = Config::parse(&v.to_string()).unwrap();
+                let process = rt::setup_process(&config.rt);
+                Engine::start(config, process, None).unwrap()
+            };
+        let producer = || {
+            let p = start(serde_json::json!([]), src, 576, serde_json::json!([]));
+            wait(&|| p.status().outputs[0].realised);
+            p
+        };
+        let input = serde_json::json!([{ "name": "in", "domain": "d", "flowId": src,
+                                         "channels": 1 }]);
+        let p = producer();
+        let e = start(input, out, 3 * 576, serde_json::json!([[1.0]]));
+        let attached = || {
+            let s = e.status();
+            s.inputs[0].up && s.inputs[0].state == InputState::Attached
+        };
+        wait(&attached);
+        let late = || e.counters().command_late.load(Relaxed);
+
+        STAMP_LATE.store(true, Relaxed);
+        p.stop();
+        wait(&|| !e.status().inputs[0].up);
+        assert_eq!(late(), 1);
+        assert!(e.status().diverged.is_some());
+
+        STAMP_LATE.store(true, Relaxed);
+        let p = producer();
+        wait(&attached);
+        assert_eq!(late(), 2);
+        e.stop();
+        p.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    fn wait(f: &dyn Fn() -> bool) {
+        let t = Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(10), "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
