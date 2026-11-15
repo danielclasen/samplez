@@ -80,6 +80,13 @@ pub fn raft_config(cluster: &str) -> openraft::Config {
         election_timeout_max: 300,
         heartbeat_interval: 50,
         max_payload_entries: MAX_PAYLOAD_ENTRIES,
+        // Entries kept behind a snapshot when the log is purged, in
+        // batches of one: a follower a little behind catches up from the
+        // log, and a purge stays clear of entries replication is still
+        // sending. openraft 0.9's defaults, pinned so a dependency bump
+        // cannot move them; 0 only in tests.
+        max_in_snapshot_log_to_keep: 1000,
+        purge_batch_size: 1,
         ..openraft::Config::default()
     }
 }

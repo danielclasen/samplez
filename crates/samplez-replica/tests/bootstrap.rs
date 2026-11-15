@@ -309,6 +309,11 @@ impl Set {
         raft.snapshot_policy = openraft::SnapshotPolicy::Never;
         raft.max_in_snapshot_log_to_keep = 0;
         raft.purge_batch_size = 1;
+        // Elections only past a long silence: under a loaded host a short
+        // timeout moves the leadership in the middle of a test that
+        // purged the leader's log.
+        raft.election_timeout_min = 1000;
+        raft.election_timeout_max = 2000;
         let replica = Replica::with_store(
             settings,
             raft,
@@ -529,8 +534,11 @@ async fn a_set_starts_from_the_marker_and_takes_writes_through_any_audio_replica
 async fn ordinal_0_rejoins_as_a_learner_after_losing_its_volume() {
     let mut set = Set::new(Voters::new(3, false).unwrap()).await;
     set.start_all().await;
-    // Ordinal 1 leads throughout, so the leader that takes the new volume
-    // in is the one that purged its log.
+    // Ordinal 1 leads throughout, and only it purges: openraft holds a
+    // leader's purge back while replication still reads the range, and
+    // does not on a follower, so a purge on one that is elected meanwhile
+    // can race its replication. The leader that takes the new volume in
+    // is the one that purged its log.
     let deadline = Instant::now() + Duration::from_secs(20);
     while set.settled().await != Slot::Audio(1) {
         assert!(Instant::now() < deadline, "ordinal 1 did not take the lead");
@@ -552,27 +560,29 @@ async fn ordinal_0_rejoins_as_a_learner_after_losing_its_volume() {
     // The log up to here goes into a snapshot, so the new volume can only
     // catch up by installing it. `last` is a product revision; snapshots
     // and purges count log ids.
-    let upto = set
-        .nodes
-        .values()
-        .map(|n| {
-            let applied = n.replica.raft().metrics().borrow().last_applied;
-            applied.map_or(0, |id| id.index)
-        })
-        .min()
-        .unwrap();
-    for node in set.nodes.values() {
-        let raft = node.replica.raft();
-        raft.trigger().snapshot().await.unwrap();
-        while raft
-            .metrics()
-            .borrow()
-            .snapshot
-            .is_none_or(|id| id.index < upto)
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        raft.trigger().purge_log(upto).await.unwrap();
+    let raft = set.replica(leader).raft().clone();
+    let upto = raft
+        .metrics()
+        .borrow()
+        .last_applied
+        .map_or(0, |id| id.index);
+    raft.trigger().snapshot().await.unwrap();
+    while raft
+        .metrics()
+        .borrow()
+        .snapshot
+        .is_none_or(|id| id.index < upto)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    raft.trigger().purge_log(upto).await.unwrap();
+    while raft
+        .metrics()
+        .borrow()
+        .purged
+        .is_none_or(|id| id.index < upto)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     let old = set.nodes[&Slot::Audio(0)].id;
@@ -582,7 +592,11 @@ async fn ordinal_0_rejoins_as_a_learner_after_losing_its_volume() {
     assert_eq!(node.plan, Plan::Bootstrap);
     assert_ne!(node.id, old);
     set.nodes.insert(Slot::Audio(0), node);
-    set.settled().await;
+    assert_eq!(
+        set.settled().await,
+        leader,
+        "the leader that purged took it in"
+    );
     assert!(
         set.api
             .marker()

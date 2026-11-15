@@ -3,7 +3,7 @@
 
 mod harness;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,6 +79,8 @@ struct Set {
     listeners: BTreeMap<NodeId, std::net::TcpListener>,
     tls: BTreeMap<NodeId, Tls>,
     nodes: BTreeMap<NodeId, Node>,
+    /// Replicas that never call an election once (re)started.
+    quiet: BTreeSet<NodeId>,
     _panics: harness::PanicGuard,
 }
 
@@ -102,6 +104,7 @@ impl Set {
             listeners.insert(id, tcp);
         }
         let mut set = Set {
+            quiet: BTreeSet::new(),
             _panics: harness::PanicGuard::new(),
             root,
             listeners,
@@ -143,6 +146,15 @@ impl Set {
         raft.snapshot_policy = openraft::SnapshotPolicy::Never;
         raft.max_in_snapshot_log_to_keep = 0;
         raft.purge_batch_size = 1;
+        // Elections only past a long silence: under a loaded host a short
+        // timeout moves the leadership in the middle of a test that
+        // purged the leader's log.
+        raft.election_timeout_min = 1000;
+        raft.election_timeout_max = 2000;
+        if self.quiet.contains(&id) {
+            raft.election_timeout_min = 60_000;
+            raft.election_timeout_max = 61_000;
+        }
         // Small chunks, so a snapshot of a few commands takes several.
         raft.snapshot_max_chunk_size = 64;
         let replica = Replica::start(
@@ -308,37 +320,42 @@ async fn a_snapshot_is_installed_over_the_peer_listener() {
     }
     set.applied(last).await;
     // `last` is a product revision; snapshots and purges count log ids.
-    let log = |node: &Node| {
-        let applied = node.replica.raft().metrics().borrow().last_applied;
-        applied.map_or(0, |id| id.index)
-    };
-    let upto = set.nodes.values().map(log).min().unwrap();
-    // On every running replica, so whichever leads after the restart
-    // holds no entry the follower lacks.
-    for node in set.nodes.values() {
-        let raft = node.replica.raft();
-        raft.trigger().snapshot().await.unwrap();
-        while raft
-            .metrics()
-            .borrow()
-            .snapshot
-            .is_none_or(|id| id.index < upto)
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        raft.trigger().purge_log(upto).await.unwrap();
-        while raft
-            .metrics()
-            .borrow()
-            .purged
-            .is_none_or(|id| id.index < upto)
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    // Only the leader purges: openraft holds a leader's purge back while
+    // replication still reads the range, and does not on a follower, so a
+    // purge on one that is elected meanwhile can race its replication. The
+    // leader is the one that sends the restarted follower the snapshot.
+    let raft = set.replica(leader).raft().clone();
+    let upto = raft
+        .metrics()
+        .borrow()
+        .last_applied
+        .map_or(0, |id| id.index);
+    raft.trigger().snapshot().await.unwrap();
+    while raft
+        .metrics()
+        .borrow()
+        .snapshot
+        .is_none_or(|id| id.index < upto)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    raft.trigger().purge_log(upto).await.unwrap();
+    while raft
+        .metrics()
+        .borrow()
+        .purged
+        .is_none_or(|id| id.index < upto)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    // A follower whose timer fires while it installs the snapshot would
+    // depose the leader with its term, openraft having no pre-vote; the
+    // next leader may hold the log the purge removed.
+    set.quiet.insert(follower);
     set.restart(follower).await;
     set.applied(last).await;
+    assert_eq!(set.leader().await, leader, "the leader that purged sent it");
     let installed = set.replica(follower);
     // The store applies the snapshot before openraft's metrics show it.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -401,6 +418,12 @@ async fn a_large_command_neither_wedges_nor_slows_replication() {
     }
     set.restart(behind).await;
     set.applied(last).await;
+    // Takes writes once a check found a leader counting it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !set.replica(behind).replica().commitable {
+        assert!(Instant::now() < deadline, "not commitable within 10 s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let small = set
         .replica(behind)
         .submit(&owner("s"), "small", Bytes::from("gain=1@1"))
