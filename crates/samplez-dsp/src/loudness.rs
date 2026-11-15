@@ -395,6 +395,68 @@ mod tests {
         }
     }
 
+    fn constant(l: &mut Loudness, from: u64, slices: u64, level: f64) -> u64 {
+        for i in from..from + slices {
+            l.push(i, Some(power(level)));
+        }
+        from + slices
+    }
+
+    /// Gating blocks below the -70 LKFS absolute gate do not count, even
+    /// where the relative gate would keep them: a programme entirely at
+    /// -72 LUFS has no integrated loudness.
+    #[test]
+    fn the_absolute_gate_excludes_blocks_below_minus_70() {
+        let mut l = Loudness::new();
+        constant(&mut l, 0, 3000, -72.0);
+        assert_eq!(l.integrated(), None);
+        assert!((l.momentary().unwrap() + 72.0).abs() < 1e-9);
+    }
+
+    /// Short-term values below -70 LUFS do not count towards the range:
+    /// a programme entirely at -75 LUFS has none, and after a -60 LUFS
+    /// tone, 300 s more at -75 LUFS change nothing once its short-term
+    /// loudness is below the gate.
+    #[test]
+    fn the_absolute_gate_excludes_short_terms_below_minus_70() {
+        let mut l = Loudness::new();
+        constant(&mut l, 0, 3000, -75.0);
+        assert_eq!(l.range(), None);
+        let mut l = Loudness::new();
+        let i = constant(&mut l, 0, 3000, -60.0);
+        let i = constant(&mut l, i, 350, -75.0);
+        let before = l.range();
+        assert_eq!(before, Some(0.0));
+        constant(&mut l, i, 30_000, -75.0);
+        assert_eq!(l.range(), before);
+    }
+
+    /// The 10th and 95th percentiles are the elements at ranks
+    /// `round((n - 1) * p / 100 + 1)`: of 101 short-term values 0.1 LU
+    /// apart from -30 LUFS, the 11th (-29.0) and the 96th (-20.5).
+    #[test]
+    fn the_range_is_the_95th_minus_the_10th_percentile() {
+        let mut l = Loudness::new();
+        for i in 0..=100 {
+            // At a bin centre, clear of the edges.
+            let level = -30.0 + f64::from(i) * 0.1 + 0.005;
+            l.short_terms.add(&l.edges, power(level));
+        }
+        let r = l.range().unwrap();
+        assert!((r - 8.5).abs() < 1e-9, "{r}");
+    }
+
+    /// Gating blocks and the short-term values of the range are taken at
+    /// the end of each 100 ms window, ten slices, not at every slice:
+    /// 1000 slices give a block at the ends of windows 3 to 99 and a
+    /// short-term value at the ends of windows 29 to 99.
+    #[test]
+    fn blocks_and_short_terms_are_on_the_100_ms_grid() {
+        let mut l = Loudness::new();
+        constant(&mut l, 0, 1000, -23.0);
+        assert_eq!((l.blocks.total, l.short_terms.total), (97, 71));
+    }
+
     #[test]
     fn a_gap_invalidates_until_reset() {
         let mut l = Loudness::new();

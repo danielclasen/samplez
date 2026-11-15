@@ -177,9 +177,10 @@ mod tests {
             .collect()
     }
 
-    /// The Annex's table is symmetric: the 48 taps read in phase order
-    /// equal themselves reversed. Each phase has a DC gain within 0.25 dB
-    /// of unity (phases 1 and 2 sum to 0.973).
+    /// The coefficients are the Annex's table, which is symmetric: the
+    /// 48 taps read in phase order equal themselves reversed. Each phase
+    /// has a DC gain within 0.25 dB of unity (phases 1 and 2 sum to
+    /// 0.973).
     #[test]
     fn coefficients_are_the_published_table() {
         let flat: Vec<f32> = (0..TAPS)
@@ -192,9 +193,28 @@ mod tests {
             let dc: f64 = h.iter().map(|&c| f64::from(c)).sum();
             assert!((dc - 1.0).abs() < 0.03, "phase DC gain {dc}");
         }
-        assert!(flat.iter().all(|c| (c * 8192.0).fract() == 0.0));
-        assert_eq!(COEFFICIENTS[0][0] * 8192.0, 14.0);
-        assert_eq!(COEFFICIENTS[3][5] * 8192.0, 7964.0);
+        // The Annex 2 table column by column, each value in units of
+        // 2^-13: every published digit, so a change to any coefficient,
+        // or to a symmetric pair of them, fails.
+        const TABLE: [[i32; TAPS]; 4] = [
+            [
+                14, 90, -161, 272, -487, 1125, 7964, -838, 390, -218, 122, -68,
+            ],
+            [
+                -239, 240, -424, 730, -1364, 3810, 6388, -1641, 832, -477, 271, -155,
+            ],
+            [
+                -155, 271, -477, 832, -1641, 6388, 3810, -1364, 730, -424, 240, -239,
+            ],
+            [
+                -68, 122, -218, 390, -838, 7964, 1125, -487, 272, -161, 90, 14,
+            ],
+        ];
+        for (h, t) in COEFFICIENTS.iter().zip(&TABLE) {
+            let units: Vec<f32> = h.iter().map(|&c| c * 8192.0).collect();
+            let table: Vec<f32> = t.iter().map(|&u| u as f32).collect();
+            assert_eq!(units, table);
+        }
     }
 
     /// Every path gives the same bits as the scalar one, for any split of
