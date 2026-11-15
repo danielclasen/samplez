@@ -71,9 +71,17 @@ fn wait_all(rs: &[&Replica], k: u64) {
 }
 
 impl Replica {
-    /// The page hashes received, by page.
+    /// The page hashes received, by page; a page sent twice fails.
     fn pages(&self) -> BTreeMap<u64, PageHash> {
-        self.hashes.try_iter().map(|h| (h.page, h)).collect()
+        let mut pages = BTreeMap::new();
+        for h in self.hashes.try_iter() {
+            assert!(
+                pages.insert(h.page, h).is_none(),
+                "page {} sent twice",
+                h.page
+            );
+        }
+        pages
     }
 
     /// The pages whose output depends on more than the input and the
