@@ -244,6 +244,27 @@ fn replicas() {
     // at_index differs from the block before at the same pilot phase.
     let ramp = (at / B - range.start) as usize * 2 * B as usize;
     assert_ne!(bits(&x[ramp..ramp + B as usize]), bits(&x[..B as usize]));
+    // A loudness reset at one index on both: from the window it lands on,
+    // both measure the same samples from the same filter state, so the
+    // maxima since then are the same bits.
+    let now = rx_a.try_iter().last().unwrap().k;
+    let reset = (now + 100) * B;
+    a.reset_loudness(0, reset).unwrap();
+    b.reset_loudness(0, reset).unwrap();
+    let since = Some(reset.div_ceil(4800) * 4800);
+    for e in [&a, &b] {
+        wait_for(5 * SECOND, "a second measured since the reset", || {
+            let m = &e.status().outputs[0].meters;
+            m.since == since && m.window.is_some_and(|w| w * 4800 > reset + 48_000)
+        });
+    }
+    let (sa, sb) = (a.status(), b.status());
+    let (ma, mb) = (&sa.outputs[0].meters, &sb.outputs[0].meters);
+    assert!(ma.valid && mb.valid, "{ma:?} {mb:?}");
+    assert_eq!(ma.max_true_peak, mb.max_true_peak);
+    let max_m = |m: &samplez::OutputMeters| m.max_momentary.map(f64::to_bits);
+    assert_eq!(max_m(ma), max_m(mb), "{ma:?} {mb:?}");
+    assert!(ma.max_momentary.is_some());
     common::stop(b);
     common::stop(a);
 }
