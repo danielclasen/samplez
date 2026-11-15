@@ -22,3 +22,11 @@ harness = false
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(samplez_rtsan)"] }
 
+[dev-dependencies]
+gungraun = "=0.20.0"
+
+# Instruction-count gates under Callgrind; CI runs them with
+# `cargo bench --bench rt` in the builder image.
+[[bench]]
+name = "rt"
+harness = false
