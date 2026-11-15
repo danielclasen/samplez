@@ -20,10 +20,11 @@ pub mod membership;
 pub mod net;
 pub mod peer;
 pub mod report;
+pub mod schedule;
 pub mod snapshot;
 pub mod state_machine;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -180,6 +181,65 @@ pub(crate) struct Shared {
     reconcile: Notify,
     /// Side reports and the contact fence, once started.
     contact: OnceLock<Arc<contact::Contact>>,
+    /// The E estimate at first receipt of the commands clients sent here.
+    receipts: Mutex<Receipts>,
+}
+
+/// First-receipt stamps of client commands, per session, oldest first:
+/// at most `maxSessionCommands` a session and `maxDedupEntries` in all,
+/// each kept until `2 x dedupRetentionS` old.
+#[derive(Default)]
+struct Receipts {
+    sessions: BTreeMap<SessionKey, VecDeque<(String, u64)>>,
+    total: usize,
+}
+
+impl Receipts {
+    /// The stamp held for (`session`, `id`), else `e` recorded as its
+    /// first receipt.
+    fn stamp(&mut self, session: SessionKey, id: &str, e: u64, limits: &Limits) -> u64 {
+        let keep = 2 * limits.retention;
+        let mut total = self.total;
+        self.sessions.retain(|_, held| {
+            while held
+                .front()
+                .is_some_and(|&(_, at)| at.saturating_add(keep) < e)
+            {
+                held.pop_front();
+                total -= 1;
+            }
+            !held.is_empty()
+        });
+        self.total = total;
+        let held = self.sessions.entry(session).or_default();
+        if let Some(&(_, at)) = held.iter().find(|(held, _)| held == id) {
+            return at;
+        }
+        if held.len() >= limits.max_session_commands {
+            held.pop_front();
+            self.total -= 1;
+        }
+        held.push_back((id.to_owned(), e));
+        self.total += 1;
+        if self.total > limits.max_dedup_entries {
+            // The oldest stamp of all goes.
+            let oldest = self
+                .sessions
+                .iter()
+                .filter_map(|(k, h)| h.front().map(|&(_, at)| (at, k.clone())))
+                .min();
+            if let Some((_, k)) = oldest
+                && let Some(h) = self.sessions.get_mut(&k)
+            {
+                h.pop_front();
+                self.total -= 1;
+                if h.is_empty() {
+                    self.sessions.remove(&k);
+                }
+            }
+        }
+        e
+    }
 }
 
 /// Counts a proposal while it lives.
@@ -265,6 +325,7 @@ impl<P: Product> Replica<P> {
             status: Mutex::default(),
             reconcile: Notify::new(),
             contact: OnceLock::new(),
+            receipts: Mutex::default(),
         });
         let (queue, queued) = mpsc::unbounded_channel();
         tokio::spawn(write(shared.clone(), queued, estimate.clone()));
@@ -517,6 +578,41 @@ fn unavailable(e: &dyn std::fmt::Display) -> Refused {
 }
 
 impl Shared {
+    /// E: contact's estimate once contact runs, none while it counts no
+    /// audio replica; before, the estimate the replica was started with.
+    fn e(&self, estimate: &Estimate) -> Option<u64> {
+        match self.contact.get() {
+            Some(c) => c.estimate(),
+            None => Some(estimate()),
+        }
+    }
+
+    /// The oldest a command's first-receipt stamp may lie below E and
+    /// still be ordered: `dedupRetentionS - ageGuard`.
+    fn max_age(&self) -> u64 {
+        let guard = self.contact.get().map_or(0, |c| c.age_guard());
+        self.settings.limits.retention.saturating_sub(guard)
+    }
+
+    /// Where the leader stamps an entry, as a refusal of what it carries
+    /// when it stamps none.
+    fn stamp(
+        &self,
+        generation: bool,
+        estimate: &Estimate,
+    ) -> Result<contact::Stamp, contact::StampRefusal> {
+        match self.contact.get() {
+            Some(c) => c.stamp(generation),
+            None => {
+                let stamp = stamping_index(estimate(), self.settings.block);
+                Ok(contact::Stamp {
+                    stamp,
+                    earliest: stamp,
+                })
+            }
+        }
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
@@ -657,8 +753,26 @@ impl Shared {
     ) -> Result<(), Refused> {
         loop {
             if let Some(_proposing) = self.propose() {
+                let stamped = self.stamp(body.needs_generation(), estimate);
+                let stamp = match stamped {
+                    Ok(stamp) => stamp,
+                    // One pending generation at a time: wait for it.
+                    Err(contact::StampRefusal::GenerationPending)
+                        if Instant::now() + self.heartbeat < deadline =>
+                    {
+                        drop(_proposing);
+                        tokio::time::sleep(self.heartbeat / 10).await;
+                        continue;
+                    }
+                    Err(refusal) => return Err(stamp_refused(refusal)),
+                };
+                let mut body = body;
+                // A later index asked for is kept.
+                if let Some(at) = body.at_index() {
+                    state_machine::restamp(&mut body, at.max(stamp.earliest));
+                }
                 let request = Request {
-                    stamp: stamping_index(estimate(), self.settings.block),
+                    stamp: stamp.stamp,
                     body,
                 };
                 return match tokio::time::timeout_at(deadline, self.raft.client_write(request))
@@ -745,6 +859,23 @@ impl Shared {
     /// Appends `items` as one entry and answers them; gives them back when
     /// this replica turned out not to lead.
     async fn write_locally(&self, items: Vec<Item>, estimate: &Estimate) -> Result<(), Vec<Item>> {
+        let stamp = match self.stamp(false, estimate) {
+            Ok(stamp) => stamp,
+            Err(refusal) => return answer_all(items, stamp_refused(refusal)),
+        };
+        // A command first received longer ago than the set deduplicates
+        // is never ordered: E's frame, no TAI clock.
+        let e = self.e(estimate).unwrap_or(0);
+        let max_age = self.max_age();
+        let (items, expired): (Vec<Item>, Vec<Item>) = items
+            .into_iter()
+            .partition(|item| item.received.saturating_add(max_age) >= e);
+        for item in expired {
+            let _ = item.reply.send(Err(Refused::Expired));
+        }
+        if items.is_empty() {
+            return Ok(());
+        }
         let mut batch = Batch::default();
         let latest = items
             .iter()
@@ -753,10 +884,18 @@ impl Shared {
             .expect("not empty");
         let positions: Vec<usize> = items
             .iter()
-            .map(|item| batch.push(item.command.clone()))
+            .map(|item| {
+                let mut command = item.command.clone();
+                // A later index asked for is kept, an earlier or absent one
+                // is the earliest.
+                if self.contact.get().is_some() {
+                    command.at_index = Some(command.at_index.unwrap_or(0).max(stamp.earliest));
+                }
+                batch.push(command)
+            })
             .collect();
         let request = Request {
-            stamp: stamping_index(estimate(), self.settings.block),
+            stamp: stamp.stamp,
             body: Body::Commands(batch.into_commands()),
         };
         let written = tokio::time::timeout_at(latest, self.raft.client_write(request)).await;
@@ -831,6 +970,17 @@ impl Shared {
         }
         again
     }
+}
+
+fn stamp_refused(refusal: contact::StampRefusal) -> Refused {
+    Refused::Unavailable(
+        match refusal {
+            contact::StampRefusal::NobodyCounted => "clock_unverified",
+            contact::StampRefusal::FutureListFull => "future_list_full",
+            contact::StampRefusal::GenerationPending => "generation pending",
+        }
+        .into(),
+    )
 }
 
 fn answer_all(items: Vec<Item>, refused: Refused) -> Result<(), Vec<Item>> {
@@ -1079,6 +1229,21 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             let refused = NotApplied::new(Reason::NotCommitable, detail);
             return Box::pin(async move { Err(refused) });
         }
+        let Some(e) = self.shared.e(&self.estimate) else {
+            let refused = NotApplied::new(Reason::Unavailable, "clock_unverified");
+            return Box::pin(async move { Err(refused) });
+        };
+        // A resend carries the stamp of its first receipt here.
+        let received = self
+            .shared
+            .receipts
+            .lock()
+            .expect("receipts lock poisoned")
+            .stamp(SessionKey::from(owner), id, e, &self.shared.settings.limits);
+        if received.saturating_add(self.shared.max_age()) < e {
+            let refused = NotApplied::new(Reason::Expired, "first received too long ago");
+            return Box::pin(async move { Err(refused) });
+        }
         let (reply, replied) = oneshot::channel();
         let deadline = Instant::now() + self.shared.settings.write_timeout;
         let item = Item {
@@ -1088,7 +1253,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                 at_index: None,
                 body: command.to_vec(),
             },
-            received: (self.estimate)(),
+            received,
             deadline,
             reply,
             forwarded: false,
@@ -1111,6 +1276,10 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                 Err(Refused::Unavailable(detail)) => {
                     Err(NotApplied::new(Reason::Unavailable, detail))
                 }
+                Err(Refused::Expired) => Err(NotApplied::new(
+                    Reason::Expired,
+                    "first received too long ago",
+                )),
                 Err(_) => Err(NotApplied::new(Reason::Unavailable, "no leader")),
             }
         })

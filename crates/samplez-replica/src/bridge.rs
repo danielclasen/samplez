@@ -140,6 +140,7 @@ impl Audio for EngineAudio {
             },
             statuses: Vec::with_capacity(self.outputs),
             unwritten: Vec::new(),
+            build_lead: Some(progress.build_lead),
         };
         if let Some(newest) = progress.processed {
             let first = (newest + 1).saturating_sub(self.window);
