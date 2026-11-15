@@ -1539,13 +1539,14 @@ impl Supervisor {
     /// Samples the kernel clock's synchronisation, for the clock
     /// self-report, and the clock status.
     fn clock(&mut self) {
-        let unsynchronised = unsynchronised();
+        let (unsynchronised, clean_after) = self_report(&self.counters.clock_steps, unsynchronised);
         if let (Some(shared), Some(u)) = (&self.shared, unsynchronised) {
             shared.self_report.store(u, Relaxed);
             // A lone voter's clean self-report clears every step detected
             // before it.
-            if self.alone && !u {
-                let steps = self.counters.clock_steps.load(Relaxed);
+            if self.alone
+                && let Some(steps) = clean_after
+            {
                 shared.steps_cleared.fetch_max(steps, Release);
             }
         }
@@ -2276,6 +2277,21 @@ impl Supervisor {
     }
 }
 
+/// The kernel clock's self-report from `read`, and on a clean one the
+/// count of clock steps detected before the reading began: a step
+/// detected while it ran is not cleared by it.
+fn self_report(
+    steps: &AtomicU64,
+    read: impl FnOnce() -> Option<bool>,
+) -> (Option<bool>, Option<u64>) {
+    let before = steps.load(Acquire);
+    let unsynchronised = read();
+    (
+        unsynchronised,
+        (unsynchronised == Some(false)).then_some(before),
+    )
+}
+
 /// Whether the kernel clock is unsynchronised: `adjtimex` reading
 /// `TIME_ERROR` or `STA_UNSYNC`. None when the call failed.
 fn unsynchronised() -> Option<bool> {
@@ -2820,6 +2836,20 @@ mod tests {
         }
         e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// A clean self-report clears only the steps detected before its
+    /// reading began.
+    #[test]
+    fn a_step_during_the_reading_is_not_cleared_by_it() {
+        let steps = AtomicU64::new(3);
+        let (u, clear) = self_report(&steps, || {
+            steps.fetch_add(1, Relaxed);
+            Some(false)
+        });
+        assert_eq!((u, clear), (Some(false), Some(3)));
+        assert_eq!(self_report(&steps, || Some(true)), (Some(true), None));
+        assert_eq!(self_report(&steps, || None), (None, None));
     }
 
     /// One voter has no peer to clear a detected clock step: its next
