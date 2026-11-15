@@ -181,6 +181,27 @@ fn registering_a_series_again_returns_it_and_remove_drops_it() {
     assert_eq!(fresh.get(), 0, "registered anew after removal");
 }
 
+/// A gauge renders its last value, negative and non-finite ones included.
+#[test]
+fn gauges_render_the_last_value() {
+    let m = Metrics::default();
+    let g = m.gauge("samplez_loudness_lufs", "Loudness.", &[("output", "a")]);
+    assert_eq!(g.get(), 0.0);
+    g.set(1.5);
+    g.set(-23.25);
+    m.gauge("samplez_loudness_lufs", "Loudness.", &[("output", "b")])
+        .set(f64::NEG_INFINITY);
+    assert_eq!(
+        m.render(),
+        "# HELP samplez_loudness_lufs Loudness.\n\
+         # TYPE samplez_loudness_lufs gauge\n\
+         samplez_loudness_lufs{output=\"a\"} -23.25\n\
+         samplez_loudness_lufs{output=\"b\"} -Inf\n"
+    );
+    let again = m.gauge("samplez_loudness_lufs", "Loudness.", &[("output", "a")]);
+    assert_eq!(again.get(), -23.25, "one series");
+}
+
 #[test]
 fn histograms_skip_nan_and_render_infinities() {
     let m = Metrics::default();
