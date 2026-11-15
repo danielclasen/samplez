@@ -268,9 +268,10 @@ pub enum Resolution {
     Stale,
 }
 
-/// [`ReplicatedState::submit`] did not apply the command. Every reason is
-/// answered as not applied, [`NotApplied::STATUS`] in HTTP terms: the
-/// command changed nothing the client can see.
+/// [`ReplicatedState::submit`] has not applied the command when it
+/// resolves; with [`Reason::Unavailable`] it may still commit later, and a
+/// resend with the same id applies once. Every reason is answered as not
+/// applied, [`NotApplied::STATUS`] in HTTP terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotApplied {
     pub reason: Reason,
