@@ -204,3 +204,20 @@ fn a_skipped_entry_never_reaches_the_rt_thread() {
     std::thread::sleep(Duration::from_millis(30));
     assert_eq!(consumed(), before + 1, "entry 7 was applied");
 }
+
+#[test]
+fn an_entry_the_engine_refuses_is_counted_in_every_sample() {
+    let domain = Domain::new();
+    let (_engine, audio) = bridge(&domain, 1 << 16);
+    assert_eq!(audio.sample().entries_refused, 0);
+    // No input slot 5: the engine refuses the entry.
+    let request = Request {
+        stamp: 0,
+        body: Body::InputDown {
+            slot: 5,
+            at_index: 48_000,
+        },
+    };
+    audio.appended(3, &request);
+    assert_eq!(audio.sample().entries_refused, 1);
+}
