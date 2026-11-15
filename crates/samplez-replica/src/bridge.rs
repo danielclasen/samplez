@@ -188,6 +188,16 @@ impl Audio for EngineAudio {
         self.engine.commit(up_to);
     }
 
+    fn skip(&self, index: u64) {
+        self.engine.skip(index);
+    }
+
+    fn overwhelmed(&self) {
+        tracing::error!("an unresolved entry found no room in the engine: withdrawn");
+        // Refused only by an engine that is not replicated.
+        let _ = self.engine.withdraw();
+    }
+
     fn unresolved(&self, index: u64, at_index: u64) -> bool {
         self.engine.unresolved(index, at_index).is_ok()
     }

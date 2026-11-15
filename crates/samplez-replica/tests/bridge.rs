@@ -175,3 +175,32 @@ fn a_block_without_a_status_word_is_reported_withheld() {
         (Kind::Withheld, Cause::Skip)
     );
 }
+
+#[test]
+fn a_skipped_entry_never_reaches_the_rt_thread() {
+    let domain = Domain::new();
+    let (engine, audio) = bridge(&domain, 1 << 16);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let processed = engine.progress().unwrap().processed.unwrap();
+    let request = |at| Request {
+        stamp: 0,
+        body: Body::InputDown {
+            slot: 0,
+            at_index: at,
+        },
+    };
+    let consumed = || engine.counters().entries_consumed.load(Ordering::Relaxed);
+    let before = consumed();
+    audio.appended(7, &request((processed + 200) * B));
+    audio.appended(8, &request((processed + 201) * B));
+    // Its commit came after its apply deadline: the log decides it.
+    audio.skip(7);
+    audio.committed(8);
+    wait_for("entry 8 taken by the RT thread", || {
+        consumed() == before + 1
+    });
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(consumed(), before + 1, "entry 7 was applied");
+}

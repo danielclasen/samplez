@@ -129,8 +129,15 @@ pub trait Audio: Send + Sync + 'static {
     fn committed(&self, up_to: u64);
     /// Entry `index` at `at_index` is unresolved: every block from
     /// `at_index` is degraded until the log decides it. False when the
-    /// engine had no room for it; it is offered again.
+    /// engine had no room for it.
     fn unresolved(&self, index: u64, at_index: u64) -> bool;
+    /// This log's entry `index` is never applied: its commit was not known
+    /// by its apply deadline, so only the log's later decision on it
+    /// counts.
+    fn skip(&self, index: u64);
+    /// An unresolved entry found no room: the replica can no longer tell
+    /// its degraded blocks, so it stops committing them at once.
+    fn overwhelmed(&self);
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -221,8 +228,29 @@ const SCHEDULED_MAX: usize = 4096;
 /// listing that names one again does not give it again.
 const GIVEN_KEPT: usize = 1024;
 
-/// The log id an unresolvable entry from a listing's overflow carries.
-pub const UNLISTED_ID: u64 = u64::MAX;
+/// The ids of the unresolvable entries a listing's overflow names: this
+/// bit and the omitted at_index in blocks, so replicas that hold one for
+/// the same index hold the same id, and none equals a log id or the
+/// engine's own reserved `u64::MAX`.
+pub const UNLISTED_BIT: u64 = 1 << 63;
+
+/// The id of the unresolvable entry at `at_index` a listing's overflow
+/// names.
+pub fn unlisted_id(at_index: u64, block: u64) -> u64 {
+    UNLISTED_BIT | (at_index / block)
+}
+
+/// A log id as a map key, in log order: index, then term and node.
+type Key = (u64, u64, u64);
+
+fn key(id: StoredLogId) -> Key {
+    (id.index, id.term, id.node)
+}
+
+/// A report whose seq lies this far or less below the newest one taken
+/// from its voter is older than that one; one further below comes from a
+/// restarted process, which drew a new first seq.
+const SEQ_WINDOW: u64 = 1 << 20;
 
 /// What a voter received directly from another.
 #[derive(Debug, Clone)]
@@ -256,7 +284,7 @@ struct Peer {
 #[derive(Debug, Clone, Copy)]
 struct Waiting {
     at_index: u64,
-    /// Past its apply deadline; the engine refused it so far.
+    /// Past its apply deadline: given to the engine at once.
     expired: bool,
 }
 
@@ -293,10 +321,13 @@ struct State {
     /// Every entry of this replica's log up to here is committed.
     known_committed: u64,
     handed: u64,
-    awaiting: BTreeMap<u64, Waiting>,
+    awaiting: BTreeMap<Key, Waiting>,
     /// Entries given to the engine as unresolved, the lowest index
     /// forgotten first.
-    given: BTreeMap<u64, u64>,
+    given: BTreeMap<Key, u64>,
+    /// The lowest at_index of a listing overflow given as unresolved: a
+    /// later overflow at or above it adds nothing, one below it is given.
+    unlisted_low: Option<u64>,
     fence: Option<u64>,
     own: Own,
     status_changes_lost: u64,
@@ -406,6 +437,7 @@ impl Contact {
                 handed: applied,
                 awaiting: BTreeMap::new(),
                 given: BTreeMap::new(),
+                unlisted_low: None,
                 fence: None,
                 own: Own::default(),
                 status_changes_lost: 0,
@@ -465,7 +497,13 @@ impl Contact {
         };
         let t1 = report.echo.and_then(|e| sent_at(e.seq));
         let peer = st.peers.entry(report.from).or_default();
-        if peer.last.as_ref().is_some_and(|l| l.seq == report.seq) {
+        // A copy, or a report delayed past a newer one from the same
+        // process.
+        if peer
+            .last
+            .as_ref()
+            .is_some_and(|l| l.seq.wrapping_sub(report.seq) < SEQ_WINDOW)
+        {
             return;
         }
         peer.reports += 1;
@@ -522,11 +560,13 @@ impl Contact {
         for l in &report.listed {
             self.note(st, l.id, l.at_index, tai);
         }
-        if let Some(at) = report.unlisted {
+        if let Some(at) = report.unlisted
+            && st.unlisted_low.is_none_or(|low| at < low)
+        {
             let id = StoredLogId {
                 term: 0,
                 node: 0,
-                index: UNLISTED_ID,
+                index: unlisted_id(at, self.timing.block),
             };
             self.note(st, id, at, tai);
         }
@@ -701,30 +741,40 @@ impl Contact {
 
     /// Gives the expired entries to the engine.
     fn offer_unresolved(&self, st: &mut State) {
+        let expired: Vec<(Key, u64)> = st
+            .awaiting
+            .iter()
+            .filter(|(_, w)| w.expired)
+            .map(|(&k, w)| (k, w.at_index))
+            .collect();
+        for (k, _) in &expired {
+            st.awaiting.remove(k);
+        }
         let Some(audio) = &self.audio else {
-            st.awaiting.retain(|_, w| !w.expired);
             return;
         };
-        let mut given = Vec::new();
-        let mut refused = 0;
-        st.awaiting.retain(|&index, w| {
-            if !w.expired {
-                return true;
+        for (k, at) in expired {
+            let (index, term, node) = k;
+            // This log's own entry is never applied: the log decides it.
+            if index & UNLISTED_BIT == 0
+                && self.log.log_id_at(index) == Some(StoredLogId { term, node, index })
+            {
+                audio.skip(index);
             }
-            if audio.unresolved(index, w.at_index) {
-                given.push((index, w.at_index));
-                false
+            if audio.unresolved(index, at) {
+                st.counts.unresolved += 1;
+                if index & UNLISTED_BIT != 0 {
+                    st.unlisted_low = Some(st.unlisted_low.map_or(at, |l| l.min(at)));
+                }
+                // Listed again, an entry given once is not given again.
+                st.given.insert(k, at);
+                while st.given.len() > GIVEN_KEPT {
+                    st.given.pop_first();
+                }
             } else {
-                refused += 1;
-                true
+                st.counts.unresolved_refused += 1;
+                audio.overwhelmed();
             }
-        });
-        st.counts.unresolved += given.len() as u64;
-        st.counts.unresolved_refused += refused;
-        // Listed again, an entry given once is not given again.
-        st.given.extend(given);
-        while st.given.len() > GIVEN_KEPT {
-            st.given.pop_first();
         }
     }
 
@@ -736,7 +786,9 @@ impl Contact {
             .find(|&(&index, &id)| self.log.log_id_at(index) != Some(id))
             .map(|(&index, _)| index);
         if let Some(from) = cut {
-            st.uncommitted.split_off(&from);
+            for (_, id) in st.uncommitted.split_off(&from) {
+                st.awaiting.remove(&key(id));
+            }
             st.scheduled.split_off(&from);
             st.told = from - 1;
             if let Some(audio) = &self.audio {
@@ -747,6 +799,11 @@ impl Contact {
         self.log.entries_after(st.told, &mut |id, request| {
             if let Some(audio) = &self.audio {
                 audio.appended(id.index, request);
+                // Given unresolved from a listing before it arrived here:
+                // never applied.
+                if st.given.contains_key(&key(id)) {
+                    audio.skip(id.index);
+                }
             }
             new.push((id, request.at_index()));
         });
@@ -773,19 +830,26 @@ impl Contact {
         // At or below the known commit point an entry is this log's own,
         // committed and handed when it was appended, or one that can no
         // longer commit.
+        let k = key(id);
         if id.index <= st.known_committed
-            || st.awaiting.contains_key(&id.index)
-            || st.given.contains_key(&id.index)
+            || st.awaiting.contains_key(&k)
+            || st.given.contains_key(&k)
         {
             return;
         }
+        let full = st.awaiting.len() >= AWAITING_MAX;
         let expired = tai >= self.timing.apply_deadline(at_index);
-        if st.awaiting.len() >= AWAITING_MAX && !expired {
+        if full && !expired {
             st.counts.awaiting_overflow += 1;
         }
-        let expired = expired || st.awaiting.len() >= AWAITING_MAX;
-        st.awaiting.insert(id.index, Waiting { at_index, expired });
-        if expired {
+        st.awaiting.insert(
+            k,
+            Waiting {
+                at_index,
+                expired: expired || full,
+            },
+        );
+        if expired || full {
             self.offer_unresolved(st);
         }
     }
@@ -799,11 +863,8 @@ impl Contact {
         }
         st.known_committed = index;
         st.uncommitted = st.uncommitted.split_off(&(index + 1));
-        let keep = st.awaiting.split_off(&(index + 1));
-        let settled = std::mem::replace(&mut st.awaiting, keep);
-        // Expired ones stay unresolved, decided in the log.
-        st.awaiting
-            .extend(settled.into_iter().filter(|(_, w)| w.expired));
+        // Awaited entries only wait unexpired: expired ones were given.
+        st.awaiting = st.awaiting.split_off(&(index + 1, 0, 0));
         self.hand(st);
     }
 
@@ -854,7 +915,10 @@ impl Contact {
                 .map(|&(t1, _)| t1)
                 .max()
         };
-        loop {
+        // No echo is newer than now: a block ending more than w ahead is
+        // never valid, so the scan ends there whatever `settled` says.
+        let end = index_at(tai + w) / t.block;
+        while k <= end {
             let start = time_of((k + 1) * t.block).saturating_sub(w);
             let valid = st
                 .members
@@ -1091,6 +1155,8 @@ mod tests {
         step_at: AtomicU64,
         fence: AtomicU64,
         calls: Mutex<Vec<String>>,
+        /// Unresolved entries it takes before it refuses.
+        room: AtomicU64,
     }
 
     impl Audio for Engine {
@@ -1127,9 +1193,20 @@ mod tests {
                 .push(format!("committed {up_to}"));
         }
         fn unresolved(&self, index: u64, at_index: u64) -> bool {
+            if self.room.load(Ordering::SeqCst) == 0 {
+                self.calls.lock().unwrap().push(format!("refused {index}"));
+                return false;
+            }
+            self.room.fetch_sub(1, Ordering::SeqCst);
             let call = format!("unresolved {index} at {at_index}");
             self.calls.lock().unwrap().push(call);
             true
+        }
+        fn skip(&self, index: u64) {
+            self.calls.lock().unwrap().push(format!("skip {index}"));
+        }
+        fn overwhelmed(&self) {
+            self.calls.lock().unwrap().push("overwhelmed".into());
         }
     }
 
@@ -1166,6 +1243,7 @@ mod tests {
             step_at: AtomicU64::new(u64::MAX),
             fence: AtomicU64::new(0),
             calls: Mutex::new(Vec::new()),
+            room: AtomicU64::new(u64::MAX),
         });
         let contact = Contact::new(
             1,
@@ -1431,16 +1509,20 @@ mod tests {
         assert_eq!(
             f.engine.calls(),
             [
+                "skip 2".into(),
                 format!("unresolved 2 at {}", at + 2 * B),
                 "committed 2".into()
             ],
-            "a commit learned at the deadline is late, and still handed"
+            "a commit learned at the deadline is late: entry 2 is never applied"
         );
         f.clock.set(timing.apply_deadline(at + 3 * B));
         f.tick();
         assert_eq!(
             f.engine.calls(),
-            [format!("unresolved 3 at {}", at + 3 * B)]
+            [
+                "skip 3".to_owned(),
+                format!("unresolved 3 at {}", at + 3 * B)
+            ]
         );
     }
 
@@ -1463,9 +1545,23 @@ mod tests {
         assert_eq!(f.engine.calls(), [format!("unresolved 7 at {at}")]);
         f.clock.set(timing.apply_deadline(at + B));
         f.tick();
+        let marker = unlisted_id(at + B, B);
+        assert_ne!(marker, u64::MAX, "the engine's own reserved id");
         assert_eq!(
             f.engine.calls(),
-            [format!("unresolved {UNLISTED_ID} at {}", at + B)]
+            [format!("unresolved {marker} at {}", at + B)]
+        );
+        // A later overflow at a higher index adds nothing; one below the
+        // lowest given is given again.
+        for (n, unlisted) in [(1, at + 2 * B), (2, at)] {
+            let mut r = f.report(2, None);
+            r.seq += n;
+            r.unlisted = Some(unlisted);
+            f.contact.receive(r);
+        }
+        assert_eq!(
+            f.engine.calls(),
+            [format!("unresolved {} at {at}", unlisted_id(at, B))]
         );
     }
 
@@ -1531,5 +1627,103 @@ mod tests {
         f.log.push(2, 3, None);
         f.contact.log_changed();
         assert_eq!(f.engine.calls(), ["truncated 3", "appended 3"]);
+    }
+
+    /// A stale listing at an index must not hide the deadline of the
+    /// entry that index holds in the set's log.
+    #[tokio::test(start_paused = true)]
+    async fn review_two_listings_at_one_index_each_keep_their_deadline() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let timing = Timing::defaults(B);
+        let early = index_at(T0) + 40 * 48;
+        let late = early + 400 * 48;
+        // A deposed leader's uncommitted entry at index 5 listed first,
+        // then the entry the set committed there, with an earlier index.
+        let mut r = f.report(2, None);
+        r.listed = vec![Listed {
+            id: id(1, 5),
+            at_index: late,
+        }];
+        f.contact.receive(r);
+        let mut r = f.report(3, None);
+        r.listed = vec![Listed {
+            id: id(2, 5),
+            at_index: early,
+        }];
+        f.contact.receive(r);
+        f.engine.calls();
+        f.clock.set(timing.apply_deadline(early));
+        f.tick();
+        let calls = f.engine.calls();
+        assert!(
+            calls.contains(&format!("unresolved 5 at {early}")),
+            "entry (2, 5) passed its deadline unknown, not unresolved: {calls:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_truncated_entry_takes_its_deadline_with_it() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let timing = Timing::defaults(B);
+        let early = index_at(T0) + 40 * 48;
+        f.log.push(1, 1, Some(early));
+        f.contact.log_changed();
+        // Replaced by another leader's entry, far ahead.
+        f.log.push(2, 1, Some(early + 4000 * B));
+        f.contact.log_changed();
+        f.engine.calls();
+        f.clock.set(timing.apply_deadline(early));
+        f.tick();
+        assert!(f.engine.calls().is_empty(), "the cut entry's deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_entry_without_room_withdraws_once_and_is_not_offered_again() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let timing = Timing::defaults(B);
+        let at = index_at(T0) + 40 * 48;
+        f.engine.room.store(0, Ordering::SeqCst);
+        let mut r = f.report(2, None);
+        r.listed = vec![Listed {
+            id: id(1, 9),
+            at_index: at,
+        }];
+        f.contact.receive(r);
+        f.clock.set(timing.apply_deadline(at));
+        f.tick();
+        assert_eq!(f.engine.calls(), ["refused 9", "overwhelmed"]);
+        f.engine.room.store(10, Ordering::SeqCst);
+        for _ in 0..3 {
+            f.tick();
+        }
+        assert!(f.engine.calls().is_empty(), "offered again");
+        assert_eq!(f.contact.metrics().unresolved_refused, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_report_older_than_the_newest_taken_is_ignored() {
+        let f = fixture(&[&[1, 2, 3]]);
+        let first = f.tick()[0].2.seq;
+        f.clock.add(Duration::from_millis(40));
+        tokio::time::advance(Duration::from_millis(40)).await;
+        let second = f.tick()[0].2.seq;
+        let mut newer = f.report(2, Some((second, f.clock.get())));
+        newer.seq = 1000;
+        f.contact.receive(newer);
+        let fence = f.fence();
+        // The older report, delayed, echoes the older seq.
+        let mut older = f.report(2, Some((first, T0)));
+        older.seq = 999;
+        f.contact.receive(older);
+        let (_, _, to_2) = f.tick().into_iter().find(|(to, _, _)| *to == 2).unwrap();
+        assert_eq!(
+            to_2.echo.unwrap().seq,
+            1000,
+            "the newer report is the one echoed"
+        );
+        assert_eq!(f.fence(), fence);
     }
 }

@@ -217,6 +217,8 @@ pub struct Fake {
     /// F as published, with the TAI time, when it changed.
     pub fences: Vec<(u64, u64)>,
     pub unresolved: Vec<(u64, u64)>,
+    pub skipped: Vec<u64>,
+    pub overwhelmed: u64,
     /// The processed block stands still from here.
     pub stalled_at: Option<u64>,
     pub flags: ClockFlags,
@@ -305,6 +307,12 @@ impl Audio for FakeAudio {
     fn unresolved(&self, index: u64, at_index: u64) -> bool {
         self.lock().unresolved.push((index, at_index));
         true
+    }
+    fn skip(&self, index: u64) {
+        self.lock().skipped.push(index);
+    }
+    fn overwhelmed(&self) {
+        self.lock().overwhelmed += 1;
     }
 }
 
