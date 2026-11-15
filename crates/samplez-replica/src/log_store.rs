@@ -560,18 +560,9 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         };
         let stored: StoredSnapshot = serde_json::from_slice(&bytes).map_err(|e| read_error(&e))?;
         let _installing = self.snapshots.lock().await;
-        let dir = {
-            let mut inner = self.lock();
-            let limits = inner.limits;
-            let at = stored.last_applied.map_or(0, |id| id.index);
-            inner
-                .sm
-                .load(stored.state.clone(), limits, at)
-                .map_err(|e| read_error(&e))?;
-            inner.last_applied = stored.last_applied;
-            inner.membership = stored.membership.clone();
-            inner.dir.clone()
-        };
+        // The file first, so a failed write leaves the state as the file
+        // on disk holds it.
+        let dir = self.lock().dir.clone();
         blocking(move || replace(&dir, "snapshot", &bytes))
             .await
             .map_err(|e| {
@@ -580,7 +571,16 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
                     &e,
                 )
             })?;
-        self.lock().snapshot = Some(stored);
+        let mut inner = self.lock();
+        let limits = inner.limits;
+        let at = stored.last_applied.map_or(0, |id| id.index);
+        inner
+            .sm
+            .load(stored.state.clone(), limits, at)
+            .map_err(|e| read_error(&e))?;
+        inner.last_applied = stored.last_applied;
+        inner.membership = stored.membership.clone();
+        inner.snapshot = Some(stored);
         Ok(())
     }
 
@@ -864,5 +864,28 @@ mod tests {
             .expect("install");
         assert_eq!(other.with_state(|sm| sm.save()), saved);
         assert_eq!(other.applied_index(), 3);
+    }
+
+    /// An install whose file cannot be written leaves the state as it was,
+    /// in step with the snapshot on disk.
+    #[tokio::test]
+    async fn a_failed_snapshot_write_leaves_the_state_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut store = open(&dir("snap-from"));
+        let entries: Vec<_> = (1..=3).map(entry).collect();
+        store.append_to_log(entries.clone()).await.expect("append");
+        store.apply_to_state_machine(&entries).await.expect("apply");
+        let snapshot = store.build_snapshot().await.expect("build");
+        let to = dir("snap-readonly");
+        let mut other = open(&to);
+        let before = other.with_state(|sm| sm.save());
+        fs::set_permissions(&to, fs::Permissions::from_mode(0o555)).expect("read-only");
+        let installed = other
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await;
+        fs::set_permissions(&to, fs::Permissions::from_mode(0o755)).expect("writable");
+        assert!(installed.is_err());
+        assert_eq!(other.applied_index(), 0);
+        assert_eq!(other.with_state(|sm| sm.save()), before);
     }
 }
