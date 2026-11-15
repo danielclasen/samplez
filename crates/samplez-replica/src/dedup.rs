@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::entry::{Resolution, SessionKey};
 
-/// Bounds on the table, set alike on every replica.
+/// Bounds on the table, set alike on every replica. They are applied in
+/// state-machine apply and on a snapshot load but not carried in the log,
+/// so replicas with different limits hold different tables and answer
+/// copies differently: they are part of the set's compatibility key,
+/// and changing one is a change of that key, not a rolling update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// `dedupRetentionS` in samples: a record retires once its stamping
