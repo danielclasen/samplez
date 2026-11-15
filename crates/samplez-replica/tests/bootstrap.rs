@@ -421,11 +421,7 @@ impl Set {
 
     async fn applied(&self, index: u64) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while self
-            .nodes
-            .values()
-            .any(|n| n.replica.store().applied_index() < index)
-        {
+        while self.nodes.values().any(|n| n.replica.revision() < index) {
             assert!(Instant::now() < deadline, "{index} not applied in 10 s");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -533,7 +529,15 @@ async fn a_set_starts_from_the_marker_and_takes_writes_through_any_audio_replica
 async fn ordinal_0_rejoins_as_a_learner_after_losing_its_volume() {
     let mut set = Set::new(Voters::new(3, false).unwrap()).await;
     set.start_all().await;
-    let leader = set.settled().await;
+    // Ordinal 1 leads throughout, so the leader that takes the new volume
+    // in is the one that purged its log.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while set.settled().await != Slot::Audio(1) {
+        assert!(Instant::now() < deadline, "ordinal 1 did not take the lead");
+        let _ = set.replica(Slot::Audio(1)).raft().trigger().elect().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let leader = Slot::Audio(1);
     let epoch = set.replica(leader).epoch();
     let mut last = 0;
     for n in 1..=3 {
@@ -546,7 +550,17 @@ async fn ordinal_0_rejoins_as_a_learner_after_losing_its_volume() {
     }
     set.applied(last).await;
     // The log up to here goes into a snapshot, so the new volume can only
-    // catch up by installing it.
+    // catch up by installing it. `last` is a product revision; snapshots
+    // and purges count log ids.
+    let upto = set
+        .nodes
+        .values()
+        .map(|n| {
+            let applied = n.replica.raft().metrics().borrow().last_applied;
+            applied.map_or(0, |id| id.index)
+        })
+        .min()
+        .unwrap();
     for node in set.nodes.values() {
         let raft = node.replica.raft();
         raft.trigger().snapshot().await.unwrap();
@@ -554,11 +568,11 @@ async fn ordinal_0_rejoins_as_a_learner_after_losing_its_volume() {
             .metrics()
             .borrow()
             .snapshot
-            .is_none_or(|id| id.index < last)
+            .is_none_or(|id| id.index < upto)
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        raft.trigger().purge_log(last).await.unwrap();
+        raft.trigger().purge_log(upto).await.unwrap();
     }
 
     let old = set.nodes[&Slot::Audio(0)].id;
@@ -836,11 +850,11 @@ async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
         );
     }
     let all: BTreeSet<NodeId> = ids.values().copied().collect();
+    let back = set.voters_become(&all, Duration::from_secs(30)).await;
     assert!(
-        set.voters_become(&all, Duration::from_secs(30))
-            .await
-            .is_some(),
-        "ordinals 1 and 2 rejoined"
+        back.is_some(),
+        "ordinals 1 and 2 did not rejoin:\n{}",
+        set.describe()
     );
     let revision = write(set.replica(Slot::Audio(2)), "2", "gain=2@2").await;
     set.applied(revision).await;

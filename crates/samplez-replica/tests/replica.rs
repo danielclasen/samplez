@@ -330,6 +330,7 @@ async fn a_command_past_its_deadline_while_queued_never_applies() {
     // proposed commits.
     set_.restart(followers[0]).await;
     let leader = set_.leader().await;
+    set_.commitable(leader).await;
     set(&**set_.replica(leader), "s", "c", "mute=1@1").await;
     set_.replica(leader).store().with_state(|sm| {
         assert!(sm.product.values.contains_key("gain"), "the stalled write");

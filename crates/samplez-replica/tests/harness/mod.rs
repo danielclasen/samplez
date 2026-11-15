@@ -531,6 +531,16 @@ impl Set {
         }
     }
 
+    /// Waits until `id` takes client writes again: within a check of a
+    /// leader counting it.
+    pub async fn commitable(&self, id: NodeId) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.replica(id).replica().commitable {
+            assert!(Instant::now() < deadline, "{id} not commitable within 5 s");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Removes what `id`'s volume holds; for a stopped replica.
     pub fn wipe(&self, id: NodeId) {
         std::fs::remove_dir_all(self.root.join(id.to_string())).expect("wipes");
