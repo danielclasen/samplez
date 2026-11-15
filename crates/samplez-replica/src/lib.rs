@@ -256,6 +256,9 @@ pub struct Replica<P> {
     shared: Arc<Shared>,
     store: Store<P>,
     queue: mpsc::UnboundedSender<Queued>,
+    /// Generation-needing entries, ordered apart: one waits for the
+    /// previous one's index to pass, which must hold up no other write.
+    generations: mpsc::UnboundedSender<Queued>,
     estimate: Estimate,
     /// Set once the replica applied the log up to the committed id it
     /// knows ([`ReplicaInfo::ready`]); nothing clears it yet.
@@ -329,6 +332,8 @@ impl<P: Product> Replica<P> {
         });
         let (queue, queued) = mpsc::unbounded_channel();
         tokio::spawn(write(shared.clone(), queued, estimate.clone()));
+        let (generations, waiting) = mpsc::unbounded_channel();
+        tokio::spawn(write(shared.clone(), waiting, estimate.clone()));
         if let Some(voters) = voters {
             tokio::spawn(membership::reconcile(shared.clone(), voters));
         }
@@ -336,6 +341,7 @@ impl<P: Product> Replica<P> {
             shared,
             store,
             queue,
+            generations,
             estimate,
             ready: AtomicBool::new(false),
         })
@@ -363,9 +369,15 @@ impl<P: Product> Replica<P> {
     }
 
     /// Orders an entry the replica set decides on rather than a client,
-    /// behind every command submitted before it.
+    /// behind every command submitted before it; a generation-needing
+    /// entry behind the earlier generation-needing ones only.
     pub fn append(&self, body: Body) {
-        let _ = self.queue.send(Queued::Entry {
+        let queue = if body.needs_generation() {
+            &self.generations
+        } else {
+            &self.queue
+        };
+        let _ = queue.send(Queued::Entry {
             body,
             deadline: Instant::now() + self.shared.settings.write_timeout,
             reply: None,
@@ -1101,7 +1113,8 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             commitable: ready
                 && voter
                 && slot_of(self.id()) != Slot::Witness
-                && (alone || self.shared.counted.load(Ordering::SeqCst)),
+                && (alone || self.shared.counted.load(Ordering::SeqCst))
+                && !self.shared.contact.get().is_some_and(|c| c.engine_failed()),
         }
     }
 
@@ -1223,6 +1236,8 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         if !info.commitable {
             let detail = if slot_of(self.id()) == Slot::Witness {
                 "the witness serves no clients"
+            } else if self.shared.contact.get().is_some_and(|c| c.engine_failed()) {
+                "the engine refused a log entry"
             } else {
                 "no leader counts this replica as a voter"
             };

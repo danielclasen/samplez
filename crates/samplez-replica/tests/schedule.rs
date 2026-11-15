@@ -294,3 +294,83 @@ async fn a_late_commit_raises_the_lead_up_to_its_cap() {
     assert_eq!(m.lead, index_at(timing().max_apply_lead.as_nanos() as u64));
     assert!(m.apply_lead_capped);
 }
+
+/// The 64-entry limit counts entries the engines still hold pending, not
+/// only those some voter has not reported committed yet.
+#[tokio::test(start_paused = true)]
+async fn review_the_future_list_counts_committed_entries() {
+    let set = start(None).await;
+    let leader = set.leader().await;
+    let far = e(&set, leader) + 4_800_000;
+    for n in 0..FUTURE_LIST as u64 + 6 {
+        set.replica(leader).append(Body::InputDown {
+            slot: 0,
+            at_index: far + n * BLOCK,
+        });
+        // Each committed and reported committed by every voter before the
+        // next one.
+        sleep(Duration::from_millis(10)).await;
+    }
+    sleep(Duration::from_millis(200)).await;
+    let pending = entries(&set, leader)
+        .iter()
+        .filter(|r| r.at_index().is_some_and(|at| at >= far))
+        .count();
+    assert_eq!(pending, FUTURE_LIST, "entries pending at the engines");
+}
+
+/// A command queued behind a generation-needing entry that waits for the
+/// previous one's index does not wait with it.
+#[tokio::test(start_paused = true)]
+async fn review_a_pending_generation_does_not_hold_commands() {
+    let set = start(None).await;
+    let leader = set.leader().await;
+    for id in set.ids() {
+        set.audio(id).lock().build_lead = Some(400 * BLOCK);
+    }
+    sleep(Duration::from_millis(20)).await;
+    set.replica(leader).append(Body::InputUp {
+        slot: 0,
+        at_index: 0,
+    });
+    set.replica(leader).append(Body::InputUp {
+        slot: 1,
+        at_index: 0,
+    });
+    sleep(Duration::from_millis(5)).await;
+    let t = tokio::time::Instant::now();
+    set.replica(leader)
+        .submit(&owner("s"), "1", Bytes::from("gain=1@1"))
+        .await
+        .expect("committed");
+    assert!(
+        t.elapsed() < Duration::from_millis(50),
+        "a control write waited {:?} behind a pending generation",
+        t.elapsed()
+    );
+    // And the second generation still follows the first's index.
+    sleep(Duration::from_millis(600)).await;
+    let ups: Vec<Request> = entries(&set, leader)
+        .into_iter()
+        .filter(|r| matches!(r.body, Body::InputUp { .. }))
+        .collect();
+    assert_eq!(ups.len(), 2);
+    assert!(ups[1].stamp >= ups[0].at_index().unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replica_whose_engine_refused_an_entry_takes_no_writes() {
+    let set = start(None).await;
+    let leader = set.leader().await;
+    let follower = set.ids().find(|&id| id != leader).unwrap();
+    set.audio(follower).lock().entries_refused = 1;
+    sleep(Duration::from_millis(10)).await;
+    assert!(!set.replica(follower).replica().commitable);
+    let refused = set
+        .replica(follower)
+        .submit(&owner("s"), "1", Bytes::from("gain=1@1"))
+        .await
+        .expect_err("not commitable");
+    assert_eq!(refused.reason, Reason::NotCommitable);
+    assert!(set.replica(leader).replica().commitable);
+}

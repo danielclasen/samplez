@@ -146,6 +146,9 @@ pub struct Sample {
     pub own: Own,
     /// Status changes the engine lost, counted.
     pub status_changes_lost: u64,
+    /// Appended entries the engine refused: it lacks a committed entry,
+    /// so its output no longer follows the log.
+    pub entries_refused: u64,
 }
 
 /// The voters of the applied membership: one configuration, or two
@@ -344,7 +347,7 @@ struct State {
     uncommitted: BTreeMap<u64, StoredLogId>,
     /// Entries with an at_index, for listings, until every voter reported
     /// them committed.
-    scheduled: BTreeMap<u64, (StoredLogId, u64)>,
+    scheduled: BTreeMap<u64, (StoredLogId, u64, u64)>,
     /// The at_index of the latest generation-needing entry appended.
     generation_at: Option<u64>,
     /// When `own` was sampled.
@@ -367,6 +370,7 @@ struct State {
     fence: Option<u64>,
     own: Own,
     status_changes_lost: u64,
+    entries_refused: u64,
     counts: Counts,
 }
 
@@ -398,6 +402,8 @@ pub struct Metrics {
     /// 99.99th percentile, as of the report period it was read in.
     pub status_lag_p9999: Option<Duration>,
     pub status_changes_lost: u64,
+    /// Appended entries the engine refused.
+    pub entries_refused: u64,
     /// Entries given to the engine as unresolved, and refusals of it.
     pub unresolved: u64,
     pub unresolved_refused: u64,
@@ -448,11 +454,15 @@ impl Contact {
     ) -> Contact {
         let applied = log.applied();
         let mut scheduled = BTreeMap::new();
+        let mut generation_at = None;
         // Entries the engine applies later, purged ones included, for
         // listings.
         // Collected first: the log's view is not re-entered from inside it.
         let mut pending = Vec::new();
         log.pending(&mut |index, body| {
+            if body.needs_generation() {
+                generation_at = generation_at.max(body.at_index());
+            }
             if let Some(at) = body.at_index() {
                 pending.push((index, at));
             }
@@ -463,7 +473,7 @@ impl Contact {
                 node: 0,
                 index,
             });
-            scheduled.insert(index, (id, at));
+            scheduled.insert(index, (id, at, 0));
         }
         Contact {
             id,
@@ -483,7 +493,7 @@ impl Contact {
                 told: applied,
                 uncommitted: BTreeMap::new(),
                 scheduled,
-                generation_at: None,
+                generation_at,
                 own_at: Instant::now(),
                 judged: BTreeSet::new(),
                 slack: Vec::new(),
@@ -501,6 +511,7 @@ impl Contact {
                 fence: None,
                 own: Own::default(),
                 status_changes_lost: 0,
+                entries_refused: 0,
                 counts: Counts::default(),
             }),
         }
@@ -618,8 +629,9 @@ impl Contact {
             st.e_spread.add(theirs.abs_diff(mine));
         }
         if self.counted(st, now).contains(&report.from) {
+            let current = self.current_stamp(st, now);
             for slack in &report.slack {
-                st.lead.add(slack.samples);
+                st.lead.add(slack.samples, slack.stamp, current);
             }
         }
         // Commit knowledge: a committed id this log holds, or a listed
@@ -697,6 +709,7 @@ impl Contact {
             st.own = sample.own;
             st.own_at = now;
             st.status_changes_lost = sample.status_changes_lost;
+            st.entries_refused = sample.entries_refused;
         }
         st.judged = self.log.judged();
         st.lead.roll();
@@ -776,8 +789,8 @@ impl Contact {
             let mut listed: Vec<Listed> = st
                 .scheduled
                 .range(their_committed.saturating_add(1)..)
-                .filter(|(_, (_, at))| *at < limit)
-                .map(|(_, &(id, at_index))| Listed { id, at_index })
+                .filter(|(_, (_, at, _))| *at < limit)
+                .map(|(_, &(id, at_index, _))| Listed { id, at_index })
                 .collect();
             listed.sort_by_key(|l| (l.at_index, l.id.index));
             let unlisted = listed.get(MAX_LISTED).map(|l| l.at_index);
@@ -906,15 +919,15 @@ impl Contact {
             if request.body.needs_generation() {
                 st.generation_at = request.at_index();
             }
-            new.push((id, request.at_index()));
+            new.push((id, request.at_index(), request.stamp));
         });
-        for (id, at) in new {
+        for (id, at, stamp) in new {
             st.told = id.index;
             if id.index > st.known_committed {
                 st.uncommitted.insert(id.index, id);
             }
             if let Some(at) = at {
-                st.scheduled.insert(id.index, (id, at));
+                st.scheduled.insert(id.index, (id, at, stamp));
                 self.note(st, id, at, tai);
             }
         }
@@ -978,17 +991,19 @@ impl Contact {
             let first = index_at(tai + self.timing.apply_guard_ns()) as i64;
             let now = Instant::now();
             let counted = self.counted(st, now).contains(&self.id);
+            let current = self.current_stamp(st, now);
             let handed: Vec<Slack> = st
                 .scheduled
                 .range(st.handed + 1..=up_to)
-                .map(|(&index, &(_, at))| Slack {
+                .map(|(&index, &(_, at, stamp))| Slack {
                     index,
                     samples: at as i64 - first,
+                    stamp,
                 })
                 .collect();
             for s in handed {
                 if counted {
-                    st.lead.add(s.samples);
+                    st.lead.add(s.samples, s.stamp, current);
                 }
                 if st.slack.len() < MAX_LISTED {
                     st.slack.push(s);
@@ -1088,6 +1103,12 @@ impl Contact {
         st.scheduled = st.scheduled.split_off(&(lowest + 1));
     }
 
+    /// The engine refused an appended entry: the replica's output no
+    /// longer follows the log, so it takes no client writes.
+    pub fn engine_failed(&self) -> bool {
+        self.lock().entries_refused > 0
+    }
+
     /// Reports from a majority of voters, itself included, within w, as
     /// of the last report period.
     pub fn in_contact(&self) -> bool {
@@ -1153,6 +1174,30 @@ impl Contact {
         out
     }
 
+    /// `ceil(E / B) * B` now, 0 while E counts nobody.
+    fn current_stamp(&self, st: &State, now: Instant) -> u64 {
+        let b = self.timing.block;
+        self.estimate_in(st, now).map_or(0, |e| e.div_ceil(b) * b)
+    }
+
+    /// Engine entries pending above `floor`: those the state machine holds
+    /// and those this log holds unapplied.
+    fn pending_above(&self, floor: u64) -> usize {
+        let mut pending = 0;
+        self.log.pending(&mut |_, body| {
+            if body.at_index().is_some_and(|at| at > floor) {
+                pending += 1;
+            }
+        });
+        self.log
+            .entries_after(self.log.applied(), &mut |_, request| {
+                if request.at_index().is_some_and(|at| at > floor) {
+                    pending += 1;
+                }
+            });
+        pending
+    }
+
     fn estimate_in(&self, st: &State, now: Instant) -> Option<u64> {
         let counted = self.counted(st, now);
         let b = self.timing.block;
@@ -1209,8 +1254,9 @@ impl Contact {
             .quantile(0.9999)
             .unwrap_or(2 * b + index_at(3_000_000));
         let floor = e.saturating_sub(index_at(self.timing.apply_guard_ns()) + spread);
-        let pending = st.scheduled.values().filter(|&&(_, at)| at > floor).count();
-        if pending >= FUTURE_LIST {
+        // Committed entries stay pending in every engine until their index:
+        // counted from the state machine, not from what is still listed.
+        if self.pending_above(floor) >= FUTURE_LIST {
             return Err(StampRefusal::FutureListFull);
         }
         let lead = st.lead.samples();
@@ -1229,10 +1275,11 @@ impl Contact {
                     return Err(StampRefusal::GenerationPending);
                 }
             }
+            let counted = self.counted(&st, now);
             let build_lead = self
                 .copies(&st, now)
                 .into_iter()
-                .filter(|(id, _, _)| self.counted(&st, now).contains(id))
+                .filter(|(id, _, _)| counted.contains(id))
                 .filter_map(|(_, _, own)| own.build_lead)
                 .max()
                 .unwrap_or(0);
@@ -1268,6 +1315,7 @@ impl Contact {
             stagger_max: c.stagger_max,
             status_lag_p9999: c.status_lag.quantile(0.9999).map(Duration::from_nanos),
             status_changes_lost: st.status_changes_lost,
+            entries_refused: st.entries_refused,
             unresolved: c.unresolved,
             unresolved_refused: c.unresolved_refused,
             awaiting_overflow: c.awaiting_overflow,
@@ -1471,6 +1519,7 @@ mod tests {
                     ..Own::default()
                 },
                 status_changes_lost: 0,
+                entries_refused: 0,
             }
         }
         fn fence(&self, end: u64) {
@@ -2032,6 +2081,31 @@ mod tests {
             "the newer report is the one echoed"
         );
         assert_eq!(f.fence(), fence);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_leader_waits_for_a_pending_generation_it_applied() {
+        let f = fixture(&[&[1]]);
+        // The state machine holds an InputUp whose index lies ahead.
+        let at = index_at(T0) + 400 * B;
+        f.log.0.lock().unwrap().pending.push((
+            3,
+            Body::InputUp {
+                slot: 0,
+                at_index: at,
+            },
+        ));
+        let contact = Contact::new(
+            1,
+            Timing::defaults(B),
+            f.clock.clone(),
+            Some(f.engine.clone()),
+            f.log.clone(),
+            1,
+        );
+        contact.tick(f.members.clone());
+        assert!(contact.stamp(false).is_ok());
+        assert_eq!(contact.stamp(true), Err(StampRefusal::GenerationPending));
     }
 
     /// The log's view holds its lock while it walks the pending entries,

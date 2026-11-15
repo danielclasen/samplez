@@ -20,6 +20,9 @@ pub struct Lead {
     minute_start: Instant,
     /// The lead wanted more than the cap since the last fall.
     pub capped: bool,
+    /// The stamping index at the last raise: entries stamped below it
+    /// carry the lead from before it.
+    raised_at: u64,
 }
 
 /// Minutes of slack the lead falls on.
@@ -58,6 +61,7 @@ impl Lead {
             minutes: VecDeque::from([Slacks::new()]),
             minute_start: Instant::now(),
             capped: false,
+            raised_at: 0,
         }
     }
 
@@ -83,9 +87,15 @@ impl Lead {
         None
     }
 
-    /// One entry's slack, in samples.
-    pub fn add(&mut self, slack: i64) {
+    /// One entry's slack, in samples, the entry stamped at `stamp`, with
+    /// `now` the stamping index at this moment. Slack of an entry stamped
+    /// before the last raise is measured at the old lead: ignored, so one
+    /// late entry, whichever replicas report it, raises the lead once.
+    pub fn add(&mut self, slack: i64, stamp: u64, now: u64) {
         self.roll();
+        if stamp < self.raised_at {
+            return;
+        }
         let b = self.block as i64;
         let blocks = slack.div_euclid(b);
         self.minutes.back_mut().expect("a minute").counts[Slacks::bucket(blocks)] += 1;
@@ -95,6 +105,7 @@ impl Lead {
             let want = self.lead + (2 - q) as u64 * self.block;
             self.capped |= want > self.max;
             self.lead = want.min(self.max);
+            self.raised_at = now.max(stamp + 1);
             // The slack measured was at the old lead: entries stamped from
             // now on carry the raise, so the window starts again.
             self.minutes = VecDeque::from([Slacks::new()]);
@@ -138,18 +149,18 @@ mod tests {
     async fn the_lead_rises_at_once_and_falls_by_a_block_a_minute() {
         let mut lead = Lead::new(B, 1440, 2400);
         for _ in 0..10_000 {
-            lead.add(10 * B as i64);
+            lead.add(10 * B as i64, 0, 0);
         }
         assert_eq!(lead.samples(), 1440, "slack of 10 blocks moves nothing");
         // One entry of 10 001 below 2B is within the 0.01 % quantile, a
         // second is not.
-        lead.add(B as i64);
+        lead.add(B as i64, 0, 0);
         assert_eq!(lead.samples(), 1440);
-        lead.add(B as i64);
+        lead.add(B as i64, 0, 0);
         assert_eq!(lead.samples(), 1440 + B, "risen by the block short");
         for minute in 0..9 {
             for _ in 0..100 {
-                lead.add(5 * B as i64);
+                lead.add(5 * B as i64, 1, 1);
             }
             tokio::time::advance(Duration::from_secs(60)).await;
             lead.roll();
@@ -166,9 +177,29 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_lead_stops_at_its_cap_and_says_so() {
         let mut lead = Lead::new(B, 1440, 2400);
-        lead.add(-(40 * B as i64));
+        lead.add(-(40 * B as i64), 0, 0);
         assert_eq!(lead.samples(), 2400);
         assert!(lead.capped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_one_late_entry_raises_the_lead_once() {
+        let b = B;
+        let mut lead = Lead::new(b, 30 * b, 50 * b);
+        lead.add(b as i64, 100 * b, 200 * b);
+        assert_eq!(lead.samples(), 31 * b, "risen by the block short");
+        // The same entry as a second counted replica reports it, and
+        // another stamped before the raise: measured at the old lead.
+        lead.add(b as i64, 100 * b, 210 * b);
+        lead.add(b as i64, 150 * b, 210 * b);
+        assert_eq!(
+            lead.samples(),
+            31 * b,
+            "the old lead's slack raised it again"
+        );
+        // One stamped after the raise still raises it.
+        lead.add(b as i64, 220 * b, 230 * b);
+        assert_eq!(lead.samples(), 32 * b);
     }
 
     #[test]

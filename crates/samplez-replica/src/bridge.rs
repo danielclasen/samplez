@@ -10,6 +10,7 @@
 //! range, which no word records, is lost with its change.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -79,6 +80,8 @@ pub struct EngineAudio {
     /// Blocks up to the processed one whose statuses reports carry.
     window: u64,
     unwritten: Mutex<Unwrittens>,
+    /// Appended entries the engine refused.
+    refused: AtomicU64,
 }
 
 impl EngineAudio {
@@ -99,6 +102,7 @@ impl EngineAudio {
             translate,
             block: timing.block,
             window: samples.div_ceil(timing.block) + 1,
+            refused: AtomicU64::new(0),
             unwritten: Mutex::new(Unwrittens {
                 changes,
                 kept: VecDeque::new(),
@@ -106,10 +110,12 @@ impl EngineAudio {
         }
     }
 
-    /// The engine's refusal of an appended entry, logged: the engine then
-    /// lacks it, and its commit will find nothing to apply.
+    /// The engine's refusal of an appended entry: the engine then lacks
+    /// it, so its output no longer follows the log. Counted, and reported
+    /// with every sample, which keeps the replica from taking writes.
     fn refused(&self, index: u64, e: &EntryError) {
-        tracing::warn!(index, error = %e, "the engine refused a log entry");
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(index, error = %e, "the engine refused a log entry");
     }
 }
 
@@ -155,6 +161,7 @@ impl Audio for EngineAudio {
         Sample {
             own,
             status_changes_lost: progress.status_changes_lost,
+            entries_refused: self.refused.load(Ordering::Relaxed),
         }
     }
 

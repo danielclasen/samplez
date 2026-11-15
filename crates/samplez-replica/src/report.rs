@@ -48,6 +48,9 @@ pub struct Report {
 pub struct Slack {
     pub index: u64,
     pub samples: i64,
+    /// The entry's stamping index: slack of an entry stamped before the
+    /// lead last rose says nothing of the risen lead.
+    pub stamp: u64,
 }
 
 /// An echo of the addressee's report `seq`: the four timestamps of an
