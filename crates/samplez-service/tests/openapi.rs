@@ -32,6 +32,8 @@ fn committed_document_matches() {
     assert_eq!(doc["info"]["title"], "example");
     assert!(doc["paths"]["/api/v1/status"]["get"].is_object());
     assert!(doc["paths"]["/api/v1/login"]["post"].is_object());
+    assert!(doc["paths"]["/api/v1/logout"]["post"].is_object());
+    assert!(doc["paths"]["/api/v1/session"]["get"].is_object());
     let schemes = &doc["components"]["securitySchemes"];
     assert_eq!(schemes["bearer"]["scheme"], "bearer");
     assert_eq!(schemes["session"]["in"], "cookie");
@@ -62,8 +64,21 @@ fn security_follows_the_mode() {
     assert!(none["paths"].get("/api/v1/login").is_none());
     assert!(none["paths"]["/api/v1/status"]["get"].is_object());
 
+    assert!(none["paths"]["/api/v1/session"]["get"].is_object());
+
+    let oidc = serde_json::to_value(document(Product::openapi(), AuthMode::Oidc)).unwrap();
+    assert!(oidc["paths"]["/api/v1/login"]["get"].is_object());
+    assert!(oidc["paths"]["/api/v1/login"].get("post").is_none());
+    assert!(oidc["paths"]["/api/v1/login/callback"]["get"].is_object());
+    assert!(oidc["paths"]["/api/v1/logout"]["post"].is_object());
+    assert_eq!(
+        oidc["security"],
+        serde_json::json!([{ "bearer": [] }, { "session": [] }])
+    );
+
     let proxy = serde_json::to_value(document(Product::openapi(), AuthMode::Proxy)).unwrap();
     assert!(proxy["paths"].get("/api/v1/login").is_none());
+    assert!(proxy["paths"].get("/api/v1/logout").is_none());
     assert_eq!(proxy["security"], serde_json::json!([{ "bearer": [] }]));
     assert!(
         proxy["components"]["securitySchemes"]

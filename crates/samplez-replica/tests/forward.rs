@@ -630,6 +630,7 @@ async fn a_follower_catches_a_client_up_to_what_its_leader_committed() {
         },
         owner: owner("c"),
         sessions,
+        ends: samplez_service::SessionEnd::never(),
     };
     let queue = ClientQueue::new(16);
     let since = Position {

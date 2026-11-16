@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::Role;
 
@@ -121,13 +122,15 @@ pub struct Tls {
     pub sans: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
     #[default]
     None,
     Token,
     Proxy,
+    /// OpenID Connect sign-in in the service itself; see [`OidcConfig`].
+    Oidc,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -135,12 +138,88 @@ pub enum AuthMode {
 pub struct AuthConfig {
     #[serde(default)]
     pub mode: AuthMode,
-    /// The API bearer token; `token` mode.
+    /// The API bearer token; required in `token` mode, optional in `oidc`
+    /// mode, where a request bearing it is an operator's.
     pub token: Option<SecretFile>,
     /// The machine listener's bearer token; `proxy` mode.
     pub machine_token: Option<SecretFile>,
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// Required in `oidc` mode.
+    pub oidc: Option<OidcConfig>,
+}
+
+/// The OpenID Connect client of `oidc` mode. A browser signs in with the
+/// authorization code flow and PKCE (S256) at
+/// `<publicUrl>/api/v1/login` and comes back to the redirect URI
+/// `<publicUrl>/api/v1/login/callback`; the service then holds the user
+/// and role in the session cookie. An API client sends an access token of
+/// the provider as a bearer instead.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OidcConfig {
+    /// The provider's issuer identifier, e.g.
+    /// `https://idp.example/realms/media`; its metadata is read from
+    /// `<issuerUrl>/.well-known/openid-configuration`. `https`, or `http`
+    /// to a loopback address.
+    pub issuer_url: String,
+    pub client_id: String,
+    /// Absent for a public client. With it the client authenticates at the
+    /// token endpoint with `client_secret_post`.
+    pub client_secret: Option<SecretFile>,
+    /// The scheme, host and optional port browsers reach the API listener
+    /// under, e.g. `https://faderz.example`, without a path. The redirect
+    /// URI is derived from it, never from `Host`; its host and origin are
+    /// allowed in addition to `api.allowedHosts` and `api.allowedOrigins`.
+    pub public_url: String,
+    /// The claim of the ID token or access token that carries the user's
+    /// roles or groups: a list of strings or one string. A name with `.`
+    /// that is not a top-level claim is followed as a path, e.g.
+    /// `realm_access.roles`.
+    #[serde(default = "default_role_claim")]
+    pub role_claim: String,
+    /// Requested in addition to `openid`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// The claim value that makes a user an operator. A value matches
+    /// with or without a leading `/`, as group paths are written.
+    pub operator_role: String,
+    /// When set, a user without the operator role needs this one to sign
+    /// in, as a viewer, and is refused otherwise. When absent, every user
+    /// the provider signs in without the operator role is a viewer.
+    pub viewer_role: Option<String>,
+    /// The clients an access token sent as a bearer may have been issued
+    /// to: its `azp` has to name one of them. The client id when empty.
+    #[serde(default)]
+    pub allowed_clients: Vec<String>,
+    /// The audience an access token sent as a bearer must name in `aud`.
+    /// Absent, `aud` is not checked: `azp` binds the token to the allowed
+    /// clients. Keycloak puts `account` into `aud` by default, and a client
+    /// id only through an audience mapper.
+    pub audience: Option<String>,
+    /// How long a session lasts from the sign-in, whatever the ID token's
+    /// lifetime: seconds, or a number with `s`, `m`, `h` or `d`, from 60 s
+    /// to 7 d; 8 h when absent. A role changed at the provider applies
+    /// from the next sign-in.
+    pub session_ttl: Option<Ttl>,
+    /// The key session cookies are signed with, 32 bytes or more.
+    /// Replicas behind one host name need the same one; without it each
+    /// process draws its own, so a session holds on that process only and
+    /// ends when it restarts.
+    pub session_key: Option<SecretFile>,
+}
+
+/// A duration: seconds as a number, or a string of seconds or of a number
+/// with `s`, `m`, `h` or `d`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum Ttl {
+    Seconds(u64),
+    Text(String),
+}
+
+fn default_role_claim() -> String {
+    "groups".into()
 }
 
 /// A secret mounted as a file, re-read every
