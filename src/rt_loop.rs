@@ -161,6 +161,14 @@ pub(crate) static CLOCK_SHIFT_NS: std::sync::atomic::AtomicI64 =
 pub(crate) static CLOCK_STEP_NS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
+/// The loop that takes [`CLOCK_STEP_NS`], by the address of its
+/// counters, or 0 for any loop. With two engines in a test, the other
+/// loop would take the step at its own wake, which can fall between a
+/// deadline and the sleep of the loop under test.
+#[cfg(test)]
+pub(crate) static CLOCK_STEP_LOOP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The kernel TAI offset, CLOCK_TAI - CLOCK_REALTIME read back to back,
 /// in whole seconds. Each read goes through the vDSO where the kernel has
 /// one for the clock, else it is a `clock_gettime` syscall.
@@ -1281,7 +1289,12 @@ impl Rt {
                 }),
             }
             #[cfg(test)]
-            CLOCK_SHIFT_NS.fetch_add(CLOCK_STEP_NS.swap(0, Relaxed), Relaxed);
+            {
+                let only = CLOCK_STEP_LOOP.load(Relaxed);
+                if only == 0 || only == Arc::as_ptr(&self.counters) as usize {
+                    CLOCK_SHIFT_NS.fetch_add(CLOCK_STEP_NS.swap(0, Relaxed), Relaxed);
+                }
+            }
             let m0 = monotonic_ns();
             let now = self.now();
             let m1 = monotonic_ns();

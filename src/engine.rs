@@ -4236,7 +4236,7 @@ mod tests {
     /// engine `e` reads it.
     #[test]
     fn the_failure_paths_run_on_the_rt_thread() {
-        use crate::rt_loop::{CLOCK_SHIFT_NS, CLOCK_STEP_NS, STALL_MS};
+        use crate::rt_loop::{CLOCK_SHIFT_NS, CLOCK_STEP_LOOP, CLOCK_STEP_NS, STALL_MS};
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         /// Takes the clock shift off again, also when the test fails.
         struct Unshift;
@@ -4244,6 +4244,7 @@ mod tests {
             fn drop(&mut self) {
                 CLOCK_STEP_NS.store(0, Relaxed);
                 CLOCK_SHIFT_NS.store(0, Relaxed);
+                CLOCK_STEP_LOOP.store(0, Relaxed);
             }
         }
         let _unshift = Unshift;
@@ -4322,6 +4323,9 @@ mod tests {
         STALL_MS.store(0, Relaxed);
         // A forward and a backward step of libmxl's clock: after the
         // backward one the output holds the blocks below its last commit.
+        // Engine `e`'s loop takes each step at its wake, between two of
+        // its blocks; both engines read the stepped clock.
+        CLOCK_STEP_LOOP.store(std::ptr::from_ref(c) as usize, Relaxed);
         let steps = n(&c.clock_steps);
         CLOCK_STEP_NS.store(50_000_000, Relaxed);
         until("forward step", &|| n(&c.clock_steps) > steps);
