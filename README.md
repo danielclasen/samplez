@@ -96,11 +96,14 @@ marks the engine diverged.
 the engine commits every block at once. With more, each block of each
 output gets a status word (`fenced`, `held`, `committed`, `withheld`),
 moved by compare-and-swap and sent as `StatusChange`s; the replicated
-state publishes F (`set_fence`), the rank, and evidence (`commit_through`)
-and withholds blocks (`withhold`). An output commits only from its commit
-start (`commit_from`), the first page boundary of 1024 samples in a block
-it computes, and stops at `stop_at`; such a block is split and its status
-covers one range. A healthy block with F past it and nothing held before
+state publishes F (`set_fence`), the ranks (`set_ranks`: one up to a
+block, another from it on, and the rank of a withdrawn replica's fills),
+and evidence (`commit_through`, for the whole block or up to a sample
+index inside it), and withholds blocks (`withhold`). An output commits
+only from its commit start (`commit_from`), the first page boundary of
+1024 samples in a block it computes, and stops at `stop_at`; such a block
+is split and its status covers one range. `standing` reads whether an
+output commits, from which sample, or since which block it does not. A healthy block with F past it and nothing held before
 it commits at once; any other waits in the output's hold ring of
 `D + w + 2B` samples (`holdMs`, default 10, and `contactWindowMs`, default
 8) and is committed later in one write, or withheld and never written. A

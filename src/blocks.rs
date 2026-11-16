@@ -251,6 +251,8 @@ fn no_slot(k: u64) -> BlockStatus {
 pub struct Statuses {
     block: u64,
     slots: Box<[Slot]>,
+    /// The output's [`Standing`], set by the RT thread.
+    standing: AtomicU64,
 }
 
 impl Statuses {
@@ -266,7 +268,17 @@ impl Statuses {
                     digest: AtomicU64::new(0),
                 })
                 .collect(),
+            standing: AtomicU64::new(Standing::Idle { since: 0 }.pack()),
         }
+    }
+
+    /// Whether the output commits.
+    pub fn standing(&self) -> Standing {
+        Standing::unpack(self.standing.load(Acquire))
+    }
+
+    fn set_standing(&self, s: Standing) {
+        self.standing.store(s.pack(), Release);
     }
 
     fn slot(&self, k: u64) -> &Slot {
@@ -334,9 +346,12 @@ impl Statuses {
     }
 
     /// Supervisor. Marks the held block `k` for commit through, naming
-    /// the voters whose silence the evidence used. False when `k` is not
-    /// `held`: committed, withheld, fenced or without a status.
-    pub fn commit_through(&self, k: u64, on_silence_of: u8) -> bool {
+    /// the voters whose silence the evidence used; with `up_to` P inside
+    /// a whole block, through `[kB, P)` only, reported `committed up to
+    /// P`, `[P, (k + 1)B)` withheld. False when `k` is not `held`
+    /// (committed, withheld, fenced or without a status), or `up_to`
+    /// leaves none of its range.
+    pub fn commit_through(&self, k: u64, on_silence_of: u8, up_to: Option<u64>) -> bool {
         let s = self.slot(k);
         let mut cur = s.word.load(Acquire);
         loop {
@@ -346,8 +361,16 @@ impl Statuses {
             if st.kind != Kind::Held {
                 return false;
             }
+            let range = match (up_to, st.range) {
+                (None, r) => r,
+                (Some(p), _) if p >= (k + 1) * self.block => st.range,
+                (Some(p), Range::Whole) if p > k * self.block => Range::UpTo(p),
+                (Some(p), Range::UpTo(q)) if p > k * self.block => Range::UpTo(p.min(q)),
+                _ => return false,
+            };
             let new = BlockStatus {
                 through: true,
+                range,
                 on_silence_of: st.on_silence_of | on_silence_of,
                 ..st
             };
@@ -499,7 +522,90 @@ pub enum Mode {
 pub struct Ctx {
     /// F: blocks ending above it are fenced.
     pub fence: u64,
+    pub ranks: Ranks,
+}
+
+/// The ranks a replica's blocks take when F passes them: one up to a
+/// block and another from it on, as the `Baseline` entries the replica
+/// knew of by each block's apply deadline place it; and a withdrawn
+/// replica's fills, which rank as demoted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ranks {
+    /// Blocks below `from`.
     pub rank: u8,
+    /// Blocks from `from` on.
+    pub next: u8,
+    pub from: u64,
+    /// Fills.
+    pub fill: u8,
+}
+
+impl Ranks {
+    /// `rank` for every block and fill.
+    pub const fn flat(rank: u8) -> Ranks {
+        Ranks {
+            rank,
+            next: rank,
+            from: 0,
+            fill: rank,
+        }
+    }
+
+    /// The rank of block `k`, a fill or not.
+    pub fn of(&self, k: u64, fill: bool) -> u8 {
+        if fill {
+            self.fill
+        } else if k < self.from {
+            self.rank
+        } else {
+            self.next
+        }
+    }
+
+    /// One word: 4 bits of each rank, the block index above them.
+    pub fn pack(&self) -> u64 {
+        let r = |r: u8| u64::from(r.min(MAX_RANK));
+        self.from << 12 | r(self.fill) << 8 | r(self.next) << 4 | r(self.rank)
+    }
+
+    pub fn unpack(word: u64) -> Ranks {
+        Ranks {
+            rank: (word & 0xf) as u8,
+            next: (word >> 4 & 0xf) as u8,
+            fill: (word >> 8 & 0xf) as u8,
+            from: word >> 12,
+        }
+    }
+}
+
+/// Whether an output commits, as its replica's reports state it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Standing {
+    /// Commits nothing and gives no status (unrealised, starting, or
+    /// waiting for a commit start), from block `since` on.
+    Idle { since: u64 },
+    /// Through only from block `since` on: standing `withdrawn`.
+    Withdrawn { since: u64 },
+    /// Committing from its commit start, sample index `from`.
+    Committing { from: u64 },
+}
+
+impl Standing {
+    fn pack(self) -> u64 {
+        match self {
+            Standing::Idle { since } => since << 2,
+            Standing::Withdrawn { since } => since << 2 | 1,
+            Standing::Committing { from } => from << 2 | 2,
+        }
+    }
+
+    fn unpack(word: u64) -> Standing {
+        match word & 3 {
+            1 => Standing::Withdrawn { since: word >> 2 },
+            2 => Standing::Committing { from: word >> 2 },
+            _ => Standing::Idle { since: word >> 2 },
+        }
+    }
 }
 
 /// A block in the hold ring.
@@ -539,6 +645,8 @@ pub struct Hold {
     start_from: Option<u64>,
     /// A requested stop at a sample index.
     stop_at: Option<u64>,
+    /// The block after the last one computed.
+    next: u64,
     /// Blocks withheld by the RT thread, and ring overflows.
     pub withheld: u64,
     pub overflows: u64,
@@ -574,6 +682,7 @@ impl Hold {
             committed_end: None,
             start_from: None,
             stop_at: None,
+            next: 0,
             withheld: 0,
             overflows: 0,
             failed_writes: 0,
@@ -621,6 +730,7 @@ impl Hold {
         cause: Cause,
     ) {
         self.mode = Mode::Idle;
+        statuses.set_standing(Standing::Idle { since: self.next });
         self.frontier = None;
         self.start_from = None;
         self.stop_at = None;
@@ -654,6 +764,9 @@ impl Hold {
         if self.mode == Mode::Idle {
             return;
         }
+        if self.mode == Mode::Committing {
+            statuses.set_standing(Standing::Withdrawn { since: self.next });
+        }
         self.mode = Mode::Withdrawn;
         // The page stays whole on this member after a block it committed.
         self.frontier = self.committed_end;
@@ -668,6 +781,14 @@ impl Hold {
                 }
                 Kind::Withheld => {
                     self.frontier = None;
+                    continue;
+                }
+                // Commits on its evidence, its range as marked.
+                Kind::Held if p.status.through => {
+                    self.frontier = Some(match p.status.range {
+                        Range::UpTo(e) => e.min(p.end),
+                        _ => p.end,
+                    });
                     continue;
                 }
                 _ => {}
@@ -788,6 +909,25 @@ impl Hold {
         changes: &mut Changes,
         sink: &mut impl Sink,
     ) -> Outcome {
+        // A withdrawal while k is decided takes effect from k.
+        self.next = k;
+        let out = self.decide(k, data, digest, ctx, statuses, changes, sink);
+        self.next = k + 1;
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn decide(
+        &mut self,
+        k: u64,
+        data: &[f32],
+        digest: Option<u64>,
+        ctx: Ctx,
+        statuses: &Statuses,
+        changes: &mut Changes,
+        sink: &mut impl Sink,
+    ) -> Outcome {
         let b = self.block;
         let (start, end) = (k * b, (k + 1) * b);
         let healthy = digest == Some(HEALTHY);
@@ -830,6 +970,7 @@ impl Hold {
             if at < end {
                 self.start_from = None;
                 self.mode = Mode::Committing;
+                statuses.set_standing(Standing::Committing { from: at });
                 self.frontier = Some(at);
                 // A fill in progress ends below the commit start.
                 if at > start {
@@ -849,6 +990,7 @@ impl Hold {
                     self.stop_at = None;
                     if p <= start {
                         self.mode = Mode::Withdrawn;
+                        statuses.set_standing(Standing::Withdrawn { since: k });
                         self.frontier = None;
                     } else {
                         range = Range::UpTo(p);
@@ -872,7 +1014,7 @@ impl Hold {
                         kind: Kind::Withheld,
                         range: Range::Whole,
                         through: false,
-                        rank: ctx.rank,
+                        rank: ctx.ranks.of(k, true),
                         cause: Cause::Unfillable,
                         on_silence_of: 0,
                         digest: None,
@@ -907,7 +1049,7 @@ impl Hold {
             kind,
             range,
             through: false,
-            rank: ctx.rank,
+            rank: ctx.ranks.of(k, fill),
             cause: Cause::None,
             on_silence_of: 0,
             digest: if fill { None } else { digest },
@@ -971,6 +1113,7 @@ impl Hold {
         }
         if stopped {
             self.mode = Mode::Withdrawn;
+            statuses.set_standing(Standing::Withdrawn { since: k + 1 });
             self.frontier = None;
         }
         out
@@ -1005,7 +1148,7 @@ impl Hold {
                         } else {
                             BlockStatus {
                                 kind: Kind::Held,
-                                rank: ctx.rank,
+                                rank: ctx.ranks.of(cur.k, p.fill),
                                 ..cur
                             }
                         }
@@ -1026,6 +1169,11 @@ impl Hold {
                     Ok(()) => {
                         changes.send(target);
                         cur = target;
+                        // Committed through up to P: `[P, (k + 1)B)` is
+                        // withheld.
+                        if let (Kind::Committed, Range::UpTo(e)) = (cur.kind, cur.range) {
+                            self.pending[n].end = self.pending[n].end.min(e);
+                        }
                     }
                     Err(now) => cur = now,
                 }
@@ -1351,7 +1499,7 @@ mod tests {
                 sink: Recorder::default(),
                 ctx: Ctx {
                     fence: u64::MAX,
-                    rank: 0,
+                    ranks: Ranks::flat(0),
                 },
             }
         }
@@ -1517,7 +1665,7 @@ mod tests {
     #[test]
     fn a_block_behind_a_held_one_is_held() {
         let mut t = T::committing(false, K0);
-        t.ctx.rank = 3;
+        t.ctx.ranks = Ranks::flat(3);
         t.compute(K0, DEGRADED);
         t.compute(K0 + 1, Some(HEALTHY));
         let held = t.statuses.get(K0).unwrap();
@@ -1528,7 +1676,7 @@ mod tests {
         let next = t.statuses.get(K0 + 1).unwrap();
         assert_eq!((next.kind, next.digest), (Kind::Held, Some(HEALTHY)));
         assert!(t.sink.writes.is_empty());
-        assert!(t.statuses.commit_through(K0, 0b10));
+        assert!(t.statuses.commit_through(K0, 0b10, None));
         t.advance();
         assert_eq!(t.statuses.get(K0).unwrap().on_silence_of, 0b10);
         assert_eq!(t.kind(K0 + 1), Some(Kind::Committed));
@@ -1546,11 +1694,11 @@ mod tests {
         t.compute(K0, DEGRADED);
         t.compute(K0 + 1, DEGRADED);
         t.compute(K0 + 2, Some(HEALTHY));
-        assert!(t.statuses.commit_through(K0 + 1, 0));
+        assert!(t.statuses.commit_through(K0 + 1, 0, None));
         t.advance();
         assert_eq!(t.kind(K0 + 1), Some(Kind::Committed));
         assert!(t.sink.writes.is_empty(), "written before K0");
-        assert!(t.statuses.commit_through(K0, 0));
+        assert!(t.statuses.commit_through(K0, 0, None));
         t.advance();
         assert_eq!(t.kind(K0 + 2), Some(Kind::Committed));
         assert_eq!(t.sink.writes, [(K0 * B, 144)]);
@@ -1609,8 +1757,8 @@ mod tests {
         );
         t.advance();
         assert!(t.sink.writes.is_empty(), "a fill commits on evidence only");
-        assert!(t.statuses.commit_through(k1, 0));
-        assert!(t.statuses.commit_through(k1 + 1, 0));
+        assert!(t.statuses.commit_through(k1, 0, None));
+        assert!(t.statuses.commit_through(k1 + 1, 0, None));
         t.advance();
         assert_eq!(t.sink.writes[0], (p, ((k1 + 2) * B - p) as usize));
         t.sink.check();
@@ -1742,7 +1890,7 @@ mod tests {
         };
         let ctx = Ctx {
             fence: u64::MAX,
-            rank: 0,
+            ranks: Ranks::flat(0),
         };
         let out = t.hold.compute(
             K0 + 64,
@@ -1772,7 +1920,7 @@ mod tests {
         t.compute(K0, Some(HEALTHY));
         let st = t.statuses.withhold(K0, Cause::OtherDigest).unwrap();
         assert_eq!(st.kind, Kind::Committed);
-        assert!(!t.statuses.commit_through(K0, 0));
+        assert!(!t.statuses.commit_through(K0, 0, None));
     }
 
     /// A commit start inside a block: the block reports `committed from
@@ -1824,7 +1972,7 @@ mod tests {
         t.ctx.fence = 0;
         t.compute(K0 + 1, Some(HEALTHY));
         t.compute(K0 + 2, Some(HEALTHY));
-        assert!(t.statuses.commit_through(K0, 0));
+        assert!(t.statuses.commit_through(K0, 0, None));
         let statuses = &t.statuses;
         let mut changes = Changes {
             ring: &mut t.tx,
@@ -1891,7 +2039,7 @@ mod tests {
         t.compute(K0, DEGRADED);
         t.ctx.fence = u64::MAX;
         t.advance();
-        t.statuses.commit_through(K0, 0);
+        t.statuses.commit_through(K0, 0, None);
         t.advance();
         let kinds: Vec<_> = t
             .sent()
@@ -1941,7 +2089,7 @@ mod tests {
         t.compute(K0, DEGRADED);
         for k in K0 + 1..K0 + CAP as u64 {
             t.compute(k, Some(HEALTHY));
-            assert!(t.statuses.commit_through(k, 0), "block {k} not held");
+            assert!(t.statuses.commit_through(k, 0, None), "block {k} not held");
         }
         t.advance();
         for k in K0 + 1..K0 + CAP as u64 {
@@ -2053,7 +2201,7 @@ mod tests {
         let mut t = T::committing(false, K0);
         t.compute(K0, DEGRADED);
         t.compute(K0 + 1, Some(HEALTHY));
-        assert!(t.statuses.commit_through(K0 + 1, 0));
+        assert!(t.statuses.commit_through(K0 + 1, 0, None));
         t.advance();
         assert_eq!(t.kind(K0 + 1), Some(Kind::Committed));
         let statuses = &t.statuses;
@@ -2282,5 +2430,94 @@ mod tests {
         assert_eq!(fingerprint(&mut [(5, 100), (2, 300)]), want);
         assert_eq!(fingerprint(&mut [(2, 300), (5, 100)]), want);
         assert_eq!(fingerprint(&mut []), HEALTHY);
+    }
+
+    /// Ranks hold per block: one up to `from`, the next from it on, and a
+    /// withdrawn replica's fills take the fill rank, so a rank change the
+    /// replicated state knows ahead lands on the block it belongs to.
+    #[test]
+    fn blocks_take_the_rank_of_their_index_and_fills_the_fill_rank() {
+        let mut t = T::committing(false, K0);
+        t.ctx.ranks = Ranks {
+            rank: 1,
+            next: 2,
+            from: K0 + 1,
+            fill: 9,
+        };
+        t.compute(K0, DEGRADED);
+        t.compute(K0 + 1, DEGRADED);
+        assert_eq!(t.statuses.get(K0).unwrap().rank, 1);
+        assert_eq!(t.statuses.get(K0 + 1).unwrap().rank, 2);
+        // Fenced, then passed by F: the rank of its index.
+        t.ctx.fence = 0;
+        t.compute(K0 + 2, DEGRADED);
+        t.ctx.fence = u64::MAX;
+        t.advance();
+        assert_eq!(t.statuses.get(K0 + 2).unwrap().rank, 2);
+        t.withdraw();
+        // The next page boundary: a fill.
+        let p = (K0 * B).next_multiple_of(PAGE) + PAGE;
+        let k = p / B;
+        t.compute(k, DEGRADED);
+        let fill = t.statuses.get(k).unwrap();
+        assert_eq!((fill.kind, fill.digest, fill.rank), (Kind::Held, None, 9));
+        assert_eq!(Ranks::unpack(t.ctx.ranks.pack()), t.ctx.ranks);
+    }
+
+    /// A held block committed through up to P writes `[kB, P)` alone and
+    /// reports `committed up to P`; a withdrawal after the mark keeps it,
+    /// and the next block is no fill continuing from it.
+    #[test]
+    fn a_block_committed_through_up_to_p_writes_only_below_p() {
+        let p = K0 * B + PAGE;
+        let k = p / B;
+        assert_ne!(p, k * B, "P inside the block");
+        let mut t = T::committing(false, K0);
+        for j in K0..k {
+            t.compute(j, Some(HEALTHY));
+        }
+        t.sink.writes.clear();
+        t.compute(k, DEGRADED);
+        assert!(
+            !t.statuses.commit_through(k, 0, Some(k * B)),
+            "nothing left"
+        );
+        assert!(t.statuses.commit_through(k, 0, Some(p)));
+        t.withdraw();
+        t.advance();
+        let st = t.statuses.get(k).unwrap();
+        assert_eq!((st.kind, st.range), (Kind::Committed, Range::UpTo(p)));
+        assert_eq!(t.sink.writes, [(k * B, (p - k * B) as usize)]);
+        t.compute(k + 1, DEGRADED);
+        assert_eq!(t.kind(k + 1), Some(Kind::Withheld), "no page boundary");
+        t.sink.check();
+    }
+
+    /// The output's standing follows its commit state: idle until its
+    /// commit start, committing from P, withdrawn from the block after
+    /// the last one computed.
+    #[test]
+    fn the_standing_follows_the_commit_state() {
+        let mut t = T::new(false);
+        assert_eq!(t.statuses.standing(), Standing::Idle { since: 0 });
+        t.hold.commit_from(K0);
+        t.compute(K0, Some(HEALTHY));
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: K0 * B });
+        t.compute(K0 + 1, Some(HEALTHY));
+        t.withdraw();
+        assert_eq!(t.statuses.standing(), Standing::Withdrawn { since: K0 + 2 });
+        // Withdrawn while the block is decided: from that block on.
+        let mut t = T::committing(false, K0);
+        t.ctx.fence = 0;
+        for k in K0..K0 + CAP as u64 {
+            t.compute(k, Some(HEALTHY));
+        }
+        t.compute(K0 + CAP as u64, Some(HEALTHY));
+        assert_eq!(
+            t.statuses.standing(),
+            Standing::Withdrawn {
+                since: K0 + CAP as u64
+            }
+        );
     }
 }

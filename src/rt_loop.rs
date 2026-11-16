@@ -347,8 +347,10 @@ pub(crate) struct Shared {
     /// F, the end of the highest block up to which every block is
     /// B1-valid: blocks ending above it are fenced.
     pub fence: AtomicU64,
-    /// This replica's rank, fixed into a block's status when F passes it.
-    pub rank: AtomicU64,
+    /// This replica's ranks ([`crate::blocks::Ranks`], packed), fixed into
+    /// a block's status when F passes it; stored before the F they hold
+    /// for.
+    pub ranks: AtomicU64,
     /// The kernel clock is unsynchronised: blocks carry no digest.
     pub self_report: AtomicBool,
     /// The clock steps the replicated state checked: a detected step
@@ -1094,10 +1096,7 @@ fn ctx(shared: &Shared, step_at: Option<u64>) -> Ctx {
     let fence = shared.fence.load(Acquire);
     Ctx {
         fence: step_at.map_or(fence, |s| fence.min(s)),
-        rank: shared
-            .rank
-            .load(Relaxed)
-            .min(u64::from(crate::blocks::MAX_RANK)) as u8,
+        ranks: crate::blocks::Ranks::unpack(shared.ranks.load(Acquire)),
     }
 }
 
@@ -2724,7 +2723,7 @@ mod tests {
         Replica {
             shared: Arc::new(Shared {
                 fence: AtomicU64::new(0),
-                rank: AtomicU64::new(0),
+                ranks: AtomicU64::new(0),
                 self_report: AtomicBool::new(false),
                 steps_cleared: AtomicU64::new(0),
                 statuses: Vec::new(),
