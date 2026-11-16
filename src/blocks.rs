@@ -18,12 +18,13 @@
 use std::sync::atomic::{AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
 
 use rtrb::Producer;
+use serde::{Deserialize, Serialize};
 
 /// Samples per merge page: an output's member resumes at a multiple of it.
 pub const PAGE: u64 = 1024;
 
 /// What a status says about the samples it covers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     /// Computed while the fence F had not passed it.
     Fenced,
@@ -37,7 +38,7 @@ pub enum Kind {
 }
 
 /// Why a block was withheld.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cause {
     /// None given: the range below a commit start, or past a stop.
     None,
@@ -81,7 +82,7 @@ const CAUSES: [Cause; 11] = [
 /// The samples of block k a status covers. A block split at P carries
 /// the status for one range; the other range is `withheld` without a
 /// cause.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Range {
     Whole,
     /// `[P, (k + 1)B)`: a commit start at P; `[kB, P)` is withheld.
@@ -91,7 +92,7 @@ pub enum Range {
 }
 
 /// One block's status for one output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockStatus {
     pub k: u64,
     pub kind: Kind,

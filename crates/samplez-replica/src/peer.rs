@@ -22,6 +22,7 @@ use tokio::net::TcpListener;
 
 use crate::entry::{Body, Command, NodeId, Outcome};
 use crate::net::{AppendReplyWire, AppendWire, ErrorWire, VoteReplyWire, VoteWire, unframe};
+use crate::report::Report;
 use crate::snapshot::{StoredLogId, StoredVote};
 use crate::state_machine::Product;
 use crate::{Replica, net};
@@ -63,6 +64,8 @@ pub enum PeerRequest {
     /// The index a read must have applied to see every committed write,
     /// once the leader confirmed with a quorum that it still leads.
     ReadIndex,
+    /// A voter's side report ([`crate::contact`]).
+    Report(Box<Report>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +76,7 @@ pub enum PeerResponse {
     Joined,
     Member(bool),
     ReadIndex(u64),
+    Reported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

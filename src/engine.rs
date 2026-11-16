@@ -290,6 +290,26 @@ impl std::fmt::Display for ResetError {
 
 impl std::error::Error for ResetError {}
 
+/// A replicated engine's progress and clock as [`Engine::progress`] reads
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Progress {
+    /// The highest block computed, its statuses set, none before the
+    /// first.
+    pub processed: Option<u64>,
+    /// Clock steps detected, and those the replicated state cleared.
+    pub steps: u64,
+    pub steps_cleared: u64,
+    /// The kernel TAI offset sampled last, in whole seconds; after a step,
+    /// the sample after it.
+    pub tai_offset_s: Option<i64>,
+    /// The kernel clock is unsynchronised.
+    pub self_report: bool,
+    /// Status changes the RT thread's ring or the channel had no room for.
+    pub status_changes_lost: u64,
+}
+
 /// How an engine that follows a replicated log takes part in its set.
 pub struct Replication {
     /// Voters of the set, the witness included. With one the engine
@@ -358,6 +378,8 @@ enum LogMsg {
     },
     /// Uncommitted entries from `from` on were removed.
     Truncate { from: LogId },
+    /// Uncommitted entry `id` was removed.
+    Skip { id: LogId },
 }
 
 /// Appended entries not yet committed, and the producer of the RT
@@ -433,6 +455,18 @@ impl Log {
             self.uncommitted.pop_front();
         }
         self.committed = self.committed.max(up_to.min(self.last));
+    }
+
+    /// Removes uncommitted entry `id`, and the generation built for it;
+    /// false when no uncommitted entry has that id.
+    fn skip(&mut self, id: LogId) -> bool {
+        let before = self.uncommitted.len();
+        self.uncommitted.retain(|e| e.id != id);
+        let skipped = self.uncommitted.len() < before;
+        if skipped {
+            let _ = self.sup.send(LogMsg::Skip { id });
+        }
+        skipped
     }
 
     /// Removes the uncommitted entries from `from` on. Committed entries
@@ -1161,6 +1195,14 @@ impl Engine {
         self.log.lock().expect("log lock").commit(up_to);
     }
 
+    /// Replicated mode: the appended entry `id` is never applied, and its
+    /// generation is dropped: its commit was not known by its apply
+    /// deadline, so the log decides it. False when no uncommitted entry has
+    /// that id: it was committed already, or never appended.
+    pub fn skip(&self, id: LogId) -> bool {
+        self.log.lock().expect("log lock").skip(id)
+    }
+
     /// Removes the uncommitted entries from log id `from` on, and drops
     /// the generations built for them; committed entries are kept.
     pub fn truncate(&self, from: LogId) {
@@ -1278,6 +1320,29 @@ impl Engine {
     ) -> Result<bool, ControlError> {
         self.output_index(output)?;
         Ok(self.replica()?.0.statuses[output].commit_through(k, on_silence_of))
+    }
+
+    /// Replicated mode: what a side report says of this replica's clock
+    /// and progress, read so that the processed index and the step count
+    /// are never newer than the flags and offset beside them.
+    pub fn progress(&self) -> Option<Progress> {
+        let shared = &self.replica.as_ref()?.0;
+        let c = &self.counters;
+        // A block is published processed after its statuses and after the
+        // steps detected before it; a step's count after the offset
+        // sampled after it.
+        let processed = c.processed.load(Acquire);
+        let steps = c.clock_steps.load(Acquire);
+        let offset = c.tai_offset_s.load(Relaxed);
+        Some(Progress {
+            processed: processed.checked_sub(1),
+            steps,
+            steps_cleared: shared.steps_cleared.load(Acquire),
+            tai_offset_s: (offset != i64::MIN).then_some(offset),
+            self_report: shared.self_report.load(Relaxed),
+            status_changes_lost: c.status_changes_dropped.load(Relaxed)
+                + c.status_changes_unsent.load(Relaxed),
+        })
     }
 
     /// Replicated mode: the status of block `k` of output `output`, none
@@ -2076,6 +2141,9 @@ impl Supervisor {
                 LogMsg::Truncate { from } => self
                     .jobs
                     .retain(|j| j.id < from || matches!(j.stage, Stage::Sent(_))),
+                LogMsg::Skip { id } => self
+                    .jobs
+                    .retain(|j| j.id != id || matches!(j.stage, Stage::Sent(_))),
             }
         }
     }
