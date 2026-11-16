@@ -527,13 +527,28 @@ async fn a_one_way_cut_of_the_top_ranked_replica_leaves_each_block_to_one() {
             );
             if cut_ms > 30 {
                 assert!(withdrawals(&set, x) > 0, "X fenced past D withdraws");
+            } else {
+                // Lifted within D: X commits every block it held fenced on
+                // the lift, and R withholds each on X's report.
+                assert_eq!(withdrawals(&set, x), 0, "X withdrew");
+                let held = (degraded..degraded + cut_ms + 40)
+                    .filter(|&k| {
+                        set.audio(x)
+                            .passed(k)
+                            .is_some_and(|at| at > t.block_deadline(k))
+                    })
+                    .count();
+                assert!(held > 0, "X held no block fenced past its deadline");
+                for k in degraded..to.min(degraded + cut_ms + 40) {
+                    assert_eq!(committers(&set, &ids, k * BLOCK), [x], "block {k}");
+                }
             }
         } else {
             let last = index_at(t_cut);
             for k in &both {
                 assert!(
                     (k + 1) * BLOCK <= last + window,
-                    "block {k} ends past the S1 exception window"
+                    "block {k} ends past the silence exception window"
                 );
             }
             assert!(withdrawals(&set, x) > 0, "X withdraws");
