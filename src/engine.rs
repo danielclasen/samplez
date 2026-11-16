@@ -4092,15 +4092,27 @@ mod tests {
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let (e, _changes, _verdicts, domain) = outputs_only("withdraw-every", 2);
         let processed = || e.counters().processed.load(Acquire);
-        committing(&e, 2);
-        // F frozen: both outputs hold block k and the blocks after it
-        // fenced.
-        let k = processed() + 2;
-        e.set_fence(k * 48).unwrap();
-        wait(&|| processed() > k + 5);
-        for o in 0..2 {
-            assert_eq!(e.block_status(o, k).unwrap().kind, Kind::Fenced);
+        let fenced =
+            |k: u64| (0..2).all(|o| e.block_status(o, k).is_some_and(|s| s.kind == Kind::Fenced));
+        let committing_all =
+            || (0..2).all(|o| matches!(e.standing(o), Some(Standing::Committing { .. })));
+        // F frozen: both outputs hold block k, the first block F has not
+        // passed, and the blocks after it fenced. An overrun skip under
+        // load withdraws the replica or leaves no status at k: then the
+        // outputs are named again and F frozen anew.
+        let mut k = None;
+        for _ in 0..10 {
+            committing(&e, 2);
+            let f = processed() + 2;
+            e.set_fence(f * 48).unwrap();
+            wait(&|| processed() > f + 5);
+            let first = (f..=processed()).find(|&j| fenced(j));
+            if committing_all() && first == Some(f) {
+                k = first;
+                break;
+            }
         }
+        let k = k.expect("no pass without an overrun in 10 attempts");
         let st = e.withhold(0, k, Cause::HoldCap).unwrap().unwrap();
         assert_eq!(st.kind, Kind::Withheld);
         e.set_fence(u64::MAX).unwrap();

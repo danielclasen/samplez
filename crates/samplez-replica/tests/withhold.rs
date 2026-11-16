@@ -43,10 +43,15 @@ fn tai(set: &Set) -> u64 {
 /// Starts `ids` with one output on each audio replica, every one of them
 /// committing.
 async fn start(ids: Vec<NodeId>) -> Set {
+    start_with(ids, 1, timing()).await
+}
+
+/// [`start`] with `outputs` outputs on each audio replica and `t`.
+async fn start_with(ids: Vec<NodeId>, outputs: usize, t: Timing) -> Set {
     let set = Set::start(Options {
         ids: Some(ids),
-        contact: Some(timing()),
-        outputs: 1,
+        contact: Some(t),
+        outputs,
         ..Options::default()
     })
     .await;
@@ -58,16 +63,20 @@ async fn start(ids: Vec<NodeId>) -> Set {
         .unwrap()
         + 1;
     for id in audio(&set) {
-        set.audio(id).commit_from(0, k);
+        for o in 0..outputs {
+            set.audio(id).commit_from(o, k);
+        }
     }
     // Past the first page boundary.
     sleep(Duration::from_millis(40)).await;
     for id in audio(&set) {
-        let standing = set.audio(id).lock().outputs[0].statuses.standing();
-        assert!(
-            matches!(standing, Standing::Committing { .. }),
-            "{id} not committing: {standing:?}"
-        );
+        for o in 0..outputs {
+            let standing = set.audio(id).lock().outputs[o].statuses.standing();
+            assert!(
+                matches!(standing, Standing::Committing { .. }),
+                "{id} output {o} not committing: {standing:?}"
+            );
+        }
     }
     set
 }
@@ -851,4 +860,48 @@ async fn a_baseline_learned_after_f_passed_a_block_leaves_its_rank() {
         let rank = set.audio(follower).status_of(0, j).unwrap().rank;
         assert_eq!(rank, want, "block {j}");
     }
+}
+
+/// A block withheld on one output withdraws the replica on every output
+/// before the next output's ring advances: in the pass in which F passes
+/// block k, output 1 does not commit k beside output 0 withholding it.
+#[tokio::test(start_paused = true)]
+async fn a_block_withheld_on_one_output_withdraws_every_output_in_the_pass() {
+    let set = start_with(vec![a(0), a(1), witness()], 2, timing()).await;
+    let x = a(0);
+    // F stalls on X: none of its reports is echoed.
+    set.net.cut_peer(a(1), x);
+    set.net.cut_peer(witness(), x);
+    sleep(Duration::from_millis(22)).await;
+    let k = {
+        let mut st = set.audio(x).lock();
+        let fenced = |st: &harness::Fake, o: usize, j: u64| {
+            st.outputs[o]
+                .statuses
+                .get(j)
+                .is_some_and(|s| s.kind == Kind::Fenced)
+        };
+        for o in 0..2 {
+            let standing = st.outputs[o].statuses.standing();
+            assert!(
+                matches!(standing, Standing::Committing { .. }),
+                "{standing:?}"
+            );
+        }
+        let last = st.computed.unwrap();
+        let k = (last - 30..=last)
+            .find(|&j| fenced(&st, 0, j) && fenced(&st, 1, j))
+            .expect("a block fenced on both outputs");
+        // The supervisor withholds k on output 0, then F passes it, with
+        // no pass of the RT thread between the two.
+        let s = st.outputs[0].statuses.withhold(k, Cause::HoldCap).unwrap();
+        assert_eq!(s.kind, Kind::Withheld);
+        st.fences.push((0, (k + 1) * BLOCK));
+        k
+    };
+    set.audio(x).step();
+    let s = set.audio(x).lock().outputs[1].statuses.get(k).unwrap();
+    assert_ne!(s.kind, Kind::Committed, "{s:?}");
+    assert!(!set.audio(x).writes(1).has(k * BLOCK));
+    set.net.heal();
 }
