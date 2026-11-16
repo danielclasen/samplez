@@ -531,12 +531,16 @@ impl Slot {
     /// samples not processed, so a parameter's value depends on the
     /// sample index and the ordered entries alone. A lower index follows
     /// a backward clock step: the position re-anchors and the ramps hold
-    /// where they are, never rewound.
+    /// where they are, never rewound. The strip's dynamics compute their
+    /// gains on the grid of the index wherever the strip started.
     fn strip_to(&mut self, index: u64) {
-        if let (Some(strip), Some(pos)) = (&mut self.strip, self.strip_pos)
-            && index > pos
-        {
-            strip.advance((index - pos) as usize);
+        if let Some(strip) = &mut self.strip {
+            if let Some(pos) = self.strip_pos
+                && index > pos
+            {
+                strip.advance((index - pos) as usize);
+            }
+            strip.align(index);
         }
         self.strip_pos = Some(index);
     }
@@ -3011,6 +3015,41 @@ mod tests {
         processed.process(&mut b, 48);
         assert_eq!(a, b);
         assert_eq!(slot.strip.as_ref(), Some(&processed));
+    }
+
+    /// A strip's gate and compressor compute their gains on the grid of
+    /// the sample index wherever the slot's strip started: a slot whose
+    /// strip starts at a block off that grid computes the bits of one
+    /// that ran from index 0.
+    #[test]
+    fn strip_dynamics_follow_the_sample_index() {
+        let comp = StripParam::Comp(samplez_dsp::CompParams {
+            enabled: true,
+            threshold_db: -30.0,
+            ratio: 4.0,
+            attack_ms: 1.0,
+            release_ms: 40.0,
+            knee_db: 6.0,
+            makeup_db: 0.0,
+        });
+        let b = 50;
+        let block = |k: usize| -> Vec<f32> {
+            (k * b..(k + 1) * b)
+                .map(|n| 0.8 * (n as f32 * 0.21).sin())
+                .collect()
+        };
+        let (mut early, mut late) = (Slot::new(0, 0, 1, 0, 0), Slot::new(0, 0, 1, 0, 0));
+        assert!(early.set_strip(0, comp));
+        for k in 0..3 {
+            early.run_strip((k * b) as u64, &mut [0.0; 50], b);
+        }
+        assert!(late.set_strip(3 * b as u64, comp));
+        for k in 3..40 {
+            let (mut x, mut y) = (block(k), block(k));
+            early.run_strip((k * b) as u64, &mut x, b);
+            late.run_strip((k * b) as u64, &mut y, b);
+            assert_eq!(x, y, "block {k}");
+        }
     }
 
     /// A strip refuses what it does not take, and a slot wider than a

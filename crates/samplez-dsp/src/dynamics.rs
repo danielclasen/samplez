@@ -11,6 +11,16 @@
 //! smoothed gain snaps to its target within 1e-4 dB, so a unit at rest
 //! applies exactly its settled gain. Switching a unit on or off ramps
 //! its effect over the ramp length.
+//!
+//! The gain computer and the smoother run once every [`GAIN_INTERVAL`]
+//! samples, on the largest key of the interval, at the sample indices
+//! that are multiples of it; between two runs the gain moves linearly to
+//! the next. The key of a sample acts from the next interval on: a unit
+//! attacks up to [`GAIN_INTERVAL`] samples and releases up to twice that
+//! later than a gain computed every sample, and an attack overshoots by
+//! what that gain would have reduced in the time. Which samples share an
+//! interval depends on the sample index alone, not on how the samples
+//! are split into blocks.
 
 use crate::Ramp;
 use crate::svf::SAMPLE_RATE;
@@ -26,9 +36,13 @@ pub const GATE_HYSTERESIS_DB: f32 = 4.0;
 /// The smoothed gain snaps to its target within this, dB.
 const SNAP_DB: f32 = 1.0e-4;
 
-/// The one-pole coefficient of time constant `ms`.
+/// Samples between two runs of the gain computer, a power of two.
+pub const GAIN_INTERVAL: u32 = 8;
+
+/// The one-pole coefficient of time constant `ms` over one
+/// [`GAIN_INTERVAL`].
 fn pole(ms: f32) -> f32 {
-    libm::exp(-1000.0 / (f64::from(ms) * SAMPLE_RATE)) as f32
+    libm::exp(-1000.0 * f64::from(GAIN_INTERVAL) / (f64::from(ms) * SAMPLE_RATE)) as f32
 }
 
 fn db_to_gain(db: f32) -> f32 {
@@ -42,7 +56,7 @@ const OCTAVES_PER_DB: f32 = 0.166_096_4;
 
 /// `log2(x)` of a positive normal `x`, within 1e-7 plus rounding.
 ///
-/// The per-sample gain computer runs on this and [`exp2`] rather than
+/// The gain computer runs on this and [`exp2`] rather than
 /// libm's `logf` and `expf`: a few multiplies and adds with no call,
 /// pure f32 arithmetic without FMA, so the same bits on every host and
 /// build whatever the libm version. The mantissa is taken to
@@ -91,14 +105,14 @@ fn exp2(x: f32) -> f32 {
     p * f32::from_bits(((n + 127) as u32) << 23)
 }
 
-/// [`db_to_gain`] in f32, for the per-sample gain.
+/// [`db_to_gain`] in f32, for the computed gain.
 #[inline]
 fn db_to_gain_f32(db: f32) -> f32 {
     exp2(db * OCTAVES_PER_DB)
 }
 
-/// One smoothing step of `y` towards `target` with pole `a`, snapping
-/// within [`SNAP_DB`].
+/// One smoothing step of `y` towards `target` with pole `a`, one
+/// [`GAIN_INTERVAL`] long, snapping within [`SNAP_DB`].
 #[inline]
 fn smooth(y: f32, target: f32, a: f32) -> f32 {
     let next = target + a * (y - target);
@@ -119,6 +133,75 @@ fn key(buf: &[f32], legs: usize, frames: usize, n: usize) -> f32 {
         }
     }
     k
+}
+
+/// The interval of the gain computer running: the largest key so far,
+/// the samples of it processed, and the gain moving linearly from `from`
+/// by `step` a sample to `to`, the gain computed at its start.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Interval {
+    peak: f32,
+    phase: u32,
+    from: f32,
+    step: f32,
+    to: f32,
+}
+
+impl Interval {
+    /// At 0 dB and the start of an interval.
+    const REST: Interval = Interval {
+        peak: 0.0,
+        phase: 0,
+        from: 1.0,
+        step: 0.0,
+        to: 1.0,
+    };
+
+    /// Takes the key of the next sample in and returns its gain.
+    #[inline]
+    fn gain(&mut self, key: f32) -> f32 {
+        if key > self.peak {
+            self.peak = key;
+        }
+        self.phase += 1;
+        self.from + self.phase as f32 * self.step
+    }
+
+    /// Whether the interval is complete, for the gain computer to run.
+    #[inline]
+    fn is_complete(&self) -> bool {
+        self.phase == GAIN_INTERVAL
+    }
+
+    /// Starts the next interval, the gain moving from the last computed
+    /// one to `to`.
+    #[inline]
+    fn start(&mut self, to: f32) {
+        const INV: f32 = 1.0 / GAIN_INTERVAL as f32;
+        self.from = self.to;
+        self.step = (to - self.to) * INV;
+        self.to = to;
+        self.peak = 0.0;
+        self.phase = 0;
+    }
+
+    /// At 0 dB, `frames` samples on.
+    fn rest(&mut self, frames: usize) {
+        let phase = self.phase;
+        *self = Interval {
+            phase,
+            ..Interval::REST
+        };
+        self.advance(frames);
+    }
+
+    fn advance(&mut self, frames: usize) {
+        self.phase = ((self.phase as usize + frames) % GAIN_INTERVAL as usize) as u32;
+    }
+
+    fn align(&mut self, index: u64) {
+        self.phase = (index % u64::from(GAIN_INTERVAL)) as u32;
+    }
 }
 
 /// A unit's switch: its effect `1 + w * (gain - 1)` with `w` ramping
@@ -185,9 +268,10 @@ pub(crate) struct Gate {
     floor: f32,
     attack: f32,
     release: f32,
-    /// Smoothed gain, dB.
+    /// Smoothed gain, dB, computed at the start of the interval.
     y: f32,
     hold: u32,
+    interval: Interval,
 }
 
 impl Gate {
@@ -202,6 +286,7 @@ impl Gate {
             release: 0.0,
             y: 0.0,
             hold: 0,
+            interval: Interval::REST,
         }
     }
 
@@ -219,27 +304,13 @@ impl Gate {
         if self.wet.is_off() {
             self.y = 0.0;
             self.hold = 0;
+            self.interval.rest(frames);
             return;
         }
         let u = *self;
-        let (mut y, mut hold) = (self.y, self.hold);
+        let (mut y, mut hold, mut iv) = (self.y, self.hold, self.interval);
         for n in 0..frames {
-            let open_at = if hold > 0 { u.reopen } else { u.threshold };
-            if key(buf, legs, frames, n) >= open_at {
-                hold = GATE_HOLD;
-            } else {
-                hold = hold.saturating_sub(1);
-            }
-            let target = if hold > 0 { 0.0 } else { u.range_db };
-            let a = if target > y { u.attack } else { u.release };
-            y = smooth(y, target, a);
-            let gain = if y == 0.0 {
-                1.0
-            } else if y == u.range_db {
-                u.floor
-            } else {
-                db_to_gain_f32(y)
-            };
+            let gain = iv.gain(key(buf, legs, frames, n));
             let w = u.wet.0.value_at(u.wet.0.pos + n as u32);
             let g = 1.0 + w * (gain - 1.0);
             if g != 1.0 {
@@ -247,9 +318,28 @@ impl Gate {
                     buf[leg * frames + n] *= g;
                 }
             }
+            if iv.is_complete() {
+                let open_at = if hold > 0 { u.reopen } else { u.threshold };
+                if iv.peak >= open_at {
+                    hold = GATE_HOLD;
+                } else {
+                    hold = hold.saturating_sub(GAIN_INTERVAL);
+                }
+                let target = if hold > 0 { 0.0 } else { u.range_db };
+                let a = if target > y { u.attack } else { u.release };
+                y = smooth(y, target, a);
+                iv.start(if y == 0.0 {
+                    1.0
+                } else if y == u.range_db {
+                    u.floor
+                } else {
+                    db_to_gain_f32(y)
+                });
+            }
         }
         self.y = y;
         self.hold = hold;
+        self.interval = iv;
         self.wet.0.advance(frames);
     }
 
@@ -258,12 +348,19 @@ impl Gate {
     /// not have.
     pub(crate) fn advance(&mut self, frames: usize) {
         self.wet.0.advance(frames);
+        self.interval.advance(frames);
+    }
+
+    /// Sets the position in the interval of the gain computer to that of
+    /// sample index `index`.
+    pub(crate) fn align(&mut self, index: u64) {
+        self.interval.align(index);
     }
 
     /// Whether the gate passes every input unchanged until it is set
-    /// again: off, or a range of 0 dB with the smoothed gain at 0 dB.
+    /// again: off, or a range of 0 dB with the gain at 0 dB.
     pub(crate) fn is_identity(&self) -> bool {
-        self.wet.is_off() || (self.range_db == 0.0 && self.y == 0.0)
+        self.wet.is_off() || (self.range_db == 0.0 && self.y == 0.0 && self.interval.from == 1.0)
     }
 }
 
@@ -278,7 +375,9 @@ pub(crate) struct Comp {
     attack: f32,
     release: f32,
     makeup: Ramp,
+    /// Smoothed gain, dB, computed at the start of the interval.
     y: f32,
+    interval: Interval,
 }
 
 impl Comp {
@@ -293,6 +392,7 @@ impl Comp {
             release: 0.0,
             makeup: Ramp::new(1.0),
             y: 0.0,
+            interval: Interval::REST,
         }
     }
 
@@ -324,23 +424,14 @@ impl Comp {
     pub(crate) fn process(&mut self, buf: &mut [f32], legs: usize, frames: usize) {
         if self.wet.is_off() {
             self.y = 0.0;
+            self.interval.rest(frames);
             self.makeup.advance(frames);
             return;
         }
         let c = *self;
-        let mut y = self.y;
+        let (mut y, mut iv) = (self.y, self.interval);
         for n in 0..frames {
-            let k = key(buf, legs, frames, n);
-            // Below the knee the gain is 0 dB; the comparison also keeps
-            // a zero key from the logarithm.
-            let target = if k > c.knee_start {
-                c.static_gain(log2(k) * DB_PER_OCTAVE)
-            } else {
-                0.0
-            };
-            let a = if target < y { c.attack } else { c.release };
-            y = smooth(y, target, a);
-            let reduction = if y == 0.0 { 1.0 } else { db_to_gain_f32(y) };
+            let reduction = iv.gain(key(buf, legs, frames, n));
             let gain = reduction * c.makeup.value_at(c.makeup.pos + n as u32);
             let w = c.wet.0.value_at(c.wet.0.pos + n as u32);
             let g = 1.0 + w * (gain - 1.0);
@@ -349,8 +440,21 @@ impl Comp {
                     buf[leg * frames + n] *= g;
                 }
             }
+            if iv.is_complete() {
+                // Below the knee the gain is 0 dB; the comparison also
+                // keeps a zero key from the logarithm.
+                let target = if iv.peak > c.knee_start {
+                    c.static_gain(log2(iv.peak) * DB_PER_OCTAVE)
+                } else {
+                    0.0
+                };
+                let a = if target < y { c.attack } else { c.release };
+                y = smooth(y, target, a);
+                iv.start(if y == 0.0 { 1.0 } else { db_to_gain_f32(y) });
+            }
         }
         self.y = y;
+        self.interval = iv;
         self.makeup.advance(frames);
         self.wet.0.advance(frames);
     }
@@ -360,15 +464,23 @@ impl Comp {
     pub(crate) fn advance(&mut self, frames: usize) {
         self.wet.0.advance(frames);
         self.makeup.advance(frames);
+        self.interval.advance(frames);
+    }
+
+    /// Sets the position in the interval of the gain computer to that of
+    /// sample index `index`.
+    pub(crate) fn align(&mut self, index: u64) {
+        self.interval.align(index);
     }
 
     /// Whether the compressor passes every input unchanged until it is
-    /// set again: off, or a ratio of 1 with the smoothed gain at 0 dB and
-    /// the makeup at rest at 0 dB.
+    /// set again: off, or a ratio of 1 with the gain at 0 dB and the
+    /// makeup at rest at 0 dB.
     pub(crate) fn is_identity(&self) -> bool {
         self.wet.is_off()
             || (self.slope == 0.0
                 && self.y == 0.0
+                && self.interval.from == 1.0
                 && !self.makeup.is_active()
                 && self.makeup.target() == 1.0)
     }
@@ -457,7 +569,8 @@ mod tests {
     }
 
     /// The gain covers 1 - 1/e of a step in its time constant: attack
-    /// into reduction, release out of it.
+    /// into reduction, release out of it, GAIN_INTERVAL samples late for
+    /// a step at the start of an interval.
     #[test]
     fn compressor_time_constants() {
         for (attack, release) in [(1.0f32, 50.0f32), (10.0, 500.0)] {
@@ -477,13 +590,107 @@ mod tests {
                 let tau = (ms * 48.0) as usize;
                 let g = gain_curve(|b| c.process(b, 1, 48), from, to, 2 * tau + 2);
                 let want = start + (end - start) * (1.0 - (-1.0f32).exp());
-                // At tau the curve has covered 1 - 1/e; sample tau and
-                // tau + 1 bracket it.
-                let (a, b) = (g[tau - 1], g[tau + 1]);
+                // At tau the curve of a per-sample gain has covered
+                // 1 - 1/e; sample tau - 1 and tau + 1 bracket it. The
+                // key of the step acts from the next interval on.
+                let late = GAIN_INTERVAL as usize;
+                let (a, b) = (g[tau - 1 + late], g[tau + 1 + late]);
                 assert!(
                     (a.min(b) - 0.05..=a.max(b) + 0.05).contains(&want),
                     "{ms} ms: {a} .. {b} around {want}"
                 );
+            }
+        }
+    }
+
+    /// The gain computer runs on the grid of the sample index: a key
+    /// stepping up inside an interval leaves the gain at exactly 0 dB up
+    /// to the end of the interval, and from there the gain moves linearly
+    /// within each interval.
+    #[test]
+    fn the_gain_moves_linearly_on_the_grid_of_the_sample_index() {
+        let mut c = Comp::new();
+        c.set(&comp(-40.0, 10.0, 0.0, 0.0), 0);
+        let step = 4800usize + 3;
+        let next = step.next_multiple_of(GAIN_INTERVAL as usize);
+        let x: Vec<f32> = (0..9600)
+            .map(|n| if n < step { 0.001 } else { 0.5 })
+            .collect();
+        let mut y = x.clone();
+        for b in y.chunks_mut(48) {
+            c.process(b, 1, 48);
+        }
+        assert_eq!(x[..next], y[..next]);
+        let g: Vec<f64> = x.iter().zip(&y).map(|(x, y)| f64::from(y / x)).collect();
+        assert!(g[next] < 1.0);
+        for i in (next..next + 960).step_by(GAIN_INTERVAL as usize) {
+            let d = g[i + 1] - g[i];
+            for n in i + 1..i + GAIN_INTERVAL as usize - 1 {
+                let e = g[n + 1] - g[n] - d;
+                assert!(e.abs() < 1e-6, "sample {n}: {e:e} off the line of {d:e}");
+            }
+        }
+    }
+
+    /// The gain, dB, the compressor `p` gives `x` with the gain computer
+    /// and the smoother run every sample: the reference the computer run
+    /// once an interval is held to.
+    fn per_sample_gain(p: &CompParams, x: &[f32]) -> Vec<f32> {
+        let mut c = Comp::new();
+        c.set(p, 0);
+        let pole = |ms: f32| libm::exp(-1000.0 / (f64::from(ms) * SAMPLE_RATE)) as f32;
+        let (attack, release) = (pole(p.attack_ms), pole(p.release_ms));
+        let mut y = 0.0f32;
+        x.iter()
+            .map(|&k| {
+                let k = k.abs();
+                let target = if k > c.knee_start {
+                    c.static_gain(log2(k) * DB_PER_OCTAVE)
+                } else {
+                    0.0
+                };
+                y = smooth(y, target, if target < y { attack } else { release });
+                y
+            })
+            .collect()
+    }
+
+    /// Steps into reduction and out of it, at every position in an
+    /// interval, from the fastest attack and release up: the gain is
+    /// that of a per-sample computer at most two intervals before, never
+    /// more reduction than it reached by then and never less than it had
+    /// two intervals earlier.
+    #[test]
+    fn the_gain_trails_a_per_sample_computer_by_two_intervals_at_most() {
+        let late = 2 * GAIN_INTERVAL as usize;
+        for (attack_ms, release_ms) in [(0.1f32, 5.0f32), (1.0, 50.0), (10.0, 500.0)] {
+            let p = CompParams {
+                attack_ms,
+                release_ms,
+                ..comp(-40.0, 10.0, 6.0, 0.0)
+            };
+            for at in 4800..4800 + GAIN_INTERVAL as usize {
+                let mut x = vec![0.001f32; at];
+                x.extend([1.0f32; 9600]);
+                x.extend([0.001f32; 48_000]);
+                let want = per_sample_gain(&p, &x);
+                let mut c = Comp::new();
+                c.set(&p, 0);
+                let mut y = x.clone();
+                for b in y.chunks_mut(48) {
+                    let len = b.len();
+                    c.process(b, 1, len);
+                }
+                for n in late..x.len() {
+                    let got = 20.0 * libm::log10f(y[n] / x[n]);
+                    let span = &want[n - late..=n];
+                    let lo = span.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                    let hi = span.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    assert!(
+                        (lo - 0.01..=hi + 0.01).contains(&got),
+                        "{p:?} step at {at}, sample {n}: {got} dB, per sample {lo} .. {hi}"
+                    );
+                }
             }
         }
     }

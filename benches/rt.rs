@@ -392,11 +392,11 @@ fn strip_skip((mut strips, _): (Vec<Strip>, Vec<f32>)) -> Vec<Strip> {
     strips
 }
 
-const STRIPS_AT_REST: u64 = 49_602;
-const STRIPS_RAMPING: u64 = 5_447_170;
-const STRIPS_NO_DYNAMICS: u64 = 1_983_630;
+const STRIPS_AT_REST: u64 = 50_728;
+const STRIPS_RAMPING: u64 = 4_841_026;
+const STRIPS_NO_DYNAMICS: u64 = 1_984_757;
 const STRIP_ENTRIES: u64 = 48_961;
-const STRIP_SKIP: u64 = 9_696;
+const STRIP_SKIP: u64 = 10_822;
 
 library_benchmark_group!(
     name = strips,

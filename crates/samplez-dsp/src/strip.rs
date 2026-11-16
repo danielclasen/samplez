@@ -7,8 +7,10 @@
 //! applied again changes nothing. A change takes effect at the next
 //! sample processed and ramps over the strip's ramp length: gains
 //! linearly in the gain domain ([`crate::Ramp`]), a polarity inversion
-//! through zero, filters by their coefficients. The ranges are those the
-//! faderz model gives its strip controls.
+//! through zero, filters by their coefficients. Gate and compressor take
+//! a new curve or time constant at their next gain computation, at most
+//! [`GAIN_INTERVAL`] samples on, and ramp only their switch and makeup.
+//! The ranges are those the faderz model gives its strip controls.
 //!
 //! The strip holds no heap memory, so a clone allocates nothing. It runs
 //! one leg after the other with scalar code, the same operations in the
@@ -18,7 +20,7 @@ use core::ops::RangeInclusive;
 
 use crate::Ramp;
 use crate::dynamics::{Comp, Gate};
-pub use crate::dynamics::{CompParams, GATE_HOLD, GateParams};
+pub use crate::dynamics::{CompParams, GAIN_INTERVAL, GATE_HOLD, GateParams};
 use crate::svf::{Shape, Svf};
 
 /// Most legs a strip carries: 7.1.
@@ -537,6 +539,17 @@ impl Strip {
             self.fade.advance(frames);
             self.end_fade();
         }
+    }
+
+    /// Takes the next sample processed to be sample index `index`: gate
+    /// and compressor compute their gains at the multiples of
+    /// [`GAIN_INTERVAL`] samples of the index. A strip starts at index 0
+    /// and counts the samples it processes and advances over.
+    pub fn align(&mut self, index: u64) {
+        self.gate.align(index);
+        self.comp.align(index);
+        self.alt_gate.align(index);
+        self.alt_comp.align(index);
     }
 }
 
