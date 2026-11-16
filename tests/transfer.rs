@@ -254,10 +254,12 @@ fn a_replayed_core_computes_the_donors_pages() {
             processed(&a.e) > end && processed(&b.e) > end
         });
         assert_eq!(b.e.counters().handovers_installed.load(Relaxed), 1);
-        // The joiner inherited it, and its decision reaches the RT thread.
+        // The joiner inherited it, and its decision reaches the RT thread:
+        // a copy after the next wake's control drain no longer holds it.
         b.e.resolved(9).unwrap();
-        let later = common::copy_core(&b.e);
-        assert_eq!(later.core.unresolved(), &[]);
+        wait_for(Duration::from_secs(5), "entry 9 resolved", || {
+            common::copy_core(&b.e).core.unresolved().is_empty()
+        });
 
         let (pa, pb) = (a.pages(), b.pages());
         let disturbed: Vec<u64> = a
