@@ -170,6 +170,9 @@ impl<P: Product> StateMachine<P> {
                 self.verdicts.insert(*replica, *judged);
                 Response::default()
             }
+            // Acted on by the replica it names, as its commit becomes
+            // known; nothing in the state follows from it.
+            Body::Diverged { .. } => Response::default(),
             Body::Disrupt(slot) => {
                 self.slot = slot.clone();
                 Response::default()

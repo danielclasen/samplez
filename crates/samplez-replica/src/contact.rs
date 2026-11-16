@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::Shared;
+use crate::baseline::{Leader, LeaderView, Voter};
 use crate::entry::{Baseline, Body, NodeId, Request};
 use crate::log_store::Store;
 use crate::peer::PeerRequest;
@@ -24,6 +25,7 @@ use crate::rank::Baselines;
 use crate::report::{Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report, Slack};
 use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
+use crate::state::{Life, PageBook, ReplicaState, Seen, View};
 use crate::state_machine::Product;
 use crate::withhold::Withhold;
 
@@ -157,6 +159,12 @@ pub trait Audio: Send + Sync + 'static {
     /// Publishes the ranks the blocks take when F passes them; called
     /// before the F they hold for.
     fn ranks(&self, ranks: Ranks);
+    /// Output `output` commits from the first page boundary in a block at
+    /// or after `min_k` it computes, decided on the statuses up to block
+    /// `seen`: ignored when a block after it was withheld for a cause.
+    fn commit_from(&self, output: usize, min_k: u64, seen: u64);
+    /// Drops output `output`'s commit start unless it took.
+    fn cancel_commit_start(&self, output: usize);
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -167,6 +175,10 @@ pub struct Sample {
     /// Appended entries the engine refused: it lacks a committed entry,
     /// so its output no longer follows the log.
     pub entries_refused: u64,
+    /// Per output, realised.
+    pub realised: Vec<bool>,
+    /// The generation its pending entries need is built, or none is.
+    pub generation_ready: bool,
 }
 
 /// The voters of the applied membership: one configuration, or two
@@ -214,6 +226,8 @@ pub trait LogView: Send + Sync + 'static {
     fn judged(&self) -> BTreeSet<NodeId>;
     /// The latest applied `Baseline`.
     fn baseline(&self) -> Option<Baseline>;
+    /// The voter holding the disruption slot.
+    fn disrupting(&self) -> Option<NodeId>;
 }
 
 impl<P: Product> LogView for Store<P> {
@@ -243,6 +257,9 @@ impl<P: Product> LogView for Store<P> {
     }
     fn baseline(&self) -> Option<Baseline> {
         self.with_state(|sm| sm.baseline.clone())
+    }
+    fn disrupting(&self) -> Option<NodeId> {
+        self.with_state(|sm| sm.slot.as_ref().map(|d| d.node))
     }
 }
 
@@ -394,6 +411,19 @@ struct State {
     ranks: Option<(Ranks, u64)>,
     baselines: Baselines,
     withhold: Withhold,
+    /// The audio replica's state; none for the witness.
+    life: Option<Life>,
+    /// Every voter's page hashes, this one's included.
+    pages: PageBook,
+    leader: Leader,
+    /// The audio `/readyz` term, as of the last period in contact; none
+    /// before the first.
+    serving: Option<bool>,
+    /// `Diverged` verdicts naming this replica, by log index and page,
+    /// until their commit is known.
+    verdicts: Vec<(u64, u64)>,
+    realised: Vec<bool>,
+    generation_ready: bool,
     own: Own,
     status_changes_lost: u64,
     entries_refused: u64,
@@ -455,6 +485,13 @@ pub struct Metrics {
     /// `w < L` or `D < statusLag + L`: a fenced replica's `withheld` or a
     /// live replica's status may miss the hold cap.
     pub hold_floor_unmet: bool,
+    /// The audio replica's state and its moves; none for the witness.
+    pub replica: Option<crate::state::Metrics>,
+    /// The decisions taken while this voter led.
+    pub leader: crate::baseline::Counts,
+    /// `replica_disagreement`: the last page this voter judged as leader
+    /// had no strict majority hash.
+    pub replica_disagreement: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -514,6 +551,7 @@ impl Contact {
         if let Some(b) = log.baseline() {
             baselines.applied(b);
         }
+        let life = audio.is_some().then(Life::new);
         Contact {
             id,
             timing,
@@ -551,6 +589,13 @@ impl Contact {
                 ranks: None,
                 baselines,
                 withhold: Withhold::default(),
+                life,
+                pages: PageBook::default(),
+                leader: Leader::default(),
+                serving: None,
+                verdicts: Vec::new(),
+                realised: Vec::new(),
+                generation_ready: true,
                 own: Own::default(),
                 status_changes_lost: 0,
                 entries_refused: 0,
@@ -647,6 +692,7 @@ impl Contact {
             peer.offsets.add(offset.unsigned_abs());
         }
         st.withhold.fold(self.id, report.from, &report.own);
+        st.pages.fold(report.from, &report.own.pages);
         peer.last = Some(Direct {
             seq: report.seq,
             received_tai: tai,
@@ -673,6 +719,7 @@ impl Contact {
                 && other.relayed.as_ref().is_none_or(|(g, _)| *g < generated)
             {
                 st.withhold.fold(self.id, heard.node, &own);
+                st.pages.fold(heard.node, &own.pages);
                 other.relayed = Some((generated, own));
             }
         }
@@ -765,6 +812,9 @@ impl Contact {
             st.own_at = now;
             st.status_changes_lost = sample.status_changes_lost;
             st.entries_refused = sample.entries_refused;
+            st.realised = sample.realised;
+            st.generation_ready = sample.generation_ready;
+            st.pages.fold(self.id, &st.own.pages);
         }
         st.judged = self.log.judged();
         st.lead.roll();
@@ -800,8 +850,10 @@ impl Contact {
             }
         }
         st.withhold.retain(&st.members);
+        st.pages.retain(|v| voters.contains(&v));
         self.fence(st, tai);
         self.decide(st, tai);
+        self.live(st, now, tai);
 
         // Reports.
         if !voters.contains(&self.id) {
@@ -963,6 +1015,7 @@ impl Contact {
             }
             st.scheduled.split_off(&from);
             st.baselines.truncated(from);
+            st.verdicts.retain(|&(index, _)| index < from);
             st.told = from - 1;
             if let Some(audio) = &self.audio {
                 audio.truncated(from);
@@ -983,6 +1036,11 @@ impl Contact {
             }
             if let Body::Baseline(b) = &request.body {
                 st.baselines.appended(id, b);
+            }
+            if let Body::Diverged { replica, page } = request.body
+                && replica == self.id
+            {
+                st.verdicts.push((id.index, page));
             }
             let baseline = match &request.body {
                 Body::Baseline(b) => Some(b.at_index),
@@ -1196,7 +1254,11 @@ impl Contact {
             Some((r, passed)) if k < passed => r.of(k, false),
             _ => baselines.rank(k, self.id, &audio_voters, &t),
         };
-        let fill = crate::rank::demoted(self.id, &audio_voters);
+        let class = match st.life.as_ref().map(Life::state) {
+            Some(ReplicaState::Diverged) => crate::rank::Class::Diverged,
+            _ => crate::rank::Class::Demoted,
+        };
+        let fill = crate::rank::demoted(self.id, &audio_voters, class);
         let (ranks, cap) = crate::rank::schedule(lo, hi, rank_of, fill);
         if published.map(|(r, _)| r) != Some(ranks) {
             audio.ranks(ranks);
@@ -1228,6 +1290,156 @@ impl Contact {
             audio.as_ref(),
             tai,
         );
+    }
+
+    /// The replica's own state (plan 2.11, Replica states), with the
+    /// verdicts naming it once their commit is known, and the audio
+    /// `/readyz` term while in contact.
+    fn live(&self, st: &mut State, now: Instant, tai: u64) {
+        let Some(audio) = &self.audio else { return };
+        let Some(life) = st.life.as_mut() else { return };
+        let known = st.known_committed;
+        let due: Vec<u64> = st
+            .verdicts
+            .iter()
+            .filter(|&&(index, _)| index <= known)
+            .map(|&(_, page)| page)
+            .collect();
+        st.verdicts.retain(|&(index, _)| index > known);
+        for page in due {
+            life.verdict(page, &st.own, &st.realised, audio.as_ref());
+        }
+        let ready = self.log.applied() >= st.known_committed && st.generation_ready;
+        let baseline = self.log.baseline();
+        let t = self.timing;
+        let fresh = t.contact_window + t.hold;
+        let audio_voters = crate::rank::audio_voters(&st.members);
+        let copies: Vec<(NodeId, Duration, Own)> = self
+            .copies(st, now)
+            .into_iter()
+            .filter(|(id, _, _)| *id != self.id && audio_voters.contains(id))
+            .map(|(id, age, own)| (id, age, own.clone()))
+            .collect();
+        let k = st.own.processed.map_or(0, |p| p + 1);
+        let mine = st.baselines.rank(k, self.id, &audio_voters, &t);
+        let above = audio_voters
+            .iter()
+            .copied()
+            .filter(|&id| id != self.id && st.baselines.rank(k, id, &audio_voters, &t) < mine)
+            .collect();
+        let life = st.life.as_mut().expect("checked above");
+        let view = View {
+            me: self.id,
+            own: &st.own,
+            realised: &st.realised,
+            ready,
+            alone: st.members.voters().len() == 1,
+            baseline: baseline.as_ref(),
+            excluded: st.judged.contains(&self.id),
+            peers: copies
+                .iter()
+                .map(|(id, age, own)| Seen {
+                    id: *id,
+                    silent: *age > fresh,
+                    own,
+                })
+                .collect(),
+            above,
+            pages: &st.pages,
+            timing: &t,
+            tai,
+        };
+        life.step(&view, audio.as_ref());
+        let state = life.state();
+        st.own.state = Some(state);
+        st.own.ready = ready;
+        st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
+        if st.in_contact {
+            let other = copies
+                .iter()
+                .any(|(_, age, own)| *age <= fresh && own.state == Some(ReplicaState::Committing));
+            st.serving = Some(state == ReplicaState::Committing || !other);
+        }
+    }
+
+    /// The audio `/readyz` term (plan 2.11, Deployment): committing, or no
+    /// other audio replica committing within `w + D` by its reports;
+    /// judged while in contact, kept out of it, false before the first
+    /// contact. Always true for the witness and for one voter.
+    pub fn serving(&self) -> bool {
+        let st = self.lock();
+        if self.audio.is_none() || st.members.voters().len() == 1 {
+            return true;
+        }
+        st.serving.unwrap_or(false)
+    }
+
+    /// This voter does not lead ([`crate::baseline::Leader::step_down`]).
+    pub fn not_leading(&self) {
+        self.lock().leader.step_down();
+    }
+
+    /// The leader's decisions this period ([`crate::baseline`]): none
+    /// while out of contact.
+    pub fn decisions(&self) -> Vec<Body> {
+        let now = Instant::now();
+        let tai = self.clocks.tai_ns();
+        let mut st = self.lock();
+        let st = &mut *st;
+        if !st.in_contact || st.members.configs.is_empty() {
+            return Vec::new();
+        }
+        let t = self.timing;
+        let fresh = t.contact_window + t.hold;
+        let regained = since(now, st.regained);
+        let audio_ids = crate::rank::audio_voters(&st.members);
+        let copies: BTreeMap<NodeId, (Duration, Own)> = self
+            .copies(st, now)
+            .into_iter()
+            .map(|(id, age, own)| (id, (age, own.clone())))
+            .collect();
+        let counted = self.counted(st, now);
+        let baseline = self.log.baseline();
+        let ms = Duration::from_millis(1).as_nanos() as u64;
+        let q = |h: &Histogram| h.quantile(0.9999);
+        let delta = st
+            .peers
+            .values()
+            .filter_map(|p| q(&p.delay))
+            .max()
+            .unwrap_or(ms);
+        let theta = st
+            .peers
+            .values()
+            .filter_map(|p| q(&p.offsets))
+            .max()
+            .unwrap_or(ms);
+        let floor = index_at(2 * t.report_period.as_nanos() as u64 + 2 * delta + theta);
+        let k = index_at(tai).saturating_sub(t.margin) / t.block;
+        let baselines = &st.baselines;
+        let rank = |id: NodeId| baselines.rank(k, id, &audio_ids, &t);
+        let view = LeaderView {
+            audio: audio_ids
+                .iter()
+                .map(|&id| {
+                    let c = copies.get(&id);
+                    Voter {
+                        id,
+                        silent: c.map_or(regained, |(age, _)| (*age).min(regained)) > fresh,
+                        own: c.map(|(_, own)| own),
+                    }
+                })
+                .collect(),
+            judged: &st.judged,
+            disrupting: self.log.disrupting(),
+            baseline: baseline.as_ref(),
+            counted: &counted,
+            pages: &st.pages,
+            timing: &t,
+            floor,
+            rank: &rank,
+        };
+        st.leader.decide(&view, now)
     }
 
     /// Drops scheduled entries every voter reported committed.
@@ -1489,6 +1701,9 @@ impl Contact {
                 }
                 _ => false,
             },
+            replica: st.life.as_ref().map(|l| l.metrics),
+            leader: st.leader.counts,
+            replica_disagreement: st.leader.disagreement,
         }
     }
 }
@@ -1518,7 +1733,11 @@ pub enum StampRefusal {
 /// every other voter each period, each sent as soon as the one before it
 /// to the same voter was answered, a newer one replacing one not yet
 /// sent.
-pub(crate) async fn run(shared: Arc<Shared>, contact: Arc<Contact>) {
+pub(crate) async fn run(
+    shared: Arc<Shared>,
+    contact: Arc<Contact>,
+    queue: tokio::sync::mpsc::UnboundedSender<crate::Queued>,
+) {
     let mut metrics = shared.raft.metrics();
     let mut tick = tokio::time::interval(contact.timing.report_period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1534,6 +1753,19 @@ pub(crate) async fn run(shared: Arc<Shared>, contact: Arc<Contact>) {
                         .entry(to)
                         .or_insert_with(|| send(shared.clone(), to, contact.timing.contact_window))
                         .send_replace(Some((addr, report)));
+                }
+                // Decisions are the leader's, and pause in an election.
+                if shared.leads() {
+                    for body in contact.decisions() {
+                        let _ = queue.send(crate::Queued::Entry {
+                            body,
+                            deadline: Instant::now() + shared.settings.write_timeout,
+                            reply: None,
+                            forwarded: false,
+                        });
+                    }
+                } else {
+                    contact.not_leading();
                 }
             }
             changed = metrics.changed() => {
@@ -1657,6 +1889,9 @@ mod tests {
         fn baseline(&self) -> Option<Baseline> {
             None
         }
+        fn disrupting(&self) -> Option<NodeId> {
+            None
+        }
     }
 
     /// Records what contact hands the engine. Its step flag shows once
@@ -1684,6 +1919,8 @@ mod tests {
                 },
                 status_changes_lost: 0,
                 entries_refused: 0,
+                realised: Vec::new(),
+                generation_ready: true,
             }
         }
         fn fence(&self, end: u64) {
@@ -1733,6 +1970,8 @@ mod tests {
             self.calls.lock().unwrap().push("withdraw".into());
         }
         fn ranks(&self, _: Ranks) {}
+        fn commit_from(&self, _: usize, _: u64, _: u64) {}
+        fn cancel_commit_start(&self, _: usize) {}
     }
 
     impl Engine {

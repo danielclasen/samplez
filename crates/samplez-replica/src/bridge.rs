@@ -1,7 +1,7 @@
 //! [`Audio`] over a replicated samplez [`Engine`]: F and unresolved
 //! entries go to the engine's control ring, the log's entries to its
 //! entry ring by log id, and reports read the status words, the
-//! processed index and the clock flags.
+//! processed index, the clock flags and the latest page hashes.
 //!
 //! Reports carry the status words of the latest blocks rather than the
 //! changes since the last report, so a change the engine's ring or
@@ -14,12 +14,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
-use samplez::blocks::{BlockStatus, Cause, Kind, Range, Ranks, Standing, StatusChange};
+use samplez::blocks::{
+    BlockStatus, Cause, HEALTHY, Kind, PAGE, PageHash, Range, Ranks, Standing, StatusChange,
+};
 use samplez::{Engine, Entry, EntryError};
 
 use crate::contact::{Audio, Sample, Timing};
 use crate::entry::{Body, Request};
-use crate::report::{ClockFlags, Own, Unwritten, runs};
+use crate::report::{ClockFlags, Own, Page, Unwritten, page_digest, runs};
 
 /// Turns a log entry into the engine entry it applies, with its index;
 /// none for an entry the engine does not apply.
@@ -48,9 +50,35 @@ pub fn input_entry(request: &Request) -> Option<(u64, Entry)> {
 /// Unwritten ranges kept for reports, at most.
 const RANGES_KEPT: usize = 64;
 
+/// Page hashes per output a report carries: every page whose record
+/// arrived within the last four pages.
+pub const PAGES_REPORTED: usize = 4;
+
 struct Unwrittens {
     changes: Receiver<StatusChange>,
     kept: VecDeque<Unwritten>,
+    hashes: Receiver<PageHash>,
+    /// Per output, the latest page records.
+    pages: Vec<VecDeque<Page>>,
+}
+
+/// A page record as reports carry it: with the degradation the statuses
+/// of its blocks show, read as the record arrives, once every one of them
+/// is final.
+pub fn page_of(h: &PageHash, block: u64, status: impl Fn(u64) -> Option<BlockStatus>) -> Page {
+    let (first, last) = (h.page * PAGE / block, ((h.page + 1) * PAGE - 1) / block);
+    let digests: Vec<Option<u64>> = (first..=last)
+        .map(|k| status(k).and_then(|s| s.digest))
+        .collect();
+    Page {
+        output: h.output,
+        page: h.page,
+        hash: h.hash,
+        fingerprint: h.fingerprint,
+        committed: h.committed,
+        degraded: digests.iter().any(|d| d.is_some_and(|d| d != HEALTHY)),
+        digest: page_digest(digests),
+    }
 }
 
 /// Block `k`'s status word, read at or below the processed block. A block
@@ -86,18 +114,22 @@ pub struct EngineAudio {
 
 impl EngineAudio {
     /// Bridges `engine`, started replicated with `changes` as its status
-    /// channel. Reports carry the statuses of the blocks a peer can still
-    /// hold a decision on: those of the last `D + w + 2p`, and one more.
+    /// channel and `hashes` as its page-hash channel. Reports carry the
+    /// statuses of the blocks a peer can still hold a decision on: those
+    /// of the last `D + w + 2p`, and one more; and the latest
+    /// [`PAGES_REPORTED`] page records per output.
     pub fn new(
         engine: Arc<Engine>,
         changes: Receiver<StatusChange>,
+        hashes: Receiver<PageHash>,
         timing: &Timing,
         translate: Translate,
     ) -> EngineAudio {
+        let outputs = engine.status().outputs.len();
         let span = timing.hold + timing.contact_window + 2 * timing.report_period;
         let samples = (span.as_nanos() as u64 * crate::contact::RATE).div_ceil(1_000_000_000);
         EngineAudio {
-            outputs: engine.status().outputs.len(),
+            outputs,
             engine,
             translate,
             block: timing.block,
@@ -106,6 +138,8 @@ impl EngineAudio {
             unwritten: Mutex::new(Unwrittens {
                 changes,
                 kept: VecDeque::new(),
+                hashes,
+                pages: (0..outputs).map(|_| VecDeque::new()).collect(),
             }),
         }
     }
@@ -134,6 +168,17 @@ impl Audio for EngineAudio {
                 unwritten.kept.push_back(Unwritten { output, from, to });
             }
         }
+        while let Ok(h) = unwritten.hashes.try_recv() {
+            let o = h.output as usize;
+            let page = page_of(&h, self.block, |k| self.engine.block_status(o, k));
+            if let Some(kept) = unwritten.pages.get_mut(o) {
+                if kept.len() == PAGES_REPORTED {
+                    kept.pop_front();
+                }
+                kept.push_back(page);
+            }
+        }
+        let status = self.engine.status();
         let mut own = Own {
             processed: progress.processed,
             clock: ClockFlags {
@@ -154,6 +199,8 @@ impl Audio for EngineAudio {
                 .collect(),
             unwritten: Vec::new(),
             build_lead: Some(progress.build_lead),
+            pages: unwritten.pages.iter().flatten().copied().collect(),
+            ..Own::default()
         };
         if let Some(newest) = progress.processed {
             let first = (newest + 1).saturating_sub(self.window);
@@ -169,6 +216,8 @@ impl Audio for EngineAudio {
             own,
             status_changes_lost: progress.status_changes_lost,
             entries_refused: self.refused.load(Ordering::Relaxed),
+            realised: status.outputs.iter().map(|o| o.realised).collect(),
+            generation_ready: status.generation.pending.is_none() || status.generation.ready,
         }
     }
 
@@ -239,6 +288,18 @@ impl Audio for EngineAudio {
 
     fn ranks(&self, ranks: Ranks) {
         let _ = self.engine.set_ranks(ranks);
+    }
+
+    fn commit_from(&self, output: usize, min_k: u64, seen: u64) {
+        if let Err(e) = self.engine.commit_from_seen(output, min_k, seen) {
+            tracing::warn!(output, error = %e, "the engine refused a commit start");
+        }
+    }
+
+    fn cancel_commit_start(&self, output: usize) {
+        if let Err(e) = self.engine.cancel_commit_start(output) {
+            tracing::warn!(output, error = %e, "the engine refused a commit start's cancel");
+        }
     }
 }
 

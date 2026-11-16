@@ -112,6 +112,21 @@ pub struct BlockStatus {
     pub digest: Option<u64>,
 }
 
+impl BlockStatus {
+    /// Whether it is `withheld` for a cause (a degradation, a fence, a
+    /// skip, `onSilenceOf`): not the range below a commit start, not a
+    /// block a withdrawn replica could not fill, and not a fill (no
+    /// digest) withheld because another replica committed the block or
+    /// nobody gave evidence for it by its hold cap.
+    pub fn for_a_cause(&self) -> bool {
+        let fill_not_needed =
+            self.digest.is_none() && matches!(self.cause, Cause::OtherDigest | Cause::HoldCap);
+        self.kind == Kind::Withheld
+            && !matches!(self.cause, Cause::None | Cause::Unfillable)
+            && !fill_not_needed
+    }
+}
+
 /// The digest of a healthy block: XXH3-64 over no bytes.
 pub const HEALTHY: u64 = 0x2d06_8005_38d3_94c2;
 
@@ -253,6 +268,51 @@ pub struct Statuses {
     slots: Box<[Slot]>,
     /// The output's [`Standing`], set by the RT thread.
     standing: AtomicU64,
+    /// The latest commit start requested, set by the supervisor.
+    start: StartSlot,
+}
+
+/// A requested commit start that is a cancel.
+const CANCEL: u64 = u64::MAX;
+
+/// One output's latest commit start request, latest wins: a sequence
+/// lock with one writer at a time, read by the RT thread without
+/// waiting. An even sequence is a complete request.
+struct StartSlot {
+    seq: AtomicU64,
+    min_k: AtomicU64,
+    seen: AtomicU64,
+}
+
+impl StartSlot {
+    fn new() -> StartSlot {
+        StartSlot {
+            seq: AtomicU64::new(0),
+            min_k: AtomicU64::new(0),
+            seen: AtomicU64::new(0),
+        }
+    }
+
+    /// The caller allows one writer at a time.
+    fn write(&self, min_k: u64, seen: u64) {
+        let s = self.seq.load(Relaxed);
+        self.seq.store(s + 1, Relaxed);
+        std::sync::atomic::fence(Release);
+        self.min_k.store(min_k, Relaxed);
+        self.seen.store(seen, Relaxed);
+        self.seq.store(s + 2, Release);
+    }
+
+    /// The request after sequence `last`, if one is complete.
+    fn read(&self, last: u64) -> Option<(u64, u64, u64)> {
+        let s = self.seq.load(Acquire);
+        if s == last || s & 1 == 1 {
+            return None;
+        }
+        let (min_k, seen) = (self.min_k.load(Relaxed), self.seen.load(Relaxed));
+        std::sync::atomic::fence(Acquire);
+        (self.seq.load(Relaxed) == s).then_some((s, min_k, seen))
+    }
 }
 
 impl Statuses {
@@ -269,7 +329,23 @@ impl Statuses {
                 })
                 .collect(),
             standing: AtomicU64::new(Standing::Idle { since: 0 }.pack()),
+            start: StartSlot::new(),
         }
+    }
+
+    /// Requests a commit start ([`Hold::commit_from_seen`]), replacing
+    /// any request the RT thread has not taken yet; the caller allows one
+    /// request at a time.
+    pub fn request_start(&self, min_k: u64, seen: u64) {
+        debug_assert!(min_k != CANCEL);
+        self.start.write(min_k, seen);
+    }
+
+    /// Requests a requested commit start dropped
+    /// ([`Hold::cancel_commit_start`]), replacing any request the RT
+    /// thread has not taken yet; the caller allows one request at a time.
+    pub fn request_cancel(&self) {
+        self.start.write(CANCEL, 0);
     }
 
     /// Whether the output commits.
@@ -643,6 +719,11 @@ pub struct Hold {
     /// A requested commit start: the first page boundary in a block at
     /// or after it.
     start_from: Option<u64>,
+    /// The block decided when the replica was last withdrawn for a cause:
+    /// a commit start decided on statuses before it is stale.
+    cause_at: Option<u64>,
+    /// The last commit start request taken from the statuses.
+    start_seq: u64,
     /// A requested stop at a sample index.
     stop_at: Option<u64>,
     /// The block after the last one computed.
@@ -657,9 +738,23 @@ pub struct Hold {
 /// What [`Hold`] did that concerns the other outputs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
-    /// A block of this output was withheld for a cause: the replica is
-    /// withdrawn on every output.
+    /// A block of this output was withheld: the replica is withdrawn on
+    /// every output.
     pub withdraw: bool,
+    /// One of them for a cause ([`BlockStatus::for_a_cause`]).
+    pub cause: bool,
+}
+
+impl Outcome {
+    fn add(&mut self, other: Outcome) {
+        self.withdraw |= other.withdraw;
+        self.cause |= other.cause;
+    }
+
+    fn withheld(&mut self, st: &BlockStatus) {
+        self.withdraw = true;
+        self.cause |= st.for_a_cause();
+    }
 }
 
 impl Hold {
@@ -681,6 +776,8 @@ impl Hold {
             frontier: None,
             committed_end: None,
             start_from: None,
+            cause_at: None,
+            start_seq: 0,
             stop_at: None,
             next: 0,
             withheld: 0,
@@ -709,8 +806,40 @@ impl Hold {
 
     /// Commits from the first page boundary in a block at or after
     /// `min_k` this output computes (from that block's start when alone).
+    /// Ignored while the output commits.
     pub fn commit_from(&mut self, min_k: u64) {
+        self.commit_from_seen(min_k, u64::MAX);
+    }
+
+    /// As [`Hold::commit_from`], for a commit start decided on the
+    /// statuses up to block `seen`: ignored when the replica was withdrawn
+    /// for a cause while a block after it was decided, which that
+    /// decision did not see.
+    pub fn commit_from_seen(&mut self, min_k: u64, seen: u64) {
+        if self.mode == Mode::Committing || self.cause_at.is_some_and(|c| c > seen) {
+            return;
+        }
         self.start_from = Some(min_k);
+    }
+
+    /// Takes the latest commit start request in `statuses`
+    /// ([`Statuses::request_start`], [`Statuses::request_cancel`]).
+    pub fn take_request(&mut self, statuses: &Statuses) {
+        let Some((seq, min_k, seen)) = statuses.start.read(self.start_seq) else {
+            return;
+        };
+        self.start_seq = seq;
+        if min_k == CANCEL {
+            self.cancel_commit_start();
+        } else {
+            self.commit_from_seen(min_k, seen);
+        }
+    }
+
+    /// Drops a requested commit start that has not taken: the output goes
+    /// on as it is. One that took is no longer pending.
+    pub fn cancel_commit_start(&mut self) {
+        self.start_from = None;
     }
 
     /// Stops committing at sample index `p`: the block holding it commits
@@ -747,21 +876,26 @@ impl Hold {
         self.committed_end = None;
     }
 
-    /// The replica is withdrawn: from now on this output commits through
-    /// only, from the next page boundary on. Blocks in the ring that a
-    /// withdrawn replica cannot fill are withheld at once. One replica
-    /// is never withdrawn.
+    /// The replica is withdrawn, `cause` for a block withheld for a
+    /// cause or the supervisor's withdrawal: from now on this output
+    /// commits through only, from the next page boundary on. Blocks in
+    /// the ring that a withdrawn replica cannot fill are withheld at once.
+    /// One replica is never withdrawn.
     /// A pending stop lapses: it applies only to a committing output. A
-    /// pending commit start lapses unless the replica is withdrawn
-    /// already: there every block is a fill, and a fill withheld while
-    /// another replica commits leaves the commit start in place.
-    pub fn withdraw(&mut self, statuses: &Statuses, changes: &mut Changes) {
+    /// pending commit start lapses on a cause, or unless the replica is
+    /// withdrawn already: there every block is a fill, and a fill
+    /// withheld while another replica commits leaves the commit start in
+    /// place.
+    pub fn withdraw(&mut self, statuses: &Statuses, changes: &mut Changes, cause: bool) {
         // One replica has no member to leave a block to: it goes on
         // committing after a block it withheld, from any index.
         if self.alone {
             return;
         }
-        if self.mode != Mode::Withdrawn {
+        if cause {
+            self.cause_at = Some(self.next);
+        }
+        if cause || self.mode != Mode::Withdrawn {
             self.start_from = None;
         }
         self.stop_at = None;
@@ -943,7 +1077,7 @@ impl Hold {
         // Each pass ends with the front block final, unless the supervisor
         // moved it meanwhile; it moves a block a bounded number of times.
         while !self.alone && self.mode != Mode::Idle && self.pending.len() == self.cap {
-            out.withdraw |= self.advance(ctx, statuses, changes, sink).withdraw;
+            out.add(self.advance(ctx, statuses, changes, sink));
             if self.pending.len() < self.cap {
                 break;
             }
@@ -953,14 +1087,14 @@ impl Hold {
             self.pending[0].status = st;
             if st.kind == Kind::Withheld {
                 self.overflows += u64::from(st.cause == Cause::Overflow);
-                out.withdraw = true;
+                out.withheld(&st);
             }
             self.flush(changes, sink);
         }
         // A block withheld for a cause withdraws the replica before block
         // k is decided: k follows the withdrawn rules.
         if out.withdraw {
-            self.withdraw(statuses, changes);
+            self.withdraw(statuses, changes, out.cause);
         }
         if let Some(min_k) = self.start_from
             && k >= min_k
@@ -1073,7 +1207,9 @@ impl Hold {
             if now.cause == Cause::NoSlot {
                 changes.send(now);
             }
-            out.withdraw |= now.kind == Kind::Withheld;
+            if now.kind == Kind::Withheld {
+                out.withheld(&now);
+            }
             self.frontier = None;
             self.committed_end = None;
             return out;
@@ -1084,7 +1220,7 @@ impl Hold {
                 self.withheld += 1;
                 self.frontier = None;
                 self.committed_end = None;
-                out.withdraw = true;
+                out.withheld(&st);
                 return out;
             }
             Kind::Committed if self.pending.is_empty() => {
@@ -1181,13 +1317,14 @@ impl Hold {
                         {
                             self.pending[n].end = e;
                             out.withdraw = true;
+                            out.cause = true;
                         }
                     }
                     Err(now) => cur = now,
                 }
             }
             if cur.kind == Kind::Withheld && p.status.kind != Kind::Withheld {
-                out.withdraw = true;
+                out.withheld(&cur);
             }
             self.pending[n].status = cur;
             prefix &= cur.kind == Kind::Committed;
@@ -1566,14 +1703,27 @@ mod tests {
                 .advance(ctx, statuses, &mut changes, &mut self.sink)
         }
 
+        /// Computes block `k` and commits it through on evidence, so no
+        /// fill overflows the ring.
+        fn evidenced(&mut self, k: u64, digest: Option<u64>) {
+            self.compute(k, digest);
+            self.statuses.commit_through(k, 0, None);
+            self.advance();
+        }
+
+        /// Withdrawn for a cause.
         fn withdraw(&mut self) {
+            self.withdraw_for(true);
+        }
+
+        fn withdraw_for(&mut self, cause: bool) {
             let statuses = &self.statuses;
             let mut changes = Changes {
                 ring: &mut self.tx,
                 dropped: &self.dropped,
                 output: 0,
             };
-            self.hold.withdraw(statuses, &mut changes);
+            self.hold.withdraw(statuses, &mut changes, cause);
         }
 
         fn kind(&self, k: u64) -> Option<Kind> {
@@ -2632,6 +2782,43 @@ mod tests {
         assert_eq!(Ranks::unpack(ranks.pack()), ranks);
     }
 
+    /// A cancelled commit start never takes, whether the output is idle
+    /// or withdrawn; one requested after it does, and a cancel after one
+    /// took changes nothing.
+    #[test]
+    fn a_cancelled_commit_start_never_takes() {
+        let p = K0 * B + PAGE;
+        let kp = p / B;
+        let mut t = T::new(false);
+        t.hold.commit_from(K0);
+        t.hold.cancel_commit_start();
+        for j in K0..=kp {
+            t.compute(j, Some(HEALTHY));
+        }
+        assert_eq!(t.statuses.standing(), Standing::Idle { since: 0 });
+        assert!(t.sink.writes.is_empty());
+
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        t.withdraw();
+        t.hold.commit_from(kp);
+        t.hold.cancel_commit_start();
+        for j in K0 + 1..=kp + 1 {
+            t.evidenced(j, DEGRADED);
+        }
+        assert!(matches!(t.statuses.standing(), Standing::Withdrawn { .. }));
+        t.hold.commit_from(kp + 2);
+        let next = ((kp + 2) * B).next_multiple_of(PAGE);
+        for j in kp + 2..=next / B {
+            t.evidenced(j, Some(HEALTHY));
+        }
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: next });
+        t.hold.cancel_commit_start();
+        t.compute(next / B + 1, Some(HEALTHY));
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: next });
+        t.sink.check();
+    }
+
     /// A withdrawn replica keeps a requested commit start when one of its
     /// fills is withheld: it commits from that page boundary, not from a
     /// later one named again after it.
@@ -2654,13 +2841,121 @@ mod tests {
                 .map(|s| s.kind),
             Some(Kind::Withheld)
         );
-        t.advance();
-        t.withdraw();
+        let out = t.advance();
+        assert_eq!((out.withdraw, out.cause), (true, false));
+        t.withdraw_for(out.cause);
         for j in fill + 1..=kp {
             t.compute(j, Some(HEALTHY));
         }
         let st = t.statuses.get(kp).unwrap();
         assert_eq!(st.range, Range::From(p), "{st:?}");
         assert_eq!(t.statuses.standing(), Standing::Committing { from: p });
+    }
+
+    /// A withdrawn replica drops a requested commit start when a block is
+    /// withheld for a cause before it takes: the start was decided on
+    /// statuses that did not have that block.
+    #[test]
+    fn a_block_withheld_for_a_cause_drops_a_requested_commit_start() {
+        let p = K0 * B + PAGE;
+        let kp = p / B;
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        t.withdraw();
+        t.hold.commit_from(kp);
+        // Skipped: withheld at the skip, before the commit start takes.
+        assert_eq!(
+            t.statuses.withhold(K0 + 1, Cause::Skip).map(|s| s.kind),
+            Some(Kind::Withheld)
+        );
+        t.withdraw();
+        for j in K0 + 2..=kp + 1 {
+            t.compute(j, Some(HEALTHY));
+        }
+        assert!(
+            matches!(t.statuses.standing(), Standing::Withdrawn { .. }),
+            "{:?}",
+            t.statuses.standing()
+        );
+    }
+
+    /// A commit start decided on statuses before a withdrawal for a cause
+    /// is ignored, one decided after it takes.
+    #[test]
+    fn a_commit_start_decided_before_a_withdrawal_for_a_cause_is_ignored() {
+        let p = K0 * B + PAGE;
+        let kp = p / B;
+        let mut t = T::committing(false, K0);
+        for j in K0..kp - 2 {
+            t.compute(j, Some(HEALTHY));
+        }
+        // Withdrawn for a cause while block kp - 2 is decided.
+        t.withdraw();
+        t.hold.commit_from_seen(kp, kp - 3);
+        for j in kp - 2..=kp {
+            t.evidenced(j, Some(HEALTHY));
+        }
+        assert!(matches!(t.statuses.standing(), Standing::Withdrawn { .. }));
+        t.hold.commit_from_seen(kp + 1, kp);
+        let next = ((kp + 1) * B).next_multiple_of(PAGE);
+        for j in kp + 1..=next / B {
+            t.evidenced(j, Some(HEALTHY));
+        }
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: next });
+        t.sink.check();
+    }
+
+    /// A commit start requested again after the output took one is
+    /// ignored: a stop then leaves the output withdrawn.
+    #[test]
+    fn a_commit_start_requested_while_committing_is_ignored() {
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        t.hold.commit_from(K0);
+        t.hold.stop_at((K0 + 1) * B);
+        let next = ((K0 + 1) * B).next_multiple_of(PAGE) / B;
+        for j in K0 + 1..=next {
+            t.compute(j, Some(HEALTHY));
+        }
+        assert!(
+            matches!(t.statuses.standing(), Standing::Withdrawn { .. }),
+            "{:?}",
+            t.statuses.standing()
+        );
+    }
+
+    /// The RT thread takes the latest commit start request once: a cancel
+    /// replaces a start not yet taken, and a start taken is not taken
+    /// again.
+    #[test]
+    fn the_latest_commit_start_request_wins() {
+        let p = K0 * B + PAGE;
+        let kp = p / B;
+        let mut t = T::new(false);
+        t.statuses.request_start(K0, K0);
+        t.statuses.request_cancel();
+        t.hold.take_request(&t.statuses);
+        for j in K0..=kp {
+            t.compute(j, Some(HEALTHY));
+        }
+        assert_eq!(t.statuses.standing(), Standing::Idle { since: 0 });
+        t.statuses.request_cancel();
+        t.statuses.request_start(kp + 1, kp);
+        t.hold.take_request(&t.statuses);
+        t.hold.cancel_commit_start();
+        // Taken already: the same request does not come back.
+        t.hold.take_request(&t.statuses);
+        let next = ((kp + 1) * B).next_multiple_of(PAGE) / B;
+        for j in kp + 1..=next {
+            t.compute(j, Some(HEALTHY));
+        }
+        assert_eq!(t.statuses.standing(), Standing::Idle { since: 0 });
+        t.statuses.request_start(next + 1, next);
+        t.hold.take_request(&t.statuses);
+        let at = ((next + 1) * B).next_multiple_of(PAGE);
+        for j in next + 1..=at / B {
+            t.compute(j, Some(HEALTHY));
+        }
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: at });
     }
 }
