@@ -17,7 +17,7 @@ use std::sync::atomic::{
 use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
 use rtrb::{Consumer, Producer};
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{KWeighting, Matrix, PlanarBuffer, Ramp, Strip, StripParam, TruePeak};
+use samplez_dsp::{KWeighting, Matrix, PlanarBuffer, Ramp, Started, Strip, StripParam, TruePeak};
 use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{FlowWriter, Write};
 use samplez_mxl::{MxlApi, time};
@@ -25,6 +25,7 @@ use samplez_mxl::{MxlApi, time};
 use crate::blocks::{
     Cause, Changes, Ctx, Hold, Kind, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
+use crate::transfer::{Core, CoreCopy, SlotCore};
 
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
@@ -334,6 +335,9 @@ pub(crate) struct Shared {
     pub steps_cleared: AtomicU64,
     /// Per output.
     pub statuses: Vec<Statuses>,
+    /// The block the RT thread computes, stored before any history sample
+    /// of it, for history copies.
+    pub started: Started,
 }
 
 /// The RT thread's part of a replicated engine.
@@ -354,6 +358,10 @@ pub(crate) struct Replica {
     pub late_lost_until: u64,
     /// Where the page hashes go.
     pub hashes: Producer<PageHash>,
+    /// Buffers for a copy of the core, allocated off the RT thread.
+    pub cores: Consumer<Box<Core>>,
+    /// The copies, back to the replicated state.
+    pub copies: Producer<CoreCopy>,
 }
 
 /// The index of a log entry in the log that orders it.
@@ -390,7 +398,7 @@ impl Change {
 /// A committed log entry, applied at sample index `at_index`, a multiple
 /// of B. Entries have a ring of their own, so a full pending list never
 /// holds back a generation or a writer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RtEntry {
     pub id: LogId,
     pub at_index: u64,
@@ -1090,6 +1098,45 @@ fn digest(
     Some(crate::blocks::degraded_digest(&r.ids, incoming, outgoing))
 }
 
+/// Copies the core out of the RT thread's state into `c`, a buffer of
+/// the same shape, without allocating.
+#[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+fn capture_core(
+    c: &mut Core,
+    m: &Mix,
+    slots: &[Slot],
+    awaiting: &[RtEntry],
+    pending_gen: Option<LogId>,
+    r: &Replica,
+) {
+    c.matrix.copy_from(&m.matrix);
+    c.pos = m.pos;
+    c.ramp_end = m.ramp_end;
+    c.pending.clear();
+    c.pending.extend_from_slice(&m.pending);
+    c.page_entries.clear();
+    c.page_entries.extend_from_slice(&m.page_entries);
+    c.entries_page = m.entries_page;
+    c.entries_lost = m.entries_lost;
+    for (d, s) in c.slots.iter_mut().zip(slots) {
+        *d = SlotCore {
+            up: s.up,
+            held: s.held,
+            fade_start: s.fade_start,
+            silenced_last: s.silenced_last,
+            xfade: s.xfade,
+        };
+    }
+    c.awaiting_gen.clear();
+    c.awaiting_gen.extend_from_slice(awaiting);
+    c.pending_gen = pending_gen;
+    c.unresolved.clear();
+    c.unresolved.extend_from_slice(&r.unresolved);
+    c.late_routes.clear();
+    c.late_routes.extend_from_slice(&r.late_routes);
+    c.late_lost_until = r.late_lost_until;
+}
+
 /// The replica is withdrawn on every output.
 fn withdraw_all(outs: &mut [Out], r: &mut Replica, counters: &Counters) {
     for (o, out) in outs.iter_mut().enumerate() {
@@ -1649,6 +1696,9 @@ impl Rt {
     fn process(&mut self, k: u64, deadline: u64) {
         let t0 = self.now();
         let b = self.block as usize;
+        if let Some(r) = &self.replica {
+            r.shared.started.begin(k);
+        }
         // Entries apply at the start of the block at their index, before
         // its inputs are read.
         let (counters, tel) = (&self.counters, &mut self.tel);
@@ -1923,6 +1973,37 @@ impl Rt {
         if k.is_multiple_of(samplez_mxl::SAMPLE_RATE as u64 / self.block) {
             self.publish_stats(done);
         }
+        self.copy_core(k);
+    }
+
+    /// Copies the core after block `k` into the buffer the replicated
+    /// state handed over, if one waits and the copy has room to go back.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn copy_core(&mut self, k: u64) {
+        let Some(r) = self.replica.as_mut() else {
+            return;
+        };
+        if r.copies.slots() == 0 {
+            return;
+        }
+        let Ok(mut core) = r.cores.pop() else {
+            return;
+        };
+        let pending_gen = self.pending_gen.as_ref().map(|p| p.0);
+        capture_core(
+            &mut core,
+            &self.mix,
+            &self.slots,
+            &self.awaiting_gen,
+            pending_gen,
+            r,
+        );
+        // The ring had room: nothing is dropped here.
+        let _ = r.copies.push(CoreCopy {
+            k0: k,
+            last_id: self.last_entry,
+            core,
+        });
     }
 
     /// Sends each slot's statistics since the last call and starts new
@@ -2337,6 +2418,8 @@ mod tests {
         let (changes, _) = rtrb::RingBuffer::new(1);
         let (_, control) = rtrb::RingBuffer::new(1);
         let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, cores) = rtrb::RingBuffer::new(1);
+        let (copies, _) = rtrb::RingBuffer::new(1);
         Replica {
             shared: Arc::new(Shared {
                 fence: AtomicU64::new(0),
@@ -2344,6 +2427,7 @@ mod tests {
                 self_report: AtomicBool::new(false),
                 steps_cleared: AtomicU64::new(0),
                 statuses: Vec::new(),
+                started: Started::new(),
             }),
             changes,
             control,
@@ -2352,7 +2436,90 @@ mod tests {
             late_routes: Vec::with_capacity(PENDING_CHANGES),
             late_lost_until: 0,
             hashes,
+            cores,
+            copies,
         }
+    }
+
+    fn slot(up: bool, held: bool, fade: Option<u64>, silenced: bool, xfade: Option<u64>) -> Slot {
+        Slot {
+            domain: 0,
+            first_channel: 0,
+            channels: 1,
+            offset: 0,
+            state: SlotState::default(),
+            fade_start: fade,
+            silenced_last: silenced,
+            up,
+            held,
+            xfade,
+            prev: SlotState::default(),
+            prune_requested: false,
+            stats: EMPTY_STATS,
+            strip: None,
+            strip_pos: None,
+        }
+    }
+
+    /// Every field of the core is copied: each set to a value other than
+    /// its default, the copy equals a core built from those values.
+    #[test]
+    fn the_core_copy_takes_every_field() {
+        let mut m = mix();
+        m.page_entries = Vec::with_capacity(4);
+        assert!(m.matrix.set(0, 0, 0.5, 480));
+        m.matrix.advance(100);
+        m.pos = Some(20 * B);
+        m.ramp_end = 19 * B + 380;
+        assert!(m.push(change(0.25, 40 * B)));
+        assert!(m.push(entry(Change::InputDown { slot: 1 }, 41 * B)));
+        m.page_entries.extend([(3, 2 * B), (4, 3 * B)]);
+        m.entries_page = Some(1);
+        m.entries_lost = true;
+        let slots = [
+            slot(true, true, Some(5 * B), false, Some(18 * B)),
+            slot(false, false, None, true, None),
+        ];
+        let awaiting = [entry(Change::InputUp { slot: 0 }, 19 * B)];
+        let mut r = replica();
+        r.unresolved.extend([(8, 21 * B), (9, 30 * B)]);
+        r.late_routes.push((10, 25 * B));
+        r.late_lost_until = 26 * B;
+
+        let mut c = Core::new(1, 1, 2, 4);
+        capture_core(&mut c, &m, &slots, &awaiting, Some(11), &r);
+        let want = Core {
+            matrix: m.matrix.clone(),
+            pos: Some(20 * B),
+            ramp_end: 19 * B + 380,
+            pending: m.pending.clone(),
+            page_entries: vec![(3, 2 * B), (4, 3 * B)],
+            entries_page: Some(1),
+            entries_lost: true,
+            slots: vec![
+                SlotCore {
+                    up: true,
+                    held: true,
+                    fade_start: Some(5 * B),
+                    silenced_last: false,
+                    xfade: Some(18 * B),
+                },
+                SlotCore {
+                    up: false,
+                    held: false,
+                    fade_start: None,
+                    silenced_last: true,
+                    xfade: None,
+                },
+            ],
+            awaiting_gen: awaiting.to_vec(),
+            pending_gen: Some(11),
+            unresolved: vec![(8, 21 * B), (9, 30 * B)],
+            late_routes: vec![(10, 25 * B)],
+            late_lost_until: 26 * B,
+        };
+        assert_eq!(c, want);
+        assert_eq!(c.pending.len(), 2);
     }
 
     /// The digest covers the inputs whose read failed, by crossfade leg,

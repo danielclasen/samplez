@@ -2,9 +2,11 @@
 //! by Gungraun (`cargo bench --bench rt`). Each benchmark processes one
 //! block of B = 48 samples at the largest shape measured here, 64 input
 //! channels to 96 output channels, on both dispatch paths, with every
-//! coefficient ramping; the strips, 64 mono ones, have one path. The
-//! hard limits are the instruction counts measured in the builder image
-//! plus 10 %, rounded up; a run above a limit fails.
+//! coefficient ramping; the strips, 64 mono ones, have one path. It also
+//! gates the RT parts of a resync at that shape: the matrix copy of the
+//! core and one block's history stores. The hard limits are the
+//! instruction counts measured in the builder image plus 10 %, rounded
+//! up; a run above a limit fails.
 
 use std::hint::black_box;
 
@@ -12,8 +14,8 @@ use gungraun::prelude::*;
 use gungraun::{Callgrind, EventKind};
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
-    CompParams, EqBand, GateParams, KWeighting, Matrix, Path, PlanarBuffer, Strip, StripParam,
-    TruePeak,
+    CompParams, EqBand, GateParams, History, KWeighting, Matrix, Path, PlanarBuffer, Started,
+    Strip, StripParam, TruePeak,
 };
 
 const B: usize = 48;
@@ -142,6 +144,41 @@ fn strip((mut strips, mut buf): (Vec<Strip>, PlanarBuffer)) -> (Vec<Strip>, Plan
     (strips, buf)
 }
 
+// The matrix part of the RT thread's core copy for a resync: every
+// coefficient and its ramp into a buffer of the same shape.
+#[library_benchmark]
+#[bench::full(setup = setup_copy, config = limit(CORE_COPY))]
+fn core_copy((mut dst, src): (Matrix, Matrix)) -> (Matrix, Matrix) {
+    dst.copy_from(black_box(&src));
+    (dst, src)
+}
+
+fn setup_copy() -> (Matrix, Matrix) {
+    (Matrix::new(INPUTS, OUTPUTS), ramping_matrix().0)
+}
+
+// One block's history stores: the started block, then one ring per input
+// channel of 100 ms of delay and 50 ms of slack, with scalar relaxed
+// stores.
+#[library_benchmark]
+#[bench::block(setup = setup_history, config = limit(HISTORY_BLOCK))]
+fn history(
+    (started, rings, buf): (Started, Vec<History>, PlanarBuffer),
+) -> (Started, Vec<History>, PlanarBuffer) {
+    started.begin(black_box(4000));
+    for (c, ring) in rings.iter().enumerate() {
+        ring.write(4000 * B as u64, black_box(buf.channel(c)));
+    }
+    (started, rings, buf)
+}
+
+fn setup_history() -> (Started, Vec<History>, PlanarBuffer) {
+    let rings = (0..INPUTS).map(|_| History::new(4800, 50, B)).collect();
+    (Started::new(), rings, signal(INPUTS))
+}
+
+const CORE_COPY: u64 = 26_000;
+const HISTORY_BLOCK: u64 = 45_000;
 const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
 const METERS_SCALAR: u64 = 1_118_000;
@@ -150,5 +187,6 @@ const STRIPS_RAMPING: u64 = 1_757_000;
 const STRIPS_SETTLED: u64 = 1_250_000;
 
 library_benchmark_group!(name = block, benchmarks = [matrix, meters, strip]);
+library_benchmark_group!(name = transfer, benchmarks = [core_copy, history]);
 
-main!(library_benchmark_groups = block);
+main!(library_benchmark_groups = block, transfer);

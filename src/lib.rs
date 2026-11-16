@@ -14,6 +14,7 @@ pub mod engine;
 mod meters;
 pub mod rt;
 mod rt_loop;
+pub mod transfer;
 
 pub use config::Config;
 pub use engine::{
@@ -22,6 +23,7 @@ pub use engine::{
 };
 pub use meters::OutputMeters;
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};
+pub use transfer::{CopyError, Core, CoreCopy};
 
 /// The lint probe's lock on a static (CI): its users never name its type.
 #[cfg(samplez_lint_probe = "samplez")]

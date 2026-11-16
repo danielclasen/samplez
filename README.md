@@ -41,7 +41,8 @@ releases its writers, which deletes the output flows.
 ```
 
 Further keys and their defaults: `maxCatchupBlocks` 2, `pruneAfterBlocks`
-50, `rampSamples` 480, `holdMs` 10, `contactWindowMs` 8, per input
+50, `rampSamples` 480, `holdMs` 10, `contactWindowMs` 8,
+`historySlackMs` 50, `resyncBudgetMs` 50, per input
 `offsetSamples` 0, per output `loudnessChannels` (one of `L`, `R`, `C`,
 `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5 Table 3;
 without it every channel weighs 1).
@@ -115,6 +116,22 @@ patterns, channels interleaved per index) and sent as a `PageHash`
 once every block overlapping it is final, with the fingerprint of the
 log entries applied in it and whether the page was committed whole.
 
+For a resync, `Engine::copy_core` has the RT thread copy the engine's
+core after the next block k0 into a buffer allocated off it: the matrix
+with its ramps, the pending entries and those applied in the page in
+progress, each input's log state and fades, the entries waiting for a
+generation and the pending generation's entry id, and the unresolved
+entries. Meters, hold rings, statuses and readers stay with the replica.
+History rings (`History` in samplez-dsp) hold a delay plus
+`historySlackMs` of slack as relaxed atomic bit patterns; the RT thread
+publishes the block it starts before it stores any history sample, and a
+copy is kept only while the RT thread has not started the last block of
+the slack after k0. The engine keeps no delay line yet, so a copy holds
+the core alone. With more than one voter every input flow must offer
+`resyncBudgetMs` of history beyond the read window; an input whose flow
+is shorter is refused with an error naming the `history_duration` it
+needs. A lone voter has no donor to resync from and needs none.
+
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
 against CLOCK_MONOTONIC at each wake, when it also samples the kernel
 TAI offset (CLOCK_TAI - CLOCK_REALTIME); the status reports both, and
@@ -152,9 +169,10 @@ uncontended std lock, which makes no libc call, nor
 and the other blocking std primitives listed in `clippy.toml` in the RT
 modules. `cargo bench --bench rt` in samplez, samplez-dsp and
 samplez-mxl fails when the instruction count of the hold ring's paths,
-the page hashes, the strip calls of the RT loop, a block's DSP or an
-output commit, gap zero-fill included, exceeds the limit in the
-benchmark. One failure path is
+the page hashes, the strip calls of the RT loop, a block's DSP, the
+matrix copy of the core, a block's history stores or an output commit,
+gap zero-fill included, exceeds the limit in the benchmark. One failure
+path is
 excepted from the no-allocation rule, and its probe is allowed by call
 site under RealtimeSanitizer: while an input is late, libmxl's flow
 validity check, one `stat()` and path allocations, can run on the RT

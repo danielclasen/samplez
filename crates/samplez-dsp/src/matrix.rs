@@ -103,6 +103,21 @@ impl Matrix {
         self.path
     }
 
+    /// Makes this matrix a copy of `src`, coefficients and ramps, without
+    /// allocating: both have the same shape, and every column reserves
+    /// room for every input, as [`Matrix::new`] and clones do.
+    pub fn copy_from(&mut self, src: &Matrix) {
+        assert!(
+            self.inputs == src.inputs && self.columns.len() == src.columns.len(),
+            "a copy between matrices of different shapes"
+        );
+        for (dst, col) in self.columns.iter_mut().zip(&src.columns) {
+            dst.clear();
+            dst.extend_from_slice(col);
+        }
+        self.path = src.path;
+    }
+
     /// Value the coefficient from `input` to `output` has on the next
     /// sample.
     pub fn gain(&self, input: usize, output: usize) -> f32 {
@@ -329,6 +344,27 @@ mod tests {
         a.process(&input, &mut out_a, CAP);
         b.process(&input, &mut out_b, CAP);
         assert_bits_eq(&out_a, &out_b, CAP, "after advance");
+    }
+
+    /// A copy taken mid-ramp continues bit-identically, a coefficient the
+    /// target had and the source has not included.
+    #[test]
+    fn a_copy_continues_the_ramps_bit_identically() {
+        let mut rng = Rng::new(11);
+        let mut src = Matrix::new(3, 2);
+        assert!(src.set(0, 0, 0.8, 1000));
+        assert!(src.set(2, 1, -0.5, 300));
+        src.advance(123);
+        let mut dst = Matrix::new(3, 2);
+        assert!(dst.set(1, 0, 0.3, 0));
+        dst.copy_from(&src);
+        assert_eq!(dst, src);
+        let mut input = PlanarBuffer::new(3, CAP);
+        let (mut out_a, mut out_b) = (PlanarBuffer::new(2, CAP), PlanarBuffer::new(2, CAP));
+        fill(&mut rng, &mut input, CAP);
+        src.process(&input, &mut out_a, CAP);
+        dst.process(&input, &mut out_b, CAP);
+        assert_bits_eq(&out_a, &out_b, CAP, "after the copy");
     }
 
     #[test]

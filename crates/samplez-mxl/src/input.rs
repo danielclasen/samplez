@@ -37,6 +37,9 @@ pub struct Timing {
     /// Read delay `readerMarginSamples`.
     pub margin: u64,
     pub max_catchup_blocks: u64,
+    /// `resyncBudgetMs` in samples, which a resync replay reads past the
+    /// read window, with more than one voter; else 0.
+    pub resync_budget: u64,
 }
 
 /// One input slot's configuration.
@@ -363,6 +366,13 @@ impl Generation {
         if required > buffer_length / 2 {
             return Err(Error::Window {
                 required,
+                buffer_length,
+            });
+        }
+        let replay = required + timing.resync_budget;
+        if replay > buffer_length / 2 {
+            return Err(Error::History {
+                required: replay,
                 buffer_length,
             });
         }
