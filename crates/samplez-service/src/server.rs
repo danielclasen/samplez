@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 
 use crate::auth::{self, Auth, Identity, Listener, Role};
 use crate::config::{AuthMode, ServiceConfig};
+use crate::oidc;
 use crate::ops::Ops;
 use crate::replica::{Owner, ReplicatedState};
 use crate::tls::{ListenerTls, TlsListener, TlsStatus};
@@ -95,7 +96,7 @@ pub struct ServiceStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretStatus {
-    /// `token` or `machineToken`.
+    /// `token`, `machineToken`, `oidcClientSecret` or `oidcSessionKey`.
     pub name: &'static str,
     /// Seconds since the Unix epoch of the last successful read.
     pub loaded_at: u64,
@@ -175,7 +176,9 @@ impl Service {
     }
 
     /// Routes served under `/api/v1` on the API listener and, in `proxy`
-    /// mode, the machine listener.
+    /// mode, the machine listener. The service adds `/session` on the API
+    /// listener, `/login` and `/logout` in `token` and `oidc` mode, and
+    /// `/login/callback` in `oidc` mode.
     pub fn api(mut self, router: Router) -> Service {
         self.api = router;
         self
@@ -316,8 +319,19 @@ impl Service {
                 ),
             );
         }
-        if listener == Listener::Api && self.auth.mode() == AuthMode::Token {
-            inner = inner.route("/login", post(auth::login).with_state(self.auth.clone()));
+        if listener == Listener::Api {
+            let auth = || self.auth.clone();
+            inner = match self.auth.mode() {
+                AuthMode::Token => inner.route("/login", post(auth::login).with_state(auth())),
+                AuthMode::Oidc => inner
+                    .route("/login", get(oidc::login).with_state(auth()))
+                    .route("/login/callback", get(oidc::callback).with_state(auth())),
+                AuthMode::None | AuthMode::Proxy => inner,
+            };
+            if matches!(self.auth.mode(), AuthMode::Token | AuthMode::Oidc) {
+                inner = inner.route("/logout", post(auth::logout).with_state(auth()));
+            }
+            inner = inner.route("/session", get(auth::session).with_state(auth()));
         }
         let api = Router::new()
             .nest(

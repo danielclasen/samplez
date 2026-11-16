@@ -1,10 +1,11 @@
 //! Authentication and the browser protections on the API and machine
 //! listeners.
 //!
-//! On the API listener in `token` mode and on the machine listener, a
-//! request carrying `Authorization` is authenticated by bearer only: an
-//! invalid one gets 401 and neither cookies nor identity headers are read.
-//! `none` mode and the `proxy` mode API listener ignore `Authorization`.
+//! On the API listener in `token` and `oidc` mode and on the machine
+//! listener, a request carrying `Authorization` is authenticated by bearer
+//! only: an invalid one gets 401 and neither cookies nor identity headers
+//! are read. `none` mode and the `proxy` mode API listener ignore
+//! `Authorization`.
 //! Requests without a valid bearer must name an allowed `Host` and, when
 //! they change state, carry `X-Samplez-Request: 1` with a JSON content
 //! type. Every WebSocket upgrade with an `Origin` must name an allowed one;
@@ -30,15 +31,20 @@ use utoipa::ToSchema;
 
 use crate::config::{AuthMode, ProxyConfig, ServiceConfig, TlsMode};
 use crate::metrics::{Counter, Metrics};
+use crate::oidc::{self, Failure, Oidc, Pending};
 use crate::{Error, ServiceStatus};
 
 pub const SESSION_COOKIE: &str = "samplez_session";
 pub const CSRF_HEADER: &str = "x-samplez-request";
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
-const LOGIN_PATH: &str = "/api/v1/login";
+const LOGIN_PATH: &str = oidc::LOGIN_PATH;
+const LOGOUT_PATH: &str = "/api/v1/logout";
+const SESSION_PATH: &str = "/api/v1/session";
 pub(crate) const WS_PATH: &str = "/api/v1/ws";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Viewer,
@@ -51,7 +57,8 @@ pub enum Role {
 /// calls [`crate::Connect::require_operator`] before it applies a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
-    /// The user named by the proxy; `None` in the other modes.
+    /// The user named by the proxy or by the OpenID provider's token;
+    /// `None` in the other modes and for a static bearer token.
     pub user: Option<String>,
     pub role: Role,
 }
@@ -131,10 +138,22 @@ pub(crate) struct Auth {
     token: Option<Secret>,
     machine_token: Option<Secret>,
     proxy: ProxyConfig,
+    oidc: Option<Oidc>,
+    client_secret: Option<Secret>,
+    session_key: Option<Secret>,
+    /// The session key of `oidc` mode without a configured one.
+    drawn_key: Vec<u8>,
     hosts: Vec<String>,
     origins: Vec<String>,
     /// The API listener runs TLS, so session cookies are `Secure`.
     tls: bool,
+}
+
+/// The outcome of a request's `Authorization` header.
+enum Bearer {
+    /// None, or one the listener and mode ignore.
+    Absent,
+    Valid(Identity),
 }
 
 impl Auth {
@@ -164,11 +183,33 @@ impl Auth {
             ));
         }
         let token = match (auth.mode, &auth.token) {
-            (AuthMode::Token, Some(t)) => Some(Secret::load("token", &t.file, metrics)?),
+            (AuthMode::Token | AuthMode::Oidc, Some(t)) => {
+                Some(Secret::load("token", &t.file, metrics)?)
+            }
             (AuthMode::Token, None) => {
                 return Err(Error::Config("token mode needs auth.token".into()));
             }
             _ => None,
+        };
+        let oidc = match (auth.mode, &auth.oidc) {
+            (AuthMode::Oidc, Some(o)) => Some(Oidc::new(o)?),
+            (AuthMode::Oidc, None) => {
+                return Err(Error::Config("oidc mode needs auth.oidc".into()));
+            }
+            _ => None,
+        };
+        let oidc_config = oidc.as_ref().map(|o| &o.config);
+        let client_secret = match oidc_config.and_then(|o| o.client_secret.as_ref()) {
+            Some(f) => Some(Secret::load("oidcClientSecret", &f.file, metrics)?),
+            None => None,
+        };
+        let session_key = match oidc_config.and_then(|o| o.session_key.as_ref()) {
+            Some(f) => Some(Secret::load("oidcSessionKey", &f.file, metrics)?),
+            None => None,
+        };
+        let drawn_key = match &oidc {
+            Some(_) => oidc::random(32)?.into_bytes(),
+            None => Vec::new(),
         };
         let machine_token = match (&listeners.machine, &auth.machine_token) {
             (Some(_), Some(t)) => Some(Secret::load("machineToken", &t.file, metrics)?),
@@ -190,12 +231,20 @@ impl Auth {
             format!("{scheme}://127.0.0.1:{port}"),
         ];
         origins.extend(config.api.allowed_origins.iter().cloned());
+        if let Some(o) = &oidc {
+            hosts.push(o.public_host.clone());
+            origins.push(o.public_origin.clone());
+        }
         let origins = origins.iter().map(|o| normalize_origin(o)).collect();
         Ok(Auth {
             mode: auth.mode,
             token,
             machine_token,
             proxy: auth.proxy.clone(),
+            oidc,
+            client_secret,
+            session_key,
+            drawn_key,
             hosts,
             origins,
             tls,
@@ -203,7 +252,113 @@ impl Auth {
     }
 
     fn secrets(&self) -> impl Iterator<Item = &Secret> {
-        [&self.token, &self.machine_token].into_iter().flatten()
+        [
+            &self.token,
+            &self.machine_token,
+            &self.client_secret,
+            &self.session_key,
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    pub(crate) fn oidc(&self) -> Option<&Oidc> {
+        self.oidc.as_ref()
+    }
+
+    pub(crate) fn client_secret(&self) -> Option<Vec<u8>> {
+        self.client_secret.as_ref().map(Secret::get)
+    }
+
+    /// The key `oidc` mode signs its cookies with.
+    fn oidc_key(&self) -> Vec<u8> {
+        match &self.session_key {
+            Some(k) => k.get(),
+            None => self.drawn_key.clone(),
+        }
+    }
+
+    /// Whether the browser reached the API over https: the listener runs
+    /// TLS, the public URL is https, or the proxy in front says so in
+    /// `X-Forwarded-Proto`. A chain of proxies appends its schemes; the
+    /// first is the client's.
+    pub(crate) fn secure(&self, headers: &HeaderMap) -> bool {
+        self.tls
+            || self.oidc.as_ref().is_some_and(|o| o.public_https)
+            || headers.get("x-forwarded-proto").is_some_and(|p| {
+                let first = p
+                    .as_bytes()
+                    .split(|&b| b == b',')
+                    .next()
+                    .unwrap_or_default();
+                first.trim_ascii().eq_ignore_ascii_case(b"https")
+            })
+    }
+
+    pub(crate) fn login_cookie(&self, pending: &Pending, secure: bool) -> String {
+        let expiry = now() + oidc::LOGIN_TTL.as_secs();
+        let payload = oidc::encode_pending(pending);
+        let tag = hex(&signed(
+            &self.oidc_key(),
+            b"samplez-oidc-login:",
+            &[&expiry.to_string(), &payload],
+        ));
+        // Lax: the provider sends the browser back with a cross-site
+        // navigation, which carries no Strict cookie.
+        format!(
+            "{}={expiry}.{payload}.{tag}; Path={LOGIN_PATH}; Max-Age={}; HttpOnly; SameSite=Lax{}",
+            oidc::LOGIN_COOKIE,
+            oidc::LOGIN_TTL.as_secs(),
+            if secure { "; Secure" } else { "" },
+        )
+    }
+
+    pub(crate) fn clear_login_cookie(&self, secure: bool) -> String {
+        format!(
+            "{}=; Path={LOGIN_PATH}; Max-Age=0; HttpOnly; SameSite=Lax{}",
+            oidc::LOGIN_COOKIE,
+            if secure { "; Secure" } else { "" },
+        )
+    }
+
+    /// The sign-in in progress the login cookie holds, when it is ours and
+    /// current.
+    pub(crate) fn pending(&self, headers: &HeaderMap) -> Option<Pending> {
+        let key = self.oidc_key();
+        let now = now();
+        cookies(headers, oidc::LOGIN_COOKIE).find_map(|value| {
+            let mut parts = value.split('.');
+            let (expiry, payload, tag) = (parts.next()?, parts.next()?, parts.next()?);
+            let expiry = digits(expiry)?;
+            if parts.next().is_some()
+                || expiry <= now
+                || expiry > now + oidc::LOGIN_TTL.as_secs()
+                || !tag_valid(
+                    &key,
+                    b"samplez-oidc-login:",
+                    &[&expiry.to_string(), payload],
+                    tag,
+                )
+            {
+                return None;
+            }
+            oidc::decode_pending(payload)
+        })
+    }
+
+    /// The session cookie of an `oidc` mode sign-in, valid until `expiry`.
+    pub(crate) fn oidc_session_cookie(
+        &self,
+        identity: &Identity,
+        expiry: u64,
+        now: u64,
+        secure: bool,
+    ) -> String {
+        session_cookie(
+            &oidc_session_value(&self.oidc_key(), expiry, identity),
+            expiry.saturating_sub(now),
+            secure,
+        )
     }
 
     /// Re-reads every token file, each on its own: a failed read keeps that
@@ -232,25 +387,66 @@ impl Auth {
         self.mode
     }
 
-    /// `Ok(None)` lets the request through without an identity: the login
-    /// route, which checks the token itself.
-    fn check(&self, listener: Listener, req: &Request) -> Result<Option<Identity>, Refused> {
-        let headers = req.headers();
-        let bearer_secret = match (listener, self.mode) {
-            (Listener::Machine, _) => self.machine_token.as_ref(),
-            (Listener::Api, AuthMode::Token) => self.token.as_ref(),
-            (Listener::Api, _) => None,
+    /// Authenticates `Authorization`: the machine token on the machine
+    /// listener, the API token in `token` mode, and in `oidc` mode the API
+    /// token when one is configured or else an access token of the
+    /// provider.
+    async fn bearer(&self, listener: Listener, headers: &HeaderMap) -> Result<Bearer, Refused> {
+        let reads = match listener {
+            Listener::Machine => true,
+            Listener::Api => matches!(self.mode, AuthMode::Token | AuthMode::Oidc),
         };
-        let bearer = match bearer_secret {
-            Some(secret) => match single(headers, header::AUTHORIZATION.as_str())? {
-                Some(value) => match bearer_token(value) {
-                    Some(t) if secret.matches(t) => true,
-                    _ => return Err(Refused::UNAUTHORIZED),
-                },
-                None if listener == Listener::Machine => return Err(Refused::UNAUTHORIZED),
-                None => false,
-            },
-            None => false,
+        if !reads {
+            return Ok(Bearer::Absent);
+        }
+        let Some(value) = single(headers, header::AUTHORIZATION.as_str())? else {
+            return match listener {
+                Listener::Machine => Err(Refused::UNAUTHORIZED),
+                Listener::Api => Ok(Bearer::Absent),
+            };
+        };
+        let token = bearer_token(value).ok_or(Refused::UNAUTHORIZED)?;
+        let operator = Identity {
+            user: None,
+            role: Role::Operator,
+        };
+        let secret = match listener {
+            Listener::Machine => self.machine_token.as_ref(),
+            Listener::Api => self.token.as_ref(),
+        };
+        if secret.is_some_and(|s| s.matches(token)) {
+            return Ok(Bearer::Valid(operator));
+        }
+        let oidc = match (listener, &self.oidc) {
+            (Listener::Api, Some(o)) => o,
+            _ => return Err(Refused::UNAUTHORIZED),
+        };
+        let token = std::str::from_utf8(token).map_err(|_| Refused::UNAUTHORIZED)?;
+        match oidc.bearer(token).await {
+            Ok(identity) => Ok(Bearer::Valid(identity)),
+            Err(Failure::NoRole) => Err(Refused(StatusCode::FORBIDDEN, "no role")),
+            Err(Failure::Token(why)) => {
+                tracing::debug!(?why, "bearer token refused");
+                Err(Refused::UNAUTHORIZED)
+            }
+            Err(Failure::Provider(e)) => {
+                tracing::warn!(error = %e, "bearer token not checked");
+                Err(Refused(
+                    StatusCode::UNAUTHORIZED,
+                    "the identity provider cannot be reached",
+                ))
+            }
+        }
+    }
+
+    /// `Ok(None)` lets the request through without an identity: the login
+    /// and logout routes, and the session route of a client that is not
+    /// signed in.
+    fn check(&self, req: &Request, bearer: Bearer) -> Result<Option<Identity>, Refused> {
+        let headers = req.headers();
+        let (bearer, bearer_identity) = match bearer {
+            Bearer::Valid(identity) => (true, Some(identity)),
+            Bearer::Absent => (false, None),
         };
 
         if !bearer && !self.host_allowed(req) {
@@ -279,23 +475,39 @@ impl Auth {
             user: None,
             role: Role::Operator,
         };
-        let identity = if bearer {
-            operator
-        } else {
-            match self.mode {
-                AuthMode::None => operator,
-                AuthMode::Token if req.uri().path() == LOGIN_PATH => return Ok(None),
+        let path = req.uri().path();
+        let open = match self.mode {
+            AuthMode::Token => [LOGIN_PATH, LOGOUT_PATH].contains(&path),
+            AuthMode::Oidc => [LOGIN_PATH, oidc::CALLBACK_PATH, LOGOUT_PATH].contains(&path),
+            AuthMode::None | AuthMode::Proxy => false,
+        };
+        let identity = match bearer_identity {
+            Some(identity) => Ok(identity),
+            None if open => return Ok(None),
+            None => match self.mode {
+                AuthMode::None => Ok(operator),
                 AuthMode::Token => {
                     let token = self.token.as_ref().expect("token mode has a token");
                     let key = token.get();
-                    if session_cookies(headers).any(|c| session_valid(&key, c, now())) {
-                        operator
+                    if cookies(headers, SESSION_COOKIE).any(|c| session_valid(&key, c, now())) {
+                        Ok(operator)
                     } else {
-                        return Err(Refused::UNAUTHORIZED);
+                        Err(Refused::UNAUTHORIZED)
                     }
                 }
-                AuthMode::Proxy => self.proxy_identity(headers)?,
-            }
+                AuthMode::Oidc => {
+                    let key = self.oidc_key();
+                    cookies(headers, SESSION_COOKIE)
+                        .find_map(|c| oidc_session(&key, c, now()))
+                        .ok_or(Refused::UNAUTHORIZED)
+                }
+                AuthMode::Proxy => self.proxy_identity(headers),
+            },
+        };
+        let identity = match identity {
+            Ok(identity) => identity,
+            Err(_) if path == SESSION_PATH => return Ok(None),
+            Err(refused) => return Err(refused),
         };
         if writes && identity.role == Role::Viewer {
             return Err(Refused(StatusCode::FORBIDDEN, "viewers may not write"));
@@ -392,15 +604,15 @@ fn csrf_ok(headers: &HeaderMap) -> bool {
     marked && json
 }
 
-/// Every `samplez_session` value: a browser sends one per matching path
+/// Every value of the cookie `name`: a browser sends one per matching path
 /// and domain, and only one of them may be current.
-fn session_cookies(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+fn cookies<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Item = &'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .filter_map(|c| c.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='))
+        .filter_map(move |c| c.trim().strip_prefix(name)?.strip_prefix('='))
 }
 
 pub(crate) fn now() -> u64 {
@@ -428,20 +640,95 @@ fn session_valid(token: &[u8], value: &str, now: u64) -> bool {
     let Some((expiry, hex)) = value.split_once('.') else {
         return false;
     };
-    if expiry.is_empty() || !expiry.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    let Ok(expiry) = expiry.parse::<u64>() else {
+    let Some(expiry) = digits(expiry) else {
         return false;
     };
-    if expiry <= now || expiry > now + SESSION_TTL.as_secs() || hex.len() != 64 {
+    if expiry <= now || expiry > now + SESSION_TTL.as_secs() {
         return false;
     }
-    let tag: Option<Vec<u8>> = (0..64)
+    unhex(hex).is_some_and(|t| session_mac(token, expiry).verify_slice(&t).is_ok())
+}
+
+/// A decimal number of ASCII digits only, no sign.
+fn digits(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 64 hex digits, a SHA-256 HMAC tag.
+fn unhex(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() != 64 {
+        return None;
+    }
+    (0..64)
         .step_by(2)
         .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-        .collect();
-    tag.is_some_and(|t| session_mac(token, expiry).verify_slice(&t).is_ok())
+        .collect()
+}
+
+/// HMAC-SHA-256 under `key` of `domain` and `parts` joined by `.`.
+fn signer(key: &[u8], domain: &[u8], parts: &[&str]) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key length");
+    mac.update(domain);
+    mac.update(parts.join(".").as_bytes());
+    mac
+}
+
+fn signed(key: &[u8], domain: &[u8], parts: &[&str]) -> Vec<u8> {
+    signer(key, domain, parts).finalize().into_bytes().to_vec()
+}
+
+fn tag_valid(key: &[u8], domain: &[u8], parts: &[&str], tag: &str) -> bool {
+    unhex(tag).is_some_and(|t| signer(key, domain, parts).verify_slice(&t).is_ok())
+}
+
+const OIDC_SESSION: &[u8] = b"samplez-oidc-session:";
+
+/// `<expiry>.<role>.<user, base64url>.<tag>`.
+fn oidc_session_value(key: &[u8], expiry: u64, identity: &Identity) -> String {
+    let role = match identity.role {
+        Role::Operator => "operator",
+        Role::Viewer => "viewer",
+    };
+    let user = oidc::encode_user(identity.user.as_deref().unwrap_or_default());
+    let expiry = expiry.to_string();
+    let tag = hex(&signed(key, OIDC_SESSION, &[&expiry, role, &user]));
+    format!("{expiry}.{role}.{user}.{tag}")
+}
+
+fn oidc_session(key: &[u8], value: &str, now: u64) -> Option<Identity> {
+    let mut parts = value.split('.');
+    let (expiry, role, user, tag) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let at = digits(expiry)?;
+    if parts.next().is_some()
+        || at <= now
+        || at > now + SESSION_TTL.as_secs()
+        || !tag_valid(key, OIDC_SESSION, &[expiry, role, user], tag)
+    {
+        return None;
+    }
+    let role = match role {
+        "operator" => Role::Operator,
+        "viewer" => Role::Viewer,
+        _ => return None,
+    };
+    Some(Identity {
+        user: Some(oidc::decode_user(user)?),
+        role,
+    })
+}
+
+fn session_cookie(value: &str, max_age: u64, secure: bool) -> String {
+    format!(
+        "{SESSION_COOKIE}={value}; Path=/api/v1; Max-Age={max_age}; HttpOnly; SameSite=Strict{}",
+        if secure { "; Secure" } else { "" },
+    )
 }
 
 /// A refusal of [`Auth::check`]: the status and why.
@@ -461,7 +748,11 @@ pub(crate) async fn middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    match auth.check(listener, &req) {
+    let checked = match auth.bearer(listener, req.headers()).await {
+        Ok(bearer) => auth.check(&req, bearer),
+        Err(refused) => Err(refused),
+    };
+    match checked {
         Ok(identity) => {
             if let Some(identity) = identity {
                 req.extensions_mut().insert(identity);
@@ -516,21 +807,10 @@ pub(crate) async fn login(
         )
             .into_response();
     }
-    // A chain of proxies appends its schemes; the first is the client's.
-    let secure = auth.tls
-        || headers.get("x-forwarded-proto").is_some_and(|p| {
-            let first = p
-                .as_bytes()
-                .split(|&b| b == b',')
-                .next()
-                .unwrap_or_default();
-            first.trim_ascii().eq_ignore_ascii_case(b"https")
-        });
-    let cookie = format!(
-        "{SESSION_COOKIE}={}; Path=/api/v1; Max-Age={}; HttpOnly; SameSite=Strict{}",
-        session_value(&token.get(), now() + SESSION_TTL.as_secs()),
+    let cookie = session_cookie(
+        &session_value(&token.get(), now() + SESSION_TTL.as_secs()),
         SESSION_TTL.as_secs(),
-        if secure { "; Secure" } else { "" },
+        auth.secure(&headers),
     );
     (
         StatusCode::NO_CONTENT,
@@ -540,6 +820,78 @@ pub(crate) async fn login(
         ],
     )
         .into_response()
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Logout {
+    /// Where the browser goes next to end its session at the identity
+    /// provider too; `oidc` mode with a provider that has an end-session
+    /// endpoint only.
+    pub redirect: Option<String>,
+}
+
+/// Clears the session cookie; `token` and `oidc` mode.
+#[utoipa::path(
+    post,
+    path = "/logout",
+    tag = "auth",
+    security(()),
+    params(("X-Samplez-Request" = String, Header, description = "Must be 1")),
+    responses(
+        (status = 200, description = "Session cookie cleared", body = Logout),
+        (status = 403, description = "Host not allowed or request header missing"),
+    )
+)]
+pub(crate) async fn logout(State(auth): State<Arc<Auth>>, headers: HeaderMap) -> Response {
+    let redirect = match &auth.oidc {
+        Some(o) => o.end_session().await,
+        None => None,
+    };
+    (
+        [
+            (
+                header::SET_COOKIE,
+                session_cookie("", 0, auth.secure(&headers)),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        Json(Logout { redirect }),
+    )
+        .into_response()
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Session {
+    pub mode: AuthMode,
+    /// `None` when not signed in, in `none` mode and for a static token.
+    pub user: Option<String>,
+    /// `None` when not signed in.
+    pub role: Option<Role>,
+}
+
+/// Who the request is authenticated as. Answered without credentials as
+/// well, with no role, so a client learns how to sign in: in `oidc` mode
+/// at `GET /login`, in `token` mode with `POST /login`.
+#[utoipa::path(
+    get,
+    path = "/session",
+    tag = "auth",
+    security(()),
+    responses(
+        (status = 200, description = "The mode and the identity, if any", body = Session),
+        (status = 403, description = "Host not allowed"),
+    )
+)]
+pub(crate) async fn session(
+    State(auth): State<Arc<Auth>>,
+    identity: Option<axum::Extension<Identity>>,
+) -> Json<Session> {
+    let identity = identity.map(|axum::Extension(i)| i);
+    Json(Session {
+        mode: auth.mode,
+        role: identity.as_ref().map(|i| i.role),
+        user: identity.and_then(|i| i.user),
+    })
 }
 
 #[cfg(test)]
@@ -558,6 +910,29 @@ mod tests {
         assert!(!session_valid(b"secret", "", t));
         assert!(!session_valid(b"secret", &v.replace('.', "x"), t));
         assert!(!session_valid(b"secret", &format!("+{v}"), t), "sign");
+    }
+
+    #[test]
+    fn an_oidc_session_carries_user_and_role_and_follows_the_key() {
+        let t = 1_000_000;
+        let alice = Identity {
+            user: Some("alice.o'neil@example".into()),
+            role: Role::Viewer,
+        };
+        let v = oidc_session_value(b"key", t + 60, &alice);
+        assert_eq!(oidc_session(b"key", &v, t), Some(alice.clone()));
+        assert_eq!(oidc_session(b"key", &v, t + 60), None, "expired");
+        assert_eq!(oidc_session(b"other", &v, t), None, "another key");
+        let promoted = v.replacen(".viewer.", ".operator.", 1);
+        assert_eq!(
+            oidc_session(b"key", &promoted, t),
+            None,
+            "the role is signed"
+        );
+        let far = oidc_session_value(b"key", t + SESSION_TTL.as_secs() + 1, &alice);
+        assert_eq!(oidc_session(b"key", &far, t), None);
+        assert_eq!(oidc_session(b"key", &format!("{v}.x"), t), None);
+        assert_eq!(oidc_session(b"key", "", t), None);
     }
 
     #[test]

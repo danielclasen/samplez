@@ -1,6 +1,15 @@
 {
   "components": {
     "schemas": {
+      "AuthMode": {
+        "enum": [
+          "none",
+          "token",
+          "proxy",
+          "oidc"
+        ],
+        "type": "string"
+      },
       "Login": {
         "properties": {
           "token": {
@@ -9,6 +18,54 @@
         },
         "required": [
           "token"
+        ],
+        "type": "object"
+      },
+      "Logout": {
+        "properties": {
+          "redirect": {
+            "description": "Where the browser goes next to end its session at the identity\nprovider too; `oidc` mode with a provider that has an end-session\nendpoint only.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "Role": {
+        "enum": [
+          "viewer",
+          "operator"
+        ],
+        "type": "string"
+      },
+      "Session": {
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/AuthMode"
+          },
+          "role": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Role",
+                "description": "`None` when not signed in."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "user": {
+            "description": "`None` when not signed in, in `none` mode and for a static token.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mode"
         ],
         "type": "object"
       },
@@ -88,6 +145,71 @@
           {}
         ],
         "summary": "Exchanges the API token for a session cookie; `token` mode only.",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/logout": {
+      "post": {
+        "operationId": "logout",
+        "parameters": [
+          {
+            "description": "Must be 1",
+            "in": "header",
+            "name": "X-Samplez-Request",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Logout"
+                }
+              }
+            },
+            "description": "Session cookie cleared"
+          },
+          "403": {
+            "description": "Host not allowed or request header missing"
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Clears the session cookie; `token` and `oidc` mode.",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/session": {
+      "get": {
+        "operationId": "session",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "The mode and the identity, if any"
+          },
+          "403": {
+            "description": "Host not allowed"
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Who the request is authenticated as. Answered without credentials as\nwell, with no role, so a client learns how to sign in: in `oidc` mode\nat `GET /login`, in `token` mode with `POST /login`.",
         "tags": [
           "auth"
         ]

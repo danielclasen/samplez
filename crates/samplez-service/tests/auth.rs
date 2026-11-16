@@ -688,3 +688,49 @@ async fn an_api_listener_with_tls_sets_secure_cookies_and_allows_its_https_origi
         .header(auth, bearer(API_TOKEN));
     assert_eq!(status(&api, http).await, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn the_session_route_answers_every_mode_and_logout_ends_a_token_session() {
+    let session = |api: Router, req: axum::http::request::Builder| async move {
+        let (code, _, body) = send(&api, req).await;
+        assert_eq!(code, StatusCode::OK);
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()
+    };
+    let none = service("none", "session-none").routers().api;
+    assert_eq!(
+        session(none, get_req("/api/v1/session")).await,
+        json!({ "mode": "none", "user": null, "role": "operator" })
+    );
+    let proxy = service("proxy", "session-proxy").routers().api;
+    let alice = get_req("/api/v1/session")
+        .header("X-Forwarded-User", "alice")
+        .header("X-Forwarded-Groups", "watchers");
+    assert_eq!(
+        session(proxy.clone(), alice).await,
+        json!({ "mode": "proxy", "user": "alice", "role": "viewer" })
+    );
+    assert_eq!(
+        session(proxy, get_req("/api/v1/session")).await,
+        json!({ "mode": "proxy", "user": null, "role": null })
+    );
+
+    let api = service("token", "session-token").routers().api;
+    assert_eq!(
+        session(api.clone(), get_req("/api/v1/session")).await,
+        json!({ "mode": "token", "user": null, "role": null })
+    );
+    let (_, set_cookie) = login(&api, write_req("/api/v1/login"), API_TOKEN).await;
+    let cookie = cookie_pair(&set_cookie);
+    let signed_in = get_req("/api/v1/session").header(header::COOKIE, cookie.clone());
+    assert_eq!(
+        session(api.clone(), signed_in).await,
+        json!({ "mode": "token", "user": null, "role": "operator" })
+    );
+    let unmarked = get_req("/api/v1/logout").method("POST");
+    assert_eq!(status(&api, unmarked).await, StatusCode::FORBIDDEN);
+    let (code, headers, body) = send(&api, write_req("/api/v1/logout")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body, r#"{"redirect":null}"#);
+    let cleared = headers[header::SET_COOKIE].to_str().unwrap();
+    assert!(cleared.starts_with("samplez_session=;") && cleared.contains("Max-Age=0"));
+}

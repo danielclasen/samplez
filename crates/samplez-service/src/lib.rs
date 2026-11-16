@@ -1,5 +1,6 @@
 //! The non-RT service layer of samplez products: the API, machine, ops and
-//! NMOS listeners, the auth modes and browser protections on the API, the
+//! NMOS listeners, the auth modes, OpenID Connect sign-in among them, and
+//! the browser protections on the API, the
 //! health, readiness and metrics endpoints, the OpenAPI document and the
 //! WebSocket send queues, and TLS on each listener.
 //!
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 pub mod auth;
 pub mod config;
 pub mod metrics;
+pub mod oidc;
 pub mod openapi;
 pub mod ops;
 pub mod replica;

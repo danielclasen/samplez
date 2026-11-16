@@ -14,19 +14,35 @@ use crate::config::AuthMode;
 pub const UPDATE_ENV: &str = "SAMPLEZ_UPDATE_COMMITTED";
 
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(crate::auth::login))]
-struct LoginApi;
+#[openapi(paths(crate::auth::session))]
+struct SessionApi;
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(crate::auth::session, crate::auth::login, crate::auth::logout))]
+struct TokenApi;
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    crate::auth::session,
+    crate::oidc::login,
+    crate::oidc::callback,
+    crate::auth::logout
+))]
+struct OidcApi;
 
 /// The product's document with its paths under `/api/v1` and what `mode`
-/// adds: in `token` mode the login route, the `bearer` and `session`
-/// security schemes and a top-level requirement of either; in `proxy` mode
-/// the `bearer` scheme of the machine listener, the API listener taking
-/// its identity from the proxy in front; in `none` mode no security.
+/// adds: the session route in every mode; in `token` mode the login and
+/// logout routes, the `bearer` and `session` security schemes and a
+/// top-level requirement of either; in `oidc` mode the same with the
+/// sign-in, callback and logout routes; in `proxy` mode the `bearer`
+/// scheme of the machine listener, the API listener taking its identity
+/// from the proxy in front; in `none` mode no security.
 pub fn document(product: OpenApi, mode: AuthMode) -> OpenApi {
     let info = product.info.clone();
     let mut api = match mode {
-        AuthMode::Token => LoginApi::openapi(),
-        AuthMode::None | AuthMode::Proxy => OpenApi::new(info.clone(), Paths::new()),
+        AuthMode::Token => TokenApi::openapi(),
+        AuthMode::Oidc => OidcApi::openapi(),
+        AuthMode::None | AuthMode::Proxy => SessionApi::openapi(),
     };
     api.merge(product);
     let mut doc = OpenApi::new(info, Paths::new()).nest("/api/v1", api);
@@ -35,7 +51,7 @@ pub fn document(product: OpenApi, mode: AuthMode) -> OpenApi {
     let mut schemes = Vec::new();
     match mode {
         AuthMode::None => {}
-        AuthMode::Token => {
+        AuthMode::Token | AuthMode::Oidc => {
             schemes.push(("bearer", bearer()));
             schemes.push((
                 "session",
