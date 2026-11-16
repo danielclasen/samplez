@@ -7,8 +7,11 @@
 //! applied again changes nothing. A change takes effect at the next
 //! sample processed and ramps over the strip's ramp length: gains
 //! linearly in the gain domain ([`crate::Ramp`]), a polarity inversion
-//! through zero, filters by their coefficients. The ranges are those the
-//! faderz model gives its strip controls.
+//! through zero, filters by their coefficients. Gate and compressor take
+//! a new curve or time constant at their next gain computation, at most
+//! [`GAIN_INTERVAL`] samples and one on, and ramp only their switch and
+//! makeup.
+//! The ranges are those the faderz model gives its strip controls.
 //!
 //! The strip holds no heap memory, so a clone allocates nothing. It runs
 //! one leg after the other with scalar code, the same operations in the
@@ -18,7 +21,7 @@ use core::ops::RangeInclusive;
 
 use crate::Ramp;
 use crate::dynamics::{Comp, Gate};
-pub use crate::dynamics::{CompParams, GATE_HOLD, GateParams};
+pub use crate::dynamics::{CompParams, GAIN_INTERVAL, GATE_HOLD, GateParams};
 use crate::svf::{Shape, Svf};
 
 /// Most legs a strip carries: 7.1.
@@ -423,10 +426,14 @@ impl Strip {
     /// on the other order's signal, a full-scale burst behind a closed
     /// gate or a compressor deep in reduction. The new order starts with
     /// the equaliser state at zero and the dynamics as they are. Flipping
-    /// back during the crossfade fades back.
+    /// back during the crossfade fades back. With gate and compressor
+    /// passing their input unchanged both orders feed the equaliser the
+    /// same signal, so the order flips at once and the equaliser keeps
+    /// its state.
     fn set_order(&mut self, before: bool) {
         let other = before != self.dynamics_before_eq;
-        if self.ramp == 0 {
+        let unity = self.gate.is_identity() && self.comp.is_identity();
+        if self.ramp == 0 || (unity && !self.is_fading()) {
             self.dynamics_before_eq = before;
             self.fade = Ramp::new(0.0);
             return;
@@ -533,6 +540,17 @@ impl Strip {
             self.fade.advance(frames);
             self.end_fade();
         }
+    }
+
+    /// Takes the next sample processed to be sample index `index`: gate
+    /// and compressor compute their gains at the multiples of
+    /// [`GAIN_INTERVAL`] samples of the index. A strip starts at index 0
+    /// and counts the samples it processes and advances over.
+    pub fn align(&mut self, index: u64) {
+        self.gate.align(index);
+        self.comp.align(index);
+        self.alt_gate.align(index);
+        self.alt_comp.align(index);
     }
 }
 
@@ -653,6 +671,65 @@ mod tests {
                     "{unit:?} before eq {before} -> {}: {peak} through the flip, {louder} settled ({over:+.1} dB)",
                     !before
                 );
+            }
+        }
+    }
+
+    /// With gate and compressor off or at unity the order flips at once
+    /// and the equaliser keeps its state: the output is the bits of the
+    /// strip that did not flip, where a crossfade to the other order
+    /// played its equaliser from a state of zero.
+    #[test]
+    fn a_flip_at_unity_dynamics_changes_no_bit() {
+        let unity = [
+            StripParam::Gate(GateParams {
+                range_db: 0.0,
+                ..GATE
+            }),
+            StripParam::Comp(CompParams {
+                ratio: 1.0,
+                makeup_db: 0.0,
+                ..COMP
+            }),
+        ];
+        let off = [
+            StripParam::Gate(GateParams {
+                enabled: false,
+                ..GATE
+            }),
+            StripParam::Comp(CompParams {
+                enabled: false,
+                ..COMP
+            }),
+        ];
+        for units in [unity, off] {
+            for before in [false, true] {
+                let mut kept = strip_with(
+                    1,
+                    &[
+                        StripParam::Eq { enabled: true },
+                        StripParam::EqBand {
+                            band: 1,
+                            value: band(BandType::Peak, 100.0, 12.0, 8.0),
+                        },
+                        units[0],
+                        units[1],
+                        StripParam::DynamicsBeforeEq { enabled: before },
+                    ],
+                );
+                sine_peak(&mut kept, 0.5, 0, 4800);
+                let mut flipped = kept.clone();
+                assert!(flipped.set(StripParam::DynamicsBeforeEq { enabled: !before }));
+                for start in (4800..4800 + 4 * RAMP as usize).step_by(48) {
+                    let x: Vec<f32> = (start..start + 48)
+                        .map(|n| 0.5 * (n as f32 * 0.013).sin())
+                        .collect();
+                    let (mut a, mut b) = (x.clone(), x);
+                    kept.process(&mut a, 48);
+                    flipped.process(&mut b, 48);
+                    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&a), bits(&b), "{units:?} at {start}");
+                }
             }
         }
     }
@@ -1266,8 +1343,9 @@ mod tests {
     }
 
     /// Ramps advanced over samples not processed land where processing
-    /// them would have: silence leaves the filter states at zero, so the
-    /// two strips are equal.
+    /// them would have, the crossfade between the dynamics orders and
+    /// the units it runs included: silence leaves the filter states at
+    /// zero and the compressor at 0 dB, so the two strips are equal.
     #[test]
     fn advance_moves_every_ramp() {
         let params = [
@@ -1281,13 +1359,12 @@ mod tests {
                 band: 3,
                 value: band(BandType::HighShelf, 6000.0, 6.0, 0.7),
             },
-            // Switched off, with a makeup ramp running.
+            // Switched on, with a makeup ramp running.
             StripParam::Comp(CompParams {
-                enabled: false,
                 makeup_db: 12.0,
                 ..COMP
             }),
-            // Flipped by a crossfade that ends within the samples.
+            // Crossfading, the compressor being on.
             StripParam::DynamicsBeforeEq { enabled: true },
         ];
         let mut a = Strip::new(1, RAMP);
@@ -1295,6 +1372,7 @@ mod tests {
         for p in params {
             assert!(a.set(p) && b.set(p));
         }
+        assert!(a.fade.is_active());
         a.advance(300);
         let mut skipped = vec![0.0f32; 300];
         b.process(&mut skipped, 300);

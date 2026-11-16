@@ -4,9 +4,10 @@
 //! = 20 blocks, with a sink that writes nothing, so the counts are the
 //! ring's and the hashes' own; and on the strip calls the RT loop makes
 //! for 64 stereo input slots: a block through strips at rest, as every
-//! slot runs one, and through strips with every unit on and ramping, the
-//! dynamics order crossfading, the most strip entries one wake applies,
-//! and a skip.
+//! slot runs one, through strips with every unit on and ramping, the
+//! dynamics order crossfading, and through the same strips without gate
+//! and compressor, the order flipped at once; the most strip entries one
+//! wake applies, and a skip.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -285,10 +286,11 @@ const SLOTS: usize = 64;
 /// Entries one wake takes off the entry ring at most: `PENDING_CHANGES`.
 const ENTRIES: usize = 64;
 
-/// The strips of 64 stereo slots, at rest or with every unit on and
-/// ramping and the dynamics order crossfading, and one block of each
-/// slot's samples, above both dynamics thresholds.
-fn slot_strips(on: bool) -> (Vec<Strip>, Vec<f32>) {
+/// The strips of 64 stereo slots, at rest, or with trim, high-pass and
+/// every band on and ramping and the dynamics order flipped, with gate
+/// and compressor on (`dynamics`) or off; and one block of each slot's
+/// samples, above both dynamics thresholds.
+fn slot_strips(on: bool, dynamics: bool) -> (Vec<Strip>, Vec<f32>) {
     let mut strips = vec![Strip::new(2, 480); SLOTS];
     if on {
         for s in &mut strips {
@@ -299,14 +301,16 @@ fn slot_strips(on: bool) -> (Vec<Strip>, Vec<f32>) {
                     freq: 80.0,
                 },
                 StripParam::Eq { enabled: true },
-                StripParam::Gate(GateParams {
+            ];
+            if dynamics {
+                params.push(StripParam::Gate(GateParams {
                     enabled: true,
                     threshold_db: -60.0,
                     range_db: 40.0,
                     attack_ms: 1.0,
                     release_ms: 50.0,
-                }),
-                StripParam::Comp(CompParams {
+                }));
+                params.push(StripParam::Comp(CompParams {
                     enabled: true,
                     threshold_db: -20.0,
                     ratio: 4.0,
@@ -314,9 +318,9 @@ fn slot_strips(on: bool) -> (Vec<Strip>, Vec<f32>) {
                     release_ms: 50.0,
                     knee_db: 6.0,
                     makeup_db: 3.0,
-                }),
-                StripParam::DynamicsBeforeEq { enabled: true },
-            ];
+                }));
+            }
+            params.push(StripParam::DynamicsBeforeEq { enabled: true });
             for (band, b) in DEFAULT_BANDS.iter().enumerate() {
                 let value = EqBand { gain_db: 6.0, ..*b };
                 params.push(StripParam::EqBand { band, value });
@@ -333,19 +337,25 @@ fn slot_strips(on: bool) -> (Vec<Strip>, Vec<f32>) {
 }
 
 fn strips_at_rest() -> (Vec<Strip>, Vec<f32>) {
-    slot_strips(false)
+    slot_strips(false, false)
 }
 
 fn strips_on() -> (Vec<Strip>, Vec<f32>) {
-    slot_strips(true)
+    slot_strips(true, true)
+}
+
+fn strips_without_dynamics() -> (Vec<Strip>, Vec<f32>) {
+    slot_strips(true, false)
 }
 
 // One block through the strips of 64 slots, each copied into the slot's
-// buffer as the loop does: at rest, passed through, and with every unit
-// on and ramping, the costliest block.
+// buffer as the loop does: at rest, passed through; with every unit on
+// and ramping, the costliest block; and with gate and compressor off,
+// whose order flips without a crossfade.
 #[library_benchmark]
 #[bench::at_rest(setup = strips_at_rest, config = limit(STRIPS_AT_REST))]
 #[bench::ramping(setup = strips_on, config = limit(STRIPS_RAMPING))]
+#[bench::no_dynamics(setup = strips_without_dynamics, config = limit(STRIPS_NO_DYNAMICS))]
 fn strip_block((mut strips, x): (Vec<Strip>, Vec<f32>)) -> Vec<Strip> {
     let mut buf = [0.0f32; 2 * B as usize];
     for s in &mut strips {
@@ -382,10 +392,11 @@ fn strip_skip((mut strips, _): (Vec<Strip>, Vec<f32>)) -> Vec<Strip> {
     strips
 }
 
-const STRIPS_AT_REST: u64 = 49_602;
-const STRIPS_RAMPING: u64 = 5_447_170;
+const STRIPS_AT_REST: u64 = 51_995;
+const STRIPS_RAMPING: u64 = 4_907_976;
+const STRIPS_NO_DYNAMICS: u64 = 1_986_024;
 const STRIP_ENTRIES: u64 = 48_961;
-const STRIP_SKIP: u64 = 9_696;
+const STRIP_SKIP: u64 = 13_005;
 
 library_benchmark_group!(
     name = strips,
