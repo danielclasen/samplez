@@ -1343,8 +1343,15 @@ impl Engine {
     /// gain change and past the engine's last `InputUp` or `Route`, so one
     /// generation is built at a time and each before its index. A flow
     /// that cannot be read is silent and reported as pruned. Refused as
-    /// invalid on an engine that follows a replicated log.
+    /// invalid on an engine that follows a replicated log, and for an
+    /// `at_index` that is not a multiple of the block size.
     pub fn route(&self, slot: usize, flow_id: &str, at_index: u64) -> Result<u64, EntryError> {
+        if !at_index.is_multiple_of(self.block) {
+            return Err(EntryError::Invalid(format!(
+                "at_index {at_index} is not a multiple of the block size {}",
+                self.block
+            )));
+        }
         self.config
             .check_input_flow(slot, flow_id)
             .map_err(|e| EntryError::Invalid(e.0))?;

@@ -563,6 +563,37 @@ fn a_down_input_re_routed_to_a_live_flow_comes_up() {
     common::stop(e);
 }
 
+/// A re-route at an index inside a block is refused, as a gain or strip
+/// change there is: taken at the next block start it would be late, its
+/// generation dropped although the call succeeded.
+#[test]
+fn a_re_route_inside_a_block_is_refused() {
+    let domain = Domain::new();
+    let (src, next, out) = (new_id(), new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let _next = Pilot::start(&domain.0, &next, 1, B, 0);
+    let (e, _rx) = common::start(config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    ));
+    running(&e);
+    // Past the earliest index a re-route is stamped at, so the index the
+    // caller gave stands.
+    let ahead = (common::processed(&e) + 2000) * B + 8;
+    for at in [1000, ahead] {
+        assert_ne!(at % B, 0);
+        assert!(
+            matches!(e.route(0, &next, at), Err(samplez::EntryError::Invalid(_))),
+            "a re-route at {at} taken"
+        );
+    }
+    assert_eq!(e.status().generation.pending, None);
+    common::stop(e);
+}
+
 /// A report the log's channel had no room for is sent again: an input
 /// pruned while the channel was full is reported pruned once there is
 /// room, and so is one that became readable while it was full.
