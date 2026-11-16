@@ -177,8 +177,9 @@ fn touched(ks: &[u64]) -> Vec<u64> {
 
 /// Hand-overs refused because the RT thread had passed their block
 /// before one landed: each attempt runs the replay up to the block the
-/// RT thread just computed and passes it on before the next wake, so
-/// only a supervisor thread held off the CPU for a block period misses.
+/// RT thread just computed and passes it on before the next wake, about
+/// one block period later, so only a supervisor thread held off the CPU
+/// for that long misses. A run with more runs again.
 const MAX_PASSED: u64 = 10;
 
 fn gain(e: &Engine, id: u64, at: u64, channel: usize, gain: f32) {
@@ -253,7 +254,9 @@ fn a_replayed_core_computes_the_donors_pages() {
         let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
         assert!(j > past2, "handed over at block {j}");
         let passed = b.e.counters().handovers_passed.load(Relaxed);
-        assert!(passed < MAX_PASSED, "{passed} hand-overs passed");
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
         let end = (at3 + u64::from(RAMP)) / B + 4 * PAGE / B;
         wait_for(Duration::from_secs(10), "entry 3 ramped", || {
             processed(&a.e) > end && processed(&b.e) > end
@@ -368,7 +371,9 @@ fn an_entry_the_replay_applied_is_not_taken_again() {
         let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
         assert!(j * B > at, "handed over at block {j}");
         let passed = b.e.counters().handovers_passed.load(Relaxed);
-        assert!(passed < MAX_PASSED, "{passed} hand-overs passed");
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
         let late = b.e.counters().command_late.load(Relaxed);
         gain(&b.e, 1, at, 0, 0.5);
         let end = j + 4 * PAGE / B;

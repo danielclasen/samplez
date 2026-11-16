@@ -142,7 +142,8 @@ generation or a crossfade) is not replayed. `Replay::run_to` stops at the
 newest block due, and `Replay::silenced` names the blocks computed with
 an input silenced. `Engine::hand_over` waits for the RT thread to
 compute a block, runs the clone up to it and passes its state to the RT
-thread by owned pointer before the next wake; the RT thread installs it
+thread by owned pointer before the next wake, about one block period
+later; the RT thread installs it
 before the next block if it has not started that block, still holds the
 generation the core names and took no entry off its pending list that
 the core does not know, keeping pending entries the core did not know,

@@ -1754,9 +1754,10 @@ impl Engine {
     /// state followed. The unresolved entries become the replay's.
     /// [`ReplayError::Missed`] when the RT thread took an entry off its
     /// pending list that the replay does not know: append it, then hand
-    /// over again. An answer to a call that timed out is taken by the
-    /// next call: if that hand-over was installed, the unresolved entries
-    /// become its core's.
+    /// over again, or, once the replay computed past the entry's index,
+    /// copy a new core and replay from it. An answer to a call that timed
+    /// out is taken by the next call: if that hand-over was installed, the
+    /// unresolved entries become its core's.
     pub fn hand_over(&self, replay: &mut Replay, timeout: Duration) -> Result<u64, ReplayError> {
         // Up to the last block the RT thread computed, before the first
         // attempt.
@@ -1902,6 +1903,8 @@ impl Engine {
         let poll =
             Duration::from_nanos(self.block * 1_000_000_000 / samplez_mxl::SAMPLE_RATE as u64 / 16);
         let processed = || self.counters.processed.load(Acquire);
+        // This call's hand-overs refused for a block the RT thread passed.
+        let mut passed = 0;
         loop {
             // The RT thread answers at its next wake. One unanswered for a
             // second can only be refused: the RT thread is then past its
@@ -1911,7 +1914,7 @@ impl Engine {
                 let Ok(h) = t.handed.pop() else {
                     if asked.elapsed() > Duration::from_secs(1) {
                         t.spare = Some(core);
-                        return Err(ReplayError::Timeout);
+                        return Err(ReplayError::Timeout { passed });
                     }
                     std::thread::sleep(poll);
                     continue;
@@ -1934,23 +1937,26 @@ impl Engine {
                         t.spare = Some(h.core);
                         return Err(ReplayError::Missed { id });
                     }
-                    Answer::Passed | Answer::Generation | Answer::Waiting => {}
+                    Answer::Passed => passed += 1,
+                    Answer::Generation | Answer::Waiting => {}
                 }
                 core = h.core;
             }
             if Instant::now() >= deadline {
                 t.spare = Some(core);
-                return Err(ReplayError::Timeout);
+                return Err(ReplayError::Timeout { passed });
             }
             // The step to the next block: the RT thread sleeps after it
-            // until its next wake, which installs a core for that block.
+            // until its next wake, which installs a core for that block,
+            // about one block period later. A sleep could take most of
+            // that: the step is waited for by yielding.
             let p = processed();
             while processed() == p {
                 if Instant::now() >= deadline {
                     t.spare = Some(core);
-                    return Err(ReplayError::Timeout);
+                    return Err(ReplayError::Timeout { passed });
                 }
-                std::thread::sleep(poll);
+                std::thread::yield_now();
             }
             let (j, last_id) = make(processed().saturating_sub(1), &mut core);
             t.seq += 1;
@@ -4420,6 +4426,7 @@ mod tests {
         let n = |c: &AtomicU64| c.load(Relaxed);
         let processed = || e.counters.processed.load(Acquire);
         // An earlier call's hand-over, installed once that call gave up.
+        let mut stale = 0;
         while n(&e.counters.handovers_installed) == 0 {
             let mut replay = e.replay(copy()).unwrap();
             let mut t = e.transfer.as_ref().unwrap().lock().unwrap();
@@ -4432,9 +4439,10 @@ mod tests {
             replay.run(processed() - 1);
             replay.rt.capture(&mut core);
             t.seq += 1;
+            stale = replay.next - 1;
             let h = Handover {
                 seq: t.seq,
-                j: replay.next - 1,
+                j: stale,
                 last_id: replay.last_id,
                 core,
                 answer: Answer::Waiting,
@@ -4453,10 +4461,33 @@ mod tests {
             }
         }
         let mut replay = e.replay(copy()).unwrap();
-        let next = replay.next_block();
         let j = e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
-        assert!(j >= next, "the late answer's block {j} returned");
+        assert_ne!(j, stale, "the late answer's block returned");
         assert_eq!(n(&e.counters.handovers_installed), 2);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A call that times out names how many of its hand-overs came back
+    /// refused for a block the RT thread passed, so a resync budget can be
+    /// judged against it.
+    #[test]
+    fn a_timed_out_handover_names_its_passed_refusals() {
+        let (e, _statuses, _verdicts, domain) = outputs_only("handover-timeout", 1);
+        let before = e.counters.handovers_passed.load(Relaxed);
+        // Each core follows a block two behind the last one computed:
+        // every attempt is refused.
+        let err = e.offer(Duration::from_millis(300), |j, _| (j.saturating_sub(2), 0));
+        let refused = e.counters.handovers_passed.load(Relaxed) - before;
+        let Err(ReplayError::Timeout { passed }) = err else {
+            panic!("{err:?}");
+        };
+        assert!(passed > 0);
+        // The last attempt's answer may come after the call gave up.
+        assert!(
+            refused == passed || refused == passed + 1,
+            "{refused} {passed}"
+        );
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

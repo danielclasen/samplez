@@ -283,8 +283,9 @@ pub enum ReplayError {
     Late { id: LogId, at_index: u64 },
     /// The pending list or the control ring is full.
     Full,
-    /// No hand-over was installed within the timeout.
-    Timeout,
+    /// No hand-over was installed within the timeout; `passed` of the
+    /// call's were refused for a block the RT thread had passed.
+    Timeout { passed: u64 },
     /// The RT thread had taken entry `id`, which the core did not know,
     /// off its pending list: the core must know it to be installed.
     Missed { id: LogId },
@@ -299,7 +300,10 @@ impl std::fmt::Display for ReplayError {
                 write!(f, "entry {id} at {at_index} is late for the replay")
             }
             ReplayError::Full => write!(f, "the replay's pending list or control ring is full"),
-            ReplayError::Timeout => write!(f, "no hand-over installed within the timeout"),
+            ReplayError::Timeout { passed } => write!(
+                f,
+                "no hand-over installed within the timeout, {passed} refused for a passed block"
+            ),
             ReplayError::Missed { id } => {
                 write!(
                     f,
