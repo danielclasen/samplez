@@ -4470,6 +4470,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(domain);
     }
 
+    /// A core is filled only for a block the RT thread has computed: the
+    /// clock runs on while the RT thread stalls, so a core for the newest
+    /// block due would follow a block the RT thread has not computed, and
+    /// install a state ahead of the one it computes from. `processed` is
+    /// read inside `make`, so the RT thread's steps after the stall can
+    /// only make it larger.
+    #[test]
+    fn a_core_is_filled_only_for_a_block_the_rt_thread_computed() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("handover-stall", 1);
+        let processed = || e.counters.processed.load(Acquire);
+        wait(&|| processed() > 10);
+        crate::rt_loop::STALL_MS.store(300, Relaxed);
+        // The RT thread is in the stall once it stops computing.
+        let still = |p: u64| {
+            std::thread::sleep(Duration::from_millis(20));
+            processed() == p
+        };
+        let t = Instant::now();
+        while !still(processed()) {
+            assert!(t.elapsed() < Duration::from_secs(5), "no stall");
+        }
+        let mut calls = Vec::new();
+        let _ = e.offer(Duration::from_secs(1), |j, _| {
+            calls.push((j, processed()));
+            (j, 0)
+        });
+        assert!(!calls.is_empty());
+        for &(j, p) in &calls {
+            assert!(j < p, "a core after block {j} with {p} computed");
+        }
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
     /// A call that times out names how many of its hand-overs came back
     /// refused for a block the RT thread passed, so a resync budget can be
     /// judged against it.
