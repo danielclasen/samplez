@@ -764,3 +764,39 @@ async fn a_partitioned_follower_whose_checks_all_run_late() {
         replica.status()
     );
 }
+
+/// A set of one voter started by `initialize` alone, with no marker
+/// bootstrap and so no counting watch, takes writes: its only voter leads
+/// it and is its own quorum, so no other leader has to count it.
+#[tokio::test(start_paused = true)]
+async fn a_set_of_one_voter_started_without_begin_takes_writes() {
+    let set_ = Set::start(Options {
+        voters: 1,
+        begin: false,
+        ..Options::default()
+    })
+    .await;
+    let replica = set_.replica(0);
+    assert!(replica.replica().commitable);
+    let first = set(&**replica, "s", "1", "gain=1@1").await;
+    assert_eq!(set(&**replica, "s", "2", "gain=2@2").await, first + 1);
+}
+
+/// A leader cut off from the others of a set of three is not commitable
+/// once no check found it counted for 3 s, though its metrics still name
+/// it leader: leading counts a replica only as the only voter.
+#[tokio::test(start_paused = true)]
+async fn a_leader_cut_off_from_a_set_of_three_is_not_commitable() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    set_.net.isolate(leader, set_.ids());
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let replica = set_.replica(leader);
+    assert_eq!(
+        replica.raft().metrics().borrow().state,
+        openraft::ServerState::Leader,
+        "still leader by its own metrics"
+    );
+    assert!(!replica.replica().commitable);
+    assert_eq!(refused(&**replica, "x").await.reason, Reason::NotCommitable);
+}

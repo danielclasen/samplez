@@ -870,9 +870,11 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     /// known here. `commitable` once ready on a voter other than the
     /// witness that a leader counts as a voter, now or within the last
     /// [`membership::UNCOUNTED`]: it forwards what it does not
-    /// order itself. A learner, the witness, which serves no clients, and
-    /// a replica no leader counts, such as one removed from the voters
-    /// while it was down, answer [`Reason::NotCommitable`].
+    /// order itself. The only voter of its membership counts itself while
+    /// it leads, as its own quorum, also without [`Replica::begin`]. A
+    /// learner, the witness, which serves no clients, and a replica no
+    /// leader counts, such as one removed from the voters while it was
+    /// down, answer [`Reason::NotCommitable`].
     fn replica(&self) -> ReplicaInfo {
         let metrics = self.shared.raft.metrics().borrow().clone();
         let applied = metrics.last_applied.map_or(0, |id| id.index);
@@ -880,11 +882,9 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             self.ready.store(true, Ordering::Relaxed);
         }
         let ready = self.ready.load(Ordering::Relaxed);
-        let voter = metrics
-            .membership_config
-            .membership()
-            .voter_ids()
-            .any(|id| id == self.id());
+        let voters: Vec<NodeId> = metrics.membership_config.membership().voter_ids().collect();
+        let voter = voters.contains(&self.id());
+        let alone = voters == [self.id()] && metrics.state == ServerState::Leader;
         ReplicaInfo {
             id: self.id().to_string(),
             role: format!("{:?}", metrics.state).to_lowercase(),
@@ -895,7 +895,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             commitable: ready
                 && voter
                 && slot_of(self.id()) != Slot::Witness
-                && self.shared.counted.load(Ordering::SeqCst),
+                && (alone || self.shared.counted.load(Ordering::SeqCst)),
         }
     }
 
