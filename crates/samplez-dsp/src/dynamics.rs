@@ -305,12 +305,24 @@ impl Interval {
         self.advance(frames);
     }
 
+    /// `frames` samples on without their keys: across the end of the
+    /// interval, the gain is held at the last one computed.
     fn advance(&mut self, frames: usize) {
-        self.phase = ((self.phase as usize + frames) % GAIN_INTERVAL as usize) as u32;
+        let phase = self.phase as usize + frames;
+        if phase >= GAIN_INTERVAL as usize {
+            self.wrap();
+        }
+        self.phase = (phase % GAIN_INTERVAL as usize) as u32;
     }
 
+    /// To the position of sample index `index`; a position other than
+    /// the current one holds the gain as [`advance`](Self::advance) does.
     fn align(&mut self, index: u64) {
-        self.phase = (index % u64::from(GAIN_INTERVAL)) as u32;
+        let phase = (index % u64::from(GAIN_INTERVAL)) as u32;
+        if phase != self.phase {
+            self.wrap();
+            self.phase = phase;
+        }
     }
 }
 
@@ -1032,6 +1044,33 @@ mod tests {
             outs.push(y);
         }
         assert_eq!(outs[0], outs[1]);
+    }
+
+    /// Samples advanced over or skipped by an alignment across the end
+    /// of an interval leave the gain held at the last one computed, and
+    /// the keys before them out of the next run.
+    #[test]
+    fn skipping_samples_holds_the_last_gain() {
+        let p = CompParams {
+            attack_ms: 10.0,
+            ..comp(-40.0, 20.0, 0.0, 0.0)
+        };
+        let (loud, quiet) = (db_to_gain(-10.0), db_to_gain(-60.0));
+        let skips: [fn(&mut Comp); 2] = [|c| c.advance(13), |c| c.align(13)];
+        for skip in skips {
+            let mut c = Comp::new();
+            c.set(&p, 0);
+            // Mid-attack, the gain moving within the interval.
+            let mut x = [loud; 48 * 4 + 3];
+            c.process(&mut x, 1, 48 * 4 + 3);
+            assert!(c.interval.step != 0.0);
+            let held = c.interval.to;
+            skip(&mut c);
+            let mut y = [quiet];
+            c.process(&mut y, 1, 1);
+            assert_eq!(y[0], applied(quiet, held));
+            assert_eq!(c.interval.peak, quiet);
+        }
     }
 
     /// Below the threshold the gate settles at its range, above it the
