@@ -151,7 +151,7 @@ fn withdraw(mut o: Out) -> Out {
         dropped: &o.dropped,
         output: 0,
     };
-    o.hold.withdraw(black_box(&o.statuses), &mut changes);
+    o.hold.withdraw(black_box(&o.statuses), &mut changes, true);
     o
 }
 

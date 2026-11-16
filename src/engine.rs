@@ -1547,19 +1547,41 @@ impl Engine {
     /// start, the first page boundary P in a block at or after `min_k`
     /// it computes (with one voter, from that block's start). The block
     /// holding P reports `committed from P`, and `[kB, P)` withheld
-    /// without a cause.
+    /// without a cause. Ignored while the output commits. The latest
+    /// request or cancel ([`Engine::cancel_commit_start`]) wins.
     pub fn commit_from(&self, output: usize, min_k: u64) -> Result<(), ControlError> {
+        self.commit_from_seen(output, min_k, u64::MAX)
+    }
+
+    /// Replicated mode: [`Engine::commit_from`], for a commit start
+    /// decided on this replica's block statuses up to block `seen`. The
+    /// output ignores it when the replica was withdrawn for a cause while
+    /// a block after `seen` was decided, and a withdrawal for a cause
+    /// drops one not yet taken.
+    pub fn commit_from_seen(
+        &self,
+        output: usize,
+        min_k: u64,
+        seen: u64,
+    ) -> Result<(), ControlError> {
         self.output_index(output)?;
-        self.control(Control::CommitFrom { output, min_k })
+        let (shared, control) = self.replica()?;
+        // One request at a time.
+        let _one = control.lock().expect("control lock");
+        shared.statuses[output].request_start(min_k, seen);
+        Ok(())
     }
 
     /// Replicated mode: drops output `output`'s requested commit start
     /// ([`Engine::commit_from`]) unless the output took it already: a
-    /// commit start named on a decision taken back. Controls apply in
-    /// the order sent, so a commit start sent after it stands.
+    /// commit start named on a decision taken back. The latest request
+    /// or cancel wins.
     pub fn cancel_commit_start(&self, output: usize) -> Result<(), ControlError> {
         self.output_index(output)?;
-        self.control(Control::CancelCommitStart { output })
+        let (shared, control) = self.replica()?;
+        let _one = control.lock().expect("control lock");
+        shared.statuses[output].request_cancel();
+        Ok(())
     }
 
     /// Replicated mode: output `output` stops committing at sample index

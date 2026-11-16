@@ -327,7 +327,13 @@ impl Fake {
         }
     }
 
+    /// Withdrawn for a cause.
     pub fn withdraw_all(&mut self) {
+        self.withdraw(true);
+    }
+
+    /// Withdrawn on every output, `cause` as the engine's hold takes it.
+    fn withdraw(&mut self, cause: bool) {
         self.withdrawals += 1;
         for out in &mut self.outputs {
             let mut changes = Changes {
@@ -335,7 +341,7 @@ impl Fake {
                 dropped: &out.dropped,
                 output: 0,
             };
-            out.hold.withdraw(&out.statuses, &mut changes);
+            out.hold.withdraw(&out.statuses, &mut changes, cause);
         }
     }
 }
@@ -528,20 +534,17 @@ impl FakeAudio {
                     dropped: &out.dropped,
                     output: o as u32,
                 };
-                let withdraw = out
-                    .hold
-                    .compute(
-                        k,
-                        &data,
-                        Some(digest),
-                        ctx,
-                        &out.statuses,
-                        &mut changes,
-                        &mut out.sink,
-                    )
-                    .withdraw;
-                if withdraw {
-                    st.withdraw_all();
+                let decided = out.hold.compute(
+                    k,
+                    &data,
+                    Some(digest),
+                    ctx,
+                    &out.statuses,
+                    &mut changes,
+                    &mut out.sink,
+                );
+                if decided.withdraw {
+                    st.withdraw(decided.cause);
                 }
             }
             st.computed = Some(k);
@@ -554,10 +557,9 @@ impl FakeAudio {
                 dropped: &out.dropped,
                 output: o as u32,
             };
-            let withdraw = out
+            let moved = out
                 .hold
-                .advance(ctx, &out.statuses, &mut changes, &mut out.sink)
-                .withdraw;
+                .advance(ctx, &out.statuses, &mut changes, &mut out.sink);
             while out.rx.pop().is_ok() {}
             out.pages
                 .settle(&out.statuses, &mut out.page_tx, &out.dropped);
@@ -569,8 +571,8 @@ impl FakeAudio {
                 out.kept.push_back(page_of(&h, b, |k| statuses.get(k)));
             }
             // As the engine does: before the next output advances.
-            if withdraw {
-                st.withdraw_all();
+            if moved.withdraw {
+                st.withdraw(moved.cause);
             }
         }
     }

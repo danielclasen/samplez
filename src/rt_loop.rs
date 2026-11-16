@@ -321,11 +321,6 @@ pub(crate) enum Command {
 /// What the replicated state tells the RT thread about committing.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Control {
-    /// Commit `output` from the first page boundary in a block at or
-    /// after `min_k`.
-    CommitFrom { output: usize, min_k: u64 },
-    /// Drop `output`'s requested commit start, unless it took.
-    CancelCommitStart { output: usize },
     /// Stop committing `output` at sample index `at`.
     StopAt { output: usize, at: u64 },
     /// The replica is withdrawn: every output commits through only.
@@ -1185,8 +1180,9 @@ fn capture_core(
     c.late_lost_until = r.late_lost_until;
 }
 
-/// The replica is withdrawn on every output.
-fn withdraw_all(outs: &mut [Out], r: &mut Replica, counters: &Counters) {
+/// The replica is withdrawn on every output, `cause` as
+/// [`crate::blocks::Hold::withdraw`] takes it.
+fn withdraw_all(outs: &mut [Out], r: &mut Replica, counters: &Counters, cause: bool) {
     for (o, out) in outs.iter_mut().enumerate() {
         if out.writer.is_none() {
             continue;
@@ -1197,7 +1193,8 @@ fn withdraw_all(outs: &mut [Out], r: &mut Replica, counters: &Counters) {
             output: o as u32,
         };
         let w0 = out.hold.withheld;
-        out.hold.withdraw(&r.shared.statuses[o], &mut changes);
+        out.hold
+            .withdraw(&r.shared.statuses[o], &mut changes, cause);
         add(&counters.blocks_withheld, out.hold.withheld - w0);
     }
 }
@@ -1413,7 +1410,7 @@ impl Rt {
                 .withhold_open(&r.shared.statuses[o], &mut changes, &mut sink, Cause::Skip);
             add(&self.counters.blocks_withheld, out.hold.withheld - w0);
         }
-        withdraw_all(&mut self.outs, r, &self.counters);
+        withdraw_all(&mut self.outs, r, &self.counters, true);
     }
 
     /// Lifts the step fence once the replicated state cleared every step
@@ -1455,24 +1452,26 @@ impl Rt {
             };
             let ctx = ctx(&r.shared, self.step_at);
             let statuses = &r.shared.statuses[o];
-            let mut withdraw = out
-                .hold
-                .advance(ctx, statuses, &mut changes, &mut sink)
-                .withdraw;
+            let moved = out.hold.advance(ctx, statuses, &mut changes, &mut sink);
+            let (mut withdraw, mut cause) = (moved.withdraw, moved.cause);
             if let Some(p) = out.pages.as_mut() {
                 p.settle(statuses, &mut r.hashes, &self.counters.page_hashes_dropped);
             }
-            withdraw |= next.is_some_and(|k| {
-                out.hold.mode() != crate::blocks::Mode::Idle
-                    && statuses.get(k).is_some_and(|s| s.kind == Kind::Withheld)
-            });
+            if let Some(s) = next
+                .filter(|_| out.hold.mode() != crate::blocks::Mode::Idle)
+                .and_then(|k| statuses.get(k))
+                .filter(|s| s.kind == Kind::Withheld)
+            {
+                withdraw = true;
+                cause |= s.for_a_cause();
+            }
             if sink.wrote {
                 written |= 1 << o;
             }
             // On every output before the next one advances: none commits a
             // block after this one withheld one.
             if withdraw {
-                withdraw_all(&mut self.outs, r, &self.counters);
+                withdraw_all(&mut self.outs, r, &self.counters, cause);
             }
         }
         written
@@ -1611,12 +1610,8 @@ impl Rt {
         };
         while let Ok(c) = r.control.pop() {
             match c {
-                Control::CommitFrom { output, min_k } => self.outs[output].hold.commit_from(min_k),
-                Control::CancelCommitStart { output } => {
-                    self.outs[output].hold.cancel_commit_start()
-                }
                 Control::StopAt { output, at } => self.outs[output].hold.stop_at(at),
-                Control::Withdraw => withdraw_all(&mut self.outs, r, &self.counters),
+                Control::Withdraw => withdraw_all(&mut self.outs, r, &self.counters, true),
                 Control::Unresolved { id, at_index } => {
                     let u = &mut r.unresolved;
                     // The engine admits at most UNRESOLVED.
@@ -1629,9 +1624,14 @@ impl Rt {
                 Control::Resolved { id } => r.unresolved.retain(|e| e.0 != id),
                 Control::DropCore => {
                     self.core = false;
-                    withdraw_all(&mut self.outs, r, &self.counters);
+                    withdraw_all(&mut self.outs, r, &self.counters, true);
                 }
             }
+        }
+        // After a withdrawal sent before them: a commit start decided
+        // before it is stale.
+        for (out, statuses) in self.outs.iter_mut().zip(&r.shared.statuses) {
+            out.hold.take_request(statuses);
         }
     }
 
@@ -1645,7 +1645,7 @@ impl Rt {
         if r.changes.push(StatusChange::Skipped { from, to }).is_err() {
             add(&self.counters.status_changes_dropped, 1);
         }
-        withdraw_all(&mut self.outs, r, &self.counters);
+        withdraw_all(&mut self.outs, r, &self.counters, true);
     }
 
     /// Blocks `[from, to)` are not computed for want of a core: withheld,
@@ -2077,9 +2077,7 @@ impl Rt {
             };
             let hold = &mut out.hold;
             let (w0, o0) = (hold.withheld, hold.overflows);
-            let withdraw = hold
-                .compute(k, src, digest, ctx, statuses, &mut changes, &mut sink)
-                .withdraw;
+            let decided = hold.compute(k, src, digest, ctx, statuses, &mut changes, &mut sink);
             add(&self.counters.blocks_withheld, hold.withheld - w0);
             add(&self.counters.hold_overflows, hold.overflows - o0);
             if sink.wrote {
@@ -2090,8 +2088,8 @@ impl Rt {
                 p.hash(k, src, fingerprint, &self.counters.page_hashes_dropped);
             }
             // Before the next output decides block k.
-            if withdraw {
-                withdraw_all(&mut self.outs, r, &self.counters);
+            if decided.withdraw {
+                withdraw_all(&mut self.outs, r, &self.counters, decided.cause);
             }
         }
         self.counters.processed.store(k + 1, Release);
