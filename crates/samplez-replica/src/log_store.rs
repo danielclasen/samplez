@@ -74,6 +74,9 @@ struct Inner<P> {
 pub struct Store<P> {
     inner: Arc<Mutex<Inner<P>>>,
     snapshots: Arc<tokio::sync::Mutex<()>>,
+    /// Added to every fsynced write, for tests of a slow volume.
+    #[cfg(test)]
+    sync_delay: std::time::Duration,
 }
 
 impl<P> Clone for Store<P> {
@@ -81,6 +84,8 @@ impl<P> Clone for Store<P> {
         Store {
             inner: self.inner.clone(),
             snapshots: self.snapshots.clone(),
+            #[cfg(test)]
+            sync_delay: self.sync_delay,
         }
     }
 }
@@ -266,11 +271,24 @@ impl<P: Product> Store<P> {
         Ok(Store {
             inner: Arc::new(Mutex::new(inner)),
             snapshots: Arc::default(),
+            #[cfg(test)]
+            sync_delay: std::time::Duration::ZERO,
         })
+    }
+
+    /// This store with every fsynced write taking `delay` longer.
+    #[cfg(test)]
+    pub(crate) fn with_sync_delay(mut self, delay: std::time::Duration) -> Store<P> {
+        self.sync_delay = delay;
+        self
     }
 
     /// Appends `records` to `log` as one frame, fsynced with `sync`.
     async fn write(&self, records: &[Record], sync: bool) -> io::Result<()> {
+        #[cfg(test)]
+        if sync && !self.sync_delay.is_zero() {
+            tokio::time::sleep(self.sync_delay).await;
+        }
         let mut out = Vec::new();
         encode(records, &mut out);
         let file = self.lock().file.clone();
