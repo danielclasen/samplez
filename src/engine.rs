@@ -1914,8 +1914,9 @@ impl Engine {
         let mut core = t.spare.take().unwrap_or_else(new);
         // Hand-overs before this one were sent by earlier calls.
         let first = t.seq + 1;
-        let poll =
-            Duration::from_nanos(self.block * 1_000_000_000 / samplez_mxl::SAMPLE_RATE as u64 / 16);
+        let period =
+            Duration::from_nanos(self.block * 1_000_000_000 / samplez_mxl::SAMPLE_RATE as u64);
+        let poll = period / 16;
         let processed = || self.counters.processed.load(Acquire);
         // This call's hand-overs refused for a block the RT thread passed.
         let mut passed = 0;
@@ -1963,14 +1964,23 @@ impl Engine {
             // The step to the next block: the RT thread sleeps after it
             // until its next wake, which installs a core for that block,
             // about one block period later. A sleep could take most of
-            // that: the step is waited for by yielding.
+            // that: the step is waited for by yielding, for one block
+            // period, the longest a running RT thread takes to step. Past
+            // that the RT thread is stalled, and a sixteenth of a period
+            // is slept between looks, so the wait does not spend the CPU
+            // a stalled RT thread may be waiting for.
             let p = processed();
+            let waiting = Instant::now();
             while processed() == p {
                 if Instant::now() >= deadline {
                     t.spare = Some(core);
                     return Err(ReplayError::Timeout { passed });
                 }
-                std::thread::yield_now();
+                if waiting.elapsed() < period {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(poll);
+                }
             }
             let (j, last_id) = make(processed().saturating_sub(1), &mut core);
             t.seq += 1;
@@ -4591,6 +4601,46 @@ mod tests {
         for &(j, p) in &calls {
             assert!(j < p, "a core after block {j} with {p} computed");
         }
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A hand-over waiting for a stalled RT thread to step sleeps between
+    /// looks after one block period of yielding: a spin for the whole
+    /// timeout would spend the CPU quota the RT thread shares.
+    #[test]
+    fn a_handover_waiting_on_a_stalled_rt_thread_spends_little_cpu() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("handover-cpu", 1);
+        let processed = || e.counters.processed.load(Acquire);
+        wait(&|| processed() > 10);
+        crate::rt_loop::STALL_MS.store(600, Relaxed);
+        let t = Instant::now();
+        loop {
+            let p = processed();
+            std::thread::sleep(Duration::from_millis(20));
+            if processed() == p {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(5), "no stall");
+        }
+        let cpu = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: a valid clock id and a timespec to write.
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) },
+                0
+            );
+            Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        };
+        let before = cpu();
+        let err = e.offer(Duration::from_millis(300), true, |j, _| (j, 0));
+        let spent = cpu() - before;
+        assert!(matches!(err, Err(ReplayError::Timeout { .. })), "{err:?}");
+        assert!(spent < Duration::from_millis(100), "{spent:?} of CPU");
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }
