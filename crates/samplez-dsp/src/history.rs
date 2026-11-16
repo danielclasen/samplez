@@ -176,12 +176,21 @@ mod tests {
                 while !stop.load(Relaxed) {
                     run(&h, &s, k..k + 1);
                     k += 1;
+                    // Slower than the copies, so some are kept; fast
+                    // enough to race them.
+                    for _ in 0..64 {
+                        std::hint::spin_loop();
+                    }
                 }
             });
         }
+        // The writer thread may start late: every attempt below copies.
+        while s.0.load(std::sync::atomic::Ordering::Acquire) < 9 {
+            std::hint::spin_loop();
+        }
         let mut kept = 0;
         let mut dst = vec![0.0; delay];
-        for _ in 0..200_000 {
+        for _ in 0..20_000 {
             // A span that has been written: reading started block L with
             // acquire makes the stores of every block before L - 1
             // visible.
