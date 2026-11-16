@@ -4442,6 +4442,49 @@ mod tests {
         std::fs::remove_dir_all(&domain).unwrap();
     }
 
+    /// An entry applied before its generation arrived keeps waiting for it
+    /// across an install, its slot held: a product core holds no
+    /// generation and an empty awaiting list, so cleared here the
+    /// generation would be returned unused when it came, and the slot
+    /// would stay on the old flow that every other replica left.
+    #[test]
+    fn an_install_keeps_an_entry_waiting_for_its_generation() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("install-awaiting", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0d", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0e", "label": "await",
+                          "group": "await", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        let route = RtEntry {
+            id: 5,
+            at_index: 96,
+            change: Change::Route { slot: 0 },
+        };
+        rt.awaiting_gen.push(route);
+        rt.slots[0].held = true;
+        rt.install_core(&core, 5);
+        assert_eq!(rt.awaiting_gen, [route]);
+        assert!(rt.slots[0].held);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
     /// Without a core a strip entry whose index passed still reaches its
     /// slot's strip, which the slot keeps across the drop: a core
     /// installed later holds no strip, so the entry would be lost.

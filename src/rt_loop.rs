@@ -2221,8 +2221,21 @@ impl Rt {
             d.silenced_last = s.silenced_last;
             d.xfade = s.xfade;
         }
-        self.awaiting_gen.clear();
-        self.awaiting_gen.extend_from_slice(&c.awaiting_gen);
+        // An entry applied here before its generation arrived keeps
+        // waiting for it: the core knew the entry, a refusal as Missed says
+        // so otherwise, but holds no generation, and the one this thread
+        // waits for arrives here. Its slot stays held until then.
+        for e in &c.awaiting_gen {
+            let known = self.awaiting_gen.iter().any(|a| a.id == e.id);
+            if !known && self.awaiting_gen.len() < PENDING_CHANGES {
+                self.awaiting_gen.push(*e);
+            }
+        }
+        for a in &self.awaiting_gen {
+            if let Change::InputUp { slot } | Change::Route { slot } = a.change {
+                self.slots[slot].held = true;
+            }
+        }
         if let Some(r) = self.replica.as_mut() {
             r.unresolved.clear();
             r.unresolved.extend_from_slice(&c.unresolved);
