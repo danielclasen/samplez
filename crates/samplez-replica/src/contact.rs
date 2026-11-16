@@ -322,8 +322,8 @@ struct State {
     known_committed: u64,
     handed: u64,
     awaiting: BTreeMap<Key, Waiting>,
-    /// Entries given to the engine as unresolved, the lowest index
-    /// forgotten first.
+    /// Entries given to the engine as unresolved, or refused by it, the
+    /// lowest index forgotten first.
     given: BTreeMap<Key, u64>,
     /// The lowest at_index of a listing overflow given as unresolved: a
     /// later overflow at or above it adds nothing, one below it is given.
@@ -779,6 +779,12 @@ impl Contact {
             } else {
                 st.counts.unresolved_refused += 1;
                 audio.overwhelmed();
+                // Kept with the given ones: listed again, it neither
+                // waits nor withdraws again.
+                st.given.insert(k, at);
+                while st.given.len() > GIVEN_KEPT {
+                    st.given.pop_first();
+                }
             }
         }
     }
@@ -1779,5 +1785,30 @@ mod tests {
                 at_index: at
             }]
         );
+    }
+
+    /// Review probe: an entry the engine had no room for, listed again
+    /// by the next reports, withdraws once.
+    #[tokio::test(start_paused = true)]
+    async fn review_a_relisted_entry_without_room_withdraws_once() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let timing = Timing::defaults(B);
+        let at = index_at(T0) + 40 * 48;
+        f.engine.room.store(0, Ordering::SeqCst);
+        f.clock.set(timing.apply_deadline(at));
+        for n in 0..5u64 {
+            let mut r = f.report(2, None);
+            r.seq += n;
+            r.listed = vec![Listed {
+                id: id(1, 9),
+                at_index: at,
+            }];
+            f.contact.receive(r);
+            f.tick();
+        }
+        let calls = f.engine.calls();
+        let n = calls.iter().filter(|c| *c == "overwhelmed").count();
+        assert_eq!(n, 1, "withdrawn {n} times: {calls:?}");
     }
 }
