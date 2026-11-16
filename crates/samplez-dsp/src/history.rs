@@ -169,7 +169,7 @@ mod tests {
         let s = Arc::new(Started::new());
         let stop = Arc::new(AtomicBool::new(false));
         // Detached: it ends once `stop` is set.
-        {
+        let writer = {
             let (h, s, stop) = (Arc::clone(&h), Arc::clone(&s), Arc::clone(&stop));
             std::thread::spawn(move || {
                 let mut k = 0;
@@ -182,10 +182,17 @@ mod tests {
                         std::hint::spin_loop();
                     }
                 }
-            });
-        }
+            })
+        };
         // The writer thread may start late: every attempt below copies.
+        // One that ended before block 9 panicked.
+        let started = std::time::Instant::now();
         while s.0.load(std::sync::atomic::Ordering::Acquire) < 9 {
+            assert!(!writer.is_finished(), "the writer thread ended");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the writer thread did not run"
+            );
             std::hint::spin_loop();
         }
         let mut kept = 0;
