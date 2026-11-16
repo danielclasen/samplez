@@ -191,7 +191,8 @@ pub enum GainError {
     /// `MAX_GAIN`, no such slot or a strip parameter it does not take, or
     /// an index that is not a multiple of the block size.
     Invalid(String),
-    /// `at_index` is below `earliest`, the first index the engine accepts.
+    /// `at_index` is below `earliest`, the first index the engine
+    /// accepts, a multiple of the block size.
     TooNear { at_index: u64, earliest: u64 },
     /// [`PENDING_CHANGES`] entries are outstanding.
     Full,
@@ -1320,7 +1321,9 @@ impl Engine {
                 "{what} come from the replicated log"
             )));
         }
-        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead);
+        // A block start, as the index must be: equivalent for the check.
+        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead)
+            .next_multiple_of(self.block);
         if at_index < earliest {
             return Err(GainError::TooNear { at_index, earliest });
         }
@@ -2022,7 +2025,9 @@ impl Engine {
             )));
         }
         let mut tx = self.resets.lock().expect("reset lock");
-        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead);
+        // A block start, as the index must be: equivalent for the check.
+        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead)
+            .next_multiple_of(self.block);
         if at_index < earliest {
             return Err(ResetError::TooNear { at_index, earliest });
         }
@@ -4377,6 +4382,52 @@ mod tests {
         assert_eq!(c.overrun_skipped_samples.load(Relaxed), skipped);
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// The earliest index a refusal as too near names is a block start, so
+    /// a caller can retry with it; while the RT thread is behind, the
+    /// clock less the reader margin sets it, at any sample.
+    #[test]
+    fn too_near_names_a_block_start() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-too-near-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0b", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0c", "label": "near",
+                          "group": "near", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let process = rt::setup_process(&config.rt);
+        let e = Engine::start(config, process, None).unwrap();
+        wait(&|| e.counters.processed.load(Acquire) > 10);
+        crate::rt_loop::STALL_MS.store(300, Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+        let mut named = Vec::new();
+        for _ in 0..8 {
+            match e.set_gain(0, 0, 0.5, 0) {
+                Err(GainError::TooNear { earliest, .. }) => named.push(earliest),
+                other => panic!("{other:?}"),
+            }
+            match e.reset_loudness(0, 0) {
+                Err(ResetError::TooNear { earliest, .. }) => named.push(earliest),
+                other => panic!("{other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        crate::rt_loop::STALL_MS.store(0, Relaxed);
+        assert!(named.iter().all(|x| x % e.block == 0), "{named:?}");
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
     }
 
     /// Without a core a strip entry whose index passed still reaches its
