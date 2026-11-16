@@ -2161,10 +2161,21 @@ impl Rt {
     /// Makes `c`, a core that knew the entries up to `last_id`, the
     /// state: the next block computed is the one after it. Entries
     /// pending here that the core did not know stay pending; one that
-    /// finds no room is counted in `handover_entries_lost`.
+    /// finds no room is counted in `handover_entries_lost`. A pending
+    /// `InputUp` or `Route` the core knew whose index it passed, held
+    /// back for want of a core, applies once the core is in, as on time:
+    /// its generation is swapped in, a crossfade anchored at its index.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn install_core(&mut self, c: &Core, last_id: LogId) {
         let m = &mut self.mix;
+        let next = c.pos.unwrap_or(0);
+        m.due.clear();
+        for e in &m.pending {
+            if e.id <= last_id && e.change.needs_generation() && e.at_index < next {
+                // Room: due holds as many as pending.
+                m.due.push((*e, false));
+            }
+        }
         m.matrix.copy_from(&c.matrix);
         m.pos = c.pos;
         m.ramp_end = c.ramp_end;
@@ -2195,6 +2206,11 @@ impl Rt {
             r.late_lost_until = c.late_lost_until;
         }
         self.skip_upto = self.skip_upto.max(last_id);
+        for n in 0..self.mix.due.len() {
+            let (e, _) = self.mix.due[n];
+            self.apply(e);
+        }
+        self.mix.due.clear();
     }
 
     /// Installs a replayed core whose last block is the one before

@@ -532,3 +532,48 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
     assert!(computed.contains(&(j + 1)) && computed.contains(&(from - 1)));
     h.e.stop();
 }
+
+/// A re-route whose index passes while no core is held is applied once a
+/// product core that folds it in is installed: its generation is swapped
+/// in, as on every replica that computed it, where it was held pending
+/// for good before.
+#[test]
+fn a_route_passed_without_a_core_applies_at_the_install() {
+    let domain = Domain::new();
+    let (src, other) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let _other = Pilot::start(&domain.0, &other, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    h.e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 5
+    });
+    let at = (processed(&h.e) + 200) * B;
+    let route = Entry::Route {
+        slot: 0,
+        flow_id: other.clone(),
+    };
+    h.e.append(1, at, route).unwrap();
+    wait_for(Duration::from_secs(5), "generation built", || {
+        h.e.status().generation.ready
+    });
+    h.e.commit(1);
+    wait_for(Duration::from_secs(5), "index passed", || {
+        processed(&h.e) > at / B + 10
+    });
+    let state = ProductState {
+        gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        pending: Vec::new(),
+        last_id: 1,
+    };
+    let late = c.command_late.load(Relaxed);
+    h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    wait_for(Duration::from_secs(5), "routed", || {
+        let s = h.e.status();
+        s.inputs[0].flow_id == other && s.generation.pending.is_none()
+    });
+    assert_eq!(c.command_late.load(Relaxed), late);
+    h.e.stop();
+}
