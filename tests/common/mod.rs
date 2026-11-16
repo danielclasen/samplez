@@ -671,7 +671,7 @@ pub fn processed(e: &Engine) -> u64 {
 /// F filling the ring until it overflows and withdraws the replica,
 /// unfillable blocks, fills committed through, a block withheld before
 /// it is computed and a stop, with gain entries in three pages for their
-/// fingerprints. It checks no outcome: an overrun skip under load changes
+/// fingerprints and strip entries switching every strip unit on. It checks no outcome: an overrun skip under load changes
 /// which paths run, and tests/hold.rs checks outcomes.
 pub fn hold_scenario(e: &Engine) {
     use samplez::blocks::{Cause, PAGE};
@@ -700,7 +700,14 @@ pub fn hold_scenario(e: &Engine) {
         };
         e.append(id, at + page * PAGE / B * B, entry).unwrap();
     }
-    e.commit(3);
+    // The strip's entries ramp over the same pages.
+    let mut id = 3;
+    for param in strip_params(1) {
+        id += 1;
+        e.append(id, at, samplez::Entry::Strip { slot: 0, param })
+            .unwrap();
+    }
+    e.commit(id);
     wait(kp + 10);
 
     // Degraded blocks, held, then committed through on evidence.
@@ -736,4 +743,49 @@ pub fn hold_scenario(e: &Engine) {
     wait(processed(e) + 10);
     through(e);
     wait(processed(e) + 10);
+}
+
+/// One entry for every unit of a strip of `legs` legs, each switching
+/// it on so that it ramps: trims, polarity, high-pass, the equaliser and
+/// every band, gate and compressor, then the order.
+pub fn strip_params(legs: usize) -> Vec<samplez_dsp::StripParam> {
+    use samplez_dsp::strip::{CompParams, DEFAULT_BANDS, EqBand, GateParams, StripParam};
+    let mut v = vec![
+        StripParam::Trim { db: -6.0 },
+        StripParam::LegTrim {
+            leg: legs - 1,
+            db: 3.0,
+        },
+        StripParam::Polarity {
+            leg: legs - 1,
+            inverted: true,
+        },
+        StripParam::Hpf {
+            enabled: true,
+            freq: 100.0,
+        },
+        StripParam::Eq { enabled: true },
+        StripParam::Gate(GateParams {
+            enabled: true,
+            threshold_db: -40.0,
+            range_db: 30.0,
+            attack_ms: 1.0,
+            release_ms: 50.0,
+        }),
+        StripParam::Comp(CompParams {
+            enabled: true,
+            threshold_db: -20.0,
+            ratio: 4.0,
+            attack_ms: 2.0,
+            release_ms: 80.0,
+            knee_db: 6.0,
+            makeup_db: 3.0,
+        }),
+        StripParam::DynamicsBeforeEq { enabled: true },
+    ];
+    for (band, b) in DEFAULT_BANDS.iter().enumerate() {
+        let value = EqBand { gain_db: 6.0, ..*b };
+        v.push(StripParam::EqBand { band, value });
+    }
+    v
 }

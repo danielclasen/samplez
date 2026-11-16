@@ -94,6 +94,7 @@ jobs:
               # The gate tests ran: without the cfg they compile to nothing.
               for t in rtsan_aborts_an_allocation_in_a_real_time_function \
                 the_rt_thread_passes_rtsan the_rt_thread_passes_rtsan_holding_blocks \
+                the_rt_thread_passes_rtsan_with_strips \
                 a_writer_refuses_in_the_real_time_context \
                 engine::tests::the_failure_paths_run_on_the_rt_thread \
                 engine::tests::page_hashes_leave_out_the_pages_a_skip_cut; do

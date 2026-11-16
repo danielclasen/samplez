@@ -3,11 +3,13 @@
 //! RTSan counts as blocking (allocation, pthread lock, sleep, blocking
 //! syscall) inside it aborts the process. The run covers input generation
 //! swaps, a re-route crossfade, a gain ramp, output commits, metering and
-//! a loudness reset, a writer's refusals, and, for a replicated engine,
-//! every path of the hold ring (`common::hold_scenario`): holding,
-//! withholding and overflow, with its pages hashed. The lib test
+//! a loudness reset, strips with every unit on, a writer's refusals, and,
+//! for a replicated engine, every path of the hold ring
+//! (`common::hold_scenario`): holding, withholding and overflow, with its
+//! pages hashed and strip entries applied. The lib test
 //! `the_failure_paths_run_on_the_rt_thread`, run under the same flags,
-//! covers catch-up, clock steps and a late input. libmxl's sync-group
+//! covers catch-up with strips advanced over the skip, clock steps and a
+//! late input. libmxl's sync-group
 //! wait, `mxlSleepUntil`, the commit's `FUTEX_WAKE` and the failure
 //! path's probe are allowed by call site. Other builds compile this file
 //! to nothing.
@@ -101,6 +103,40 @@ fn the_rt_thread_passes_rtsan() {
     );
     assert!(verdicts.iter().any(|v| v.ramping), "no gain ramp seen");
     assert!(verdicts.iter().filter(|v| v.written != 0).count() > 1_000);
+    assert_eq!(engine.status().diverged, None);
+    assert_eq!(engine.status().rt_panic, None);
+    common::stop(engine);
+}
+
+/// The strips under RealtimeSanitizer: entries switching every unit of
+/// a stereo strip on, applied and ramping, then the strip running
+/// settled with every unit on.
+#[test]
+fn the_rt_thread_passes_rtsan_with_strips() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let (engine, rx) = start(config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&dst, 2)],
+        common::diagonal(2, 1.0),
+        MARGIN,
+    ));
+    wait_for(Duration::from_secs(5), "input attached", || {
+        engine.status().inputs[0].state == InputState::Attached
+    });
+    let api = common::api();
+    let index = samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
+    let at = (index / B + 20) * B;
+    for param in common::strip_params(2) {
+        engine.set_strip(0, param, at).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let verdicts: Vec<_> = rx.try_iter().collect();
+    let applied = verdicts.last().map_or(0, |v| v.commands_applied);
+    assert_eq!(applied, common::strip_params(2).len() as u64);
+    assert!(verdicts.iter().filter(|v| v.k * B > at).count() > 1_000);
     assert_eq!(engine.status().diverged, None);
     assert_eq!(engine.status().rt_panic, None);
     common::stop(engine);

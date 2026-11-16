@@ -16,10 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use samplez_dsp::{Matrix, PlanarBuffer};
+use samplez_dsp::strip::MAX_LEGS;
+use samplez_dsp::{Matrix, PlanarBuffer, StripParam};
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, InputConfig, Poll, PolledFlow, Recovery,
-    SlotState, Timing,
+    Timing,
 };
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
@@ -29,9 +30,9 @@ use crate::config::Config;
 use crate::meters::{OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
-    BlockVerdict, Change, Command, Control, Counters, EMPTY_STATS, Gen, LogId, LoudnessReset,
-    MeterRecord, Mix, Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE,
-    Shared, Slot, SlotStats, Telemetry, UNRESOLVED,
+    BlockVerdict, Change, Command, Control, Counters, Gen, LogId, LoudnessReset, MeterRecord, Mix,
+    Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared, Slot, SlotStats,
+    Telemetry, UNRESOLVED,
 };
 
 const COMMAND_RING: usize = 64;
@@ -175,11 +176,12 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Why [`Engine::set_gain`] refused a change.
+/// Why [`Engine::set_gain`] or [`Engine::set_strip`] refused a change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GainError {
     /// No such coefficient, a gain that is not finite within
-    /// `MAX_GAIN`, or an index that is not a multiple of the block size.
+    /// `MAX_GAIN`, no such slot or a strip parameter it does not take, or
+    /// an index that is not a multiple of the block size.
     Invalid(String),
     /// `at_index` is below `earliest`, the first index the engine accepts.
     TooNear { at_index: u64, earliest: u64 },
@@ -203,7 +205,7 @@ impl std::fmt::Display for GainError {
 impl std::error::Error for GainError {}
 
 /// A log entry for the engine. Each sets an absolute target, so one
-/// applied again changes nothing.
+/// applied again once its ramp has ended changes nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     /// Ramps the gain from input channel `input` to output channel
@@ -222,15 +224,18 @@ pub enum Entry {
     /// Input slot `slot` crossfades to flow `flow_id` over the ramp
     /// length from the entry's index.
     Route { slot: usize, flow_id: String },
+    /// Sets parameter `param` of input slot `slot`'s strip from the
+    /// entry's index, ramping over the ramp length.
+    Strip { slot: usize, param: StripParam },
 }
 
 /// Why the engine refused an entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryError {
     /// No such slot or coefficient, a gain that is not finite within
-    /// `MAX_GAIN`, a flow an input may not read, an index that is not a
-    /// multiple of the block size, or an entry the engine's log mode does
-    /// not take.
+    /// `MAX_GAIN`, a flow an input may not read, a strip parameter the
+    /// slot's strip does not take, an index that is not a multiple of the
+    /// block size, or an entry the engine's log mode does not take.
     Invalid(String),
     /// [`PENDING_CHANGES`] entries are outstanding.
     Full,
@@ -482,6 +487,21 @@ impl Log {
     }
 }
 
+/// Whether input slot `slot` exists and has a strip that takes `param`:
+/// one of 1 to [`MAX_LEGS`] channels.
+fn check_strip(config: &Config, slot: usize, param: &StripParam) -> Result<(), String> {
+    let Some(input) = config.inputs.get(slot) else {
+        return Err(format!("no input slot {slot}"));
+    };
+    let legs = input.channels as usize;
+    if legs > MAX_LEGS {
+        return Err(format!(
+            "input slot {slot} has {legs} channels, a strip at most {MAX_LEGS}"
+        ));
+    }
+    param.check(legs)
+}
+
 /// Where the next generation-needing or other entry for a slot may be
 /// stamped: at `earliest`, after the latest one for the slot and its ramp.
 fn stamp(earliest: u64, last_at: u64, ramp: u64, block: u64) -> u64 {
@@ -566,11 +586,12 @@ pub struct Engine {
 
 impl Engine {
     /// Starts the RT thread and the supervisor with the engine's own log:
-    /// [`Engine::set_gain`] and [`Engine::route`] append and commit at
-    /// once, and so does the supervisor for its own [`Report`]s. `process`
-    /// is the outcome of [`rt::setup_process`], run before any other
-    /// thread. Each block's verdict goes to `verdicts` when given; one the
-    /// channel has no room for is counted in `verdicts_dropped`.
+    /// [`Engine::set_gain`], [`Engine::set_strip`] and [`Engine::route`]
+    /// append and commit at once, and so does the supervisor for its own
+    /// [`Report`]s. `process` is the outcome of [`rt::setup_process`], run
+    /// before any other thread. Each block's verdict goes to `verdicts`
+    /// when given; one the channel has no room for is counted in
+    /// `verdicts_dropped`.
     pub fn start(
         config: Config,
         process: ProcessStatus,
@@ -736,21 +757,13 @@ impl Engine {
                 in_domains.push(d);
                 in_domains.len() - 1
             });
-            slots.push(Slot {
+            slots.push(Slot::new(
                 domain,
-                first_channel: channel,
-                channels: i.channels as usize,
-                offset: i.offset_samples,
-                state: SlotState::default(),
-                fade_start: None,
-                silenced_last: true,
-                up: true,
-                held: false,
-                xfade: None,
-                prev: SlotState::default(),
-                prune_requested: false,
-                stats: EMPTY_STATS,
-            });
+                channel,
+                i.channels as usize,
+                i.offset_samples,
+                config.ramp_samples,
+            ));
             channel += i.channels as usize;
         }
         let mut outs = Vec::new();
@@ -1050,6 +1063,33 @@ impl Engine {
                 "gain {gain} is not finite within MAX_GAIN"
             )));
         }
+        let change = Change::Gain {
+            input,
+            output,
+            gain,
+        };
+        self.set_local(change, at_index, "gain changes")
+    }
+
+    /// Sets parameter `param` of input slot `slot`'s strip from sample
+    /// index `at_index`, a multiple of the block size, ramping over the
+    /// configured ramp length. Refused as [`Engine::set_gain`] refuses a
+    /// change, and as invalid for a slot that does not exist or has more
+    /// than [`MAX_LEGS`] channels, and for a parameter its strip refuses
+    /// ([`StripParam::check`]).
+    pub fn set_strip(
+        &self,
+        slot: usize,
+        param: StripParam,
+        at_index: u64,
+    ) -> Result<(), GainError> {
+        check_strip(&self.config, slot, &param).map_err(GainError::Invalid)?;
+        self.set_local(Change::Strip { slot, param }, at_index, "strip changes")
+    }
+
+    /// Appends `change` at `at_index` to the engine's own log and commits
+    /// it; `what` names the changes in the refusal of a replicated engine.
+    fn set_local(&self, change: Change, at_index: u64, what: &str) -> Result<(), GainError> {
         if !at_index.is_multiple_of(self.block) {
             return Err(GainError::Invalid(format!(
                 "at_index {at_index} is not a multiple of the block size {}",
@@ -1058,9 +1098,9 @@ impl Engine {
         }
         let mut log = self.log.lock().expect("log lock");
         if log.local.is_none() {
-            return Err(GainError::Invalid(
-                "gain changes come from the replicated log".to_owned(),
-            ));
+            return Err(GainError::Invalid(format!(
+                "{what} come from the replicated log"
+            )));
         }
         let earliest = earliest(&self.api, &self.counters, self.margin, self.lead);
         if at_index < earliest {
@@ -1069,11 +1109,7 @@ impl Engine {
         let e = RtEntry {
             id: log.last + 1,
             at_index,
-            change: Change::Gain {
-                input,
-                output,
-                gain,
-            },
+            change,
         };
         let consumed = self.counters.entries_consumed.load(Acquire);
         log.append(e, None, consumed).map_err(|_| GainError::Full)?;
@@ -1173,6 +1209,10 @@ impl Engine {
                     .check_input_flow(slot, &flow_id)
                     .map_err(|e| EntryError::Invalid(e.0))?;
                 (Change::Route { slot }, Some(flow_id))
+            }
+            Entry::Strip { slot, param } => {
+                check_strip(&self.config, slot, &param).map_err(EntryError::Invalid)?;
+                (Change::Strip { slot, param }, None)
             }
         };
         let mut log = self.log.lock().expect("log lock");
@@ -1768,6 +1808,15 @@ impl Supervisor {
                         "log entry {} ({:?}) at index {} was applied before its generation \
                          arrived, with {PENDING_CHANGES} others awaiting theirs; its \
                          generation is not swapped in",
+                        entry.id, entry.change, entry.at_index
+                    );
+                    log(format_args!("diverged: {reason}"));
+                    self.status().diverged.get_or_insert(reason);
+                }
+                Telemetry::StripRefused { entry } => {
+                    let reason = format!(
+                        "log entry {} ({:?}) at index {} was refused by its slot's strip; \
+                         not applied",
                         entry.id, entry.change, entry.at_index
                     );
                     log(format_args!("diverged: {reason}"));
@@ -3487,7 +3536,8 @@ mod tests {
     /// The RT loop's failure paths run, so that CI's RealtimeSanitizer
     /// run over the lib tests checks them: a stall's catch-up and skip, a
     /// forward and a backward clock step with the wakes behind the last
-    /// block after it, and a late input with its probe. Engine `p` writes the flow,
+    /// block after it, and a late input with its probe, with a strip
+    /// advanced over the skip. Engine `p` writes the flow,
     /// engine `e` reads it.
     #[test]
     fn the_failure_paths_run_on_the_rt_thread() {
@@ -3532,6 +3582,30 @@ mod tests {
                                          "channels": 1 }]);
         let e = start(input, out, 3 * 576, serde_json::json!([[1.0]]));
         wait(&|| e.status().inputs[0].state == InputState::Attached);
+        // A strip with filters on: Strip::advance runs over the skip.
+        let produced = e.counters.produced.load(Acquire);
+        let at = (produced / 48 + 40) * 48;
+        let mut params = vec![
+            StripParam::Trim { db: -6.0 },
+            StripParam::Hpf {
+                enabled: true,
+                freq: 100.0,
+            },
+            StripParam::Eq { enabled: true },
+            StripParam::DynamicsBeforeEq { enabled: true },
+        ];
+        params.extend(
+            samplez_dsp::strip::DEFAULT_BANDS
+                .iter()
+                .enumerate()
+                .map(|(band, b)| StripParam::EqBand {
+                    band,
+                    value: samplez_dsp::EqBand { gain_db: 6.0, ..*b },
+                }),
+        );
+        for param in params {
+            e.set_strip(0, param, at).unwrap();
+        }
         let c = e.counters();
         let n = |a: &AtomicU64| a.load(Relaxed);
         let until = |what: &str, f: &dyn Fn() -> bool| {
@@ -3565,6 +3639,73 @@ mod tests {
         until("late block", &|| n(&c.input_late_blocks) > 0);
         until("probe", &|| n(&c.input_probes) > 0);
         assert_eq!(e.status().rt_panic, None);
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// A strip entry the slot's strip refuses on the RT thread, as on a
+    /// replica whose slot has another width than the one the entry was
+    /// checked against, is not applied: it is counted and marks the
+    /// engine diverged.
+    #[test]
+    fn a_strip_entry_refused_on_the_rt_thread_marks_the_engine_diverged() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d07", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d08", "label": "refused",
+                          "group": "refused", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let process = rt::setup_process(&config.rt);
+        let e = Engine::start(config, process, None).unwrap();
+        let c = &e.counters;
+        let until = |what: &str, f: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !f() {
+                assert!(t.elapsed() < Duration::from_secs(10), "no {what}: {c:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        until("block", &|| c.heartbeat_blocks.load(Relaxed) > 0);
+        // Past the checks of set_strip: leg 1 of a mono strip.
+        let refused = StripParam::LegTrim { leg: 1, db: 0.0 };
+        let mut log = e.log.lock().unwrap();
+        let entry = RtEntry {
+            id: log.last + 1,
+            at_index: earliest(&e.api, &e.counters, e.margin, e.lead),
+            change: Change::Strip {
+                slot: 0,
+                param: refused,
+            },
+        };
+        log.append(entry, None, e.counters.entries_consumed.load(Acquire))
+            .unwrap();
+        log.commit(entry.id);
+        drop(log);
+        e.set_strip(0, StripParam::Trim { db: -3.0 }, entry.at_index)
+            .unwrap();
+        until("divergence", &|| e.status().diverged.is_some());
+        let diverged = e.status().diverged.unwrap();
+        assert!(
+            diverged.contains("refused by its slot's strip"),
+            "{diverged}"
+        );
+        // The entry set_strip took is applied; the supervisor's own
+        // InputDown for the missing input may come in between.
+        until("both entries", &|| c.entries_consumed.load(Relaxed) >= 2);
+        assert_eq!(c.strip_refused.load(Relaxed), 1);
+        assert_eq!(c.command_late.load(Relaxed), 0);
         e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
     }
