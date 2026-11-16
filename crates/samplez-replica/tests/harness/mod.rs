@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,14 +28,18 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, Raft, ServerState};
+use samplez::blocks::{
+    BlockStatus, Cause, Changes, Ctx, HEALTHY, Hold, Kind, Ranks, Sink, StatusChange, Statuses,
+};
 use samplez_replica::bootstrap::{Bootstrap, Marker, Markers, Volume, random_id};
+use samplez_replica::bridge::word_or_skip;
 use samplez_replica::contact::{self, Audio, Clocks, Sample, Timing};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::Request;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
 use samplez_replica::membership::{Slot, slot_of};
-use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest};
-use samplez_replica::report::{ClockFlags, Own, Report};
+use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest, PeerResponse};
+use samplez_replica::report::{ClockFlags, Own, Report, Run, runs};
 use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
 use samplez_service::{Owner, ReplicatedState, Role};
@@ -200,11 +204,49 @@ impl Clocks for Tai {
 
 /// The engine of one replica, in place of a real one: it computes every
 /// block as it falls due on the replica's TAI clock, unless stalled, and
-/// records what contact hands it.
+/// records what contact hands it. With outputs, each one is a real hold
+/// ring and status ring ([`Hold`], [`Statuses`]) over a sink that records
+/// the samples it commits; every sample carries its own index.
 pub struct FakeAudio {
     clock: Arc<Clock>,
     timing: Timing,
     pub state: Mutex<Fake>,
+}
+
+/// One output of a [`FakeAudio`].
+pub struct Output {
+    pub hold: Hold,
+    pub statuses: Statuses,
+    tx: rtrb::Producer<StatusChange>,
+    rx: rtrb::Consumer<StatusChange>,
+    dropped: AtomicU64,
+    pub sink: Writes,
+}
+
+/// The ranges an output committed, `(start, len)`, in order.
+#[derive(Debug, Default, Clone)]
+pub struct Writes(pub Vec<(u64, usize)>);
+
+impl Sink for Writes {
+    fn write(&mut self, start: u64, len: usize, data: &[f32], _stride: usize) -> bool {
+        for (i, &x) in data[..len].iter().enumerate() {
+            assert_eq!(
+                x,
+                (start + i as u64) as f32,
+                "sample {} out of place",
+                start + i as u64
+            );
+        }
+        self.0.push((start, len));
+        true
+    }
+}
+
+impl Writes {
+    /// Whether sample `i` was committed.
+    pub fn has(&self, i: u64) -> bool {
+        self.0.iter().any(|&(s, n)| (s..s + n as u64).contains(&i))
+    }
 }
 
 #[derive(Default)]
@@ -224,14 +266,73 @@ pub struct Fake {
     pub flags: ClockFlags,
     pub build_lead: Option<u64>,
     pub entries_refused: u64,
+    pub outputs: Vec<Output>,
+    /// The last block computed.
+    pub computed: Option<u64>,
+    /// The ranks as published, with the TAI time.
+    pub ranks: Vec<(u64, Ranks)>,
+    /// Digests of degraded blocks: `(from, to, digest)` for the blocks
+    /// `[from, to)` of every output; the rest are healthy.
+    pub degraded: Vec<(u64, u64, u64)>,
+    pub withdrawals: u64,
+    /// The RT thread neither computes nor moves a block.
+    pub frozen: bool,
+}
+
+impl Fake {
+    fn digest(&self, k: u64) -> u64 {
+        self.degraded
+            .iter()
+            .rev()
+            .find(|&&(a, b, _)| (a..b).contains(&k))
+            .map_or(HEALTHY, |&(_, _, d)| d)
+    }
+
+    fn ctx(&self) -> Ctx {
+        Ctx {
+            fence: self.fences.last().map_or(0, |&(_, f)| f),
+            ranks: self.ranks.last().map_or(Ranks::default(), |&(_, r)| r),
+        }
+    }
+
+    pub fn withdraw_all(&mut self) {
+        self.withdrawals += 1;
+        for out in &mut self.outputs {
+            let mut changes = Changes {
+                ring: &mut out.tx,
+                dropped: &out.dropped,
+                output: 0,
+            };
+            out.hold.withdraw(&out.statuses, &mut changes);
+        }
+    }
 }
 
 impl FakeAudio {
-    pub fn new(clock: Arc<Clock>, timing: Timing) -> FakeAudio {
+    pub fn new(clock: Arc<Clock>, timing: Timing, outputs: usize) -> FakeAudio {
+        let cap = contact::index_at((timing.hold + timing.contact_window).as_nanos() as u64)
+            .div_ceil(timing.block) as usize
+            + 2;
+        let outputs = (0..outputs)
+            .map(|_| {
+                let (tx, rx) = rtrb::RingBuffer::new(4096);
+                Output {
+                    hold: Hold::new(1, timing.block, cap, false),
+                    statuses: Statuses::new(256, timing.block),
+                    tx,
+                    rx,
+                    dropped: AtomicU64::new(0),
+                    sink: Writes::default(),
+                }
+            })
+            .collect();
         FakeAudio {
             clock,
             timing,
-            state: Mutex::new(Fake::default()),
+            state: Mutex::new(Fake {
+                outputs,
+                ..Fake::default()
+            }),
         }
     }
 
@@ -263,20 +364,155 @@ impl FakeAudio {
             .find(|&&(up_to, _)| up_to >= index)
             .map(|&(_, t)| t)
     }
+
+    /// Output `output` commits from the first page boundary in a block at
+    /// or after `k`.
+    pub fn commit_from(&self, output: usize, k: u64) {
+        self.lock().outputs[output].hold.commit_from(k);
+    }
+
+    /// Every output commits from the first page boundary after the block
+    /// due now; returns that block.
+    pub fn commit_all(&self) -> u64 {
+        let k = self.due().expect("a block is due") + 1;
+        let mut st = self.lock();
+        for out in &mut st.outputs {
+            out.hold.commit_from(k);
+        }
+        k
+    }
+
+    /// The RT thread overruns: the next `n` blocks are skipped, withheld at
+    /// the skip without a status word, and the replica withdraws.
+    pub fn overrun(&self, n: u64) {
+        self.step();
+        let mut st = self.lock();
+        if let Some(c) = st.computed {
+            st.computed = Some(c + n);
+        }
+        st.withdraw_all();
+    }
+
+    /// Blocks `[from, to)` are degraded with `digest`.
+    pub fn degrade(&self, from: u64, to: u64, digest: u64) {
+        self.lock().degraded.push((from, to, digest));
+    }
+
+    /// Block `k`'s status on `output`.
+    pub fn status_of(&self, output: usize, k: u64) -> Option<BlockStatus> {
+        self.step();
+        self.lock().outputs[output].statuses.get(k)
+    }
+
+    /// What `output` committed.
+    pub fn writes(&self, output: usize) -> Writes {
+        self.step();
+        self.lock().outputs[output].sink.clone()
+    }
+
+    /// The RT thread: computes every block due since the last one, unless
+    /// stalled, then moves the blocks in each ring.
+    pub fn step(&self) {
+        let due = self.due();
+        let mut st = self.lock();
+        let st = &mut *st;
+        if st.outputs.is_empty() || st.frozen {
+            return;
+        }
+        let target = match (due, st.stalled_at) {
+            (Some(d), Some(s)) => Some(d.min(s)),
+            (due, _) => due,
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let first = st.computed.map_or(target, |c| c + 1);
+        let b = self.timing.block;
+        for k in first..=target {
+            let ctx = st.ctx();
+            let digest = st.digest(k);
+            let data: Vec<f32> = (k * b..(k + 1) * b).map(|i| i as f32).collect();
+            for o in 0..st.outputs.len() {
+                let out = &mut st.outputs[o];
+                let mut changes = Changes {
+                    ring: &mut out.tx,
+                    dropped: &out.dropped,
+                    output: o as u32,
+                };
+                let withdraw = out
+                    .hold
+                    .compute(
+                        k,
+                        &data,
+                        Some(digest),
+                        ctx,
+                        &out.statuses,
+                        &mut changes,
+                        &mut out.sink,
+                    )
+                    .withdraw;
+                if withdraw {
+                    st.withdraw_all();
+                }
+            }
+            st.computed = Some(k);
+        }
+        let ctx = st.ctx();
+        let mut withdraw = false;
+        for out in &mut st.outputs {
+            let mut changes = Changes {
+                ring: &mut out.tx,
+                dropped: &out.dropped,
+                output: 0,
+            };
+            withdraw |= out
+                .hold
+                .advance(ctx, &out.statuses, &mut changes, &mut out.sink)
+                .withdraw;
+            while out.rx.pop().is_ok() {}
+        }
+        if withdraw {
+            st.withdraw_all();
+        }
+    }
+
+    /// Statuses a report carries: those of the blocks a peer can still
+    /// hold a decision on, as [`samplez_replica::bridge::EngineAudio`]
+    /// reports them.
+    fn statuses(&self, st: &Fake) -> Vec<Vec<Run>> {
+        let t = &self.timing;
+        let span = t.hold + t.contact_window + 2 * t.report_period;
+        let window = contact::index_at(span.as_nanos() as u64).div_ceil(t.block) + 1;
+        let Some(newest) = st.computed else {
+            return st.outputs.iter().map(|_| Vec::new()).collect();
+        };
+        let first = (newest + 1).saturating_sub(window);
+        st.outputs
+            .iter()
+            .map(|out| runs((first..=newest).map(|k| Some(word_or_skip(out.statuses.get(k), k)))))
+            .collect()
+    }
 }
 
 impl Audio for FakeAudio {
     fn sample(&self) -> Sample {
+        self.step();
         let due = self.due();
         let st = self.lock();
+        let processed = if st.outputs.is_empty() {
+            match (due, st.stalled_at) {
+                (Some(d), Some(s)) => Some(d.min(s)),
+                (due, _) => due,
+            }
+        } else {
+            st.computed
+        };
         Sample {
             own: Own {
-                processed: match (due, st.stalled_at) {
-                    (Some(d), Some(s)) => Some(d.min(s)),
-                    (due, _) => due,
-                },
+                processed,
                 clock: st.flags,
-                statuses: Vec::new(),
+                statuses: self.statuses(&st),
+                standing: st.outputs.iter().map(|o| o.statuses.standing()).collect(),
                 unwritten: Vec::new(),
                 build_lead: st.build_lead,
             },
@@ -286,17 +522,30 @@ impl Audio for FakeAudio {
     }
     fn fence(&self, end: u64) {
         let tai = self.clock.tai_ns();
-        let mut st = self.lock();
-        if st.fences.last().is_none_or(|&(_, f)| f != end) {
-            st.fences.push((tai, end));
+        {
+            let mut st = self.lock();
+            if st.fences.last().is_none_or(|&(_, f)| f != end) {
+                st.fences.push((tai, end));
+            }
         }
+        self.step();
     }
-    /// A block the engine computed leaves its hold ring, withheld when it
-    /// is still fenced, once `D + w + 2B` of later blocks were computed.
+    /// Without outputs, a block the engine computed leaves its hold ring,
+    /// withheld when it is still fenced, once `D + w + 2B` of later blocks
+    /// were computed; with outputs, as the bridge reads the status words.
     fn settled(&self, k: u64) -> bool {
-        let ring = (self.timing.hold + self.timing.contact_window).as_nanos() as u64;
-        let ring = contact::index_at(ring).div_ceil(self.timing.block) + 2;
-        self.sample().own.processed.is_some_and(|p| p >= k + ring)
+        self.step();
+        let st = self.lock();
+        if st.outputs.is_empty() {
+            drop(st);
+            let ring = (self.timing.hold + self.timing.contact_window).as_nanos() as u64;
+            let ring = contact::index_at(ring).div_ceil(self.timing.block) + 2;
+            return self.sample().own.processed.is_some_and(|p| p >= k + ring);
+        }
+        st.outputs.iter().all(|o| match o.statuses.get(k) {
+            Some(s) => matches!(s.kind, Kind::Committed | Kind::Withheld),
+            None => st.computed.is_some_and(|p| k <= p),
+        })
     }
     fn appended(&self, index: u64, request: &Request) {
         self.lock().appended.push((index, request.at_index()));
@@ -317,6 +566,29 @@ impl Audio for FakeAudio {
     }
     fn overwhelmed(&self) {
         self.lock().overwhelmed += 1;
+    }
+    fn status(&self, output: usize, k: u64) -> Option<BlockStatus> {
+        self.step();
+        self.lock().outputs.get(output)?.statuses.get(k)
+    }
+    fn withhold(&self, output: usize, k: u64, cause: Cause) -> Option<BlockStatus> {
+        self.step();
+        self.lock().outputs.get(output)?.statuses.withhold(k, cause)
+    }
+    fn commit_through(&self, output: usize, k: u64, on_silence_of: u8, up_to: Option<u64>) -> bool {
+        self.step();
+        self.lock()
+            .outputs
+            .get(output)
+            .is_some_and(|o| o.statuses.commit_through(k, on_silence_of, up_to))
+    }
+    fn withdraw(&self) {
+        self.step();
+        self.lock().withdraw_all();
+    }
+    fn ranks(&self, ranks: Ranks) {
+        let tai = self.clock.tai_ns();
+        self.lock().ranks.push((tai, ranks));
     }
 }
 
@@ -346,6 +618,11 @@ struct Links {
     /// (from, to): peer requests, side reports among them, do not
     /// arrive; openraft's RPCs do.
     cut_peer: BTreeSet<(NodeId, NodeId)>,
+    /// (from, to): openraft's RPCs do not arrive; peer requests do.
+    cut_raft: BTreeSet<(NodeId, NodeId)>,
+    /// Side reports from this node arrive this much later, each on its
+    /// own, as through a slow link that still carries every report.
+    delayed: BTreeMap<NodeId, Duration>,
 }
 
 /// The links between the replicas of one set.
@@ -396,6 +673,8 @@ impl Net {
         links.hold_replies.clear();
         links.drop_heartbeats.clear();
         links.cut_peer.clear();
+        links.cut_raft.clear();
+        links.delayed.clear();
     }
 
     /// Joins `a` and `b` again in both directions.
@@ -436,6 +715,24 @@ impl Net {
         self.links().cut_peer.insert((from, to));
     }
 
+    /// Peer requests from `from` to `to` arrive again.
+    pub fn join_peer(&self, from: NodeId, to: NodeId) {
+        self.links().cut_peer.remove(&(from, to));
+    }
+
+    /// openraft's RPCs between `a` and `b` do not arrive, either way; peer
+    /// requests do.
+    pub fn cut_raft(&self, a: NodeId, b: NodeId) {
+        let mut links = self.links();
+        links.cut_raft.insert((a, b));
+        links.cut_raft.insert((b, a));
+    }
+
+    /// Side reports from `from` arrive `by` late, every one of them.
+    pub fn delay_reports(&self, from: NodeId, by: Duration) {
+        self.links().delayed.insert(from, by);
+    }
+
     /// Records every side report delivered from now on.
     pub fn tap_reports(&self) {
         self.links().reports = Some(Vec::new());
@@ -469,6 +766,7 @@ impl Net {
         &self,
         from: NodeId,
         to: NodeId,
+        raft_rpc: bool,
     ) -> Result<Raft<TypeConfig>, RPCError<NodeId, BasicNode, E>> {
         let hung = self.links().hung.contains(&(from, to));
         if hung {
@@ -496,6 +794,9 @@ impl Net {
         if links.cut.contains(&(from, to)) || !links.rafts.contains_key(&to) {
             return Err(unreachable());
         }
+        if raft_rpc && links.cut_raft.contains(&(from, to)) {
+            return Err(unreachable());
+        }
         links.delivered += 1;
         Ok(raft)
     }
@@ -518,30 +819,47 @@ impl PeerClient for Peers {
     ) -> BoxFuture<'a, Result<PeerReply, String>> {
         Box::pin(async move {
             let target = addr.parse().expect("a harness address is a node id");
-            let call = async {
-                if self.net.links().cut_peer.contains(&(self.from, target)) {
-                    return Err(format!("{} -> {target} down", self.from));
-                }
-                self.net
-                    .route::<io::Error>(self.from, target)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let replica = {
-                    let mut links = self.net.links();
-                    if let (Some(tap), PeerRequest::Report(report)) =
-                        (links.reports.as_mut(), &request)
-                    {
-                        tap.push((target, (**report).clone()));
-                    }
-                    links.replicas.get(&target).cloned()
-                };
-                let replica = replica.ok_or_else(|| format!("{target} down"))?;
-                Ok(replica.handle(to, request).await)
-            };
+            let delay = self.net.links().delayed.get(&self.from).copied();
+            if let (Some(by), PeerRequest::Report(_)) = (delay, &request) {
+                let (net, from) = (self.net.clone(), self.from);
+                tokio::spawn(async move {
+                    tokio::time::sleep(by).await;
+                    let peers = Peers { from, net };
+                    let _ = peers.deliver(to, target, request).await;
+                });
+                return Ok(Ok(PeerResponse::Reported));
+            }
+            let call = self.deliver(to, target, request);
             tokio::time::timeout(within, call)
                 .await
                 .unwrap_or_else(|_| Err("timed out".into()))
         })
+    }
+}
+
+impl Peers {
+    async fn deliver(
+        &self,
+        to: Option<NodeId>,
+        target: NodeId,
+        request: PeerRequest,
+    ) -> Result<PeerReply, String> {
+        if self.net.links().cut_peer.contains(&(self.from, target)) {
+            return Err(format!("{} -> {target} down", self.from));
+        }
+        self.net
+            .route::<io::Error>(self.from, target, false)
+            .await
+            .map_err(|e| e.to_string())?;
+        let replica = {
+            let mut links = self.net.links();
+            if let (Some(tap), PeerRequest::Report(report)) = (links.reports.as_mut(), &request) {
+                tap.push((target, (**report).clone()));
+            }
+            links.replicas.get(&target).cloned()
+        };
+        let replica = replica.ok_or_else(|| format!("{target} down"))?;
+        Ok(replica.handle(to, request).await)
     }
 }
 
@@ -594,7 +912,7 @@ impl RaftNetwork<TypeConfig> for Link {
             .entries
             .iter()
             .any(|e| matches!(e.payload, openraft::EntryPayload::Normal(_)));
-        let raft = self.net.route(self.from, self.to).await?;
+        let raft = self.net.route(self.from, self.to, true).await?;
         let reply = raft
             .append_entries(rpc)
             .await
@@ -619,7 +937,7 @@ impl RaftNetwork<TypeConfig> for Link {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let raft = self.net.route(self.from, self.to).await?;
+        let raft = self.net.route(self.from, self.to, true).await?;
         raft.install_snapshot(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.to, e)))
@@ -630,7 +948,7 @@ impl RaftNetwork<TypeConfig> for Link {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let raft = self.net.route(self.from, self.to).await?;
+        let raft = self.net.route(self.from, self.to, true).await?;
         raft.vote(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.to, e)))
@@ -667,6 +985,8 @@ pub struct Options {
     /// The node ids, in place of `0..voters`; a witness among them is
     /// waited for as a voter, not as commitable.
     pub ids: Option<Vec<NodeId>>,
+    /// Outputs of each [`FakeAudio`]; none leaves it without blocks.
+    pub outputs: usize,
 }
 
 impl Default for Options {
@@ -680,6 +1000,7 @@ impl Default for Options {
             begin: true,
             contact: None,
             ids: None,
+            outputs: 0,
         }
     }
 }
@@ -823,7 +1144,7 @@ impl Set {
         if let Some(timing) = self.options.contact {
             let clock = self.clocks[&id].clone();
             let audio = (slot_of(id) != Slot::Witness)
-                .then(|| Arc::new(FakeAudio::new(clock.clone(), timing)));
+                .then(|| Arc::new(FakeAudio::new(clock.clone(), timing, self.options.outputs)));
             let engine = audio.clone().map(|a| a as Arc<dyn Audio>);
             replica
                 .contact(timing, Arc::new(Tai(clock)), engine)

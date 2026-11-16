@@ -1601,6 +1601,7 @@ dependencies = [
  "libc",
  "openraft",
  "rcgen",
+ "rtrb",
  "rustls",
  "samplez",
  "samplez-mxl",

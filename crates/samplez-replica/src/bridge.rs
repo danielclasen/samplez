@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
-use samplez::blocks::{BlockStatus, Cause, Kind, Range, StatusChange};
+use samplez::blocks::{BlockStatus, Cause, Kind, Range, Ranks, Standing, StatusChange};
 use samplez::{Engine, Entry, EntryError};
 
 use crate::contact::{Audio, Sample, Timing};
@@ -59,7 +59,7 @@ struct Unwrittens {
 /// processed, and computes no index twice), or its output had no writer or
 /// no commit start yet. So it is withheld, though the change saying so may
 /// have been lost.
-fn word_or_skip(word: Option<BlockStatus>, k: u64) -> BlockStatus {
+pub fn word_or_skip(word: Option<BlockStatus>, k: u64) -> BlockStatus {
     word.unwrap_or(BlockStatus {
         k,
         kind: Kind::Withheld,
@@ -145,6 +145,13 @@ impl Audio for EngineAudio {
                 tai_offset_s: progress.tai_offset_s,
             },
             statuses: Vec::with_capacity(self.outputs),
+            standing: (0..self.outputs)
+                .map(|o| {
+                    self.engine
+                        .standing(o)
+                        .unwrap_or(Standing::Idle { since: 0 })
+                })
+                .collect(),
             unwritten: Vec::new(),
             build_lead: Some(progress.build_lead),
         };
@@ -208,6 +215,30 @@ impl Audio for EngineAudio {
 
     fn unresolved(&self, index: u64, at_index: u64) -> bool {
         self.engine.unresolved(index, at_index).is_ok()
+    }
+
+    fn status(&self, output: usize, k: u64) -> Option<BlockStatus> {
+        self.engine.block_status(output, k)
+    }
+
+    fn withhold(&self, output: usize, k: u64, cause: Cause) -> Option<BlockStatus> {
+        self.engine.withhold(output, k, cause).ok().flatten()
+    }
+
+    fn commit_through(&self, output: usize, k: u64, on_silence_of: u8, up_to: Option<u64>) -> bool {
+        self.engine
+            .commit_through(output, k, on_silence_of, up_to)
+            .unwrap_or(false)
+    }
+
+    fn withdraw(&self) {
+        if let Err(e) = self.engine.withdraw() {
+            tracing::error!(error = ?e, "the engine refused a withdrawal");
+        }
+    }
+
+    fn ranks(&self, ranks: Ranks) {
+        let _ = self.engine.set_ranks(ranks);
     }
 }
 
