@@ -579,6 +579,33 @@ async fn a_replica_resuming_inside_a_degraded_block_splits_it() {
     pages_whole(&set, &ids, kp - 2, kp + 3);
 }
 
+/// The same with R healthy after the block holding P: R commits `[kB, P)`
+/// through, withdraws on it and commits none of the blocks after it, which
+/// W, committing from P, holds.
+#[tokio::test(start_paused = true)]
+async fn a_replica_split_at_p_commits_no_healthy_block_after_it() {
+    let set = start(vec![a(0), a(1), witness()]).await;
+    let ids = audio(&set);
+    let (r, w) = (a(0), a(1));
+    set.audio(w).lock().withdraw_all();
+    sleep(Duration::from_millis(30)).await;
+    let p = page_inside(&set, 30);
+    let kp = p / BLOCK;
+    set.audio(r).degrade(kp - 2, kp + 1, DEGRADED);
+    while set.audio(w).due().unwrap() < kp {
+        set.audio(w).commit_from(0, kp);
+        sleep(Duration::from_millis(1)).await;
+    }
+    past_cap(&set, kp + 3).await;
+    let s = set.audio(r).status_of(0, kp).unwrap();
+    assert_eq!((s.kind, s.range), (Kind::Committed, Range::UpTo(p)));
+    for j in [kp + 1, kp + 2] {
+        assert_ne!(status(&set, r, j).0, Kind::Committed, "R block {j}");
+    }
+    once(&set, &ids, kp - 2, kp + 3);
+    pages_whole(&set, &ids, kp - 2, kp + 3);
+}
+
 /// A named N committing from P while a withdrawn F fills: F commits
 /// `[kB, P)` and withholds from P on N's `committed from P` report.
 #[tokio::test(start_paused = true)]

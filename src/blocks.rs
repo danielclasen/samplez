@@ -1170,9 +1170,13 @@ impl Hold {
                         changes.send(target);
                         cur = target;
                         // Committed through up to P: `[P, (k + 1)B)` is
-                        // withheld.
-                        if let (Kind::Committed, Range::UpTo(e)) = (cur.kind, cur.range) {
-                            self.pending[n].end = self.pending[n].end.min(e);
+                        // withheld for a cause, which withdraws the replica
+                        // before any block after it is decided.
+                        if let (Kind::Committed, Range::UpTo(e)) = (cur.kind, cur.range)
+                            && e < self.pending[n].end
+                        {
+                            self.pending[n].end = e;
+                            out.withdraw = true;
                         }
                     }
                     Err(now) => cur = now,
@@ -2490,6 +2494,41 @@ mod tests {
         assert_eq!(t.sink.writes, [(k * B, (p - k * B) as usize)]);
         t.compute(k + 1, DEGRADED);
         assert_eq!(t.kind(k + 1), Some(Kind::Withheld), "no page boundary");
+        t.sink.check();
+    }
+
+    /// A commit through up to P withholds `[P, (k + 1)B)` for a cause:
+    /// the same pass withdraws the replica before the healthy blocks held
+    /// behind the block commit, whenever the supervisor's own withdrawal
+    /// arrives.
+    #[test]
+    fn a_commit_through_up_to_p_withdraws_before_the_blocks_behind_it() {
+        let p = K0 * B + PAGE;
+        let k = p / B;
+        let mut t = T::committing(false, K0);
+        for j in K0..k {
+            t.compute(j, Some(HEALTHY));
+        }
+        t.sink.writes.clear();
+        t.compute(k, DEGRADED);
+        t.compute(k + 1, Some(HEALTHY));
+        t.compute(k + 2, Some(HEALTHY));
+        assert!(t.statuses.commit_through(k, 0, Some(p)));
+        assert!(t.advance().withdraw);
+        assert_eq!(t.sink.writes, [(k * B, (p - k * B) as usize)]);
+        for j in [k + 1, k + 2] {
+            assert_eq!(t.kind(j), Some(Kind::Held), "block {j}");
+        }
+        // A block that stops at P on its own, held and committed through
+        // over its whole range, withdraws nothing.
+        let mut t = T::committing(false, K0);
+        for j in K0..k {
+            t.compute(j, Some(HEALTHY));
+        }
+        t.hold.stop_at(p);
+        t.compute(k, DEGRADED);
+        assert!(t.statuses.commit_through(k, 0, None));
+        assert!(!t.advance().withdraw);
         t.sink.check();
     }
 
