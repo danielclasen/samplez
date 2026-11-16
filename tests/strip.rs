@@ -1,5 +1,6 @@
 //! Strip entries on real libmxl flows: checked when appended or set,
-//! applied at their index to the legs of their slot.
+//! applied at their index to the legs of their slot, ramping as a strip
+//! run alone does.
 
 mod common;
 
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use common::{B, Domain, MARGIN, Pilot, config, diagonal, new_id, read_blocks, wait_for};
 use samplez::{BlockVerdict, Entry, EntryError, GainError, InputState};
-use samplez_dsp::StripParam;
+use samplez_dsp::{BandType, EqBand, Strip, StripParam};
 
 /// The newest block an engine processed.
 fn now(rx: &Receiver<BlockVerdict>) -> u64 {
@@ -83,6 +84,112 @@ fn a_strip_entry_applies_at_its_index_to_its_leg() {
     assert!(compared > 40, "{compared} blocks compared");
     assert_eq!(e.status().diverged, None);
     common::stop(e);
+}
+
+/// With a ramp, the engine's output is that of a strip run alone over
+/// the pilot, block by block, its entries set at the start of their
+/// block: trims, polarity and an equaliser band ramp at the rate of one
+/// sample per sample. A block silenced, faded in or skipped in the
+/// window makes the run start again, at most four times.
+#[test]
+fn ramps_run_as_in_a_strip_alone() {
+    const RAMP: u32 = 480;
+    let mut seen_why = Vec::new();
+    for _ in 0..4 {
+        match ramp_run(RAMP) {
+            Ok(()) => return,
+            Err(why) => {
+                eprintln!("run disturbed ({why}): running it again");
+                seen_why.push(why);
+            }
+        }
+    }
+    panic!("every run was disturbed: {seen_why:?}");
+}
+
+fn ramp_run(ramp: u32) -> Result<(), String> {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let mut cfg = config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&dst, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    );
+    cfg.ramp_samples = ramp;
+    let (e, rx) = common::start(cfg);
+    wait_for(Duration::from_secs(5), "running", || {
+        let s = e.status();
+        s.outputs[0].realised && s.inputs[0].state == InputState::Attached
+    });
+    let at = (now(&rx) + 100) * B;
+    // Inside the first entries' ramp.
+    let at2 = at + 4 * B;
+    let entries = [
+        (at, StripParam::Trim { db: -12.0 }),
+        (at, StripParam::Eq { enabled: true }),
+        (
+            at,
+            StripParam::EqBand {
+                band: 1,
+                value: EqBand {
+                    kind: BandType::Peak,
+                    freq: 1000.0,
+                    gain_db: 9.0,
+                    q: 2.0,
+                },
+            },
+        ),
+        (at2, StripParam::LegTrim { leg: 1, db: 6.0 }),
+        (
+            at2,
+            StripParam::Polarity {
+                leg: 0,
+                inverted: true,
+            },
+        ),
+    ];
+    for &(i, p) in &entries {
+        e.set_strip(0, p, i).unwrap();
+    }
+    let ks = at / B - 10..at2 / B + 2 * u64::from(ramp) / B;
+    let mut seen = Vec::new();
+    wait_for(Duration::from_secs(10), "blocks written", || {
+        seen.extend(rx.try_iter());
+        seen.last().is_some_and(|v| v.k > ks.end + 2)
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    for k in ks.clone() {
+        match seen.iter().find(|v| v.k == k) {
+            None => return Err(format!("block {k} skipped")),
+            Some(v) if v.silenced != 0 || v.fading != 0 => {
+                return Err(format!("block {k} silenced or faded in"));
+            }
+            Some(_) => {}
+        }
+    }
+    let got = read_blocks(&domain.0, &dst, 2, ks.clone());
+    let mut strip = Strip::new(2, ramp);
+    let b = B as usize;
+    for (i, k) in ks.enumerate() {
+        for &(idx, p) in &entries {
+            if idx == k * B {
+                assert!(strip.set(p));
+            }
+        }
+        let mut want: Vec<f32> = (0..2)
+            .flat_map(|c| (0..B).map(move |n| common::pilot(c, k * B + n)))
+            .collect();
+        strip.process(&mut want, b);
+        let block = &got[i * 2 * b..(i + 1) * 2 * b];
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(block), bits(&want), "block {k}");
+    }
+    assert_eq!(e.status().diverged, None);
+    common::stop(e);
+    Ok(())
 }
 
 /// A strip entry is refused for a slot that does not exist, a slot

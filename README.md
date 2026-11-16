@@ -64,18 +64,9 @@ index on, whatever is readable), `InputUp` (it fades in from the index),
 `Route` (it crossfades to another flow over the ramp length from the
 index) and `Strip` (one parameter of an input's channel strip, a
 `samplez_dsp::StripParam`, ramping over the ramp length). Each sets an
-absolute target, so an entry applied again changes nothing.
-
-Each input of 1 to 8 channels has a strip: trim, per-leg trim and
-polarity, high-pass, a four-band equaliser, gate and compressor
-(`samplez_dsp::strip`). It runs on every block computed, after the
-input's copy, fade-in or crossfade and before the matrix, and passes
-its input unchanged until an entry sets it. Its ramps advance over
-skipped samples, as the matrix's do; its filter and envelope state
-follows the samples it processed, so after a skip or a silenced read it
-differs from that of an engine that computed them. An entry for an
-input wider than 8 channels, or one its strip refuses, is refused when
-appended (`append`) or set (`set_strip`). `InputUp` and `Route` need a new input generation:
+absolute target, so an entry applied again once its ramp has ended
+changes nothing; applied again while it ramps, it starts the ramp over
+from where it is. `InputUp` and `Route` need a new input generation:
 the engine builds it when the entry is appended, one at a time, and
 swaps it in at the entry's index. The status reports the 99.99th
 percentile of the build times and buildLead, how far ahead such entries
@@ -84,6 +75,21 @@ when an input is pruned and `InputUp` once it has been on time for a
 second, and each `InputUp` or `Route` at least buildLead after the one
 before; `Engine::start_replicated` takes entries through `append`,
 `commit` and `truncate` and sends those reports out instead.
+
+Each input of 1 to 8 channels has a strip: trim, per-leg trim and
+polarity, high-pass, a four-band equaliser, gate and compressor
+(`samplez_dsp::strip`). It runs on every block computed, after the
+input's copy, fade-in or crossfade and before the matrix, and passes
+its input unchanged until an entry sets it. Its ramps advance over
+skipped samples, as the matrix's do; its filter and envelope state
+follows the samples it processed, so after a skip or a silenced read it
+differs from that of an engine that computed them. Strips are not part
+of a state copy yet, so until then a replica that skipped converges
+with the others only through its strips' time constants. An entry for
+an input wider than 8 channels, or one its strip refuses, is refused
+when appended (`append`) or set (`set_strip`); one that a strip on the
+RT thread still refuses is counted in `strip_refused`, not applied, and
+marks the engine diverged.
 
 `Engine::start_replicated` takes the set's voter count. With one voter
 the engine commits every block at once. With more, each block of each

@@ -217,9 +217,9 @@ fn two_engines_hash_the_pages_both_computed_alike() {
 /// Two engines on the same input and the same strip entries hash every
 /// page both computed alike: the strips' ramps, filters and dynamics
 /// compute the same bits on both, and the pages they change differ from
-/// the input's. A disturbed block changes a strip's filter and envelope
-/// state beyond the ramp, so a run disturbed after the first entry is
-/// run again.
+/// the input's. A skip or a silenced block changes a strip's filter and
+/// envelope state beyond the ramp, so pages are compared up to the first
+/// one; a run with fewer than six strip pages before it runs again.
 #[test]
 fn two_engines_with_strips_hash_the_pages_both_computed_alike() {
     use samplez_dsp::strip::{BandType, CompParams, EqBand, GateParams, StripParam};
@@ -293,22 +293,32 @@ fn two_engines_with_strips_hash_the_pages_both_computed_alike() {
             }
             r.e.commit(params.len() as u64);
         }
-        // A skip leaves a strip's state without the samples skipped.
-        let skipped = |r: &Replica| r.e.counters().overrun_skipped_samples.load(Relaxed);
-        let before = skipped(&a) + skipped(&b);
         wait_all(&[&a, &b], (at2 + 24 * PAGE) / B);
-        let disturbed: Vec<_> = a.disturbed().into_iter().chain(b.disturbed()).collect();
-        if let Some((from, _)) = disturbed.iter().find(|&&(_, to)| to > at / PAGE) {
-            return Err(format!("page {from} disturbed"));
-        }
-        let after = skipped(&a) + skipped(&b);
-        if after > before {
-            return Err(format!("{} samples skipped", after - before));
+        // A skip or a silenced read leaves a strip's state without those
+        // samples until it converges: pages are compared up to the first
+        // one either engine had after the strip left its rest at `at`.
+        let mut cut = u64::MAX;
+        let mut disturbed = Vec::new();
+        for r in [&a, &b] {
+            let vs: Vec<BlockVerdict> = r.verdicts.try_iter().collect();
+            for w in vs.windows(2) {
+                if w[1].k > w[0].k + 1 && w[1].k * B > at {
+                    cut = cut.min(((w[0].k + 1) * B).max(at));
+                }
+            }
+            for v in vs.iter().filter(|v| v.silenced != 0) {
+                let (from, to) = (v.k * B, (v.k + 1) * B + u64::from(RAMP));
+                disturbed.push((from / PAGE, to.div_ceil(PAGE)));
+                if to > at {
+                    cut = cut.min(from.max(at));
+                }
+            }
         }
         let (pa, pb) = (a.pages(), b.pages());
         let pairs: Vec<_> = pa
             .iter()
             .filter_map(|(p, ha)| Some((*ha, *pb.get(p)?)))
+            .filter(|(h, _)| (h.page + 1) * PAGE <= cut)
             .filter(|(h, _)| !disturbed.iter().any(|d| (d.0..d.1).contains(&h.page)))
             .collect();
         for (ha, hb) in &pairs {
@@ -321,16 +331,21 @@ fn two_engines_with_strips_hash_the_pages_both_computed_alike() {
             );
         }
         let strip_pages = pairs.iter().filter(|h| h.0.page > at / PAGE).count();
-        if strip_pages < 20 {
+        if strip_pages < 6 {
             return Err(format!("{strip_pages} pages with the strip compared"));
         }
         // The pilot repeats every three pages: the strip changes them,
-        // so no page after the entries hashes as the page three before.
+        // so no compared page after the entries hashes as the page three
+        // before them.
         let hash = |p: u64| pa.get(&p).map(|h| h.hash);
-        let ends = (at2 + 2 * B) / PAGE + 4;
-        for p in (at / PAGE + 1..ends).filter(|p| hash(*p).is_some()) {
+        for (h, _) in pairs.iter().filter(|h| h.0.page > at / PAGE) {
+            let p = h.page;
             if let Some(before) = hash(p - 3 * ((p - at / PAGE) / 3 + 1)) {
-                assert_ne!(hash(p), Some(before), "page {p} unchanged by the strip");
+                assert_ne!(
+                    Some(h.hash),
+                    Some(before),
+                    "page {p} unchanged by the strip"
+                );
             }
         }
         Ok(())

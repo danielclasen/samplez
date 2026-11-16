@@ -17,10 +17,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Matrix, PlanarBuffer, Strip, StripParam};
+use samplez_dsp::{Matrix, PlanarBuffer, StripParam};
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, InputConfig, Poll, PolledFlow, Recovery,
-    SlotState, Timing,
+    Timing,
 };
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
@@ -30,9 +30,9 @@ use crate::config::Config;
 use crate::meters::{OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
-    BlockVerdict, Change, Command, Control, Counters, EMPTY_STATS, Gen, LogId, LoudnessReset,
-    MeterRecord, Mix, Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE,
-    Shared, Slot, SlotStats, Telemetry, UNRESOLVED,
+    BlockVerdict, Change, Command, Control, Counters, Gen, LogId, LoudnessReset, MeterRecord, Mix,
+    Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared, Slot, SlotStats,
+    Telemetry, UNRESOLVED,
 };
 
 const COMMAND_RING: usize = 64;
@@ -205,7 +205,7 @@ impl std::fmt::Display for GainError {
 impl std::error::Error for GainError {}
 
 /// A log entry for the engine. Each sets an absolute target, so one
-/// applied again changes nothing.
+/// applied again once its ramp has ended changes nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     /// Ramps the gain from input channel `input` to output channel
@@ -757,24 +757,13 @@ impl Engine {
                 in_domains.push(d);
                 in_domains.len() - 1
             });
-            slots.push(Slot {
+            slots.push(Slot::new(
                 domain,
-                first_channel: channel,
-                channels: i.channels as usize,
-                offset: i.offset_samples,
-                state: SlotState::default(),
-                fade_start: None,
-                silenced_last: true,
-                up: true,
-                held: false,
-                xfade: None,
-                prev: SlotState::default(),
-                prune_requested: false,
-                stats: EMPTY_STATS,
-                strip: (i.channels as usize <= MAX_LEGS)
-                    .then(|| Strip::new(i.channels as usize, config.ramp_samples)),
-                strip_pos: None,
-            });
+                channel,
+                i.channels as usize,
+                i.offset_samples,
+                config.ramp_samples,
+            ));
             channel += i.channels as usize;
         }
         let mut outs = Vec::new();
@@ -1819,6 +1808,15 @@ impl Supervisor {
                         "log entry {} ({:?}) at index {} was applied before its generation \
                          arrived, with {PENDING_CHANGES} others awaiting theirs; its \
                          generation is not swapped in",
+                        entry.id, entry.change, entry.at_index
+                    );
+                    log(format_args!("diverged: {reason}"));
+                    self.status().diverged.get_or_insert(reason);
+                }
+                Telemetry::StripRefused { entry } => {
+                    let reason = format!(
+                        "log entry {} ({:?}) at index {} was refused by its slot's strip; \
+                         not applied",
                         entry.id, entry.change, entry.at_index
                     );
                     log(format_args!("diverged: {reason}"));
@@ -3641,6 +3639,73 @@ mod tests {
         until("late block", &|| n(&c.input_late_blocks) > 0);
         until("probe", &|| n(&c.input_probes) > 0);
         assert_eq!(e.status().rt_panic, None);
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// A strip entry the slot's strip refuses on the RT thread, as on a
+    /// replica whose slot has another width than the one the entry was
+    /// checked against, is not applied: it is counted and marks the
+    /// engine diverged.
+    #[test]
+    fn a_strip_entry_refused_on_the_rt_thread_marks_the_engine_diverged() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d07", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d08", "label": "refused",
+                          "group": "refused", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let process = rt::setup_process(&config.rt);
+        let e = Engine::start(config, process, None).unwrap();
+        let c = &e.counters;
+        let until = |what: &str, f: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !f() {
+                assert!(t.elapsed() < Duration::from_secs(10), "no {what}: {c:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        until("block", &|| c.heartbeat_blocks.load(Relaxed) > 0);
+        // Past the checks of set_strip: leg 1 of a mono strip.
+        let refused = StripParam::LegTrim { leg: 1, db: 0.0 };
+        let mut log = e.log.lock().unwrap();
+        let entry = RtEntry {
+            id: log.last + 1,
+            at_index: earliest(&e.api, &e.counters, e.margin, e.lead),
+            change: Change::Strip {
+                slot: 0,
+                param: refused,
+            },
+        };
+        log.append(entry, None, e.counters.entries_consumed.load(Acquire))
+            .unwrap();
+        log.commit(entry.id);
+        drop(log);
+        e.set_strip(0, StripParam::Trim { db: -3.0 }, entry.at_index)
+            .unwrap();
+        until("divergence", &|| e.status().diverged.is_some());
+        let diverged = e.status().diverged.unwrap();
+        assert!(
+            diverged.contains("refused by its slot's strip"),
+            "{diverged}"
+        );
+        // The entry set_strip took is applied; the supervisor's own
+        // InputDown for the missing input may come in between.
+        until("both entries", &|| c.entries_consumed.load(Relaxed) >= 2);
+        assert_eq!(c.strip_refused.load(Relaxed), 1);
+        assert_eq!(c.command_late.load(Relaxed), 0);
         e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
     }
