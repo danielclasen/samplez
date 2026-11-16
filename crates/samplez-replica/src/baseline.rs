@@ -15,7 +15,7 @@ use crate::contact::{Timing, index_at};
 use crate::entry::{Baseline, Body, NodeId};
 use crate::rank::{Class, demoted};
 use crate::report::Own;
-use crate::state::{PageBook, ReplicaState, filling, withheld_from};
+use crate::state::{PAGES_KEPT, PageBook, ReplicaState, filling, withheld_from};
 use crate::verdict::judge;
 
 /// How long the leader waits for a decision it appended to show in the
@@ -229,6 +229,10 @@ impl Leader {
             // Every page some voter still reports: a new leader judges
             // the pages of the election too.
             let pages = v.pages.pages(o);
+            let newest = reporting
+                .iter()
+                .filter_map(|a| v.pages.newest(a.id, o))
+                .max();
             let judged = self.judged.entry(o).or_default();
             judged.retain(|q| pages.contains(q));
             for q in &pages {
@@ -236,11 +240,12 @@ impl Leader {
                     continue;
                 }
                 // Every replica that may report it did, or reported a
-                // later page.
+                // later page, or no longer hashes the output.
                 let complete = reporting.iter().all(|a| {
                     v.pages.get(a.id, o, *q).is_some()
                         || v.pages.newest(a.id, o).is_some_and(|n| n > *q)
                         || v.pages.of(a.id, o).is_none()
+                        || stopped(v, a, o, newest)
                 });
                 if !complete {
                     break;
@@ -279,6 +284,24 @@ impl Leader {
         }
         out
     }
+}
+
+/// Whether `a` no longer hashes output `o`: it reports the output idle,
+/// or its newest page of it lags the newest any replica reported by more
+/// than the pages the book keeps.
+fn stopped(v: &LeaderView, a: &Voter, o: u32, newest: Option<u64>) -> bool {
+    let idle = a.own.is_some_and(|own| {
+        matches!(
+            own.standing.get(o as usize),
+            None | Some(Standing::Idle { .. })
+        )
+    });
+    let lags = v
+        .pages
+        .newest(a.id, o)
+        .zip(newest)
+        .is_some_and(|(n, m)| n + (PAGES_KEPT as u64) < m);
+    idle || lags
 }
 
 /// Whether a committed status in `own` at or after the baseline's P names
@@ -648,6 +671,18 @@ mod tests {
         }
     }
 
+    fn record(q: u64, hash: u64) -> crate::report::Page {
+        crate::report::Page {
+            output: 0,
+            page: q,
+            hash,
+            fingerprint: 1,
+            committed: true,
+            degraded: false,
+            digest: Some(HEALTHY),
+        }
+    }
+
     /// A replica committing while no `Baseline` is applied (one voter
     /// commits without its entry) is named once the set grows.
     #[tokio::test(start_paused = true)]
@@ -680,5 +715,31 @@ mod tests {
         let mut leader = Leader::default();
         assert_eq!(named(&f.decide(&mut leader)), Some(a(1)));
         assert_eq!(leader.counts.renamed, 1);
+    }
+
+    /// A replica that still reports but no longer hashes an output it
+    /// reported pages of once does not hold the verdicts on that output
+    /// back.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_idle_on_an_output_does_not_halt_its_verdicts() {
+        let k = 1_000_000;
+        let q = 900;
+        let mut f = Fixture::new(vec![
+            (a(0), false, committing_own(k)),
+            (a(1), false, committing_own(k)),
+            (a(2), false, own(ReplicaState::Withdrawn, k)),
+        ]);
+        f.owns[2].2.standing = vec![Standing::Idle { since: 0 }];
+        f.pages.fold(a(2), &[record(q - 1, 1)]);
+        for x in [a(0), a(1)] {
+            f.pages.fold(x, &[record(q, 1), record(q + 1, 1)]);
+        }
+        let mut leader = Leader::default();
+        f.decide(&mut leader);
+        let judged = &leader.judged[&0];
+        assert!(
+            judged.contains(&q) && judged.contains(&(q + 1)),
+            "{judged:?}"
+        );
     }
 }
