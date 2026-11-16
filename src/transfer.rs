@@ -10,7 +10,10 @@
 //! replica. The RT thread copies it into a buffer allocated off the RT
 //! thread, of the same shape, so the copy allocates nothing.
 
+use std::sync::atomic::Ordering::Relaxed;
+
 use samplez_dsp::Matrix;
+use samplez_mxl::time;
 
 use crate::blocks::PageHash;
 use crate::engine::Entry;
@@ -96,10 +99,29 @@ impl Core {
 /// A replayed core after block `j`, which knew the log entries up to
 /// `last_id`, for the RT thread to install before block `j + 1`.
 pub(crate) struct Handover {
+    /// Numbers the hand-overs, so that the answer to one a caller gave up
+    /// on is told apart from the answer to the next.
+    pub seq: u64,
     pub j: u64,
     pub last_id: LogId,
     pub core: Box<Core>,
-    pub installed: bool,
+    pub answer: Answer,
+}
+
+/// What the RT thread did with a hand-over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// Not answered yet.
+    Waiting,
+    Installed,
+    /// The RT thread had started a block after `j + 1`.
+    Passed,
+    /// The RT thread held a pending generation the core did not name.
+    Generation,
+    /// The RT thread had taken entry `id`, above the core's `last_id`,
+    /// off its pending list: applied, or reported late. Installed, the
+    /// core would lose it.
+    Missed(LogId),
 }
 
 /// The core after block `k0`, and the highest log id the RT thread had
@@ -120,6 +142,8 @@ pub struct Replay {
     pub(crate) hashes: rtrb::Consumer<PageHash>,
     pub(crate) control: rtrb::Producer<Control>,
     pub(crate) pages: Vec<PageHash>,
+    /// The blocks computed with an input silenced, not yet taken.
+    pub(crate) silenced: Vec<u64>,
     /// The next block it computes.
     pub(crate) next: u64,
     /// The highest log id it knows.
@@ -181,11 +205,26 @@ impl Replay {
         self.control.push(c).map_err(|_| ReplayError::Full)
     }
 
-    /// Computes the blocks up to `k`.
+    /// Computes the blocks up to `k`, or up to the newest block due if
+    /// that is lower: the input of a later block may not be written yet.
     pub fn run_to(&mut self, k: u64) {
+        let rt = &self.rt;
+        let now = time::now(&rt.api);
+        if let Some(due) = time::newest_due_block(&rt.api, now, rt.block, rt.margin) {
+            self.run(k.min(due));
+        }
+    }
+
+    /// Computes the blocks up to `k`, whose input must be written.
+    pub(crate) fn run(&mut self, k: u64) {
+        let silenced = |rt: &Rt| rt.counters.input_silenced_blocks.load(Relaxed);
         while self.next <= k {
+            let before = silenced(&self.rt);
             self.rt.control();
             self.rt.process(self.next, u64::MAX);
+            if silenced(&self.rt) != before {
+                self.silenced.push(self.next);
+            }
             self.pages
                 .extend(std::iter::from_fn(|| self.hashes.pop().ok()));
             self.next += 1;
@@ -195,6 +234,14 @@ impl Replay {
     /// The page hashes computed since the last call, `committed` false.
     pub fn pages(&mut self) -> Vec<PageHash> {
         std::mem::take(&mut self.pages)
+    }
+
+    /// The blocks computed since the last call with an input silenced:
+    /// the input was not readable, a late write or one the history no
+    /// longer held, or the slot was down. Their pages and those of the
+    /// fade-in after them depend on more than the input and the log.
+    pub fn silenced(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.silenced)
     }
 }
 
@@ -214,6 +261,9 @@ pub enum ReplayError {
     Full,
     /// No hand-over was installed within the timeout.
     Timeout,
+    /// The RT thread had taken entry `id`, which the core did not know,
+    /// off its pending list: the core must know it to be installed.
+    Missed { id: LogId },
 }
 
 impl std::fmt::Display for ReplayError {
@@ -226,6 +276,12 @@ impl std::fmt::Display for ReplayError {
             }
             ReplayError::Full => write!(f, "the replay's pending list or control ring is full"),
             ReplayError::Timeout => write!(f, "no hand-over installed within the timeout"),
+            ReplayError::Missed { id } => {
+                write!(
+                    f,
+                    "the RT thread took entry {id}, which the core does not know"
+                )
+            }
         }
     }
 }

@@ -34,7 +34,7 @@ use crate::rt_loop::{
     Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared, Slot, SlotStats,
     Telemetry, UNRESOLVED,
 };
-use crate::transfer::{CopyError, Core, CoreCopy, Handover, Replay, ReplayError};
+use crate::transfer::{Answer, CopyError, Core, CoreCopy, Handover, Replay, ReplayError};
 
 const COMMAND_RING: usize = 64;
 const RETURN_RING: usize = 64;
@@ -388,7 +388,9 @@ struct Transfer {
     handed: rtrb::Consumer<Handover>,
     /// A hand-over is with the RT thread.
     handing: bool,
-    /// The buffer of a copy refused by the guard, for the next one.
+    /// The number of the last hand-over sent.
+    seq: u64,
+    /// A core buffer not in use, for the next copy or hand-over.
     spare: Option<Box<Core>>,
     /// Input and output channels, input slots and the room for one
     /// page's entries: the shape of a core buffer.
@@ -929,6 +931,7 @@ impl Engine {
                     handovers: handovers_tx,
                     handed: handed_rx,
                     handing: false,
+                    seq: 0,
                     spare: None,
                     shape: (
                         config.input_channels(),
@@ -1729,17 +1732,26 @@ impl Engine {
             hashes,
             control,
             pages: Vec::new(),
+            silenced: Vec::new(),
             next: copy.k0 + 1,
             last_id: copy.last_id,
         })
     }
 
-    /// Replicated mode with more than one voter: runs `replay` up to the
-    /// newest block due and passes its state to the RT thread, which
-    /// installs it before its next block if it has not started that
-    /// block and computes on from it; else the replay runs on and tries
-    /// again, until `timeout`. Returns the block the installed state
-    /// followed. The unresolved entries become the replay's.
+    /// Replicated mode with more than one voter: passes `replay`'s state
+    /// to the RT thread, which installs it before its next block and
+    /// computes on from it. The RT thread installs a core only before the
+    /// block after the core's: once it computed a block, the replay runs
+    /// up to that block and its state is passed on at once, before the
+    /// RT thread's next wake. One that comes back refused for a block the
+    /// RT thread passed, or for a pending generation it does not name,
+    /// is tried again until `timeout`. Returns the block the installed
+    /// state followed. The unresolved entries become the replay's.
+    /// [`ReplayError::Missed`] when the RT thread took an entry off its
+    /// pending list that the replay does not know: append it, then hand
+    /// over again. An answer to a call that timed out is taken by the
+    /// next call: if that hand-over was installed, the unresolved entries
+    /// become its core's.
     pub fn hand_over(&self, replay: &mut Replay, timeout: Duration) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
             return Err(ReplayError::Invalid(
@@ -1749,53 +1761,81 @@ impl Engine {
         let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + timeout;
         let (n, m, slots, page) = t.shape;
-        let mut core = Box::new(Core::new(n, m, slots, page));
+        let new = || Box::new(Core::new(n, m, slots, page));
+        let mut core = t.spare.take().unwrap_or_else(new);
+        // Hand-overs before this one were sent by earlier calls.
+        let first = t.seq + 1;
+        let poll =
+            Duration::from_nanos(self.block * 1_000_000_000 / samplez_mxl::SAMPLE_RATE as u64 / 16);
+        let processed = || self.counters.processed.load(Acquire);
         loop {
             // The RT thread answers at its next wake. One unanswered for a
             // second can only be refused: the RT thread is then past its
             // block. The next call collects the answer.
             let asked = Instant::now();
             while t.handing {
-                if asked.elapsed() > Duration::from_secs(1) {
-                    return Err(ReplayError::Timeout);
+                let Ok(h) = t.handed.pop() else {
+                    if asked.elapsed() > Duration::from_secs(1) {
+                        t.spare = Some(core);
+                        return Err(ReplayError::Timeout);
+                    }
+                    std::thread::sleep(poll);
+                    continue;
+                };
+                t.handing = false;
+                if h.answer == Answer::Installed {
+                    let mut control = control.lock().expect("control lock");
+                    control.unresolved.clear();
+                    control
+                        .unresolved
+                        .extend(h.core.unresolved.iter().map(|u| u.0));
                 }
-                if let Ok(h) = t.handed.pop() {
-                    t.handing = false;
-                    if h.installed {
-                        let mut control = control.lock().expect("control lock");
-                        control.unresolved.clear();
-                        control
-                            .unresolved
-                            .extend(h.core.unresolved.iter().map(|u| u.0));
+                match h.answer {
+                    _ if h.seq < first => {}
+                    Answer::Installed => {
+                        t.spare = Some(h.core);
                         return Ok(h.j);
                     }
-                    core = h.core;
-                } else {
-                    std::thread::sleep(Duration::from_millis(1));
+                    Answer::Missed(id) => {
+                        t.spare = Some(h.core);
+                        return Err(ReplayError::Missed { id });
+                    }
+                    Answer::Passed | Answer::Generation | Answer::Waiting => {}
                 }
+                core = h.core;
             }
             if Instant::now() >= deadline {
+                t.spare = Some(core);
                 return Err(ReplayError::Timeout);
             }
-            let now = time::now(&self.api);
-            let Some(newest) = time::newest_due_block(&self.api, now, self.block, self.margin)
-            else {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            };
-            replay.run_to(newest);
+            // Up to the last block the RT thread computed, then the step
+            // to the next one: the RT thread sleeps after it until its
+            // next wake, which installs a core for that block.
+            let p = processed();
+            replay.run(p.saturating_sub(1));
+            let p = processed();
+            while processed() == p {
+                if Instant::now() >= deadline {
+                    t.spare = Some(core);
+                    return Err(ReplayError::Timeout);
+                }
+                std::thread::sleep(poll);
+            }
+            replay.run(processed().saturating_sub(1));
             replay.rt.capture(&mut core);
+            t.seq += 1;
             let h = Handover {
+                seq: t.seq,
                 j: replay.next - 1,
                 last_id: replay.last_id,
                 core,
-                installed: false,
+                answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
                 unreachable!("one hand-over is with the RT thread at most");
             }
             t.handing = true;
-            core = Box::new(Core::new(n, m, slots, page));
+            core = t.spare.take().unwrap_or_else(new);
         }
     }
 
@@ -4132,10 +4172,11 @@ mod tests {
         wait(&|| e.counters.processed.load(Acquire) > copy.k0 + 2);
         let mut t = e.transfer.as_ref().unwrap().lock().unwrap();
         let h = Handover {
+            seq: 1,
             j: copy.k0,
             last_id: copy.last_id,
             core: copy.core,
-            installed: true,
+            answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
         let h = loop {
@@ -4144,10 +4185,66 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         };
-        assert!(!h.installed);
-        assert_eq!(e.counters.handovers_refused.load(Relaxed), 1);
+        assert_eq!(h.answer, Answer::Passed);
+        assert_eq!(e.counters.handovers_passed.load(Relaxed), 1);
         assert_eq!(e.counters.handovers_installed.load(Relaxed), 0);
         drop(t);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// The answer to a hand-over whose caller gave up goes to the next
+    /// call, which does not take it for its own: that call installs its
+    /// own core.
+    #[test]
+    fn a_late_answer_is_not_taken_for_the_next_handover() {
+        let (e, _statuses, _verdicts, domain) = outputs_only("handover-late", 1);
+        let copy = || loop {
+            match e.copy_core(Duration::from_secs(2)) {
+                Err(CopyError::Passed { .. }) => continue,
+                c => break c.unwrap(),
+            }
+        };
+        let n = |c: &AtomicU64| c.load(Relaxed);
+        let processed = || e.counters.processed.load(Acquire);
+        // An earlier call's hand-over, installed once that call gave up.
+        while n(&e.counters.handovers_installed) == 0 {
+            let mut replay = e.replay(copy()).unwrap();
+            let mut t = e.transfer.as_ref().unwrap().lock().unwrap();
+            let (inputs, outputs, slots, page) = t.shape;
+            let mut core = Box::new(Core::new(inputs, outputs, slots, page));
+            let p = processed();
+            while processed() == p {
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            replay.run(processed() - 1);
+            replay.rt.capture(&mut core);
+            t.seq += 1;
+            let h = Handover {
+                seq: t.seq,
+                j: replay.next - 1,
+                last_id: replay.last_id,
+                core,
+                answer: Answer::Waiting,
+            };
+            assert!(t.handovers.push(h).is_ok());
+            t.handing = true;
+            let answered = n(&e.counters.handovers_passed);
+            wait(&|| {
+                n(&e.counters.handovers_installed) > 0 || n(&e.counters.handovers_passed) > answered
+            });
+            if n(&e.counters.handovers_installed) == 0 {
+                while t.handed.pop().is_err() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                t.handing = false;
+            }
+        }
+        let mut replay = e.replay(copy()).unwrap();
+        let next = replay.next_block();
+        let j = e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        assert!(j >= next, "the late answer's block {j} returned");
+        assert_eq!(n(&e.counters.handovers_installed), 2);
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

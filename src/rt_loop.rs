@@ -25,7 +25,7 @@ use samplez_mxl::{MxlApi, time};
 use crate::blocks::{
     Cause, Changes, Ctx, Hold, Kind, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
-use crate::transfer::{Core, CoreCopy, Handover, SlotCore};
+use crate::transfer::{Answer, Core, CoreCopy, Handover, SlotCore};
 
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
@@ -120,9 +120,15 @@ pub struct Counters {
     pub page_hashes_dropped: AtomicU64,
     /// Replayed cores installed at a block boundary.
     pub handovers_installed: AtomicU64,
-    /// Replayed cores refused: the RT thread had passed their block, or
-    /// held a generation they did not name.
-    pub handovers_refused: AtomicU64,
+    /// Replayed cores refused: the RT thread had started a block after
+    /// the one after theirs.
+    pub handovers_passed: AtomicU64,
+    /// Replayed cores refused: the RT thread held a pending generation
+    /// they did not name.
+    pub handovers_generation: AtomicU64,
+    /// Replayed cores refused: the RT thread had taken an entry they did
+    /// not know off its pending list.
+    pub handovers_missed: AtomicU64,
     /// Pending entries a hand-over found no room for.
     pub handover_entries_lost: AtomicU64,
     /// Page hashes the supervisor could not pass on: the replicated
@@ -812,6 +818,9 @@ pub(crate) struct Mix {
     pub due: Vec<(RtEntry, bool)>,
     /// Entries applied: gain changes the matrix took, and the others.
     pub applied: u64,
+    /// The highest log id taken off the pending list: applied, reported
+    /// late, or passed to the loop.
+    pub last_taken: LogId,
     /// The `(log id, at_index)` of the entries applied whose index lies
     /// in page `entries_page`, for its fingerprint. Empty capacity when
     /// no page is hashed; else room for every entry one page can take:
@@ -833,6 +842,7 @@ impl Mix {
             pending: Vec::with_capacity(PENDING_CHANGES),
             due: Vec::with_capacity(PENDING_CHANGES),
             applied: 0,
+            last_taken: 0,
             page_entries: Vec::new(),
             entries_page: None,
             entries_lost: false,
@@ -909,6 +919,7 @@ impl Mix {
             && c.at_index <= start
         {
             self.pending.remove(0);
+            self.last_taken = self.last_taken.max(c.id);
             let Change::Gain {
                 input,
                 output,
@@ -2102,8 +2113,9 @@ impl Rt {
 
     /// Installs a replayed core whose last block is the one before
     /// `first`, the first block this wake computes. One for a block
-    /// still to come waits; one this thread passed, or that names a
-    /// generation other than the one held here, goes back refused.
+    /// still to come waits; one this thread passed, that names a
+    /// generation other than the one held here, or that misses an entry
+    /// this thread took off its pending list goes back refused.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn take_handover(&mut self, first: u64) {
         let Some(r) = self.replica.as_mut() else {
@@ -2121,18 +2133,30 @@ impl Rt {
         let Ok(mut h) = r.handovers.pop() else {
             return;
         };
-        let fits = h.j + 1 == first && h.core.pending_gen == self.pending_gen.as_ref().map(|p| p.0);
-        if fits {
-            self.install_core(&h.core, h.last_id);
-            // The page holding the boundary mixes both states: no record.
-            for p in self.outs.iter_mut().filter_map(|o| o.pages.as_mut()) {
-                p.restart();
-            }
-            add(&self.counters.handovers_installed, 1);
+        h.answer = if h.j + 1 != first {
+            Answer::Passed
+        } else if h.core.pending_gen != self.pending_gen.as_ref().map(|p| p.0) {
+            Answer::Generation
+        } else if self.mix.last_taken > h.last_id {
+            Answer::Missed(self.mix.last_taken)
         } else {
-            add(&self.counters.handovers_refused, 1);
-        }
-        h.installed = fits;
+            Answer::Installed
+        };
+        let counter = match h.answer {
+            Answer::Installed => {
+                self.install_core(&h.core, h.last_id);
+                // The page holding the boundary mixes both states: no
+                // record.
+                for p in self.outs.iter_mut().filter_map(|o| o.pages.as_mut()) {
+                    p.restart();
+                }
+                &self.counters.handovers_installed
+            }
+            Answer::Generation => &self.counters.handovers_generation,
+            Answer::Missed(_) => &self.counters.handovers_missed,
+            Answer::Passed | Answer::Waiting => &self.counters.handovers_passed,
+        };
+        add(counter, 1);
         if let Some(r) = self.replica.as_mut() {
             // Room was checked: nothing is dropped here.
             let _ = r.handed.push(h);

@@ -138,12 +138,17 @@ input domain reading the blocks after k0 from the flows' history, its
 entries and unresolved-entry decisions after the core's last log id
 taken from the caller, and every page it computes whole hashed. A core
 with a generation-needing entry in flight (`InputUp`, `Route`, a pending
-generation or a crossfade) is not replayed. `Engine::hand_over` runs the
-clone up to the newest block due and passes its state to the RT thread
-by owned pointer; the RT thread installs it before the next block if it
-has not started that block and still holds the generation the core
-names, keeping pending entries the core did not know, and computes on
-from it. Otherwise the state comes back refused and the clone runs on.
+generation or a crossfade) is not replayed. `Replay::run_to` stops at the
+newest block due, and `Replay::silenced` names the blocks computed with
+an input silenced. `Engine::hand_over` waits for the RT thread to
+compute a block, runs the clone up to it and passes its state to the RT
+thread by owned pointer before the next wake; the RT thread installs it
+before the next block if it has not started that block, still holds the
+generation the core names and took no entry off its pending list that
+the core does not know, keeping pending entries the core did not know,
+and computes on from it. A state refused for a passed block or a
+generation is tried again; one missing an entry returns
+`ReplayError::Missed`. Refusals are counted per cause.
 The status reports the replay speed s, blocks per block period, measured
 at start-up on silence.
 

@@ -12,7 +12,7 @@ use common::{
 };
 use common::{MARGIN, config, diagonal};
 use samplez::blocks::{PAGE, PageHash};
-use samplez::{BlockVerdict, CopyError, Engine, Entry, InputState, Replication};
+use samplez::{BlockVerdict, CopyError, Engine, Entry, InputState, ReplayError, Replication};
 
 /// The copy holds the state after block k0: entries due by then applied
 /// with their ramps run out, later ones pending, the input's log state,
@@ -153,13 +153,28 @@ impl Hashed {
     /// The pages a silenced input block and the fade-in after it touch:
     /// their output depends on more than the input and the log.
     fn disturbed(&self) -> Vec<u64> {
-        self.verdicts
+        let silenced: Vec<u64> = self
+            .verdicts
             .try_iter()
             .filter(|v| v.silenced != 0)
-            .flat_map(|v| v.k * B / PAGE..((v.k + 1) * B + u64::from(RAMP)).div_ceil(PAGE))
-            .collect()
+            .map(|v| v.k)
+            .collect();
+        touched(&silenced)
     }
 }
+
+/// The pages blocks `ks` and the fade-in after each touch.
+fn touched(ks: &[u64]) -> Vec<u64> {
+    ks.iter()
+        .flat_map(|k| k * B / PAGE..((k + 1) * B + u64::from(RAMP)).div_ceil(PAGE))
+        .collect()
+}
+
+/// Hand-overs refused because the RT thread had passed their block
+/// before one landed: each attempt runs the replay up to the block the
+/// RT thread just computed and passes it on before the next wake, so
+/// only a supervisor thread held off the CPU for a block period misses.
+const MAX_PASSED: u64 = 10;
 
 fn gain(e: &Engine, id: u64, at: u64, channel: usize, gain: f32) {
     let entry = Entry::Gain {
@@ -232,6 +247,8 @@ fn a_replayed_core_computes_the_donors_pages() {
         }
         let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
         assert!(j > past2, "handed over at block {j}");
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        assert!(passed < MAX_PASSED, "{passed} hand-overs passed");
         let end = (at3 + u64::from(RAMP)) / B + 4 * PAGE / B;
         wait_for(Duration::from_secs(10), "entry 3 ramped", || {
             processed(&a.e) > end && processed(&b.e) > end
@@ -243,7 +260,12 @@ fn a_replayed_core_computes_the_donors_pages() {
         assert_eq!(later.core.unresolved(), &[]);
 
         let (pa, pb) = (a.pages(), b.pages());
-        let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+        let disturbed: Vec<u64> = a
+            .disturbed()
+            .into_iter()
+            .chain(b.disturbed())
+            .chain(touched(&replay.silenced()))
+            .collect();
         let clean = |p: &u64| !disturbed.contains(p);
         // The replay against the donor, on every page both computed.
         let replayed = replay.pages();
@@ -298,4 +320,118 @@ fn a_replayed_core_computes_the_donors_pages() {
         assert!(differ > 0, "the joiner never diverged");
         Ok(())
     });
+}
+
+/// An entry the replay applied before the hand-over, which reaches the
+/// joiner's RT thread only after it, is not taken again: its index
+/// passed, it would count late and degrade blocks the donor computed
+/// clean. The replay never computes a block whose input may still be
+/// unwritten.
+#[test]
+fn an_entry_the_replay_applied_is_not_taken_again() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        let mut replay = b.e.replay(copy(&a.e)).unwrap();
+        // The RT thread computes a block once its input is in, before it
+        // is due: the copy can follow a block not due yet.
+        let start = replay.next_block();
+        replay.run_to(now_block() + 100);
+        let due = now_block() - MARGIN / B;
+        assert!(
+            replay.next_block() <= start.max(due),
+            "the replay ran to block {}, {due} due",
+            replay.next_block()
+        );
+        let at = (now_block() + 20) * B;
+        gain(&a.e, 1, at, 0, 0.5);
+        let entry = Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.5,
+        };
+        replay.append(1, at, &entry).unwrap();
+        let past = (at + u64::from(RAMP)) / B + PAGE / B;
+        while now_block() <= past + MARGIN / B + 2 {
+            std::thread::sleep(Duration::from_millis(5));
+            replay.run_to(now_block());
+        }
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        assert!(j * B > at, "handed over at block {j}");
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        assert!(passed < MAX_PASSED, "{passed} hand-overs passed");
+        let late = b.e.counters().command_late.load(Relaxed);
+        gain(&b.e, 1, at, 0, 0.5);
+        let end = j + 4 * PAGE / B;
+        wait_for(Duration::from_secs(5), "pages after the hand-over", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        assert_eq!(b.e.counters().command_late.load(Relaxed), late);
+
+        let (pa, pb) = (a.pages(), b.pages());
+        let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+        let mut equal = 0;
+        for (p, hb) in pb
+            .iter()
+            .filter(|(p, _)| *p * PAGE >= (j + 1) * B && !disturbed.contains(p))
+        {
+            let Some(ha) = pa.get(p) else { continue };
+            assert_eq!(
+                (hb.hash, hb.fingerprint),
+                (ha.hash, ha.fingerprint),
+                "page {p}"
+            );
+            equal += 1;
+        }
+        if equal < 2 {
+            return Err(format!("{equal} pages after the hand-over compared"));
+        }
+        Ok(())
+    });
+}
+
+/// A core missing an entry the joiner's RT thread took off its pending
+/// list is refused: installed, it would drop the entry, and the joiner
+/// would compute without it what the donor computed with it.
+#[test]
+fn a_core_missing_an_entry_the_rt_thread_took_is_refused() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let b = hashed(&domain, &src);
+    let mut replay = b.e.replay(copy(&b.e)).unwrap();
+    let at = (now_block() + 5) * B;
+    gain(&b.e, 1, at, 0, 0.5);
+    wait_for(Duration::from_secs(5), "entry 1 applied", || {
+        processed(&b.e) > at / B
+    });
+    assert_eq!(
+        b.e.hand_over(&mut replay, Duration::from_secs(2)),
+        Err(ReplayError::Missed { id: 1 })
+    );
+    let c = b.e.counters();
+    assert_eq!(c.handovers_missed.load(Relaxed), 1);
+    assert_eq!(c.handovers_installed.load(Relaxed), 0);
+    b.e.stop();
+}
+
+/// A replay names the blocks it computed with an input silenced: those
+/// of a core older than the history the flow keeps, whose input is gone.
+#[test]
+fn a_replay_names_its_silenced_blocks() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let b = hashed(&domain, &src);
+    let copy = copy(&b.e);
+    let k0 = copy.k0;
+    // The test domain's flows keep a ring of two seconds.
+    std::thread::sleep(Duration::from_millis(2500));
+    let mut replay = b.e.replay(copy).unwrap();
+    replay.run_to(k0 + 10);
+    assert_eq!(replay.silenced(), (k0 + 1..k0 + 11).collect::<Vec<_>>());
+    assert_eq!(replay.silenced(), Vec::<u64>::new());
+    b.e.stop();
 }
