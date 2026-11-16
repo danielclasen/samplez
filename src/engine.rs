@@ -1762,7 +1762,7 @@ impl Engine {
         // Up to the last block the RT thread computed, before the first
         // attempt.
         replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
-        self.offer(timeout, |j, core| {
+        self.offer(timeout, true, |j, core| {
             replay.run(j);
             replay.rt.capture(core);
             (replay.next - 1, replay.last_id)
@@ -1785,9 +1785,9 @@ impl Engine {
 
     /// Replicated mode with more than one voter: builds a core from
     /// `state` off the RT thread, its targets at their values, its fades
-    /// and ramps cold, its pending entries and the generation this engine
-    /// holds pending, and installs it at a block boundary as a replay is
-    /// handed over. Returns the block the core followed. The core holds no
+    /// and ramps cold, its pending entries, and installs it at a block
+    /// boundary as a replay is handed over, the RT thread keeping the
+    /// generation it holds pending. Returns the block the core followed. The core holds no
     /// unresolved entry: the caller adds the ones still unresolved with
     /// [`Engine::unresolved`] after the install. While no core is held the
     /// RT thread takes the entries needing no generation whose index
@@ -1821,7 +1821,7 @@ impl Engine {
         if pending.len() > PENDING_CHANGES {
             return Err(ReplayError::Full);
         }
-        self.offer(timeout, |j, core| {
+        self.offer(timeout, false, |j, core| {
             for (i, row) in state.gains.iter().enumerate() {
                 for (o, &g) in row.iter().enumerate() {
                     let _ = core.matrix.set(i, o, g, 0);
@@ -1867,9 +1867,10 @@ impl Engine {
                 };
             }
             core.awaiting_gen.clear();
-            // Read at each attempt: a new pending generation refuses a
-            // core naming the one before.
-            core.pending_gen = self.status().generation.pending;
+            // The RT thread keeps the generation it holds pending: the
+            // supervisor sends one only once its entry is committed, so
+            // the status can name one the RT thread does not hold yet.
+            core.pending_gen = None;
             core.unresolved.clear();
             core.late_routes.clear();
             core.late_lost_until = 0;
@@ -1882,10 +1883,13 @@ impl Engine {
     /// before the block after the core's: each attempt waits for it to
     /// compute a block, has `make` fill a core for that block at once and
     /// passes it on before the RT thread's next wake. `make` returns the
-    /// block the core follows and the highest log id it knew.
+    /// block the core follows and the highest log id it knew. With
+    /// `names_gen` the core must name the pending generation the RT
+    /// thread holds.
     fn offer(
         &self,
         timeout: Duration,
+        names_gen: bool,
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
@@ -1965,6 +1969,7 @@ impl Engine {
                 j,
                 last_id,
                 core,
+                names_gen,
                 answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
@@ -4313,6 +4318,7 @@ mod tests {
             j: copy.k0,
             last_id: copy.last_id,
             core: copy.core,
+            names_gen: true,
             answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
@@ -4472,6 +4478,7 @@ mod tests {
                 j: stale,
                 last_id: replay.last_id,
                 core,
+                names_gen: true,
                 answer: Answer::Waiting,
             };
             assert!(t.handovers.push(h).is_ok());
@@ -4518,7 +4525,7 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5), "no stall");
         }
         let mut calls = Vec::new();
-        let _ = e.offer(Duration::from_secs(1), |j, _| {
+        let _ = e.offer(Duration::from_secs(1), true, |j, _| {
             calls.push((j, processed()));
             (j, 0)
         });
@@ -4540,7 +4547,9 @@ mod tests {
         let before = e.counters.handovers_passed.load(Relaxed);
         // Each core follows a block two behind the last one computed:
         // every attempt is refused.
-        let err = e.offer(Duration::from_millis(300), |j, _| (j.saturating_sub(2), 0));
+        let err = e.offer(Duration::from_millis(300), true, |j, _| {
+            (j.saturating_sub(2), 0)
+        });
         let refused = e.counters.handovers_passed.load(Relaxed) - before;
         let Err(ReplayError::Timeout { passed }) = err else {
             panic!("{err:?}");

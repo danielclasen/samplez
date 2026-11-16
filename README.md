@@ -162,7 +162,7 @@ pending list, strip entries applied to the strips the slots keep and the
 others not, and the core installed next must know them.
 `Engine::install_product` builds a core from product state off the RT
 thread (targets at their values, fades and ramps cold, the pending
-entries, the generation the engine holds pending, no unresolved entry)
+entries, no unresolved entry; the RT thread keeps its pending generation)
 and installs it through the same block-boundary hand-over as a replay;
 the first block committed after it follows the withdrawn rules.
 

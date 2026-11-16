@@ -733,3 +733,47 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
         Ok(())
     });
 }
+
+/// A re-route a product state folds in, appended but committed only after
+/// the install, still swaps its generation in. Its generation is built
+/// but held until the commit, so the install must not need the RT thread
+/// to hold it.
+#[test]
+fn a_route_folded_into_a_product_core_still_swaps_in() {
+    let domain = Domain::new();
+    let (src, other) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let _other = Pilot::start(&domain.0, &other, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    h.e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 5
+    });
+    let at = (processed(&h.e) + 200) * B;
+    let route = Entry::Route {
+        slot: 0,
+        flow_id: other.clone(),
+    };
+    h.e.append(1, at, route).unwrap();
+    wait_for(Duration::from_secs(5), "generation built", || {
+        h.e.status().generation.ready
+    });
+    wait_for(Duration::from_secs(5), "index passed", || {
+        processed(&h.e) > at / B + 10
+    });
+    let state = ProductState {
+        gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        pending: Vec::new(),
+        last_id: 1,
+    };
+    h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    h.e.commit(1);
+    wait_for(Duration::from_secs(5), "routed", || {
+        let s = h.e.status();
+        s.inputs[0].flow_id == other && s.generation.pending.is_none()
+    });
+    assert_eq!(c.command_late.load(Relaxed), 0);
+    h.e.stop();
+}

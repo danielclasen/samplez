@@ -105,6 +105,10 @@ pub(crate) struct Handover {
     pub j: u64,
     pub last_id: LogId,
     pub core: Box<Core>,
+    /// The core names the pending generation it was computed with, which
+    /// the RT thread must hold. A core built from product state was
+    /// computed with none and keeps the RT thread's.
+    pub names_gen: bool,
     pub answer: Answer,
 }
 

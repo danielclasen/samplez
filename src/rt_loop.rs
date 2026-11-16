@@ -2257,7 +2257,7 @@ impl Rt {
         };
         h.answer = if h.j + 1 != first {
             Answer::Passed
-        } else if h.core.pending_gen != self.pending_gen.as_ref().map(|p| p.0) {
+        } else if h.names_gen && h.core.pending_gen != self.pending_gen.as_ref().map(|p| p.0) {
             Answer::Generation
         } else if self.mix.last_taken > h.last_id {
             Answer::Missed(self.mix.last_taken)
