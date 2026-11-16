@@ -611,6 +611,8 @@ async fn a_replica_split_at_p_commits_no_healthy_block_after_it() {
     }
     once(&set, &ids, kp - 2, kp + 3);
     pages_whole(&set, &ids, kp - 2, kp + 3);
+    let m = set.replica(r).contact_metrics().unwrap();
+    assert_eq!(m.withholding.withdrawals, 1, "{:?}", m.withholding);
 }
 
 /// A named N committing from P while a withdrawn F fills: F commits

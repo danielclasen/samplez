@@ -40,7 +40,8 @@ pub struct Counts {
     /// Blocks committed through, and those whose evidence used a silence.
     pub through: u64,
     pub through_on_silence: u64,
-    /// Withdrawals on a status naming this replica in `onSilenceOf`.
+    /// Withdrawals on a status naming this replica in `onSilenceOf`, or on
+    /// a block committed through only up to another's commit start.
     pub withdrawals: u64,
 }
 
@@ -417,9 +418,11 @@ impl Withhold {
         }
         self.counts.through += 1;
         self.counts.through_on_silence += u64::from(through != 0);
-        // The engine withdraws the replica as it commits the block up to P.
+        // The engine withdraws the replica as it commits the block up to
+        // P, or withholds it, which withdraws it as well.
         if up_to.is_some() {
             self.counts.other_digest += 1;
+            self.counts.withdrawals += 1;
         }
     }
 }
