@@ -405,6 +405,9 @@ pub struct Options {
     /// it as it is.
     pub wanted: Option<samplez_replica::membership::Voters>,
     pub write_timeout: Duration,
+    /// Whether each replica starts `Replica::begin`, the marker bootstrap
+    /// and the counting watch.
+    pub begin: bool,
 }
 
 impl Default for Options {
@@ -415,6 +418,7 @@ impl Default for Options {
             raft: raft_config("test"),
             wanted: None,
             write_timeout: Duration::from_secs(2),
+            begin: true,
         }
     }
 }
@@ -539,12 +543,14 @@ impl Set {
         .await
         .expect("replica starts");
         let replica = Arc::new(replica);
-        let dir = self.root.join(id.to_string());
-        replica.begin(Bootstrap {
-            markers: self.markers.clone(),
-            volume: Volume::open(&dir).expect("volume opens"),
-            slot: slot_of(id),
-        });
+        if self.options.begin {
+            let dir = self.root.join(id.to_string());
+            replica.begin(Bootstrap {
+                markers: self.markers.clone(),
+                volume: Volume::open(&dir).expect("volume opens"),
+                slot: slot_of(id),
+            });
+        }
         let mut links = self.net.links();
         links.rafts.insert(id, replica.raft().clone());
         links.replicas.insert(id, replica.clone());
