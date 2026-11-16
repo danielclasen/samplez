@@ -1006,6 +1006,56 @@ mod tests {
         }
     }
 
+    /// A gate run once an interval opens and closes at most two
+    /// intervals after one run every sample: its gain, dB, is always
+    /// within the span the per-sample gain had over the two intervals
+    /// before. Its hold counts down by intervals from the end of the one
+    /// with the last key at the threshold, so it starts closing 1 to
+    /// GAIN_INTERVAL samples after the per-sample gate.
+    #[test]
+    fn a_gate_trails_a_per_sample_one_by_two_intervals_at_most() {
+        let late = 2 * GAIN_INTERVAL as usize;
+        for attack_ms in [1.0f32, 10.0] {
+            let p = GateParams {
+                attack_ms,
+                release_ms: 20.0,
+                ..gate(-40.0, 40.0)
+            };
+            for at in 4800..4800 + GAIN_INTERVAL as usize {
+                // Long enough to open fully at 10 ms.
+                let len = 9600;
+                let x = burst(at, len);
+                let db = |y: &[f32]| -> Vec<f32> {
+                    y.iter()
+                        .zip(&x)
+                        .map(|(y, x)| 20.0 * libm::log10f(y / x))
+                        .collect()
+                };
+                let want = db(&per_sample_gate(&p, &x));
+                let mut g = Gate::new();
+                g.set(&p, 0);
+                let got = db(&run(|y| g.process(y, 1, y.len()), &x, 48));
+                let close = |g: &[f32]| (at + len..).find(|&n| g[n] < 0.0).unwrap();
+                assert_eq!(close(&want), at + len - 1 + GATE_HOLD as usize);
+                let lag = close(&got) - close(&want);
+                assert!(
+                    (1..=GAIN_INTERVAL as usize).contains(&lag),
+                    "{attack_ms} ms, burst at {at}: closes {lag} samples late"
+                );
+                for n in late..x.len() {
+                    let span = &want[n - late..=n];
+                    let lo = span.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                    let hi = span.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    assert!(
+                        (lo - 0.01..=hi + 0.01).contains(&got[n]),
+                        "{attack_ms} ms, burst at {at}, sample {n}: {} dB, per sample {lo} .. {hi}",
+                        got[n]
+                    );
+                }
+            }
+        }
+    }
+
     /// An attack set across the bound mid-interval takes effect at the
     /// next multiple of GAIN_INTERVAL: up to it the unit computes the
     /// bits of one left at the old attack, at any block size.
