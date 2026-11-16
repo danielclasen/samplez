@@ -1,5 +1,5 @@
 //! DSP core of samplez: planar buffers, gain ramps, the mixing matrix,
-//! meters, true peak and loudness.
+//! the input channel strip, meters, true peak and loudness.
 //!
 //! Every `process` function works on state and scratch allocated at
 //! construction and does not allocate.
@@ -19,6 +19,8 @@ mod ramp;
 #[cfg(test)]
 mod require;
 mod simd;
+pub mod strip;
+mod svf;
 #[cfg(test)]
 mod test_util;
 mod true_peak;
@@ -30,6 +32,7 @@ pub use matrix::{Matrix, Path};
 pub use meter::Meters;
 pub use mxcsr::{DAZ, FTZ, SavedMxcsr, mxcsr, restore_mxcsr, set_ftz_daz};
 pub use ramp::{MAX_GAIN, MAX_RAMP_LEN, Ramp, valid_gain};
+pub use strip::{BandType, EqBand, Strip, StripParam};
 pub use true_peak::TruePeak;
 
 /// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez-dsp"`,
