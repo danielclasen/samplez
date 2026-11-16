@@ -6,7 +6,6 @@ mod harness;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -28,8 +27,6 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-
-static SETS: AtomicU64 = AtomicU64::new(0);
 
 /// A CA and a certificate for 127.0.0.1 it issued, as `<name>.crt`,
 /// `<name>.key` and `<name>-ca.crt` in `root`.
@@ -86,11 +83,7 @@ struct Set {
 
 impl Set {
     async fn start() -> Set {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "peer-set-{}-{}",
-            std::process::id(),
-            SETS.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = harness::root("peer-set");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let ca = authority();

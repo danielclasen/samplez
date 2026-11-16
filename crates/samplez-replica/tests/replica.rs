@@ -476,8 +476,8 @@ async fn tables_stay_identical_under_the_caps_and_after_a_snapshot_install() {
     };
     // One snapshot, taken by hand once the writes are in: a snapshot
     // built while the leader retries an unreachable peer is sent in place
-    // of the one it planned, which openraft 0.9.21 debug-asserts against
-    // (progress/inflight `ack`).
+    // of the one it planned, which openraft up to 0.9.25 debug-asserted
+    // against (progress/inflight `ack`).
     options.raft.snapshot_policy = openraft::SnapshotPolicy::Never;
     options.raft.max_in_snapshot_log_to_keep = 0;
     options.raft.purge_batch_size = 1;

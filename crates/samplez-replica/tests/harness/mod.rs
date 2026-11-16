@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, Raft, ServerState};
-use samplez_replica::bootstrap::{Bootstrap, Marker, Markers, Volume};
+use samplez_replica::bootstrap::{Bootstrap, Marker, Markers, Volume, random_id};
 use samplez_replica::contact::{self, Audio, Clocks, Sample, Timing};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::Request;
@@ -637,7 +637,16 @@ impl RaftNetwork<TypeConfig> for Link {
     }
 }
 
-static SETS: AtomicU64 = AtomicU64::new(0);
+/// A fresh directory name under the target's tmp dir, for one test's
+/// volumes. The process id alone repeats across containers that share a
+/// target dir, where one test's cleanup would delete another's volumes.
+pub fn root(kind: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "{kind}-{}-{:016x}",
+        std::process::id(),
+        random_id().expect("a random id")
+    ))
+}
 
 /// How a set is built; the defaults are the chart's.
 #[derive(Clone)]
@@ -690,11 +699,7 @@ pub struct Set {
 impl Set {
     /// Starts `options.voters` replicas and initializes them as one set.
     pub async fn start(options: Options) -> Set {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "replica-set-{}-{}",
-            std::process::id(),
-            SETS.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = root("replica-set");
         let _ = std::fs::remove_dir_all(&root);
         let base = Instant::now();
         let ids: Vec<NodeId> = options

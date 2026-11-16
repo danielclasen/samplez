@@ -1306,3 +1306,162 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         ));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state_machine::tests::Paths;
+    use openraft::error::{InstallSnapshotError, RPCError, Unreachable};
+    use openraft::network::{RPCOption, RaftNetwork};
+    use openraft::raft::{
+        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+        InstallSnapshotResponse, VoteRequest, VoteResponse,
+    };
+    use openraft::storage::RaftStorage;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
+    use std::path::PathBuf;
+
+    const ID: NodeId = 7;
+
+    /// A network that reaches no one; a set of one voter sends nothing.
+    struct Nobody;
+
+    fn unreachable<E: std::error::Error>() -> RPCError<NodeId, BasicNode, E> {
+        RPCError::Unreachable(Unreachable::new(&std::io::Error::other("nobody")))
+    }
+
+    impl RaftNetworkFactory<TypeConfig> for Nobody {
+        type Network = Nobody;
+        async fn new_client(&mut self, _: NodeId, _: &BasicNode) -> Nobody {
+            Nobody
+        }
+    }
+
+    impl RaftNetwork<TypeConfig> for Nobody {
+        async fn append_entries(
+            &mut self,
+            _: AppendEntriesRequest<TypeConfig>,
+            _: RPCOption,
+        ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
+        {
+            Err(unreachable())
+        }
+        async fn install_snapshot(
+            &mut self,
+            _: InstallSnapshotRequest<TypeConfig>,
+            _: RPCOption,
+        ) -> Result<
+            InstallSnapshotResponse<NodeId>,
+            RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+        > {
+            Err(unreachable())
+        }
+        async fn vote(
+            &mut self,
+            _: VoteRequest<NodeId>,
+            _: RPCOption,
+        ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+            Err(unreachable())
+        }
+    }
+
+    impl PeerClient for Nobody {
+        fn call<'a>(
+            &'a self,
+            _: Option<NodeId>,
+            _: &'a str,
+            _: PeerRequest,
+            _: Duration,
+        ) -> BoxFuture<'a, Result<PeerReply, String>> {
+            Box::pin(async { Err("nobody".to_owned()) })
+        }
+    }
+
+    fn dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("samplez-replica-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn open(dir: &Path) -> Store<Paths> {
+        Store::open(dir, Paths::default(), Limits::defaults(48_000)).expect("opens")
+    }
+
+    async fn start(store: Store<Paths>) -> Replica<Paths> {
+        let settings = Settings {
+            id: ID,
+            epoch: 1,
+            limits: Limits::defaults(48_000),
+            block: 48,
+            write_timeout: Duration::from_secs(2),
+            addr: "local".to_owned(),
+            peers: vec![],
+            voters: None,
+        };
+        Replica::with_store(
+            settings,
+            raft_config("lone"),
+            store,
+            Nobody,
+            Arc::new(Nobody),
+            Arc::new(|| 0),
+        )
+        .await
+        .expect("starts")
+    }
+
+    /// A vote takes this long to save, longer than openraft's tick of
+    /// 1.5 heartbeats (75 ms).
+    const SLOW: Duration = Duration::from_millis(100);
+
+    async fn leads(replica: &Replica<Paths>, what: &'static str) {
+        let leads = replica
+            .raft()
+            .wait(Some(Duration::from_secs(5)))
+            .state(ServerState::Leader, what)
+            .await;
+        assert!(leads.is_ok(), "{leads:?}");
+    }
+
+    /// openraft elects the only voter on a tick it does not lead, and
+    /// counts its own vote only once the vote is saved. Up to 0.9.25 it
+    /// also elected while that vote was still being saved, so the next
+    /// term overtook every slow vote and the replica never led.
+    #[tokio::test(start_paused = true)]
+    async fn a_set_of_one_voter_whose_vote_takes_longer_than_the_tick_to_save_still_leads() {
+        let dir = dir("lone-fresh");
+        let replica = start(open(&dir).with_sync_delay(SLOW)).await;
+        replica
+            .initialize([(ID, "local".to_owned())])
+            .await
+            .expect("initializes");
+        leads(&replica, "a fresh set of one voter leads").await;
+        replica.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As above, for a volume whose only voter is itself and whose last
+    /// vote never counted: startup does not restore leadership, so the
+    /// replica has to elect itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopened_set_of_one_voter_whose_vote_takes_longer_than_the_tick_to_save_still_leads()
+    {
+        let dir = dir("lone-reopened");
+        let mut store = open(&dir);
+        let membership = Membership::from(BTreeMap::from([(ID, BasicNode::new("local"))]));
+        store
+            .append_to_log([Entry::<TypeConfig> {
+                log_id: LogId::new(CommittedLeaderId::new(0, 0), 0),
+                payload: EntryPayload::Membership(membership),
+            }])
+            .await
+            .expect("appends");
+        store.save_vote(&Vote::new(1, ID)).await.expect("votes");
+        drop(store);
+        let replica = start(open(&dir).with_sync_delay(SLOW)).await;
+        leads(&replica, "a reopened set of one voter leads").await;
+        replica.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
