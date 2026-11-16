@@ -393,15 +393,17 @@ impl Life {
             ReplicaState::Committing if withdrawn || !committing => {
                 self.state = ReplicaState::Withdrawn
             }
-            // A diverged replica commits again only by the Named rule.
+            // A diverged replica commits again only by the Named rule,
+            // under a naming it has not spent.
             ReplicaState::Diverged
                 if committing
                     && !withdrawn
                     && self.named.is_some_and(|(p, _)| {
-                        v.own
-                            .standing
-                            .iter()
-                            .any(|s| matches!(s, Standing::Committing { from } if *from >= p))
+                        self.spent != Some(p)
+                            && v.own
+                                .standing
+                                .iter()
+                                .any(|s| matches!(s, Standing::Committing { from } if *from >= p))
                     }) =>
             {
                 self.state = ReplicaState::Committing
@@ -482,7 +484,8 @@ impl Life {
             self.cancel(audio, |why| matches!(why, Why::Named(_)));
         }
         let Some(p) = naming else { return };
-        if self.named.is_none() {
+        // A naming spent by a divergence is not taken up again.
+        if self.named.is_none() && self.spent != Some(p) {
             // Known before the block holding P was processed: from P.
             let kp = p / v.timing.block;
             let in_time =
@@ -935,6 +938,32 @@ mod tests {
         assert_eq!(life.state(), ReplicaState::Diverged);
         assert_eq!(calls.take(), ["withdraw"]);
         assert_eq!(life.metrics.divergences, 1);
+    }
+
+    /// A named replica diverged by a verdict stays diverged under the
+    /// `Baseline` that named it, though its output still shows the
+    /// commit start it took under it until the engine withdraws it.
+    #[test]
+    fn a_diverged_named_baseline_stays_diverged() {
+        let idle = Standing::Idle { since: 0 };
+        let b = naming((K + 10) * B);
+        let p = b.at_index.next_multiple_of(PAGE);
+        let calls = Calls::default();
+        let mut life = Life::new();
+        step(&mut life, &own(K, idle), None, &calls);
+        step(&mut life, &own(K + 1, idle), Some(&b), &calls);
+        let committing = own(p / B + 50, Standing::Committing { from: p });
+        step(&mut life, &committing, Some(&b), &calls);
+        assert_eq!(life.state(), ReplicaState::Committing);
+        life.verdict(p / PAGE, &committing, &[true], &calls);
+        assert_eq!(life.state(), ReplicaState::Diverged);
+        calls.take();
+        step(&mut life, &committing, Some(&b), &calls);
+        assert_eq!(life.state(), ReplicaState::Diverged);
+        let withdrawn = own(p / B + 51, Standing::Withdrawn { since: p / B + 51 });
+        step(&mut life, &withdrawn, Some(&b), &calls);
+        assert_eq!(life.state(), ReplicaState::Diverged);
+        assert!(calls.take().is_empty(), "no commit start under it again");
     }
 
     /// A per-output commit start not taken yet is cancelled once the
