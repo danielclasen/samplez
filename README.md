@@ -154,13 +154,16 @@ at start-up on silence.
 
 `Engine::drop_core` drops the RT thread's core while the replica starts:
 the RT thread keeps its writers, flows, hold rings and statuses, computes
-no block and withholds each one, cause `NoCore` (`StatusChange::NoCore`
-ranges), with the replica withdrawn. `Engine::install_product` builds a
-core from product state off the RT thread (targets at their values,
-fades and ramps cold, the pending entries, the generation the engine
-holds pending) and installs it through the same block-boundary hand-over
-as a replay; the first block committed after it follows the withdrawn
-rules.
+no block and withholds each one, overrun skips included, cause `NoCore`
+(`StatusChange::NoCore` ranges), with the replica withdrawn. Entries
+needing no generation whose index passes meanwhile are taken off the
+pending list, strip entries applied to the strips the slots keep and the
+others not, and the core installed next must know them.
+`Engine::install_product` builds a core from product state off the RT
+thread (targets at their values, fades and ramps cold, the pending
+entries, the generation the engine holds pending, no unresolved entry)
+and installs it through the same block-boundary hand-over as a replay;
+the first block committed after it follows the withdrawn rules.
 
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
 against CLOCK_MONOTONIC at each wake, when it also samples the kernel

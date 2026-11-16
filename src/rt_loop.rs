@@ -133,6 +133,9 @@ pub struct Counters {
     pub handover_entries_lost: AtomicU64,
     /// Blocks not computed for want of a core, withheld.
     pub blocks_without_core: AtomicU64,
+    /// Entries whose index passed without a core, taken off the pending
+    /// list: strip entries applied to their strips, the others not.
+    pub entries_without_core: AtomicU64,
     /// Page hashes the supervisor could not pass on: the replicated
     /// state's channel was full.
     pub page_hashes_unsent: AtomicU64,
@@ -1317,21 +1320,35 @@ impl Rt {
                 self.sleep_until(now + period);
                 continue;
             }
-            add(&self.counters.overrun_skipped_samples, skipped);
-            if skipped > 0 {
-                self.skipped(catchup.start - skipped / self.block, catchup.start);
+            let first = if catchup.is_empty() { k } else { catchup.start };
+            // The first block due this wake, overrun skips included.
+            let due = first - skipped / self.block;
+            if !self.core {
+                // Without a core no block would have been computed: the
+                // skipped ones are not computed for want of a core.
+                if due < first {
+                    self.no_core(due, first);
+                }
+            } else {
+                add(&self.counters.overrun_skipped_samples, skipped);
+                if skipped > 0 {
+                    self.skipped(due, first);
+                }
             }
             if !catchup.is_empty() {
                 for s in &mut self.statuses {
                     *s = GroupWait::Skipped;
                 }
             }
-            let first = if catchup.is_empty() { k } else { catchup.start };
             self.take_handover(first);
             if !self.core {
                 // No block is computed: each is withheld, held blocks
-                // still move.
+                // still move, and the entries whose index passed are
+                // taken off the pending list.
+                add(&self.counters.heartbeat_blocks, 1);
+                self.advance_holds(None);
                 self.no_core(first, k + 1);
+                self.pass_entries(k);
                 let deadline = time::deadline(&self.api, k, self.block, self.margin);
                 self.sleep_until(deadline);
                 next = Some(k + 1);
@@ -1606,8 +1623,6 @@ impl Rt {
     /// cause no core, on every output; the replica stays withdrawn.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn no_core(&mut self, from: u64, to: u64) {
-        add(&self.counters.heartbeat_blocks, 1);
-        self.advance_holds(None);
         let Some(r) = self.replica.as_mut() else {
             return;
         };
@@ -1617,6 +1632,45 @@ impl Rt {
             add(&self.counters.status_changes_dropped, 1);
         }
         self.counters.processed.store(to, Release);
+    }
+
+    /// Without a core: takes the entries due by block `k` that need no
+    /// generation off the pending list, so that a long spell neither
+    /// fills the list nor holds the log's entries back. A strip entry is
+    /// applied to its slot's strip, which stays with the slot; the others
+    /// pass unapplied. A core installed later must know them, as it must
+    /// know every entry taken.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    pub(crate) fn pass_entries(&mut self, k: u64) {
+        let end = (k + 1) * self.block;
+        let mut i = 0;
+        while let Some(&e) = self.mix.pending.get(i) {
+            if e.at_index >= end || e.change.needs_generation() {
+                i += 1;
+                continue;
+            }
+            self.mix.pending.remove(i);
+            self.mix.last_taken = self.mix.last_taken.max(e.id);
+            add(&self.counters.entries_without_core, 1);
+            if let Change::Strip { slot, param } = e.change
+                && !self.slots[slot].set_strip(e.at_index, param)
+            {
+                add(&self.counters.strip_refused, 1);
+                self.send(Telemetry::StripRefused { entry: e });
+            }
+        }
+        self.publish_consumed();
+    }
+
+    /// Publishes the entries taken from the ring and done with: the
+    /// taken ones still pending have ids up to the highest taken, those a
+    /// hand-over brought in ahead of the ring above it.
+    fn publish_consumed(&self) {
+        let last = self.last_entry;
+        let waiting = self.mix.pending.iter().filter(|e| e.id <= last).count() as u64;
+        self.counters
+            .entries_consumed
+            .store(self.taken - waiting, Release);
     }
 
     /// Makes `generation` the one of input domain `domain` and hands the
@@ -1781,14 +1835,7 @@ impl Rt {
         });
         self.apply_due(k);
         self.counters.produced.store((k + 1) * self.block, Release);
-        // Entries taken from the ring and done with: the taken ones still
-        // pending have ids up to the highest taken, those a hand-over
-        // brought in ahead of the ring above it.
-        let last = self.last_entry;
-        let waiting = self.mix.pending.iter().filter(|e| e.id <= last).count() as u64;
-        self.counters
-            .entries_consumed
-            .store(self.taken - waiting, Release);
+        self.publish_consumed();
         let start = k * self.block;
         let mut silenced = 0u64;
         let mut fading = 0u64;

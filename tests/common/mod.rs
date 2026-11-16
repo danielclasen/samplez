@@ -737,7 +737,8 @@ pub fn hold_scenario(e: &Engine) {
             .unwrap();
     }
     e.commit(id);
-    wait(kp + 10);
+    // Applied, their pages hashed, before the core is dropped.
+    wait((kp + 10).max((at + 4 * PAGE) / B + PAGE / B));
 
     // Degraded blocks, held, then committed through on evidence.
     e.unresolved(7, processed(e) * B).unwrap();
@@ -759,8 +760,8 @@ pub fn hold_scenario(e: &Engine) {
         gains: vec![vec![1.0]],
         up: vec![true],
         pending: Vec::new(),
-        // Folds in no entry: the entries pending on the RT thread stay.
-        last_id: 0,
+        // Folds in the entries applied before the drop.
+        last_id: id,
     };
     e.install_product(&state, Duration::from_secs(5)).unwrap();
     assert_eq!(e.counters().handovers_installed.load(Ordering::Relaxed), 2);

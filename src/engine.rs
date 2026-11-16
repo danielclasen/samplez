@@ -1786,7 +1786,13 @@ impl Engine {
     /// `state` off the RT thread, its targets at their values, its fades
     /// and ramps cold, its pending entries and the generation this engine
     /// holds pending, and installs it at a block boundary as a replay is
-    /// handed over. Returns the block the core followed.
+    /// handed over. Returns the block the core followed. The core holds no
+    /// unresolved entry: the caller adds the ones still unresolved with
+    /// [`Engine::unresolved`] after the install. While no core is held the
+    /// RT thread takes the entries needing no generation whose index
+    /// passed off its pending list, applying only strip entries, to the
+    /// strips the slots keep; [`ReplayError::Missed`] when it took one
+    /// above `state.last_id`.
     pub fn install_product(
         &self,
         state: &ProductState,
@@ -4289,6 +4295,88 @@ mod tests {
         assert_eq!(e.counters.handovers_passed.load(Relaxed), 1);
         assert_eq!(e.counters.handovers_installed.load(Relaxed), 0);
         drop(t);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Blocks a late wake skips while no core is held are not computed
+    /// for want of a core, as every other block then: they are reported
+    /// as such in one gapless run of ranges, not as a skip.
+    #[test]
+    fn a_skip_without_a_core_is_reported_as_no_core() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, statuses, _verdicts, domain) = outputs_only("no-core-skip", 1);
+        let c = &e.counters;
+        e.drop_core().unwrap();
+        wait(&|| c.blocks_without_core.load(Relaxed) > 5);
+        // Changes from before the drop, a skip under load among them.
+        statuses.try_iter().for_each(drop);
+        let skipped = c.overrun_skipped_samples.load(Relaxed);
+        // A stall of 40 blocks, past maxCatchupBlocks. An RT thread of a
+        // test holding no engine lock may take the stall: it is set again
+        // until one is seen.
+        let mut ranges = Vec::new();
+        let t = Instant::now();
+        while !ranges.iter().any(|&(from, to)| to - from >= 20) {
+            assert!(t.elapsed() < Duration::from_secs(10), "no stall");
+            if crate::rt_loop::STALL_MS.load(Relaxed) == 0 {
+                crate::rt_loop::STALL_MS.store(40, Relaxed);
+            }
+            match statuses.recv_timeout(Duration::from_millis(200)) {
+                Ok(StatusChange::NoCore { from, to }) => ranges.push((from, to)),
+                Ok(StatusChange::Skipped { from, to }) => panic!("skipped {from}..{to}"),
+                _ => {}
+            }
+        }
+        crate::rt_loop::STALL_MS.store(0, Relaxed);
+        assert!(ranges.windows(2).all(|w| w[0].1 == w[1].0), "{ranges:?}");
+        assert_eq!(c.overrun_skipped_samples.load(Relaxed), skipped);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Without a core a strip entry whose index passed still reaches its
+    /// slot's strip, which the slot keeps across the drop: a core
+    /// installed later holds no strip, so the entry would be lost.
+    #[test]
+    fn a_strip_entry_due_without_a_core_reaches_the_strip() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("no-core-strip", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d09", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0a", "label": "strip",
+                          "group": "strip", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let param = StripParam::Trim { db: -6.0 };
+        let entry = |id, at_index, change| RtEntry {
+            id,
+            at_index,
+            change,
+        };
+        assert!(rt.mix.push(entry(1, 48, Change::Strip { slot: 0, param })));
+        assert!(rt.mix.push(entry(2, 96, Change::InputDown { slot: 0 })));
+        assert!(rt.mix.push(entry(3, 960, Change::InputDown { slot: 0 })));
+        rt.pass_entries(2);
+        let ids: Vec<LogId> = rt.mix.pending.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [3]);
+        assert_eq!(rt.mix.last_taken, 2);
+        assert!(rt.slots[0].up, "an entry other than a strip entry applied");
+        let mut reference = samplez_dsp::Strip::new(1, config.ramp_samples);
+        assert!(reference.set(param));
+        assert_eq!(rt.slots[0].strip.as_ref(), Some(&reference));
+        assert_eq!(rt.slots[0].strip_pos, Some(48));
+        assert_eq!(rt.counters.entries_without_core.load(Relaxed), 2);
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

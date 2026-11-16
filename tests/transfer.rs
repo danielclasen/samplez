@@ -459,12 +459,43 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
     wait_for(Duration::from_secs(5), "blocks without a core", || {
         c.blocks_without_core.load(Relaxed) > 50
     });
-    let state = ProductState {
+    // The block counter moves on: a hand-over waits for its steps.
+    let p = processed(&h.e);
+    wait_for(Duration::from_secs(5), "blocks passed", || {
+        processed(&h.e) > p + 20
+    });
+    // Entries whose index passed are taken off the pending list: a full
+    // log takes entries again.
+    let entry = Entry::Gain {
+        input: 0,
+        output: 0,
+        gain: 0.5,
+    };
+    let at = (processed(&h.e) + 5) * B;
+    for id in 1..=64 {
+        h.e.append(id, at, entry.clone()).unwrap();
+    }
+    h.e.commit(64);
+    wait_for(Duration::from_secs(5), "entries taken", || {
+        c.entries_consumed.load(Relaxed) == 64
+    });
+    h.e.append(65, at, entry).unwrap();
+    h.e.commit(65);
+    wait_for(Duration::from_secs(5), "entry 65 taken", || {
+        c.entries_without_core.load(Relaxed) == 65
+    });
+    // A core must know them.
+    let mut state = ProductState {
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
         pending: Vec::new(),
         last_id: 0,
     };
+    assert_eq!(
+        h.e.install_product(&state, Duration::from_secs(2)),
+        Err(ReplayError::Missed { id: 65 })
+    );
+    state.last_id = 65;
     let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
     // At the targets from the first block on, with no ramp to them.
     let core = common::copy_core(&h.e).core;
