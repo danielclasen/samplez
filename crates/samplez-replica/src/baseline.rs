@@ -250,13 +250,26 @@ impl Leader {
                 if !complete {
                     break;
                 }
-                judged.insert(*q);
                 let records: Vec<_> = reporting
                     .iter()
                     .filter_map(|a| v.pages.get(a.id, o, *q).map(|p| (a.id, *p)))
                     .collect();
                 // (1) is decided with the log's decisions on entries.
                 let j = judge(&records, base, &BTreeSet::new());
+                let reported = |id: NodeId| {
+                    v.audio
+                        .iter()
+                        .any(|a| a.id == id && state(a) == Some(ReplicaState::Diverged))
+                };
+                // Judged again once a verdict in flight on the replica it
+                // diverges clears: that one may be ignored as stale.
+                if j.diverged
+                    .iter()
+                    .any(|id| self.verdicts.contains_key(id) && !reported(*id))
+                {
+                    continue;
+                }
+                judged.insert(*q);
                 if j.disagreement {
                     self.counts.disagreements += 1;
                 }
@@ -266,11 +279,7 @@ impl Leader {
                     if Some(id) == base {
                         self.against = Some(id);
                     }
-                    let reported = v
-                        .audio
-                        .iter()
-                        .any(|a| a.id == id && state(a) == Some(ReplicaState::Diverged));
-                    if reported || self.verdicts.contains_key(&id) {
+                    if reported(id) {
                         continue;
                     }
                     self.verdicts.insert(id, now);
@@ -741,5 +750,35 @@ mod tests {
             judged.contains(&q) && judged.contains(&(q + 1)),
             "{judged:?}"
         );
+    }
+
+    /// A page that diverges a replica with a verdict in flight is judged
+    /// again once that verdict clears, which the replica may have ignored
+    /// as stale.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_behind_a_verdict_in_flight_is_judged_once_it_clears() {
+        let k = 1_000_000;
+        let q = 900;
+        let mut f = Fixture::new(vec![
+            (a(0), false, committing_own(k)),
+            (a(1), false, committing_own(k)),
+            (a(2), false, committing_own(k)),
+        ]);
+        for (x, h) in [(a(0), 1), (a(1), 2), (a(2), 1)] {
+            f.pages.fold(x, &[record(q, h), record(q + 1, h)]);
+        }
+        let verdicts = |b: &[Body]| -> Vec<(NodeId, u64)> {
+            b.iter()
+                .filter_map(|b| match b {
+                    Body::Diverged { replica, page } => Some((*replica, *page)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut leader = Leader::default();
+        assert_eq!(verdicts(&f.decide(&mut leader)), [(a(1), q)]);
+        assert!(verdicts(&f.decide(&mut leader)).is_empty());
+        tokio::time::advance(INFLIGHT).await;
+        assert_eq!(verdicts(&f.decide(&mut leader)), [(a(1), q + 1)]);
     }
 }
