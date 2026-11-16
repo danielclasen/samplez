@@ -398,7 +398,7 @@ impl Change {
 /// A committed log entry, applied at sample index `at_index`, a multiple
 /// of B. Entries have a ring of their own, so a full pending list never
 /// holds back a generation or a writer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RtEntry {
     pub id: LogId,
     pub at_index: u64,
@@ -1096,6 +1096,45 @@ fn digest(
     }
     r.ids.sort_unstable();
     Some(crate::blocks::degraded_digest(&r.ids, incoming, outgoing))
+}
+
+/// Copies the core out of the RT thread's state into `c`, a buffer of
+/// the same shape, without allocating.
+#[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+fn capture_core(
+    c: &mut Core,
+    m: &Mix,
+    slots: &[Slot],
+    awaiting: &[RtEntry],
+    pending_gen: Option<LogId>,
+    r: &Replica,
+) {
+    c.matrix.copy_from(&m.matrix);
+    c.pos = m.pos;
+    c.ramp_end = m.ramp_end;
+    c.pending.clear();
+    c.pending.extend_from_slice(&m.pending);
+    c.page_entries.clear();
+    c.page_entries.extend_from_slice(&m.page_entries);
+    c.entries_page = m.entries_page;
+    c.entries_lost = m.entries_lost;
+    for (d, s) in c.slots.iter_mut().zip(slots) {
+        *d = SlotCore {
+            up: s.up,
+            held: s.held,
+            fade_start: s.fade_start,
+            silenced_last: s.silenced_last,
+            xfade: s.xfade,
+        };
+    }
+    c.awaiting_gen.clear();
+    c.awaiting_gen.extend_from_slice(awaiting);
+    c.pending_gen = pending_gen;
+    c.unresolved.clear();
+    c.unresolved.extend_from_slice(&r.unresolved);
+    c.late_routes.clear();
+    c.late_routes.extend_from_slice(&r.late_routes);
+    c.late_lost_until = r.late_lost_until;
 }
 
 /// The replica is withdrawn on every output.
@@ -1950,33 +1989,15 @@ impl Rt {
         let Ok(mut core) = r.cores.pop() else {
             return;
         };
-        let (c, m) = (&mut *core, &self.mix);
-        c.matrix.copy_from(&m.matrix);
-        c.pos = m.pos;
-        c.ramp_end = m.ramp_end;
-        c.pending.clear();
-        c.pending.extend_from_slice(&m.pending);
-        c.page_entries.clear();
-        c.page_entries.extend_from_slice(&m.page_entries);
-        c.entries_page = m.entries_page;
-        c.entries_lost = m.entries_lost;
-        for (d, s) in c.slots.iter_mut().zip(&self.slots) {
-            *d = SlotCore {
-                up: s.up,
-                held: s.held,
-                fade_start: s.fade_start,
-                silenced_last: s.silenced_last,
-                xfade: s.xfade,
-            };
-        }
-        c.awaiting_gen.clear();
-        c.awaiting_gen.extend_from_slice(&self.awaiting_gen);
-        c.pending_gen = self.pending_gen.as_ref().map(|p| p.0);
-        c.unresolved.clear();
-        c.unresolved.extend_from_slice(&r.unresolved);
-        c.late_routes.clear();
-        c.late_routes.extend_from_slice(&r.late_routes);
-        c.late_lost_until = r.late_lost_until;
+        let pending_gen = self.pending_gen.as_ref().map(|p| p.0);
+        capture_core(
+            &mut core,
+            &self.mix,
+            &self.slots,
+            &self.awaiting_gen,
+            pending_gen,
+            r,
+        );
         // The ring had room: nothing is dropped here.
         let _ = r.copies.push(CoreCopy {
             k0: k,
@@ -2418,6 +2439,87 @@ mod tests {
             cores,
             copies,
         }
+    }
+
+    fn slot(up: bool, held: bool, fade: Option<u64>, silenced: bool, xfade: Option<u64>) -> Slot {
+        Slot {
+            domain: 0,
+            first_channel: 0,
+            channels: 1,
+            offset: 0,
+            state: SlotState::default(),
+            fade_start: fade,
+            silenced_last: silenced,
+            up,
+            held,
+            xfade,
+            prev: SlotState::default(),
+            prune_requested: false,
+            stats: EMPTY_STATS,
+            strip: None,
+            strip_pos: None,
+        }
+    }
+
+    /// Every field of the core is copied: each set to a value other than
+    /// its default, the copy equals a core built from those values.
+    #[test]
+    fn the_core_copy_takes_every_field() {
+        let mut m = mix();
+        m.page_entries = Vec::with_capacity(4);
+        assert!(m.matrix.set(0, 0, 0.5, 480));
+        m.matrix.advance(100);
+        m.pos = Some(20 * B);
+        m.ramp_end = 19 * B + 380;
+        assert!(m.push(change(0.25, 40 * B)));
+        assert!(m.push(entry(Change::InputDown { slot: 1 }, 41 * B)));
+        m.page_entries.extend([(3, 2 * B), (4, 3 * B)]);
+        m.entries_page = Some(1);
+        m.entries_lost = true;
+        let slots = [
+            slot(true, true, Some(5 * B), false, Some(18 * B)),
+            slot(false, false, None, true, None),
+        ];
+        let awaiting = [entry(Change::InputUp { slot: 0 }, 19 * B)];
+        let mut r = replica();
+        r.unresolved.extend([(8, 21 * B), (9, 30 * B)]);
+        r.late_routes.push((10, 25 * B));
+        r.late_lost_until = 26 * B;
+
+        let mut c = Core::new(1, 1, 2, 4);
+        capture_core(&mut c, &m, &slots, &awaiting, Some(11), &r);
+        let want = Core {
+            matrix: m.matrix.clone(),
+            pos: Some(20 * B),
+            ramp_end: 19 * B + 380,
+            pending: m.pending.clone(),
+            page_entries: vec![(3, 2 * B), (4, 3 * B)],
+            entries_page: Some(1),
+            entries_lost: true,
+            slots: vec![
+                SlotCore {
+                    up: true,
+                    held: true,
+                    fade_start: Some(5 * B),
+                    silenced_last: false,
+                    xfade: Some(18 * B),
+                },
+                SlotCore {
+                    up: false,
+                    held: false,
+                    fade_start: None,
+                    silenced_last: true,
+                    xfade: None,
+                },
+            ],
+            awaiting_gen: awaiting.to_vec(),
+            pending_gen: Some(11),
+            unresolved: vec![(8, 21 * B), (9, 30 * B)],
+            late_routes: vec![(10, 25 * B)],
+            late_lost_until: 26 * B,
+        };
+        assert_eq!(c, want);
+        assert_eq!(c.pending.len(), 2);
     }
 
     /// The digest covers the inputs whose read failed, by crossfade leg,

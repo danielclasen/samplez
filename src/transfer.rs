@@ -25,6 +25,7 @@ pub(crate) struct SlotCore {
 }
 
 /// The core of an engine after a block.
+#[derive(Debug, PartialEq)]
 pub struct Core {
     pub(crate) matrix: Matrix,
     pub(crate) pos: Option<u64>,
@@ -102,7 +103,7 @@ pub struct CoreCopy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyError {
     /// The engine is not replicated with more than one voter.
-    Invalid(String),
+    NotReplicated,
     /// The RT thread computed no block within the timeout.
     Timeout,
     /// The RT thread had started block `started`, the guard block of the
@@ -113,7 +114,9 @@ pub enum CopyError {
 impl std::fmt::Display for CopyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CopyError::Invalid(m) => write!(f, "{m}"),
+            CopyError::NotReplicated => {
+                write!(f, "the engine is not replicated with more than one voter")
+            }
             CopyError::Timeout => write!(f, "no block computed within the timeout"),
             CopyError::Passed { k0, started } => write!(
                 f,

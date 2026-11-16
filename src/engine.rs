@@ -576,6 +576,14 @@ impl BuildTimes {
     }
 }
 
+/// Whether a copy of history rings with `slack` blocks of slack, read
+/// after the RT thread handed out the core after block `k0`, is intact:
+/// the replay of block `k0 + 1` needs the span ending at that block's
+/// start, first overwritten by block `k0 + 1 + slack`.
+fn history_kept(started: &Started, k0: u64, slack: u64) -> Result<(), u64> {
+    started.confirms(k0 + 1, slack)
+}
+
 /// A running engine. Dropping it stops the engine and releases its
 /// writers, which deletes their flows.
 pub struct Engine {
@@ -699,6 +707,13 @@ impl Engine {
         let hold_blocks = config.hold_blocks();
         let alone = voters == 1;
         let hash_tx = hash_tx.filter(|_| reports.is_some() && !alone);
+        // Room for one page's entries, for its fingerprint; a core buffer
+        // takes the same, so the RT thread's copy allocates nothing.
+        let page_entries = if hash_tx.is_some() {
+            PENDING_CHANGES * PAGE.div_ceil(b) as usize
+        } else {
+            0
+        };
         let mut transfer = None;
         let (replica, rt_replica, change_rx, hash_rx) = if reports.is_some() {
             // A page's first settle reads the status of each of its
@@ -745,11 +760,6 @@ impl Engine {
             let (control_tx, control_rx) = rtrb::RingBuffer::new(UNRESOLVED);
             let (cores_tx, cores_rx) = rtrb::RingBuffer::new(1);
             let (copies_tx, copies_rx) = rtrb::RingBuffer::new(1);
-            let page_entries = if hash_tx.is_some() {
-                PENDING_CHANGES * PAGE.div_ceil(b) as usize
-            } else {
-                0
-            };
             transfer = (!alone).then(|| {
                 Mutex::new(Transfer {
                     cores: cores_tx,
@@ -854,11 +864,7 @@ impl Engine {
             slots,
             outs,
             mix: Mix {
-                page_entries: Vec::with_capacity(if hash_tx.is_some() {
-                    PENDING_CHANGES * PAGE.div_ceil(b) as usize
-                } else {
-                    0
-                }),
+                page_entries: Vec::with_capacity(page_entries),
                 ..Mix::new(matrix, b, config.ramp_samples)
             },
             inbuf: PlanarBuffer::new(n, b as usize),
@@ -1463,12 +1469,10 @@ impl Engine {
     /// history after `k0` (`historySlackMs`), which a copy of history
     /// rings needs; the engine keeps no delay line, so it holds the core
     /// alone. A copy left behind by a timeout is returned by the next
-    /// call.
+    /// call. Calls serialise: one buffer is with the RT thread at a time.
     pub fn copy_core(&self, timeout: Duration) -> Result<CoreCopy, CopyError> {
         let (Some((shared, _)), Some(transfer)) = (&self.replica, &self.transfer) else {
-            return Err(CopyError::Invalid(
-                "the engine is not replicated with more than one voter".to_owned(),
-            ));
+            return Err(CopyError::NotReplicated);
         };
         let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
         if !t.in_flight {
@@ -1493,8 +1497,7 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(1));
         };
-        // The span of history the replay needs ends with block k0.
-        match shared.started.confirms(copy.k0 + 1, t.slack_blocks) {
+        match history_kept(&shared.started, copy.k0, t.slack_blocks) {
             Ok(()) => Ok(copy),
             Err(started) => {
                 t.spare = Some(copy.core);
@@ -2650,6 +2653,20 @@ mod tests {
     /// The percentile follows the build times: every build below 10 000
     /// counts, one slow build among 20 000 does not, and buildLead covers
     /// it, a supervisor tick and the lead in whole blocks.
+    /// The history after the core of block k0 ends at the start of block
+    /// k0 + 1 and is first overwritten by block k0 + 1 + slack: with the
+    /// block in progress and one guard block, a copy is kept while the RT
+    /// thread started at most block k0 + slack - 1, refused from k0 + slack.
+    #[test]
+    fn the_history_copy_ends_at_the_block_after_k0() {
+        let started = Started::new();
+        let (k0, slack) = (1000, 50);
+        started.begin(k0 + slack - 1);
+        assert_eq!(history_kept(&started, k0, slack), Ok(()));
+        started.begin(k0 + slack);
+        assert_eq!(history_kept(&started, k0, slack), Err(k0 + slack));
+    }
+
     #[test]
     fn build_lead_covers_the_p9999_build_time() {
         let mut t = BuildTimes::new();

@@ -158,7 +158,10 @@ mod tests {
     }
 
     /// A copy that races the writer is either confirmed and intact, or
-    /// rejected: never confirmed with a sample of a later block.
+    /// rejected: never confirmed with a sample of a later block. This
+    /// checks the guard arithmetic under a real race; the two fences are
+    /// needed under the Rust memory model all the same, and x86's store
+    /// order keeps this test green without them.
     #[test]
     fn a_confirmed_copy_is_never_torn() {
         let (delay, slack) = (16, 8);

@@ -64,7 +64,7 @@ fn a_single_voter_copies_no_core() {
     let (e, _hashes) = start_held(&domain.0, &src, &dst, 1);
     assert!(matches!(
         e.copy_core(Duration::from_millis(100)),
-        Err(CopyError::Invalid(_))
+        Err(CopyError::NotReplicated)
     ));
     e.stop();
 }
@@ -78,7 +78,8 @@ fn only_a_set_of_voters_needs_the_replay_history() {
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
-    // A second of budget: more than half the flow's ring of 19456.
+    // A second of budget: with the read window, more than the 1 s of
+    // history the test domain keeps.
     let budget = serde_json::json!({ "resyncBudgetMs": 1000 });
     let (two, _) = start_held_with(&domain.0, &src, &new_id(), 2, budget.clone());
     wait_for(Duration::from_secs(5), "attach refused", || {
