@@ -215,12 +215,29 @@ impl<const L: usize> Svf<L> {
     /// Filters `frames` samples of each of the first `legs` legs of the
     /// planar `buf` in place and moves the ramp on.
     pub(crate) fn process(&mut self, buf: &mut [f32], legs: usize, frames: usize) {
+        let mut state = self.state;
+        self.filter(&mut state, buf, legs, frames);
+        self.state = state;
+        self.advance(frames);
+    }
+
+    /// Filters as [`Svf::process`] does, with `state` in place of the
+    /// section's own and without moving the ramp on. A bypassed section
+    /// sets `state` to zero.
+    pub(crate) fn filter(
+        &self,
+        state: &mut [[f32; 2]; L],
+        buf: &mut [f32],
+        legs: usize,
+        frames: usize,
+    ) {
         if self.is_bypassed() {
+            *state = [[0.0; 2]; L];
             return;
         }
         let ramp = ((self.len - self.pos) as usize).min(frames);
         for (leg, x) in buf.chunks_exact_mut(frames).take(legs).enumerate() {
-            let mut s = self.state[leg];
+            let mut s = state[leg];
             let (ramped, held) = x.split_at_mut(ramp);
             for (n, v) in ramped.iter_mut().enumerate() {
                 let c = self.at(self.pos + n as u32);
@@ -238,9 +255,8 @@ impl<const L: usize> Svf<L> {
                     *v = 0.0;
                 }
             }
-            self.state[leg] = s;
+            state[leg] = s;
         }
-        self.advance(frames);
     }
 }
 

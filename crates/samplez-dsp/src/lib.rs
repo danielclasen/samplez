@@ -10,6 +10,7 @@
 compile_error!("samplez-dsp supports x86_64 only");
 
 mod buffer;
+mod dynamics;
 mod kweight;
 mod loudness;
 mod matrix;
@@ -32,7 +33,7 @@ pub use matrix::{Matrix, Path};
 pub use meter::Meters;
 pub use mxcsr::{DAZ, FTZ, SavedMxcsr, mxcsr, restore_mxcsr, set_ftz_daz};
 pub use ramp::{MAX_GAIN, MAX_RAMP_LEN, Ramp, valid_gain};
-pub use strip::{BandType, EqBand, Strip, StripParam};
+pub use strip::{BandType, CompParams, EqBand, GateParams, Strip, StripParam};
 pub use true_peak::TruePeak;
 
 /// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez-dsp"`,
