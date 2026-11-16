@@ -458,21 +458,22 @@ impl FakeAudio {
             st.computed = Some(k);
         }
         let ctx = st.ctx();
-        let mut withdraw = false;
-        for out in &mut st.outputs {
+        for o in 0..st.outputs.len() {
+            let out = &mut st.outputs[o];
             let mut changes = Changes {
                 ring: &mut out.tx,
                 dropped: &out.dropped,
-                output: 0,
+                output: o as u32,
             };
-            withdraw |= out
+            let withdraw = out
                 .hold
                 .advance(ctx, &out.statuses, &mut changes, &mut out.sink)
                 .withdraw;
             while out.rx.pop().is_ok() {}
-        }
-        if withdraw {
-            st.withdraw_all();
+            // As the engine does: before the next output advances.
+            if withdraw {
+                st.withdraw_all();
+            }
         }
     }
 

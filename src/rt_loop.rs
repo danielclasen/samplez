@@ -1435,9 +1435,9 @@ impl Rt {
         let Some(r) = self.replica.as_mut() else {
             return 0;
         };
-        let mut withdraw = false;
         let mut written = 0;
-        for (o, out) in self.outs.iter_mut().enumerate() {
+        for o in 0..self.outs.len() {
+            let out = &mut self.outs[o];
             let Some(writer) = out.writer.as_deref_mut() else {
                 continue;
             };
@@ -1453,7 +1453,7 @@ impl Rt {
             };
             let ctx = ctx(&r.shared, self.step_at);
             let statuses = &r.shared.statuses[o];
-            withdraw |= out
+            let mut withdraw = out
                 .hold
                 .advance(ctx, statuses, &mut changes, &mut sink)
                 .withdraw;
@@ -1467,9 +1467,11 @@ impl Rt {
             if sink.wrote {
                 written |= 1 << o;
             }
-        }
-        if withdraw {
-            withdraw_all(&mut self.outs, r, &self.counters);
+            // On every output before the next one advances: none commits a
+            // block after this one withheld one.
+            if withdraw {
+                withdraw_all(&mut self.outs, r, &self.counters);
+            }
         }
         written
     }

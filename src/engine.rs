@@ -4083,6 +4083,34 @@ mod tests {
         std::fs::remove_dir_all(&domain).unwrap();
     }
 
+    /// A block withheld on one output withdraws the replica on every
+    /// output before the next one advances: in the pass that moves F past
+    /// block k, output 1 does not commit k while output 0 withholds it.
+    #[test]
+    fn a_block_withheld_on_one_output_withdraws_the_next_before_it_advances() {
+        use crate::blocks::{Cause, Kind};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _changes, _verdicts, domain) = outputs_only("withdraw-every", 2);
+        let processed = || e.counters().processed.load(Acquire);
+        committing(&e, 2);
+        // F frozen: both outputs hold block k and the blocks after it
+        // fenced.
+        let k = processed() + 2;
+        e.set_fence(k * 48).unwrap();
+        wait(&|| processed() > k + 5);
+        for o in 0..2 {
+            assert_eq!(e.block_status(o, k).unwrap().kind, Kind::Fenced);
+        }
+        let st = e.withhold(0, k, Cause::HoldCap).unwrap().unwrap();
+        assert_eq!(st.kind, Kind::Withheld);
+        e.set_fence(u64::MAX).unwrap();
+        wait(&|| processed() > k + 15);
+        let st = e.block_status(1, k).unwrap();
+        assert_ne!(st.kind, Kind::Committed, "{st:?}");
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
     /// The engine's own log stamps an `InputDown` or `InputUp` that
     /// reached the RT thread late again, from the state the RT thread has:
     /// the input goes down once its flow is gone, and comes up once it is
