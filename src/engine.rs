@@ -4298,6 +4298,7 @@ mod tests {
     /// state after a later block with an older one.
     #[test]
     fn a_handover_the_rt_thread_passed_is_refused() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let (e, _statuses, _verdicts, domain) = outputs_only("handover-passed", 1);
         let copy = loop {
             match e.copy_core(Duration::from_secs(2)) {
@@ -4416,6 +4417,7 @@ mod tests {
     /// own core.
     #[test]
     fn a_late_answer_is_not_taken_for_the_next_handover() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let (e, _statuses, _verdicts, domain) = outputs_only("handover-late", 1);
         let copy = || loop {
             match e.copy_core(Duration::from_secs(2)) {
@@ -4473,6 +4475,7 @@ mod tests {
     /// judged against it.
     #[test]
     fn a_timed_out_handover_names_its_passed_refusals() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let (e, _statuses, _verdicts, domain) = outputs_only("handover-timeout", 1);
         let before = e.counters.handovers_passed.load(Relaxed);
         // Each core follows a block two behind the last one computed:
