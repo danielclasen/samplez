@@ -3,10 +3,11 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use samplez::{Config, Engine, Replication};
+use samplez_replica::bootstrap::random_id;
 use samplez_replica::bridge::{EngineAudio, input_entry};
 use samplez_replica::contact::{Audio, Timing};
 use samplez_replica::entry::{Body, Request};
@@ -27,11 +28,12 @@ struct Domain(PathBuf);
 
 impl Domain {
     fn new() -> Domain {
-        static N: AtomicU64 = AtomicU64::new(0);
+        // The process id alone repeats across containers sharing the host's
+        // /dev/shm.
         let dir = PathBuf::from("/dev/shm").join(format!(
-            "samplez-bridge-{}-{}",
+            "samplez-bridge-{}-{:016x}",
             std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
+            random_id().expect("a random id")
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();

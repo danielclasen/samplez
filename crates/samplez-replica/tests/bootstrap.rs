@@ -9,7 +9,6 @@ use std::future::IntoFuture;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -168,16 +167,6 @@ impl Api {
     }
 }
 
-static SETS: AtomicU64 = AtomicU64::new(0);
-
-fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "bootstrap-set-{}-{}",
-        std::process::id(),
-        SETS.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
 async fn kube(api: &Api, root: &std::path::Path) -> Kube {
     let (addr, ca) = api.serve().await;
     let token = root.join("token");
@@ -225,7 +214,7 @@ fn name(slot: Slot) -> String {
 
 impl Set {
     async fn new(voters: Voters) -> Set {
-        let root = root();
+        let root = harness::root("bootstrap-set");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let api = Api::default();
