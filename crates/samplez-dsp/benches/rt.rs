@@ -92,9 +92,10 @@ fn setup_meters(path: Path) -> (Path, TruePeak, KWeighting, PlanarBuffer) {
 }
 
 /// 64 mono strips with trim, high-pass, every band, gate and compressor
-/// on, the signal above both thresholds, all of them ramping (the
-/// costliest block) or all settled.
-fn strips(ramping: bool) -> (Vec<Strip>, PlanarBuffer) {
+/// on at an attack of `attack_ms`, the signal above both thresholds, all
+/// of them ramping (the costliest block) or all settled. An attack under
+/// 1 ms runs the gain computers every sample.
+fn strips(ramping: bool, attack_ms: f32) -> (Vec<Strip>, PlanarBuffer) {
     let mut v = Vec::new();
     for _ in 0..INPUTS {
         let mut s = Strip::new(1, if ramping { 480 } else { 0 });
@@ -109,14 +110,14 @@ fn strips(ramping: bool) -> (Vec<Strip>, PlanarBuffer) {
                 enabled: true,
                 threshold_db: -60.0,
                 range_db: 40.0,
-                attack_ms: 1.0,
+                attack_ms,
                 release_ms: 50.0,
             }),
             StripParam::Comp(CompParams {
                 enabled: true,
                 threshold_db: -20.0,
                 ratio: 4.0,
-                attack_ms: 1.0,
+                attack_ms,
                 release_ms: 50.0,
                 knee_db: 6.0,
                 makeup_db: 3.0,
@@ -135,8 +136,10 @@ fn strips(ramping: bool) -> (Vec<Strip>, PlanarBuffer) {
 }
 
 #[library_benchmark]
-#[bench::ramping(args = (true,), setup = strips, config = limit(STRIPS_RAMPING))]
-#[bench::settled(args = (false,), setup = strips, config = limit(STRIPS_SETTLED))]
+#[bench::ramping(args = (true, 1.0), setup = strips, config = limit(STRIPS_RAMPING))]
+#[bench::settled(args = (false, 1.0), setup = strips, config = limit(STRIPS_SETTLED))]
+#[bench::ramping_fast_attack(args = (true, 0.1), setup = strips, config = limit(STRIPS_RAMPING_FAST))]
+#[bench::settled_fast_attack(args = (false, 0.1), setup = strips, config = limit(STRIPS_SETTLED_FAST))]
 fn strip((mut strips, mut buf): (Vec<Strip>, PlanarBuffer)) -> (Vec<Strip>, PlanarBuffer) {
     for (c, s) in strips.iter_mut().enumerate() {
         s.process(black_box(buf.channel_mut(c)), B);
@@ -183,8 +186,10 @@ const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
 const METERS_SCALAR: u64 = 1_118_000;
 const METERS_AVX2: u64 = 303_000;
-const STRIPS_RAMPING: u64 = 1_468_626;
-const STRIPS_SETTLED: u64 = 952_170;
+const STRIPS_RAMPING: u64 = 1_502_708;
+const STRIPS_SETTLED: u64 = 979_919;
+const STRIPS_RAMPING_FAST: u64 = 1_771_069;
+const STRIPS_SETTLED_FAST: u64 = 1_273_161;
 
 library_benchmark_group!(name = block, benchmarks = [matrix, meters, strip]);
 library_benchmark_group!(name = transfer, benchmarks = [core_copy, history]);

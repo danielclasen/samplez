@@ -9,7 +9,8 @@
 //! linearly in the gain domain ([`crate::Ramp`]), a polarity inversion
 //! through zero, filters by their coefficients. Gate and compressor take
 //! a new curve or time constant at their next gain computation, at most
-//! [`GAIN_INTERVAL`] samples on, and ramp only their switch and makeup.
+//! [`GAIN_INTERVAL`] samples and one on, and ramp only their switch and
+//! makeup.
 //! The ranges are those the faderz model gives its strip controls.
 //!
 //! The strip holds no heap memory, so a clone allocates nothing. It runs
