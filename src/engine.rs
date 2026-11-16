@@ -308,6 +308,8 @@ pub struct Progress {
     pub self_report: bool,
     /// Status changes the RT thread's ring or the channel had no room for.
     pub status_changes_lost: u64,
+    /// buildLead in samples ([`GenerationStatus::build_lead`]).
+    pub build_lead: u64,
 }
 
 /// How an engine that follows a replicated log takes part in its set.
@@ -1342,6 +1344,7 @@ impl Engine {
             self_report: shared.self_report.load(Relaxed),
             status_changes_lost: c.status_changes_dropped.load(Relaxed)
                 + c.status_changes_unsent.load(Relaxed),
+            build_lead: self.build_lead.load(Relaxed),
         })
     }
 

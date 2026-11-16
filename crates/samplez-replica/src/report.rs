@@ -35,6 +35,22 @@ pub struct Report {
     /// The lowest at_index of the entries the listing had no room for:
     /// an entry the addressee knows of and cannot resolve.
     pub unlisted: Option<u64>,
+    /// The sender's E estimate when it built the report, in samples.
+    pub estimate: Option<u64>,
+    /// Per entry the sender learned committed since its last report, the
+    /// slack: its at_index less the first index the sender could still
+    /// apply it at by the apply deadline, in samples; at most
+    /// [`MAX_LISTED`].
+    pub slack: Vec<Slack>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Slack {
+    pub index: u64,
+    pub samples: i64,
+    /// The entry's stamping index: slack of an entry stamped before the
+    /// lead last rose says nothing of the risen lead.
+    pub stamp: u64,
 }
 
 /// An echo of the addressee's report `seq`: the four timestamps of an
@@ -90,6 +106,9 @@ pub struct Own {
     /// Per output, the statuses of its latest blocks.
     pub statuses: Vec<Vec<Run>>,
     pub unwritten: Vec<Unwritten>,
+    /// buildLead: samples a generation-needing entry is stamped ahead of
+    /// the earliest index, covering this replica's generation builds.
+    pub build_lead: Option<u64>,
 }
 
 /// What the sender holds of another voter.

@@ -19,7 +19,8 @@ use crate::Shared;
 use crate::entry::{Body, NodeId, Request};
 use crate::log_store::Store;
 use crate::peer::PeerRequest;
-use crate::report::{Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report};
+use crate::report::{Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report, Slack};
+use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
 use crate::state_machine::Product;
 
@@ -145,6 +146,9 @@ pub struct Sample {
     pub own: Own,
     /// Status changes the engine lost, counted.
     pub status_changes_lost: u64,
+    /// Appended entries the engine refused: it lacks a committed entry,
+    /// so its output no longer follows the log.
+    pub entries_refused: u64,
 }
 
 /// The voters of the applied membership: one configuration, or two
@@ -188,6 +192,10 @@ pub trait LogView: Send + Sync + 'static {
     fn log_id_at(&self, index: u64) -> Option<StoredLogId>;
     fn entries_after(&self, index: u64, f: &mut dyn FnMut(StoredLogId, &Request));
     fn pending(&self, f: &mut dyn FnMut(u64, &Body));
+    /// The replicas the latest applied `ClockVerdict` judges.
+    fn judged(&self) -> BTreeSet<NodeId>;
+    /// The replica the latest applied `Baseline` names.
+    fn baseline(&self) -> Option<NodeId>;
 }
 
 impl<P: Product> LogView for Store<P> {
@@ -206,7 +214,26 @@ impl<P: Product> LogView for Store<P> {
     fn pending(&self, f: &mut dyn FnMut(u64, &Body)) {
         Store::pending(self, f)
     }
+    fn judged(&self) -> BTreeSet<NodeId> {
+        self.with_state(|sm| {
+            sm.verdicts
+                .iter()
+                .filter(|&(_, &judged)| judged)
+                .map(|(&id, _)| id)
+                .collect()
+        })
+    }
+    fn baseline(&self) -> Option<NodeId> {
+        self.with_state(|sm| sm.baseline.as_ref().map(|b| b.replica))
+    }
 }
+
+/// The lead before any slack was reported: 30 ms.
+pub const START_LEAD: Duration = Duration::from_millis(30);
+
+/// Entries with an at_index the engine holds at most (plan 2.7): the
+/// leader stamps no entry beyond them.
+pub const FUTURE_LIST: usize = 64;
 
 /// Sequence numbers sent, with their TAI time, kept for echoes: 2 s at
 /// the default period. An older echo counts for nothing.
@@ -272,6 +299,9 @@ struct Peer {
     silent: bool,
     /// The latest TAI time this replica held the peer silent.
     silent_at: Option<u64>,
+    /// The newest copy a third voter relayed, when newer than the direct
+    /// one: when the peer generated it, by this replica's clock.
+    relayed: Option<(Instant, Own)>,
     /// The latest NTP-style offset estimate, the peer's clock minus this
     /// one's, ns.
     offset_ns: Option<i64>,
@@ -317,7 +347,16 @@ struct State {
     uncommitted: BTreeMap<u64, StoredLogId>,
     /// Entries with an at_index, for listings, until every voter reported
     /// them committed.
-    scheduled: BTreeMap<u64, (StoredLogId, u64)>,
+    scheduled: BTreeMap<u64, (StoredLogId, u64, u64)>,
+    /// The at_index of the latest generation-needing entry appended.
+    generation_at: Option<u64>,
+    /// When `own` was sampled.
+    own_at: Instant,
+    judged: BTreeSet<NodeId>,
+    /// Slack of the entries learned committed, for the next reports.
+    slack: Vec<Slack>,
+    lead: Lead,
+    e_spread: Histogram,
     /// Every entry of this replica's log up to here is committed.
     known_committed: u64,
     handed: u64,
@@ -331,6 +370,7 @@ struct State {
     fence: Option<u64>,
     own: Own,
     status_changes_lost: u64,
+    entries_refused: u64,
     counts: Counts,
 }
 
@@ -362,6 +402,8 @@ pub struct Metrics {
     /// 99.99th percentile, as of the report period it was read in.
     pub status_lag_p9999: Option<Duration>,
     pub status_changes_lost: u64,
+    /// Appended entries the engine refused.
+    pub entries_refused: u64,
     /// Entries given to the engine as unresolved, and refusals of it.
     pub unresolved: u64,
     pub unresolved_refused: u64,
@@ -369,6 +411,15 @@ pub struct Metrics {
     pub awaiting_overflow: u64,
     /// Entries dropped from the listings for want of room.
     pub scheduled_dropped: u64,
+    /// E, and the audio replicas it counts.
+    pub estimate: Option<u64>,
+    pub counted: Vec<NodeId>,
+    /// The lead, in samples, and whether it wanted more than the cap.
+    pub lead: u64,
+    pub apply_lead_capped: bool,
+    /// How far the E estimates other voters report lie from this one's at
+    /// receipt, 99.99th percentile, in samples.
+    pub e_spread_p9999: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -403,11 +454,15 @@ impl Contact {
     ) -> Contact {
         let applied = log.applied();
         let mut scheduled = BTreeMap::new();
+        let mut generation_at = None;
         // Entries the engine applies later, purged ones included, for
         // listings.
         // Collected first: the log's view is not re-entered from inside it.
         let mut pending = Vec::new();
         log.pending(&mut |index, body| {
+            if body.needs_generation() {
+                generation_at = generation_at.max(body.at_index());
+            }
             if let Some(at) = body.at_index() {
                 pending.push((index, at));
             }
@@ -418,7 +473,7 @@ impl Contact {
                 node: 0,
                 index,
             });
-            scheduled.insert(index, (id, at));
+            scheduled.insert(index, (id, at, 0));
         }
         Contact {
             id,
@@ -438,6 +493,16 @@ impl Contact {
                 told: applied,
                 uncommitted: BTreeMap::new(),
                 scheduled,
+                generation_at,
+                own_at: Instant::now(),
+                judged: BTreeSet::new(),
+                slack: Vec::new(),
+                lead: Lead::new(
+                    timing.block,
+                    index_at(START_LEAD.as_nanos() as u64),
+                    index_at(timing.max_apply_lead.as_nanos() as u64),
+                ),
+                e_spread: Histogram::default(),
                 known_committed: applied,
                 handed: applied,
                 awaiting: BTreeMap::new(),
@@ -446,6 +511,7 @@ impl Contact {
                 fence: None,
                 own: Own::default(),
                 status_changes_lost: 0,
+                entries_refused: 0,
                 counts: Counts::default(),
             }),
         }
@@ -543,6 +609,31 @@ impl Contact {
             own: report.own,
             committed: report.committed,
         });
+        // One relay hop: copies of voters the sender heard directly.
+        for heard in report.heard {
+            if heard.node == self.id || heard.node == report.from || !voters.contains(&heard.node) {
+                continue;
+            }
+            let (Some(age), Some(own)) = (heard.age_us, heard.own) else {
+                continue;
+            };
+            let other = st.peers.entry(heard.node).or_default();
+            let generated = now.checked_sub(Duration::from_micros(age)).unwrap_or(now);
+            if other.last.as_ref().is_none_or(|d| d.received < generated)
+                && other.relayed.as_ref().is_none_or(|(g, _)| *g < generated)
+            {
+                other.relayed = Some((generated, own));
+            }
+        }
+        if let (Some(theirs), Some(mine)) = (report.estimate, self.estimate_in(st, now)) {
+            st.e_spread.add(theirs.abs_diff(mine));
+        }
+        if self.counted(st, now).contains(&report.from) {
+            let current = self.current_stamp(st, now);
+            for slack in &report.slack {
+                st.lead.add(slack.samples, slack.stamp, current);
+            }
+        }
         // Commit knowledge: a committed id this log holds, or a listed
         // entry's exact id at or below the sender's committed index.
         let mut learned = st.known_committed;
@@ -616,8 +707,12 @@ impl Contact {
                 st.counts.status_lag.add(lag);
             }
             st.own = sample.own;
+            st.own_at = now;
             st.status_changes_lost = sample.status_changes_lost;
+            st.entries_refused = sample.entries_refused;
         }
+        st.judged = self.log.judged();
+        st.lead.roll();
 
         // Contact: reports from a majority, itself included, within w.
         let w = self.timing.contact_window;
@@ -671,6 +766,9 @@ impl Contact {
         let limit = index_at(
             tai + (self.timing.max_apply_lead + self.timing.contact_window).as_nanos() as u64,
         );
+        let estimate = self.estimate_in(st, now);
+        let mut slack = std::mem::take(&mut st.slack);
+        slack.truncate(MAX_LISTED);
         let mut out = Vec::new();
         for to in voters.iter().copied().filter(|&v| v != self.id) {
             let Some(addr) = st.members.addrs.get(&to).cloned() else {
@@ -691,8 +789,8 @@ impl Contact {
             let mut listed: Vec<Listed> = st
                 .scheduled
                 .range(their_committed.saturating_add(1)..)
-                .filter(|(_, (_, at))| *at < limit)
-                .map(|(_, &(id, at_index))| Listed { id, at_index })
+                .filter(|(_, (_, at, _))| *at < limit)
+                .map(|(_, &(id, at_index, _))| Listed { id, at_index })
                 .collect();
             listed.sort_by_key(|l| (l.at_index, l.id.index));
             let unlisted = listed.get(MAX_LISTED).map(|l| l.at_index);
@@ -725,6 +823,8 @@ impl Contact {
                     heard,
                     listed,
                     unlisted,
+                    estimate,
+                    slack: slack.clone(),
                 },
             ));
         }
@@ -816,15 +916,18 @@ impl Contact {
                     audio.skip(id.index);
                 }
             }
-            new.push((id, request.at_index()));
+            if request.body.needs_generation() {
+                st.generation_at = request.at_index();
+            }
+            new.push((id, request.at_index(), request.stamp));
         });
-        for (id, at) in new {
+        for (id, at, stamp) in new {
             st.told = id.index;
             if id.index > st.known_committed {
                 st.uncommitted.insert(id.index, id);
             }
             if let Some(at) = at {
-                st.scheduled.insert(id.index, (id, at));
+                st.scheduled.insert(id.index, (id, at, stamp));
                 self.note(st, id, at, tai);
             }
         }
@@ -881,6 +984,32 @@ impl Contact {
 
     fn hand(&self, st: &mut State) {
         let up_to = st.known_committed.min(st.told);
+        if up_to > st.handed && self.audio.is_some() {
+            // Slack against the apply deadline: the first index this
+            // replica could still apply an entry at, learned now.
+            let tai = self.clocks.tai_ns();
+            let first = index_at(tai + self.timing.apply_guard_ns()) as i64;
+            let now = Instant::now();
+            let counted = self.counted(st, now).contains(&self.id);
+            let current = self.current_stamp(st, now);
+            let handed: Vec<Slack> = st
+                .scheduled
+                .range(st.handed + 1..=up_to)
+                .map(|(&index, &(_, at, stamp))| Slack {
+                    index,
+                    samples: at as i64 - first,
+                    stamp,
+                })
+                .collect();
+            for s in handed {
+                if counted {
+                    st.lead.add(s.samples, s.stamp, current);
+                }
+                if st.slack.len() < MAX_LISTED {
+                    st.slack.push(s);
+                }
+            }
+        }
         if up_to > st.handed {
             st.handed = up_to;
             if let Some(audio) = &self.audio {
@@ -974,6 +1103,12 @@ impl Contact {
         st.scheduled = st.scheduled.split_off(&(lowest + 1));
     }
 
+    /// The engine refused an appended entry: the replica's output no
+    /// longer follows the log, so it takes no client writes.
+    pub fn engine_failed(&self) -> bool {
+        self.lock().entries_refused > 0
+    }
+
     /// Reports from a majority of voters, itself included, within w, as
     /// of the last report period.
     pub fn in_contact(&self) -> bool {
@@ -990,6 +1125,169 @@ impl Contact {
                 since(now, d.received) > within || d.committed.is_some_and(|c| c.index >= index)
             })
         })
+    }
+
+    /// The audio replicas E counts (plan 2.11, Command scheduling), by
+    /// their newest copy, direct or relayed: not silent (a copy generated
+    /// within w + D), clock-verified, not judged by a `ClockVerdict`, and
+    /// with neither a clock self-report nor a detected-step fence; when
+    /// none is, those whose only flag is a self-report.
+    fn counted(&self, st: &State, now: Instant) -> BTreeSet<NodeId> {
+        let fresh = self.timing.contact_window + self.timing.hold;
+        let copies = self.copies(st, now);
+        let eligible =
+            |own: &Own| own.processed.is_some() && !own.clock.unverified && !own.clock.step_fence;
+        let pick = |self_report: bool| -> BTreeSet<NodeId> {
+            copies
+                .iter()
+                .filter(|(id, age, own)| {
+                    *age <= fresh
+                        && eligible(own)
+                        && own.clock.self_report == self_report
+                        && !st.judged.contains(id)
+                })
+                .map(|(id, _, _)| *id)
+                .collect()
+        };
+        let free = pick(false);
+        if free.is_empty() { pick(true) } else { free }
+    }
+
+    /// Each voter's newest copy, direct or relayed, with its age; this
+    /// replica's own as of its last sample.
+    fn copies<'a>(&self, st: &'a State, now: Instant) -> Vec<(NodeId, Duration, &'a Own)> {
+        let mut out = Vec::new();
+        if self.audio.is_some() {
+            out.push((self.id, since(now, st.own_at), &st.own));
+        }
+        for (&id, p) in &st.peers {
+            let direct = p.last.as_ref().map(|d| (d.received, &d.own));
+            let relayed = p.relayed.as_ref().map(|(g, own)| (*g, own));
+            let newest = match (direct, relayed) {
+                (Some(d), Some(r)) if r.0 > d.0 => Some(r),
+                (d, r) => d.or(r),
+            };
+            if let Some((at, own)) = newest {
+                out.push((id, since(now, at), own));
+            }
+        }
+        out
+    }
+
+    /// `ceil(E / B) * B` now, 0 while E counts nobody.
+    fn current_stamp(&self, st: &State, now: Instant) -> u64 {
+        let b = self.timing.block;
+        self.estimate_in(st, now).map_or(0, |e| e.div_ceil(b) * b)
+    }
+
+    /// Engine entries pending above `floor`: those the state machine holds
+    /// and those this log holds unapplied.
+    fn pending_above(&self, floor: u64) -> usize {
+        let mut pending = 0;
+        self.log.pending(&mut |_, body| {
+            if body.at_index().is_some_and(|at| at > floor) {
+                pending += 1;
+            }
+        });
+        self.log
+            .entries_after(self.log.applied(), &mut |_, request| {
+                if request.at_index().is_some_and(|at| at > floor) {
+                    pending += 1;
+                }
+            });
+        pending
+    }
+
+    fn estimate_in(&self, st: &State, now: Instant) -> Option<u64> {
+        let counted = self.counted(st, now);
+        let b = self.timing.block;
+        self.copies(st, now)
+            .into_iter()
+            .filter(|(id, _, _)| counted.contains(id))
+            .filter_map(|(_, age, own)| {
+                let end = (own.processed? + 1) * b;
+                Some(end + index_at(age.as_nanos() as u64))
+            })
+            .max()
+    }
+
+    /// E: the highest processed index among the audio replicas it counts,
+    /// each extrapolated by `CLOCK_MONOTONIC` since its copy was generated;
+    /// none when it counts nobody.
+    pub fn estimate(&self) -> Option<u64> {
+        let st = self.lock();
+        self.estimate_in(&st, Instant::now())
+    }
+
+    /// `ageGuard` (plan 2.11, Retention) with statusLag and delta as
+    /// measured here, 1 ms each before any measurement.
+    pub fn age_guard(&self) -> u64 {
+        let st = self.lock();
+        let ms = index_at(1_000_000);
+        let status_lag = st.counts.status_lag.quantile(0.9999).map_or(ms, index_at);
+        let delta = st
+            .peers
+            .values()
+            .filter_map(|p| p.delay.quantile(0.9999))
+            .max()
+            .map_or(ms, index_at);
+        crate::schedule::age_guard(
+            self.timing.block,
+            status_lag,
+            delta,
+            self.timing.clock_guard,
+        )
+    }
+
+    /// Where the leader stamps an entry: none while E counts nobody, or
+    /// with [`FUTURE_LIST`] entries pending above `E - applyGuard - S`.
+    pub fn stamp(&self, generation: bool) -> Result<Stamp, StampRefusal> {
+        let st = self.lock();
+        let now = Instant::now();
+        let e = self
+            .estimate_in(&st, now)
+            .ok_or(StampRefusal::NobodyCounted)?;
+        let b = self.timing.block;
+        let stamp = e.div_ceil(b) * b;
+        let spread = st
+            .e_spread
+            .quantile(0.9999)
+            .unwrap_or(2 * b + index_at(3_000_000));
+        let floor = e.saturating_sub(index_at(self.timing.apply_guard_ns()) + spread);
+        // Committed entries stay pending in every engine until their index:
+        // counted from the state machine, not from what is still listed.
+        if self.pending_above(floor) >= FUTURE_LIST {
+            return Err(StampRefusal::FutureListFull);
+        }
+        let lead = st.lead.samples();
+        let earliest = if generation {
+            // The last one's at_index has passed on the baseline, or on E
+            // while no baseline is named.
+            if let Some(at) = st.generation_at {
+                let baseline = self.log.baseline();
+                let passed = self
+                    .copies(&st, now)
+                    .into_iter()
+                    .find(|(id, _, _)| Some(*id) == baseline)
+                    .and_then(|(_, _, own)| own.processed)
+                    .map_or(e, |k| (k + 1) * b);
+                if passed <= at {
+                    return Err(StampRefusal::GenerationPending);
+                }
+            }
+            let counted = self.counted(&st, now);
+            let build_lead = self
+                .copies(&st, now)
+                .into_iter()
+                .filter(|(id, _, _)| counted.contains(id))
+                .filter_map(|(_, _, own)| own.build_lead)
+                .max()
+                .unwrap_or(0);
+            stamp + lead.max(build_lead).next_multiple_of(b)
+        } else {
+            stamp + lead
+        };
+        Ok(Stamp { stamp, earliest })
     }
 
     pub fn metrics(&self) -> Metrics {
@@ -1017,12 +1315,39 @@ impl Contact {
             stagger_max: c.stagger_max,
             status_lag_p9999: c.status_lag.quantile(0.9999).map(Duration::from_nanos),
             status_changes_lost: st.status_changes_lost,
+            entries_refused: st.entries_refused,
             unresolved: c.unresolved,
             unresolved_refused: c.unresolved_refused,
             awaiting_overflow: c.awaiting_overflow,
             scheduled_dropped: c.scheduled_dropped,
+            estimate: self.estimate_in(&st, Instant::now()),
+            counted: self.counted(&st, Instant::now()).into_iter().collect(),
+            lead: st.lead.samples(),
+            apply_lead_capped: st.lead.capped,
+            e_spread_p9999: st.e_spread.quantile(0.9999),
         }
     }
+}
+
+/// Where an entry is stamped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    /// `ceil(E / B) * B`: the log time dedup retention counts in.
+    pub stamp: u64,
+    /// The earliest at_index: the stamp plus the lead, or for a
+    /// generation-needing entry plus the larger of the lead and buildLead.
+    pub earliest: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StampRefusal {
+    /// E counts no audio replica: nothing is stamped.
+    NobodyCounted,
+    /// [`FUTURE_LIST`] entries are pending.
+    FutureListFull,
+    /// The previous generation-needing entry's at_index has not passed on
+    /// the baseline.
+    GenerationPending,
 }
 
 /// Runs contact for `contact` until the replica shuts down: a report to
@@ -1162,6 +1487,12 @@ mod tests {
                 f(*index, body);
             }
         }
+        fn judged(&self) -> BTreeSet<NodeId> {
+            BTreeSet::new()
+        }
+        fn baseline(&self) -> Option<NodeId> {
+            None
+        }
     }
 
     /// Records what contact hands the engine. Its step flag shows once
@@ -1188,6 +1519,7 @@ mod tests {
                     ..Own::default()
                 },
                 status_changes_lost: 0,
+                entries_refused: 0,
             }
         }
         fn fence(&self, end: u64) {
@@ -1308,6 +1640,8 @@ mod tests {
                 heard: Vec::new(),
                 listed: Vec::new(),
                 unlisted: None,
+                estimate: None,
+                slack: Vec::new(),
             }
         }
 
@@ -1747,6 +2081,31 @@ mod tests {
             "the newer report is the one echoed"
         );
         assert_eq!(f.fence(), fence);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_leader_waits_for_a_pending_generation_it_applied() {
+        let f = fixture(&[&[1]]);
+        // The state machine holds an InputUp whose index lies ahead.
+        let at = index_at(T0) + 400 * B;
+        f.log.0.lock().unwrap().pending.push((
+            3,
+            Body::InputUp {
+                slot: 0,
+                at_index: at,
+            },
+        ));
+        let contact = Contact::new(
+            1,
+            Timing::defaults(B),
+            f.clock.clone(),
+            Some(f.engine.clone()),
+            f.log.clone(),
+            1,
+        );
+        contact.tick(f.members.clone());
+        assert!(contact.stamp(false).is_ok());
+        assert_eq!(contact.stamp(true), Err(StampRefusal::GenerationPending));
     }
 
     /// The log's view holds its lock while it walks the pending entries,

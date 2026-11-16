@@ -222,6 +222,8 @@ pub struct Fake {
     /// The processed block stands still from here.
     pub stalled_at: Option<u64>,
     pub flags: ClockFlags,
+    pub build_lead: Option<u64>,
+    pub entries_refused: u64,
 }
 
 impl FakeAudio {
@@ -276,8 +278,10 @@ impl Audio for FakeAudio {
                 clock: st.flags,
                 statuses: Vec::new(),
                 unwritten: Vec::new(),
+                build_lead: st.build_lead,
             },
             status_changes_lost: 0,
+            entries_refused: st.entries_refused,
         }
     }
     fn fence(&self, end: u64) {

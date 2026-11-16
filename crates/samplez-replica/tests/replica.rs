@@ -450,7 +450,12 @@ async fn a_delayed_copy_is_a_duplicate_within_retention_and_stale_after_it() {
         (seven, Resolution::Duplicate)
     );
     tokio::time::sleep(Duration::from_secs(11)).await;
-    let after = ack(&**replica, "s", "7", "gain=7@7").await;
+    // Past the retention a resend to the replica that first received it
+    // is refused by its first-receipt stamp; one through another replica
+    // is stamped there on receipt.
+    let leader = set_.leader().await;
+    let other = set_.ids().find(|&id| id != leader).unwrap();
+    let after = ack(&**set_.replica(other), "s", "7", "gain=7@7").await;
     assert_ne!(after.revision, seven);
     assert_eq!(after.resolution, Resolution::Stale, "the client is told");
     replica.store().with_state(|sm| {

@@ -191,6 +191,11 @@ pub enum Body {
 }
 
 impl Body {
+    /// An entry whose generation every replica builds on receipt.
+    pub fn needs_generation(&self) -> bool {
+        matches!(self, Body::InputUp { .. } | Body::Route { .. })
+    }
+
     /// The engine index the entry takes effect at, for the entries the
     /// engine applies rather than the state machine alone.
     pub fn at_index(&self) -> Option<u64> {

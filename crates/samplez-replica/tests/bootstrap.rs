@@ -728,8 +728,13 @@ async fn joiners_follow_a_replaced_marker_and_a_stale_cluster_is_refused() {
     };
     assert!(set.kube.create(stale).await.unwrap());
     set.start_slots(&[Slot::Audio(1), Slot::Audio(2)]).await;
-    tokio::time::sleep(PERIOD * 2).await;
-    assert_eq!(set.epochs(), BTreeSet::from([11]));
+    // Each reads the marker on its next watch period, which a loaded host
+    // delays: waited for, not slept for.
+    assert!(
+        until(PERIOD * 10, || set.epochs() == BTreeSet::from([11])).await,
+        "{:?}",
+        set.epochs()
+    );
 
     set.api.delete();
     set.start_slots(&[Slot::Audio(0)]).await;

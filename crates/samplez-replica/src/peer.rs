@@ -101,6 +101,9 @@ pub enum Refused {
     OtherCluster,
     /// A join for a slot the set does not want.
     NotWanted,
+    /// First received longer ago than the set deduplicates
+    /// (`dedupRetentionS - ageGuard` of E): never ordered.
+    Expired,
     /// A leader asked for a read index that no majority acknowledged
     /// within the lease: the asker reads its own state, marked stale.
     CutOff,

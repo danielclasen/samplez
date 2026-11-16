@@ -351,7 +351,7 @@ impl<P: Product> StateMachine<P> {
     }
 }
 
-fn restamp(body: &mut Body, to: u64) {
+pub(crate) fn restamp(body: &mut Body, to: u64) {
     match body {
         Body::InputDown { at_index, .. }
         | Body::InputUp { at_index, .. }
