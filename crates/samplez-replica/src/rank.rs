@@ -153,7 +153,7 @@ impl Baselines {
     /// [`audio_voters`]), 0 the top.
     pub fn rank(&self, k: u64, me: NodeId, audio: &[NodeId], timing: &Timing) -> u8 {
         let Ok(base) = self.base(k, timing) else {
-            return demoted(me, audio);
+            return demoted(me, audio, Class::Demoted);
         };
         let mut order: Vec<NodeId> = Vec::with_capacity(audio.len());
         if let Some(b) = base {
@@ -170,7 +170,7 @@ impl Baselines {
         }
         match order.iter().position(|&id| id == me) {
             Some(p) => (p as u8).min(MAX_RANK),
-            None => demoted(me, audio),
+            None => demoted(me, audio, Class::Demoted),
         }
     }
 }
@@ -203,10 +203,29 @@ pub fn schedule(lo: u64, hi: u64, rank_of: impl Fn(u64) -> u8, fill: u8) -> (Ran
     (ranks, None)
 }
 
-/// `me`'s rank as demoted: below every audio voter, by ordinal.
-pub fn demoted(me: NodeId, audio: &[NodeId]) -> u8 {
-    let p = audio.iter().position(|&id| id == me).unwrap_or(audio.len());
-    ((audio.len() + p) as u8).min(MAX_RANK)
+/// The classes demoted replicas rank in, below every replica that is
+/// not demoted, each by ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Class {
+    /// Not diverged, with the baseline's key.
+    Demoted,
+    /// An old-key filler in a key hand-over.
+    Filler,
+    Diverged,
+}
+
+/// `me`'s rank as demoted in `class`: below every audio voter that is not
+/// demoted, then by class, then by ordinal. Seven audio voters, the most a
+/// set has, rank up to 27 and fit [`MAX_RANK`].
+pub fn demoted(me: NodeId, audio: &[NodeId], class: Class) -> u8 {
+    let n = audio.len();
+    let p = audio.iter().position(|&id| id == me).unwrap_or(n);
+    let class = match class {
+        Class::Demoted => 1,
+        Class::Filler => 2,
+        Class::Diverged => 3,
+    };
+    ((class * n + p) as u8).min(MAX_RANK)
 }
 
 /// The bit of `id` in an `onSilenceOf` mask: its ordinal; none for the
@@ -300,6 +319,22 @@ mod tests {
         assert_eq!(b.rank(1000, a(0), &m[..], &t), 0);
     }
 
+    /// Demoted replicas rank below every other, the diverged ones below
+    /// the rest and old-key fillers between them; with seven audio voters
+    /// the lowest fits the status's 5 bits of rank.
+    #[test]
+    fn demoted_classes_rank_below_the_rest_and_fit_five_bits() {
+        let seven: Vec<NodeId> = (0..7).map(a).collect();
+        let r = |o, c| demoted(a(o), &seven, c);
+        assert_eq!(r(0, Class::Demoted), 7);
+        assert!(r(6, Class::Demoted) < r(0, Class::Filler));
+        assert!(r(6, Class::Filler) < r(0, Class::Diverged));
+        assert_eq!(r(6, Class::Diverged), 27);
+        assert!(r(6, Class::Diverged) <= MAX_RANK);
+        let three: Vec<NodeId> = (0..3).map(a).collect();
+        assert!(demoted(a(2), &three, Class::Demoted) < demoted(a(0), &three, Class::Diverged));
+    }
+
     /// One change in `[lo, hi)` goes into the ranks; a second one is
     /// where F has to wait.
     #[test]
@@ -311,7 +346,7 @@ mod tests {
         b.appended(id(6), &baseline(a(1), &[], 1020 * B));
         b.learned(6, 0, |i| Some(id(i)));
         let rank_of = |k| b.rank(k, a(1), &m[..], &t);
-        let fill = demoted(a(1), &m);
+        let fill = demoted(a(1), &m, Class::Demoted);
         let (r, cap) = schedule(1000, 1015, rank_of, fill);
         assert_eq!(
             r,

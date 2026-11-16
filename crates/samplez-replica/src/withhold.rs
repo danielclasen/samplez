@@ -475,6 +475,8 @@ mod tests {
             self.0.lock().unwrap().push("withdraw".into());
         }
         fn ranks(&self, _: Ranks) {}
+        fn commit_from(&self, _: usize, _: u64) {}
+        fn cancel_commit_start(&self, _: usize) {}
     }
 
     fn a(o: u16) -> NodeId {

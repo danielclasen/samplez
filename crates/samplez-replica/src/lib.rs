@@ -10,6 +10,7 @@
 //! every other volume joins as a learner, and the leader reconciles the
 //! voters with the wanted ones ([`membership`]).
 
+pub mod baseline;
 pub mod bootstrap;
 pub mod bridge;
 pub mod contact;
@@ -23,7 +24,9 @@ pub mod rank;
 pub mod report;
 pub mod schedule;
 pub mod snapshot;
+pub mod state;
 pub mod state_machine;
+pub mod verdict;
 pub mod withhold;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -146,7 +149,7 @@ struct Item {
     forwarded: bool,
 }
 
-enum Queued {
+pub(crate) enum Queued {
     Command(Item),
     Entry {
         body: Body,
@@ -433,7 +436,11 @@ impl<P: Product> Replica<P> {
             .contact
             .set(contact.clone())
             .map_err(|_| "contact runs already".to_owned())?;
-        tokio::spawn(contact::run(self.shared.clone(), contact));
+        tokio::spawn(contact::run(
+            self.shared.clone(),
+            contact,
+            self.queue.clone(),
+        ));
         Ok(())
     }
 
@@ -785,6 +792,9 @@ impl Shared {
                 if let Some(at) = body.at_index() {
                     state_machine::restamp(&mut body, at.max(stamp.earliest));
                 }
+                if let Body::Baseline(b) = &mut body {
+                    b.at_index = b.at_index.max(stamp.earliest);
+                }
                 let request = Request {
                     stamp: stamp.stamp,
                     body,
@@ -1083,7 +1093,9 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     /// ready until it has joined, a saved vote alone included. The
     /// clock verification and the generations 2.11 adds to it are not
     /// known here. With contact running the witness is ready only while
-    /// it is in contact. `commitable` once ready on a voter other than the
+    /// it is in contact, and an audio replica of a set of more than one
+    /// voter only as [`contact::Contact::serving`] says; `commitable`
+    /// does not take that term. `commitable` once ready on a voter other than the
     /// witness that a leader counts as a voter, now or within the last
     /// [`membership::UNCOUNTED`]: it forwards what it does not
     /// order itself. The only voter of its membership counts itself while
@@ -1111,7 +1123,8 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             leader: metrics.current_leader.map(|id| id.to_string()),
             in_sync: metrics.last_log_index.unwrap_or(0) <= applied,
             lag: None,
-            ready,
+            // An audio replica adds the term of plan 2.11, Deployment.
+            ready: ready && self.shared.contact.get().is_none_or(|c| c.serving()),
             commitable: ready
                 && voter
                 && slot_of(self.id()) != Slot::Witness

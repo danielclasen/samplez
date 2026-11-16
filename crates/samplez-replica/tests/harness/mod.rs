@@ -13,7 +13,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -29,17 +29,18 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Raft, ServerState};
 use samplez::blocks::{
-    BlockStatus, Cause, Changes, Ctx, HEALTHY, Hold, Kind, Ranks, Sink, StatusChange, Statuses,
+    BlockStatus, Cause, Changes, Ctx, HEALTHY, Hold, Kind, PAGE, PageHash, Pages, Ranks, Sink,
+    StatusChange, Statuses,
 };
 use samplez_replica::bootstrap::{Bootstrap, Marker, Markers, Volume, random_id};
-use samplez_replica::bridge::word_or_skip;
+use samplez_replica::bridge::{PAGES_REPORTED, page_of, word_or_skip};
 use samplez_replica::contact::{self, Audio, Clocks, Sample, Timing};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::Request;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
 use samplez_replica::membership::{Slot, slot_of};
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest, PeerResponse};
-use samplez_replica::report::{ClockFlags, Own, Report, Run, runs};
+use samplez_replica::report::{ClockFlags, Own, Page, Report, Run, runs};
 use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
 use samplez_service::{Owner, ReplicatedState, Role};
@@ -213,7 +214,8 @@ pub struct FakeAudio {
     pub state: Mutex<Fake>,
 }
 
-/// One output of a [`FakeAudio`].
+/// One output of a [`FakeAudio`]: its pages hashed as the engine hashes
+/// them, from the samples it computes.
 pub struct Output {
     pub hold: Hold,
     pub statuses: Statuses,
@@ -221,6 +223,13 @@ pub struct Output {
     rx: rtrb::Consumer<StatusChange>,
     dropped: AtomicU64,
     pub sink: Writes,
+    pages: Pages,
+    page_tx: rtrb::Producer<PageHash>,
+    page_rx: rtrb::Consumer<PageHash>,
+    /// The latest page records, as reports carry them.
+    pub kept: VecDeque<Page>,
+    /// Without a writer the output computes, hashes and commits nothing.
+    pub realised: bool,
 }
 
 /// The ranges an output committed, `(start, len)`, in order.
@@ -277,6 +286,21 @@ pub struct Fake {
     pub withdrawals: u64,
     /// The RT thread neither computes nor moves a block.
     pub frozen: bool,
+    /// Commit starts and cancels the supervisor named are recorded and not
+    /// applied: a test names them by hand.
+    pub manual: bool,
+    /// Commit starts the supervisor named, `(output, min_k)`, and cancels.
+    pub commit_starts: Vec<(usize, u64)>,
+    pub cancels: Vec<usize>,
+    /// Blocks `[from, to)` whose samples differ from every other replica's
+    /// by a factor `1 + by`, in what is hashed, not in what is written: content
+    /// diverged.
+    pub glitched: Vec<(u64, u64, f32)>,
+    /// Entry fingerprints `(from, to, fingerprint)` of pages `[from, to)`;
+    /// the rest have 0.
+    pub fingerprints: Vec<(u64, u64, u64)>,
+    /// A generation its pending entries need is not built.
+    pub generation_pending: bool,
 }
 
 impl Fake {
@@ -286,6 +310,14 @@ impl Fake {
             .rev()
             .find(|&&(a, b, _)| (a..b).contains(&k))
             .map_or(HEALTHY, |&(_, _, d)| d)
+    }
+
+    fn fingerprint(&self, page: u64) -> u64 {
+        self.fingerprints
+            .iter()
+            .rev()
+            .find(|&&(a, b, _)| (a..b).contains(&page))
+            .map_or(0, |&(_, _, f)| f)
     }
 
     fn ctx(&self) -> Ctx {
@@ -309,20 +341,27 @@ impl Fake {
 }
 
 impl FakeAudio {
-    pub fn new(clock: Arc<Clock>, timing: Timing, outputs: usize) -> FakeAudio {
+    /// `alone`: the only voter, which commits every block at once.
+    pub fn new(clock: Arc<Clock>, timing: Timing, outputs: usize, alone: bool) -> FakeAudio {
         let cap = contact::index_at((timing.hold + timing.contact_window).as_nanos() as u64)
             .div_ceil(timing.block) as usize
             + 2;
         let outputs = (0..outputs)
-            .map(|_| {
+            .map(|o| {
                 let (tx, rx) = rtrb::RingBuffer::new(4096);
+                let (page_tx, page_rx) = rtrb::RingBuffer::new(256);
                 Output {
-                    hold: Hold::new(1, timing.block, cap, false),
+                    hold: Hold::new(1, timing.block, cap, alone),
                     statuses: Statuses::new(256, timing.block),
                     tx,
                     rx,
                     dropped: AtomicU64::new(0),
                     sink: Writes::default(),
+                    pages: Pages::new(o as u32, 1, timing.block, cap),
+                    page_tx,
+                    page_rx,
+                    kept: VecDeque::new(),
+                    realised: true,
                 }
             })
             .collect();
@@ -398,6 +437,43 @@ impl FakeAudio {
         self.lock().degraded.push((from, to, digest));
     }
 
+    /// Blocks `[from, to)` compute other samples than every other
+    /// replica's, scaled by `1 + by`, unknown to the replica: its page hashes
+    /// differ.
+    pub fn glitch(&self, from: u64, to: u64, by: f32) {
+        self.lock().glitched.push((from, to, by));
+    }
+
+    /// Output `output` loses its writer, as the engine releases one: its
+    /// open blocks are withheld and it commits, hashes and computes
+    /// nothing until [`FakeAudio::realise`].
+    pub fn unrealise(&self, output: usize) {
+        self.step();
+        let mut st = self.lock();
+        let out = &mut st.outputs[output];
+        out.realised = false;
+        let mut changes = Changes {
+            ring: &mut out.tx,
+            dropped: &out.dropped,
+            output: output as u32,
+        };
+        out.hold
+            .idle(&out.statuses, &mut changes, &mut out.sink, Cause::Released);
+        out.pages.restart();
+        out.kept.clear();
+    }
+
+    /// Output `output` has a writer again: idle until a commit start.
+    pub fn realise(&self, output: usize) {
+        self.step();
+        self.lock().outputs[output].realised = true;
+    }
+
+    /// Commit starts and cancels the supervisor names are recorded only.
+    pub fn manual(&self) {
+        self.lock().manual = true;
+    }
+
     /// Block `k`'s status on `output`.
     pub fn status_of(&self, output: usize, k: u64) -> Option<BlockStatus> {
         self.step();
@@ -432,8 +508,21 @@ impl FakeAudio {
             let ctx = st.ctx();
             let digest = st.digest(k);
             let data: Vec<f32> = (k * b..(k + 1) * b).map(|i| i as f32).collect();
+            let shift = st
+                .glitched
+                .iter()
+                .rev()
+                .find(|&&(a, z, _)| (a..z).contains(&k))
+                .map_or(0.0, |&(_, _, by)| by);
+            // Scaled: an offset is lost at these indices' magnitude.
+            let hashed: Vec<f32> = data.iter().map(|&x| x * (1.0 + shift)).collect();
+            let fingerprint = st.fingerprint(((k + 1) * b - 1) / PAGE);
             for o in 0..st.outputs.len() {
                 let out = &mut st.outputs[o];
+                if !out.realised {
+                    continue;
+                }
+                out.pages.hash(k, &hashed, Some(fingerprint), &out.dropped);
                 let mut changes = Changes {
                     ring: &mut out.tx,
                     dropped: &out.dropped,
@@ -470,6 +559,15 @@ impl FakeAudio {
                 .advance(ctx, &out.statuses, &mut changes, &mut out.sink)
                 .withdraw;
             while out.rx.pop().is_ok() {}
+            out.pages
+                .settle(&out.statuses, &mut out.page_tx, &out.dropped);
+            while let Ok(h) = out.page_rx.pop() {
+                if out.kept.len() == PAGES_REPORTED {
+                    out.kept.pop_front();
+                }
+                let statuses = &out.statuses;
+                out.kept.push_back(page_of(&h, b, |k| statuses.get(k)));
+            }
             // As the engine does: before the next output advances.
             if withdraw {
                 st.withdraw_all();
@@ -516,9 +614,17 @@ impl Audio for FakeAudio {
                 standing: st.outputs.iter().map(|o| o.statuses.standing()).collect(),
                 unwritten: Vec::new(),
                 build_lead: st.build_lead,
+                pages: st
+                    .outputs
+                    .iter()
+                    .flat_map(|o| o.kept.iter().copied())
+                    .collect(),
+                ..Own::default()
             },
             status_changes_lost: 0,
             entries_refused: st.entries_refused,
+            realised: st.outputs.iter().map(|o| o.realised).collect(),
+            generation_ready: !st.generation_pending,
         }
     }
     fn fence(&self, end: u64) {
@@ -590,6 +696,26 @@ impl Audio for FakeAudio {
     fn ranks(&self, ranks: Ranks) {
         let tai = self.clock.tai_ns();
         self.lock().ranks.push((tai, ranks));
+    }
+    fn commit_from(&self, output: usize, min_k: u64) {
+        let mut st = self.lock();
+        if st.commit_starts.last() != Some(&(output, min_k)) {
+            st.commit_starts.push((output, min_k));
+        }
+        if !st.manual
+            && let Some(out) = st.outputs.get_mut(output)
+        {
+            out.hold.commit_from(min_k);
+        }
+    }
+    fn cancel_commit_start(&self, output: usize) {
+        let mut st = self.lock();
+        st.cancels.push(output);
+        if !st.manual
+            && let Some(out) = st.outputs.get_mut(output)
+        {
+            out.hold.cancel_commit_start();
+        }
     }
 }
 
@@ -988,6 +1114,9 @@ pub struct Options {
     pub ids: Option<Vec<NodeId>>,
     /// Outputs of each [`FakeAudio`]; none leaves it without blocks.
     pub outputs: usize,
+    /// Each [`FakeAudio`] records the commit starts its supervisor names
+    /// and applies none ([`FakeAudio::manual`]): the test names them.
+    pub manual: bool,
 }
 
 impl Default for Options {
@@ -1002,6 +1131,7 @@ impl Default for Options {
             contact: None,
             ids: None,
             outputs: 0,
+            manual: false,
         }
     }
 }
@@ -1144,8 +1274,14 @@ impl Set {
         let replica = Arc::new(replica);
         if let Some(timing) = self.options.contact {
             let clock = self.clocks[&id].clone();
-            let audio = (slot_of(id) != Slot::Witness)
-                .then(|| Arc::new(FakeAudio::new(clock.clone(), timing, self.options.outputs)));
+            let audio = (slot_of(id) != Slot::Witness).then(|| {
+                let alone = self.ids().count() == 1;
+                let audio = FakeAudio::new(clock.clone(), timing, self.options.outputs, alone);
+                if self.options.manual {
+                    audio.manual();
+                }
+                Arc::new(audio)
+            });
             let engine = audio.clone().map(|a| a as Arc<dyn Audio>);
             replica
                 .contact(timing, Arc::new(Tai(clock)), engine)

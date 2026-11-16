@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use samplez::blocks::{HEALTHY, PAGE};
 use samplez::{Config, Engine, Replication};
 use samplez_replica::bootstrap::random_id;
-use samplez_replica::bridge::{EngineAudio, input_entry};
+use samplez_replica::bridge::{EngineAudio, PAGES_REPORTED, input_entry};
 use samplez_replica::contact::{Audio, Timing};
 use samplez_replica::entry::{Body, Request};
-use samplez_replica::report::status_of;
+use samplez_replica::report::{page_digest, status_of};
 
 const B: u64 = 48;
 
@@ -74,12 +75,13 @@ fn bridge(domain: &Domain, changes: usize) -> (Arc<Engine>, EngineAudio) {
     let config = Config::parse(&v.to_string()).unwrap();
     let (reports, _) = std::sync::mpsc::sync_channel(64);
     let (status_tx, status_rx) = std::sync::mpsc::sync_channel(changes);
+    let (hash_tx, hash_rx) = std::sync::mpsc::sync_channel(1 << 10);
     let process = samplez::rt::setup_process(&config.rt);
     let replication = Replication {
         voters: 3,
         reports,
         statuses: Some(status_tx),
-        hashes: None,
+        hashes: Some(hash_tx),
     };
     let engine = Arc::new(Engine::start_replicated(config, process, None, replication).unwrap());
     wait_for("output realised", || engine.status().outputs[0].realised);
@@ -87,7 +89,13 @@ fn bridge(domain: &Domain, changes: usize) -> (Arc<Engine>, EngineAudio) {
         margin: 960,
         ..Timing::defaults(B)
     };
-    let audio = EngineAudio::new(engine.clone(), status_rx, &timing, Box::new(input_entry));
+    let audio = EngineAudio::new(
+        engine.clone(),
+        status_rx,
+        hash_rx,
+        &timing,
+        Box::new(input_entry),
+    );
     (engine, audio)
 }
 
@@ -262,4 +270,50 @@ fn the_supervisor_moves_the_engines_blocks_through_the_bridge() {
             [Standing::Withdrawn { since }] if since > k
         )
     });
+}
+
+/// Reports carry each output's latest page records, an idle output's
+/// too: uncommitted and without digest while it gives no status, and once
+/// it commits with the degradation its blocks' statuses show.
+#[test]
+fn reports_carry_the_latest_page_hashes() {
+    let domain = Domain::new();
+    let (engine, audio) = bridge(&domain, 1 << 16);
+    wait_for("an idle output's page hashed", || {
+        !audio.sample().own.pages.is_empty()
+    });
+    let idle = audio.sample().own.pages;
+    assert!(idle.len() <= PAGES_REPORTED, "{idle:?}");
+    assert!(
+        idle.iter()
+            .all(|p| !p.committed && !p.degraded && p.digest.is_none()),
+        "{idle:?}"
+    );
+    engine.set_fence(u64::MAX).unwrap();
+    engine.commit_from(0, 0).unwrap();
+    // Read as the records arrive: a block's status is gone once its slot
+    // is reused.
+    let blocks = |q: u64| q * PAGE / B..=((q + 1) * PAGE - 1) / B;
+    let mut checked = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while checked < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "{checked} pages with statuses in 10 s"
+        );
+        for page in audio.sample().own.pages {
+            let statuses: Vec<_> = blocks(page.page)
+                .map(|k| engine.block_status(0, k))
+                .collect();
+            if statuses.iter().any(Option::is_none) {
+                continue;
+            }
+            let digests: Vec<Option<u64>> = statuses.iter().map(|s| s.unwrap().digest).collect();
+            let degraded = digests.iter().any(|d| d.is_some_and(|d| d != HEALTHY));
+            assert_eq!(page.degraded, degraded, "{page:?} {statuses:?}");
+            assert_eq!(page.digest, page_digest(digests), "{page:?} {statuses:?}");
+            checked += 1;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

@@ -161,6 +161,13 @@ pub enum Body {
         replica: NodeId,
         judged: bool,
     },
+    /// The leader's page verdict: `replica`'s hash for `page` lost (plan
+    /// 2.11, Withholding and divergence). It turns diverged once it knows
+    /// the entry committed, unless its commit start lies after the page.
+    Diverged {
+        replica: NodeId,
+        page: u64,
+    },
     Disrupt(Option<Disruption>),
     /// Renews the leases of these sessions at the entry's stamping index.
     LeaseRenew(Vec<SessionKey>),

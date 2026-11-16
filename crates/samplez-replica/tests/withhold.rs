@@ -52,6 +52,7 @@ async fn start_with(ids: Vec<NodeId>, outputs: usize, t: Timing) -> Set {
         ids: Some(ids),
         contact: Some(t),
         outputs,
+        manual: true,
         ..Options::default()
     })
     .await;
@@ -407,6 +408,7 @@ async fn start_some(ids: Vec<NodeId>, committing: &[NodeId]) -> Set {
         ids: Some(ids),
         contact: Some(timing()),
         outputs: 1,
+        manual: true,
         ..Options::default()
     })
     .await;

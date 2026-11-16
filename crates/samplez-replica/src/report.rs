@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::entry::NodeId;
 use crate::snapshot::StoredLogId;
+use crate::state::ReplicaState;
 
 /// Entries one report lists at most.
 pub const MAX_LISTED: usize = 64;
@@ -114,6 +115,48 @@ pub struct Own {
     /// buildLead: samples a generation-needing entry is stamped ahead of
     /// the earliest index, covering this replica's generation builds.
     pub build_lead: Option<u64>,
+    /// The replica's state (plan 2.11, Replica states); none for the
+    /// witness.
+    #[serde(default)]
+    pub state: Option<ReplicaState>,
+    /// Applied the log up to the commit index it knows and built the
+    /// generations its pending entries need.
+    #[serde(default)]
+    pub ready: bool,
+    /// The latest `Baseline` it applied, as `(replica, at_index)`.
+    #[serde(default)]
+    pub baseline: Option<(NodeId, u64)>,
+    /// The page hashes of its latest pages, per output, oldest first.
+    #[serde(default)]
+    pub pages: Vec<Page>,
+}
+
+/// One page of one output as the sender computed it (plan 2.11, page
+/// hashes): sent once every block overlapping it is final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Page {
+    pub output: u32,
+    pub page: u64,
+    pub hash: u64,
+    /// The entry fingerprint of the page.
+    pub fingerprint: u64,
+    /// Every sample of the page was committed.
+    pub committed: bool,
+    /// A block overlapping the page carried a degradation the sender knew
+    /// of before it committed: a digest other than the healthy one.
+    pub degraded: bool,
+    /// The digests of the blocks overlapping the page, combined; none when
+    /// one of them had none.
+    pub digest: Option<u64>,
+}
+
+/// [`Page::digest`] over the digests of a page's blocks, in block order.
+pub fn page_digest(digests: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    let mut h = xxhash_rust::xxh3::Xxh3Default::new();
+    for d in digests {
+        h.update(&d?.to_le_bytes());
+    }
+    Some(h.digest())
 }
 
 /// What the sender holds of another voter.
