@@ -132,21 +132,21 @@ pub fn degraded_digest(ids: &[u64], incoming: u64, outgoing: u64) -> u64 {
 }
 
 // Status word layout, from bit 0: kind (3, 0 = no status), range (2),
-// split offset P - kB (11), through (1), digest present (1), rank (4),
-// cause (4), onSilenceOf (8), the block index's low 30 bits.
+// split offset P - kB (10, below B <= 1024), through (1), digest present
+// (1), rank (5), cause (4), onSilenceOf (8), the block index's low 30 bits.
 const KIND_BITS: u32 = 3;
 const RANGE_SHIFT: u32 = 3;
 const SPLIT_SHIFT: u32 = 5;
-const THROUGH_BIT: u32 = 16;
-const DIGEST_BIT: u32 = 17;
-const RANK_SHIFT: u32 = 18;
+const THROUGH_BIT: u32 = 15;
+const DIGEST_BIT: u32 = 16;
+const RANK_SHIFT: u32 = 17;
 const CAUSE_SHIFT: u32 = 22;
 const SILENCE_SHIFT: u32 = 26;
 const TAG_SHIFT: u32 = 34;
 const TAG_MASK: u64 = (1 << 30) - 1;
 
-/// Ranks from 0 to this; a status carries 4 bits of rank.
-pub const MAX_RANK: u8 = 15;
+/// Ranks from 0 to this; a status carries 5 bits of rank.
+pub const MAX_RANK: u8 = 31;
 
 fn encode(s: &BlockStatus, block: u64) -> u64 {
     let kind = match s.kind {
@@ -183,7 +183,7 @@ fn decode(word: u64, digest: u64, k: u64, block: u64) -> Option<BlockStatus> {
     if word >> TAG_SHIFT != k & TAG_MASK {
         return None;
     }
-    let split = k * block + (word >> SPLIT_SHIFT & 0x7ff);
+    let split = k * block + (word >> SPLIT_SHIFT & 0x3ff);
     let range = match word >> RANGE_SHIFT & 3 {
         1 => Range::From(split),
         2 => Range::UpTo(split),
@@ -194,7 +194,7 @@ fn decode(word: u64, digest: u64, k: u64, block: u64) -> Option<BlockStatus> {
         kind,
         range,
         through: word >> THROUGH_BIT & 1 == 1,
-        rank: (word >> RANK_SHIFT & 0xf) as u8,
+        rank: (word >> RANK_SHIFT & 0x1f) as u8,
         cause: CAUSES[(word >> CAUSE_SHIFT & 0xf) as usize % CAUSES.len()],
         on_silence_of: (word >> SILENCE_SHIFT & 0xff) as u8,
         digest: (word >> DIGEST_BIT & 1 == 1).then_some(digest),
@@ -562,18 +562,18 @@ impl Ranks {
         }
     }
 
-    /// One word: 4 bits of each rank, the block index above them.
+    /// One word: 5 bits of each rank, the block index above them.
     pub fn pack(&self) -> u64 {
         let r = |r: u8| u64::from(r.min(MAX_RANK));
-        self.from << 12 | r(self.fill) << 8 | r(self.next) << 4 | r(self.rank)
+        self.from << 15 | r(self.fill) << 10 | r(self.next) << 5 | r(self.rank)
     }
 
     pub fn unpack(word: u64) -> Ranks {
         Ranks {
-            rank: (word & 0xf) as u8,
-            next: (word >> 4 & 0xf) as u8,
-            fill: (word >> 8 & 0xf) as u8,
-            from: word >> 12,
+            rank: (word & 0x1f) as u8,
+            next: (word >> 5 & 0x1f) as u8,
+            fill: (word >> 10 & 0x1f) as u8,
+            from: word >> 15,
         }
     }
 }
@@ -2561,6 +2561,42 @@ mod tests {
                 since: K0 + CAP as u64
             }
         );
+    }
+
+    /// A status holds a rank up to [`MAX_RANK`] beside a split offset up
+    /// to `B - 1` at the largest block size: the demoted classes of seven
+    /// replicas fit, and neither field spills into the other.
+    #[test]
+    fn a_status_holds_a_rank_above_15_beside_the_largest_split() {
+        let block = 1024;
+        let statuses = Statuses::new(64, block);
+        let k = 5_000;
+        for (rank, range) in [
+            (20, Range::From(k * block + 1023)),
+            (MAX_RANK, Range::UpTo(k * block + 1)),
+            (16, Range::Whole),
+        ] {
+            let s = BlockStatus {
+                k,
+                kind: Kind::Held,
+                range,
+                through: true,
+                rank,
+                cause: Cause::HoldCap,
+                on_silence_of: 0b101,
+                digest: Some(9),
+            };
+            statuses.slot(k).word.store(0, Relaxed);
+            assert!(statuses.first(&s).is_ok());
+            assert_eq!(statuses.get(k), Some(s));
+        }
+        let ranks = Ranks {
+            rank: 20,
+            next: MAX_RANK,
+            from: 1 << 40,
+            fill: 17,
+        };
+        assert_eq!(Ranks::unpack(ranks.pack()), ranks);
     }
 
     /// A withdrawn replica keeps a requested commit start when one of its
