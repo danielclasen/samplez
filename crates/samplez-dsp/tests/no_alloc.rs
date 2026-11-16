@@ -4,9 +4,10 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
-    KWeighting, Loudness, Matrix, Meters, Path, PlanarBuffer, Ramp, TruePeak, restore_mxcsr,
-    set_ftz_daz,
+    BandType, EqBand, KWeighting, Loudness, Matrix, Meters, Path, PlanarBuffer, Ramp, Strip,
+    StripParam, TruePeak, restore_mxcsr, set_ftz_daz,
 };
 
 #[path = "../src/require.rs"]
@@ -74,6 +75,8 @@ fn process_calls_do_not_allocate() {
         .flat_map(|&p| [(p, Matrix::new(n, m)), (p, sparse.clone())])
         .collect();
     let mut scratch = vec![0.0f32; cap];
+    let mut strips: Vec<Strip> = [1, 2, 6, 8].map(|legs| Strip::new(legs, 480)).into();
+    let mut strip_buf = vec![0.0f32; 8 * cap];
 
     let before = allocations();
     let saved = set_ftz_daz(true);
@@ -107,6 +110,62 @@ fn process_calls_do_not_allocate() {
         }
         assert!(ramp.set_target(0.25 * round as f32, 100));
         ramp.process(&mut scratch[..frames]);
+        // Every parameter of every strip, set and processed while the
+        // ramps run, and a clone into an existing strip.
+        let on = round % 2 == 0;
+        for s in &mut strips {
+            let last = s.legs() - 1;
+            let gain_db = if on { 12.0 } else { -6.0 };
+            for p in [
+                StripParam::Trim { db: gain_db },
+                StripParam::LegTrim {
+                    leg: last,
+                    db: -gain_db,
+                },
+                StripParam::Polarity {
+                    leg: last,
+                    inverted: on,
+                },
+                StripParam::Hpf {
+                    enabled: on,
+                    freq: 120.0,
+                },
+                StripParam::Eq { enabled: true },
+            ] {
+                assert!(s.set(p));
+            }
+            // Refused: a leg and a band the strip lacks, a value out of
+            // range.
+            for p in [
+                StripParam::LegTrim {
+                    leg: s.legs(),
+                    db: 0.0,
+                },
+                StripParam::EqBand {
+                    band: DEFAULT_BANDS.len(),
+                    value: DEFAULT_BANDS[0],
+                },
+                StripParam::Trim { db: f32::NAN },
+            ] {
+                assert!(!s.set(p));
+            }
+            for (band, b) in DEFAULT_BANDS.iter().enumerate() {
+                let value = EqBand {
+                    kind: if on { b.kind } else { BandType::Peak },
+                    gain_db,
+                    ..*b
+                };
+                assert!(s.set(StripParam::EqBand { band, value }));
+            }
+            let x = &mut strip_buf[..s.legs() * frames];
+            for (n, v) in x.iter_mut().enumerate() {
+                *v = ((n * 7) % 97) as f32 / 97.0 - 0.5;
+            }
+            s.process(x, frames);
+            s.advance(frames);
+        }
+        let first = strips[0].clone();
+        strips[0].clone_from(&first);
     }
     restore_mxcsr(saved);
     let during = allocations() - before;

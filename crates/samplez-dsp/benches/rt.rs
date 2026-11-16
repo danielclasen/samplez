@@ -2,15 +2,16 @@
 //! by Gungraun (`cargo bench --bench rt`). Each benchmark processes one
 //! block of B = 48 samples at the largest shape measured here, 64 input
 //! channels to 96 output channels, on both dispatch paths, with every
-//! coefficient ramping. The hard limits are the instruction counts
-//! measured in the builder image plus 10 %, rounded up; a run above a
-//! limit fails.
+//! coefficient ramping; the strips, 64 mono ones, have one path. The
+//! hard limits are the instruction counts measured in the builder image
+//! plus 10 %, rounded up; a run above a limit fails.
 
 use std::hint::black_box;
 
 use gungraun::prelude::*;
 use gungraun::{Callgrind, EventKind};
-use samplez_dsp::{KWeighting, Matrix, Path, PlanarBuffer, TruePeak};
+use samplez_dsp::strip::DEFAULT_BANDS;
+use samplez_dsp::{EqBand, KWeighting, Matrix, Path, PlanarBuffer, Strip, StripParam, TruePeak};
 
 const B: usize = 48;
 const INPUTS: usize = 64;
@@ -85,11 +86,49 @@ fn setup_meters(path: Path) -> (Path, TruePeak, KWeighting, PlanarBuffer) {
     )
 }
 
+/// 64 mono strips with trim, high-pass and every band on, all of them
+/// ramping (the costliest block) or all settled.
+fn strips(ramping: bool) -> (Vec<Strip>, PlanarBuffer) {
+    let mut v = Vec::new();
+    for _ in 0..INPUTS {
+        let mut s = Strip::new(1, if ramping { 480 } else { 0 });
+        let mut params = vec![
+            StripParam::Trim { db: 6.0 },
+            StripParam::Hpf {
+                enabled: true,
+                freq: 80.0,
+            },
+            StripParam::Eq { enabled: true },
+        ];
+        for (band, b) in DEFAULT_BANDS.iter().enumerate() {
+            let value = EqBand { gain_db: 6.0, ..*b };
+            params.push(StripParam::EqBand { band, value });
+        }
+        for p in params {
+            assert!(s.set(p));
+        }
+        v.push(s);
+    }
+    (v, signal(INPUTS))
+}
+
+#[library_benchmark]
+#[bench::ramping(args = (true,), setup = strips, config = limit(STRIPS_RAMPING))]
+#[bench::settled(args = (false,), setup = strips, config = limit(STRIPS_SETTLED))]
+fn strip((mut strips, mut buf): (Vec<Strip>, PlanarBuffer)) -> (Vec<Strip>, PlanarBuffer) {
+    for (c, s) in strips.iter_mut().enumerate() {
+        s.process(black_box(buf.channel_mut(c)), B);
+    }
+    (strips, buf)
+}
+
 const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
 const METERS_SCALAR: u64 = 1_118_000;
 const METERS_AVX2: u64 = 303_000;
+const STRIPS_RAMPING: u64 = 998_000;
+const STRIPS_SETTLED: u64 = 510_000;
 
-library_benchmark_group!(name = block, benchmarks = [matrix, meters]);
+library_benchmark_group!(name = block, benchmarks = [matrix, meters, strip]);
 
 main!(library_benchmark_groups = block);
