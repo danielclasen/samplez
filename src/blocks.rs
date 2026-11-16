@@ -1214,6 +1214,24 @@ impl Pages {
         }
     }
 
+    /// Drops the page being hashed: its samples before now came from
+    /// another state, so it gets no record.
+    pub fn restart(&mut self) {
+        self.current = None;
+    }
+
+    /// A replay's pages: sends the record of every waiting page, with
+    /// `committed` false, since a replay holds and writes nothing. A
+    /// record `ring` has no room for is counted in `dropped`.
+    pub fn settle_unheld(&mut self, ring: &mut Producer<PageHash>, dropped: &AtomicU64) {
+        while let Some(mut w) = self.waiting.pop_front() {
+            w.record.committed = false;
+            if ring.push(w.record).is_err() {
+                dropped.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
     /// RT. Sends the record of each waiting page whose every block is
     /// final: committed, withheld, or without a status, computed while
     /// the output committed nothing. A record `ring` has no room for is

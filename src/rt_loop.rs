@@ -25,7 +25,7 @@ use samplez_mxl::{MxlApi, time};
 use crate::blocks::{
     Cause, Changes, Ctx, Hold, Kind, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
-use crate::transfer::{Core, CoreCopy, SlotCore};
+use crate::transfer::{Answer, Core, CoreCopy, Handover, SlotCore};
 
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
@@ -118,6 +118,19 @@ pub struct Counters {
     /// supervisor was full, more pages waited for their blocks than it
     /// keeps, or the page's entries did not fit its fingerprint list.
     pub page_hashes_dropped: AtomicU64,
+    /// Replayed cores installed at a block boundary.
+    pub handovers_installed: AtomicU64,
+    /// Replayed cores refused: the RT thread had started a block after
+    /// the one after theirs.
+    pub handovers_passed: AtomicU64,
+    /// Replayed cores refused: the RT thread held a pending generation
+    /// they did not name.
+    pub handovers_generation: AtomicU64,
+    /// Replayed cores refused: the RT thread had taken an entry they did
+    /// not know off its pending list.
+    pub handovers_missed: AtomicU64,
+    /// Pending entries a hand-over found no room for.
+    pub handover_entries_lost: AtomicU64,
     /// Page hashes the supervisor could not pass on: the replicated
     /// state's channel was full.
     pub page_hashes_unsent: AtomicU64,
@@ -362,6 +375,10 @@ pub(crate) struct Replica {
     pub cores: Consumer<Box<Core>>,
     /// The copies, back to the replicated state.
     pub copies: Producer<CoreCopy>,
+    /// A replayed core to install at a block boundary.
+    pub handovers: Consumer<Handover>,
+    /// Handed-over cores back, installed or refused.
+    pub handed: Producer<Handover>,
 }
 
 /// The index of a log entry in the log that orders it.
@@ -801,9 +818,9 @@ pub(crate) struct Mix {
     pub due: Vec<(RtEntry, bool)>,
     /// Entries applied: gain changes the matrix took, and the others.
     pub applied: u64,
-    /// Entries taken off the pending list: applied, refused by the
-    /// matrix or late.
-    pub consumed: u64,
+    /// The highest log id taken off the pending list: applied, reported
+    /// late, or passed to the loop.
+    pub last_taken: LogId,
     /// The `(log id, at_index)` of the entries applied whose index lies
     /// in page `entries_page`, for its fingerprint. Empty capacity when
     /// no page is hashed; else room for every entry one page can take:
@@ -825,7 +842,7 @@ impl Mix {
             pending: Vec::with_capacity(PENDING_CHANGES),
             due: Vec::with_capacity(PENDING_CHANGES),
             applied: 0,
-            consumed: 0,
+            last_taken: 0,
             page_entries: Vec::new(),
             entries_page: None,
             entries_lost: false,
@@ -902,7 +919,7 @@ impl Mix {
             && c.at_index <= start
         {
             self.pending.remove(0);
-            self.consumed += 1;
+            self.last_taken = self.last_taken.max(c.id);
             let Change::Gain {
                 input,
                 output,
@@ -961,6 +978,14 @@ pub(crate) struct Rt {
     pub awaiting_gen: Vec<RtEntry>,
     /// The highest log id taken from the entry ring.
     pub last_entry: LogId,
+    /// Entries taken from the entry ring.
+    pub taken: u64,
+    /// The highest log id a handed-over core knew: an entry up to it
+    /// taken from the ring later is pending or applied already.
+    pub skip_upto: LogId,
+    /// A replay clone: computes off the RT thread from past input, writes
+    /// nothing and hashes every page it computes whole.
+    pub replay: bool,
     pub cmd: Consumer<Command>,
     pub entries: Consumer<RtEntry>,
     pub ret: Producer<Returned>,
@@ -1293,6 +1318,7 @@ impl Rt {
                     *s = GroupWait::Skipped;
                 }
             }
+            self.take_handover(if catchup.is_empty() { k } else { catchup.start });
             for k in catchup {
                 let deadline = time::deadline(&self.api, k, self.block, self.margin);
                 self.process(k, deadline);
@@ -1435,7 +1461,13 @@ impl Rt {
         while self.mix.pending.len() < PENDING_CHANGES
             && let Ok(entry) = self.entries.pop()
         {
+            self.taken += 1;
             self.last_entry = self.last_entry.max(entry.id);
+            // A hand-over brought the entry in already, pending or
+            // applied by the replay.
+            if entry.id <= self.skip_upto || self.mix.holds(entry.id) {
+                continue;
+            }
             let _ = self.mix.push(entry);
         }
     }
@@ -1512,7 +1544,7 @@ impl Rt {
 
     /// Takes the replicated state's control messages.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    fn control(&mut self) {
+    pub(crate) fn control(&mut self) {
         let Some(r) = self.replica.as_mut() else {
             return;
         };
@@ -1693,7 +1725,7 @@ impl Rt {
 
     /// Reads, mixes and writes block `k`, due at `deadline`.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    fn process(&mut self, k: u64, deadline: u64) {
+    pub(crate) fn process(&mut self, k: u64, deadline: u64) {
         let t0 = self.now();
         let b = self.block as usize;
         if let Some(r) = &self.replica {
@@ -1710,9 +1742,14 @@ impl Rt {
         });
         self.apply_due(k);
         self.counters.produced.store((k + 1) * self.block, Release);
+        // Entries taken from the ring and done with: the taken ones still
+        // pending have ids up to the highest taken, those a hand-over
+        // brought in ahead of the ring above it.
+        let last = self.last_entry;
+        let waiting = self.mix.pending.iter().filter(|e| e.id <= last).count() as u64;
         self.counters
             .entries_consumed
-            .store(self.mix.consumed, Release);
+            .store(self.taken - waiting, Release);
         let start = k * self.block;
         let mut silenced = 0u64;
         let mut fading = 0u64;
@@ -1881,6 +1918,18 @@ impl Rt {
         let mut written = self.advance_holds(Some(k));
         for o in 0..self.outs.len() {
             let out = &mut self.outs[o];
+            if self.replay {
+                let src = &mut self.scratch[..out.channels * b];
+                for (c, ch) in src.chunks_exact_mut(b).enumerate() {
+                    ch.copy_from_slice(&self.outbuf.channel(out.first_channel + c)[..b]);
+                }
+                if let (Some(p), Some(r)) = (out.pages.as_mut(), self.replica.as_mut()) {
+                    let dropped = &self.counters.page_hashes_dropped;
+                    p.hash(k, src, fingerprint, dropped);
+                    p.settle_unheld(&mut r.hashes, dropped);
+                }
+                continue;
+            }
             let Some(writer) = out.writer.as_deref_mut() else {
                 continue;
             };
@@ -1955,7 +2004,7 @@ impl Rt {
         }
 
         let done = self.now();
-        if done > deadline + self.period_ns() / 4 {
+        if done > deadline.saturating_add(self.period_ns() / 4) {
             add(&self.counters.deadline_miss, 1);
         }
         self.counters
@@ -2004,6 +2053,114 @@ impl Rt {
             last_id: self.last_entry,
             core,
         });
+    }
+
+    /// Copies the core into `c`, a buffer of the same shape, without
+    /// allocating.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    pub(crate) fn capture(&self, c: &mut Core) {
+        if let Some(r) = &self.replica {
+            let pending_gen = self.pending_gen.as_ref().map(|p| p.0);
+            capture_core(
+                c,
+                &self.mix,
+                &self.slots,
+                &self.awaiting_gen,
+                pending_gen,
+                r,
+            );
+        }
+    }
+
+    /// Makes `c`, a core that knew the entries up to `last_id`, the
+    /// state: the next block computed is the one after it. Entries
+    /// pending here that the core did not know stay pending; one that
+    /// finds no room is counted in `handover_entries_lost`.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    pub(crate) fn install_core(&mut self, c: &Core, last_id: LogId) {
+        let m = &mut self.mix;
+        m.matrix.copy_from(&c.matrix);
+        m.pos = c.pos;
+        m.ramp_end = c.ramp_end;
+        m.pending.retain(|e| e.id > last_id);
+        for e in &c.pending {
+            if !m.holds(e.id) && !m.push(*e) {
+                add(&self.counters.handover_entries_lost, 1);
+            }
+        }
+        m.page_entries.clear();
+        m.page_entries.extend_from_slice(&c.page_entries);
+        m.entries_page = c.entries_page;
+        m.entries_lost = c.entries_lost;
+        for (d, s) in self.slots.iter_mut().zip(&c.slots) {
+            d.up = s.up;
+            d.held = s.held;
+            d.fade_start = s.fade_start;
+            d.silenced_last = s.silenced_last;
+            d.xfade = s.xfade;
+        }
+        self.awaiting_gen.clear();
+        self.awaiting_gen.extend_from_slice(&c.awaiting_gen);
+        if let Some(r) = self.replica.as_mut() {
+            r.unresolved.clear();
+            r.unresolved.extend_from_slice(&c.unresolved);
+            r.late_routes.clear();
+            r.late_routes.extend_from_slice(&c.late_routes);
+            r.late_lost_until = c.late_lost_until;
+        }
+        self.skip_upto = self.skip_upto.max(last_id);
+    }
+
+    /// Installs a replayed core whose last block is the one before
+    /// `first`, the first block this wake computes. One for a block
+    /// still to come waits; one this thread passed, that names a
+    /// generation other than the one held here, or that misses an entry
+    /// this thread took off its pending list goes back refused.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn take_handover(&mut self, first: u64) {
+        let Some(r) = self.replica.as_mut() else {
+            return;
+        };
+        if r.handed.slots() == 0 {
+            return;
+        }
+        let Ok(h) = r.handovers.peek() else {
+            return;
+        };
+        if h.j + 1 > first {
+            return;
+        }
+        let Ok(mut h) = r.handovers.pop() else {
+            return;
+        };
+        h.answer = if h.j + 1 != first {
+            Answer::Passed
+        } else if h.core.pending_gen != self.pending_gen.as_ref().map(|p| p.0) {
+            Answer::Generation
+        } else if self.mix.last_taken > h.last_id {
+            Answer::Missed(self.mix.last_taken)
+        } else {
+            Answer::Installed
+        };
+        let counter = match h.answer {
+            Answer::Installed => {
+                self.install_core(&h.core, h.last_id);
+                // The page holding the boundary mixes both states: no
+                // record.
+                for p in self.outs.iter_mut().filter_map(|o| o.pages.as_mut()) {
+                    p.restart();
+                }
+                &self.counters.handovers_installed
+            }
+            Answer::Generation => &self.counters.handovers_generation,
+            Answer::Missed(_) => &self.counters.handovers_missed,
+            Answer::Passed | Answer::Waiting => &self.counters.handovers_passed,
+        };
+        add(counter, 1);
+        if let Some(r) = self.replica.as_mut() {
+            // Room was checked: nothing is dropped here.
+            let _ = r.handed.push(h);
+        }
     }
 
     /// Sends each slot's statistics since the last call and starts new
@@ -2284,7 +2441,7 @@ mod tests {
         assert!(to(&mut m, 10).is_empty());
         assert!(m.push(change(0.5, 50 * B)));
         assert!(to(&mut m, 100).is_empty());
-        assert_eq!((m.applied, m.consumed), (1, 1));
+        assert_eq!((m.applied, m.pending.len()), (1, 0));
         // The ramp started at 50B and ended at 50B + 480, before 100B.
         assert_eq!(m.matrix.gain(0, 0), 0.5);
         assert_eq!(m.ramp_end, 50 * B + 480);
@@ -2300,7 +2457,7 @@ mod tests {
         // The clock stepped back to block 50: the change at the new start
         // applies, it is not late.
         assert!(to(&mut m, 50).is_empty());
-        assert_eq!((m.applied, m.consumed), (1, 1));
+        assert_eq!((m.applied, m.pending.len()), (1, 0));
         assert_eq!(m.pos, Some(51 * B));
         assert!(m.ramping(50) && m.matrix.is_ramping(0, 0));
         // The next block follows the new position.
@@ -2328,7 +2485,7 @@ mod tests {
         to(&mut m, 10);
         assert!(m.push(change(0.5, 5 * B)));
         assert_eq!(to(&mut m, 11), vec![(5 * B, 11 * B)]);
-        assert_eq!((m.applied, m.consumed), (0, 1));
+        assert_eq!((m.applied, m.pending.len()), (0, 0));
         assert_eq!(m.matrix.gain(0, 0), 1.0);
     }
 
@@ -2420,6 +2577,8 @@ mod tests {
         let (hashes, _) = rtrb::RingBuffer::new(1);
         let (_, cores) = rtrb::RingBuffer::new(1);
         let (copies, _) = rtrb::RingBuffer::new(1);
+        let (_, handovers) = rtrb::RingBuffer::new(1);
+        let (handed, _) = rtrb::RingBuffer::new(1);
         Replica {
             shared: Arc::new(Shared {
                 fence: AtomicU64::new(0),
@@ -2438,6 +2597,8 @@ mod tests {
             hashes,
             cores,
             copies,
+            handovers,
+            handed,
         }
     }
 
@@ -2592,7 +2753,7 @@ mod tests {
         assert!(m.push(up));
         to(&mut m, 15);
         assert_eq!((m.due[0].0.id, m.due[0].1), (up.id, true));
-        assert_eq!(m.consumed, 3);
+        assert!(m.pending.is_empty());
     }
 
     /// A mono slot whose strip ramps over 480 samples.

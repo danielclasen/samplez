@@ -34,7 +34,7 @@ use crate::rt_loop::{
     Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared, Slot, SlotStats,
     Telemetry, UNRESOLVED,
 };
-use crate::transfer::{CopyError, Core, CoreCopy};
+use crate::transfer::{Answer, CopyError, Core, CoreCopy, Handover, Replay, ReplayError};
 
 const COMMAND_RING: usize = 64;
 const RETURN_RING: usize = 64;
@@ -158,6 +158,10 @@ pub struct Status {
     pub rt_panic: Option<String>,
     pub inputs: Vec<InputStatus>,
     pub outputs: Vec<OutputStatus>,
+    /// Replicated mode with more than one voter: replay speed s, the
+    /// blocks a replay clone computes per block period, measured at
+    /// start-up on silence.
+    pub replay_speed: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -380,7 +384,13 @@ struct Transfer {
     cores: rtrb::Producer<Box<Core>>,
     copies: rtrb::Consumer<CoreCopy>,
     in_flight: bool,
-    /// The buffer of a copy refused by the guard, for the next one.
+    handovers: rtrb::Producer<Handover>,
+    handed: rtrb::Consumer<Handover>,
+    /// A hand-over is with the RT thread.
+    handing: bool,
+    /// The number of the last hand-over sent.
+    seq: u64,
+    /// A core buffer not in use, for the next copy or hand-over.
     spare: Option<Box<Core>>,
     /// Input and output channels, input slots and the room for one
     /// page's entries: the shape of a core buffer.
@@ -584,6 +594,157 @@ fn history_kept(started: &Started, k0: u64, slack: u64) -> Result<(), u64> {
     started.confirms(k0 + 1, slack)
 }
 
+/// The input slots of `config`'s shape, every one up, and the index in
+/// `config.domains` of each input domain they use.
+fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
+    let mut in_domains: Vec<usize> = Vec::new();
+    let mut slots = Vec::new();
+    let mut channel = 0;
+    for i in &config.inputs {
+        let d = config.domain(&i.domain).expect("validated");
+        let domain = in_domains.iter().position(|&x| x == d).unwrap_or_else(|| {
+            in_domains.push(d);
+            in_domains.len() - 1
+        });
+        slots.push(Slot::new(
+            domain,
+            channel,
+            i.channels as usize,
+            i.offset_samples,
+            config.ramp_samples,
+        ));
+        channel += i.channels as usize;
+    }
+    (slots, in_domains)
+}
+
+/// A replay clone of `config`'s shape: an engine computing off the RT
+/// thread from `gens`, writing nothing and hashing every page it computes
+/// whole into `hashes`, its entries and controls handed in directly.
+fn replay_rt(
+    config: &Config,
+    api: &Arc<MxlApi>,
+    gens: Vec<Option<Box<Gen>>>,
+    hashes: rtrb::Producer<PageHash>,
+    control: rtrb::Consumer<Control>,
+) -> Rt {
+    let b = u64::from(config.block_size);
+    let (slots, in_domains) = new_slots(config);
+    let (n, m) = (config.input_channels(), config.output_channels());
+    let mut channel = 0;
+    let outs = config
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(o, out)| {
+            let ch = out.channels as usize;
+            channel += ch;
+            Out {
+                first_channel: channel - ch,
+                channels: ch,
+                writer: None,
+                first_k: 0,
+                meter: OutMeter::new(ch),
+                hold: Hold::new(ch, b, 0, true),
+                pages: Some(Pages::new(o as u32, ch, b, 0)),
+            }
+        })
+        .collect();
+    let widest = config
+        .inputs
+        .iter()
+        .map(|i| i.channels)
+        .chain(config.outputs.iter().map(|o| o.channels))
+        .max()
+        .unwrap_or(0) as usize;
+    fn none<T>() -> rtrb::Consumer<T> {
+        rtrb::RingBuffer::new(1).1
+    }
+    fn sink<T>() -> rtrb::Producer<T> {
+        rtrb::RingBuffer::new(1).0
+    }
+    let replica = Replica {
+        shared: Arc::new(Shared {
+            fence: AtomicU64::new(u64::MAX),
+            rank: AtomicU64::new(0),
+            self_report: AtomicBool::new(false),
+            steps_cleared: AtomicU64::new(0),
+            statuses: Vec::new(),
+            started: Started::new(),
+        }),
+        changes: sink(),
+        control,
+        unresolved: Vec::with_capacity(UNRESOLVED),
+        ids: Vec::with_capacity(UNRESOLVED + PENDING_CHANGES),
+        late_routes: Vec::with_capacity(PENDING_CHANGES),
+        late_lost_until: 0,
+        hashes,
+        cores: none(),
+        copies: sink(),
+        handovers: none(),
+        handed: sink(),
+    };
+    Rt {
+        api: Arc::clone(api),
+        block: b,
+        margin: u64::from(config.reader_margin_samples),
+        max_catchup: u64::from(config.max_catchup_blocks),
+        ramp: config.ramp_samples,
+        gens,
+        statuses: (0..in_domains.len()).map(|_| GroupWait::Skipped).collect(),
+        slots,
+        outs,
+        mix: Mix {
+            page_entries: Vec::with_capacity(PENDING_CHANGES * PAGE.div_ceil(b) as usize),
+            ..Mix::new(Matrix::new(n, m), b, config.ramp_samples)
+        },
+        inbuf: PlanarBuffer::new(n, b as usize),
+        outbuf: PlanarBuffer::new(m, b as usize),
+        scratch: vec![0.0; widest * b as usize],
+        scratch_out: vec![0.0; widest * b as usize],
+        pending_gen: None,
+        awaiting_gen: Vec::with_capacity(PENDING_CHANGES),
+        last_entry: 0,
+        taken: 0,
+        skip_upto: 0,
+        replay: true,
+        cmd: none(),
+        entries: none(),
+        ret: sink(),
+        tel: sink(),
+        meters: sink(),
+        resets: none(),
+        meter_seq: 0,
+        counters: Arc::new(Counters::default()),
+        stop: Arc::new(AtomicBool::new(false)),
+        replica: Some(replica),
+        step_at: None,
+    }
+}
+
+/// Replay speed s: blocks a silent replay clone of `config`'s shape
+/// computes per block period, over a second of blocks.
+fn replay_speed(config: &Config, api: &Arc<MxlApi>) -> f64 {
+    let (_, control) = rtrb::RingBuffer::new(1);
+    let (hashes, _) = rtrb::RingBuffer::new(1);
+    let domains = new_slots(config).1.len();
+    let mut rt = replay_rt(
+        config,
+        api,
+        (0..domains).map(|_| None).collect(),
+        hashes,
+        control,
+    );
+    let b = u64::from(config.block_size);
+    let blocks = u64::from(config.sample_rate) / b;
+    let t0 = Instant::now();
+    for k in 0..blocks {
+        rt.process(k, u64::MAX);
+    }
+    let elapsed = t0.elapsed().as_secs_f64().max(1e-9);
+    blocks as f64 * b as f64 / f64::from(config.sample_rate) / elapsed
+}
+
 /// A running engine. Dropping it stops the engine and releases its
 /// writers, which deletes their flows.
 pub struct Engine {
@@ -760,11 +921,17 @@ impl Engine {
             let (control_tx, control_rx) = rtrb::RingBuffer::new(UNRESOLVED);
             let (cores_tx, cores_rx) = rtrb::RingBuffer::new(1);
             let (copies_tx, copies_rx) = rtrb::RingBuffer::new(1);
+            let (handovers_tx, handovers_rx) = rtrb::RingBuffer::new(1);
+            let (handed_tx, handed_rx) = rtrb::RingBuffer::new(1);
             transfer = (!alone).then(|| {
                 Mutex::new(Transfer {
                     cores: cores_tx,
                     copies: copies_rx,
                     in_flight: false,
+                    handovers: handovers_tx,
+                    handed: handed_rx,
+                    handing: false,
+                    seq: 0,
                     spare: None,
                     shape: (
                         config.input_channels(),
@@ -786,6 +953,8 @@ impl Engine {
                 hashes: hashes_tx,
                 cores: cores_rx,
                 copies: copies_tx,
+                handovers: handovers_rx,
+                handed: handed_tx,
             };
             let control = ReplicaControl {
                 ring: control_tx,
@@ -801,24 +970,7 @@ impl Engine {
             (None, None, None, None)
         };
 
-        let mut in_domains: Vec<usize> = Vec::new();
-        let mut slots = Vec::new();
-        let mut channel = 0;
-        for i in &config.inputs {
-            let d = config.domain(&i.domain).expect("validated");
-            let domain = in_domains.iter().position(|&x| x == d).unwrap_or_else(|| {
-                in_domains.push(d);
-                in_domains.len() - 1
-            });
-            slots.push(Slot::new(
-                domain,
-                channel,
-                i.channels as usize,
-                i.offset_samples,
-                config.ramp_samples,
-            ));
-            channel += i.channels as usize;
-        }
+        let (slots, in_domains) = new_slots(&config);
         let mut outs = Vec::new();
         let mut channel = 0;
         for (n, o) in config.outputs.iter().enumerate() {
@@ -874,6 +1026,9 @@ impl Engine {
             pending_gen: None,
             awaiting_gen: Vec::with_capacity(PENDING_CHANGES),
             last_entry: 0,
+            taken: 0,
+            skip_upto: 0,
+            replay: false,
             cmd: cmd_rx,
             entries: entry_rx,
             ret: ret_tx,
@@ -902,6 +1057,7 @@ impl Engine {
             .recv()
             .map_err(|_| Error::Thread("the RT thread ended during set-up".to_owned()))?;
 
+        let replay_speed = transfer.is_some().then(|| replay_speed(&config, &api));
         let status = Arc::new(Mutex::new(Status {
             rt: RtStatus {
                 process: process.clone(),
@@ -911,6 +1067,7 @@ impl Engine {
             generation: GenerationStatus::default(),
             diverged: None,
             rt_panic: None,
+            replay_speed,
             inputs: config
                 .inputs
                 .iter()
@@ -1506,6 +1663,179 @@ impl Engine {
                     started,
                 })
             }
+        }
+    }
+
+    /// Replicated mode with more than one voter: a replay clone of this
+    /// engine from `copy`, a donor's core, computing the blocks after
+    /// `copy.k0` off the RT thread from past input. Its readers are on
+    /// a new instance per input domain, on the flows this engine's
+    /// attached inputs read. A core with a generation-needing entry in
+    /// flight (a pending generation, an entry awaiting one, a crossfade
+    /// running or an `InputUp` or `Route` pending) is refused: copy again
+    /// once it applied.
+    pub fn replay(&self, copy: CoreCopy) -> Result<Replay, ReplayError> {
+        if self.transfer.is_none() {
+            return Err(ReplayError::Invalid(
+                "the engine is not replicated with more than one voter".to_owned(),
+            ));
+        }
+        let c = &copy.core;
+        let next = (copy.k0 + 1) * self.block;
+        let ramp = u64::from(self.config.ramp_samples);
+        let generating = c.pending_gen.is_some()
+            || !c.awaiting_gen.is_empty()
+            || c.slots
+                .iter()
+                .any(|s| s.xfade.is_some_and(|x| next < x + ramp))
+            || c.pending.iter().any(|e| e.change.needs_generation());
+        if generating {
+            return Err(ReplayError::Generation);
+        }
+        let status = self.status();
+        let (slots, in_domains) = new_slots(&self.config);
+        let timing = Timing {
+            block: self.block,
+            margin: self.margin,
+            max_catchup_blocks: u64::from(self.config.max_catchup_blocks),
+            resync_budget: self.config.resync_budget_samples(),
+        };
+        let attach = |e: samplez_mxl::Error| ReplayError::Attach(e.to_string());
+        let mut gens = Vec::with_capacity(in_domains.len());
+        for (d, &domain) in in_domains.iter().enumerate() {
+            let path = &self.config.domains[domain].path;
+            let mut g = Generation::new(&self.api, path, slots.len()).map_err(attach)?;
+            for (i, slot) in slots.iter().enumerate() {
+                let input = &status.inputs[i];
+                if slot.domain != d || input.state != InputState::Attached {
+                    continue;
+                }
+                let cfg = InputConfig {
+                    flow_id: &input.flow_id,
+                    channels: slot.channels as u32,
+                    offset: slot.offset,
+                };
+                g.attach(i, &cfg, &timing).map_err(attach)?;
+            }
+            gens.push(Some(Box::new(Gen {
+                mxl: g,
+                prune_after: vec![u64::MAX; slots.len()],
+                rerouted: false,
+            })));
+        }
+        let (hashes_tx, hashes) = rtrb::RingBuffer::new(4 * self.config.outputs.len().max(1));
+        let (control, control_rx) = rtrb::RingBuffer::new(UNRESOLVED);
+        let mut rt = replay_rt(&self.config, &self.api, gens, hashes_tx, control_rx);
+        rt.install_core(c, copy.last_id);
+        Ok(Replay {
+            rt: Box::new(rt),
+            hashes,
+            control,
+            pages: Vec::new(),
+            silenced: Vec::new(),
+            next: copy.k0 + 1,
+            last_id: copy.last_id,
+        })
+    }
+
+    /// Replicated mode with more than one voter: passes `replay`'s state
+    /// to the RT thread, which installs it before its next block and
+    /// computes on from it. The RT thread installs a core only before the
+    /// block after the core's: once it computed a block, the replay runs
+    /// up to that block and its state is passed on at once, before the
+    /// RT thread's next wake. One that comes back refused for a block the
+    /// RT thread passed, or for a pending generation it does not name,
+    /// is tried again until `timeout`. Returns the block the installed
+    /// state followed. The unresolved entries become the replay's.
+    /// [`ReplayError::Missed`] when the RT thread took an entry off its
+    /// pending list that the replay does not know: append it, then hand
+    /// over again. An answer to a call that timed out is taken by the
+    /// next call: if that hand-over was installed, the unresolved entries
+    /// become its core's.
+    pub fn hand_over(&self, replay: &mut Replay, timeout: Duration) -> Result<u64, ReplayError> {
+        let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
+            return Err(ReplayError::Invalid(
+                "the engine is not replicated with more than one voter".to_owned(),
+            ));
+        };
+        let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + timeout;
+        let (n, m, slots, page) = t.shape;
+        let new = || Box::new(Core::new(n, m, slots, page));
+        let mut core = t.spare.take().unwrap_or_else(new);
+        // Hand-overs before this one were sent by earlier calls.
+        let first = t.seq + 1;
+        let poll =
+            Duration::from_nanos(self.block * 1_000_000_000 / samplez_mxl::SAMPLE_RATE as u64 / 16);
+        let processed = || self.counters.processed.load(Acquire);
+        loop {
+            // The RT thread answers at its next wake. One unanswered for a
+            // second can only be refused: the RT thread is then past its
+            // block. The next call collects the answer.
+            let asked = Instant::now();
+            while t.handing {
+                let Ok(h) = t.handed.pop() else {
+                    if asked.elapsed() > Duration::from_secs(1) {
+                        t.spare = Some(core);
+                        return Err(ReplayError::Timeout);
+                    }
+                    std::thread::sleep(poll);
+                    continue;
+                };
+                t.handing = false;
+                if h.answer == Answer::Installed {
+                    let mut control = control.lock().expect("control lock");
+                    control.unresolved.clear();
+                    control
+                        .unresolved
+                        .extend(h.core.unresolved.iter().map(|u| u.0));
+                }
+                match h.answer {
+                    _ if h.seq < first => {}
+                    Answer::Installed => {
+                        t.spare = Some(h.core);
+                        return Ok(h.j);
+                    }
+                    Answer::Missed(id) => {
+                        t.spare = Some(h.core);
+                        return Err(ReplayError::Missed { id });
+                    }
+                    Answer::Passed | Answer::Generation | Answer::Waiting => {}
+                }
+                core = h.core;
+            }
+            if Instant::now() >= deadline {
+                t.spare = Some(core);
+                return Err(ReplayError::Timeout);
+            }
+            // Up to the last block the RT thread computed, then the step
+            // to the next one: the RT thread sleeps after it until its
+            // next wake, which installs a core for that block.
+            let p = processed();
+            replay.run(p.saturating_sub(1));
+            let p = processed();
+            while processed() == p {
+                if Instant::now() >= deadline {
+                    t.spare = Some(core);
+                    return Err(ReplayError::Timeout);
+                }
+                std::thread::sleep(poll);
+            }
+            replay.run(processed().saturating_sub(1));
+            replay.rt.capture(&mut core);
+            t.seq += 1;
+            let h = Handover {
+                seq: t.seq,
+                j: replay.next - 1,
+                last_id: replay.last_id,
+                core,
+                answer: Answer::Waiting,
+            };
+            if t.handovers.push(h).is_err() {
+                unreachable!("one hand-over is with the RT thread at most");
+            }
+            t.handing = true;
+            core = t.spare.take().unwrap_or_else(new);
         }
     }
 
@@ -3825,6 +4155,98 @@ mod tests {
         assert_eq!(c.command_late.load(Relaxed), 0);
         e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// A replayed core for a block the RT thread passed goes back
+    /// refused, its state untouched: installed there, it would replace the
+    /// state after a later block with an older one.
+    #[test]
+    fn a_handover_the_rt_thread_passed_is_refused() {
+        let (e, _statuses, _verdicts, domain) = outputs_only("handover-passed", 1);
+        let copy = loop {
+            match e.copy_core(Duration::from_secs(2)) {
+                Err(CopyError::Passed { .. }) => continue,
+                c => break c.unwrap(),
+            }
+        };
+        wait(&|| e.counters.processed.load(Acquire) > copy.k0 + 2);
+        let mut t = e.transfer.as_ref().unwrap().lock().unwrap();
+        let h = Handover {
+            seq: 1,
+            j: copy.k0,
+            last_id: copy.last_id,
+            core: copy.core,
+            answer: Answer::Waiting,
+        };
+        assert!(t.handovers.push(h).is_ok());
+        let h = loop {
+            if let Ok(h) = t.handed.pop() {
+                break h;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(h.answer, Answer::Passed);
+        assert_eq!(e.counters.handovers_passed.load(Relaxed), 1);
+        assert_eq!(e.counters.handovers_installed.load(Relaxed), 0);
+        drop(t);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// The answer to a hand-over whose caller gave up goes to the next
+    /// call, which does not take it for its own: that call installs its
+    /// own core.
+    #[test]
+    fn a_late_answer_is_not_taken_for_the_next_handover() {
+        let (e, _statuses, _verdicts, domain) = outputs_only("handover-late", 1);
+        let copy = || loop {
+            match e.copy_core(Duration::from_secs(2)) {
+                Err(CopyError::Passed { .. }) => continue,
+                c => break c.unwrap(),
+            }
+        };
+        let n = |c: &AtomicU64| c.load(Relaxed);
+        let processed = || e.counters.processed.load(Acquire);
+        // An earlier call's hand-over, installed once that call gave up.
+        while n(&e.counters.handovers_installed) == 0 {
+            let mut replay = e.replay(copy()).unwrap();
+            let mut t = e.transfer.as_ref().unwrap().lock().unwrap();
+            let (inputs, outputs, slots, page) = t.shape;
+            let mut core = Box::new(Core::new(inputs, outputs, slots, page));
+            let p = processed();
+            while processed() == p {
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            replay.run(processed() - 1);
+            replay.rt.capture(&mut core);
+            t.seq += 1;
+            let h = Handover {
+                seq: t.seq,
+                j: replay.next - 1,
+                last_id: replay.last_id,
+                core,
+                answer: Answer::Waiting,
+            };
+            assert!(t.handovers.push(h).is_ok());
+            t.handing = true;
+            let answered = n(&e.counters.handovers_passed);
+            wait(&|| {
+                n(&e.counters.handovers_installed) > 0 || n(&e.counters.handovers_passed) > answered
+            });
+            if n(&e.counters.handovers_installed) == 0 {
+                while t.handed.pop().is_err() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                t.handing = false;
+            }
+        }
+        let mut replay = e.replay(copy()).unwrap();
+        let next = replay.next_block();
+        let j = e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        assert!(j >= next, "the late answer's block {j} returned");
+        assert_eq!(n(&e.counters.handovers_installed), 2);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
     }
 
     fn wait(f: &dyn Fn() -> bool) {

@@ -132,6 +132,26 @@ the core alone. With more than one voter every input flow must offer
 is shorter is refused with an error naming the `history_duration` it
 needs. A lone voter has no donor to resync from and needs none.
 
+`Engine::replay` builds a replay clone from a donor's core: the engine's
+block computation off the RT thread, its readers on a new instance per
+input domain reading the blocks after k0 from the flows' history, its
+entries and unresolved-entry decisions after the core's last log id
+taken from the caller, and every page it computes whole hashed. A core
+with a generation-needing entry in flight (`InputUp`, `Route`, a pending
+generation or a crossfade) is not replayed. `Replay::run_to` stops at the
+newest block due, and `Replay::silenced` names the blocks computed with
+an input silenced. `Engine::hand_over` waits for the RT thread to
+compute a block, runs the clone up to it and passes its state to the RT
+thread by owned pointer before the next wake; the RT thread installs it
+before the next block if it has not started that block, still holds the
+generation the core names and took no entry off its pending list that
+the core does not know, keeping pending entries the core did not know,
+and computes on from it. A state refused for a passed block or a
+generation is tried again; one missing an entry returns
+`ReplayError::Missed`. Refusals are counted per cause.
+The status reports the replay speed s, blocks per block period, measured
+at start-up on silence.
+
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
 against CLOCK_MONOTONIC at each wake, when it also samples the kernel
 TAI offset (CLOCK_TAI - CLOCK_REALTIME); the status reports both, and
