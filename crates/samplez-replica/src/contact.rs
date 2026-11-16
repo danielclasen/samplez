@@ -1374,6 +1374,11 @@ impl Contact {
         st.serving.unwrap_or(false)
     }
 
+    /// This voter does not lead ([`crate::baseline::Leader::step_down`]).
+    pub fn not_leading(&self) {
+        self.lock().leader.step_down();
+    }
+
     /// The leader's decisions this period ([`crate::baseline`]): none
     /// while out of contact.
     pub fn decisions(&self) -> Vec<Body> {
@@ -1759,6 +1764,8 @@ pub(crate) async fn run(
                             forwarded: false,
                         });
                     }
+                } else {
+                    contact.not_leading();
                 }
             }
             changed = metrics.changed() => {

@@ -74,8 +74,9 @@ pub(crate) struct Leader {
     verdicts: BTreeMap<NodeId, Instant>,
     /// Pages judged, per output.
     judged: BTreeMap<u32, BTreeSet<u64>>,
-    /// The baseline a page verdict diverged.
-    against: Option<NodeId>,
+    /// The baseline a page verdict diverged, with the `Baseline` applied
+    /// then: void once another is applied.
+    against: Option<(NodeId, Option<Baseline>)>,
     pub counts: Counts,
     /// `replica_disagreement`: the last page judged had no strict majority.
     pub disagreement: bool,
@@ -115,8 +116,21 @@ impl Leader {
         out
     }
 
+    /// Leadership is lost: a verdict taken while leading does not rename
+    /// a baseline in a later term.
+    pub fn step_down(&mut self) {
+        self.against = None;
+    }
+
     /// The `Baseline` to append, if any.
     fn baseline(&mut self, v: &LeaderView) -> Option<Baseline> {
+        if self
+            .against
+            .as_ref()
+            .is_some_and(|(_, under)| under.as_ref() != v.baseline)
+        {
+            self.against = None;
+        }
         let anyone = v.audio.iter().any(committing);
         let Some(current) = v.baseline else {
             if !anyone {
@@ -141,7 +155,7 @@ impl Leader {
             self.counts.renamed += 1;
             return Some(b);
         };
-        let renamed = if self.against == Some(n.id) {
+        let renamed = if self.against.as_ref().is_some_and(|(id, _)| *id == n.id) {
             true
         } else if committing(n) {
             // About to stop: another committed through on its silence.
@@ -277,7 +291,7 @@ impl Leader {
                 for id in j.diverged {
                     // (4)
                     if Some(id) == base {
-                        self.against = Some(id);
+                        self.against = Some((id, v.baseline.cloned()));
                     }
                     if reported(id) {
                         continue;
@@ -780,5 +794,42 @@ mod tests {
         assert!(verdicts(&f.decide(&mut leader)).is_empty());
         tokio::time::advance(INFLIGHT).await;
         assert_eq!(verdicts(&f.decide(&mut leader)), [(a(1), q + 1)]);
+    }
+
+    /// A page verdict against the baseline renames it only under the
+    /// `Baseline` applied when it was taken, and only in that term.
+    #[tokio::test(start_paused = true)]
+    async fn a_verdict_against_the_baseline_lapses_with_its_term_and_baseline() {
+        let k = 1_000_000;
+        let q = 900;
+        let b = Baseline {
+            replica: a(1),
+            order: Vec::new(),
+            at_index: 0,
+        };
+        let mut f = Fixture::new(vec![
+            (a(0), false, committing_own(k)),
+            (a(1), false, committing_own(k)),
+            (a(2), false, committing_own(k)),
+        ]);
+        f.baseline = Some(b.clone());
+        for (x, h) in [(a(0), 1), (a(1), 2), (a(2), 1)] {
+            f.pages.fold(x, &[record(q, h)]);
+        }
+        let mut leader = Leader::default();
+        // The verdict is taken; the rename waits for nothing in flight.
+        let out = f.decide(&mut leader);
+        assert_eq!(named(&out), Some(a(0)), "{out:?}");
+        // Taken again, then leadership lost: no rename in a later term.
+        let mut leader = Leader::default();
+        leader.judged.entry(0).or_default().insert(q);
+        leader.against = Some((a(1), Some(b.clone())));
+        leader.step_down();
+        assert_eq!(named(&f.decide(&mut leader)), None);
+        // Taken under another `Baseline`: void under this one.
+        let mut leader = Leader::default();
+        leader.judged.entry(0).or_default().insert(q);
+        leader.against = Some((a(1), Some(Baseline { at_index: 1, ..b })));
+        assert_eq!(named(&f.decide(&mut leader)), None);
     }
 }
