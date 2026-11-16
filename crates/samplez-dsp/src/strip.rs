@@ -1,6 +1,7 @@
 //! The input channel strip: trim, per-leg trim and polarity, high-pass
-//! filter and a four-band equaliser, in that order, over the legs of one
-//! input of width 1 to [`MAX_LEGS`].
+//! filter, a four-band equaliser, gate and compressor, in that order or
+//! with the dynamics before the equaliser, over the legs of one input of
+//! width 1 to [`MAX_LEGS`].
 //!
 //! Every parameter is set by a [`StripParam`], an absolute value, so one
 //! applied again changes nothing. A change takes effect at the next
@@ -16,6 +17,8 @@
 use core::ops::RangeInclusive;
 
 use crate::Ramp;
+use crate::dynamics::{Comp, Gate};
+pub use crate::dynamics::{CompParams, GATE_HOLD, GateParams};
 use crate::svf::{Shape, Svf};
 
 /// Most legs a strip carries: 7.1.
@@ -33,6 +36,22 @@ pub const EQ_FREQ: RangeInclusive<f32> = 20.0..=20_000.0;
 pub const EQ_GAIN_DB: RangeInclusive<f32> = -18.0..=18.0;
 /// Equaliser band Q.
 pub const EQ_Q: RangeInclusive<f32> = 0.1..=16.0;
+/// Gate threshold, dBFS.
+pub const GATE_THRESHOLD_DB: RangeInclusive<f32> = -80.0..=0.0;
+/// Gate range, dB.
+pub const GATE_RANGE_DB: RangeInclusive<f32> = 0.0..=80.0;
+/// Compressor threshold, dBFS.
+pub const COMP_THRESHOLD_DB: RangeInclusive<f32> = -60.0..=0.0;
+/// Compressor ratio.
+pub const COMP_RATIO: RangeInclusive<f32> = 1.0..=20.0;
+/// Compressor knee width, dB. faderz has no knee control.
+pub const COMP_KNEE_DB: RangeInclusive<f32> = 0.0..=24.0;
+/// Compressor makeup gain, dB.
+pub const MAKEUP_DB: RangeInclusive<f32> = 0.0..=24.0;
+/// Attack time constant of the gate and the compressor, ms.
+pub const ATTACK_MS: RangeInclusive<f32> = 0.1..=200.0;
+/// Release time constant of the gate and the compressor, ms.
+pub const RELEASE_MS: RangeInclusive<f32> = 5.0..=5000.0;
 
 /// The response of an equaliser band.
 ///
@@ -112,6 +131,12 @@ pub enum StripParam {
     Eq { enabled: bool },
     /// Band `band` of the equaliser, bands ordered low to high.
     EqBand { band: usize, value: EqBand },
+    /// The gate, linked over the legs.
+    Gate(GateParams),
+    /// The compressor, linked over the legs.
+    Comp(CompParams),
+    /// Runs gate and compressor before the equaliser, or after it.
+    DynamicsBeforeEq { enabled: bool },
 }
 
 /// Why a strip refuses a parameter. Building one does not allocate, so
@@ -170,6 +195,21 @@ impl StripParam {
                 }
                 value.refusal()
             }
+            StripParam::Gate(g) => {
+                within("gate threshold", g.threshold_db, &GATE_THRESHOLD_DB)?;
+                within("gate range", g.range_db, &GATE_RANGE_DB)?;
+                within("gate attack", g.attack_ms, &ATTACK_MS)?;
+                within("gate release", g.release_ms, &RELEASE_MS)
+            }
+            StripParam::Comp(c) => {
+                within("comp threshold", c.threshold_db, &COMP_THRESHOLD_DB)?;
+                within("comp ratio", c.ratio, &COMP_RATIO)?;
+                within("comp attack", c.attack_ms, &ATTACK_MS)?;
+                within("comp release", c.release_ms, &RELEASE_MS)?;
+                within("comp knee", c.knee_db, &COMP_KNEE_DB)?;
+                within("comp makeup", c.makeup_db, &MAKEUP_DB)
+            }
+            StripParam::DynamicsBeforeEq { .. } => Ok(()),
         }
     }
 }
@@ -204,8 +244,9 @@ pub const DEFAULT_BANDS: [EqBand; EQ_BANDS] = [
 ];
 
 /// One input's strip. Before any parameter is set it passes its input
-/// unchanged: trims at 0 dB, no leg inverted, high-pass and equaliser
-/// off, the bands at [`DEFAULT_BANDS`], the high-pass at 80 Hz.
+/// unchanged: trims at 0 dB, no leg inverted, high-pass, equaliser, gate
+/// and compressor off, the bands at [`DEFAULT_BANDS`], the high-pass at
+/// 80 Hz, the dynamics after the equaliser.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Strip {
     legs: usize,
@@ -220,6 +261,9 @@ pub struct Strip {
     eq_enabled: bool,
     bands: [EqBand; EQ_BANDS],
     eq: [Svf<MAX_LEGS>; EQ_BANDS],
+    gate: Gate,
+    comp: Comp,
+    dynamics_before_eq: bool,
 }
 
 impl Strip {
@@ -246,6 +290,9 @@ impl Strip {
             eq_enabled: false,
             bands: DEFAULT_BANDS,
             eq: [Svf::new(); EQ_BANDS],
+            gate: Gate::new(),
+            comp: Comp::new(),
+            dynamics_before_eq: false,
         };
         // The sections off, holding the g and k of their shapes.
         s.hpf.set(Shape::HighPass { freq: 80.0 }, false, 0);
@@ -297,6 +344,9 @@ impl Strip {
                 self.bands[band] = value;
                 self.retarget_band(band);
             }
+            StripParam::Gate(g) => self.gate.set(&g, self.ramp),
+            StripParam::Comp(c) => self.comp.set(&c, self.ramp),
+            StripParam::DynamicsBeforeEq { enabled } => self.dynamics_before_eq = enabled,
         }
         true
     }
@@ -329,8 +379,16 @@ impl Strip {
             }
         }
         self.hpf.process(buf, self.legs, frames);
+        if self.dynamics_before_eq {
+            self.gate.process(buf, self.legs, frames);
+            self.comp.process(buf, self.legs, frames);
+        }
         for eq in &mut self.eq {
             eq.process(buf, self.legs, frames);
+        }
+        if !self.dynamics_before_eq {
+            self.gate.process(buf, self.legs, frames);
+            self.comp.process(buf, self.legs, frames);
         }
     }
 
@@ -345,6 +403,8 @@ impl Strip {
         for eq in &mut self.eq {
             eq.advance(frames);
         }
+        self.gate.advance(frames);
+        self.comp.advance(frames);
     }
 }
 
@@ -355,6 +415,64 @@ mod tests {
     use crate::svf::{Coefficients, coefficients};
 
     const RAMP: u32 = 480;
+    const GATE: GateParams = GateParams {
+        enabled: true,
+        threshold_db: -12.0,
+        range_db: 20.0,
+        attack_ms: 0.5,
+        release_ms: 30.0,
+    };
+    const COMP: CompParams = CompParams {
+        enabled: true,
+        threshold_db: -18.0,
+        ratio: 4.0,
+        attack_ms: 2.0,
+        release_ms: 80.0,
+        knee_db: 6.0,
+        makeup_db: 4.0,
+    };
+
+    /// The dynamics run before or after the equaliser as switched: the
+    /// strip's output is the bits of its units run in that order.
+    #[test]
+    fn dynamics_run_where_switched() {
+        let bell = band(BandType::Peak, 1000.0, 18.0, 1.0);
+        let input: Vec<f32> = (0..4800).map(|n| 0.4 * (n as f32 * 0.13).sin()).collect();
+        for before in [false, true] {
+            let mut s = strip_with(
+                1,
+                &[
+                    StripParam::Eq { enabled: true },
+                    StripParam::EqBand {
+                        band: 1,
+                        value: bell,
+                    },
+                    StripParam::Comp(COMP),
+                    StripParam::Gate(GATE),
+                    StripParam::DynamicsBeforeEq { enabled: before },
+                ],
+            );
+            let mut eq = Svf::<1>::new();
+            eq.set(bell.shape(), true, 0);
+            let (mut gate, mut comp) = (Gate::new(), Comp::new());
+            gate.set(&GATE, 0);
+            comp.set(&COMP, 0);
+            for block in input.chunks(48) {
+                let mut a = block.to_vec();
+                s.process(&mut a, 48);
+                let mut b = block.to_vec();
+                if !before {
+                    eq.process(&mut b, 1, 48);
+                }
+                gate.process(&mut b, 1, 48);
+                comp.process(&mut b, 1, 48);
+                if before {
+                    eq.process(&mut b, 1, 48);
+                }
+                assert_eq!(a, b, "dynamics before eq: {before}");
+            }
+        }
+    }
 
     fn band(kind: BandType, freq: f32, gain_db: f32, q: f32) -> EqBand {
         EqBand {
@@ -456,6 +574,52 @@ mod tests {
                 value: band(BandType::Peak, 1000.0, 0.0, f32::INFINITY),
             },
         ];
+        let refused = refused.into_iter().chain([
+            StripParam::Gate(GateParams {
+                threshold_db: -81.0,
+                ..GATE
+            }),
+            StripParam::Gate(GateParams {
+                range_db: 81.0,
+                ..GATE
+            }),
+            StripParam::Gate(GateParams {
+                attack_ms: 0.05,
+                ..GATE
+            }),
+            StripParam::Gate(GateParams {
+                release_ms: 5001.0,
+                ..GATE
+            }),
+            StripParam::Comp(CompParams {
+                threshold_db: -61.0,
+                ..COMP
+            }),
+            StripParam::Comp(CompParams { ratio: 0.5, ..COMP }),
+            StripParam::Comp(CompParams {
+                ratio: f32::NAN,
+                ..COMP
+            }),
+            StripParam::Comp(CompParams {
+                attack_ms: 201.0,
+                ..COMP
+            }),
+            StripParam::Comp(CompParams {
+                release_ms: 4.0,
+                ..COMP
+            }),
+            StripParam::Comp(CompParams {
+                knee_db: 25.0,
+                ..COMP
+            }),
+            StripParam::Comp(CompParams {
+                makeup_db: -1.0,
+                ..COMP
+            }),
+        ]);
+        for p in [StripParam::Gate(GATE), StripParam::Comp(COMP)] {
+            assert_eq!(p.check(1), Ok(()));
+        }
         let mut s = Strip::new(2, RAMP);
         for p in refused {
             assert!(p.check(2).is_err(), "{p:?}");
@@ -800,6 +964,9 @@ mod tests {
                 },
             ),
             (1920, StripParam::LegTrim { leg: 0, db: -7.5 }),
+            (2400, StripParam::Gate(GATE)),
+            (2880, StripParam::Comp(COMP)),
+            (3360, StripParam::DynamicsBeforeEq { enabled: true }),
         ];
         let run = |b: usize, clone_at: Option<usize>| {
             let mut s = Strip::new(2, RAMP);

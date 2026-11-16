@@ -11,7 +11,10 @@ use std::hint::black_box;
 use gungraun::prelude::*;
 use gungraun::{Callgrind, EventKind};
 use samplez_dsp::strip::DEFAULT_BANDS;
-use samplez_dsp::{EqBand, KWeighting, Matrix, Path, PlanarBuffer, Strip, StripParam, TruePeak};
+use samplez_dsp::{
+    CompParams, EqBand, GateParams, KWeighting, Matrix, Path, PlanarBuffer, Strip, StripParam,
+    TruePeak,
+};
 
 const B: usize = 48;
 const INPUTS: usize = 64;
@@ -86,8 +89,9 @@ fn setup_meters(path: Path) -> (Path, TruePeak, KWeighting, PlanarBuffer) {
     )
 }
 
-/// 64 mono strips with trim, high-pass and every band on, all of them
-/// ramping (the costliest block) or all settled.
+/// 64 mono strips with trim, high-pass, every band, gate and compressor
+/// on, the signal above both thresholds, all of them ramping (the
+/// costliest block) or all settled.
 fn strips(ramping: bool) -> (Vec<Strip>, PlanarBuffer) {
     let mut v = Vec::new();
     for _ in 0..INPUTS {
@@ -99,6 +103,22 @@ fn strips(ramping: bool) -> (Vec<Strip>, PlanarBuffer) {
                 freq: 80.0,
             },
             StripParam::Eq { enabled: true },
+            StripParam::Gate(GateParams {
+                enabled: true,
+                threshold_db: -60.0,
+                range_db: 40.0,
+                attack_ms: 1.0,
+                release_ms: 50.0,
+            }),
+            StripParam::Comp(CompParams {
+                enabled: true,
+                threshold_db: -20.0,
+                ratio: 4.0,
+                attack_ms: 1.0,
+                release_ms: 50.0,
+                knee_db: 6.0,
+                makeup_db: 3.0,
+            }),
         ];
         for (band, b) in DEFAULT_BANDS.iter().enumerate() {
             let value = EqBand { gain_db: 6.0, ..*b };
@@ -126,8 +146,8 @@ const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
 const METERS_SCALAR: u64 = 1_118_000;
 const METERS_AVX2: u64 = 303_000;
-const STRIPS_RAMPING: u64 = 998_000;
-const STRIPS_SETTLED: u64 = 510_000;
+const STRIPS_RAMPING: u64 = 1_850_000;
+const STRIPS_SETTLED: u64 = 1_367_000;
 
 library_benchmark_group!(name = block, benchmarks = [matrix, meters, strip]);
 

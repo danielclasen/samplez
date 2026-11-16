@@ -6,8 +6,8 @@ use std::cell::Cell;
 
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
-    BandType, EqBand, KWeighting, Loudness, Matrix, Meters, Path, PlanarBuffer, Ramp, Strip,
-    StripParam, TruePeak, restore_mxcsr, set_ftz_daz,
+    BandType, CompParams, EqBand, GateParams, KWeighting, Loudness, Matrix, Meters, Path,
+    PlanarBuffer, Ramp, Strip, StripParam, TruePeak, restore_mxcsr, set_ftz_daz,
 };
 
 #[path = "../src/require.rs"]
@@ -131,6 +131,23 @@ fn process_calls_do_not_allocate() {
                     freq: 120.0,
                 },
                 StripParam::Eq { enabled: true },
+                StripParam::DynamicsBeforeEq { enabled: on },
+                StripParam::Gate(GateParams {
+                    enabled: true,
+                    threshold_db: -30.0,
+                    range_db: 40.0,
+                    attack_ms: 1.0,
+                    release_ms: 50.0,
+                }),
+                StripParam::Comp(CompParams {
+                    enabled: true,
+                    threshold_db: -20.0,
+                    ratio: 4.0,
+                    attack_ms: 1.0,
+                    release_ms: 50.0,
+                    knee_db: 6.0,
+                    makeup_db: 3.0,
+                }),
             ] {
                 assert!(s.set(p));
             }
