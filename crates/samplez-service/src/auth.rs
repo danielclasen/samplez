@@ -245,7 +245,8 @@ pub(crate) struct Auth {
     session_key: Option<Secret>,
     /// The session key of `oidc` mode without a configured one.
     drawn_key: Vec<u8>,
-    /// Signed-out sessions by id, with their expiry; this process only.
+    /// Signed-out sessions by id, with their expiry: this process only,
+    /// and lost when it restarts.
     revoked: std::sync::Mutex<HashMap<String, u64>>,
     /// Counts every sign-out, so open WebSockets look again.
     revocations: watch::Sender<u64>,
@@ -826,17 +827,17 @@ fn session_valid(token: &[u8], value: &str, now: u64) -> bool {
     token_session(token, value, now).is_some()
 }
 
-/// The expiry and id of a current `token` mode session cookie; its tag is
-/// its id.
+/// The expiry and id of a current `token` mode session cookie; its id is
+/// its tag, written out from the bytes the cookie decodes to.
 fn token_session(token: &[u8], value: &str, now: u64) -> Option<(u64, String)> {
-    let (expiry, hex) = value.split_once('.')?;
+    let (expiry, text) = value.split_once('.')?;
     let expiry = digits(expiry)?;
     if expiry <= now || expiry > now + SESSION_TTL.as_secs() {
         return None;
     }
-    let tag = unhex(hex)?;
+    let tag = unhex(text)?;
     session_mac(token, expiry).verify_slice(&tag).ok()?;
-    Some((expiry, hex.to_owned()))
+    Some((expiry, hex(&tag)))
 }
 
 /// A decimal number of ASCII digits only, no sign.
@@ -851,14 +852,21 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 64 hex digits, a SHA-256 HMAC tag.
+/// 64 lower-case hex digits, a SHA-256 HMAC tag, as [`hex`] writes it and
+/// in no other spelling: a tag has one text, so a cookie has one text.
 fn unhex(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() != 64 {
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    };
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
         return None;
     }
-    (0..64)
-        .step_by(2)
-        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
         .collect()
 }
 
@@ -1032,7 +1040,8 @@ pub struct Logout {
     pub redirect: Option<String>,
 }
 
-/// Clears the session cookie and ends the session on this process, for
+/// Clears the session cookie and ends the session on this process until
+/// it restarts, for
 /// any copy of the cookie and the WebSockets opened with it; `token` and
 /// `oidc` mode.
 #[utoipa::path(
@@ -1214,6 +1223,48 @@ mod tests {
         assert!(other_waits.is_err(), "another session goes on");
     }
 
+    /// In token mode as well, a signed-out session stays out under every
+    /// spelling of its cookie, and its WebSockets end.
+    #[tokio::test]
+    async fn a_token_session_signed_out_stays_out_in_every_spelling() {
+        let file = std::env::temp_dir().join(format!("samplez-revoke-{}", std::process::id()));
+        std::fs::write(&file, "token-of-thirty-two-bytes-or-so!").unwrap();
+        let config: ServiceConfig = serde_json::from_value(serde_json::json!({
+            "auth": { "mode": "token", "token": { "file": file } }
+        }))
+        .unwrap();
+        let auth = Arc::new(Auth::new(&config, &Metrics::default()).unwrap());
+        let _ = std::fs::remove_file(&file);
+        let expiry = now() + 600;
+        let value = session_value(b"token-of-thirty-two-bytes-or-so!", expiry);
+        let cookie = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::COOKIE,
+                format!("{SESSION_COOKIE}={v}").parse().unwrap(),
+            );
+            h
+        };
+        let (_, id, at) = auth.cookie_session(&cookie(&value)).unwrap();
+        let end = auth.session_end(id.clone(), at);
+        auth.revoke(&id, at);
+        tokio::time::timeout(Duration::from_secs(1), end.ended())
+            .await
+            .expect("the WebSocket's session ended");
+        let (expiry_text, tag) = value.split_once('.').unwrap();
+        for copy in [
+            value.clone(),
+            format!("{expiry_text}.{}", tag.to_ascii_uppercase()),
+            format!(
+                "{expiry_text}.{}{}",
+                tag[..1].to_ascii_uppercase(),
+                &tag[1..]
+            ),
+        ] {
+            assert!(auth.cookie_session(&cookie(&copy)).is_none(), "{copy}");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_session_ends_at_its_expiry() {
         let end = SessionEnd::at(now() + 30);
@@ -1237,6 +1288,23 @@ mod tests {
         assert_eq!(revoked.len(), MAX_REVOKED);
         assert!(!revoked.contains_key("s0"), "the one ending first goes");
         assert!(revoked.contains_key("last") && revoked.contains_key("s1"));
+    }
+
+    /// A tag has one spelling: an upper-case or signed copy of a cookie
+    /// would otherwise verify under another id than the one signed out.
+    #[test]
+    fn tags_are_read_in_lower_case_hex_only() {
+        let tag = [0x0bu8; 32];
+        let text = hex(&tag);
+        assert_eq!(unhex(&text), Some(tag.to_vec()));
+        assert_eq!(unhex(&text.to_ascii_uppercase()), None);
+        assert_eq!(unhex(&format!("+b{}", &text[2..])), None, "a sign");
+        assert_eq!(unhex(&format!("0B{}", &text[2..])), None, "mixed case");
+        assert_eq!(unhex(&text[2..]), None);
+        let t = 1_000_000;
+        let v = session_value(b"secret", t + 60);
+        assert!(session_valid(b"secret", &v, t));
+        assert!(!session_valid(b"secret", &v.to_ascii_uppercase(), t));
     }
 
     #[test]

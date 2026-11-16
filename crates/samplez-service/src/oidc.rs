@@ -32,9 +32,12 @@ use crate::config::OidcConfig;
 pub const LEEWAY: u64 = 60;
 /// The shortest time between two reads of the signing keys.
 pub const JWKS_MIN_REFRESH: Duration = Duration::from_secs(10);
-/// Every request to the provider is abandoned after this long, and a
-/// request waits this long at most for another one's read.
+/// Every request to the provider is abandoned after this long. A read is
+/// at most two requests, the metadata and the keys, and a request waits
+/// for another one's read as long as that can take, plus [`WAIT_MARGIN`].
 pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
+/// What a request waits for another one's read beyond its two requests.
+pub const WAIT_MARGIN: Duration = Duration::from_millis(500);
 /// After a failed read of the provider, no read is made for this long; the
 /// requests that need one fail at once.
 pub const PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(15);
@@ -376,8 +379,14 @@ pub(crate) struct Tuning {
     pub(crate) min_refresh: Duration,
     /// How long a failed read answers for the provider.
     pub(crate) retry_after: Duration,
-    /// How long a request waits for a read another one is making.
-    pub(crate) wait: Duration,
+}
+
+impl Tuning {
+    /// How long a request waits for a read another one is making: the
+    /// longest that read can take, metadata and keys.
+    pub(crate) fn wait(&self) -> Duration {
+        self.timeout * 2 + WAIT_MARGIN
+    }
 }
 
 impl Default for Tuning {
@@ -386,7 +395,6 @@ impl Default for Tuning {
             timeout: PROVIDER_TIMEOUT,
             min_refresh: JWKS_MIN_REFRESH,
             retry_after: PROVIDER_RETRY_AFTER,
-            wait: PROVIDER_TIMEOUT,
         }
     }
 }
@@ -620,7 +628,8 @@ impl Oidc {
 
     /// What `need` takes from the cache, reading the provider when the
     /// cache does not hold it. One request reads at a time, outside the
-    /// cache lock; others wait for it at most [`Tuning::wait`], then find
+    /// cache lock; others wait for it as long as it can take
+    /// ([`Tuning::wait`]), then find
     /// its outcome in the cache. A failed read answers for
     /// [`Tuning::retry_after`] without another.
     async fn load(&self, need: Need) -> Result<Held, Failure> {
@@ -632,7 +641,7 @@ impl Oidc {
         }
         let _reading = match self.reading.try_lock() {
             Ok(g) => g,
-            Err(_) => tokio::time::timeout(self.tuning.wait, self.reading.lock())
+            Err(_) => tokio::time::timeout(self.tuning.wait(), self.reading.lock())
                 .await
                 .map_err(|_| Failure::Provider("a read of the provider is still running".into()))?,
         };
@@ -1677,14 +1686,15 @@ mod tests {
     }
 
     /// A slow read of new keys holds up neither tokens of the keys already
-    /// held nor, for longer than the wait, other requests that need a read.
+    /// held nor, past the read's own timeout, other requests that need a
+    /// read: they find its failure.
     #[tokio::test]
     async fn a_slow_read_holds_up_no_token_of_a_known_key() {
         let s = Signer::new("k1");
         let p = fake(json!({ "keys": [s.jwk()] })).await;
         let oidc = Arc::new(tuned(&p.issuer, |t| {
             t.min_refresh = Duration::ZERO;
-            t.wait = Duration::from_millis(200);
+            t.timeout = Duration::from_millis(400);
         }));
         oidc.bearer(&access(&s, &p.issuer)).await.unwrap();
         p.set(|b| b.delay = Duration::from_secs(2));
@@ -1708,10 +1718,7 @@ mod tests {
         ));
         let waited = started.elapsed();
         assert!(waited < Duration::from_millis(800), "{waited:?}");
-        assert!(matches!(
-            slow.await.unwrap(),
-            Err(Failure::Token(Invalid::UnknownKey))
-        ));
+        assert!(matches!(slow.await.unwrap(), Err(Failure::Provider(_))));
     }
 
     /// The issuer is compared as configured, trailing `/` included.
@@ -1774,6 +1781,35 @@ mod tests {
             p.hits.redirected.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    /// The first requests after start all wait for one cold read of the
+    /// metadata and the keys, which takes two of the provider's answers;
+    /// none of them gives up while that read may still succeed.
+    #[tokio::test]
+    async fn requests_waiting_for_a_cold_read_wait_for_both_answers() {
+        let s = Signer::new("k1");
+        let p = fake(json!({ "keys": [s.jwk()] })).await;
+        // Each answer takes most of the timeout; both together exceed it.
+        p.set(|b| b.delay = Duration::from_millis(700));
+        let oidc = Arc::new(tuned(&p.issuer, |t| t.timeout = Duration::from_secs(1)));
+        let token = access(&s, &p.issuer);
+        let first = tokio::spawn({
+            let (oidc, t) = (oidc.clone(), token.clone());
+            async move { oidc.bearer(&t).await.map(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let waiting: Vec<_> = (0..3)
+            .map(|_| {
+                let (oidc, t) = (oidc.clone(), token.clone());
+                tokio::spawn(async move { oidc.bearer(&t).await.map(|_| ()) })
+            })
+            .collect();
+        first.await.unwrap().unwrap();
+        for w in waiting {
+            w.await.unwrap().unwrap();
+        }
+        assert_eq!(p.hits(), (1, 1), "one read for all of them");
     }
 
     #[test]
