@@ -1844,9 +1844,9 @@ impl Engine {
                     }
                     Change::InputDown { slot } => up[slot] = false,
                     Change::InputUp { slot } => up[slot] = true,
-                    // The RT thread swaps in a passed re-route's
-                    // generation at the install, and applied a passed
-                    // strip entry to the strip it keeps.
+                    // The core holds neither a generation nor a strip:
+                    // the RT thread applies a passed re-route or strip
+                    // entry itself, taken before the install or after.
                     Change::Route { .. } | Change::Strip { .. } => {}
                 }
             }
@@ -4408,6 +4408,31 @@ mod tests {
         assert_eq!(rt.slots[0].strip.as_ref(), Some(&reference));
         assert_eq!(rt.slots[0].strip_pos, Some(48));
         assert_eq!(rt.counters.entries_without_core.load(Relaxed), 2);
+
+        // A strip entry the core knew, pending here, whose index the core
+        // passed: the core holds no strip, so it applies at the install.
+        let gain = StripParam::Trim { db: -3.0 };
+        assert!(rt.mix.push(entry(
+            4,
+            192,
+            Change::Strip {
+                slot: 0,
+                param: gain
+            }
+        )));
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        rt.install_core(&core, 4);
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.slots[0].strip_pos, Some(192));
+        let mut set = samplez_dsp::Strip::new(1, config.ramp_samples);
+        assert!(set.set(param));
+        set.advance(192 - 48);
+        assert!(set.set(gain));
+        assert_eq!(rt.slots[0].strip.as_ref(), Some(&set));
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

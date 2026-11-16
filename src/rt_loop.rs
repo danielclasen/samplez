@@ -418,6 +418,14 @@ impl Change {
     pub fn needs_generation(&self) -> bool {
         matches!(self, Change::InputUp { .. } | Change::Route { .. })
     }
+
+    /// Whether a core holds what this change did once applied: a gain
+    /// change is in the matrix and an `InputDown` in the slot state, but
+    /// a strip's settings and a swapped-in generation stay with the RT
+    /// thread, so an entry making them must still reach it.
+    pub fn in_core(&self) -> bool {
+        matches!(self, Change::Gain { .. } | Change::InputDown { .. })
+    }
 }
 
 /// A committed log entry, applied at sample index `at_index`, a multiple
@@ -1500,7 +1508,17 @@ impl Rt {
             self.last_entry = self.last_entry.max(entry.id);
             // A hand-over brought the entry in already, pending or
             // applied by the replay.
-            if entry.id <= self.skip_upto || self.mix.holds(entry.id) {
+            if self.mix.holds(entry.id) {
+                continue;
+            }
+            if entry.id <= self.skip_upto && !entry.change.in_core() {
+                // The core knew it but holds only part of what it did:
+                // applied as on time if its index passed.
+                if entry.at_index < self.mix.pos.unwrap_or(0) {
+                    self.apply(entry);
+                    continue;
+                }
+            } else if entry.id <= self.skip_upto {
                 continue;
             }
             let _ = self.mix.push(entry);
@@ -2162,16 +2180,18 @@ impl Rt {
     /// state: the next block computed is the one after it. Entries
     /// pending here that the core did not know stay pending; one that
     /// finds no room is counted in `handover_entries_lost`. A pending
-    /// `InputUp` or `Route` the core knew whose index it passed, held
-    /// back for want of a core, applies once the core is in, as on time:
-    /// its generation is swapped in, a crossfade anchored at its index.
+    /// entry the core knew whose index it passed and whose effect it
+    /// does not hold, an `InputUp` or `Route` held back for want of a
+    /// core or a strip entry, applies once the core is in, as on time:
+    /// its generation is swapped in, a crossfade anchored at its index,
+    /// or the strip set from its index.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn install_core(&mut self, c: &Core, last_id: LogId) {
         let m = &mut self.mix;
         let next = c.pos.unwrap_or(0);
         m.due.clear();
         for e in &m.pending {
-            if e.id <= last_id && e.change.needs_generation() && e.at_index < next {
+            if e.id <= last_id && !e.change.in_core() && e.at_index < next {
                 // Room: due holds as many as pending.
                 m.due.push((*e, false));
             }

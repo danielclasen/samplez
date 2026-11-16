@@ -624,3 +624,112 @@ fn a_product_entry_the_install_passed_is_folded_in() {
     assert_eq!(c.command_late.load(Relaxed), late);
     h.e.stop();
 }
+
+/// A strip entry the replay applied, which reaches the joiner's RT thread
+/// only after the hand-over, still sets the joiner's strip: the core
+/// holds no strip, so skipped as known it would leave the strip at its
+/// old setting for good, every page after differing from the donor's
+/// with equal fingerprints.
+#[test]
+fn a_strip_entry_the_replay_applied_still_reaches_the_strip() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        let mut replay = b.e.replay(copy(&a.e)).unwrap();
+        let at = (now_block() + 20) * B;
+        let strip = Entry::Strip {
+            slot: 0,
+            param: samplez_dsp::StripParam::Trim { db: -6.0 },
+        };
+        a.e.append(1, at, strip.clone()).unwrap();
+        a.e.commit(1);
+        replay.append(1, at, &strip).unwrap();
+        let past = (at + u64::from(RAMP)) / B + PAGE / B;
+        while now_block() <= past + MARGIN / B + 2 {
+            std::thread::sleep(Duration::from_millis(5));
+            replay.run_to(now_block());
+        }
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        assert!(j * B > at, "handed over at block {j}");
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        let late = b.e.counters().command_late.load(Relaxed);
+        b.e.append(1, at, strip).unwrap();
+        b.e.commit(1);
+        let from = processed(&b.e) + 2;
+        assert_same_after(&a, &b, from * B)?;
+        assert_eq!(b.e.counters().command_late.load(Relaxed), late);
+        Ok(())
+    });
+}
+
+/// Every page both engines computed from index `from` on, a few pages
+/// past it, hashes alike; a run with fewer than two compared runs again.
+fn assert_same_after(a: &Hashed, b: &Hashed, from: u64) -> Result<(), String> {
+    let end = from / B + 4 * PAGE / B;
+    wait_for(Duration::from_secs(5), "pages compared", || {
+        processed(&a.e) > end && processed(&b.e) > end
+    });
+    let (pa, pb) = (a.pages(), b.pages());
+    let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+    let mut equal = 0;
+    for (p, hb) in pb
+        .iter()
+        .filter(|(p, _)| *p * PAGE >= from && !disturbed.contains(p))
+    {
+        let Some(ha) = pa.get(p) else { continue };
+        assert_eq!(
+            (hb.hash, hb.fingerprint),
+            (ha.hash, ha.fingerprint),
+            "page {p}"
+        );
+        equal += 1;
+    }
+    if equal < 2 {
+        return Err(format!("{equal} pages compared"));
+    }
+    Ok(())
+}
+
+/// A strip entry a product state folds in, which reaches the RT thread
+/// only after the install, still sets the strip, as on the engines that
+/// applied it at its index.
+#[test]
+fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        b.e.drop_core().unwrap();
+        let at = (now_block() + 20) * B;
+        let strip = Entry::Strip {
+            slot: 0,
+            param: samplez_dsp::StripParam::Trim { db: -6.0 },
+        };
+        a.e.append(1, at, strip.clone()).unwrap();
+        a.e.commit(1);
+        // Appended, committed only after the install.
+        b.e.append(1, at, strip.clone()).unwrap();
+        wait_for(Duration::from_secs(5), "index passed", || {
+            processed(&b.e) > (at + u64::from(RAMP)) / B + 2
+        });
+        let state = ProductState {
+            gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            up: vec![true],
+            pending: vec![(1, at, strip)],
+            last_id: 1,
+        };
+        let j = b.e.install_product(&state, Duration::from_secs(2)).unwrap();
+        b.e.commit(1);
+        // After the fade-in from silence the install starts with.
+        let from = ((processed(&b.e) + 2) * B).max((j + 1) * B + u64::from(RAMP));
+        assert_same_after(&a, &b, from)?;
+        assert_eq!(b.e.counters().command_late.load(Relaxed), 0);
+        Ok(())
+    });
+}
