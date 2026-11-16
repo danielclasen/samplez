@@ -289,9 +289,10 @@ async fn a_browser_signs_in_with_the_code_flow_and_pkce() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!(
-        (295..=300).contains(&max_age),
-        "not past the ID token's expiry: {max_age}"
+    assert_eq!(
+        max_age,
+        8 * 3600,
+        "the session lifetime, not the ID token's 5 min"
     );
 
     let cookie = pair(&session);
@@ -335,6 +336,22 @@ async fn a_browser_signs_in_with_the_code_flow_and_pkce() {
         gone.starts_with("samplez_session=;") && gone.contains("Max-Age=0"),
         "{gone}"
     );
+    assert_eq!(
+        status(&api, with(get_req(WHOAMI))).await,
+        StatusCode::UNAUTHORIZED,
+        "a copy of the signed-out cookie is refused"
+    );
+}
+
+#[tokio::test]
+async fn the_session_lifetime_is_configured() {
+    let p = provider(false).await;
+    let api = oidc_service(oidc_config(&p, json!({ "sessionTtl": "90m" })))
+        .routers()
+        .api;
+    let (_, headers) = sign_in(&api, &p, "/", p.claims(&[])).await;
+    let session = set_cookie(&headers, "samplez_session").unwrap();
+    assert!(session.contains("Max-Age=5400;"), "{session}");
 }
 
 #[tokio::test]
@@ -510,11 +527,26 @@ async fn api_clients_send_an_access_token_or_the_static_token() {
         "Operator None"
     );
 
+    // Keycloak's default access token audience; azp binds it here.
     let mut c = p.claims(&["faderz-operator"]);
     c["aud"] = json!("account");
     assert_eq!(
         status(&api, bearer_req(&p.key.sign(&c))).await,
-        StatusCode::UNAUTHORIZED
+        StatusCode::OK
+    );
+    let mut other_client = c.clone();
+    other_client["azp"] = json!("another-client");
+    assert_eq!(
+        status(&api, bearer_req(&p.key.sign(&other_client))).await,
+        StatusCode::UNAUTHORIZED,
+        "a token of another client of the provider"
+    );
+    let mut id_token = p.claims(&["faderz-operator"]);
+    id_token["nonce"] = json!("n");
+    assert_eq!(
+        status(&api, bearer_req(&p.key.sign(&id_token))).await,
+        StatusCode::UNAUTHORIZED,
+        "an ID token is no bearer"
     );
     let stranger = Key::new("k1");
     let forged = stranger.sign(&p.claims(&["faderz-operator"]));
@@ -542,13 +574,25 @@ async fn api_clients_send_an_access_token_or_the_static_token() {
     let both = bearer_req("junk").header(header::COOKIE, cookie);
     assert_eq!(status(&api, both).await, StatusCode::UNAUTHORIZED);
 
-    let audience = json!({ "audience": "mixer-api" });
+    let audience = json!({ "audience": "mixer-api", "allowedClients": ["faderz", "cli"] });
     let api = oidc_service(oidc_config(&p, audience)).routers().api;
     let mut c = p.claims(&["faderz-operator"]);
     c["aud"] = json!(["mixer-api", "account"]);
     assert_eq!(
         status(&api, bearer_req(&p.key.sign(&c))).await,
         StatusCode::OK
+    );
+    c["azp"] = json!("cli");
+    assert_eq!(
+        status(&api, bearer_req(&p.key.sign(&c))).await,
+        StatusCode::OK,
+        "an allowed client"
+    );
+    c["aud"] = json!("account");
+    assert_eq!(
+        status(&api, bearer_req(&p.key.sign(&c))).await,
+        StatusCode::UNAUTHORIZED,
+        "the configured audience is required"
     );
 }
 
@@ -629,6 +673,22 @@ fn oidc_config_rules() {
         rules(missing),
         Err(samplez_service::Error::Secret(..))
     ));
+    let mut short = base();
+    short["auth"]["oidc"]["sessionKey"] =
+        json!({ "file": secret("oidc-short-key", "0123456789abcdef0123456789abcde") });
+    assert!(
+        matches!(rules(short), Err(samplez_service::Error::Config(_))),
+        "a session key under 32 bytes"
+    );
+    let mut ttl = base();
+    ttl["auth"]["oidc"]["sessionTtl"] = json!("8w");
+    assert!(rules(ttl).is_err());
+    let mut ttl = base();
+    ttl["auth"]["oidc"]["sessionTtl"] = json!(3600);
+    assert!(rules(ttl).is_ok());
+    let mut public_http = base();
+    public_http["auth"]["oidc"]["publicUrl"] = json!("http://faderz.example");
+    assert!(rules(public_http).is_err(), "plain http off loopback");
     let mut unknown = base();
     unknown["auth"]["oidc"]["clientSecretValue"] = json!("inline");
     assert!(serde_json::from_value::<ServiceConfig>(unknown).is_err());

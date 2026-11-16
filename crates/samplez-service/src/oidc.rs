@@ -4,8 +4,10 @@
 //!
 //! The metadata is read on first use and kept; the signing keys are read
 //! with it and again when a token names a key they do not hold, at most
-//! once per [`JWKS_MIN_REFRESH`]. A provider that cannot be reached fails
-//! the sign-ins and bearer requests of that moment only.
+//! once per [`JWKS_MIN_REFRESH`]. One request reads at a time, and a failed
+//! read is not repeated for [`PROVIDER_RETRY_AFTER`], so a provider that
+//! cannot be reached fails the sign-ins and bearer requests of that moment
+//! only, at once, and tokens of keys already held keep verifying.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,8 +32,20 @@ use crate::config::OidcConfig;
 pub const LEEWAY: u64 = 60;
 /// The shortest time between two reads of the signing keys.
 pub const JWKS_MIN_REFRESH: Duration = Duration::from_secs(10);
-/// Every request to the provider is abandoned after this long.
-pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Every request to the provider is abandoned after this long, and a
+/// request waits this long at most for another one's read.
+pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
+/// After a failed read of the provider, no read is made for this long; the
+/// requests that need one fail at once.
+pub const PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(15);
+/// The longest answer read from the provider.
+pub const MAX_BODY: usize = 1 << 20;
+/// How long a session lasts without `sessionTtl`.
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+/// The shortest `sessionTtl`, in seconds.
+pub const MIN_SESSION_TTL: u64 = 60;
+/// The longest `sessionTtl`, in seconds.
+pub const MAX_SESSION_TTL: u64 = 7 * 86_400;
 /// How long a sign-in may take from the redirect to the provider to the
 /// callback.
 pub const LOGIN_TTL: Duration = Duration::from_secs(600);
@@ -51,6 +65,11 @@ pub enum Invalid {
     Signature,
     Issuer,
     Audience,
+    /// `azp` missing where required, or naming a client not allowed.
+    Party,
+    /// An ID token, or another token that is not an access token, sent
+    /// as a bearer.
+    NotAccessToken,
     Expired,
     NotYetValid,
     Nonce,
@@ -81,13 +100,28 @@ pub struct Jwk {
 /// What a token's claims have to hold besides a valid signature and
 /// lifetime.
 pub struct Expect<'a> {
+    /// `iss`, compared as given.
     pub issuer: &'a str,
-    /// One of `aud`.
-    pub audience: &'a str,
-    /// `azp`, when the token has one.
-    pub authorized_party: Option<&'a str>,
+    /// One of `aud`; `None` checks no audience.
+    pub audience: Option<&'a str>,
+    /// The clients `azp` may name. `azp` is checked when present, and
+    /// required when `require_party` is set or `aud` names more than one
+    /// audience.
+    pub parties: &'a [String],
+    pub require_party: bool,
     /// `nonce`; ID tokens only.
     pub nonce: Option<&'a str>,
+    /// An access token is wanted: a token with a `nonce`, a `typ` claim of
+    /// `ID` or a header `typ` other than `JWT` or `at+jwt` is refused.
+    pub access: bool,
+}
+
+/// The header fields of a JWT that decide which key verifies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Header {
+    pub alg: String,
+    pub kid: Option<String>,
+    pub typ: Option<String>,
 }
 
 /// The JWS algorithms accepted, with the key type and curve each needs.
@@ -103,6 +137,30 @@ fn algorithm(alg: &str) -> Option<(&'static str, Option<&'static str>)> {
 
 fn b64(s: &str) -> Result<Vec<u8>, Invalid> {
     B64.decode(s).map_err(|_| Invalid::Malformed)
+}
+
+/// Parses a JWT's header and refuses what no key can verify: anything but
+/// three parts, an algorithm not accepted, or a `crit` header. Reads
+/// nothing from the provider.
+pub fn header(token: &str) -> Result<Header, Invalid> {
+    let mut parts = token.split('.');
+    let (Some(h), Some(_), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(Invalid::Malformed);
+    };
+    let header: Value = serde_json::from_slice(&b64(h)?).map_err(|_| Invalid::Malformed)?;
+    if header.get("crit").is_some() {
+        return Err(Invalid::Algorithm);
+    }
+    let alg = header["alg"].as_str().ok_or(Invalid::Malformed)?;
+    algorithm(alg).ok_or(Invalid::Algorithm)?;
+    let text = |k: &str| header.get(k).and_then(Value::as_str).map(str::to_owned);
+    Ok(Header {
+        alg: alg.to_owned(),
+        kid: text("kid"),
+        typ: text("typ"),
+    })
 }
 
 fn check_signature(alg: &str, key: &Jwk, message: &[u8], sig: &[u8]) -> Result<(), Invalid> {
@@ -142,19 +200,15 @@ fn check_signature(alg: &str, key: &Jwk, message: &[u8], sig: &[u8]) -> Result<(
 /// Checks a signed JWT (RFC 7519) against `keys` and `expect` at `now`,
 /// seconds since the Unix epoch, and returns its claims.
 pub fn verify(token: &str, keys: &[Jwk], expect: &Expect, now: u64) -> Result<Value, Invalid> {
+    let head = header(token)?;
     let mut parts = token.split('.');
-    let (Some(h), Some(p), Some(s), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err(Invalid::Malformed);
+    let (h, p, s) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(h), Some(p), Some(s)) => (h, p, s),
+        _ => return Err(Invalid::Malformed),
     };
-    let header: Value = serde_json::from_slice(&b64(h)?).map_err(|_| Invalid::Malformed)?;
-    if header.get("crit").is_some() {
-        return Err(Invalid::Algorithm);
-    }
-    let alg = header["alg"].as_str().ok_or(Invalid::Malformed)?;
+    let alg = head.alg.as_str();
     let (kty, crv) = algorithm(alg).ok_or(Invalid::Algorithm)?;
-    let kid = header.get("kid").and_then(Value::as_str);
+    let kid = head.kid.as_deref();
     let candidates: Vec<&Jwk> = keys
         .iter()
         .filter(|k| k.kty == kty && (crv.is_none() || k.crv.as_deref() == crv))
@@ -162,20 +216,17 @@ pub fn verify(token: &str, keys: &[Jwk], expect: &Expect, now: u64) -> Result<Va
         .filter(|k| k.usage.as_deref().is_none_or(|u| u == "sig"))
         .filter(|k| kid.is_none() || k.kid.as_deref() == kid)
         .collect();
-    let key = match candidates.as_slice() {
-        [key] => *key,
+    let message = format!("{h}.{p}");
+    let sig = b64(s)?;
+    match candidates.as_slice() {
         [] => return Err(Invalid::UnknownKey),
         // Without a kid, or with keys sharing one, the signature decides.
         many => {
-            let message = format!("{h}.{p}");
-            let sig = b64(s)?;
-            *many
-                .iter()
+            many.iter()
                 .find(|k| check_signature(alg, k, message.as_bytes(), &sig).is_ok())
-                .ok_or(Invalid::Signature)?
+                .ok_or(Invalid::Signature)?;
         }
-    };
-    check_signature(alg, key, format!("{h}.{p}").as_bytes(), &b64(s)?)?;
+    }
 
     let claims: Value = serde_json::from_slice(&b64(p)?).map_err(|_| Invalid::Malformed)?;
     if !claims.is_object() {
@@ -184,18 +235,29 @@ pub fn verify(token: &str, keys: &[Jwk], expect: &Expect, now: u64) -> Result<Va
     if claims["iss"].as_str() != Some(expect.issuer) {
         return Err(Invalid::Issuer);
     }
-    let audience_ok = match &claims["aud"] {
-        Value::String(a) => a == expect.audience,
-        Value::Array(a) => a.iter().any(|v| v.as_str() == Some(expect.audience)),
-        _ => false,
+    let audiences: Vec<&str> = match &claims["aud"] {
+        Value::String(a) => vec![a.as_str()],
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
     };
-    if !audience_ok {
-        return Err(Invalid::Audience);
-    }
-    if let (Some(azp), Some(want)) = (claims.get("azp"), expect.authorized_party)
-        && azp.as_str() != Some(want)
+    if let Some(want) = expect.audience
+        && !audiences.contains(&want)
     {
         return Err(Invalid::Audience);
+    }
+    match claims.get("azp").map(Value::as_str) {
+        Some(Some(azp)) if expect.parties.iter().any(|p| p == azp) => {}
+        None if !expect.require_party && audiences.len() <= 1 => {}
+        _ => return Err(Invalid::Party),
+    }
+    if expect.access {
+        let typ = |v: Option<&str>| v.map(str::to_ascii_lowercase);
+        let id_claim = typ(claims["typ"].as_str()).is_some_and(|t| t == "id");
+        let header_ok = typ(head.typ.as_deref())
+            .is_none_or(|t| ["jwt", "at+jwt", "application/at+jwt"].contains(&t.as_str()));
+        if claims.get("nonce").is_some() || id_claim || !header_ok {
+            return Err(Invalid::NotAccessToken);
+        }
     }
     let exp = claims["exp"].as_u64().ok_or(Invalid::Malformed)?;
     if exp.saturating_add(LEEWAY) <= now {
@@ -283,11 +345,50 @@ struct Metadata {
     end_session_endpoint: Option<String>,
 }
 
+/// What has been read from the provider. Never held across a read.
 #[derive(Default)]
 struct Cache {
     metadata: Option<Arc<Metadata>>,
-    keys: Arc<Vec<Jwk>>,
-    fetched: Option<Instant>,
+    keys: Option<Arc<Vec<Jwk>>>,
+    keys_at: Option<Instant>,
+    /// The last failed read and why; no read is made for
+    /// [`Tuning::retry_after`] after it.
+    failed: Option<(Instant, String)>,
+}
+
+/// The metadata, and the keys when asked for.
+type Held = (Arc<Metadata>, Option<Arc<Vec<Jwk>>>);
+
+/// What a request needs read from the provider.
+enum Need {
+    Metadata,
+    Keys,
+    /// Keys other than these, as a token names a key they do not hold.
+    NewKeys(Arc<Vec<Jwk>>),
+}
+
+/// The timing of the reads from the provider.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Tuning {
+    /// Every request to the provider is abandoned after this long.
+    pub(crate) timeout: Duration,
+    /// The shortest time between two reads of the keys.
+    pub(crate) min_refresh: Duration,
+    /// How long a failed read answers for the provider.
+    pub(crate) retry_after: Duration,
+    /// How long a request waits for a read another one is making.
+    pub(crate) wait: Duration,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            timeout: PROVIDER_TIMEOUT,
+            min_refresh: JWKS_MIN_REFRESH,
+            retry_after: PROVIDER_RETRY_AFTER,
+            wait: PROVIDER_TIMEOUT,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -311,16 +412,20 @@ pub(crate) struct Pending {
 
 pub(crate) struct Oidc {
     pub(crate) config: OidcConfig,
-    issuer: String,
     pub(crate) redirect_uri: String,
     /// The public URL's origin, normalized.
     pub(crate) public_origin: String,
     pub(crate) public_host: String,
     pub(crate) public_https: bool,
-    audience: String,
+    /// The clients a bearer's `azp` may name.
+    parties: Vec<String>,
+    /// How long a session lasts, in seconds.
+    pub(crate) session_ttl: u64,
     http: reqwest::Client,
-    cache: tokio::sync::Mutex<Cache>,
-    min_refresh: Duration,
+    cache: std::sync::Mutex<Cache>,
+    /// Held by the one request reading from the provider.
+    reading: tokio::sync::Mutex<()>,
+    tuning: Tuning,
 }
 
 fn loopback(url: &reqwest::Url) -> bool {
@@ -332,20 +437,68 @@ fn loopback(url: &reqwest::Url) -> bool {
             .is_ok_and(|a| a.is_loopback())
 }
 
+/// `https`, or `http` to a loopback address.
+fn secure_url(url: &str) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http" if loopback(&parsed) => Ok(parsed),
+        _ => Err(format!("{url}: https, or http to a loopback address")),
+    }
+}
+
+/// A session lifetime: seconds, or a number with `s`, `m`, `h` or `d`.
+pub fn parse_ttl(ttl: &crate::config::Ttl) -> Result<u64, String> {
+    let secs = match ttl {
+        crate::config::Ttl::Seconds(s) => *s,
+        crate::config::Ttl::Text(t) => {
+            let t = t.trim();
+            let (n, unit) = match t.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+                Some((i, _)) => t.split_at(i),
+                None => (t, "s"),
+            };
+            let n: u64 = n.parse().map_err(|_| format!("{t:?}: not a duration"))?;
+            let scale = match unit {
+                "s" => 1,
+                "m" => 60,
+                "h" => 3600,
+                "d" => 86_400,
+                _ => return Err(format!("{t:?}: the unit is s, m, h or d")),
+            };
+            n.saturating_mul(scale)
+        }
+    };
+    if !(MIN_SESSION_TTL..=MAX_SESSION_TTL).contains(&secs) {
+        return Err(format!(
+            "{secs} s: between {MIN_SESSION_TTL} s and {MAX_SESSION_TTL} s"
+        ));
+    }
+    Ok(secs)
+}
+
+/// Reads a response body of at most [`MAX_BODY`] bytes.
+async fn body(mut res: reqwest::Response) -> Result<Vec<u8>, String> {
+    if res.content_length().is_some_and(|l| l > MAX_BODY as u64) {
+        return Err(format!("the answer is longer than {MAX_BODY} bytes"));
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+        if out.len() + chunk.len() > MAX_BODY {
+            return Err(format!("the answer is longer than {MAX_BODY} bytes"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 impl Oidc {
     pub(crate) fn new(config: &OidcConfig) -> Result<Oidc, Error> {
+        Oidc::with_tuning(config, Tuning::default())
+    }
+
+    pub(crate) fn with_tuning(config: &OidcConfig, tuning: Tuning) -> Result<Oidc, Error> {
         let bad = |what: &str, why: String| Error::Config(format!("auth.oidc.{what}: {why}"));
-        let issuer = config.issuer_url.trim_end_matches('/').to_owned();
-        let issuer_url =
-            reqwest::Url::parse(&issuer).map_err(|e| bad("issuerUrl", e.to_string()))?;
-        if issuer_url.scheme() != "https"
-            && !(issuer_url.scheme() == "http" && loopback(&issuer_url))
-        {
-            return Err(bad(
-                "issuerUrl",
-                "https, or http to a loopback address".into(),
-            ));
-        }
+        secure_url(&config.issuer_url).map_err(|e| bad("issuerUrl", e))?;
         let public =
             reqwest::Url::parse(&config.public_url).map_err(|e| bad("publicUrl", e.to_string()))?;
         if !matches!(public.scheme(), "http" | "https")
@@ -357,6 +510,12 @@ impl Oidc {
             return Err(bad(
                 "publicUrl",
                 "a scheme, host and optional port only, e.g. https://faderz.example".into(),
+            ));
+        }
+        if public.scheme() == "http" && !loopback(&public) {
+            return Err(bad(
+                "publicUrl",
+                "https, or http to a loopback address: the session cookie would cross the network in the clear".into(),
             ));
         }
         let public_host = public
@@ -372,26 +531,51 @@ impl Oidc {
         if config.operator_role.is_empty() {
             return Err(bad("operatorRole", "empty".into()));
         }
+        let session_ttl = match &config.session_ttl {
+            Some(t) => parse_ttl(t).map_err(|e| bad("sessionTtl", e))?,
+            None => DEFAULT_SESSION_TTL.as_secs(),
+        };
+        let parties = match config.allowed_clients.as_slice() {
+            [] => vec![config.client_id.clone()],
+            given => given.to_vec(),
+        };
+        if config.viewer_role.is_none() {
+            tracing::warn!(
+                "auth.oidc.viewerRole is not set: every user the provider signs in to this client is a viewer"
+            );
+        }
+        // No redirect is followed: a token request sent on would carry the
+        // code, the verifier and the client secret wherever it pointed.
         let http = reqwest::Client::builder()
-            .timeout(PROVIDER_TIMEOUT)
+            .timeout(tuning.timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| Error::Config(format!("the HTTP client for the provider: {e}")))?;
         Ok(Oidc {
-            issuer,
             redirect_uri: format!("{public_origin}{CALLBACK_PATH}"),
             public_https: public.scheme() == "https",
             public_origin,
             public_host,
-            audience: config.audience.clone().unwrap_or(config.client_id.clone()),
+            parties,
+            session_ttl,
             config: config.clone(),
             http,
-            cache: tokio::sync::Mutex::default(),
-            min_refresh: JWKS_MIN_REFRESH,
+            cache: std::sync::Mutex::default(),
+            reading: tokio::sync::Mutex::new(()),
+            tuning,
         })
     }
 
-    async fn get(&self, url: &str) -> Result<Value, Failure> {
-        let fail = |e: String| Failure::Provider(format!("GET {url}: {e}"));
+    fn issuer(&self) -> &str {
+        &self.config.issuer_url
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, Cache> {
+        self.cache.lock().expect("oidc cache lock poisoned")
+    }
+
+    async fn get(&self, url: &str) -> Result<Value, String> {
+        let fail = |e: String| format!("GET {url}: {e}");
         let res = self
             .http
             .get(url)
@@ -401,77 +585,142 @@ impl Oidc {
         if !res.status().is_success() {
             return Err(fail(res.status().to_string()));
         }
-        let bytes = res.bytes().await.map_err(|e| fail(e.to_string()))?;
+        let bytes = body(res).await.map_err(fail)?;
         serde_json::from_slice(&bytes).map_err(|e| fail(e.to_string()))
     }
 
-    async fn metadata_locked(&self, cache: &mut Cache) -> Result<Arc<Metadata>, Failure> {
-        if let Some(m) = &cache.metadata {
-            return Ok(m.clone());
+    /// What the cache holds for `need`, if it is enough.
+    fn held(&self, need: &Need) -> Option<Held> {
+        let cache = self.cache();
+        let metadata = cache.metadata.clone()?;
+        match need {
+            Need::Metadata => Some((metadata, None)),
+            Need::Keys => Some((metadata, Some(cache.keys.clone()?))),
+            Need::NewKeys(seen) => {
+                let keys = cache.keys.clone()?;
+                let recent = cache
+                    .keys_at
+                    .is_some_and(|at| at.elapsed() < self.tuning.min_refresh);
+                (!Arc::ptr_eq(seen, &keys) || recent).then_some((metadata, Some(keys)))
+            }
         }
-        let url = format!("{}/.well-known/openid-configuration", self.issuer);
-        let metadata: Metadata = serde_json::from_value(self.get(&url).await?)
-            .map_err(|e| Failure::Provider(format!("{url}: {e}")))?;
-        if metadata.issuer.trim_end_matches('/') != self.issuer {
-            return Err(Failure::Provider(format!(
-                "{url} names the issuer {:?}, not {:?}",
-                metadata.issuer, self.issuer
-            )));
+    }
+
+    /// The failure a read within [`Tuning::retry_after`] ended in.
+    fn failed(&self) -> Option<Failure> {
+        let cache = self.cache();
+        let (at, why) = cache.failed.as_ref()?;
+        (at.elapsed() < self.tuning.retry_after).then(|| {
+            Failure::Provider(format!(
+                "not read again for {} s after: {why}",
+                self.tuning.retry_after.as_secs()
+            ))
+        })
+    }
+
+    /// What `need` takes from the cache, reading the provider when the
+    /// cache does not hold it. One request reads at a time, outside the
+    /// cache lock; others wait for it at most [`Tuning::wait`], then find
+    /// its outcome in the cache. A failed read answers for
+    /// [`Tuning::retry_after`] without another.
+    async fn load(&self, need: Need) -> Result<Held, Failure> {
+        if let Some(held) = self.held(&need) {
+            return Ok(held);
         }
-        let metadata = Arc::new(metadata);
-        cache.metadata = Some(metadata.clone());
-        Ok(metadata)
+        if let Some(f) = self.failed() {
+            return Err(f);
+        }
+        let _reading = match self.reading.try_lock() {
+            Ok(g) => g,
+            Err(_) => tokio::time::timeout(self.tuning.wait, self.reading.lock())
+                .await
+                .map_err(|_| Failure::Provider("a read of the provider is still running".into()))?,
+        };
+        if let Some(held) = self.held(&need) {
+            return Ok(held);
+        }
+        if let Some(f) = self.failed() {
+            return Err(f);
+        }
+        match self.read(&need).await {
+            Ok(()) => self
+                .held(&need)
+                .ok_or_else(|| Failure::Provider("the read left nothing".into())),
+            Err(why) => {
+                self.cache().failed = Some((Instant::now(), why.clone()));
+                Err(Failure::Provider(why))
+            }
+        }
+    }
+
+    /// Reads what `need` takes into the cache.
+    async fn read(&self, need: &Need) -> Result<(), String> {
+        let metadata = self.cache().metadata.clone();
+        let metadata = match metadata {
+            Some(m) => m,
+            None => {
+                let url = format!(
+                    "{}/.well-known/openid-configuration",
+                    self.issuer().trim_end_matches('/')
+                );
+                let metadata: Metadata = serde_json::from_value(self.get(&url).await?)
+                    .map_err(|e| format!("{url}: {e}"))?;
+                if metadata.issuer != self.issuer() {
+                    return Err(format!(
+                        "{url} names the issuer {:?}, not {:?}",
+                        metadata.issuer,
+                        self.issuer()
+                    ));
+                }
+                let endpoints = [
+                    Some(&metadata.authorization_endpoint),
+                    Some(&metadata.token_endpoint),
+                    Some(&metadata.jwks_uri),
+                    metadata.end_session_endpoint.as_ref(),
+                ];
+                for e in endpoints.into_iter().flatten() {
+                    secure_url(e).map_err(|why| format!("{url}: {why}"))?;
+                }
+                let metadata = Arc::new(metadata);
+                self.cache().metadata = Some(metadata.clone());
+                metadata
+            }
+        };
+        if matches!(need, Need::Metadata) {
+            return Ok(());
+        }
+        let set = self.get(&metadata.jwks_uri).await?;
+        let keys = set["keys"]
+            .as_array()
+            .ok_or_else(|| format!("{}: no keys", metadata.jwks_uri))?
+            .iter()
+            .filter_map(|k| serde_json::from_value::<Jwk>(k.clone()).ok())
+            .collect();
+        let mut cache = self.cache();
+        cache.keys = Some(Arc::new(keys));
+        cache.keys_at = Some(Instant::now());
+        cache.failed = None;
+        Ok(())
     }
 
     async fn metadata(&self) -> Result<Arc<Metadata>, Failure> {
-        self.metadata_locked(&mut *self.cache.lock().await).await
+        Ok(self.load(Need::Metadata).await?.0)
     }
 
-    /// Reads the keys again unless they were read within the refresh
-    /// interval or have changed since `seen` was taken.
-    async fn keys(&self, seen: Option<&Arc<Vec<Jwk>>>) -> Result<Arc<Vec<Jwk>>, Failure> {
-        let mut cache = self.cache.lock().await;
-        let metadata = self.metadata_locked(&mut cache).await?;
-        let stale = match (seen, cache.fetched) {
-            (_, None) => true,
-            (Some(seen), Some(at)) => {
-                Arc::ptr_eq(seen, &cache.keys) && at.elapsed() >= self.min_refresh
-            }
-            (None, Some(_)) => false,
-        };
-        if stale {
-            let set = self.get(&metadata.jwks_uri).await?;
-            let keys = set["keys"]
-                .as_array()
-                .ok_or_else(|| Failure::Provider(format!("{}: no keys", metadata.jwks_uri)))?
-                .iter()
-                .filter_map(|k| serde_json::from_value::<Jwk>(k.clone()).ok())
-                .collect();
-            cache.keys = Arc::new(keys);
-            cache.fetched = Some(Instant::now());
-        }
-        Ok(cache.keys.clone())
-    }
-
-    /// Verifies a token of the provider, reading the keys again once when
-    /// it names one they do not hold.
-    async fn verify(
-        &self,
-        token: &str,
-        audience: &str,
-        nonce: Option<&str>,
-    ) -> Result<Value, Failure> {
-        let expect = Expect {
-            issuer: &self.issuer,
-            audience,
-            authorized_party: nonce.map(|_| self.config.client_id.as_str()),
-            nonce,
-        };
-        let keys = self.keys(None).await?;
-        match verify(token, &keys, &expect, auth::now()) {
+    /// Verifies a token of the provider. Its header is checked before
+    /// anything is read; the keys are read again once when it names one
+    /// they do not hold.
+    async fn verify(&self, token: &str, expect: &Expect<'_>) -> Result<Value, Failure> {
+        header(token).map_err(Failure::Token)?;
+        let keys = self.load(Need::Keys).await?.1.expect("keys were asked for");
+        match verify(token, &keys, expect, auth::now()) {
             Err(Invalid::UnknownKey) => {
-                let keys = self.keys(Some(&keys)).await?;
-                verify(token, &keys, &expect, auth::now()).map_err(Failure::Token)
+                let keys = self
+                    .load(Need::NewKeys(keys))
+                    .await?
+                    .1
+                    .expect("keys were asked for");
+                verify(token, &keys, expect, auth::now()).map_err(Failure::Token)
             }
             r => r.map_err(Failure::Token),
         }
@@ -488,10 +737,21 @@ impl Oidc {
         })
     }
 
-    /// The identity of an access token sent as a bearer.
-    pub(crate) async fn bearer(&self, token: &str) -> Result<Identity, Failure> {
-        let claims = self.verify(token, &self.audience, None).await?;
-        self.identity(&claims).ok_or(Failure::NoRole)
+    /// The identity of an access token sent as a bearer, and its `exp`.
+    /// It has to be an access token issued to one of the allowed clients
+    /// (`azp`), and to name the configured audience when there is one.
+    pub(crate) async fn bearer(&self, token: &str) -> Result<(Identity, u64), Failure> {
+        let expect = Expect {
+            issuer: self.issuer(),
+            audience: self.config.audience.as_deref(),
+            parties: &self.parties,
+            require_party: true,
+            nonce: None,
+            access: true,
+        };
+        let claims = self.verify(token, &expect).await?;
+        let exp = claims["exp"].as_u64().unwrap_or_default();
+        Ok((self.identity(&claims).ok_or(Failure::NoRole)?, exp))
     }
 
     fn authorize_url(&self, metadata: &Metadata, pending: &Pending) -> Result<String, String> {
@@ -549,7 +809,7 @@ impl Oidc {
             .await
             .map_err(|e| fail(e.to_string()))?;
         let status = res.status();
-        let bytes = res.bytes().await.map_err(|e| fail(e.to_string()))?;
+        let bytes = body(res).await.map_err(fail)?;
         if !status.is_success() {
             let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
             return Err(fail(format!(
@@ -561,8 +821,15 @@ impl Oidc {
         let id_token = body["id_token"]
             .as_str()
             .ok_or_else(|| fail("no id_token".into()))?;
-        self.verify(id_token, &self.config.client_id, Some(&pending.nonce))
-            .await
+        let expect = Expect {
+            issuer: self.issuer(),
+            audience: Some(&self.config.client_id),
+            parties: std::slice::from_ref(&self.config.client_id),
+            require_party: false,
+            nonce: Some(&pending.nonce),
+            access: false,
+        };
+        self.verify(id_token, &expect).await
     }
 
     /// Where the browser goes after its session cookie is cleared: the
@@ -577,12 +844,6 @@ impl Oidc {
                 &format!("{}/", self.public_origin),
             );
         Some(url.into())
-    }
-
-    #[cfg(test)]
-    fn with_min_refresh(mut self, d: Duration) -> Oidc {
-        self.min_refresh = d;
-        self
     }
 }
 
@@ -698,7 +959,7 @@ pub(crate) struct CallbackQuery {
         ("error" = Option<String>, Query, description = "The provider's error code"),
     ),
     responses(
-        (status = 303, description = "Session cookie set until the ID token's expiry, 12 h at most; to the path the sign-in started from"),
+        (status = 303, description = "Session cookie set for `sessionTtl`, 8 h by default; to the path the sign-in started from"),
         (status = 400, description = "No sign-in in progress, or another one's state"),
         (status = 401, description = "The provider refused the sign-in, or the ID token is invalid"),
         (status = 403, description = "Host not allowed, or the user has no role"),
@@ -763,12 +1024,14 @@ pub(crate) async fn callback(
     let Some(identity) = oidc.identity(&claims) else {
         return refuse(StatusCode::FORBIDDEN, "signed in, but without a role here");
     };
-    let exp = claims["exp"].as_u64().unwrap_or_default();
+    // The ID token was valid just now; the session lasts sessionTtl from
+    // here, whatever the ID token's own lifetime.
     let now = auth::now();
-    let expiry = exp.min(now + auth::SESSION_TTL.as_secs());
-    if expiry <= now {
-        return refuse(StatusCode::UNAUTHORIZED, "the ID token has expired");
-    }
+    let expiry = now + oidc.session_ttl;
+    let session = match auth.oidc_session_cookie(&identity, expiry, now, secure) {
+        Ok(c) => c,
+        Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     let mut response = (
         StatusCode::SEE_OTHER,
         [
@@ -779,7 +1042,6 @@ pub(crate) async fn callback(
         .into_response();
     let h = response.headers_mut();
     h.append(header::SET_COOKIE, clear.parse().expect("a valid header"));
-    let session = auth.oidc_session_cookie(&identity, expiry, now, secure);
     h.append(header::SET_COOKIE, session.parse().expect("a valid header"));
     response
 }
@@ -835,6 +1097,10 @@ mod tests {
 
         pub(crate) fn sign(&self, claims: &Value) -> String {
             let header = json!({ "alg": "ES256", "typ": "JWT", "kid": self.kid });
+            self.sign_with(&header, claims)
+        }
+
+        pub(crate) fn sign_with(&self, header: &Value, claims: &Value) -> String {
             let input = format!(
                 "{}.{}",
                 B64.encode(header.to_string()),
@@ -859,13 +1125,42 @@ mod tests {
         })
     }
 
+    fn faderz() -> &'static [String] {
+        static P: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        P.get_or_init(|| vec!["faderz".to_owned()])
+    }
+
+    /// What the callback asks of an ID token.
     fn expect() -> Expect<'static> {
         Expect {
             issuer: ISS,
-            audience: "faderz",
-            authorized_party: Some("faderz"),
+            audience: Some("faderz"),
+            parties: faderz(),
+            require_party: false,
             nonce: Some("n1"),
+            access: false,
         }
+    }
+
+    /// What a bearer is asked by default: an access token, `azp` among the
+    /// allowed clients, no audience.
+    fn bearer_expect() -> Expect<'static> {
+        Expect {
+            issuer: ISS,
+            audience: None,
+            parties: faderz(),
+            require_party: true,
+            nonce: None,
+            access: true,
+        }
+    }
+
+    fn access_claims() -> Value {
+        let mut c = claims();
+        c.as_object_mut().unwrap().remove("nonce");
+        c["aud"] = json!("account");
+        c["typ"] = json!("Bearer");
+        c
     }
 
     fn keys(signers: &[&Signer]) -> Vec<Jwk> {
@@ -920,21 +1215,95 @@ mod tests {
         );
         assert_eq!(with("aud", json!("other")), Err(Invalid::Audience));
         assert!(with("aud", json!(["other", "faderz"])).is_ok());
-        assert_eq!(with("azp", json!("other")), Err(Invalid::Audience));
+        assert_eq!(with("azp", json!("other")), Err(Invalid::Party));
         assert_eq!(with("nonce", json!("n2")), Err(Invalid::Nonce));
         assert_eq!(with("nonce", json!("")), Err(Invalid::Nonce));
         let mut c = claims();
         c.as_object_mut().unwrap().remove("nonce");
         assert_eq!(verify(&s.sign(&c), &k, &expect(), NOW), Err(Invalid::Nonce));
-        let access = Expect {
-            nonce: None,
-            authorized_party: None,
-            ..expect()
-        };
+    }
+
+    /// OIDC Core 3.1.3.7: with more than one audience, `azp` has to be
+    /// present and name this client.
+    #[test]
+    fn an_id_token_for_several_audiences_needs_this_client_as_azp() {
+        let s = Signer::new("k1");
+        let k = keys(&[&s]);
+        let mut c = claims();
+        c["aud"] = json!(["faderz", "other"]);
+        c.as_object_mut().unwrap().remove("azp");
+        assert_eq!(verify(&s.sign(&c), &k, &expect(), NOW), Err(Invalid::Party));
+        c["azp"] = json!("other");
+        assert_eq!(verify(&s.sign(&c), &k, &expect(), NOW), Err(Invalid::Party));
+        c["azp"] = json!("faderz");
+        assert!(verify(&s.sign(&c), &k, &expect(), NOW).is_ok());
+        c["aud"] = json!("faderz");
+        c.as_object_mut().unwrap().remove("azp");
         assert!(
-            verify(&s.sign(&c), &k, &access, NOW).is_ok(),
-            "no nonce on an access token"
+            verify(&s.sign(&c), &k, &expect(), NOW).is_ok(),
+            "one audience, no azp"
         );
+    }
+
+    /// A bearer has to be an access token issued to an allowed client: an
+    /// ID token of the same client is refused, and so is a token of
+    /// another client of the provider, whatever its audience.
+    #[test]
+    fn a_bearer_is_an_access_token_of_an_allowed_client() {
+        let s = Signer::new("k1");
+        let k = keys(&[&s]);
+        let check = |c: &Value, e: &Expect| verify(&s.sign(c), &k, e, NOW);
+        assert!(check(&access_claims(), &bearer_expect()).is_ok());
+
+        assert_eq!(
+            check(&claims(), &bearer_expect()),
+            Err(Invalid::NotAccessToken),
+            "an ID token"
+        );
+        let mut id_typ = access_claims();
+        id_typ["typ"] = json!("ID");
+        assert_eq!(
+            check(&id_typ, &bearer_expect()),
+            Err(Invalid::NotAccessToken)
+        );
+        let head = |typ: &str| {
+            let h = json!({ "alg": "ES256", "kid": "k1", "typ": typ });
+            s.sign_with(&h, &access_claims())
+        };
+        assert!(verify(&head("at+jwt"), &k, &bearer_expect(), NOW).is_ok());
+        assert_eq!(
+            verify(&head("id+jwt"), &k, &bearer_expect(), NOW),
+            Err(Invalid::NotAccessToken)
+        );
+
+        let mut other = access_claims();
+        other["azp"] = json!("another-client");
+        assert_eq!(check(&other, &bearer_expect()), Err(Invalid::Party));
+        let mut none = access_claims();
+        none.as_object_mut().unwrap().remove("azp");
+        assert_eq!(
+            check(&none, &bearer_expect()),
+            Err(Invalid::Party),
+            "azp is required"
+        );
+        let both = ["faderz".to_owned(), "another-client".to_owned()];
+        let allowed = Expect {
+            parties: &both,
+            ..bearer_expect()
+        };
+        assert!(check(&other, &allowed).is_ok());
+
+        let with_audience = Expect {
+            audience: Some("mixer-api"),
+            ..bearer_expect()
+        };
+        assert_eq!(
+            check(&access_claims(), &with_audience),
+            Err(Invalid::Audience)
+        );
+        let mut aud = access_claims();
+        aud["aud"] = json!(["account", "mixer-api"]);
+        assert!(check(&aud, &with_audience).is_ok());
     }
 
     #[test]
@@ -1083,38 +1452,132 @@ mod tests {
         assert_eq!(decode_pending("!"), None);
     }
 
-    /// A provider serving its metadata and a key set that can be swapped.
-    async fn provider(
-        keys: Arc<std::sync::Mutex<Value>>,
-        hits: Arc<std::sync::atomic::AtomicUsize>,
-    ) -> String {
-        use axum::routing::get;
+    /// What the fake provider answers.
+    #[derive(Default)]
+    struct Behaviour {
+        keys: Value,
+        /// Every read answers 500.
+        down: bool,
+        /// Every read waits this long first.
+        delay: Duration,
+        /// Overrides the published `jwks_uri`.
+        jwks_uri: Option<String>,
+        /// The key set is padded past [`MAX_BODY`].
+        huge: bool,
+    }
+
+    #[derive(Default)]
+    struct Hits {
+        metadata: std::sync::atomic::AtomicUsize,
+        jwks: std::sync::atomic::AtomicUsize,
+        /// Requests that followed the token endpoint's redirect.
+        redirected: std::sync::atomic::AtomicUsize,
+    }
+
+    struct Fake {
+        /// The issuer: the base URL with a trailing `/`.
+        issuer: String,
+        behaviour: Arc<std::sync::Mutex<Behaviour>>,
+        hits: Arc<Hits>,
+    }
+
+    impl Fake {
+        fn hits(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (self.hits.metadata.load(SeqCst), self.hits.jwks.load(SeqCst))
+        }
+
+        fn set(&self, f: impl FnOnce(&mut Behaviour)) {
+            f(&mut self.behaviour.lock().unwrap());
+        }
+    }
+
+    /// A provider whose issuer ends in `/`, as some providers' do.
+    async fn fake(keys: Value) -> Fake {
+        use axum::routing::{get, post};
+        use std::sync::atomic::Ordering::SeqCst;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let issuer = base.clone();
+        let issuer = format!("{base}/");
+        let behaviour = Arc::new(std::sync::Mutex::new(Behaviour {
+            keys,
+            ..Behaviour::default()
+        }));
+        let hits = Arc::new(Hits::default());
+        let (b1, b2, h1, h2, h3) = (
+            behaviour.clone(),
+            behaviour.clone(),
+            hits.clone(),
+            hits.clone(),
+            hits.clone(),
+        );
+        let (iss, base1) = (issuer.clone(), base.clone());
         let router = axum::Router::new()
             .route(
                 "/.well-known/openid-configuration",
                 get(move || {
-                    let b = issuer.clone();
+                    h1.metadata.fetch_add(1, SeqCst);
+                    let (down, delay, jwks) = {
+                        let b = b1.lock().unwrap();
+                        (b.down, b.delay, b.jwks_uri.clone())
+                    };
+                    let (iss, base) = (iss.clone(), base1.clone());
                     async move {
+                        tokio::time::sleep(delay).await;
+                        if down {
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
                         axum::Json(json!({
-                            "issuer": b, "authorization_endpoint": format!("{b}/auth"),
-                            "token_endpoint": format!("{b}/token"), "jwks_uri": format!("{b}/jwks"),
+                            "issuer": iss, "authorization_endpoint": format!("{base}/auth"),
+                            "token_endpoint": format!("{base}/token"),
+                            "jwks_uri": jwks.unwrap_or(format!("{base}/jwks")),
                         }))
+                        .into_response()
                     }
                 }),
             )
             .route(
                 "/jwks",
                 get(move || {
-                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let k = keys.lock().unwrap().clone();
-                    async move { axum::Json(k) }
+                    h2.jwks.fetch_add(1, SeqCst);
+                    let (down, delay, mut keys, huge) = {
+                        let b = b2.lock().unwrap();
+                        (b.down, b.delay, b.keys.clone(), b.huge)
+                    };
+                    async move {
+                        tokio::time::sleep(delay).await;
+                        if down {
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                        if huge {
+                            keys["padding"] = json!("x".repeat(MAX_BODY));
+                        }
+                        axum::Json(keys).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, "/stolen")],
+                    )
+                }),
+            )
+            .route(
+                "/stolen",
+                post(move || {
+                    h3.redirected.fetch_add(1, SeqCst);
+                    async { "{}" }
                 }),
             );
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        base
+        Fake {
+            issuer,
+            behaviour,
+            hits,
+        }
     }
 
     fn client(issuer: &str) -> OidcConfig {
@@ -1125,56 +1588,208 @@ mod tests {
         .unwrap()
     }
 
+    fn tuned(issuer: &str, f: impl FnOnce(&mut Tuning)) -> Oidc {
+        let mut t = Tuning::default();
+        f(&mut t);
+        Oidc::with_tuning(&client(issuer), t).unwrap()
+    }
+
+    /// An access token of `issuer` signed by `s`.
+    fn access(s: &Signer, issuer: &str) -> String {
+        let mut c = access_claims();
+        c["iss"] = json!(issuer);
+        c["exp"] = json!(auth::now() + 300);
+        s.sign(&c)
+    }
+
     #[tokio::test]
     async fn an_unknown_kid_reads_the_keys_again_once_per_interval() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let (old, new) = (Signer::new("old"), Signer::new("new"));
-        let keys = Arc::new(std::sync::Mutex::new(json!({ "keys": [old.jwk()] })));
-        let hits = Arc::new(AtomicUsize::new(0));
-        let issuer = provider(keys.clone(), hits.clone()).await;
-        let token = |s: &Signer| {
-            let mut c = claims();
-            c["iss"] = json!(issuer);
-            c["exp"] = json!(auth::now() + 300);
-            c.as_object_mut().unwrap().remove("nonce");
-            s.sign(&c)
-        };
-
-        let oidc = Oidc::new(&client(&issuer))
-            .unwrap()
-            .with_min_refresh(Duration::ZERO);
-        assert_eq!(
-            oidc.bearer(&token(&old)).await.unwrap().role,
-            Role::Operator
-        );
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let p = fake(json!({ "keys": [old.jwk()] })).await;
+        let oidc = tuned(&p.issuer, |t| t.min_refresh = Duration::ZERO);
+        let (id, exp) = oidc.bearer(&access(&old, &p.issuer)).await.unwrap();
+        assert_eq!(id.role, Role::Operator);
+        assert!(exp > auth::now());
+        assert_eq!(p.hits(), (1, 1));
         // The provider rotates its key.
-        *keys.lock().unwrap() = json!({ "keys": [new.jwk()] });
-        let id = oidc.bearer(&token(&new)).await.unwrap();
+        p.set(|b| b.keys = json!({ "keys": [new.jwk()] }));
+        let (id, _) = oidc.bearer(&access(&new, &p.issuer)).await.unwrap();
         assert_eq!(id.user.as_deref(), Some("alice"));
-        assert_eq!(hits.load(Ordering::SeqCst), 2, "read again for the new kid");
-        oidc.bearer(&token(&new)).await.unwrap();
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            2,
-            "the known kid needs no read"
-        );
+        assert_eq!(p.hits(), (1, 2), "read again for the new kid");
+        oidc.bearer(&access(&new, &p.issuer)).await.unwrap();
+        assert_eq!(p.hits(), (1, 2), "the known kid needs no read");
 
-        let held = Oidc::new(&client(&issuer)).unwrap();
-        held.bearer(&token(&new)).await.unwrap();
-        let before = hits.load(Ordering::SeqCst);
+        let held = Oidc::new(&client(&p.issuer)).unwrap();
+        held.bearer(&access(&new, &p.issuer)).await.unwrap();
+        let before = p.hits();
         let stranger = Signer::new("stranger");
         for _ in 0..3 {
             assert!(matches!(
-                held.bearer(&token(&stranger)).await,
+                held.bearer(&access(&stranger, &p.issuer)).await,
                 Err(Failure::Token(Invalid::UnknownKey))
             ));
         }
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            before,
-            "unknown kids cannot force reads"
+        assert_eq!(p.hits(), before, "unknown kids cannot force reads");
+    }
+
+    /// A bearer that no key could verify is refused without a read, so a
+    /// client cannot make the service call the provider with junk.
+    #[tokio::test]
+    async fn a_malformed_bearer_reads_nothing() {
+        let p = fake(json!({ "keys": [] })).await;
+        let oidc = Oidc::new(&client(&p.issuer)).unwrap();
+        let hs256 = format!(
+            "{}.{}.{}",
+            B64.encode(json!({ "alg": "HS256" }).to_string()),
+            B64.encode("{}"),
+            B64.encode("x")
         );
+        for junk in ["x", "a.b", "a.b.c", &hs256] {
+            assert!(
+                matches!(oidc.bearer(junk).await, Err(Failure::Token(_))),
+                "{junk}"
+            );
+        }
+        assert_eq!(p.hits(), (0, 0));
+    }
+
+    /// While the provider is down, one read fails and the requests after
+    /// it fail at once, without reading, until the retry interval passes.
+    #[tokio::test]
+    async fn a_failed_read_is_not_repeated_within_the_retry_interval() {
+        let s = Signer::new("k1");
+        let p = fake(json!({ "keys": [s.jwk()] })).await;
+        p.set(|b| b.down = true);
+        let oidc = tuned(&p.issuer, |t| t.retry_after = Duration::from_millis(300));
+        let token = access(&s, &p.issuer);
+        for _ in 0..5 {
+            assert!(matches!(
+                oidc.bearer(&token).await,
+                Err(Failure::Provider(_))
+            ));
+            assert!(matches!(oidc.metadata().await, Err(Failure::Provider(_))));
+        }
+        assert_eq!(p.hits(), (1, 0), "one read for all of them");
+        p.set(|b| b.down = false);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        oidc.bearer(&token).await.unwrap();
+        assert_eq!(p.hits(), (2, 1));
+    }
+
+    /// A slow read of new keys holds up neither tokens of the keys already
+    /// held nor, for longer than the wait, other requests that need a read.
+    #[tokio::test]
+    async fn a_slow_read_holds_up_no_token_of_a_known_key() {
+        let s = Signer::new("k1");
+        let p = fake(json!({ "keys": [s.jwk()] })).await;
+        let oidc = Arc::new(tuned(&p.issuer, |t| {
+            t.min_refresh = Duration::ZERO;
+            t.wait = Duration::from_millis(200);
+        }));
+        oidc.bearer(&access(&s, &p.issuer)).await.unwrap();
+        p.set(|b| b.delay = Duration::from_secs(2));
+        let stranger = access(&Signer::new("stranger"), &p.issuer);
+        let slow = tokio::spawn({
+            let (oidc, t) = (oidc.clone(), stranger.clone());
+            async move { oidc.bearer(&t).await.map(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        oidc.bearer(&access(&s, &p.issuer)).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            oidc.bearer(&stranger).await,
+            Err(Failure::Provider(_))
+        ));
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_millis(800), "{waited:?}");
+        assert!(matches!(
+            slow.await.unwrap(),
+            Err(Failure::Token(Invalid::UnknownKey))
+        ));
+    }
+
+    /// The issuer is compared as configured, trailing `/` included.
+    #[tokio::test]
+    async fn the_issuer_is_compared_exactly() {
+        let s = Signer::new("k1");
+        let p = fake(json!({ "keys": [s.jwk()] })).await;
+        let oidc = Oidc::new(&client(&p.issuer)).unwrap();
+        oidc.bearer(&access(&s, &p.issuer)).await.unwrap();
+        let trimmed = p.issuer.trim_end_matches('/');
+        assert!(matches!(
+            oidc.bearer(&access(&s, trimmed)).await,
+            Err(Failure::Token(Invalid::Issuer))
+        ));
+        let other = Oidc::new(&client(trimmed)).unwrap();
+        match other.metadata().await {
+            Err(Failure::Provider(why)) => assert!(why.contains("names the issuer"), "{why}"),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_endpoints_need_https_and_answers_are_bounded() {
+        let s = Signer::new("k1");
+        let p = fake(json!({ "keys": [s.jwk()] })).await;
+        p.set(|b| b.jwks_uri = Some("http://idp.example/jwks".into()));
+        let oidc = Oidc::new(&client(&p.issuer)).unwrap();
+        match oidc.bearer(&access(&s, &p.issuer)).await {
+            Err(Failure::Provider(why)) => assert!(why.contains("https"), "{why}"),
+            r => panic!("{r:?}"),
+        }
+        p.set(|b| {
+            b.jwks_uri = None;
+            b.huge = true;
+        });
+        let oidc = Oidc::new(&client(&p.issuer)).unwrap();
+        match oidc.bearer(&access(&s, &p.issuer)).await {
+            Err(Failure::Provider(why)) => assert!(why.contains("longer than"), "{why}"),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    /// A redirect from the token endpoint is not followed: the request
+    /// carries the code, the verifier and the client secret.
+    #[tokio::test]
+    async fn the_token_request_follows_no_redirect() {
+        let p = fake(json!({ "keys": [] })).await;
+        let oidc = Oidc::new(&client(&p.issuer)).unwrap();
+        let pending = Pending {
+            state: "s".into(),
+            nonce: "n".into(),
+            verifier: "v".into(),
+            to: "/".into(),
+        };
+        let r = oidc
+            .redeem("code", &pending, Some(b"secret".to_vec()))
+            .await;
+        assert!(matches!(r, Err(Failure::Provider(_))), "{r:?}");
+        assert_eq!(
+            p.hits.redirected.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn session_lifetimes_parse_and_are_bounded() {
+        use crate::config::Ttl;
+        assert_eq!(parse_ttl(&Ttl::Seconds(3600)), Ok(3600));
+        assert_eq!(parse_ttl(&Ttl::Text("8h".into())), Ok(8 * 3600));
+        assert_eq!(parse_ttl(&Ttl::Text("90m".into())), Ok(5400));
+        assert_eq!(parse_ttl(&Ttl::Text("2d".into())), Ok(2 * 86_400));
+        assert_eq!(parse_ttl(&Ttl::Text("600".into())), Ok(600));
+        for bad in ["59", "8w", "h", "-1h", "8 h", "8d"] {
+            assert!(parse_ttl(&Ttl::Text(bad.into())).is_err(), "{bad}");
+        }
+        assert!(parse_ttl(&Ttl::Seconds(MAX_SESSION_TTL + 1)).is_err());
+        let o = Oidc::new(&client("https://idp.example/")).unwrap();
+        assert_eq!(o.session_ttl, DEFAULT_SESSION_TTL.as_secs());
     }
 
     #[test]
@@ -1195,11 +1810,15 @@ mod tests {
             "https://faderz.example/mixer",
             "ftp://faderz.example",
             "faderz.example",
+            "http://faderz.example",
         ] {
             let mut c = ok.clone();
             c.public_url = bad.into();
             assert!(Oidc::new(&c).is_err(), "{bad}");
         }
+        let mut c = ok.clone();
+        c.public_url = "http://127.0.0.1:8080".into();
+        assert!(Oidc::new(&c).is_ok(), "plain http on loopback");
         let mut c = ok.clone();
         c.public_url = "https://Faderz.Example:443/".into();
         assert_eq!(

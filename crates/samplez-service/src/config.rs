@@ -188,14 +188,34 @@ pub struct OidcConfig {
     /// in, as a viewer, and is refused otherwise. When absent, every user
     /// the provider signs in without the operator role is a viewer.
     pub viewer_role: Option<String>,
-    /// The audience an access token sent as a bearer must name; the client
-    /// id when absent.
+    /// The clients an access token sent as a bearer may have been issued
+    /// to: its `azp` has to name one of them. The client id when empty.
+    #[serde(default)]
+    pub allowed_clients: Vec<String>,
+    /// The audience an access token sent as a bearer must name in `aud`.
+    /// Absent, `aud` is not checked: `azp` binds the token to the allowed
+    /// clients. Keycloak puts `account` into `aud` by default, and a client
+    /// id only through an audience mapper.
     pub audience: Option<String>,
-    /// The key session cookies are signed with, 32 random bytes or more.
+    /// How long a session lasts from the sign-in, whatever the ID token's
+    /// lifetime: seconds, or a number with `s`, `m`, `h` or `d`, from 60 s
+    /// to 7 d; 8 h when absent. A role changed at the provider applies
+    /// from the next sign-in.
+    pub session_ttl: Option<Ttl>,
+    /// The key session cookies are signed with, 32 bytes or more.
     /// Replicas behind one host name need the same one; without it each
     /// process draws its own, so a session holds on that process only and
     /// ends when it restarts.
     pub session_key: Option<SecretFile>,
+}
+
+/// A duration: seconds as a number, or a string of seconds or of a number
+/// with `s`, `m`, `h` or `d`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum Ttl {
+    Seconds(u64),
+    Text(String),
 }
 
 fn default_role_claim() -> String {

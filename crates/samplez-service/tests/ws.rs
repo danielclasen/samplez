@@ -16,10 +16,11 @@ use samplez_service::server::MAX_SESSION_ID;
 use samplez_service::ws::{
     Admission, Answer, CatchUp, ClientQueue, Delta, Encode, Ended, Frame, Hub, MAX_PAUSE,
     MAX_PAUSE_TOTAL, MAX_PENDING_REPLIES, PING_PERIOD, PONG_TIMEOUT, Popped, Pushed,
-    READ_INDEX_HOLD, Reply, Sent, Sessions, Slot, To, serve_client,
+    READ_INDEX_HOLD, Reply, SESSION_ENDED_CLOSE, Sent, Sessions, Slot, To, serve_client,
 };
 use samplez_service::{
-    Connect, Forbidden, Identity, Metrics, Ops, Owner, OwnerHandle, Position, ReplicatedState, Role,
+    Connect, Forbidden, Identity, Metrics, Ops, Owner, OwnerHandle, Position, ReplicatedState,
+    Role, SessionEnd,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -307,6 +308,7 @@ fn connect(sessions: &Arc<Sessions>, role: Role, n: u32) -> Connect {
             connection: format!("r1:{n}"),
         },
         sessions: sessions.clone(),
+        ends: SessionEnd::never(),
     }
 }
 
@@ -730,6 +732,43 @@ async fn an_epoch_change_closes_every_connection() {
     assert_eq!(start.elapsed(), Duration::ZERO);
     apply(&state, &hub);
     assert_eq!(reconnected.next().await, "delta@2");
+}
+
+/// A connection whose credentials end is closed then, with a close code
+/// the client can tell from a lost connection; one without an end goes on.
+#[tokio::test(start_paused = true)]
+async fn a_connection_closes_when_its_session_ends() {
+    let state = FakeState::new("r1", "leader");
+    let hub = Hub::new(8, &Metrics::default());
+    let sessions = Arc::new(Sessions::new("r1").unwrap());
+    let mut ending = connect(&sessions, Role::Operator, 1);
+    ending.ends = SessionEnd::at(samplez_service::auth::now() + 2);
+    let mut client = Client::start(&hub, &state, ending);
+    let mut lasting = Client::start(&hub, &state, connect(&sessions, Role::Operator, 2));
+    assert_eq!(client.next().await, "snapshot@7:0");
+    assert_eq!(lasting.next().await, "snapshot@7:0");
+    // The other connection answers its pings meanwhile.
+    let (close, ()) = tokio::join!(
+        async {
+            loop {
+                match client.next_message().await {
+                    Message::Close(c) => break c,
+                    Message::Text(t) => panic!("unexpected {t}"),
+                    _ => {}
+                }
+            }
+        },
+        async {
+            let quiet =
+                tokio::time::timeout(Duration::from_millis(2500), lasting.next_message()).await;
+            assert!(quiet.is_err(), "unexpected {quiet:?}");
+        }
+    );
+    let close = close.expect("a close frame");
+    assert_eq!(close.code, SESSION_ENDED_CLOSE);
+    assert_eq!(client.ended().await, Ended::SessionEnded);
+    apply(&state, &hub);
+    assert_eq!(lasting.next().await, "delta@1");
 }
 
 /// A catch-up held when the epoch changes answers with the new epoch's

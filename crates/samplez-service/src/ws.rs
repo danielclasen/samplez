@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::ws::{Message, Utf8Bytes};
+use axum::extract::ws::{CloseFrame, Message, Utf8Bytes};
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesOrdered;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -41,6 +41,10 @@ use crate::server::Connect;
 /// How often [`serve_client`] pings, from the client's first [`CatchUp`]
 /// on.
 pub const PING_PERIOD: Duration = Duration::from_millis(250);
+/// The close code [`serve_client`] sends when the connection's credentials
+/// end ([`Ended::SessionEnded`]): 1008, policy violation (RFC 6455 section
+/// 7.4.1).
+pub const SESSION_ENDED_CLOSE: u16 = 1008;
 /// [`serve_client`] closes a connection that has answered no ping sent in
 /// this long, and only connections that answered one are renewed
 /// ([`Sessions::live`]); neither counts the time the connection was not
@@ -816,6 +820,10 @@ pub enum Ended {
     /// A text frame overflowed the client's queue ([`Pushed::Dropped`]); a
     /// close frame was sent. The client catches up on a new connection.
     Overflow,
+    /// The credentials the connection was opened with ended
+    /// ([`crate::SessionEnd`]): a close frame with
+    /// [`SESSION_ENDED_CLOSE`] was sent. A new connection needs new ones.
+    SessionEnded,
 }
 
 /// Answers a client's [`CatchUp`]. A position of the state's epoch waits up
@@ -1058,6 +1066,8 @@ where
     let sessions = &connect.sessions;
     let owner = &connect.owner;
     sessions.answered(owner, Instant::now());
+    let session_ended = connect.ends.ended();
+    tokio::pin!(session_ended);
     let ended = async {
         let accepted = Instant::now();
         // When the last ping answered was sent, or the connection
@@ -1131,6 +1141,15 @@ where
                     if paused.is_some() =>
                 {
                     return Ended::Failed;
+                }
+                () = &mut session_ended => {
+                    let deadline = pong_deadline(answered, paused_since);
+                    let close = CloseFrame {
+                        code: SESSION_ENDED_CLOSE,
+                        reason: "session ended".into(),
+                    };
+                    let _ = send(&mut tx, Message::Close(Some(close)), deadline).await;
+                    return Ended::SessionEnded;
                 }
                 _ = ping.tick() => {
                     let deadline = pong_deadline(answered, paused_since);

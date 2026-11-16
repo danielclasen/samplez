@@ -13,6 +13,7 @@
 //! same `Origin` rule holds for every request to the WebSocket path and for
 //! every `CONNECT`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -27,6 +28,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tokio::sync::watch;
 use utoipa::ToSchema;
 
 use crate::config::{AuthMode, ProxyConfig, ServiceConfig, TlsMode};
@@ -72,6 +74,8 @@ pub(crate) enum Listener {
 struct Secret {
     name: &'static str,
     path: PathBuf,
+    /// The fewest bytes a value may have.
+    min: usize,
     value: RwLock<Vec<u8>>,
     /// Seconds since the Unix epoch of the last successful read.
     loaded_at: AtomicU64,
@@ -80,10 +84,20 @@ struct Secret {
 
 impl Secret {
     fn load(name: &'static str, path: &Path, metrics: &Metrics) -> Result<Secret, Error> {
+        Secret::load_min(name, path, 1, metrics)
+    }
+
+    fn load_min(
+        name: &'static str,
+        path: &Path,
+        min: usize,
+        metrics: &Metrics,
+    ) -> Result<Secret, Error> {
         Ok(Secret {
             name,
             path: path.to_owned(),
-            value: RwLock::new(read_secret(path)?),
+            min,
+            value: RwLock::new(read_secret(path, min)?),
             loaded_at: AtomicU64::new(now()),
             failures: metrics.counter(
                 "samplez_secret_reload_failures_total",
@@ -94,7 +108,7 @@ impl Secret {
     }
 
     fn reload(&self) -> Result<(), Error> {
-        let value = match read_secret(&self.path) {
+        let value = match read_secret(&self.path, self.min) {
             Ok(v) => v,
             Err(e) => {
                 self.failures.add(1);
@@ -124,13 +138,101 @@ impl Secret {
     }
 }
 
-fn read_secret(path: &Path) -> Result<Vec<u8>, Error> {
+fn read_secret(path: &Path, min: usize) -> Result<Vec<u8>, Error> {
     let mut value = std::fs::read(path).map_err(|e| Error::Secret(path.to_owned(), e))?;
     value.truncate(value.trim_ascii_end().len());
     if value.is_empty() {
         return Err(Error::Config(format!("{} is empty", path.display())));
     }
+    if value.len() < min {
+        return Err(Error::Config(format!(
+            "{} holds {} bytes, fewer than {min}",
+            path.display(),
+            value.len()
+        )));
+    }
     Ok(value)
+}
+
+/// The most signed-out sessions remembered; past it the one ending first
+/// is forgotten.
+pub const MAX_REVOKED: usize = 65_536;
+/// The fewest bytes of `auth.oidc.sessionKey`.
+pub const MIN_SESSION_KEY: usize = 32;
+
+/// When the credentials a WebSocket was opened with end: a session
+/// cookie's expiry or its sign-out on this process, or an access token's
+/// `exp`. [`crate::ws::serve_client`] closes the connection then. A static
+/// bearer token and `none` and `proxy` mode never end.
+#[derive(Clone, Default)]
+pub struct SessionEnd {
+    /// Seconds since the Unix epoch.
+    at: Option<u64>,
+    revoked: Option<Revocable>,
+}
+
+#[derive(Clone)]
+struct Revocable {
+    auth: Arc<Auth>,
+    id: String,
+    changes: watch::Receiver<u64>,
+}
+
+impl std::fmt::Debug for SessionEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionEnd")
+            .field("at", &self.at)
+            .field("revocable", &self.revoked.is_some())
+            .finish()
+    }
+}
+
+impl SessionEnd {
+    /// Never ends.
+    pub fn never() -> SessionEnd {
+        SessionEnd::default()
+    }
+
+    /// Ends at `at`, seconds since the Unix epoch.
+    pub fn at(at: u64) -> SessionEnd {
+        SessionEnd {
+            at: Some(at),
+            revoked: None,
+        }
+    }
+
+    /// Seconds since the Unix epoch it ends at, unless signed out sooner.
+    pub fn expiry(&self) -> Option<u64> {
+        self.at
+    }
+
+    /// Completes when the session ends.
+    pub async fn ended(&self) {
+        let expire = async {
+            match self.at {
+                Some(at) => tokio::time::sleep(Duration::from_secs(at.saturating_sub(now()))).await,
+                None => std::future::pending().await,
+            }
+        };
+        let revoke = async {
+            let Some(r) = &self.revoked else {
+                return std::future::pending().await;
+            };
+            let mut changes = r.changes.clone();
+            loop {
+                if r.auth.is_revoked(&r.id) {
+                    return;
+                }
+                if changes.changed().await.is_err() {
+                    return std::future::pending().await;
+                }
+            }
+        };
+        tokio::select! {
+            () = expire => {}
+            () = revoke => {}
+        }
+    }
 }
 
 pub(crate) struct Auth {
@@ -143,6 +245,10 @@ pub(crate) struct Auth {
     session_key: Option<Secret>,
     /// The session key of `oidc` mode without a configured one.
     drawn_key: Vec<u8>,
+    /// Signed-out sessions by id, with their expiry; this process only.
+    revoked: std::sync::Mutex<HashMap<String, u64>>,
+    /// Counts every sign-out, so open WebSockets look again.
+    revocations: watch::Sender<u64>,
     hosts: Vec<String>,
     origins: Vec<String>,
     /// The API listener runs TLS, so session cookies are `Secure`.
@@ -153,7 +259,7 @@ pub(crate) struct Auth {
 enum Bearer {
     /// None, or one the listener and mode ignore.
     Absent,
-    Valid(Identity),
+    Valid(Identity, SessionEnd),
 }
 
 impl Auth {
@@ -204,7 +310,12 @@ impl Auth {
             None => None,
         };
         let session_key = match oidc_config.and_then(|o| o.session_key.as_ref()) {
-            Some(f) => Some(Secret::load("oidcSessionKey", &f.file, metrics)?),
+            Some(f) => Some(Secret::load_min(
+                "oidcSessionKey",
+                &f.file,
+                MIN_SESSION_KEY,
+                metrics,
+            )?),
             None => None,
         };
         let drawn_key = match &oidc {
@@ -245,6 +356,8 @@ impl Auth {
             client_secret,
             session_key,
             drawn_key,
+            revoked: std::sync::Mutex::default(),
+            revocations: watch::Sender::new(0),
             hosts,
             origins,
             tls,
@@ -353,12 +466,88 @@ impl Auth {
         expiry: u64,
         now: u64,
         secure: bool,
-    ) -> String {
-        session_cookie(
-            &oidc_session_value(&self.oidc_key(), expiry, identity),
+    ) -> Result<String, Error> {
+        let id = oidc::random(16)?;
+        Ok(session_cookie(
+            &oidc_session_value(&self.oidc_key(), expiry, &id, identity),
             expiry.saturating_sub(now),
             secure,
-        )
+        ))
+    }
+
+    /// The longest a session of this mode lasts, in seconds.
+    fn session_ttl(&self) -> u64 {
+        match &self.oidc {
+            Some(o) => o.session_ttl,
+            None => SESSION_TTL.as_secs(),
+        }
+    }
+
+    fn is_revoked(&self, id: &str) -> bool {
+        self.revoked
+            .lock()
+            .expect("revocations lock poisoned")
+            .contains_key(id)
+    }
+
+    /// Remembers that session `id`, valid until `expiry`, was signed out,
+    /// and wakes the WebSockets opened with it.
+    fn revoke(&self, id: &str, expiry: u64) {
+        let now = now();
+        let mut revoked = self.revoked.lock().expect("revocations lock poisoned");
+        if revoked.len() >= MAX_REVOKED {
+            revoked.retain(|_, until| *until > now);
+        }
+        if revoked.len() >= MAX_REVOKED
+            && let Some(first) = revoked
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(id, _)| id.clone())
+        {
+            revoked.remove(&first);
+        }
+        revoked.insert(id.to_owned(), expiry);
+        drop(revoked);
+        self.revocations.send_modify(|n| *n += 1);
+    }
+
+    /// The identity, id and expiry of the current session cookie the
+    /// request carries, if any.
+    fn cookie_session(&self, headers: &HeaderMap) -> Option<(Identity, String, u64)> {
+        let now = now();
+        let ttl = self.session_ttl();
+        match self.mode {
+            AuthMode::Token => {
+                let key = self.token.as_ref()?.get();
+                cookies(headers, SESSION_COOKIE).find_map(|c| {
+                    let (expiry, id) = token_session(&key, c, now)?;
+                    let operator = Identity {
+                        user: None,
+                        role: Role::Operator,
+                    };
+                    (!self.is_revoked(&id)).then_some((operator, id, expiry))
+                })
+            }
+            AuthMode::Oidc => {
+                let key = self.oidc_key();
+                cookies(headers, SESSION_COOKIE).find_map(|c| {
+                    let s = oidc_session(&key, c, now, ttl)?;
+                    (!self.is_revoked(&s.1)).then_some(s)
+                })
+            }
+            AuthMode::None | AuthMode::Proxy => None,
+        }
+    }
+
+    fn session_end(self: &Arc<Self>, id: String, expiry: u64) -> SessionEnd {
+        SessionEnd {
+            at: Some(expiry),
+            revoked: Some(Revocable {
+                auth: self.clone(),
+                id,
+                changes: self.revocations.subscribe(),
+            }),
+        }
     }
 
     /// Re-reads every token file, each on its own: a failed read keeps that
@@ -415,7 +604,7 @@ impl Auth {
             Listener::Api => self.token.as_ref(),
         };
         if secret.is_some_and(|s| s.matches(token)) {
-            return Ok(Bearer::Valid(operator));
+            return Ok(Bearer::Valid(operator, SessionEnd::never()));
         }
         let oidc = match (listener, &self.oidc) {
             (Listener::Api, Some(o)) => o,
@@ -423,7 +612,7 @@ impl Auth {
         };
         let token = std::str::from_utf8(token).map_err(|_| Refused::UNAUTHORIZED)?;
         match oidc.bearer(token).await {
-            Ok(identity) => Ok(Bearer::Valid(identity)),
+            Ok((identity, exp)) => Ok(Bearer::Valid(identity, SessionEnd::at(exp))),
             Err(Failure::NoRole) => Err(Refused(StatusCode::FORBIDDEN, "no role")),
             Err(Failure::Token(why)) => {
                 tracing::debug!(?why, "bearer token refused");
@@ -442,10 +631,14 @@ impl Auth {
     /// `Ok(None)` lets the request through without an identity: the login
     /// and logout routes, and the session route of a client that is not
     /// signed in.
-    fn check(&self, req: &Request, bearer: Bearer) -> Result<Option<Identity>, Refused> {
+    fn check(
+        self: &Arc<Self>,
+        req: &Request,
+        bearer: Bearer,
+    ) -> Result<Option<(Identity, SessionEnd)>, Refused> {
         let headers = req.headers();
         let (bearer, bearer_identity) = match bearer {
-            Bearer::Valid(identity) => (true, Some(identity)),
+            Bearer::Valid(identity, end) => (true, Some((identity, end))),
             Bearer::Absent => (false, None),
         };
 
@@ -485,23 +678,14 @@ impl Auth {
             Some(identity) => Ok(identity),
             None if open => return Ok(None),
             None => match self.mode {
-                AuthMode::None => Ok(operator),
-                AuthMode::Token => {
-                    let token = self.token.as_ref().expect("token mode has a token");
-                    let key = token.get();
-                    if cookies(headers, SESSION_COOKIE).any(|c| session_valid(&key, c, now())) {
-                        Ok(operator)
-                    } else {
-                        Err(Refused::UNAUTHORIZED)
-                    }
-                }
-                AuthMode::Oidc => {
-                    let key = self.oidc_key();
-                    cookies(headers, SESSION_COOKIE)
-                        .find_map(|c| oidc_session(&key, c, now()))
-                        .ok_or(Refused::UNAUTHORIZED)
-                }
-                AuthMode::Proxy => self.proxy_identity(headers),
+                AuthMode::None => Ok((operator, SessionEnd::never())),
+                AuthMode::Token | AuthMode::Oidc => match self.cookie_session(headers) {
+                    Some((identity, id, expiry)) => Ok((identity, self.session_end(id, expiry))),
+                    None => Err(Refused::UNAUTHORIZED),
+                },
+                AuthMode::Proxy => self
+                    .proxy_identity(headers)
+                    .map(|i| (i, SessionEnd::never())),
             },
         };
         let identity = match identity {
@@ -509,7 +693,7 @@ impl Auth {
             Err(_) if path == SESSION_PATH => return Ok(None),
             Err(refused) => return Err(refused),
         };
-        if writes && identity.role == Role::Viewer {
+        if writes && identity.0.role == Role::Viewer {
             return Err(Refused(StatusCode::FORBIDDEN, "viewers may not write"));
         }
         Ok(Some(identity))
@@ -615,7 +799,8 @@ fn cookies<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Item = &'
         .filter_map(move |c| c.trim().strip_prefix(name)?.strip_prefix('='))
 }
 
-pub(crate) fn now() -> u64 {
+/// Seconds since the Unix epoch.
+pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")
@@ -636,17 +821,22 @@ fn session_value(token: &[u8], expiry: u64) -> String {
     format!("{expiry}.{hex}")
 }
 
+#[cfg(test)]
 fn session_valid(token: &[u8], value: &str, now: u64) -> bool {
-    let Some((expiry, hex)) = value.split_once('.') else {
-        return false;
-    };
-    let Some(expiry) = digits(expiry) else {
-        return false;
-    };
+    token_session(token, value, now).is_some()
+}
+
+/// The expiry and id of a current `token` mode session cookie; its tag is
+/// its id.
+fn token_session(token: &[u8], value: &str, now: u64) -> Option<(u64, String)> {
+    let (expiry, hex) = value.split_once('.')?;
+    let expiry = digits(expiry)?;
     if expiry <= now || expiry > now + SESSION_TTL.as_secs() {
-        return false;
+        return None;
     }
-    unhex(hex).is_some_and(|t| session_mac(token, expiry).verify_slice(&t).is_ok())
+    let tag = unhex(hex)?;
+    session_mac(token, expiry).verify_slice(&tag).ok()?;
+    Some((expiry, hex.to_owned()))
 }
 
 /// A decimal number of ASCII digits only, no sign.
@@ -690,26 +880,36 @@ fn tag_valid(key: &[u8], domain: &[u8], parts: &[&str], tag: &str) -> bool {
 
 const OIDC_SESSION: &[u8] = b"samplez-oidc-session:";
 
-/// `<expiry>.<role>.<user, base64url>.<tag>`.
-fn oidc_session_value(key: &[u8], expiry: u64, identity: &Identity) -> String {
+/// `<expiry>.<role>.<user, base64url>.<id>.<tag>`; `id` is base64url and
+/// names the session for its sign-out.
+fn oidc_session_value(key: &[u8], expiry: u64, id: &str, identity: &Identity) -> String {
     let role = match identity.role {
         Role::Operator => "operator",
         Role::Viewer => "viewer",
     };
     let user = oidc::encode_user(identity.user.as_deref().unwrap_or_default());
     let expiry = expiry.to_string();
-    let tag = hex(&signed(key, OIDC_SESSION, &[&expiry, role, &user]));
-    format!("{expiry}.{role}.{user}.{tag}")
+    let tag = hex(&signed(key, OIDC_SESSION, &[&expiry, role, &user, id]));
+    format!("{expiry}.{role}.{user}.{id}.{tag}")
 }
 
-fn oidc_session(key: &[u8], value: &str, now: u64) -> Option<Identity> {
+/// The identity, id and expiry of a current `oidc` mode session cookie
+/// no longer than `ttl` seconds from `now`.
+fn oidc_session(key: &[u8], value: &str, now: u64, ttl: u64) -> Option<(Identity, String, u64)> {
     let mut parts = value.split('.');
-    let (expiry, role, user, tag) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let (expiry, role, user, id, tag) = (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    );
     let at = digits(expiry)?;
     if parts.next().is_some()
         || at <= now
-        || at > now + SESSION_TTL.as_secs()
-        || !tag_valid(key, OIDC_SESSION, &[expiry, role, user], tag)
+        || at > now + ttl
+        || id.is_empty()
+        || !tag_valid(key, OIDC_SESSION, &[expiry, role, user, id], tag)
     {
         return None;
     }
@@ -718,10 +918,11 @@ fn oidc_session(key: &[u8], value: &str, now: u64) -> Option<Identity> {
         "viewer" => Role::Viewer,
         _ => return None,
     };
-    Some(Identity {
+    let identity = Identity {
         user: Some(oidc::decode_user(user)?),
         role,
-    })
+    };
+    Some((identity, id.to_owned(), at))
 }
 
 fn session_cookie(value: &str, max_age: u64, secure: bool) -> String {
@@ -754,8 +955,9 @@ pub(crate) async fn middleware(
     };
     match checked {
         Ok(identity) => {
-            if let Some(identity) = identity {
+            if let Some((identity, end)) = identity {
                 req.extensions_mut().insert(identity);
+                req.extensions_mut().insert(end);
             }
             next.run(req).await
         }
@@ -830,7 +1032,9 @@ pub struct Logout {
     pub redirect: Option<String>,
 }
 
-/// Clears the session cookie; `token` and `oidc` mode.
+/// Clears the session cookie and ends the session on this process, for
+/// any copy of the cookie and the WebSockets opened with it; `token` and
+/// `oidc` mode.
 #[utoipa::path(
     post,
     path = "/logout",
@@ -843,6 +1047,11 @@ pub struct Logout {
     )
 )]
 pub(crate) async fn logout(State(auth): State<Arc<Auth>>, headers: HeaderMap) -> Response {
+    // The cookie is cleared in the browser; a copy of it, and the
+    // WebSockets opened with it, end here too.
+    if let Some((_, id, expiry)) = auth.cookie_session(&headers) {
+        auth.revoke(&id, expiry);
+    }
     let redirect = match &auth.oidc {
         Some(o) => o.end_session().await,
         None => None,
@@ -915,24 +1124,119 @@ mod tests {
     #[test]
     fn an_oidc_session_carries_user_and_role_and_follows_the_key() {
         let t = 1_000_000;
+        let ttl = 3600;
         let alice = Identity {
             user: Some("alice.o'neil@example".into()),
             role: Role::Viewer,
         };
-        let v = oidc_session_value(b"key", t + 60, &alice);
-        assert_eq!(oidc_session(b"key", &v, t), Some(alice.clone()));
-        assert_eq!(oidc_session(b"key", &v, t + 60), None, "expired");
-        assert_eq!(oidc_session(b"other", &v, t), None, "another key");
-        let promoted = v.replacen(".viewer.", ".operator.", 1);
+        let v = oidc_session_value(b"key", t + 60, "sid1", &alice);
+        let got = |v: &str, key: &[u8], at: u64| oidc_session(key, v, at, ttl).map(|s| s.0);
         assert_eq!(
-            oidc_session(b"key", &promoted, t),
-            None,
-            "the role is signed"
+            oidc_session(b"key", &v, t, ttl),
+            Some((alice.clone(), "sid1".to_owned(), t + 60))
         );
-        let far = oidc_session_value(b"key", t + SESSION_TTL.as_secs() + 1, &alice);
-        assert_eq!(oidc_session(b"key", &far, t), None);
-        assert_eq!(oidc_session(b"key", &format!("{v}.x"), t), None);
-        assert_eq!(oidc_session(b"key", "", t), None);
+        assert_eq!(got(&v, b"key", t + 60), None, "expired");
+        assert_eq!(got(&v, b"other", t), None, "another key");
+        let promoted = v.replacen(".viewer.", ".operator.", 1);
+        assert_eq!(got(&promoted, b"key", t), None, "the role is signed");
+        let other_id = v.replacen(".sid1.", ".sid2.", 1);
+        assert_eq!(got(&other_id, b"key", t), None, "the id is signed");
+        let far = oidc_session_value(b"key", t + ttl + 1, "sid1", &alice);
+        assert_eq!(
+            got(&far, b"key", t),
+            None,
+            "longer than the session lifetime"
+        );
+        assert_eq!(got(&format!("{v}.x"), b"key", t), None);
+        assert_eq!(got("", b"key", t), None);
+    }
+
+    fn oidc_auth() -> Arc<Auth> {
+        let config: ServiceConfig = serde_json::from_value(serde_json::json!({
+            "auth": { "mode": "oidc", "oidc": {
+                "issuerUrl": "https://idp.example/realms/r", "clientId": "c",
+                "publicUrl": "https://faderz.example", "operatorRole": "op",
+            } }
+        }))
+        .unwrap();
+        Arc::new(Auth::new(&config, &Metrics::default()).unwrap())
+    }
+
+    /// A sign-out ends the session for every copy of its cookie and wakes
+    /// the WebSockets opened with it; another session goes on.
+    #[tokio::test]
+    async fn a_sign_out_revokes_the_session_and_ends_its_websockets() {
+        let auth = oidc_auth();
+        let identity = Identity {
+            user: Some("alice".into()),
+            role: Role::Operator,
+        };
+        let now = now();
+        let cookie = |c: String| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::COOKIE,
+                c.split(';').next().unwrap().parse().unwrap(),
+            );
+            h
+        };
+        let mine = cookie(
+            auth.oidc_session_cookie(&identity, now + 600, now, true)
+                .unwrap(),
+        );
+        let other = cookie(
+            auth.oidc_session_cookie(&identity, now + 600, now, true)
+                .unwrap(),
+        );
+        let (_, id, expiry) = auth.cookie_session(&mine).unwrap();
+        assert_eq!(expiry, now + 600);
+        let end = auth.session_end(id.clone(), expiry);
+        let (_, other_id, _) = auth.cookie_session(&other).unwrap();
+        let other_end = auth.session_end(other_id, expiry);
+        let waiting = tokio::spawn({
+            let end = end.clone();
+            async move { end.ended().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        auth.revoke(&id, expiry);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the WebSocket's session ended")
+            .unwrap();
+        assert!(
+            auth.cookie_session(&mine).is_none(),
+            "a copy of the cookie is refused"
+        );
+        assert!(auth.cookie_session(&other).is_some());
+        let other_waits = tokio::time::timeout(Duration::from_millis(50), other_end.ended()).await;
+        assert!(other_waits.is_err(), "another session goes on");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_ends_at_its_expiry() {
+        let end = SessionEnd::at(now() + 30);
+        let started = tokio::time::Instant::now();
+        end.ended().await;
+        assert!(started.elapsed() >= Duration::from_secs(29));
+        let never = SessionEnd::never();
+        let waited = tokio::time::timeout(Duration::from_secs(86_400), never.ended()).await;
+        assert!(waited.is_err());
+    }
+
+    #[test]
+    fn revocations_are_bounded() {
+        let auth = oidc_auth();
+        let far = now() + 3600;
+        for i in 0..MAX_REVOKED {
+            auth.revoke(&format!("s{i}"), far + i as u64);
+        }
+        auth.revoke("last", far + MAX_REVOKED as u64);
+        let revoked = auth.revoked.lock().unwrap();
+        assert_eq!(revoked.len(), MAX_REVOKED);
+        assert!(!revoked.contains_key("s0"), "the one ending first goes");
+        assert!(revoked.contains_key("last") && revoked.contains_key("s1"));
     }
 
     #[test]

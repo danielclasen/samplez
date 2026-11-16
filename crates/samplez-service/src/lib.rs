@@ -23,7 +23,7 @@ pub mod server;
 pub mod tls;
 pub mod ws;
 
-pub use auth::{Identity, Role};
+pub use auth::{Identity, Role, SessionEnd};
 pub use config::ServiceConfig;
 pub use metrics::{Counter, Gauge, Histogram, Metrics};
 pub use ops::{Heartbeat, Ops};

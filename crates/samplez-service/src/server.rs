@@ -18,7 +18,7 @@ use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::auth::{self, Auth, Identity, Listener, Role};
+use crate::auth::{self, Auth, Identity, Listener, Role, SessionEnd};
 use crate::config::{AuthMode, ServiceConfig};
 use crate::oidc;
 use crate::ops::Ops;
@@ -54,6 +54,9 @@ pub struct Connect {
     /// Where [`crate::ws::serve_client`] keeps the connection while it
     /// answers pings.
     pub sessions: Arc<Sessions>,
+    /// When the credentials of the upgrade end; [`crate::ws::serve_client`]
+    /// closes the connection then.
+    pub ends: SessionEnd,
 }
 
 /// Returned by [`Connect::require_operator`].
@@ -287,6 +290,7 @@ impl Service {
                 get(
                     move |upgrade: WebSocketUpgrade,
                           Extension(identity): Extension<Identity>,
+                          ends: Option<Extension<SessionEnd>>,
                           Query(query): Query<WsQuery>| {
                         let handler = handler.clone();
                         let sessions = sessions.clone();
@@ -312,6 +316,7 @@ impl Service {
                                 identity,
                                 owner,
                                 sessions,
+                                ends: ends.map(|Extension(e)| e).unwrap_or_default(),
                             };
                             upgrade.on_upgrade(move |socket| handler(socket, connect))
                         }

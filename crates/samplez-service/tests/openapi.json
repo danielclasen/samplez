@@ -182,7 +182,7 @@
         "security": [
           {}
         ],
-        "summary": "Clears the session cookie; `token` and `oidc` mode.",
+        "summary": "Clears the session cookie and ends the session on this process, for\nany copy of the cookie and the WebSockets opened with it; `token` and\n`oidc` mode.",
         "tags": [
           "auth"
         ]
