@@ -471,7 +471,7 @@ fn attach_refuses_flows_that_do_not_fit() {
     assert!(
         refused
             .to_string()
-            .contains("history_duration of at least 406 ms"),
+            .contains("history_duration of at least 203 ms"),
         "{refused}"
     );
     assert!(!g.has_inputs());

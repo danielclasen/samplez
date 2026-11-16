@@ -72,9 +72,10 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "a resync replay needs {required} samples of history: the flow needs a \
-                 history_duration of at least {} ms, its ring of {buffer_length} samples \
-                 offers half of it",
-                (2 * required * 1000).div_ceil(SAMPLE_RATE as u64)
+                 history_duration of at least {} ms (the readable half of its ring), its \
+                 ring of {buffer_length} samples offers {}",
+                (required * 1000).div_ceil(SAMPLE_RATE as u64),
+                buffer_length / 2
             ),
             Error::Block {
                 block,
