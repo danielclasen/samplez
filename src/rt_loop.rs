@@ -999,6 +999,9 @@ pub(crate) struct Rt {
     /// The highest log id a handed-over core knew: an entry up to it
     /// taken from the ring later is pending or applied already.
     pub skip_upto: LogId,
+    /// The first sample index the last handed-over core computed: an
+    /// entry the core knew at or past it was on the core's pending list.
+    pub install_at: u64,
     /// A replay clone: computes off the RT thread from past input, writes
     /// nothing and hashes every page it computes whole.
     pub replay: bool,
@@ -1511,14 +1514,16 @@ impl Rt {
             if self.mix.holds(entry.id) {
                 continue;
             }
-            if entry.id <= self.skip_upto && !entry.change.in_core() {
-                // The core knew it but holds only part of what it did:
-                // applied as on time if its index passed.
-                if entry.at_index < self.mix.pos.unwrap_or(0) {
+            if entry.id <= self.skip_upto {
+                // The core knew it. It holds what a gain change or an
+                // InputDown did; any other entry below the install it
+                // applied without what it did reaching this thread, so
+                // that entry is applied as on time. One at or past the
+                // install was on the core's pending list, applied here at
+                // its index.
+                if !entry.change.in_core() && entry.at_index < self.install_at {
                     self.apply(entry);
-                    continue;
                 }
-            } else if entry.id <= self.skip_upto {
                 continue;
             }
             let _ = self.mix.push(entry);
@@ -2226,6 +2231,7 @@ impl Rt {
             r.late_lost_until = c.late_lost_until;
         }
         self.skip_upto = self.skip_upto.max(last_id);
+        self.install_at = next;
         for n in 0..self.mix.due.len() {
             let (e, _) = self.mix.due[n];
             self.apply(e);
