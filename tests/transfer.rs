@@ -577,3 +577,45 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
     assert_eq!(c.command_late.load(Relaxed), late);
     h.e.stop();
 }
+
+/// A product state's pending entry whose index the install block passed
+/// is folded into the targets: left pending it would be reported late
+/// and never apply.
+#[test]
+fn a_product_entry_the_install_passed_is_folded_in() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    h.e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 5
+    });
+    // Due in a block computed already when the state is built.
+    let at = (processed(&h.e) - 1) * B;
+    let state = ProductState {
+        gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        pending: vec![(
+            1,
+            at,
+            Entry::Gain {
+                input: 0,
+                output: 0,
+                gain: 0.5,
+            },
+        )],
+        last_id: 1,
+    };
+    let late = c.command_late.load(Relaxed);
+    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    assert!(j * B >= at, "installed after block {j}");
+    wait_for(Duration::from_secs(5), "computing", || {
+        processed(&h.e) > j + 5
+    });
+    let core = common::copy_core(&h.e).core;
+    assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.5, 1.0));
+    assert_eq!(c.command_late.load(Relaxed), late);
+    h.e.stop();
+}

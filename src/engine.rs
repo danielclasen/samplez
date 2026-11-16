@@ -1820,21 +1820,43 @@ impl Engine {
         if pending.len() > PENDING_CHANGES {
             return Err(ReplayError::Full);
         }
-        let pending_gen = self.status().generation.pending;
         self.offer(timeout, |j, core| {
             for (i, row) in state.gains.iter().enumerate() {
                 for (o, &g) in row.iter().enumerate() {
                     let _ = core.matrix.set(i, o, g, 0);
                 }
             }
-            core.pos = Some((j + 1) * self.block);
+            // The entries whose index the install passed are folded in
+            // like the rest of the state: reported late they would never
+            // apply.
+            let next = (j + 1) * self.block;
+            let passed = pending.partition_point(|e| e.at_index < next);
+            let mut up = state.up.clone();
+            for e in &pending[..passed] {
+                match e.change {
+                    Change::Gain {
+                        input,
+                        output,
+                        gain,
+                    } => {
+                        let _ = core.matrix.set(input, output, gain, 0);
+                    }
+                    Change::InputDown { slot } => up[slot] = false,
+                    Change::InputUp { slot } => up[slot] = true,
+                    // The RT thread swaps in a passed re-route's
+                    // generation at the install, and applied a passed
+                    // strip entry to the strip it keeps.
+                    Change::Route { .. } | Change::Strip { .. } => {}
+                }
+            }
+            core.pos = Some(next);
             core.ramp_end = 0;
             core.pending.clear();
-            core.pending.extend_from_slice(&pending);
+            core.pending.extend_from_slice(&pending[passed..]);
             core.page_entries.clear();
             core.entries_page = None;
             core.entries_lost = false;
-            for (c, &up) in core.slots.iter_mut().zip(&state.up) {
+            for (c, &up) in core.slots.iter_mut().zip(&up) {
                 *c = SlotCore {
                     up,
                     held: false,
@@ -1844,7 +1866,9 @@ impl Engine {
                 };
             }
             core.awaiting_gen.clear();
-            core.pending_gen = pending_gen;
+            // Read at each attempt: a new pending generation refuses a
+            // core naming the one before.
+            core.pending_gen = self.status().generation.pending;
             core.unresolved.clear();
             core.late_routes.clear();
             core.late_lost_until = 0;
