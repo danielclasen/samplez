@@ -90,11 +90,14 @@ fn committing(v: &Voter) -> bool {
     !v.silent && state(v) == Some(ReplicaState::Committing)
 }
 
-/// Whether `own` commits a block at or after P.
+/// Whether `own` commits a block at or after P; a fill (no digest),
+/// committed through while withdrawn, is no commit start.
 fn commits_from(own: &Own, p: u64, block: u64) -> bool {
     own.state == Some(ReplicaState::Committing)
         || own.statuses.iter().flatten().any(|run| {
-            run.status.kind == Kind::Committed && (run.status.k + u64::from(run.count)) * block > p
+            run.status.kind == Kind::Committed
+                && run.status.digest.is_some()
+                && (run.status.k + u64::from(run.count)) * block > p
         })
 }
 
@@ -831,5 +834,37 @@ mod tests {
         leader.judged.entry(0).or_default().insert(q);
         leader.against = Some((a(1), Some(Baseline { at_index: 1, ..b })));
         assert_eq!(named(&f.decide(&mut leader)), None);
+    }
+
+    /// A named replica that only fills a stop after P does not hold its
+    /// start bound open: a fill is no commit start, so the bound lapses
+    /// and the leader names again.
+    #[tokio::test(start_paused = true)]
+    async fn a_named_replica_filling_after_p_lets_its_start_bound_lapse() {
+        let k = 1_000_000;
+        let p = (k * B + 10 * B).next_multiple_of(PAGE);
+        let b = Baseline {
+            replica: a(0),
+            order: Vec::new(),
+            at_index: p - 1,
+        };
+        let bound = p + PAGE + index_at(18_000_000) + index_at(7_000_000);
+        let past = bound / B + 1;
+        let mut filler = own(ReplicaState::Withdrawn, past);
+        filler.statuses[0] = runs([Some(BlockStatus {
+            through: true,
+            ..status(past - 5, Kind::Committed, Cause::None, None)
+        })]);
+        filler.baseline = Some((b.replica, b.at_index));
+        let mut f = Fixture::new(vec![
+            (a(0), false, filler),
+            (a(1), false, own(ReplicaState::Withdrawn, past)),
+        ]);
+        f.baseline = Some(b);
+        assert_eq!(
+            named(&f.decide(&mut Leader::default())),
+            Some(a(0)),
+            "named again, filling first"
+        );
     }
 }
