@@ -263,7 +263,14 @@ pub struct Strip {
     eq: [Svf<MAX_LEGS>; EQ_BANDS],
     gate: Gate,
     comp: Comp,
+    /// The order of the chain running: `eq` states, `gate` and `comp`.
     dynamics_before_eq: bool,
+    /// While the order flips, the weight of the other order's chain:
+    /// `alt_eq` states, `alt_gate` and `alt_comp`.
+    fade: Ramp,
+    alt_eq: [[[f32; 2]; MAX_LEGS]; EQ_BANDS],
+    alt_gate: Gate,
+    alt_comp: Comp,
 }
 
 impl Strip {
@@ -293,6 +300,10 @@ impl Strip {
             gate: Gate::new(),
             comp: Comp::new(),
             dynamics_before_eq: false,
+            fade: Ramp::new(0.0),
+            alt_eq: [[[0.0; 2]; MAX_LEGS]; EQ_BANDS],
+            alt_gate: Gate::new(),
+            alt_comp: Comp::new(),
         };
         // The sections off, holding the g and k of their shapes.
         s.hpf.set(Shape::HighPass { freq: 80.0 }, false, 0);
@@ -344,9 +355,15 @@ impl Strip {
                 self.bands[band] = value;
                 self.retarget_band(band);
             }
-            StripParam::Gate(g) => self.gate.set(&g, self.ramp),
-            StripParam::Comp(c) => self.comp.set(&c, self.ramp),
-            StripParam::DynamicsBeforeEq { enabled } => self.dynamics_before_eq = enabled,
+            StripParam::Gate(g) => {
+                self.gate.set(&g, self.ramp);
+                self.alt_gate.set(&g, self.ramp);
+            }
+            StripParam::Comp(c) => {
+                self.comp.set(&c, self.ramp);
+                self.alt_comp.set(&c, self.ramp);
+            }
+            StripParam::DynamicsBeforeEq { enabled } => self.set_order(enabled),
         }
         true
     }
@@ -379,6 +396,14 @@ impl Strip {
             }
         }
         self.hpf.process(buf, self.legs, frames);
+        if self.is_fading() {
+            self.process_fading(buf, frames);
+        } else {
+            self.process_dynamics_and_eq(buf, frames);
+        }
+    }
+
+    fn process_dynamics_and_eq(&mut self, buf: &mut [f32], frames: usize) {
         if self.dynamics_before_eq {
             self.gate.process(buf, self.legs, frames);
             self.comp.process(buf, self.legs, frames);
@@ -392,9 +417,106 @@ impl Strip {
         }
     }
 
+    /// Runs the dynamics before the equaliser or after it. A flip runs
+    /// both orders over the ramp length and crossfades from the one to
+    /// the other: switching outright would play the equaliser state built
+    /// on the other order's signal, a full-scale burst behind a closed
+    /// gate or a compressor deep in reduction. The new order starts with
+    /// the equaliser state at zero and the dynamics as they are. Flipping
+    /// back during the crossfade fades back.
+    fn set_order(&mut self, before: bool) {
+        let other = before != self.dynamics_before_eq;
+        if self.ramp == 0 {
+            self.dynamics_before_eq = before;
+            self.fade = Ramp::new(0.0);
+            return;
+        }
+        if other && !self.is_fading() {
+            self.alt_eq = [[[0.0; 2]; MAX_LEGS]; EQ_BANDS];
+            self.alt_gate = self.gate;
+            self.alt_comp = self.comp;
+        }
+        let _ = self
+            .fade
+            .set_target(if other { 1.0 } else { 0.0 }, self.ramp);
+    }
+
+    fn is_fading(&self) -> bool {
+        self.fade.is_active() || self.fade.target() != 0.0
+    }
+
+    /// Once a crossfade is over, the order faded to becomes the one
+    /// running.
+    fn end_fade(&mut self) {
+        if self.fade.is_active() {
+            return;
+        }
+        if self.fade.target() == 1.0 {
+            for (eq, state) in self.eq.iter_mut().zip(&self.alt_eq) {
+                eq.state = *state;
+            }
+            self.gate = self.alt_gate;
+            self.comp = self.alt_comp;
+            self.dynamics_before_eq = !self.dynamics_before_eq;
+        }
+        self.fade = Ramp::new(0.0);
+    }
+
+    /// The dynamics and the equaliser in both orders, mixed by the fade,
+    /// in chunks through scratch on the stack. A chunk ends where the
+    /// crossfade does, so the samples after it run one order alone
+    /// whatever the block size.
+    fn process_fading(&mut self, buf: &mut [f32], frames: usize) {
+        const CHUNK: usize = 64;
+        let legs = self.legs;
+        let mut scratch_a = [0.0f32; MAX_LEGS * CHUNK];
+        let mut scratch_b = [0.0f32; MAX_LEGS * CHUNK];
+        let mut at = 0;
+        while at < frames {
+            let fading = self.is_fading();
+            let mut n = (frames - at).min(CHUNK);
+            if self.fade.is_active() {
+                n = n.min((self.fade.len - self.fade.pos) as usize);
+            }
+            let a = &mut scratch_a[..legs * n];
+            for (leg, x) in a.chunks_exact_mut(n).enumerate() {
+                x.copy_from_slice(&buf[leg * frames + at..][..n]);
+            }
+            if fading {
+                let b = &mut scratch_b[..legs * n];
+                b.copy_from_slice(a);
+                let mut states = core::array::from_fn(|i| self.eq[i].state);
+                let order = self.dynamics_before_eq;
+                let units = (&mut self.gate, &mut self.comp);
+                run_chain(&self.eq, &mut states, units, order, a, legs, n);
+                let units = (&mut self.alt_gate, &mut self.alt_comp);
+                run_chain(&self.eq, &mut self.alt_eq, units, !order, b, legs, n);
+                for (eq, state) in self.eq.iter_mut().zip(states) {
+                    eq.state = state;
+                    eq.advance(n);
+                }
+                for (i, (x, y)) in a.iter_mut().zip(b.iter()).enumerate() {
+                    let w = self.fade.value_at(self.fade.pos + (i % n) as u32);
+                    *x += w * (*y - *x);
+                }
+                self.fade.advance(n);
+                self.end_fade();
+            } else {
+                self.process_dynamics_and_eq(a, n);
+            }
+            for (leg, x) in a.chunks_exact(n).enumerate() {
+                buf[leg * frames + at..][..n].copy_from_slice(x);
+            }
+            at += n;
+        }
+    }
+
     /// Moves every ramp `frames` samples on without processing, for
     /// samples the engine does not compute: a parameter's value depends
-    /// on the sample index and the changes alone.
+    /// on the sample index and the changes alone. What follows the signal
+    /// stays as it is: filter states, the smoothed gains of gate and
+    /// compressor and the gate's hold. A crossfade between the dynamics
+    /// orders that ends within `frames` ends here as it would processing.
     pub fn advance(&mut self, frames: usize) {
         for g in &mut self.gain[..self.legs] {
             g.advance(frames);
@@ -405,6 +527,36 @@ impl Strip {
         }
         self.gate.advance(frames);
         self.comp.advance(frames);
+        if self.is_fading() {
+            self.alt_gate.advance(frames);
+            self.alt_comp.advance(frames);
+            self.fade.advance(frames);
+            self.end_fade();
+        }
+    }
+}
+
+/// Gate and compressor, then the equaliser on `states`, or the other way
+/// round; the equaliser's ramps do not move.
+fn run_chain(
+    eq: &[Svf<MAX_LEGS>; EQ_BANDS],
+    states: &mut [[[f32; 2]; MAX_LEGS]; EQ_BANDS],
+    (gate, comp): (&mut Gate, &mut Comp),
+    dynamics_first: bool,
+    buf: &mut [f32],
+    legs: usize,
+    frames: usize,
+) {
+    if dynamics_first {
+        gate.process(buf, legs, frames);
+        comp.process(buf, legs, frames);
+    }
+    for (f, state) in eq.iter().zip(states) {
+        f.filter(state, buf, legs, frames);
+    }
+    if !dynamics_first {
+        gate.process(buf, legs, frames);
+        comp.process(buf, legs, frames);
     }
 }
 
@@ -431,6 +583,121 @@ mod tests {
         knee_db: 6.0,
         makeup_db: 4.0,
     };
+
+    /// The peak of `frames` samples of a 100 Hz sine at `level` from
+    /// sample `from` on, through `s`.
+    fn sine_peak(s: &mut Strip, level: f32, from: usize, frames: usize) -> f32 {
+        let w = 2.0 * core::f64::consts::PI * 100.0 / 48_000.0;
+        let mut peak = 0.0f32;
+        for start in (from..from + frames).step_by(48) {
+            let mut b: Vec<f32> = (start..start + 48)
+                .map(|n| level * (w * n as f64).sin() as f32)
+                .collect();
+            s.process(&mut b, 48);
+            peak = b.iter().fold(peak, |p, v| p.max(v.abs()));
+        }
+        peak
+    }
+
+    /// Flipping the order crossfades: through the flip the output peaks
+    /// within 0.5 dB of the louder of the two orders settled, with the
+    /// compressor deep in reduction or the gate closed, where switching
+    /// outright played the equaliser state built on the other order's
+    /// signal, up to 39 dB louder.
+    #[test]
+    fn flipping_the_order_crossfades() {
+        let bell = StripParam::EqBand {
+            band: 1,
+            value: band(BandType::Peak, 100.0, 12.0, 2.0),
+        };
+        let comp = StripParam::Comp(CompParams {
+            enabled: true,
+            threshold_db: -40.0,
+            ratio: 20.0,
+            attack_ms: 1.0,
+            release_ms: 100.0,
+            knee_db: 0.0,
+            makeup_db: 0.0,
+        });
+        let gate = StripParam::Gate(GateParams {
+            enabled: true,
+            threshold_db: -6.0,
+            range_db: 80.0,
+            attack_ms: 1.0,
+            release_ms: 50.0,
+        });
+        let second = 48_000;
+        for (unit, level) in [(comp, 0.5), (gate, 0.1)] {
+            for before in [false, true] {
+                let order = |enabled| {
+                    let mut s = strip_with(
+                        1,
+                        &[
+                            StripParam::Eq { enabled: true },
+                            bell,
+                            unit,
+                            StripParam::DynamicsBeforeEq { enabled },
+                        ],
+                    );
+                    sine_peak(&mut s, level, 0, second);
+                    s
+                };
+                let settled = |enabled| sine_peak(&mut order(enabled), level, second, second);
+                let louder = settled(before).max(settled(!before));
+                let mut s = order(before);
+                assert!(s.set(StripParam::DynamicsBeforeEq { enabled: !before }));
+                let peak = sine_peak(&mut s, level, second, second);
+                let over = 20.0 * (peak / louder).log10();
+                assert!(
+                    over <= 0.5,
+                    "{unit:?} before eq {before} -> {}: {peak} through the flip, {louder} settled ({over:+.1} dB)",
+                    !before
+                );
+            }
+        }
+    }
+
+    /// A crossfade between the orders gives the same bits whatever the
+    /// block sizes, also where a block spans its end.
+    #[test]
+    fn a_crossfade_ignores_block_sizes() {
+        let frames = 1920;
+        let input: Vec<f32> = (0..2 * frames)
+            .map(|n| ((n * 7919) % 1013) as f32 / 1013.0 - 0.5)
+            .collect();
+        let run = |sizes: &[usize]| {
+            let mut s = strip_with(
+                2,
+                &[
+                    StripParam::Eq { enabled: true },
+                    StripParam::EqBand {
+                        band: 1,
+                        value: band(BandType::Peak, 300.0, 12.0, 2.0),
+                    },
+                    StripParam::Comp(COMP),
+                    StripParam::Gate(GATE),
+                ],
+            );
+            assert!(s.set(StripParam::DynamicsBeforeEq { enabled: true }));
+            let mut out = vec![0.0f32; 2 * frames];
+            let mut at = 0;
+            let mut sizes = sizes.iter().cycle();
+            while at < frames {
+                let b = (*sizes.next().unwrap()).min(frames - at);
+                let mut buf = [&input[at..at + b], &input[frames + at..frames + at + b]].concat();
+                s.process(&mut buf, b);
+                out[at..at + b].copy_from_slice(&buf[..b]);
+                out[frames + at..frames + at + b].copy_from_slice(&buf[b..]);
+                at += b;
+            }
+            out
+        };
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        let whole = bits(&run(&[48]));
+        for sizes in [&[100usize][..], &[7, 41], &[1920]] {
+            assert_eq!(bits(&run(sizes)), whole, "blocks of {sizes:?}");
+        }
+    }
 
     /// The dynamics run before or after the equaliser as switched: the
     /// strip's output is the bits of its units run in that order.
@@ -1014,6 +1281,14 @@ mod tests {
                 band: 3,
                 value: band(BandType::HighShelf, 6000.0, 6.0, 0.7),
             },
+            // Switched off, with a makeup ramp running.
+            StripParam::Comp(CompParams {
+                enabled: false,
+                makeup_db: 12.0,
+                ..COMP
+            }),
+            // Flipped by a crossfade that ends within the samples.
+            StripParam::DynamicsBeforeEq { enabled: true },
         ];
         let mut a = Strip::new(1, RAMP);
         let mut b = Strip::new(1, RAMP);

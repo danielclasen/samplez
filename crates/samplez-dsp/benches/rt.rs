@@ -146,8 +146,8 @@ const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
 const METERS_SCALAR: u64 = 1_118_000;
 const METERS_AVX2: u64 = 303_000;
-const STRIPS_RAMPING: u64 = 1_850_000;
-const STRIPS_SETTLED: u64 = 1_367_000;
+const STRIPS_RAMPING: u64 = 1_757_000;
+const STRIPS_SETTLED: u64 = 1_250_000;
 
 library_benchmark_group!(name = block, benchmarks = [matrix, meters, strip]);
 
