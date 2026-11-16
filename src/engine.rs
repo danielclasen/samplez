@@ -4378,7 +4378,12 @@ mod tests {
         let mut log = e.log.lock().unwrap();
         let entry = RtEntry {
             id: log.last + 1,
-            at_index: earliest(&e.api, &e.counters, e.margin, e.lead).next_multiple_of(e.block),
+            // A few blocks past the earliest index: set_strip below
+            // checks the same index against a clock that has moved on,
+            // and one block passing in between would refuse it as too
+            // near.
+            at_index: (earliest(&e.api, &e.counters, e.margin, e.lead) + 4 * e.block)
+                .next_multiple_of(e.block),
             change: Change::Strip {
                 slot: 0,
                 param: refused,
