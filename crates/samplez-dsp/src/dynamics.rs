@@ -259,6 +259,12 @@ impl Gate {
     pub(crate) fn advance(&mut self, frames: usize) {
         self.wet.0.advance(frames);
     }
+
+    /// Whether the gate passes every input unchanged until it is set
+    /// again: off, or a range of 0 dB with the smoothed gain at 0 dB.
+    pub(crate) fn is_identity(&self) -> bool {
+        self.wet.is_off() || (self.range_db == 0.0 && self.y == 0.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -354,6 +360,17 @@ impl Comp {
     pub(crate) fn advance(&mut self, frames: usize) {
         self.wet.0.advance(frames);
         self.makeup.advance(frames);
+    }
+
+    /// Whether the compressor passes every input unchanged until it is
+    /// set again: off, or a ratio of 1 with the smoothed gain at 0 dB and
+    /// the makeup at rest at 0 dB.
+    pub(crate) fn is_identity(&self) -> bool {
+        self.wet.is_off()
+            || (self.slope == 0.0
+                && self.y == 0.0
+                && !self.makeup.is_active()
+                && self.makeup.target() == 1.0)
     }
 }
 
