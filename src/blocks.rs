@@ -751,9 +751,10 @@ impl Hold {
     /// only, from the next page boundary on. Blocks in the ring that a
     /// withdrawn replica cannot fill are withheld at once. One replica
     /// is never withdrawn.
-    /// A pending commit start or stop lapses unless the replica is
-    /// withdrawn already: there every block is a fill, and a fill withheld
-    /// while another replica commits leaves the commit start in place.
+    /// A pending stop lapses: it applies only to a committing output. A
+    /// pending commit start lapses unless the replica is withdrawn
+    /// already: there every block is a fill, and a fill withheld while
+    /// another replica commits leaves the commit start in place.
     pub fn withdraw(&mut self, statuses: &Statuses, changes: &mut Changes) {
         // One replica has no member to leave a block to: it goes on
         // committing after a block it withheld, from any index.
@@ -762,8 +763,8 @@ impl Hold {
         }
         if self.mode != Mode::Withdrawn {
             self.start_from = None;
-            self.stop_at = None;
         }
+        self.stop_at = None;
         if self.mode == Mode::Idle {
             return;
         }
@@ -2561,6 +2562,38 @@ mod tests {
                 since: K0 + CAP as u64
             }
         );
+    }
+
+    /// A stop named while the replica is withdrawn lapses on its next
+    /// withdrawal: the commit start named after it takes, and the output
+    /// commits from it rather than stopping in the same block.
+    #[test]
+    fn a_stop_named_while_withdrawn_lapses_before_the_next_commit_start() {
+        let p = K0 * B + PAGE;
+        let kp = p / B;
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        t.withdraw();
+        t.hold.stop_at(K0 * B + 1);
+        let fill = (K0 * B).next_multiple_of(PAGE) / B + 1;
+        for j in K0 + 1..=fill {
+            t.compute(j, DEGRADED);
+        }
+        assert_eq!(
+            t.statuses
+                .withhold(fill, Cause::OtherDigest)
+                .map(|s| s.kind),
+            Some(Kind::Withheld)
+        );
+        t.advance();
+        t.withdraw();
+        t.hold.commit_from(kp);
+        for j in fill + 1..=kp {
+            t.compute(j, Some(HEALTHY));
+        }
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: p });
+        let st = t.statuses.get(kp).unwrap();
+        assert_eq!((st.kind, st.range), (Kind::Committed, Range::From(p)));
     }
 
     /// A status holds a rank up to [`MAX_RANK`] beside a split offset up
