@@ -1343,8 +1343,9 @@ mod tests {
     }
 
     /// Ramps advanced over samples not processed land where processing
-    /// them would have: silence leaves the filter states at zero, so the
-    /// two strips are equal.
+    /// them would have, the crossfade between the dynamics orders and
+    /// the units it runs included: silence leaves the filter states at
+    /// zero and the compressor at 0 dB, so the two strips are equal.
     #[test]
     fn advance_moves_every_ramp() {
         let params = [
@@ -1358,13 +1359,12 @@ mod tests {
                 band: 3,
                 value: band(BandType::HighShelf, 6000.0, 6.0, 0.7),
             },
-            // Switched off, with a makeup ramp running.
+            // Switched on, with a makeup ramp running.
             StripParam::Comp(CompParams {
-                enabled: false,
                 makeup_db: 12.0,
                 ..COMP
             }),
-            // Flipped at once, gate and compressor being off.
+            // Crossfading, the compressor being on.
             StripParam::DynamicsBeforeEq { enabled: true },
         ];
         let mut a = Strip::new(1, RAMP);
@@ -1372,6 +1372,7 @@ mod tests {
         for p in params {
             assert!(a.set(p) && b.set(p));
         }
+        assert!(a.fade.is_active());
         a.advance(300);
         let mut skipped = vec![0.0f32; 300];
         b.process(&mut skipped, 300);
