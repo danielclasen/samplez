@@ -1573,6 +1573,12 @@ mod tests {
             f.engine.calls(),
             [format!("unresolved {} at {at}", unlisted_id(at, B))]
         );
+        f.clock.set(timing.apply_deadline(at + 2 * B));
+        f.tick();
+        assert!(
+            f.engine.calls().is_empty(),
+            "the overflow above the lowest given"
+        );
     }
 
     #[tokio::test(start_paused = true)]
