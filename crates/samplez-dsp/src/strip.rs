@@ -35,6 +35,12 @@ pub const EQ_GAIN_DB: RangeInclusive<f32> = -18.0..=18.0;
 pub const EQ_Q: RangeInclusive<f32> = 0.1..=16.0;
 
 /// The response of an equaliser band.
+///
+/// A bell takes the band's Q as it is. A shelf takes it as the RBJ shelf
+/// slope `S = 2 Q^2`, at most 1: the slope whose Q at 0 dB is the band's,
+/// and from Q 0.707 up the steepest shelf whose response stays between 0
+/// dB and its gain. A higher Q would add a resonant peak and dip beside
+/// the shelf, +23 dB at Q 2 on an 18 dB shelf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BandType {
     /// Shelf below `freq`, half its gain at `freq` (RBJ lowShelf).
@@ -58,7 +64,7 @@ pub struct EqBand {
 }
 
 impl EqBand {
-    fn check(&self) -> Result<(), String> {
+    fn refusal(&self) -> Result<(), Refusal> {
         within("eq band freq", self.freq, &EQ_FREQ)?;
         within("eq band gain", self.gain_db, &EQ_GAIN_DB)?;
         within("eq band q", self.q, &EQ_Q)
@@ -67,11 +73,27 @@ impl EqBand {
     fn shape(&self) -> Shape {
         let (freq, gain_db, q) = (self.freq, self.gain_db, self.q);
         match self.kind {
-            BandType::LowShelf => Shape::LowShelf { freq, gain_db, q },
+            BandType::LowShelf => Shape::LowShelf {
+                freq,
+                gain_db,
+                q: shelf_q(gain_db, q),
+            },
             BandType::Peak => Shape::Bell { freq, gain_db, q },
-            BandType::HighShelf => Shape::HighShelf { freq, gain_db, q },
+            BandType::HighShelf => Shape::HighShelf {
+                freq,
+                gain_db,
+                q: shelf_q(gain_db, q),
+            },
         }
     }
+}
+
+/// The RBJ Q of a shelf of `gain_db` whose slope is `S = 2 q^2`, at most
+/// 1 (see [`BandType`]).
+fn shelf_q(gain_db: f32, q: f32) -> f32 {
+    let s = (2.0 * f64::from(q) * f64::from(q)).min(1.0);
+    let a = libm::pow(10.0, f64::from(gain_db) / 40.0);
+    (1.0 / libm::sqrt((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0)) as f32
 }
 
 /// One parameter of a strip, set to an absolute value.
@@ -92,15 +114,29 @@ pub enum StripParam {
     EqBand { band: usize, value: EqBand },
 }
 
-fn within(what: &str, v: f32, range: &RangeInclusive<f32>) -> Result<(), String> {
+/// Why a strip refuses a parameter. Building one does not allocate, so
+/// [`Strip::set`] can refuse on the real-time thread.
+enum Refusal {
+    Outside(&'static str, f32, f32, f32),
+    NoLeg(usize, usize),
+    NoBand(usize),
+}
+
+impl Refusal {
+    fn message(&self) -> String {
+        match *self {
+            Refusal::Outside(what, v, lo, hi) => format!("{what} {v} is outside {lo}..={hi}"),
+            Refusal::NoLeg(leg, legs) => format!("no leg {leg} on a strip of {legs}"),
+            Refusal::NoBand(band) => format!("no eq band {band}"),
+        }
+    }
+}
+
+fn within(what: &'static str, v: f32, range: &RangeInclusive<f32>) -> Result<(), Refusal> {
     if range.contains(&v) {
         Ok(())
     } else {
-        Err(format!(
-            "{what} {v} is outside {}..={}",
-            range.start(),
-            range.end()
-        ))
+        Err(Refusal::Outside(what, v, *range.start(), *range.end()))
     }
 }
 
@@ -108,11 +144,15 @@ impl StripParam {
     /// Whether a strip of `legs` legs takes the parameter: legs and bands
     /// that exist, values within their ranges, no NaN.
     pub fn check(&self, legs: usize) -> Result<(), String> {
+        self.refusal(legs).map_err(|r| r.message())
+    }
+
+    fn refusal(&self, legs: usize) -> Result<(), Refusal> {
         let leg_exists = |leg: usize| {
             if leg < legs {
                 Ok(())
             } else {
-                Err(format!("no leg {leg} on a strip of {legs}"))
+                Err(Refusal::NoLeg(leg, legs))
             }
         };
         match *self {
@@ -126,9 +166,9 @@ impl StripParam {
             StripParam::Eq { .. } => Ok(()),
             StripParam::EqBand { band, value } => {
                 if band >= EQ_BANDS {
-                    return Err(format!("no eq band {band}"));
+                    return Err(Refusal::NoBand(band));
                 }
-                value.check()
+                value.refusal()
             }
         }
     }
@@ -193,7 +233,7 @@ impl Strip {
             (1..=MAX_LEGS).contains(&legs),
             "a strip has 1 to {MAX_LEGS} legs, not {legs}"
         );
-        Strip {
+        let mut s = Strip {
             legs,
             ramp,
             trim_db: 0.0,
@@ -206,7 +246,13 @@ impl Strip {
             eq_enabled: false,
             bands: DEFAULT_BANDS,
             eq: [Svf::new(); EQ_BANDS],
+        };
+        // The sections off, holding the g and k of their shapes.
+        s.hpf.set(Shape::HighPass { freq: 80.0 }, false, 0);
+        for band in 0..EQ_BANDS {
+            s.retarget_band(band);
         }
+        s
     }
 
     pub fn legs(&self) -> usize {
@@ -215,10 +261,10 @@ impl Strip {
 
     /// Sets `param` from the next sample processed on, ramping over the
     /// strip's ramp length. Returns false and changes nothing when
-    /// [`StripParam::check`] refuses it.
+    /// [`StripParam::check`] refuses it; a refusal does not allocate.
     #[must_use]
     pub fn set(&mut self, param: StripParam) -> bool {
-        if param.check(self.legs).is_err() {
+        if param.refusal(self.legs).is_err() {
             return false;
         }
         match param {
@@ -239,12 +285,7 @@ impl Strip {
             StripParam::Hpf { enabled, freq } => {
                 self.hpf_enabled = enabled;
                 self.hpf_freq = freq;
-                let shape = if enabled {
-                    Shape::HighPass { freq }
-                } else {
-                    Shape::Identity
-                };
-                self.hpf.set(shape, self.ramp);
+                self.hpf.set(Shape::HighPass { freq }, enabled, self.ramp);
             }
             StripParam::Eq { enabled } => {
                 self.eq_enabled = enabled;
@@ -269,12 +310,8 @@ impl Strip {
     }
 
     fn retarget_band(&mut self, band: usize) {
-        let shape = if self.eq_enabled {
-            self.bands[band].shape()
-        } else {
-            Shape::Identity
-        };
-        self.eq[band].set(shape, self.ramp);
+        let shape = self.bands[band].shape();
+        self.eq[band].set(shape, self.eq_enabled, self.ramp);
     }
 
     /// Processes `frames` samples of each leg in place: `buf` holds the
@@ -315,6 +352,7 @@ impl Strip {
 mod tests {
     use super::*;
     use crate::svf::tests::{measure, reference};
+    use crate::svf::{Coefficients, coefficients};
 
     const RAMP: u32 = 480;
 
@@ -578,47 +616,163 @@ mod tests {
         (changing, settled)
     }
 
+    /// The largest difference over the first 8 samples after a change
+    /// between the strip given it and the same strip without it, on a
+    /// 110 Hz sine: a ramp starts from the old coefficients and stays
+    /// close, a coefficient that jumps does not.
+    fn departure(before: &[StripParam], after: StripParam, ramp: u32) -> f32 {
+        let mut s = strip_with(1, before);
+        s.ramp = ramp;
+        let w = 2.0 * core::f64::consts::PI * 110.0 / 48_000.0;
+        let sine = |n: usize| (0.5 * (w * n as f64).sin()) as f32;
+        let warm = 9637;
+        let mut x: Vec<f32> = (0..warm).map(sine).collect();
+        s.process(&mut x, warm);
+        let mut kept = s.clone();
+        assert!(s.set(after));
+        let mut a: Vec<f32> = (warm..warm + 8).map(sine).collect();
+        let mut b = a.clone();
+        s.process(&mut a, 8);
+        kept.process(&mut b, 8);
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
     #[test]
     fn changes_ramp_without_a_click() {
         let eq_on = StripParam::Eq { enabled: true };
-        let low = StripParam::EqBand {
+        let bell = |freq, gain_db| StripParam::EqBand {
             band: 0,
-            value: band(BandType::Peak, 100.0, -18.0, 2.0),
+            value: band(BandType::Peak, freq, gain_db, 2.0),
         };
-        let high = StripParam::EqBand {
-            band: 0,
-            value: band(BandType::Peak, 100.0, 18.0, 2.0),
+        let hpf = |freq| StripParam::Hpf {
+            enabled: true,
+            freq,
         };
+        // (settings, change, whether the change sweeps over octaves)
         let cases = [
-            (vec![eq_on, low], high),
+            (vec![eq_on, bell(100.0, -18.0)], bell(100.0, 18.0), false),
+            (vec![hpf(20.0)], hpf(500.0), false),
             (
                 vec![],
                 StripParam::Polarity {
                     leg: 0,
                     inverted: true,
                 },
+                false,
             ),
-            (vec![], StripParam::Trim { db: 20.0 }),
+            (vec![], StripParam::Trim { db: 20.0 }, false),
+            (vec![eq_on, bell(100.0, 12.0)], bell(5000.0, 12.0), true),
         ];
-        for (before, after) in cases {
+        for (before, after, sweep) in cases {
             let (ramped, settled) = largest_step(&before, after, RAMP);
-            assert!(
-                ramped <= settled * 1.5,
-                "{after:?}: step {ramped} while ramping, {settled} settled"
+            let (jumped, _) = largest_step(&before, after, 0);
+            if sweep {
+                // g ramps linearly, so the bell leaves the sine's octave
+                // in the first 2 ms of the ramp: a larger step than a
+                // settled one, still a fraction of a jump's.
+                assert!(
+                    ramped * 4.0 < jumped,
+                    "{after:?}: step {ramped} while ramping, {jumped} on a jump"
+                );
+            } else {
+                assert!(
+                    ramped <= settled * 1.5,
+                    "{after:?}: step {ramped} while ramping, {settled} settled"
+                );
+                assert!(
+                    jumped > settled * 2.0,
+                    "{after:?}: a jump makes a step of only {jumped}, settled {settled}"
+                );
+            }
+            let (ramped, jumped) = (
+                departure(&before, after, RAMP),
+                departure(&before, after, 0),
             );
-            let (jumped, settled) = largest_step(&before, after, 0);
             assert!(
-                jumped > settled * 2.0,
-                "{after:?}: a jump makes a step of only {jumped}, settled {settled}"
+                ramped * 10.0 < jumped,
+                "{after:?}: departs by {ramped} when ramped, {jumped} when jumped"
             );
         }
     }
 
+    /// A shelf at full boost or cut stays between 0 dB and its gain at
+    /// every Q of the range, where the RBJ Q of 16 would peak at +41 dB.
+    #[test]
+    fn shelves_do_not_overshoot_at_any_q() {
+        let qs = [0.1, 0.25, 0.5, 0.707, 1.0, 2.0, 4.0, 8.0, 16.0];
+        for kind in [BandType::LowShelf, BandType::HighShelf] {
+            for gain_db in [-18.0f32, 18.0] {
+                let (lo, hi) = (f64::from(gain_db.min(0.0)), f64::from(gain_db.max(0.0)));
+                for q in qs {
+                    for freq in [20.0, 100.0, 1000.0, 8000.0, 20_000.0] {
+                        let shape = band(kind, freq, gain_db, q).shape();
+                        for i in 0..=600 {
+                            let f = 10.0 * 2399.0f64.powf(f64::from(i) / 600.0);
+                            let (db, _) = reference(shape, f);
+                            assert!(
+                                db <= hi + 0.1 && db >= lo - 0.1,
+                                "{kind:?} {freq} Hz {gain_db} dB Q {q}: {db} dB at {f} Hz"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The strip itself, where the RBJ Q 16 low shelf peaks.
+        let mut s = strip_with(
+            1,
+            &[
+                StripParam::Eq { enabled: true },
+                StripParam::EqBand {
+                    band: 0,
+                    value: band(BandType::LowShelf, 100.0, 18.0, 16.0),
+                },
+            ],
+        );
+        for f in [40.0, 59.0, 80.0] {
+            let (db, _) = mono_response(&mut s, f);
+            assert!(db <= 18.1, "{f} Hz: {db} dB");
+        }
+    }
+
+    /// A switched-off section holds the g and k of its shape, so switching
+    /// it on ramps its mix alone, not from a frequency it was never set
+    /// to; a change while off does not ramp.
+    #[test]
+    fn switched_off_sections_hold_their_shape() {
+        let gk = |c: Coefficients| [c[0], c[1]];
+        let mut s = Strip::new(1, RAMP);
+        assert_eq!(
+            gk(s.hpf.target()),
+            gk(coefficients(Shape::HighPass { freq: 80.0 }))
+        );
+        for (b, value) in DEFAULT_BANDS.iter().enumerate() {
+            assert_eq!(gk(s.eq[b].target()), gk(coefficients(value.shape())));
+        }
+        assert!(s.set(StripParam::Hpf {
+            enabled: false,
+            freq: 20.0
+        }));
+        assert!(s.hpf.is_bypassed());
+        let off = s.hpf.target();
+        assert_eq!(gk(off), gk(coefficients(Shape::HighPass { freq: 20.0 })));
+        assert!(s.set(StripParam::Hpf {
+            enabled: true,
+            freq: 20.0
+        }));
+        assert_eq!(gk(s.hpf.target()), gk(off));
+    }
+
     /// Two strips given the same parameters at the same samples compute
     /// the same bits, whatever the block sizes, and a clone taken while a
-    /// ramp runs continues as the original does.
+    /// ramp runs continues as the original does, under FTZ/DAZ as in
+    /// production.
     #[test]
     fn strips_are_deterministic_and_clones_continue_alike() {
+        let saved = crate::set_ftz_daz(true);
         let input: Vec<f32> = (0..4800 * 2)
             .map(|n| ((n * 7919) % 1013) as f32 / 1013.0 - 0.5)
             .collect();
@@ -674,6 +828,7 @@ mod tests {
         assert_eq!(bits(&run(16, None)), bits(&reference));
         assert_eq!(bits(&run(480, None)), bits(&reference));
         assert_eq!(bits(&run(48, Some(1440 + 96))), bits(&reference));
+        crate::restore_mxcsr(saved);
     }
 
     /// Ramps advanced over samples not processed land where processing

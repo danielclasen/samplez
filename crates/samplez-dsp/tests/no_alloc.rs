@@ -134,6 +134,21 @@ fn process_calls_do_not_allocate() {
             ] {
                 assert!(s.set(p));
             }
+            // Refused: a leg and a band the strip lacks, a value out of
+            // range.
+            for p in [
+                StripParam::LegTrim {
+                    leg: s.legs(),
+                    db: 0.0,
+                },
+                StripParam::EqBand {
+                    band: DEFAULT_BANDS.len(),
+                    value: DEFAULT_BANDS[0],
+                },
+                StripParam::Trim { db: f32::NAN },
+            ] {
+                assert!(!s.set(p));
+            }
             for (band, b) in DEFAULT_BANDS.iter().enumerate() {
                 let value = EqBand {
                     kind: if on { b.kind } else { BandType::Peak },

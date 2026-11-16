@@ -24,8 +24,6 @@ pub(crate) type Coefficients = [f32; 5];
 /// The response of a filter section. Frequencies in Hz, gains in dB.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Shape {
-    /// The input unchanged; `g` and `k` of the filter stay as they were.
-    Identity,
     /// Second-order Butterworth high-pass, 12 dB per octave, -3.01 dB at
     /// `freq`: the cookbook HPF with Q = 1/sqrt(2).
     HighPass { freq: f32 },
@@ -45,10 +43,9 @@ fn amplitude(gain_db: f32) -> f64 {
     libm::pow(10.0, f64::from(gain_db) / 40.0)
 }
 
-/// The coefficients of `shape`; an identity keeps `g` and `k` of `held`.
-pub(crate) fn coefficients(shape: Shape, held: &Coefficients) -> Coefficients {
+/// The coefficients of `shape`.
+pub(crate) fn coefficients(shape: Shape) -> Coefficients {
     let (g, k, m0, m1, m2) = match shape {
-        Shape::Identity => return [held[0], held[1], 1.0, 0.0, 0.0],
         Shape::HighPass { freq } => {
             let k = core::f64::consts::SQRT_2;
             (warp(freq), k, 1.0, -k, -1.0)
@@ -172,15 +169,25 @@ impl<const L: usize> Svf<L> {
     }
 
     /// Ramps from the current coefficients to those of `shape` over `len`
-    /// samples; 0 jumps. Equal targets on a section that is not ramping
-    /// change nothing.
-    pub(crate) fn set(&mut self, shape: Shape, len: u32) {
-        let target = coefficients(shape, &self.target);
+    /// samples, or to its `g` and `k` with the input passed unchanged
+    /// when not `on`; 0 jumps. A section switched off keeps the `g` and
+    /// `k` of its shape, so switching it on or off ramps only the mix.
+    /// Equal targets on a section that is not ramping change nothing; a
+    /// section off and staying off jumps, as nothing of it is heard.
+    pub(crate) fn set(&mut self, shape: Shape, on: bool, len: u32) {
+        let mut target = coefficients(shape);
+        if !on {
+            target[2..].copy_from_slice(&[1.0, 0.0, 0.0]);
+        }
         if !self.is_ramping() && target == self.target {
             return;
         }
-        let len = len.min(crate::MAX_RAMP_LEN);
         let c0 = self.at(self.pos);
+        let len = if is_identity(&target) && is_identity(&c0) {
+            0
+        } else {
+            len.min(crate::MAX_RAMP_LEN)
+        };
         if len == 0 {
             self.len = 0;
             self.c0 = target;
@@ -247,7 +254,6 @@ pub(crate) mod tests {
     /// against.
     pub(crate) fn cookbook(shape: Shape) -> [f64; 6] {
         let (freq, gain_db, q) = match shape {
-            Shape::Identity => return [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             Shape::HighPass { freq } => (freq, 0.0, core::f32::consts::FRAC_1_SQRT_2),
             Shape::Bell { freq, gain_db, q }
             | Shape::LowShelf { freq, gain_db, q }
@@ -259,7 +265,6 @@ pub(crate) mod tests {
         let a = 10f64.powf(f64::from(gain_db) / 40.0);
         let sa = 2.0 * a.sqrt() * alpha;
         match shape {
-            Shape::Identity => unreachable!(),
             Shape::HighPass { .. } => [
                 (1.0 + cw) / 2.0,
                 -(1.0 + cw),
@@ -335,7 +340,7 @@ pub(crate) mod tests {
 
     fn svf_response(shape: Shape, freq: f64) -> (f64, f64) {
         let mut f = Svf::<1>::new();
-        f.set(shape, 0);
+        f.set(shape, true, 0);
         measure(freq, |b| f.process(b, 1, b.len()))
     }
 
@@ -461,11 +466,20 @@ pub(crate) mod tests {
                 gain_db: 6.0,
                 q: 1.0,
             },
+            true,
             0,
         );
         let mut noise = [0.25f32; 64];
         f.process(&mut noise, 1, 64);
-        f.set(Shape::Identity, 32);
+        f.set(
+            Shape::Bell {
+                freq: 1000.0,
+                gain_db: 6.0,
+                q: 1.0,
+            },
+            false,
+            32,
+        );
         assert!(!f.is_bypassed());
         f.process(&mut noise, 1, 64);
         assert!(f.is_bypassed());
@@ -494,14 +508,14 @@ pub(crate) mod tests {
             .collect();
         let run = |sizes: &[usize]| {
             let mut f = Svf::<2>::new();
-            f.set(a, 0);
+            f.set(a, true, 0);
             let mut out = Vec::new();
             let mut at = 0;
             let mut sizes = sizes.iter().cycle();
             while at < input.len() {
                 let len = (*sizes.next().unwrap()).min(input.len() - at);
                 if at == 96 {
-                    f.set(b, 480);
+                    f.set(b, true, 480);
                 }
                 let mut buf: Vec<f32> = input[at..at + len]
                     .iter()
@@ -516,7 +530,7 @@ pub(crate) mod tests {
             (out, f)
         };
         let (whole, f) = run(&[48]);
-        assert_eq!(f.target(), coefficients(b, &neutral()));
+        assert_eq!(f.target(), coefficients(b));
         assert!(!f.is_ramping());
         for sizes in [&[16usize][..], &[48, 1, 47], &[96]] {
             let (other, _) = run(sizes);
@@ -535,7 +549,7 @@ pub(crate) mod tests {
         let saved = crate::set_ftz_daz(true);
         for shape in shapes() {
             let mut f = Svf::<1>::new();
-            f.set(shape, 0);
+            f.set(shape, true, 0);
             let mut x = [1.0f32; 480];
             f.process(&mut x, 1, 480);
 
