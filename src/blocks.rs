@@ -751,16 +751,19 @@ impl Hold {
     /// only, from the next page boundary on. Blocks in the ring that a
     /// withdrawn replica cannot fill are withheld at once. One replica
     /// is never withdrawn.
-    /// A pending commit start or stop lapses in every mode: the
-    /// supervisor names a commit start again once it still wants one.
+    /// A pending commit start or stop lapses unless the replica is
+    /// withdrawn already: there every block is a fill, and a fill withheld
+    /// while another replica commits leaves the commit start in place.
     pub fn withdraw(&mut self, statuses: &Statuses, changes: &mut Changes) {
         // One replica has no member to leave a block to: it goes on
         // committing after a block it withheld, from any index.
         if self.alone {
             return;
         }
-        self.start_from = None;
-        self.stop_at = None;
+        if self.mode != Mode::Withdrawn {
+            self.start_from = None;
+            self.stop_at = None;
+        }
         if self.mode == Mode::Idle {
             return;
         }
@@ -2558,5 +2561,37 @@ mod tests {
                 since: K0 + CAP as u64
             }
         );
+    }
+
+    /// A withdrawn replica keeps a requested commit start when one of its
+    /// fills is withheld: it commits from that page boundary, not from a
+    /// later one named again after it.
+    #[test]
+    fn a_withheld_fill_keeps_a_requested_commit_start() {
+        let p = K0 * B + PAGE;
+        let kp = p / B;
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        t.withdraw();
+        t.hold.commit_from(kp);
+        // A fill withheld on another replica's report withdraws again.
+        let fill = (K0 * B).next_multiple_of(PAGE) / B + 1;
+        for j in K0 + 1..=fill {
+            t.compute(j, DEGRADED);
+        }
+        assert_eq!(
+            t.statuses
+                .withhold(fill, Cause::OtherDigest)
+                .map(|s| s.kind),
+            Some(Kind::Withheld)
+        );
+        t.advance();
+        t.withdraw();
+        for j in fill + 1..=kp {
+            t.compute(j, Some(HEALTHY));
+        }
+        let st = t.statuses.get(kp).unwrap();
+        assert_eq!(st.range, Range::From(p), "{st:?}");
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: p });
     }
 }

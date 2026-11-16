@@ -564,12 +564,7 @@ async fn a_replica_resuming_inside_a_degraded_block_splits_it() {
     let p = page_inside(&set, 30);
     let kp = p / BLOCK;
     set.audio(r).degrade(kp - 2, kp + 3, DEGRADED);
-    // A withheld fill lapses a pending commit start: named again until
-    // the block holding P is computed.
-    while set.audio(w).due().unwrap() < kp {
-        set.audio(w).commit_from(0, kp);
-        sleep(Duration::from_millis(1)).await;
-    }
+    set.audio(w).commit_from(0, kp);
     past_cap(&set, kp + 3).await;
     let s = set.audio(r).status_of(0, kp).unwrap();
     assert_eq!((s.kind, s.range), (Kind::Committed, Range::UpTo(p)));
@@ -592,10 +587,7 @@ async fn a_replica_split_at_p_commits_no_healthy_block_after_it() {
     let p = page_inside(&set, 30);
     let kp = p / BLOCK;
     set.audio(r).degrade(kp - 2, kp + 1, DEGRADED);
-    while set.audio(w).due().unwrap() < kp {
-        set.audio(w).commit_from(0, kp);
-        sleep(Duration::from_millis(1)).await;
-    }
+    set.audio(w).commit_from(0, kp);
     past_cap(&set, kp + 3).await;
     let s = set.audio(r).status_of(0, kp).unwrap();
     assert_eq!((s.kind, s.range), (Kind::Committed, Range::UpTo(p)));
