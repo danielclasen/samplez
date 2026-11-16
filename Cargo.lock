@@ -1878,7 +1878,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "samplez"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gungraun",
  "libc",
@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "samplez-dsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gungraun",
  "libm",
@@ -1901,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "samplez-mxl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gungraun",
  "mxl",
@@ -1911,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "samplez-replica"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "samplez-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
