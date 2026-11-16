@@ -4266,7 +4266,7 @@ mod tests {
         let mut log = e.log.lock().unwrap();
         let entry = RtEntry {
             id: log.last + 1,
-            at_index: earliest(&e.api, &e.counters, e.margin, e.lead),
+            at_index: earliest(&e.api, &e.counters, e.margin, e.lead).next_multiple_of(e.block),
             change: Change::Strip {
                 slot: 0,
                 param: refused,
