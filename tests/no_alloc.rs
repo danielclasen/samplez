@@ -2,7 +2,8 @@
 //! allocator once it runs, over a run that includes input generation
 //! swaps, a prune and the `InputDown` it brings, an `InputUp` whose
 //! generation is swapped in at its index with a fade-in, a re-route
-//! crossfade, a gain ramp, output metering and a loudness reset, and,
+//! crossfade, a gain ramp, strip entries switching every strip unit on
+//! across a prune and a re-add, output metering and a loudness reset, and,
 //! for a replicated engine, every path of the hold ring (see
 //! `common::hold_scenario`) with its pages hashed. libmxl's own C++
 //! allocations are not seen by this allocator.
@@ -141,6 +142,9 @@ fn rt_thread_allocates_nothing() {
     let api = common::api();
     let index = samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
     engine.set_gain(0, 0, 0.25, (index / B + 20) * B).unwrap();
+    for param in common::strip_params(2) {
+        engine.set_strip(0, param, (index / B + 20) * B).unwrap();
+    }
     let reset = (index / B + 40) * B;
     engine.reset_loudness(0, reset).unwrap();
     // The same id again: polled, re-added in a new generation, faded in.

@@ -2,9 +2,11 @@
 //! replicated output, run under Callgrind by Gungraun (`cargo bench
 //! --bench rt`): 8 channels, B = 48 and the default ring of `D + w + 2B`
 //! = 20 blocks, with a sink that writes nothing, so the counts are the
-//! ring's and the hashes' own. The hard limits are the instruction
-//! counts measured in the builder image plus 10 %, rounded up; a run
-//! above a limit fails.
+//! ring's and the hashes' own; and on the strip calls the RT loop makes
+//! for 64 stereo input slots: a block through strips at rest, as every
+//! slot runs one, the most strip entries one wake applies, and a skip.
+//! The hard limits are the instruction counts measured in the builder
+//! image plus 10 %, rounded up; a run above a limit fails.
 
 use std::hint::black_box;
 use std::sync::atomic::AtomicU64;
@@ -14,6 +16,7 @@ use gungraun::{Callgrind, EventKind};
 use samplez::blocks::{
     Changes, Ctx, HEALTHY, Hold, PageHash, Pages, Sink, StatusChange, Statuses, fingerprint,
 };
+use samplez_dsp::strip::{CompParams, DEFAULT_BANDS, EqBand, GateParams, Strip, StripParam};
 
 const B: u64 = 48;
 const CHANNELS: usize = 8;
@@ -269,6 +272,112 @@ const HASH_PAGE_END: u64 = 8_511;
 const SETTLE_PAGE: u64 = 2_090;
 const FINGERPRINT_FULL: u64 = 501_769;
 
+/// Input slots of the strip benchmarks, each of two legs.
+const SLOTS: usize = 64;
+/// Entries one wake takes off the entry ring at most: `PENDING_CHANGES`.
+const ENTRIES: usize = 64;
+
+/// The strips of 64 stereo slots, at rest or with every unit on and
+/// ramping, and one block of each slot's samples.
+fn slot_strips(on: bool) -> (Vec<Strip>, Vec<f32>) {
+    let mut strips = vec![Strip::new(2, 480); SLOTS];
+    if on {
+        for s in &mut strips {
+            let mut params = vec![
+                StripParam::Trim { db: 6.0 },
+                StripParam::Hpf {
+                    enabled: true,
+                    freq: 80.0,
+                },
+                StripParam::Eq { enabled: true },
+                StripParam::Gate(GateParams {
+                    enabled: true,
+                    threshold_db: -60.0,
+                    range_db: 40.0,
+                    attack_ms: 1.0,
+                    release_ms: 50.0,
+                }),
+                StripParam::Comp(CompParams {
+                    enabled: true,
+                    threshold_db: -20.0,
+                    ratio: 4.0,
+                    attack_ms: 1.0,
+                    release_ms: 50.0,
+                    knee_db: 6.0,
+                    makeup_db: 3.0,
+                }),
+            ];
+            for (band, b) in DEFAULT_BANDS.iter().enumerate() {
+                let value = EqBand { gain_db: 6.0, ..*b };
+                params.push(StripParam::EqBand { band, value });
+            }
+            for p in params {
+                assert!(s.set(p));
+            }
+        }
+    }
+    let x = (0..2 * B as usize)
+        .map(|n| 0.5 * (n as f32 * 0.37).sin())
+        .collect();
+    (strips, x)
+}
+
+fn strips_at_rest() -> (Vec<Strip>, Vec<f32>) {
+    slot_strips(false)
+}
+
+fn strips_on() -> (Vec<Strip>, Vec<f32>) {
+    slot_strips(true)
+}
+
+// One block through the strips of 64 slots at rest: passed through.
+#[library_benchmark]
+#[bench::at_rest(setup = strips_at_rest, config = limit(STRIPS_AT_REST))]
+fn strip_block((mut strips, x): (Vec<Strip>, Vec<f32>)) -> Vec<Strip> {
+    let mut buf = [0.0f32; 2 * B as usize];
+    for s in &mut strips {
+        buf.copy_from_slice(&x);
+        s.process(black_box(&mut buf), B as usize);
+    }
+    strips
+}
+
+// The most entries one wake applies, each an equaliser band, whose
+// coefficients are the costliest to compute.
+#[library_benchmark]
+#[bench::bands(setup = strips_on, config = limit(STRIP_ENTRIES))]
+fn strip_entries((mut strips, _): (Vec<Strip>, Vec<f32>)) -> Vec<Strip> {
+    for n in 0..ENTRIES {
+        let value = EqBand {
+            gain_db: -3.0,
+            ..DEFAULT_BANDS[n % 4]
+        };
+        let param = StripParam::EqBand { band: n % 4, value };
+        assert!(strips[n % SLOTS].set(black_box(param)));
+    }
+    strips
+}
+
+// The strips of 64 slots, every unit on and ramping, advanced over a
+// skip of two blocks.
+#[library_benchmark]
+#[bench::ramping(setup = strips_on, config = limit(STRIP_SKIP))]
+fn strip_skip((mut strips, _): (Vec<Strip>, Vec<f32>)) -> Vec<Strip> {
+    for s in &mut strips {
+        s.advance(black_box(2 * B as usize));
+    }
+    strips
+}
+
+const STRIPS_AT_REST: u64 = 29_256;
+const STRIP_ENTRIES: u64 = 38_630;
+const STRIP_SKIP: u64 = 7_232;
+
+library_benchmark_group!(
+    name = strips,
+    benchmarks = [strip_block, strip_entries, strip_skip]
+);
+
 library_benchmark_group!(
     name = pages,
     benchmarks = [hash_block, hash_page_end, settle_page, fingerprint_full]
@@ -285,4 +394,4 @@ library_benchmark_group!(
     ]
 );
 
-main!(library_benchmark_groups = hold, pages);
+main!(library_benchmark_groups = hold, pages, strips);

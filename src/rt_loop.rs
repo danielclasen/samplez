@@ -16,7 +16,7 @@ use std::sync::atomic::{
 
 use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
 use rtrb::{Consumer, Producer};
-use samplez_dsp::{KWeighting, Matrix, PlanarBuffer, Ramp, TruePeak};
+use samplez_dsp::{KWeighting, Matrix, PlanarBuffer, Ramp, Strip, StripParam, TruePeak};
 use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{FlowWriter, Write};
 use samplez_mxl::{MxlApi, time};
@@ -182,7 +182,7 @@ pub struct BlockVerdict {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Every input copied, no ramp: each output is the matrix of its
-    /// inputs.
+    /// inputs after their strips.
     Clean,
     /// Every input copied, a fade or a coefficient ramp running.
     Ramp,
@@ -368,6 +368,8 @@ pub(crate) enum Change {
     /// The slot crossfades to another flow from the index; needs a
     /// generation holding both readers.
     Route { slot: usize },
+    /// Sets one parameter of the slot's strip from the index.
+    Strip { slot: usize, param: StripParam },
 }
 
 impl Change {
@@ -418,6 +420,27 @@ pub(crate) struct Slot {
     pub prev: SlotState,
     pub prune_requested: bool,
     pub stats: SlotStats,
+    /// The slot's strip, run on each block computed after the copy and
+    /// the fades; none on a slot wider than a strip.
+    pub strip: Option<Strip>,
+    /// The index of the next sample the strip processes.
+    pub strip_pos: Option<u64>,
+}
+
+impl Slot {
+    /// Brings the strip to sample index `index`: its ramps advance over
+    /// samples not processed, so a parameter's value depends on the
+    /// sample index and the ordered entries alone. A lower index follows
+    /// a backward clock step: the position re-anchors and the ramps hold
+    /// where they are, never rewound.
+    fn strip_to(&mut self, index: u64) {
+        if let (Some(strip), Some(pos)) = (&mut self.strip, self.strip_pos)
+            && index > pos
+        {
+            strip.advance((index - pos) as usize);
+        }
+        self.strip_pos = Some(index);
+    }
 }
 
 pub(crate) struct Out {
@@ -1509,6 +1532,15 @@ impl Rt {
                 }
                 return;
             }
+            Change::Strip { slot, param } => {
+                let s = &mut self.slots[slot];
+                s.strip_to(e.at_index);
+                if let Some(strip) = &mut s.strip {
+                    // Checked when the entry was appended.
+                    let _ = strip.set(param);
+                }
+                return;
+            }
             Change::InputUp { slot } | Change::Route { slot } => slot,
         };
         if matches!(e.change, Change::InputUp { .. }) && !self.slots[slot].up {
@@ -1714,6 +1746,13 @@ impl Rt {
                 add(&self.counters.input_silenced_blocks, 1);
                 slot.silenced_last = true;
             }
+            // Silenced blocks too: the strip's filters and dynamics ring
+            // out on silence.
+            slot.strip_to(start);
+            if let Some(strip) = &mut slot.strip {
+                strip.process(dst, b);
+            }
+            slot.strip_pos = Some(start + self.block);
             for (c, ch) in dst.chunks_exact(b).enumerate() {
                 self.inbuf.channel_mut(slot.first_channel + c)[..b].copy_from_slice(ch);
             }
@@ -2335,5 +2374,59 @@ mod tests {
         to(&mut m, 15);
         assert_eq!((m.due[0].0.id, m.due[0].1), (up.id, true));
         assert_eq!(m.consumed, 3);
+    }
+
+    fn strip_slot() -> Slot {
+        Slot {
+            domain: 0,
+            first_channel: 0,
+            channels: 1,
+            offset: 0,
+            state: SlotState::default(),
+            fade_start: None,
+            silenced_last: true,
+            up: true,
+            held: false,
+            xfade: None,
+            prev: SlotState::default(),
+            prune_requested: false,
+            stats: EMPTY_STATS,
+            strip: Some(Strip::new(1, 480)),
+            strip_pos: None,
+        }
+    }
+
+    /// The strip's ramps advance over samples not processed, as the
+    /// matrix's do: a slot that skipped half a ramp computes the block
+    /// after it as one that processed those samples. Below its position
+    /// it re-anchors and rewinds nothing.
+    #[test]
+    fn a_strip_advances_over_samples_not_processed() {
+        let (mut skipped, mut computed) = (strip_slot(), strip_slot());
+        for s in [&mut skipped, &mut computed] {
+            s.strip_to(0);
+            assert!(
+                s.strip
+                    .as_mut()
+                    .unwrap()
+                    .set(StripParam::Trim { db: -20.0 })
+            );
+        }
+        let mut silence = vec![0.0f32; 240];
+        computed.strip.as_mut().unwrap().process(&mut silence, 240);
+        computed.strip_pos = Some(240);
+        let block = |s: &mut Slot| {
+            s.strip_to(240);
+            let mut x = vec![0.5f32; 48];
+            s.strip.as_mut().unwrap().process(&mut x, 48);
+            s.strip_pos = Some(288);
+            x
+        };
+        let (a, b) = (block(&mut skipped), block(&mut computed));
+        assert_eq!(a, b);
+        assert!(a[0] < 0.5 && a[0] > 0.05, "{}", a[0]);
+        let held = skipped.strip.clone();
+        skipped.strip_to(96);
+        assert_eq!((skipped.strip, skipped.strip_pos), (held, Some(96)));
     }
 }

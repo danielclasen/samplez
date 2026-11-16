@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use samplez_dsp::{Matrix, PlanarBuffer};
+use samplez_dsp::strip::MAX_LEGS;
+use samplez_dsp::{Matrix, PlanarBuffer, Strip, StripParam};
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, InputConfig, Poll, PolledFlow, Recovery,
     SlotState, Timing,
@@ -175,11 +176,12 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Why [`Engine::set_gain`] refused a change.
+/// Why [`Engine::set_gain`] or [`Engine::set_strip`] refused a change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GainError {
     /// No such coefficient, a gain that is not finite within
-    /// `MAX_GAIN`, or an index that is not a multiple of the block size.
+    /// `MAX_GAIN`, no such slot or a strip parameter it does not take, or
+    /// an index that is not a multiple of the block size.
     Invalid(String),
     /// `at_index` is below `earliest`, the first index the engine accepts.
     TooNear { at_index: u64, earliest: u64 },
@@ -222,15 +224,18 @@ pub enum Entry {
     /// Input slot `slot` crossfades to flow `flow_id` over the ramp
     /// length from the entry's index.
     Route { slot: usize, flow_id: String },
+    /// Sets parameter `param` of input slot `slot`'s strip from the
+    /// entry's index, ramping over the ramp length.
+    Strip { slot: usize, param: StripParam },
 }
 
 /// Why the engine refused an entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryError {
     /// No such slot or coefficient, a gain that is not finite within
-    /// `MAX_GAIN`, a flow an input may not read, an index that is not a
-    /// multiple of the block size, or an entry the engine's log mode does
-    /// not take.
+    /// `MAX_GAIN`, a flow an input may not read, a strip parameter the
+    /// slot's strip does not take, an index that is not a multiple of the
+    /// block size, or an entry the engine's log mode does not take.
     Invalid(String),
     /// [`PENDING_CHANGES`] entries are outstanding.
     Full,
@@ -482,6 +487,21 @@ impl Log {
     }
 }
 
+/// Whether input slot `slot` exists and has a strip that takes `param`:
+/// one of 1 to [`MAX_LEGS`] channels.
+fn check_strip(config: &Config, slot: usize, param: &StripParam) -> Result<(), String> {
+    let Some(input) = config.inputs.get(slot) else {
+        return Err(format!("no input slot {slot}"));
+    };
+    let legs = input.channels as usize;
+    if legs > MAX_LEGS {
+        return Err(format!(
+            "input slot {slot} has {legs} channels, a strip at most {MAX_LEGS}"
+        ));
+    }
+    param.check(legs)
+}
+
 /// Where the next generation-needing or other entry for a slot may be
 /// stamped: at `earliest`, after the latest one for the slot and its ramp.
 fn stamp(earliest: u64, last_at: u64, ramp: u64, block: u64) -> u64 {
@@ -566,11 +586,12 @@ pub struct Engine {
 
 impl Engine {
     /// Starts the RT thread and the supervisor with the engine's own log:
-    /// [`Engine::set_gain`] and [`Engine::route`] append and commit at
-    /// once, and so does the supervisor for its own [`Report`]s. `process`
-    /// is the outcome of [`rt::setup_process`], run before any other
-    /// thread. Each block's verdict goes to `verdicts` when given; one the
-    /// channel has no room for is counted in `verdicts_dropped`.
+    /// [`Engine::set_gain`], [`Engine::set_strip`] and [`Engine::route`]
+    /// append and commit at once, and so does the supervisor for its own
+    /// [`Report`]s. `process` is the outcome of [`rt::setup_process`], run
+    /// before any other thread. Each block's verdict goes to `verdicts`
+    /// when given; one the channel has no room for is counted in
+    /// `verdicts_dropped`.
     pub fn start(
         config: Config,
         process: ProcessStatus,
@@ -750,6 +771,9 @@ impl Engine {
                 prev: SlotState::default(),
                 prune_requested: false,
                 stats: EMPTY_STATS,
+                strip: (i.channels as usize <= MAX_LEGS)
+                    .then(|| Strip::new(i.channels as usize, config.ramp_samples)),
+                strip_pos: None,
             });
             channel += i.channels as usize;
         }
@@ -1050,6 +1074,33 @@ impl Engine {
                 "gain {gain} is not finite within MAX_GAIN"
             )));
         }
+        let change = Change::Gain {
+            input,
+            output,
+            gain,
+        };
+        self.set_local(change, at_index, "gain changes")
+    }
+
+    /// Sets parameter `param` of input slot `slot`'s strip from sample
+    /// index `at_index`, a multiple of the block size, ramping over the
+    /// configured ramp length. Refused as [`Engine::set_gain`] refuses a
+    /// change, and as invalid for a slot that does not exist or has more
+    /// than [`MAX_LEGS`] channels, and for a parameter its strip refuses
+    /// ([`StripParam::check`]).
+    pub fn set_strip(
+        &self,
+        slot: usize,
+        param: StripParam,
+        at_index: u64,
+    ) -> Result<(), GainError> {
+        check_strip(&self.config, slot, &param).map_err(GainError::Invalid)?;
+        self.set_local(Change::Strip { slot, param }, at_index, "strip changes")
+    }
+
+    /// Appends `change` at `at_index` to the engine's own log and commits
+    /// it; `what` names the changes in the refusal of a replicated engine.
+    fn set_local(&self, change: Change, at_index: u64, what: &str) -> Result<(), GainError> {
         if !at_index.is_multiple_of(self.block) {
             return Err(GainError::Invalid(format!(
                 "at_index {at_index} is not a multiple of the block size {}",
@@ -1058,9 +1109,9 @@ impl Engine {
         }
         let mut log = self.log.lock().expect("log lock");
         if log.local.is_none() {
-            return Err(GainError::Invalid(
-                "gain changes come from the replicated log".to_owned(),
-            ));
+            return Err(GainError::Invalid(format!(
+                "{what} come from the replicated log"
+            )));
         }
         let earliest = earliest(&self.api, &self.counters, self.margin, self.lead);
         if at_index < earliest {
@@ -1069,11 +1120,7 @@ impl Engine {
         let e = RtEntry {
             id: log.last + 1,
             at_index,
-            change: Change::Gain {
-                input,
-                output,
-                gain,
-            },
+            change,
         };
         let consumed = self.counters.entries_consumed.load(Acquire);
         log.append(e, None, consumed).map_err(|_| GainError::Full)?;
@@ -1173,6 +1220,10 @@ impl Engine {
                     .check_input_flow(slot, &flow_id)
                     .map_err(|e| EntryError::Invalid(e.0))?;
                 (Change::Route { slot }, Some(flow_id))
+            }
+            Entry::Strip { slot, param } => {
+                check_strip(&self.config, slot, &param).map_err(EntryError::Invalid)?;
+                (Change::Strip { slot, param }, None)
             }
         };
         let mut log = self.log.lock().expect("log lock");
@@ -3487,7 +3538,8 @@ mod tests {
     /// The RT loop's failure paths run, so that CI's RealtimeSanitizer
     /// run over the lib tests checks them: a stall's catch-up and skip, a
     /// forward and a backward clock step with the wakes behind the last
-    /// block after it, and a late input with its probe. Engine `p` writes the flow,
+    /// block after it, and a late input with its probe, with a strip
+    /// advanced over the skip. Engine `p` writes the flow,
     /// engine `e` reads it.
     #[test]
     fn the_failure_paths_run_on_the_rt_thread() {
@@ -3532,6 +3584,30 @@ mod tests {
                                          "channels": 1 }]);
         let e = start(input, out, 3 * 576, serde_json::json!([[1.0]]));
         wait(&|| e.status().inputs[0].state == InputState::Attached);
+        // A strip with filters on: Strip::advance runs over the skip.
+        let produced = e.counters.produced.load(Acquire);
+        let at = (produced / 48 + 40) * 48;
+        let mut params = vec![
+            StripParam::Trim { db: -6.0 },
+            StripParam::Hpf {
+                enabled: true,
+                freq: 100.0,
+            },
+            StripParam::Eq { enabled: true },
+            StripParam::DynamicsBeforeEq { enabled: true },
+        ];
+        params.extend(
+            samplez_dsp::strip::DEFAULT_BANDS
+                .iter()
+                .enumerate()
+                .map(|(band, b)| StripParam::EqBand {
+                    band,
+                    value: samplez_dsp::EqBand { gain_db: 6.0, ..*b },
+                }),
+        );
+        for param in params {
+            e.set_strip(0, param, at).unwrap();
+        }
         let c = e.counters();
         let n = |a: &AtomicU64| a.load(Relaxed);
         let until = |what: &str, f: &dyn Fn() -> bool| {

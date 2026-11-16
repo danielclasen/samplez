@@ -214,6 +214,129 @@ fn two_engines_hash_the_pages_both_computed_alike() {
     });
 }
 
+/// Two engines on the same input and the same strip entries hash every
+/// page both computed alike: the strips' ramps, filters and dynamics
+/// compute the same bits on both, and the pages they change differ from
+/// the input's. A disturbed block changes a strip's filter and envelope
+/// state beyond the ramp, so a run disturbed after the first entry is
+/// run again.
+#[test]
+fn two_engines_with_strips_hash_the_pages_both_computed_alike() {
+    use samplez_dsp::strip::{BandType, CompParams, EqBand, GateParams, StripParam};
+    undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let a = start(&domain, &src, 2, 1 << 16);
+        let b = start(&domain, &src, 3, 1 << 16);
+        let k = processed(&a.e).max(processed(&b.e));
+        let at = (k + u64::from(RAMP) / B + 100) * B;
+        let at2 = ((at / PAGE + 3) * PAGE).next_multiple_of(B) + 5 * B;
+        let params = [
+            (at, StripParam::Trim { db: -3.0 }),
+            (
+                at,
+                StripParam::Polarity {
+                    leg: 1,
+                    inverted: true,
+                },
+            ),
+            (
+                at,
+                StripParam::Hpf {
+                    enabled: true,
+                    freq: 120.0,
+                },
+            ),
+            (at, StripParam::Eq { enabled: true }),
+            (
+                at,
+                StripParam::EqBand {
+                    band: 2,
+                    value: EqBand {
+                        kind: BandType::Peak,
+                        freq: 1250.0,
+                        gain_db: 9.0,
+                        q: 2.0,
+                    },
+                },
+            ),
+            (
+                at2,
+                StripParam::Gate(GateParams {
+                    enabled: true,
+                    threshold_db: -30.0,
+                    range_db: 20.0,
+                    attack_ms: 1.0,
+                    release_ms: 50.0,
+                }),
+            ),
+            (
+                at2,
+                StripParam::Comp(CompParams {
+                    enabled: true,
+                    threshold_db: -24.0,
+                    ratio: 4.0,
+                    attack_ms: 2.0,
+                    release_ms: 80.0,
+                    knee_db: 0.0,
+                    makeup_db: 3.0,
+                }),
+            ),
+            (at2 + 2 * B, StripParam::DynamicsBeforeEq { enabled: true }),
+            (at2 + 2 * B, StripParam::LegTrim { leg: 0, db: 4.5 }),
+        ];
+        for r in [&a, &b] {
+            for (id, &(at, param)) in params.iter().enumerate() {
+                r.e.append(id as u64 + 1, at, Entry::Strip { slot: 0, param })
+                    .unwrap();
+            }
+            r.e.commit(params.len() as u64);
+        }
+        // A skip leaves a strip's state without the samples skipped.
+        let skipped = |r: &Replica| r.e.counters().overrun_skipped_samples.load(Relaxed);
+        let before = skipped(&a) + skipped(&b);
+        wait_all(&[&a, &b], (at2 + 24 * PAGE) / B);
+        let disturbed: Vec<_> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+        if let Some((from, _)) = disturbed.iter().find(|&&(_, to)| to > at / PAGE) {
+            return Err(format!("page {from} disturbed"));
+        }
+        let after = skipped(&a) + skipped(&b);
+        if after > before {
+            return Err(format!("{} samples skipped", after - before));
+        }
+        let (pa, pb) = (a.pages(), b.pages());
+        let pairs: Vec<_> = pa
+            .iter()
+            .filter_map(|(p, ha)| Some((*ha, *pb.get(p)?)))
+            .filter(|(h, _)| !disturbed.iter().any(|d| (d.0..d.1).contains(&h.page)))
+            .collect();
+        for (ha, hb) in &pairs {
+            assert_eq!(
+                (ha.hash, ha.fingerprint),
+                (hb.hash, hb.fingerprint),
+                "page {}, the first entry in page {}",
+                ha.page,
+                at / PAGE
+            );
+        }
+        let strip_pages = pairs.iter().filter(|h| h.0.page > at / PAGE).count();
+        if strip_pages < 20 {
+            return Err(format!("{strip_pages} pages with the strip compared"));
+        }
+        // The pilot repeats every three pages: the strip changes them,
+        // so no page after the entries hashes as the page three before.
+        let hash = |p: u64| pa.get(&p).map(|h| h.hash);
+        let ends = (at2 + 2 * B) / PAGE + 4;
+        for p in (at / PAGE + 1..ends).filter(|p| hash(*p).is_some()) {
+            if let Some(before) = hash(p - 3 * ((p - at / PAGE) / 3 + 1)) {
+                assert_ne!(hash(p), Some(before), "page {p} unchanged by the strip");
+            }
+        }
+        Ok(())
+    });
+}
+
 /// An entry that changes no sample changes the fingerprint of its page
 /// and not its hash: one engine applies it at one index, the other at
 /// another (restamped), each page holding it differs in fingerprint
