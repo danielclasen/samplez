@@ -290,8 +290,8 @@ impl Audio for EngineAudio {
         let _ = self.engine.set_ranks(ranks);
     }
 
-    fn commit_from(&self, output: usize, min_k: u64) {
-        if let Err(e) = self.engine.commit_from(output, min_k) {
+    fn commit_from(&self, output: usize, min_k: u64, seen: u64) {
+        if let Err(e) = self.engine.commit_from_seen(output, min_k, seen) {
             tracing::warn!(output, error = %e, "the engine refused a commit start");
         }
     }

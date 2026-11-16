@@ -699,7 +699,7 @@ impl Audio for FakeAudio {
         let tai = self.clock.tai_ns();
         self.lock().ranks.push((tai, ranks));
     }
-    fn commit_from(&self, output: usize, min_k: u64) {
+    fn commit_from(&self, output: usize, min_k: u64, seen: u64) {
         let mut st = self.lock();
         if st.commit_starts.last() != Some(&(output, min_k)) {
             st.commit_starts.push((output, min_k));
@@ -707,7 +707,7 @@ impl Audio for FakeAudio {
         if !st.manual
             && let Some(out) = st.outputs.get_mut(output)
         {
-            out.hold.commit_from(min_k);
+            out.hold.commit_from_seen(min_k, seen);
         }
     }
     fn cancel_commit_start(&self, output: usize) {

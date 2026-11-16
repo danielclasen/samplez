@@ -160,8 +160,9 @@ pub trait Audio: Send + Sync + 'static {
     /// before the F they hold for.
     fn ranks(&self, ranks: Ranks);
     /// Output `output` commits from the first page boundary in a block at
-    /// or after `min_k` it computes.
-    fn commit_from(&self, output: usize, min_k: u64);
+    /// or after `min_k` it computes, decided on the statuses up to block
+    /// `seen`: ignored when a block after it was withheld for a cause.
+    fn commit_from(&self, output: usize, min_k: u64, seen: u64);
     /// Drops output `output`'s commit start unless it took.
     fn cancel_commit_start(&self, output: usize);
 }
@@ -1306,7 +1307,7 @@ impl Contact {
             .collect();
         st.verdicts.retain(|&(index, _)| index > known);
         for page in due {
-            life.verdict(page, &st.own, audio.as_ref());
+            life.verdict(page, &st.own, &st.realised, audio.as_ref());
         }
         let ready = self.log.applied() >= st.known_committed && st.generation_ready;
         let baseline = self.log.baseline();
@@ -1962,7 +1963,7 @@ mod tests {
             self.calls.lock().unwrap().push("withdraw".into());
         }
         fn ranks(&self, _: Ranks) {}
-        fn commit_from(&self, _: usize, _: u64) {}
+        fn commit_from(&self, _: usize, _: u64, _: u64) {}
         fn cancel_commit_start(&self, _: usize) {}
     }
 

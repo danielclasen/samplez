@@ -4,12 +4,14 @@
 //! start each of them names. The leader's part is in [`crate::baseline`].
 //!
 //! Every commit start is named to the engine again each report period
-//! until the output takes it, since a withdrawal may drop it, and one a
-//! later decision takes back is cancelled before anything else is named.
+//! until the output takes it, since a withdrawal may drop it, with the
+//! processed block the decision saw: the engine ignores one decided
+//! before a block it withheld for a cause since. One a later decision
+//! takes back is cancelled before anything else is named.
 
 use std::collections::BTreeMap;
 
-use samplez::blocks::{BlockStatus, Cause, Kind, PAGE, Range, Standing};
+use samplez::blocks::{Kind, PAGE, Range, Standing};
 use serde::{Deserialize, Serialize};
 
 use crate::contact::{Audio, Timing};
@@ -39,7 +41,7 @@ impl ReplicaState {
 }
 
 /// Pages kept per voter and output, newest first kept.
-const PAGES_KEPT: usize = 64;
+pub(crate) const PAGES_KEPT: usize = 64;
 
 /// The page hashes every voter reported, by voter, output and page.
 #[derive(Debug, Default)]
@@ -91,30 +93,18 @@ impl PageBook {
     }
 }
 
-/// Whether a `withheld` status is one for a cause (a degradation, a
-/// fence, a skip, `onSilenceOf`), Resume's reference: not the range below
-/// a commit start, not a block a withdrawn replica could not fill, and
-/// not a fill (no digest) withheld because another replica committed the
-/// block or nobody gave evidence for it by its hold cap.
-pub fn for_a_cause(s: &BlockStatus) -> bool {
-    let fill_not_needed =
-        s.digest.is_none() && matches!(s.cause, Cause::OtherDigest | Cause::HoldCap);
-    s.kind == Kind::Withheld
-        && !matches!(s.cause, Cause::None | Cause::Unfillable)
-        && !fill_not_needed
-}
-
-/// The latest block of output `o` `own` reported withheld for a cause; an
-/// idle output gives no status, so its blocks say nothing.
+/// The latest block of output `o` `own` reported withheld for a cause
+/// ([`samplez::blocks::BlockStatus::for_a_cause`]), Resume's reference;
+/// an idle output gives no status, so its blocks say nothing.
 pub fn last_withheld(own: &Own, o: usize) -> Option<u64> {
     if matches!(own.standing.get(o), None | Some(Standing::Idle { .. })) {
         return None;
     }
-    own.statuses
-        .get(o)?
-        .iter()
-        .rev()
-        .find_map(|run| for_a_cause(&run.status).then(|| run.status.k + u64::from(run.count) - 1))
+    own.statuses.get(o)?.iter().rev().find_map(|run| {
+        run.status
+            .for_a_cause()
+            .then(|| run.status.k + u64::from(run.count) - 1)
+    })
 }
 
 /// Whether `own` reported a block at or after `k` withheld for a cause.
@@ -171,6 +161,8 @@ enum Why {
     Named(u64),
     Resume,
     PerOutput,
+    /// The only voter.
+    Alone,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -181,6 +173,8 @@ struct Start {
     end_before: Option<u64>,
     /// The replica filled a stop when it was named.
     filling: bool,
+    /// Resume's reference for the output when it was named.
+    reference: u64,
 }
 
 /// The replica's moves, counted.
@@ -212,6 +206,8 @@ pub(crate) struct Life {
     starts: Vec<Option<Start>>,
     /// Per output: the end of its last commit.
     committed_end: Vec<Option<u64>>,
+    /// Per output: its latest commit start.
+    last_start: Vec<Option<u64>>,
     /// The Named rule's plan under the latest `Baseline` naming this
     /// replica: its P, and the block to commit from once decided.
     named: Option<(u64, Option<u64>)>,
@@ -234,6 +230,7 @@ impl Life {
             withheld: Vec::new(),
             starts: Vec::new(),
             committed_end: Vec::new(),
+            last_start: Vec::new(),
             named: None,
             spent: None,
             fills_counted: Vec::new(),
@@ -254,6 +251,7 @@ impl Life {
         self.starts.resize(outputs, None);
         self.committed_end.resize(outputs, None);
         self.fills_counted.resize(outputs, 0);
+        self.note_starts(v.own);
         let b = v.timing.block;
         if let Some(last) = self.last_tai
             && self.state.demoted()
@@ -295,6 +293,7 @@ impl Life {
         self.note_naming(v, audio);
         self.leave_starting(v);
         self.follow_standing(v);
+        self.lapse(audio);
         self.named_rule(v, audio);
         if v.alone {
             self.alone(v);
@@ -305,12 +304,42 @@ impl Life {
             }
         }
         // Named again until taken: a withdrawal may have dropped it.
+        let seen = v.own.processed.unwrap_or(0);
         for (o, start) in self.starts.iter().enumerate() {
             if let Some(s) = start {
-                audio.commit_from(o, s.min_k);
+                audio.commit_from(o, s.min_k, seen);
             }
         }
         self.metrics.state = Some(self.state);
+    }
+
+    /// Each output's latest commit start.
+    fn note_starts(&mut self, own: &Own) {
+        self.last_start
+            .resize(own.standing.len().max(self.last_start.len()), None);
+        for (o, s) in own.standing.iter().enumerate() {
+            if let Standing::Committing { from } = *s {
+                self.last_start[o] = self.last_start[o].max(Some(from));
+            }
+        }
+    }
+
+    /// Cancels the Resume and per-output commit starts not taken that
+    /// were decided on what no longer holds: a block withheld for a cause
+    /// after Resume's reference, or the replica no longer committing.
+    fn lapse(&mut self, audio: &dyn Audio) {
+        for o in 0..self.starts.len() {
+            let Some(s) = self.starts[o] else { continue };
+            let lapsed = match s.why {
+                Why::Resume => self.reference(o) != s.reference,
+                Why::PerOutput => self.state != ReplicaState::Committing,
+                Why::Named(_) | Why::Alone => false,
+            };
+            if lapsed {
+                self.starts[o] = None;
+                audio.cancel_commit_start(o);
+            }
+        }
     }
 
     /// The commit starts the outputs took.
@@ -436,6 +465,7 @@ impl Life {
                 why: Why::Named(p),
                 end_before: self.committed_end[o],
                 filling,
+                reference: self.reference(o),
             });
         }
     }
@@ -482,9 +512,10 @@ impl Life {
             {
                 self.starts[o] = Some(Start {
                     min_k: processed + 1,
-                    why: Why::PerOutput,
+                    why: Why::Alone,
                     end_before: None,
                     filling: false,
+                    reference: self.reference(o),
                 });
             }
         }
@@ -513,6 +544,7 @@ impl Life {
                     why: Why::Resume,
                     end_before: self.committed_end[o],
                     filling: false,
+                    reference: self.reference(o),
                 });
             }
             Some(false) => self.diverge(audio),
@@ -594,22 +626,29 @@ impl Life {
             why: Why::PerOutput,
             end_before: self.committed_end[o],
             filling: false,
+            reference: self.reference(o),
         });
     }
 
     /// The leader's verdict on `page`, once known committed: diverged,
-    /// unless every committing output's commit start lies after that
-    /// page or the replica is diverged already.
-    pub fn verdict(&mut self, page: u64, own: &Own, audio: &dyn Audio) {
+    /// unless the latest commit start of every realised output that
+    /// committed lies after that page, committing now or not, or the
+    /// replica is diverged already.
+    pub fn verdict(&mut self, page: u64, own: &Own, realised: &[bool], audio: &dyn Audio) {
         if matches!(self.state, ReplicaState::Diverged | ReplicaState::Starting) {
             return;
         }
+        self.note_starts(own);
         let end = (page + 1) * PAGE;
-        let after = own
-            .standing
+        let mut starts = self
+            .last_start
             .iter()
-            .any(|s| matches!(s, Standing::Committing { from } if *from >= end));
-        if after {
+            .enumerate()
+            .filter(|&(o, _)| realised.get(o).copied().unwrap_or(true))
+            .filter_map(|(_, s)| *s)
+            .peekable();
+        let stale = starts.peek().is_some() && starts.all(|from| from >= end);
+        if stale {
             return;
         }
         self.diverge(audio);
@@ -640,7 +679,7 @@ impl Life {
 mod tests {
     use std::sync::Mutex;
 
-    use samplez::blocks::Ranks;
+    use samplez::blocks::{BlockStatus, Cause, Ranks};
 
     use super::*;
     use crate::contact::Sample;
@@ -689,7 +728,7 @@ mod tests {
             self.0.lock().unwrap().push("withdraw".into());
         }
         fn ranks(&self, _: Ranks) {}
-        fn commit_from(&self, output: usize, min_k: u64) {
+        fn commit_from(&self, output: usize, min_k: u64, _: u64) {
             self.0
                 .lock()
                 .unwrap()
@@ -715,22 +754,63 @@ mod tests {
 
     fn step(life: &mut Life, own: &Own, baseline: Option<&Baseline>, calls: &Calls) {
         let pages = PageBook::default();
+        step_with(life, own, baseline, Vec::new(), &pages, calls);
+    }
+
+    fn step_with(
+        life: &mut Life,
+        own: &Own,
+        baseline: Option<&Baseline>,
+        peers: Vec<Seen>,
+        pages: &PageBook,
+        calls: &Calls,
+    ) {
         let timing = Timing::defaults(B);
+        let realised = vec![true; own.standing.len()];
         let v = View {
             me: me(),
             own,
-            realised: &[true],
+            realised: &realised,
             ready: true,
             alone: false,
             baseline,
             excluded: false,
-            peers: Vec::new(),
-            above: Vec::new(),
-            pages: &pages,
+            above: peers.iter().map(|p| p.id).collect(),
+            peers,
+            pages,
             timing: &timing,
             tai: 0,
         };
         life.step(&v, calls);
+    }
+
+    fn peer() -> NodeId {
+        node_id(Slot::Audio(1), 2)
+    }
+
+    fn page(q: u64, committed: bool) -> Page {
+        Page {
+            output: 0,
+            page: q,
+            hash: 1,
+            fingerprint: 1,
+            committed,
+            degraded: false,
+            digest: None,
+        }
+    }
+
+    fn skipped(k: u64) -> BlockStatus {
+        BlockStatus {
+            k,
+            kind: Kind::Withheld,
+            range: Range::Whole,
+            through: false,
+            rank: 0,
+            cause: Cause::Skip,
+            on_silence_of: 0,
+            digest: None,
+        }
     }
 
     fn naming(at_index: u64) -> Baseline {
@@ -848,12 +928,114 @@ mod tests {
         let mut life = Life::new();
         step(&mut life, &committing, None, &calls);
         assert_eq!(life.state(), ReplicaState::Committing);
-        life.verdict(p / PAGE - 1, &committing, &calls);
+        life.verdict(p / PAGE - 1, &committing, &[true], &calls);
         assert_eq!(life.state(), ReplicaState::Committing);
-        life.verdict(p / PAGE, &committing, &calls);
-        life.verdict(p / PAGE + 1, &committing, &calls);
+        life.verdict(p / PAGE, &committing, &[true], &calls);
+        life.verdict(p / PAGE + 1, &committing, &[true], &calls);
         assert_eq!(life.state(), ReplicaState::Diverged);
         assert_eq!(calls.take(), ["withdraw"]);
         assert_eq!(life.metrics.divergences, 1);
+    }
+
+    /// A per-output commit start not taken yet is cancelled once the
+    /// replica no longer commits: a withdrawn replica commits no output
+    /// it named while committing.
+    #[test]
+    fn a_per_output_start_does_not_outlive_a_withdrawal() {
+        let idle = Standing::Idle { since: 0 };
+        let two = |processed, first| Own {
+            processed: Some(processed),
+            standing: vec![first, idle],
+            statuses: vec![Vec::new(), Vec::new()],
+            ..Own::default()
+        };
+        let calls = Calls::default();
+        let mut life = Life::new();
+        step(
+            &mut life,
+            &two(K, Standing::Committing { from: 0 }),
+            None,
+            &calls,
+        );
+        assert_eq!(life.state(), ReplicaState::Committing);
+        assert_eq!(calls.take(), [format!("from 1 {}", K + 1)]);
+        step(
+            &mut life,
+            &two(K + 1, Standing::Withdrawn { since: K + 1 }),
+            None,
+            &calls,
+        );
+        assert_eq!(life.state(), ReplicaState::Withdrawn);
+        assert_eq!(calls.take(), ["cancel 1"]);
+    }
+
+    /// A Resume commit start not taken yet is cancelled once a block is
+    /// withheld for a cause after the reference it was decided on.
+    #[test]
+    fn a_resume_start_lapses_on_a_block_withheld_after_its_reference() {
+        let calls = Calls::default();
+        let mut life = Life::new();
+        let mut withdrawn = own(K, Standing::Withdrawn { since: 0 });
+        step(&mut life, &withdrawn, None, &calls);
+        assert_eq!(life.state(), ReplicaState::Withdrawn);
+        let q = ((K + 1) * B).div_ceil(PAGE);
+        let mut pages = PageBook::default();
+        pages.fold(me(), &[page(q, false)]);
+        pages.fold(peer(), &[page(q, true)]);
+        let other = Own {
+            state: Some(ReplicaState::Committing),
+            ..own(q * PAGE / B + 30, Standing::Committing { from: 0 })
+        };
+        let seen = || {
+            vec![Seen {
+                id: peer(),
+                silent: false,
+                own: &other,
+            }]
+        };
+        withdrawn.processed = Some(q * PAGE / B + 30);
+        step_with(&mut life, &withdrawn, None, seen(), &pages, &calls);
+        assert_eq!(calls.take(), [format!("from 0 {}", q * PAGE / B + 31)]);
+        withdrawn.statuses[0] = runs([Some(skipped(q * PAGE / B + 31))]);
+        withdrawn.processed = Some(q * PAGE / B + 31);
+        step_with(&mut life, &withdrawn, None, seen(), &pages, &calls);
+        assert_eq!(calls.take(), ["cancel 0"]);
+    }
+
+    /// A verdict is ignored only when every output that committed last
+    /// started committing after the page: one output committing since
+    /// before it is enough, and a replica withdrawn since its last commit
+    /// start after the page ignores it.
+    #[test]
+    fn a_verdict_applies_while_another_output_committed_the_page() {
+        let p = 977 * PAGE;
+        let mixed = Own {
+            processed: Some(p / B + 50),
+            standing: vec![
+                Standing::Committing { from: p - PAGE },
+                Standing::Committing { from: p + PAGE },
+            ],
+            statuses: vec![Vec::new(), Vec::new()],
+            ..Own::default()
+        };
+        let calls = Calls::default();
+        let mut life = Life::new();
+        step(&mut life, &mixed, None, &calls);
+        assert_eq!(life.state(), ReplicaState::Committing);
+        life.verdict(p / PAGE, &mixed, &[true, true], &calls);
+        assert_eq!(life.state(), ReplicaState::Diverged);
+
+        let mut life = Life::new();
+        step(
+            &mut life,
+            &own(p / B + 50, Standing::Committing { from: p }),
+            None,
+            &calls,
+        );
+        let withdrawn = own(p / B + 60, Standing::Withdrawn { since: p / B + 60 });
+        step(&mut life, &withdrawn, None, &calls);
+        assert_eq!(life.state(), ReplicaState::Withdrawn);
+        life.verdict(p / PAGE - 1, &withdrawn, &[true], &calls);
+        assert_eq!(life.state(), ReplicaState::Withdrawn, "stale");
     }
 }
