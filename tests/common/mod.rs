@@ -746,6 +746,10 @@ pub fn hold_scenario(e: &Engine) {
     // A core copy for a resync carries the unresolved entry.
     let c = copy_core(e);
     assert!(c.core.unresolved().iter().any(|u| u.0 == 7));
+    // The engine's own core, replayed and handed back to its RT thread.
+    let mut replay = e.replay(c).unwrap();
+    e.hand_over(&mut replay, Duration::from_secs(5)).unwrap();
+    assert_eq!(e.counters().handovers_installed.load(Ordering::Relaxed), 1);
     through(e);
     wait(processed(e) + 5);
     e.resolved(7).unwrap();
@@ -820,4 +824,22 @@ pub fn strip_params(legs: usize) -> Vec<samplez_dsp::StripParam> {
         v.push(StripParam::EqBand { band, value });
     }
     v
+}
+
+/// Runs `scenario` until a run is not disturbed where it must compare
+/// pages, at most four times: a late input read silences a block of one
+/// engine and changes its output there. A run that compared what it
+/// must, and failed, fails the test.
+pub fn undisturbed(scenario: impl Fn() -> Result<(), String>) {
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        match scenario() {
+            Ok(()) => return,
+            Err(why) => {
+                eprintln!("run disturbed ({why}): running it again");
+                seen.push(why);
+            }
+        }
+    }
+    panic!("every run was disturbed: {seen:?}");
 }

@@ -130,31 +130,13 @@ fn both(a: &Replica, b: &Replica) -> Vec<(PageHash, PageHash)> {
         .collect()
 }
 
-/// Runs `scenario` until a run is not disturbed where it must compare
-/// pages, at most four times: a late input read silences a block of one
-/// engine and changes its output there. A run that compared what it
-/// must, and failed, fails the test.
-fn undisturbed(scenario: impl Fn() -> Result<(), String>) {
-    let mut seen = Vec::new();
-    for _ in 0..4 {
-        match scenario() {
-            Ok(()) => return,
-            Err(why) => {
-                eprintln!("run disturbed ({why}): running it again");
-                seen.push(why);
-            }
-        }
-    }
-    panic!("every run was disturbed: {seen:?}");
-}
-
 /// Two engines on the same input and the same log hash every page both
 /// computed alike, with equal fingerprints: whatever their commit mode
 /// (one commits, the other commits nothing), across gain ramps, and with
 /// blocks of 48 samples, so blocks straddle pages.
 #[test]
 fn two_engines_hash_the_pages_both_computed_alike() {
-    undisturbed(|| {
+    common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
         let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -223,7 +205,7 @@ fn two_engines_hash_the_pages_both_computed_alike() {
 #[test]
 fn two_engines_with_strips_hash_the_pages_both_computed_alike() {
     use samplez_dsp::strip::{BandType, CompParams, EqBand, GateParams, StripParam};
-    undisturbed(|| {
+    common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
         let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -358,7 +340,7 @@ fn two_engines_with_strips_hash_the_pages_both_computed_alike() {
 /// alone, and every other page agrees in both.
 #[test]
 fn an_inaudible_entry_changes_the_fingerprint_not_the_hash() {
-    undisturbed(|| {
+    common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
         let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
