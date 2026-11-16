@@ -23,7 +23,7 @@ pub use engine::{
 };
 pub use meters::OutputMeters;
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};
-pub use transfer::{CopyError, Core, CoreCopy, Replay, ReplayError};
+pub use transfer::{CopyError, Core, CoreCopy, ProductState, Replay, ReplayError};
 
 /// The lint probe's lock on a static (CI): its users never name its type.
 #[cfg(samplez_lint_probe = "samplez")]

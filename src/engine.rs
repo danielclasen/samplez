@@ -34,7 +34,10 @@ use crate::rt_loop::{
     Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared, Slot, SlotStats,
     Telemetry, UNRESOLVED,
 };
-use crate::transfer::{Answer, CopyError, Core, CoreCopy, Handover, Replay, ReplayError};
+use crate::transfer::{
+    Answer, CopyError, Core, CoreCopy, Handover, ProductState, Replay, ReplayError, SlotCore,
+    change_of,
+};
 
 const COMMAND_RING: usize = 64;
 const RETURN_RING: usize = 64;
@@ -188,7 +191,8 @@ pub enum GainError {
     /// `MAX_GAIN`, no such slot or a strip parameter it does not take, or
     /// an index that is not a multiple of the block size.
     Invalid(String),
-    /// `at_index` is below `earliest`, the first index the engine accepts.
+    /// `at_index` is below `earliest`, the first index the engine
+    /// accepts, a multiple of the block size.
     TooNear { at_index: u64, earliest: u64 },
     /// [`PENDING_CHANGES`] entries are outstanding.
     Full,
@@ -707,7 +711,9 @@ fn replay_rt(
         last_entry: 0,
         taken: 0,
         skip_upto: 0,
+        install_at: 0,
         replay: true,
+        core: true,
         cmd: none(),
         entries: none(),
         ret: sink(),
@@ -1028,7 +1034,9 @@ impl Engine {
             last_entry: 0,
             taken: 0,
             skip_upto: 0,
+            install_at: 0,
             replay: false,
+            core: true,
             cmd: cmd_rx,
             entries: entry_rx,
             ret: ret_tx,
@@ -1315,7 +1323,9 @@ impl Engine {
                 "{what} come from the replicated log"
             )));
         }
-        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead);
+        // A block start, as the index must be: equivalent for the check.
+        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead)
+            .next_multiple_of(self.block);
         if at_index < earliest {
             return Err(GainError::TooNear { at_index, earliest });
         }
@@ -1338,8 +1348,15 @@ impl Engine {
     /// gain change and past the engine's last `InputUp` or `Route`, so one
     /// generation is built at a time and each before its index. A flow
     /// that cannot be read is silent and reported as pruned. Refused as
-    /// invalid on an engine that follows a replicated log.
+    /// invalid on an engine that follows a replicated log, and for an
+    /// `at_index` that is not a multiple of the block size.
     pub fn route(&self, slot: usize, flow_id: &str, at_index: u64) -> Result<u64, EntryError> {
+        if !at_index.is_multiple_of(self.block) {
+            return Err(EntryError::Invalid(format!(
+                "at_index {at_index} is not a multiple of the block size {}",
+                self.block
+            )));
+        }
         self.config
             .check_input_flow(slot, flow_id)
             .map_err(|e| EntryError::Invalid(e.0))?;
@@ -1749,10 +1766,144 @@ impl Engine {
     /// state followed. The unresolved entries become the replay's.
     /// [`ReplayError::Missed`] when the RT thread took an entry off its
     /// pending list that the replay does not know: append it, then hand
-    /// over again. An answer to a call that timed out is taken by the
-    /// next call: if that hand-over was installed, the unresolved entries
-    /// become its core's.
+    /// over again, or, once the replay computed past the entry's index,
+    /// copy a new core and replay from it. An answer to a call that timed
+    /// out is taken by the next call: if that hand-over was installed, the
+    /// unresolved entries become its core's.
     pub fn hand_over(&self, replay: &mut Replay, timeout: Duration) -> Result<u64, ReplayError> {
+        // Up to the last block the RT thread computed, before the first
+        // attempt.
+        replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
+        self.offer(timeout, true, |j, core| {
+            replay.run(j);
+            replay.rt.capture(core);
+            (replay.next - 1, replay.last_id)
+        })
+    }
+
+    /// Replicated mode with more than one voter: drops the RT thread's
+    /// core. The RT thread keeps its writers, hold rings and statuses but
+    /// computes no block: each is withheld, cause [`Cause::NoCore`], and
+    /// the replica is withdrawn, until [`Engine::install_product`] or
+    /// [`Engine::hand_over`] installs a core.
+    pub fn drop_core(&self) -> Result<(), ControlError> {
+        if self.transfer.is_none() {
+            return Err(ControlError::Invalid(
+                "the engine is not replicated with more than one voter".to_owned(),
+            ));
+        }
+        self.control(Control::DropCore)
+    }
+
+    /// Replicated mode with more than one voter: builds a core from
+    /// `state` off the RT thread, its targets at their values, its fades
+    /// and ramps cold, its pending entries, and installs it at a block
+    /// boundary as a replay is handed over, the RT thread keeping the
+    /// generation it holds pending. Returns the block the core followed. The core holds no
+    /// unresolved entry: the caller adds the ones still unresolved with
+    /// [`Engine::unresolved`] after the install. While no core is held the
+    /// RT thread takes the entries needing no generation whose index
+    /// passed off its pending list, applying only strip entries, to the
+    /// strips the slots keep; [`ReplayError::Missed`] when it took one
+    /// above `state.last_id`.
+    pub fn install_product(
+        &self,
+        state: &ProductState,
+        timeout: Duration,
+    ) -> Result<u64, ReplayError> {
+        let (n, m) = self.shape;
+        let slots = self.config.inputs.len();
+        if state.gains.len() != n
+            || state.gains.iter().any(|row| row.len() != m)
+            || state.up.len() != slots
+        {
+            return Err(ReplayError::Invalid(format!(
+                "a product state of the shape {n} x {m} with {slots} inputs"
+            )));
+        }
+        let mut pending = Vec::with_capacity(state.pending.len());
+        for (id, at_index, entry) in &state.pending {
+            pending.push(RtEntry {
+                id: *id,
+                at_index: *at_index,
+                change: change_of(entry),
+            });
+        }
+        pending.sort_by_key(|e| (e.at_index, e.id));
+        if pending.len() > PENDING_CHANGES {
+            return Err(ReplayError::Full);
+        }
+        self.offer(timeout, false, |j, core| {
+            for (i, row) in state.gains.iter().enumerate() {
+                for (o, &g) in row.iter().enumerate() {
+                    let _ = core.matrix.set(i, o, g, 0);
+                }
+            }
+            // The entries whose index the install passed are folded in
+            // like the rest of the state: reported late they would never
+            // apply.
+            let next = (j + 1) * self.block;
+            let passed = pending.partition_point(|e| e.at_index < next);
+            let mut up = state.up.clone();
+            for e in &pending[..passed] {
+                match e.change {
+                    Change::Gain {
+                        input,
+                        output,
+                        gain,
+                    } => {
+                        let _ = core.matrix.set(input, output, gain, 0);
+                    }
+                    Change::InputDown { slot } => up[slot] = false,
+                    Change::InputUp { slot } => up[slot] = true,
+                    // The core holds neither a generation nor a strip:
+                    // the RT thread applies a passed re-route or strip
+                    // entry itself, taken before the install or after.
+                    Change::Route { .. } | Change::Strip { .. } => {}
+                }
+            }
+            core.pos = Some(next);
+            core.ramp_end = 0;
+            core.pending.clear();
+            core.pending.extend_from_slice(&pending[passed..]);
+            core.page_entries.clear();
+            core.entries_page = None;
+            core.entries_lost = false;
+            for (c, &up) in core.slots.iter_mut().zip(&up) {
+                *c = SlotCore {
+                    up,
+                    held: false,
+                    fade_start: None,
+                    silenced_last: true,
+                    xfade: None,
+                };
+            }
+            core.awaiting_gen.clear();
+            // The RT thread keeps the generation it holds pending: the
+            // supervisor sends one only once its entry is committed, so
+            // the status can name one the RT thread does not hold yet.
+            core.pending_gen = None;
+            core.unresolved.clear();
+            core.late_routes.clear();
+            core.late_lost_until = 0;
+            (j, state.last_id)
+        })
+    }
+
+    /// Passes the cores `make` fills to the RT thread until one is
+    /// installed or `timeout` passes. The RT thread installs a core only
+    /// before the block after the core's: each attempt waits for it to
+    /// compute a block, has `make` fill a core for that block at once and
+    /// passes it on before the RT thread's next wake. `make` returns the
+    /// block the core follows and the highest log id it knew. With
+    /// `names_gen` the core must name the pending generation the RT
+    /// thread holds.
+    fn offer(
+        &self,
+        timeout: Duration,
+        names_gen: bool,
+        mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
+    ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
             return Err(ReplayError::Invalid(
                 "the engine is not replicated with more than one voter".to_owned(),
@@ -1765,9 +1916,12 @@ impl Engine {
         let mut core = t.spare.take().unwrap_or_else(new);
         // Hand-overs before this one were sent by earlier calls.
         let first = t.seq + 1;
-        let poll =
-            Duration::from_nanos(self.block * 1_000_000_000 / samplez_mxl::SAMPLE_RATE as u64 / 16);
+        let period =
+            Duration::from_nanos(self.block * 1_000_000_000 / samplez_mxl::SAMPLE_RATE as u64);
+        let poll = period / 16;
         let processed = || self.counters.processed.load(Acquire);
+        // This call's hand-overs refused for a block the RT thread passed.
+        let mut passed = 0;
         loop {
             // The RT thread answers at its next wake. One unanswered for a
             // second can only be refused: the RT thread is then past its
@@ -1777,7 +1931,7 @@ impl Engine {
                 let Ok(h) = t.handed.pop() else {
                     if asked.elapsed() > Duration::from_secs(1) {
                         t.spare = Some(core);
-                        return Err(ReplayError::Timeout);
+                        return Err(ReplayError::Timeout { passed });
                     }
                     std::thread::sleep(poll);
                     continue;
@@ -1800,35 +1954,44 @@ impl Engine {
                         t.spare = Some(h.core);
                         return Err(ReplayError::Missed { id });
                     }
-                    Answer::Passed | Answer::Generation | Answer::Waiting => {}
+                    Answer::Passed => passed += 1,
+                    Answer::Generation | Answer::Waiting => {}
                 }
                 core = h.core;
             }
             if Instant::now() >= deadline {
                 t.spare = Some(core);
-                return Err(ReplayError::Timeout);
+                return Err(ReplayError::Timeout { passed });
             }
-            // Up to the last block the RT thread computed, then the step
-            // to the next one: the RT thread sleeps after it until its
-            // next wake, which installs a core for that block.
+            // The step to the next block: the RT thread sleeps after it
+            // until its next wake, which installs a core for that block,
+            // about one block period later. A sleep could take most of
+            // that: the step is waited for by yielding, for one block
+            // period, the longest a running RT thread takes to step. Past
+            // that the RT thread is stalled, and a sixteenth of a period
+            // is slept between looks, so the wait does not spend the CPU
+            // a stalled RT thread may be waiting for.
             let p = processed();
-            replay.run(p.saturating_sub(1));
-            let p = processed();
+            let waiting = Instant::now();
             while processed() == p {
                 if Instant::now() >= deadline {
                     t.spare = Some(core);
-                    return Err(ReplayError::Timeout);
+                    return Err(ReplayError::Timeout { passed });
                 }
-                std::thread::sleep(poll);
+                if waiting.elapsed() < period {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(poll);
+                }
             }
-            replay.run(processed().saturating_sub(1));
-            replay.rt.capture(&mut core);
+            let (j, last_id) = make(processed().saturating_sub(1), &mut core);
             t.seq += 1;
             let h = Handover {
                 seq: t.seq,
-                j: replay.next - 1,
-                last_id: replay.last_id,
+                j,
+                last_id,
                 core,
+                names_gen,
                 answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
@@ -1874,7 +2037,9 @@ impl Engine {
             )));
         }
         let mut tx = self.resets.lock().expect("reset lock");
-        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead);
+        // A block start, as the index must be: equivalent for the check.
+        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead)
+            .next_multiple_of(self.block);
         if at_index < earliest {
             return Err(ResetError::TooNear { at_index, earliest });
         }
@@ -4130,7 +4295,7 @@ mod tests {
         let mut log = e.log.lock().unwrap();
         let entry = RtEntry {
             id: log.last + 1,
-            at_index: earliest(&e.api, &e.counters, e.margin, e.lead),
+            at_index: earliest(&e.api, &e.counters, e.margin, e.lead).next_multiple_of(e.block),
             change: Change::Strip {
                 slot: 0,
                 param: refused,
@@ -4162,6 +4327,7 @@ mod tests {
     /// state after a later block with an older one.
     #[test]
     fn a_handover_the_rt_thread_passed_is_refused() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let (e, _statuses, _verdicts, domain) = outputs_only("handover-passed", 1);
         let copy = loop {
             match e.copy_core(Duration::from_secs(2)) {
@@ -4176,6 +4342,7 @@ mod tests {
             j: copy.k0,
             last_id: copy.last_id,
             core: copy.core,
+            names_gen: true,
             answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
@@ -4193,11 +4360,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(domain);
     }
 
+    /// Blocks a late wake skips while no core is held are not computed
+    /// for want of a core, as every other block then: they are reported
+    /// as such in one gapless run of ranges, not as a skip.
+    #[test]
+    fn a_skip_without_a_core_is_reported_as_no_core() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, statuses, _verdicts, domain) = outputs_only("no-core-skip", 1);
+        let c = &e.counters;
+        e.drop_core().unwrap();
+        wait(&|| c.blocks_without_core.load(Relaxed) > 5);
+        // Changes from before the drop, a skip under load among them.
+        statuses.try_iter().for_each(drop);
+        let skipped = c.overrun_skipped_samples.load(Relaxed);
+        // A stall of 40 blocks, past maxCatchupBlocks. An RT thread of a
+        // test holding no engine lock may take the stall: it is set again
+        // until one is seen.
+        let mut ranges = Vec::new();
+        let t = Instant::now();
+        while !ranges.iter().any(|&(from, to)| to - from >= 20) {
+            assert!(t.elapsed() < Duration::from_secs(10), "no stall");
+            if crate::rt_loop::STALL_MS.load(Relaxed) == 0 {
+                crate::rt_loop::STALL_MS.store(40, Relaxed);
+            }
+            match statuses.recv_timeout(Duration::from_millis(200)) {
+                Ok(StatusChange::NoCore { from, to }) => ranges.push((from, to)),
+                Ok(StatusChange::Skipped { from, to }) => panic!("skipped {from}..{to}"),
+                _ => {}
+            }
+        }
+        crate::rt_loop::STALL_MS.store(0, Relaxed);
+        assert!(ranges.windows(2).all(|w| w[0].1 == w[1].0), "{ranges:?}");
+        assert_eq!(c.overrun_skipped_samples.load(Relaxed), skipped);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// The earliest index a refusal as too near names is a block start, so
+    /// a caller can retry with it; while the RT thread is behind, the
+    /// clock less the reader margin sets it, at any sample.
+    #[test]
+    fn too_near_names_a_block_start() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let domain = std::env::temp_dir().join(format!("samplez-too-near-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0b", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0c", "label": "near",
+                          "group": "near", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let process = rt::setup_process(&config.rt);
+        let e = Engine::start(config, process, None).unwrap();
+        wait(&|| e.counters.processed.load(Acquire) > 10);
+        crate::rt_loop::STALL_MS.store(300, Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+        let mut named = Vec::new();
+        for _ in 0..8 {
+            match e.set_gain(0, 0, 0.5, 0) {
+                Err(GainError::TooNear { earliest, .. }) => named.push(earliest),
+                other => panic!("{other:?}"),
+            }
+            match e.reset_loudness(0, 0) {
+                Err(ResetError::TooNear { earliest, .. }) => named.push(earliest),
+                other => panic!("{other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        crate::rt_loop::STALL_MS.store(0, Relaxed);
+        assert!(named.iter().all(|x| x % e.block == 0), "{named:?}");
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// An entry applied before its generation arrived keeps waiting for it
+    /// across an install, its slot held: a product core holds no
+    /// generation and an empty awaiting list, so cleared here the
+    /// generation would be returned unused when it came, and the slot
+    /// would stay on the old flow that every other replica left.
+    #[test]
+    fn an_install_keeps_an_entry_waiting_for_its_generation() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("install-awaiting", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0d", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0e", "label": "await",
+                          "group": "await", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        let route = RtEntry {
+            id: 5,
+            at_index: 96,
+            change: Change::Route { slot: 0 },
+        };
+        rt.awaiting_gen.push(route);
+        rt.slots[0].held = true;
+        rt.install_core(&core, 5);
+        assert_eq!(rt.awaiting_gen, [route]);
+        assert!(rt.slots[0].held);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Without a core a strip entry whose index passed still reaches its
+    /// slot's strip, which the slot keeps across the drop: a core
+    /// installed later holds no strip, so the entry would be lost.
+    #[test]
+    fn a_strip_entry_due_without_a_core_reaches_the_strip() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("no-core-strip", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d09", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d0a", "label": "strip",
+                          "group": "strip", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let param = StripParam::Trim { db: -6.0 };
+        let entry = |id, at_index, change| RtEntry {
+            id,
+            at_index,
+            change,
+        };
+        assert!(rt.mix.push(entry(1, 48, Change::Strip { slot: 0, param })));
+        assert!(rt.mix.push(entry(2, 96, Change::InputDown { slot: 0 })));
+        assert!(rt.mix.push(entry(3, 960, Change::InputDown { slot: 0 })));
+        rt.pass_entries(2);
+        let ids: Vec<LogId> = rt.mix.pending.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [3]);
+        assert_eq!(rt.mix.last_taken, 2);
+        assert!(rt.slots[0].up, "an entry other than a strip entry applied");
+        let mut reference = samplez_dsp::Strip::new(1, config.ramp_samples);
+        assert!(reference.set(param));
+        assert_eq!(rt.slots[0].strip.as_ref(), Some(&reference));
+        assert_eq!(rt.slots[0].strip_pos, Some(48));
+        assert_eq!(rt.counters.entries_without_core.load(Relaxed), 2);
+
+        // A strip entry the core knew, pending here, whose index the core
+        // passed: the core holds no strip, so it applies at the install.
+        let gain = StripParam::Trim { db: -3.0 };
+        assert!(rt.mix.push(entry(
+            4,
+            192,
+            Change::Strip {
+                slot: 0,
+                param: gain
+            }
+        )));
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        rt.install_core(&core, 4);
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.slots[0].strip_pos, Some(192));
+        let mut set = samplez_dsp::Strip::new(1, config.ramp_samples);
+        assert!(set.set(param));
+        set.advance(192 - 48);
+        assert!(set.set(gain));
+        assert_eq!(rt.slots[0].strip.as_ref(), Some(&set));
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
     /// The answer to a hand-over whose caller gave up goes to the next
     /// call, which does not take it for its own: that call installs its
     /// own core.
     #[test]
     fn a_late_answer_is_not_taken_for_the_next_handover() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let (e, _statuses, _verdicts, domain) = outputs_only("handover-late", 1);
         let copy = || loop {
             match e.copy_core(Duration::from_secs(2)) {
@@ -4208,6 +4572,7 @@ mod tests {
         let n = |c: &AtomicU64| c.load(Relaxed);
         let processed = || e.counters.processed.load(Acquire);
         // An earlier call's hand-over, installed once that call gave up.
+        let mut stale = 0;
         while n(&e.counters.handovers_installed) == 0 {
             let mut replay = e.replay(copy()).unwrap();
             let mut t = e.transfer.as_ref().unwrap().lock().unwrap();
@@ -4220,11 +4585,13 @@ mod tests {
             replay.run(processed() - 1);
             replay.rt.capture(&mut core);
             t.seq += 1;
+            stale = replay.next - 1;
             let h = Handover {
                 seq: t.seq,
-                j: replay.next - 1,
+                j: stale,
                 last_id: replay.last_id,
                 core,
+                names_gen: true,
                 answer: Answer::Waiting,
             };
             assert!(t.handovers.push(h).is_ok());
@@ -4241,10 +4608,111 @@ mod tests {
             }
         }
         let mut replay = e.replay(copy()).unwrap();
-        let next = replay.next_block();
         let j = e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
-        assert!(j >= next, "the late answer's block {j} returned");
+        assert_ne!(j, stale, "the late answer's block returned");
         assert_eq!(n(&e.counters.handovers_installed), 2);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A core is filled only for a block the RT thread has computed: the
+    /// clock runs on while the RT thread stalls, so a core for the newest
+    /// block due would follow a block the RT thread has not computed, and
+    /// install a state ahead of the one it computes from. `processed` is
+    /// read inside `make`, so the RT thread's steps after the stall can
+    /// only make it larger.
+    #[test]
+    fn a_core_is_filled_only_for_a_block_the_rt_thread_computed() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("handover-stall", 1);
+        let processed = || e.counters.processed.load(Acquire);
+        wait(&|| processed() > 10);
+        crate::rt_loop::STALL_MS.store(300, Relaxed);
+        // The RT thread is in the stall once it stops computing.
+        let still = |p: u64| {
+            std::thread::sleep(Duration::from_millis(20));
+            processed() == p
+        };
+        let t = Instant::now();
+        while !still(processed()) {
+            assert!(t.elapsed() < Duration::from_secs(5), "no stall");
+        }
+        let mut calls = Vec::new();
+        let _ = e.offer(Duration::from_secs(1), true, |j, _| {
+            calls.push((j, processed()));
+            (j, 0)
+        });
+        assert!(!calls.is_empty());
+        for &(j, p) in &calls {
+            assert!(j < p, "a core after block {j} with {p} computed");
+        }
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A hand-over waiting for a stalled RT thread to step sleeps between
+    /// looks after one block period of yielding: a spin for the whole
+    /// timeout would spend the CPU quota the RT thread shares.
+    #[test]
+    fn a_handover_waiting_on_a_stalled_rt_thread_spends_little_cpu() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("handover-cpu", 1);
+        let processed = || e.counters.processed.load(Acquire);
+        wait(&|| processed() > 10);
+        crate::rt_loop::STALL_MS.store(600, Relaxed);
+        let t = Instant::now();
+        loop {
+            let p = processed();
+            std::thread::sleep(Duration::from_millis(20));
+            if processed() == p {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(5), "no stall");
+        }
+        let cpu = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: a valid clock id and a timespec to write.
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) },
+                0
+            );
+            Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        };
+        let before = cpu();
+        let err = e.offer(Duration::from_millis(300), true, |j, _| (j, 0));
+        let spent = cpu() - before;
+        assert!(matches!(err, Err(ReplayError::Timeout { .. })), "{err:?}");
+        assert!(spent < Duration::from_millis(100), "{spent:?} of CPU");
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A call that times out names how many of its hand-overs came back
+    /// refused for a block the RT thread passed, so a resync budget can be
+    /// judged against it.
+    #[test]
+    fn a_timed_out_handover_names_its_passed_refusals() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("handover-timeout", 1);
+        let before = e.counters.handovers_passed.load(Relaxed);
+        // Each core follows a block two behind the last one computed:
+        // every attempt is refused.
+        let err = e.offer(Duration::from_millis(300), true, |j, _| {
+            (j.saturating_sub(2), 0)
+        });
+        let refused = e.counters.handovers_passed.load(Relaxed) - before;
+        let Err(ReplayError::Timeout { passed }) = err else {
+            panic!("{err:?}");
+        };
+        assert!(passed > 0);
+        // The last attempt's answer may come after the call gave up.
+        assert!(
+            refused == passed || refused == passed + 1,
+            "{refused} {passed}"
+        );
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

@@ -11,8 +11,10 @@ use common::{
     B, Domain, Pilot, copy_core as copy, new_id, processed, start_held, start_held_with, wait_for,
 };
 use common::{MARGIN, config, diagonal};
-use samplez::blocks::{PAGE, PageHash};
-use samplez::{BlockVerdict, CopyError, Engine, Entry, InputState, ReplayError, Replication};
+use samplez::blocks::{PAGE, PageHash, StatusChange};
+use samplez::{
+    BlockVerdict, CopyError, Engine, Entry, InputState, ProductState, ReplayError, Replication,
+};
 
 /// The copy holds the state after block k0: entries due by then applied
 /// with their ramps run out, later ones pending, the input's log state,
@@ -108,6 +110,7 @@ struct Hashed {
     e: Engine,
     hashes: Receiver<PageHash>,
     verdicts: Receiver<BlockVerdict>,
+    statuses: Receiver<StatusChange>,
 }
 
 /// Samples of a gain ramp: about two pages, so the pages a ramp runs
@@ -126,11 +129,12 @@ fn hashed(domain: &Domain, src: &str) -> Hashed {
     let (report_tx, _reports) = sync_channel(64);
     let (hash_tx, hashes) = sync_channel(1 << 16);
     let (verdict_tx, verdicts) = sync_channel(1 << 16);
+    let (status_tx, statuses) = sync_channel(1 << 16);
     let process = samplez::rt::setup_process(&config.rt);
     let replication = Replication {
         voters: 2,
         reports: report_tx,
-        statuses: None,
+        statuses: Some(status_tx),
         hashes: Some(hash_tx),
     };
     let e = Engine::start_replicated(config, process, Some(verdict_tx), replication).unwrap();
@@ -142,6 +146,7 @@ fn hashed(domain: &Domain, src: &str) -> Hashed {
         e,
         hashes,
         verdicts,
+        statuses,
     }
 }
 
@@ -172,8 +177,9 @@ fn touched(ks: &[u64]) -> Vec<u64> {
 
 /// Hand-overs refused because the RT thread had passed their block
 /// before one landed: each attempt runs the replay up to the block the
-/// RT thread just computed and passes it on before the next wake, so
-/// only a supervisor thread held off the CPU for a block period misses.
+/// RT thread just computed and passes it on before the next wake, about
+/// one block period later, so only a supervisor thread held off the CPU
+/// for that long misses. A run with more runs again.
 const MAX_PASSED: u64 = 10;
 
 fn gain(e: &Engine, id: u64, at: u64, channel: usize, gain: f32) {
@@ -248,7 +254,9 @@ fn a_replayed_core_computes_the_donors_pages() {
         let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
         assert!(j > past2, "handed over at block {j}");
         let passed = b.e.counters().handovers_passed.load(Relaxed);
-        assert!(passed < MAX_PASSED, "{passed} hand-overs passed");
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
         let end = (at3 + u64::from(RAMP)) / B + 4 * PAGE / B;
         wait_for(Duration::from_secs(10), "entry 3 ramped", || {
             processed(&a.e) > end && processed(&b.e) > end
@@ -363,7 +371,9 @@ fn an_entry_the_replay_applied_is_not_taken_again() {
         let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
         assert!(j * B > at, "handed over at block {j}");
         let passed = b.e.counters().handovers_passed.load(Relaxed);
-        assert!(passed < MAX_PASSED, "{passed} hand-overs passed");
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
         let late = b.e.counters().command_late.load(Relaxed);
         gain(&b.e, 1, at, 0, 0.5);
         let end = j + 4 * PAGE / B;
@@ -436,4 +446,434 @@ fn a_replay_names_its_silenced_blocks() {
     assert_eq!(replay.silenced(), (k0 + 1..k0 + 11).collect::<Vec<_>>());
     assert_eq!(replay.silenced(), Vec::<u64>::new());
     b.e.stop();
+}
+
+/// With its core dropped the RT thread computes no block: each is
+/// withheld, cause no core, the ranges sent without a gap, and none is
+/// written or metered. A core built from product state is installed at a
+/// block boundary: computing resumes at the block after it, never a block
+/// twice, with the product's targets in place and no ramp to them.
+#[test]
+fn a_dropped_core_withholds_until_a_product_core_is_installed() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    h.e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 50
+    });
+    // The block counter moves on: a hand-over waits for its steps.
+    let p = processed(&h.e);
+    wait_for(Duration::from_secs(5), "blocks passed", || {
+        processed(&h.e) > p + 20
+    });
+    // Entries whose index passed are taken off the pending list: a full
+    // log takes entries again.
+    let entry = Entry::Gain {
+        input: 0,
+        output: 0,
+        gain: 0.5,
+    };
+    let at = (processed(&h.e) + 5) * B;
+    for id in 1..=64 {
+        h.e.append(id, at, entry.clone()).unwrap();
+    }
+    h.e.commit(64);
+    wait_for(Duration::from_secs(5), "entries taken", || {
+        c.entries_consumed.load(Relaxed) == 64
+    });
+    h.e.append(65, at, entry).unwrap();
+    h.e.commit(65);
+    wait_for(Duration::from_secs(5), "entry 65 taken", || {
+        c.entries_without_core.load(Relaxed) == 65
+    });
+    // A core must know them.
+    let mut state = ProductState {
+        gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
+        up: vec![true],
+        pending: Vec::new(),
+        last_id: 0,
+    };
+    assert_eq!(
+        h.e.install_product(&state, Duration::from_secs(2)),
+        Err(ReplayError::Missed { id: 65 })
+    );
+    state.last_id = 65;
+    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    // At the targets from the first block on, with no ramp to them.
+    let core = common::copy_core(&h.e).core;
+    assert_eq!(
+        (core.gain(0, 0), core.gain(1, 1), core.gain(0, 1)),
+        (0.25, 0.5, 0.0)
+    );
+    assert!(core.input_up(0));
+    wait_for(Duration::from_secs(5), "computing again", || {
+        processed(&h.e) > j + 20
+    });
+
+    let ranges: Vec<(u64, u64)> = h
+        .statuses
+        .try_iter()
+        .filter_map(|s| match s {
+            StatusChange::NoCore { from, to } => Some((from, to)),
+            _ => None,
+        })
+        .collect();
+    assert!(!ranges.is_empty());
+    assert!(ranges.windows(2).all(|w| w[0].1 == w[1].0), "{ranges:?}");
+    let (from, to) = (ranges[0].0, ranges.last().unwrap().1);
+    assert_eq!(
+        to,
+        j + 1,
+        "the last block without a core is the one installed after"
+    );
+    let computed: Vec<u64> = h.verdicts.try_iter().map(|v| v.k).collect();
+    assert!(
+        computed.iter().all(|k| !(from..to).contains(k)),
+        "a block without a core computed"
+    );
+    assert!(computed.contains(&(j + 1)) && computed.contains(&(from - 1)));
+    h.e.stop();
+}
+
+/// A re-route whose index passes while no core is held is applied once a
+/// product core that folds it in is installed: its generation is swapped
+/// in, as on every replica that computed it, where it was held pending
+/// for good before.
+#[test]
+fn a_route_passed_without_a_core_applies_at_the_install() {
+    let domain = Domain::new();
+    let (src, other) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let _other = Pilot::start(&domain.0, &other, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    h.e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 5
+    });
+    let at = (processed(&h.e) + 200) * B;
+    let route = Entry::Route {
+        slot: 0,
+        flow_id: other.clone(),
+    };
+    h.e.append(1, at, route).unwrap();
+    wait_for(Duration::from_secs(5), "generation built", || {
+        h.e.status().generation.ready
+    });
+    h.e.commit(1);
+    wait_for(Duration::from_secs(5), "index passed", || {
+        processed(&h.e) > at / B + 10
+    });
+    let state = ProductState {
+        gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        pending: Vec::new(),
+        last_id: 1,
+    };
+    let late = c.command_late.load(Relaxed);
+    h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    wait_for(Duration::from_secs(5), "routed", || {
+        let s = h.e.status();
+        s.inputs[0].flow_id == other && s.generation.pending.is_none()
+    });
+    assert_eq!(c.command_late.load(Relaxed), late);
+    h.e.stop();
+}
+
+/// A product state's pending entry whose index the install block passed
+/// is folded into the targets: left pending it would be reported late
+/// and never apply.
+#[test]
+fn a_product_entry_the_install_passed_is_folded_in() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    h.e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 5
+    });
+    // Due in a block computed already when the state is built.
+    let at = (processed(&h.e) - 1) * B;
+    let state = ProductState {
+        gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        pending: vec![(
+            1,
+            at,
+            Entry::Gain {
+                input: 0,
+                output: 0,
+                gain: 0.5,
+            },
+        )],
+        last_id: 1,
+    };
+    let late = c.command_late.load(Relaxed);
+    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    assert!(j * B >= at, "installed after block {j}");
+    wait_for(Duration::from_secs(5), "computing", || {
+        processed(&h.e) > j + 5
+    });
+    let core = common::copy_core(&h.e).core;
+    assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.5, 1.0));
+    assert_eq!(c.command_late.load(Relaxed), late);
+    h.e.stop();
+}
+
+/// A strip entry the replay applied, which reaches the joiner's RT thread
+/// only after the hand-over, still sets the joiner's strip: the core
+/// holds no strip, so skipped as known it would leave the strip at its
+/// old setting for good, every page after differing from the donor's
+/// with equal fingerprints.
+#[test]
+fn a_strip_entry_the_replay_applied_still_reaches_the_strip() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        let mut replay = b.e.replay(copy(&a.e)).unwrap();
+        let at = (now_block() + 20) * B;
+        let strip = Entry::Strip {
+            slot: 0,
+            param: samplez_dsp::StripParam::Trim { db: -6.0 },
+        };
+        a.e.append(1, at, strip.clone()).unwrap();
+        a.e.commit(1);
+        replay.append(1, at, &strip).unwrap();
+        let past = (at + u64::from(RAMP)) / B + PAGE / B;
+        while now_block() <= past + MARGIN / B + 2 {
+            std::thread::sleep(Duration::from_millis(5));
+            replay.run_to(now_block());
+        }
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        assert!(j * B > at, "handed over at block {j}");
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        let late = b.e.counters().command_late.load(Relaxed);
+        b.e.append(1, at, strip).unwrap();
+        b.e.commit(1);
+        let from = processed(&b.e) + 2;
+        assert_same_within(&a, &b, from * B, from * B + 4 * PAGE)?;
+        assert_eq!(b.e.counters().command_late.load(Relaxed), late);
+        Ok(())
+    });
+}
+
+/// Every page both engines computed whole within `[from, to)` hashes
+/// alike, each of them compared; a run where one is disturbed or
+/// missing runs again.
+fn assert_same_within(a: &Hashed, b: &Hashed, from: u64, to: u64) -> Result<(), String> {
+    let end = to.div_ceil(B) + PAGE / B;
+    wait_for(Duration::from_secs(10), "pages compared", || {
+        processed(&a.e) > end && processed(&b.e) > end
+    });
+    let (pa, pb) = (a.pages(), b.pages());
+    let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+    for p in from.div_ceil(PAGE)..to / PAGE {
+        if disturbed.contains(&p) {
+            return Err(format!("page {p} disturbed"));
+        }
+        let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+            return Err(format!("page {p} not hashed by both"));
+        };
+        assert_eq!(
+            (hb.hash, hb.fingerprint),
+            (ha.hash, ha.fingerprint),
+            "page {p}"
+        );
+    }
+    Ok(())
+}
+
+/// A strip entry a product state folds in, which reaches the RT thread
+/// only after the install, still sets the strip, as on the engines that
+/// applied it at its index.
+#[test]
+fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        b.e.drop_core().unwrap();
+        let at = (now_block() + 20) * B;
+        let strip = Entry::Strip {
+            slot: 0,
+            param: samplez_dsp::StripParam::Trim { db: -6.0 },
+        };
+        a.e.append(1, at, strip.clone()).unwrap();
+        a.e.commit(1);
+        // Appended, committed only after the install.
+        b.e.append(1, at, strip.clone()).unwrap();
+        wait_for(Duration::from_secs(5), "index passed", || {
+            processed(&b.e) > (at + u64::from(RAMP)) / B + 2
+        });
+        let state = ProductState {
+            gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            up: vec![true],
+            pending: vec![(1, at, strip)],
+            last_id: 1,
+        };
+        let j = b.e.install_product(&state, Duration::from_secs(2)).unwrap();
+        b.e.commit(1);
+        // After the fade-in from silence the install starts with.
+        let from = ((processed(&b.e) + 2) * B).max((j + 1) * B + u64::from(RAMP));
+        assert_same_within(&a, &b, from, from + 4 * PAGE)?;
+        assert_eq!(b.e.counters().command_late.load(Relaxed), 0);
+        Ok(())
+    });
+}
+
+/// A re-route a product state folds in, appended but committed only after
+/// the install, still swaps its generation in. Its generation is built
+/// but held until the commit, so the install must not need the RT thread
+/// to hold it.
+#[test]
+fn a_route_folded_into_a_product_core_still_swaps_in() {
+    let domain = Domain::new();
+    let (src, other) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let _other = Pilot::start(&domain.0, &other, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    h.e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 5
+    });
+    let at = (processed(&h.e) + 200) * B;
+    let route = Entry::Route {
+        slot: 0,
+        flow_id: other.clone(),
+    };
+    h.e.append(1, at, route).unwrap();
+    wait_for(Duration::from_secs(5), "generation built", || {
+        h.e.status().generation.ready
+    });
+    wait_for(Duration::from_secs(5), "index passed", || {
+        processed(&h.e) > at / B + 10
+    });
+    let state = ProductState {
+        gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        pending: Vec::new(),
+        last_id: 1,
+    };
+    h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    h.e.commit(1);
+    wait_for(Duration::from_secs(5), "routed", || {
+        let s = h.e.status();
+        s.inputs[0].flow_id == other && s.generation.pending.is_none()
+    });
+    assert_eq!(c.command_late.load(Relaxed), 0);
+    h.e.stop();
+}
+
+/// A strip entry the replay knew ahead of its index travels in the core's
+/// pending list and applies there at its index; the joiner's log
+/// delivering it later, within its ramp, applies nothing again: a second
+/// apply would restart the ramp and move the strip back to the entry's
+/// index, so the pages of the ramp would differ from the donor's.
+#[test]
+fn a_strip_entry_the_core_carried_is_not_applied_again() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        let mut replay = b.e.replay(copy(&a.e)).unwrap();
+        let at = (now_block() + 400) * B;
+        let strip = Entry::Strip {
+            slot: 0,
+            param: samplez_dsp::StripParam::Trim { db: -6.0 },
+        };
+        a.e.append(1, at, strip.clone()).unwrap();
+        a.e.commit(1);
+        replay.append(1, at, &strip).unwrap();
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        if (j + 1) * B >= at {
+            return Err(format!("handed over at block {j}, past the entry"));
+        }
+        wait_for(Duration::from_secs(5), "index passed", || {
+            processed(&b.e) > at / B + 2
+        });
+        b.e.append(1, at, strip).unwrap();
+        b.e.commit(1);
+        let delivered = processed(&b.e);
+        let end = at + u64::from(RAMP);
+        if delivered * B >= end {
+            return Err(format!("delivered at block {delivered}, past the ramp"));
+        }
+        // From the entry's page through the end of its ramp.
+        assert_same_within(&a, &b, at / PAGE * PAGE, end + PAGE)?;
+        Ok(())
+    });
+}
+
+/// A re-route a product state lists pending applies at its index from the
+/// core's pending list; the log delivering it after its index applies
+/// nothing again: a second apply finds the generation swapped in already,
+/// and would hold the slot silent for good, waiting for another.
+#[test]
+fn a_route_the_core_carried_is_not_applied_again() {
+    let domain = Domain::new();
+    let (src, other) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let _other = Pilot::start(&domain.0, &other, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    h.e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 5
+    });
+    let at = (processed(&h.e) + 100) * B;
+    let route = Entry::Route {
+        slot: 0,
+        flow_id: other.clone(),
+    };
+    // Appended, committed only once its index passed.
+    h.e.append(1, at, route.clone()).unwrap();
+    wait_for(Duration::from_secs(5), "generation built", || {
+        h.e.status().generation.ready
+    });
+    let state = ProductState {
+        gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        pending: vec![(1, at, route)],
+        last_id: 1,
+    };
+    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    assert!(
+        (j + 1) * B <= at,
+        "installed after block {j}, past the route"
+    );
+    wait_for(Duration::from_secs(5), "index passed", || {
+        processed(&h.e) > at / B + 5
+    });
+    h.e.commit(1);
+    wait_for(Duration::from_secs(5), "routed", || {
+        let s = h.e.status();
+        s.inputs[0].flow_id == other && s.generation.pending.is_none()
+    });
+    // Past the fade-in after the held blocks, no block is silenced.
+    let k = processed(&h.e) + u64::from(RAMP) / B + 2;
+    let _ = h.verdicts.try_iter().count();
+    wait_for(Duration::from_secs(5), "blocks after the route", || {
+        processed(&h.e) > k + 100
+    });
+    let silenced: Vec<u64> = h
+        .verdicts
+        .try_iter()
+        .filter(|v| v.k > k && v.silenced != 0)
+        .map(|v| v.k)
+        .collect();
+    assert!(silenced.is_empty(), "silenced blocks {silenced:?}");
+    h.e.stop();
 }

@@ -131,6 +131,11 @@ pub struct Counters {
     pub handovers_missed: AtomicU64,
     /// Pending entries a hand-over found no room for.
     pub handover_entries_lost: AtomicU64,
+    /// Blocks not computed for want of a core, withheld.
+    pub blocks_without_core: AtomicU64,
+    /// Entries whose index passed without a core, taken off the pending
+    /// list: strip entries applied to their strips, the others not.
+    pub entries_without_core: AtomicU64,
     /// Page hashes the supervisor could not pass on: the replicated
     /// state's channel was full.
     pub page_hashes_unsent: AtomicU64,
@@ -328,6 +333,9 @@ pub(crate) enum Control {
     Unresolved { id: LogId, at_index: u64 },
     /// Entry `id` is decided.
     Resolved { id: LogId },
+    /// The core is dropped: no block is computed until a hand-over
+    /// installs one.
+    DropCore,
 }
 
 /// Unresolved entries the RT thread holds, and the capacity of the
@@ -409,6 +417,14 @@ pub(crate) enum Change {
 impl Change {
     pub fn needs_generation(&self) -> bool {
         matches!(self, Change::InputUp { .. } | Change::Route { .. })
+    }
+
+    /// Whether a core holds what this change did once applied: a gain
+    /// change is in the matrix and an `InputDown` in the slot state, but
+    /// a strip's settings and a swapped-in generation stay with the RT
+    /// thread, so an entry making them must still reach it.
+    pub fn in_core(&self) -> bool {
+        matches!(self, Change::Gain { .. } | Change::InputDown { .. })
     }
 }
 
@@ -983,9 +999,15 @@ pub(crate) struct Rt {
     /// The highest log id a handed-over core knew: an entry up to it
     /// taken from the ring later is pending or applied already.
     pub skip_upto: LogId,
+    /// The first sample index the last handed-over core computed: an
+    /// entry the core knew at or past it was on the core's pending list.
+    pub install_at: u64,
     /// A replay clone: computes off the RT thread from past input, writes
     /// nothing and hashes every page it computes whole.
     pub replay: bool,
+    /// The engine holds a core: false from a dropped core until a
+    /// hand-over installs one.
+    pub core: bool,
     pub cmd: Consumer<Command>,
     pub entries: Consumer<RtEntry>,
     pub ret: Producer<Returned>,
@@ -1309,16 +1331,40 @@ impl Rt {
                 self.sleep_until(now + period);
                 continue;
             }
-            add(&self.counters.overrun_skipped_samples, skipped);
-            if skipped > 0 {
-                self.skipped(catchup.start - skipped / self.block, catchup.start);
+            let first = if catchup.is_empty() { k } else { catchup.start };
+            // The first block due this wake, overrun skips included.
+            let due = first - skipped / self.block;
+            if !self.core {
+                // Without a core no block would have been computed: the
+                // skipped ones are not computed for want of a core.
+                if due < first {
+                    self.no_core(due, first);
+                }
+            } else {
+                add(&self.counters.overrun_skipped_samples, skipped);
+                if skipped > 0 {
+                    self.skipped(due, first);
+                }
             }
             if !catchup.is_empty() {
                 for s in &mut self.statuses {
                     *s = GroupWait::Skipped;
                 }
             }
-            self.take_handover(if catchup.is_empty() { k } else { catchup.start });
+            self.take_handover(first);
+            if !self.core {
+                // No block is computed: each is withheld, held blocks
+                // still move, and the entries whose index passed are
+                // taken off the pending list.
+                add(&self.counters.heartbeat_blocks, 1);
+                self.advance_holds(None);
+                self.no_core(first, k + 1);
+                self.pass_entries(k);
+                let deadline = time::deadline(&self.api, k, self.block, self.margin);
+                self.sleep_until(deadline);
+                next = Some(k + 1);
+                continue;
+            }
             for k in catchup {
                 let deadline = time::deadline(&self.api, k, self.block, self.margin);
                 self.process(k, deadline);
@@ -1465,7 +1511,19 @@ impl Rt {
             self.last_entry = self.last_entry.max(entry.id);
             // A hand-over brought the entry in already, pending or
             // applied by the replay.
-            if entry.id <= self.skip_upto || self.mix.holds(entry.id) {
+            if self.mix.holds(entry.id) {
+                continue;
+            }
+            if entry.id <= self.skip_upto {
+                // The core knew it. It holds what a gain change or an
+                // InputDown did; any other entry below the install it
+                // applied without what it did reaching this thread, so
+                // that entry is applied as on time. One at or past the
+                // install was on the core's pending list, applied here at
+                // its index.
+                if !entry.change.in_core() && entry.at_index < self.install_at {
+                    self.apply(entry);
+                }
                 continue;
             }
             let _ = self.mix.push(entry);
@@ -1563,6 +1621,10 @@ impl Rt {
                     }
                 }
                 Control::Resolved { id } => r.unresolved.retain(|e| e.0 != id),
+                Control::DropCore => {
+                    self.core = false;
+                    withdraw_all(&mut self.outs, r, &self.counters);
+                }
             }
         }
     }
@@ -1578,6 +1640,60 @@ impl Rt {
             add(&self.counters.status_changes_dropped, 1);
         }
         withdraw_all(&mut self.outs, r, &self.counters);
+    }
+
+    /// Blocks `[from, to)` are not computed for want of a core: withheld,
+    /// cause no core, on every output; the replica stays withdrawn.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn no_core(&mut self, from: u64, to: u64) {
+        let Some(r) = self.replica.as_mut() else {
+            return;
+        };
+        add(&self.counters.blocks_withheld, to - from);
+        add(&self.counters.blocks_without_core, to - from);
+        if r.changes.push(StatusChange::NoCore { from, to }).is_err() {
+            add(&self.counters.status_changes_dropped, 1);
+        }
+        self.counters.processed.store(to, Release);
+    }
+
+    /// Without a core: takes the entries due by block `k` that need no
+    /// generation off the pending list, so that a long spell neither
+    /// fills the list nor holds the log's entries back. A strip entry is
+    /// applied to its slot's strip, which stays with the slot; the others
+    /// pass unapplied. A core installed later must know them, as it must
+    /// know every entry taken.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    pub(crate) fn pass_entries(&mut self, k: u64) {
+        let end = (k + 1) * self.block;
+        let mut i = 0;
+        while let Some(&e) = self.mix.pending.get(i) {
+            if e.at_index >= end || e.change.needs_generation() {
+                i += 1;
+                continue;
+            }
+            self.mix.pending.remove(i);
+            self.mix.last_taken = self.mix.last_taken.max(e.id);
+            add(&self.counters.entries_without_core, 1);
+            if let Change::Strip { slot, param } = e.change
+                && !self.slots[slot].set_strip(e.at_index, param)
+            {
+                add(&self.counters.strip_refused, 1);
+                self.send(Telemetry::StripRefused { entry: e });
+            }
+        }
+        self.publish_consumed();
+    }
+
+    /// Publishes the entries taken from the ring and done with: the
+    /// taken ones still pending have ids up to the highest taken, those a
+    /// hand-over brought in ahead of the ring above it.
+    fn publish_consumed(&self) {
+        let last = self.last_entry;
+        let waiting = self.mix.pending.iter().filter(|e| e.id <= last).count() as u64;
+        self.counters
+            .entries_consumed
+            .store(self.taken - waiting, Release);
     }
 
     /// Makes `generation` the one of input domain `domain` and hands the
@@ -1742,14 +1858,7 @@ impl Rt {
         });
         self.apply_due(k);
         self.counters.produced.store((k + 1) * self.block, Release);
-        // Entries taken from the ring and done with: the taken ones still
-        // pending have ids up to the highest taken, those a hand-over
-        // brought in ahead of the ring above it.
-        let last = self.last_entry;
-        let waiting = self.mix.pending.iter().filter(|e| e.id <= last).count() as u64;
-        self.counters
-            .entries_consumed
-            .store(self.taken - waiting, Release);
+        self.publish_consumed();
         let start = k * self.block;
         let mut silenced = 0u64;
         let mut fading = 0u64;
@@ -2075,10 +2184,23 @@ impl Rt {
     /// Makes `c`, a core that knew the entries up to `last_id`, the
     /// state: the next block computed is the one after it. Entries
     /// pending here that the core did not know stay pending; one that
-    /// finds no room is counted in `handover_entries_lost`.
+    /// finds no room is counted in `handover_entries_lost`. A pending
+    /// entry the core knew whose index it passed and whose effect it
+    /// does not hold, an `InputUp` or `Route` held back for want of a
+    /// core or a strip entry, applies once the core is in, as on time:
+    /// its generation is swapped in, a crossfade anchored at its index,
+    /// or the strip set from its index.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn install_core(&mut self, c: &Core, last_id: LogId) {
         let m = &mut self.mix;
+        let next = c.pos.unwrap_or(0);
+        m.due.clear();
+        for e in &m.pending {
+            if e.id <= last_id && !e.change.in_core() && e.at_index < next {
+                // Room: due holds as many as pending.
+                m.due.push((*e, false));
+            }
+        }
         m.matrix.copy_from(&c.matrix);
         m.pos = c.pos;
         m.ramp_end = c.ramp_end;
@@ -2099,8 +2221,21 @@ impl Rt {
             d.silenced_last = s.silenced_last;
             d.xfade = s.xfade;
         }
-        self.awaiting_gen.clear();
-        self.awaiting_gen.extend_from_slice(&c.awaiting_gen);
+        // An entry applied here before its generation arrived keeps
+        // waiting for it: the core knew the entry, a refusal as Missed says
+        // so otherwise, but holds no generation, and the one this thread
+        // waits for arrives here. Its slot stays held until then.
+        for e in &c.awaiting_gen {
+            let known = self.awaiting_gen.iter().any(|a| a.id == e.id);
+            if !known && self.awaiting_gen.len() < PENDING_CHANGES {
+                self.awaiting_gen.push(*e);
+            }
+        }
+        for a in &self.awaiting_gen {
+            if let Change::InputUp { slot } | Change::Route { slot } = a.change {
+                self.slots[slot].held = true;
+            }
+        }
         if let Some(r) = self.replica.as_mut() {
             r.unresolved.clear();
             r.unresolved.extend_from_slice(&c.unresolved);
@@ -2109,6 +2244,12 @@ impl Rt {
             r.late_lost_until = c.late_lost_until;
         }
         self.skip_upto = self.skip_upto.max(last_id);
+        self.install_at = next;
+        for n in 0..self.mix.due.len() {
+            let (e, _) = self.mix.due[n];
+            self.apply(e);
+        }
+        self.mix.due.clear();
     }
 
     /// Installs a replayed core whose last block is the one before
@@ -2135,7 +2276,7 @@ impl Rt {
         };
         h.answer = if h.j + 1 != first {
             Answer::Passed
-        } else if h.core.pending_gen != self.pending_gen.as_ref().map(|p| p.0) {
+        } else if h.names_gen && h.core.pending_gen != self.pending_gen.as_ref().map(|p| p.0) {
             Answer::Generation
         } else if self.mix.last_taken > h.last_id {
             Answer::Missed(self.mix.last_taken)
@@ -2150,6 +2291,7 @@ impl Rt {
                 for p in self.outs.iter_mut().filter_map(|o| o.pages.as_mut()) {
                     p.restart();
                 }
+                self.core = true;
                 &self.counters.handovers_installed
             }
             Answer::Generation => &self.counters.handovers_generation,

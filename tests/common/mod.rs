@@ -737,7 +737,8 @@ pub fn hold_scenario(e: &Engine) {
             .unwrap();
     }
     e.commit(id);
-    wait(kp + 10);
+    // Applied, their pages hashed, before the core is dropped.
+    wait((kp + 10).max((at + 4 * PAGE) / B + PAGE / B));
 
     // Degraded blocks, held, then committed through on evidence.
     e.unresolved(7, processed(e) * B).unwrap();
@@ -750,6 +751,20 @@ pub fn hold_scenario(e: &Engine) {
     let mut replay = e.replay(c).unwrap();
     e.hand_over(&mut replay, Duration::from_secs(5)).unwrap();
     assert_eq!(e.counters().handovers_installed.load(Ordering::Relaxed), 1);
+    // The core dropped, then rebuilt from product state.
+    e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        e.counters().blocks_without_core.load(Ordering::Relaxed) > 5
+    });
+    let state = samplez::ProductState {
+        gains: vec![vec![1.0]],
+        up: vec![true],
+        pending: Vec::new(),
+        // Folds in the entries applied before the drop.
+        last_id: id,
+    };
+    e.install_product(&state, Duration::from_secs(5)).unwrap();
+    assert_eq!(e.counters().handovers_installed.load(Ordering::Relaxed), 2);
     through(e);
     wait(processed(e) + 5);
     e.resolved(7).unwrap();

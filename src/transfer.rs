@@ -105,6 +105,10 @@ pub(crate) struct Handover {
     pub j: u64,
     pub last_id: LogId,
     pub core: Box<Core>,
+    /// The core names the pending generation it was computed with, which
+    /// the RT thread must hold. A core built from product state was
+    /// computed with none and keeps the RT thread's.
+    pub names_gen: bool,
     pub answer: Answer,
 }
 
@@ -163,20 +167,10 @@ impl Replay {
         if id <= self.last_id {
             return Ok(());
         }
-        let change = match *entry {
-            Entry::Gain {
-                input,
-                output,
-                gain,
-            } => Change::Gain {
-                input,
-                output,
-                gain,
-            },
-            Entry::InputDown { slot } => Change::InputDown { slot },
-            Entry::Strip { slot, param } => Change::Strip { slot, param },
-            Entry::InputUp { .. } | Entry::Route { .. } => return Err(ReplayError::Generation),
-        };
+        let change = change_of(entry);
+        if change.needs_generation() {
+            return Err(ReplayError::Generation);
+        }
         let b = self.rt.block;
         if !at_index.is_multiple_of(b) || at_index < self.next * b {
             return Err(ReplayError::Late { id, at_index });
@@ -245,6 +239,40 @@ impl Replay {
     }
 }
 
+/// The change log entry `entry` makes on the RT thread.
+pub(crate) fn change_of(entry: &Entry) -> Change {
+    match *entry {
+        Entry::Gain {
+            input,
+            output,
+            gain,
+        } => Change::Gain {
+            input,
+            output,
+            gain,
+        },
+        Entry::InputDown { slot } => Change::InputDown { slot },
+        Entry::InputUp { slot } => Change::InputUp { slot },
+        Entry::Route { slot, .. } => Change::Route { slot },
+        Entry::Strip { slot, param } => Change::Strip { slot, param },
+    }
+}
+
+/// The product state an engine core is built from
+/// ([`Engine::install_product`](crate::Engine::install_product)).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductState {
+    /// The gain targets: one row per input channel, one column per output
+    /// channel.
+    pub gains: Vec<Vec<f32>>,
+    /// Per input slot whether it is up in the log.
+    pub up: Vec<bool>,
+    /// Committed entries not applied yet: log id, `at_index` and entry.
+    pub pending: Vec<(LogId, u64, Entry)>,
+    /// The highest log id the state folds in.
+    pub last_id: LogId,
+}
+
 /// Why a replay was not built, took no entry, or was not handed over.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplayError {
@@ -259,8 +287,9 @@ pub enum ReplayError {
     Late { id: LogId, at_index: u64 },
     /// The pending list or the control ring is full.
     Full,
-    /// No hand-over was installed within the timeout.
-    Timeout,
+    /// No hand-over was installed within the timeout; `passed` of the
+    /// call's were refused for a block the RT thread had passed.
+    Timeout { passed: u64 },
     /// The RT thread had taken entry `id`, which the core did not know,
     /// off its pending list: the core must know it to be installed.
     Missed { id: LogId },
@@ -275,7 +304,10 @@ impl std::fmt::Display for ReplayError {
                 write!(f, "entry {id} at {at_index} is late for the replay")
             }
             ReplayError::Full => write!(f, "the replay's pending list or control ring is full"),
-            ReplayError::Timeout => write!(f, "no hand-over installed within the timeout"),
+            ReplayError::Timeout { passed } => write!(
+                f,
+                "no hand-over installed within the timeout, {passed} refused for a passed block"
+            ),
             ReplayError::Missed { id } => {
                 write!(
                     f,

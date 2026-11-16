@@ -142,7 +142,8 @@ generation or a crossfade) is not replayed. `Replay::run_to` stops at the
 newest block due, and `Replay::silenced` names the blocks computed with
 an input silenced. `Engine::hand_over` waits for the RT thread to
 compute a block, runs the clone up to it and passes its state to the RT
-thread by owned pointer before the next wake; the RT thread installs it
+thread by owned pointer before the next wake, about one block period
+later; the RT thread installs it
 before the next block if it has not started that block, still holds the
 generation the core names and took no entry off its pending list that
 the core does not know, keeping pending entries the core did not know,
@@ -151,6 +152,19 @@ generation is tried again; one missing an entry returns
 `ReplayError::Missed`. Refusals are counted per cause.
 The status reports the replay speed s, blocks per block period, measured
 at start-up on silence.
+
+`Engine::drop_core` drops the RT thread's core while the replica starts:
+the RT thread keeps its writers, flows, hold rings and statuses, computes
+no block and withholds each one, overrun skips included, cause `NoCore`
+(`StatusChange::NoCore` ranges), with the replica withdrawn. Entries
+needing no generation whose index passes meanwhile are taken off the
+pending list, strip entries applied to the strips the slots keep and the
+others not, and the core installed next must know them.
+`Engine::install_product` builds a core from product state off the RT
+thread (targets at their values, fades and ramps cold, the pending
+entries, no unresolved entry; the RT thread keeps its pending generation)
+and installs it through the same block-boundary hand-over as a replay;
+the first block committed after it follows the withdrawn rules.
 
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
 against CLOCK_MONOTONIC at each wake, when it also samples the kernel
