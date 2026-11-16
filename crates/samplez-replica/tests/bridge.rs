@@ -223,3 +223,43 @@ fn an_entry_the_engine_refuses_is_counted_in_every_sample() {
     audio.appended(3, &request);
     assert_eq!(audio.sample().entries_refused, 1);
 }
+
+#[test]
+fn the_supervisor_moves_the_engines_blocks_through_the_bridge() {
+    use samplez::blocks::{Cause, Kind, Ranks, Standing};
+    let domain = Domain::new();
+    let (engine, audio) = bridge(&domain, 1 << 16);
+    engine.commit_from(0, 0).unwrap();
+    audio.ranks(Ranks::flat(3));
+    audio.fence(u64::MAX);
+    // Nobody writes the input: every block is degraded and held at the
+    // rank.
+    let held = |audio: &EngineAudio| {
+        let p = engine.progress().unwrap().processed?;
+        (p.saturating_sub(4)..=p)
+            .find(|&k| audio.status(0, k).is_some_and(|s| s.kind == Kind::Held))
+    };
+    wait_for("a held block", || held(&audio).is_some());
+    let k = held(&audio).unwrap();
+    assert_eq!(audio.status(0, k).unwrap().rank, 3);
+    assert!(matches!(
+        audio.sample().own.standing[..],
+        [Standing::Committing { .. }]
+    ));
+    assert!(audio.commit_through(0, k, 0b10, None));
+    wait_for("committed through", || {
+        audio
+            .status(0, k)
+            .is_some_and(|s| s.kind == Kind::Committed && s.on_silence_of == 0b10)
+    });
+    wait_for("a later held block", || held(&audio).is_some_and(|j| j > k));
+    let j = held(&audio).unwrap();
+    let s = audio.withhold(0, j, Cause::HoldCap).unwrap();
+    assert_eq!((s.kind, s.cause), (Kind::Withheld, Cause::HoldCap));
+    wait_for("withdrawn", || {
+        matches!(
+            audio.sample().own.standing[..],
+            [Standing::Withdrawn { since }] if since > k
+        )
+    });
+}

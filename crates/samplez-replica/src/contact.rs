@@ -12,17 +12,20 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use openraft::{BasicNode, RaftMetrics};
+use samplez::blocks::{BlockStatus, Cause, Ranks};
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::Shared;
-use crate::entry::{Body, NodeId, Request};
+use crate::entry::{Baseline, Body, NodeId, Request};
 use crate::log_store::Store;
 use crate::peer::PeerRequest;
+use crate::rank::Baselines;
 use crate::report::{Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report, Slack};
 use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
 use crate::state_machine::Product;
+use crate::withhold::Withhold;
 
 /// The engine's sample rate (plan 2.3).
 pub const RATE: u64 = samplez_mxl::SAMPLE_RATE as u64;
@@ -139,6 +142,21 @@ pub trait Audio: Send + Sync + 'static {
     /// An unresolved entry found no room: the replica can no longer tell
     /// its degraded blocks, so it stops committing them at once.
     fn overwhelmed(&self);
+    /// Block `k`'s status on output `output`, none before its first.
+    fn status(&self, output: usize, k: u64) -> Option<BlockStatus>;
+    /// Moves block `k` of `output` to `withheld` for `cause`, from no
+    /// status yet, `fenced` or `held`: the status it ends with, none when
+    /// nothing was recorded.
+    fn withhold(&self, output: usize, k: u64, cause: Cause) -> Option<BlockStatus>;
+    /// Marks the held block `k` of `output` for commit through, `[kB, P)`
+    /// only with `up_to` P, naming the voters whose silence the evidence
+    /// used by bit; false when it is not held.
+    fn commit_through(&self, output: usize, k: u64, on_silence_of: u8, up_to: Option<u64>) -> bool;
+    /// The replica is withdrawn on every output that commits.
+    fn withdraw(&self);
+    /// Publishes the ranks the blocks take when F passes them; called
+    /// before the F they hold for.
+    fn ranks(&self, ranks: Ranks);
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -176,7 +194,7 @@ impl Members {
     }
 
     /// Whether `holds` holds a majority of every configuration.
-    fn majority(&self, holds: impl Fn(NodeId) -> bool) -> bool {
+    pub(crate) fn majority(&self, holds: impl Fn(NodeId) -> bool) -> bool {
         !self.configs.is_empty()
             && self
                 .configs
@@ -194,8 +212,8 @@ pub trait LogView: Send + Sync + 'static {
     fn pending(&self, f: &mut dyn FnMut(u64, &Body));
     /// The replicas the latest applied `ClockVerdict` judges.
     fn judged(&self) -> BTreeSet<NodeId>;
-    /// The replica the latest applied `Baseline` names.
-    fn baseline(&self) -> Option<NodeId>;
+    /// The latest applied `Baseline`.
+    fn baseline(&self) -> Option<Baseline>;
 }
 
 impl<P: Product> LogView for Store<P> {
@@ -223,8 +241,8 @@ impl<P: Product> LogView for Store<P> {
                 .collect()
         })
     }
-    fn baseline(&self) -> Option<NodeId> {
-        self.with_state(|sm| sm.baseline.as_ref().map(|b| b.replica))
+    fn baseline(&self) -> Option<Baseline> {
+        self.with_state(|sm| sm.baseline.clone())
     }
 }
 
@@ -305,6 +323,8 @@ struct Peer {
     /// The latest NTP-style offset estimate, the peer's clock minus this
     /// one's, ns.
     offset_ns: Option<i64>,
+    /// Its magnitude over the exchanges, ns.
+    offsets: Histogram,
     delay: Histogram,
     gaps: Histogram,
     gaps_over_window: u64,
@@ -346,8 +366,9 @@ struct State {
     /// Entries handed as appended whose commit is not known.
     uncommitted: BTreeMap<u64, StoredLogId>,
     /// Entries with an at_index, for listings, until every voter reported
-    /// them committed.
-    scheduled: BTreeMap<u64, (StoredLogId, u64, u64)>,
+    /// them committed: log id, at_index, stamp, and whether it is a
+    /// `Baseline`.
+    scheduled: BTreeMap<u64, (StoredLogId, u64, u64, bool)>,
     /// The at_index of the latest generation-needing entry appended.
     generation_at: Option<u64>,
     /// When `own` was sampled.
@@ -368,6 +389,11 @@ struct State {
     /// later overflow at or above it adds nothing, one below it is given.
     unlisted_low: Option<u64>,
     fence: Option<u64>,
+    /// The ranks last published, with the first block F had not passed
+    /// then: blocks below it keep their rank.
+    ranks: Option<(Ranks, u64)>,
+    baselines: Baselines,
+    withhold: Withhold,
     own: Own,
     status_changes_lost: u64,
     entries_refused: u64,
@@ -420,6 +446,15 @@ pub struct Metrics {
     /// How far the E estimates other voters report lie from this one's at
     /// receipt, 99.99th percentile, in samples.
     pub e_spread_p9999: Option<u64>,
+    /// The supervisor's moves on this replica's blocks.
+    pub withholding: crate::withhold::Counts,
+    /// `L = 2p + 2 delta + |theta|` (Withholding, floors), from delta and
+    /// the exchange offset |theta| measured here, 99.99th percentiles;
+    /// none before both are.
+    pub floor: Option<Duration>,
+    /// `w < L` or `D < statusLag + L`: a fenced replica's `withheld` or a
+    /// live replica's status may miss the hold cap.
+    pub hold_floor_unmet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -473,7 +508,11 @@ impl Contact {
                 node: 0,
                 index,
             });
-            scheduled.insert(index, (id, at, 0));
+            scheduled.insert(index, (id, at, 0, false));
+        }
+        let mut baselines = Baselines::default();
+        if let Some(b) = log.baseline() {
+            baselines.applied(b);
         }
         Contact {
             id,
@@ -509,6 +548,9 @@ impl Contact {
                 given: BTreeMap::new(),
                 unlisted_low: None,
                 fence: None,
+                ranks: None,
+                baselines,
+                withhold: Withhold::default(),
                 own: Own::default(),
                 status_changes_lost: 0,
                 entries_refused: 0,
@@ -600,8 +642,11 @@ impl Contact {
             if delay >= 0 {
                 peer.delay.add((delay / 2) as u64);
             }
-            peer.offset_ns = Some((((t2 - t1) + (t3 - t4)) / 2) as i64);
+            let offset = (((t2 - t1) + (t3 - t4)) / 2) as i64;
+            peer.offset_ns = Some(offset);
+            peer.offsets.add(offset.unsigned_abs());
         }
+        st.withhold.fold(self.id, report.from, &report.own);
         peer.last = Some(Direct {
             seq: report.seq,
             received_tai: tai,
@@ -609,10 +654,15 @@ impl Contact {
             own: report.own,
             committed: report.committed,
         });
-        // One relay hop: copies of voters the sender heard directly.
+        // One relay hop: copies of voters the sender heard directly, and
+        // whom it holds silent.
         for heard in report.heard {
             if heard.node == self.id || heard.node == report.from || !voters.contains(&heard.node) {
                 continue;
+            }
+            if heard.silent {
+                st.withhold
+                    .held_silent(report.from, heard.node, report.sent_at);
             }
             let (Some(age), Some(own)) = (heard.age_us, heard.own) else {
                 continue;
@@ -622,6 +672,7 @@ impl Contact {
             if other.last.as_ref().is_none_or(|d| d.received < generated)
                 && other.relayed.as_ref().is_none_or(|(g, _)| *g < generated)
             {
+                st.withhold.fold(self.id, heard.node, &own);
                 other.relayed = Some((generated, own));
             }
         }
@@ -654,7 +705,11 @@ impl Contact {
         }
         self.learn(st, learned);
         for l in &report.listed {
-            self.note(st, l.id, l.at_index, tai);
+            if l.baseline {
+                st.baselines.listed(l.id, l.at_index);
+            } else {
+                self.note(st, l.id, l.at_index, tai);
+            }
         }
         if let Some(at) = report.unlisted
             && st.unlisted_low.is_none_or(|low| at < low)
@@ -744,7 +799,9 @@ impl Contact {
                 p.silent_at = Some(tai);
             }
         }
+        st.withhold.retain(&st.members);
         self.fence(st, tai);
+        self.decide(st, tai);
 
         // Reports.
         if !voters.contains(&self.id) {
@@ -789,8 +846,12 @@ impl Contact {
             let mut listed: Vec<Listed> = st
                 .scheduled
                 .range(their_committed.saturating_add(1)..)
-                .filter(|(_, (_, at, _))| *at < limit)
-                .map(|(_, &(id, at_index, _))| Listed { id, at_index })
+                .filter(|(_, (_, at, _, _))| *at < limit)
+                .map(|(_, &(id, at_index, _, baseline))| Listed {
+                    id,
+                    at_index,
+                    baseline,
+                })
                 .collect();
             listed.sort_by_key(|l| (l.at_index, l.id.index));
             let unlisted = listed.get(MAX_LISTED).map(|l| l.at_index);
@@ -901,6 +962,7 @@ impl Contact {
                 st.awaiting.remove(&key(id));
             }
             st.scheduled.split_off(&from);
+            st.baselines.truncated(from);
             st.told = from - 1;
             if let Some(audio) = &self.audio {
                 audio.truncated(from);
@@ -919,16 +981,27 @@ impl Contact {
             if request.body.needs_generation() {
                 st.generation_at = request.at_index();
             }
-            new.push((id, request.at_index(), request.stamp));
+            if let Body::Baseline(b) = &request.body {
+                st.baselines.appended(id, b);
+            }
+            let baseline = match &request.body {
+                Body::Baseline(b) => Some(b.at_index),
+                _ => None,
+            };
+            new.push((id, request.at_index(), baseline, request.stamp));
         });
-        for (id, at, stamp) in new {
+        for (id, at, baseline, stamp) in new {
             st.told = id.index;
             if id.index > st.known_committed {
                 st.uncommitted.insert(id.index, id);
             }
             if let Some(at) = at {
-                st.scheduled.insert(id.index, (id, at, stamp));
+                st.scheduled.insert(id.index, (id, at, stamp, false));
                 self.note(st, id, at, tai);
+            }
+            // Listed, never unresolved: it changes no engine state.
+            if let Some(at) = baseline {
+                st.scheduled.insert(id.index, (id, at, stamp, true));
             }
         }
         while st.scheduled.len() > SCHEDULED_MAX {
@@ -976,6 +1049,9 @@ impl Contact {
             return;
         }
         st.known_committed = index;
+        let log = &self.log;
+        st.baselines
+            .learned(index, self.clocks.tai_ns(), |i| log.log_id_at(i));
         st.uncommitted = st.uncommitted.split_off(&(index + 1));
         // Awaited entries only wait unexpired: expired ones were given.
         st.awaiting = st.awaiting.split_off(&(index + 1, 0, 0));
@@ -995,7 +1071,8 @@ impl Contact {
             let handed: Vec<Slack> = st
                 .scheduled
                 .range(st.handed + 1..=up_to)
-                .map(|(&index, &(_, at, stamp))| Slack {
+                .filter(|(_, e)| !e.3)
+                .map(|(&index, &(_, at, stamp, _))| Slack {
                     index,
                     samples: at as i64 - first,
                     stamp,
@@ -1072,13 +1149,85 @@ impl Contact {
             }
             k += 1;
         }
-        let f = k * t.block;
+        let mut f = k * t.block;
+        if let Some(audio) = &self.audio {
+            f = self.publish_ranks(st, audio.as_ref(), f, tai);
+        }
         if st.fence != Some(f) {
             st.fence = Some(f);
             if let Some(audio) = &self.audio {
                 audio.fence(f);
             }
         }
+    }
+
+    /// Publishes the ranks of the blocks F at `f` passes before F, each
+    /// fixed once F passed it, and returns `f`, lowered to a second rank
+    /// change the RT thread cannot take yet.
+    fn publish_ranks(&self, st: &mut State, audio: &dyn Audio, f: u64, tai: u64) -> u64 {
+        let t = self.timing;
+        let b = t.block;
+        let ring = index_at((t.hold + t.contact_window).as_nanos() as u64).div_ceil(b) + 2;
+        // The lowest block that can still take a rank: the next one
+        // computed, or one computed fenced. One computed past its fence
+        // deadline is withheld whatever its rank.
+        let due = index_at(tai).saturating_sub(t.margin) / b;
+        let next = st
+            .own
+            .processed
+            .map_or(0, |p| p + 1)
+            .max(due.saturating_sub(ring));
+        let outputs = st.own.standing.len();
+        let lo = (next.saturating_sub(ring)..next)
+            .find(|&k| {
+                (0..outputs).any(|o| {
+                    audio
+                        .status(o, k)
+                        .is_some_and(|s| s.kind == samplez::blocks::Kind::Fenced)
+                })
+            })
+            .unwrap_or(next);
+        let hi = (f / b).max(lo + 1);
+        st.baselines.prune(lo, &t);
+        let published = st.ranks;
+        let audio_voters = crate::rank::audio_voters(&st.members);
+        let baselines = &st.baselines;
+        let rank_of = |k: u64| match published {
+            Some((r, passed)) if k < passed => r.of(k, false),
+            _ => baselines.rank(k, self.id, &audio_voters, &t),
+        };
+        let fill = crate::rank::demoted(self.id, &audio_voters);
+        let (ranks, cap) = crate::rank::schedule(lo, hi, rank_of, fill);
+        if published.map(|(r, _)| r) != Some(ranks) {
+            audio.ranks(ranks);
+        }
+        let f = match cap {
+            Some(c) => f.min(c * b).max(st.fence.unwrap_or(0)),
+            None => f,
+        };
+        st.ranks = Some((ranks, f / b));
+        f
+    }
+
+    /// The supervisor's moves on this replica's blocks (Withholding).
+    fn decide(&self, st: &mut State, tai: u64) {
+        let Some(audio) = &self.audio else {
+            return;
+        };
+        if st.members.configs.is_empty() {
+            return;
+        }
+        let peers = &st.peers;
+        let mine = |x: NodeId| peers.get(&x).and_then(|p| p.silent_at);
+        st.withhold.decide(
+            self.id,
+            &st.own,
+            &mine,
+            &st.members,
+            &self.timing,
+            audio.as_ref(),
+            tai,
+        );
     }
 
     /// Drops scheduled entries every voter reported committed.
@@ -1264,7 +1413,7 @@ impl Contact {
             // The last one's at_index has passed on the baseline, or on E
             // while no baseline is named.
             if let Some(at) = st.generation_at {
-                let baseline = self.log.baseline();
+                let baseline = self.log.baseline().map(|b| b.replica);
                 let passed = self
                     .copies(&st, now)
                     .into_iter()
@@ -1293,6 +1442,13 @@ impl Contact {
     pub fn metrics(&self) -> Metrics {
         let st = self.lock();
         let c = &st.counts;
+        let q = |h: &Histogram| h.quantile(0.9999);
+        let delta = st.peers.values().filter_map(|p| q(&p.delay)).max();
+        let theta = st.peers.values().filter_map(|p| q(&p.offsets)).max();
+        let floor = delta
+            .zip(theta)
+            .map(|(d, th)| 2 * self.timing.report_period + Duration::from_nanos(2 * d + th));
+        let status_lag = q(&c.status_lag).map(Duration::from_nanos);
         Metrics {
             fence: st.fence,
             in_contact: st.in_contact,
@@ -1325,6 +1481,14 @@ impl Contact {
             lead: st.lead.samples(),
             apply_lead_capped: st.lead.capped,
             e_spread_p9999: st.e_spread.quantile(0.9999),
+            withholding: st.withhold.counts,
+            floor,
+            hold_floor_unmet: match (floor, status_lag) {
+                (Some(l), Some(lag)) => {
+                    self.timing.contact_window < l || self.timing.hold < lag + l
+                }
+                _ => false,
+            },
         }
     }
 }
@@ -1490,7 +1654,7 @@ mod tests {
         fn judged(&self) -> BTreeSet<NodeId> {
             BTreeSet::new()
         }
-        fn baseline(&self) -> Option<NodeId> {
+        fn baseline(&self) -> Option<Baseline> {
             None
         }
     }
@@ -1556,6 +1720,19 @@ mod tests {
         fn overwhelmed(&self) {
             self.calls.lock().unwrap().push("overwhelmed".into());
         }
+        fn status(&self, _: usize, _: u64) -> Option<BlockStatus> {
+            None
+        }
+        fn withhold(&self, _: usize, _: u64, _: Cause) -> Option<BlockStatus> {
+            None
+        }
+        fn commit_through(&self, _: usize, _: u64, _: u8, _: Option<u64>) -> bool {
+            false
+        }
+        fn withdraw(&self) {
+            self.calls.lock().unwrap().push("withdraw".into());
+        }
+        fn ranks(&self, _: Ranks) {}
     }
 
     impl Engine {
@@ -1819,6 +1996,7 @@ mod tests {
         r.listed = vec![Listed {
             id: id(2, 5),
             at_index: at,
+            baseline: false,
         }];
         f.contact.receive(r.clone());
         assert!(f.engine.calls().is_empty(), "another entry at index 5");
@@ -1826,6 +2004,7 @@ mod tests {
         r.listed = vec![Listed {
             id: id(1, 5),
             at_index: at,
+            baseline: false,
         }];
         f.contact.receive(r);
         assert_eq!(f.engine.calls(), ["committed 5"]);
@@ -1887,6 +2066,7 @@ mod tests {
         r.listed = vec![Listed {
             id: id(1, 7),
             at_index: at,
+            baseline: false,
         }];
         r.unlisted = Some(at + B);
         f.contact.receive(r);
@@ -2000,12 +2180,14 @@ mod tests {
         r.listed = vec![Listed {
             id: id(1, 5),
             at_index: late,
+            baseline: false,
         }];
         f.contact.receive(r);
         let mut r = f.report(3, None);
         r.listed = vec![Listed {
             id: id(2, 5),
             at_index: early,
+            baseline: false,
         }];
         f.contact.receive(r);
         f.engine.calls();
@@ -2046,6 +2228,7 @@ mod tests {
         r.listed = vec![Listed {
             id: id(1, 9),
             at_index: at,
+            baseline: false,
         }];
         f.contact.receive(r);
         f.clock.set(timing.apply_deadline(at));
@@ -2141,7 +2324,8 @@ mod tests {
             report.listed,
             [Listed {
                 id: id(1, 3),
-                at_index: at
+                at_index: at,
+                baseline: false,
             }]
         );
     }
@@ -2162,6 +2346,7 @@ mod tests {
             r.listed = vec![Listed {
                 id: id(1, 9),
                 at_index: at,
+                baseline: false,
             }];
             f.contact.receive(r);
             f.tick();

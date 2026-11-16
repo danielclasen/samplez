@@ -157,7 +157,7 @@ fn wait_processed(e: &Engine, k: u64) {
 fn commit_through(e: &Engine, ks: std::ops::Range<u64>, skip: &[u64]) {
     for k in ks {
         if !skip.contains(&k) {
-            let _ = e.commit_through(0, k, 0);
+            let _ = e.commit_through(0, k, 0, None);
         }
     }
 }

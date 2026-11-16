@@ -19,10 +19,12 @@ pub mod log_store;
 pub mod membership;
 pub mod net;
 pub mod peer;
+pub mod rank;
 pub mod report;
 pub mod schedule;
 pub mod snapshot;
 pub mod state_machine;
+pub mod withhold;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Cursor;

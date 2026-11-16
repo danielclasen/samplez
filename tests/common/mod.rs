@@ -712,7 +712,7 @@ pub fn hold_scenario(e: &Engine) {
     let through = |e: &Engine| {
         let p = processed(e);
         for k in p.saturating_sub(40)..p {
-            let _ = e.commit_through(0, k, 1);
+            let _ = e.commit_through(0, k, 1, None);
         }
     };
     e.set_fence(u64::MAX).unwrap();

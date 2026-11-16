@@ -25,7 +25,9 @@ use samplez_mxl::input::{
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
 
-use crate::blocks::{BlockStatus, Cause, Hold, PAGE, PageHash, Pages, StatusChange, Statuses};
+use crate::blocks::{
+    BlockStatus, Cause, Hold, PAGE, PageHash, Pages, Ranks, Standing, StatusChange, Statuses,
+};
 use crate::config::Config;
 use crate::meters::{OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
@@ -670,7 +672,7 @@ fn replay_rt(
     let replica = Replica {
         shared: Arc::new(Shared {
             fence: AtomicU64::new(u64::MAX),
-            rank: AtomicU64::new(0),
+            ranks: AtomicU64::new(0),
             self_report: AtomicBool::new(false),
             steps_cleared: AtomicU64::new(0),
             statuses: Vec::new(),
@@ -893,7 +895,7 @@ impl Engine {
                 .max(MIN_STATUS_SLOTS);
             let shared = Arc::new(Shared {
                 fence: AtomicU64::new(if alone { u64::MAX } else { 0 }),
-                rank: AtomicU64::new(0),
+                ranks: AtomicU64::new(0),
                 self_report: AtomicBool::new(false),
                 steps_cleared: AtomicU64::new(0),
                 statuses: (0..config.outputs.len())
@@ -1532,10 +1534,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Replicated mode: this replica's rank, 0 the top, fixed into each
-    /// block's status when F passes it; at most [`crate::blocks::MAX_RANK`].
-    pub fn set_rank(&self, rank: u8) -> Result<(), ControlError> {
-        self.replica()?.0.rank.store(u64::from(rank), Relaxed);
+    /// Replicated mode: this replica's ranks, 0 the top, each fixed into
+    /// a block's status when F passes it; at most
+    /// [`crate::blocks::MAX_RANK`]. Set before the F that passes the
+    /// blocks they hold for ([`Engine::set_fence`]).
+    pub fn set_ranks(&self, ranks: Ranks) -> Result<(), ControlError> {
+        self.replica()?.0.ranks.store(ranks.pack(), Release);
         Ok(())
     }
 
@@ -1583,15 +1587,23 @@ impl Engine {
 
     /// Replicated mode: block `k` of output `output`, `held`, commits
     /// through on evidence that used the silence of the voters in
-    /// `on_silence_of`, by bit. False when it is not `held`.
+    /// `on_silence_of`, by bit; with `up_to` P inside the block, only
+    /// `[kB, P)` ([`crate::blocks::Statuses::commit_through`]). False when
+    /// it is not `held`.
     pub fn commit_through(
         &self,
         output: usize,
         k: u64,
         on_silence_of: u8,
+        up_to: Option<u64>,
     ) -> Result<bool, ControlError> {
         self.output_index(output)?;
-        Ok(self.replica()?.0.statuses[output].commit_through(k, on_silence_of))
+        Ok(self.replica()?.0.statuses[output].commit_through(k, on_silence_of, up_to))
+    }
+
+    /// Replicated mode: whether output `output` commits, and since when.
+    pub fn standing(&self, output: usize) -> Option<Standing> {
+        Some(self.replica.as_ref()?.0.statuses.get(output)?.standing())
     }
 
     /// Replicated mode: what a side report says of this replica's clock
@@ -3630,7 +3642,7 @@ mod tests {
                 e.block_status(0, kp + 3)
             );
             for k in to..processed() {
-                let _ = e.commit_through(0, k, 0);
+                let _ = e.commit_through(0, k, 0, None);
             }
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -4067,6 +4079,46 @@ mod tests {
         );
         assert_eq!(c.output_held_blocks.load(Relaxed), 0);
         wait(&|| e.status().clock.step_fenced);
+        e.stop();
+        std::fs::remove_dir_all(&domain).unwrap();
+    }
+
+    /// A block withheld on one output withdraws the replica on every
+    /// output before the next one advances: in the pass that moves F past
+    /// block k, output 1 does not commit k while output 0 withholds it.
+    #[test]
+    fn a_block_withheld_on_one_output_withdraws_the_next_before_it_advances() {
+        use crate::blocks::{Cause, Kind};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _changes, _verdicts, domain) = outputs_only("withdraw-every", 2);
+        let processed = || e.counters().processed.load(Acquire);
+        let fenced =
+            |k: u64| (0..2).all(|o| e.block_status(o, k).is_some_and(|s| s.kind == Kind::Fenced));
+        let committing_all =
+            || (0..2).all(|o| matches!(e.standing(o), Some(Standing::Committing { .. })));
+        // F frozen: both outputs hold block k, the first block F has not
+        // passed, and the blocks after it fenced. An overrun skip under
+        // load withdraws the replica or leaves no status at k: then the
+        // outputs are named again and F frozen anew.
+        let mut k = None;
+        for _ in 0..10 {
+            committing(&e, 2);
+            let f = processed() + 2;
+            e.set_fence(f * 48).unwrap();
+            wait(&|| processed() > f + 5);
+            let first = (f..=processed()).find(|&j| fenced(j));
+            if committing_all() && first == Some(f) {
+                k = first;
+                break;
+            }
+        }
+        let k = k.expect("no pass without an overrun in 10 attempts");
+        let st = e.withhold(0, k, Cause::HoldCap).unwrap().unwrap();
+        assert_eq!(st.kind, Kind::Withheld);
+        e.set_fence(u64::MAX).unwrap();
+        wait(&|| processed() > k + 15);
+        let st = e.block_status(1, k).unwrap();
+        assert_ne!(st.kind, Kind::Committed, "{st:?}");
         e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
     }

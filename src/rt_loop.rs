@@ -347,8 +347,10 @@ pub(crate) struct Shared {
     /// F, the end of the highest block up to which every block is
     /// B1-valid: blocks ending above it are fenced.
     pub fence: AtomicU64,
-    /// This replica's rank, fixed into a block's status when F passes it.
-    pub rank: AtomicU64,
+    /// This replica's ranks ([`crate::blocks::Ranks`], packed), fixed into
+    /// a block's status when F passes it; stored before the F they hold
+    /// for.
+    pub ranks: AtomicU64,
     /// The kernel clock is unsynchronised: blocks carry no digest.
     pub self_report: AtomicBool,
     /// The clock steps the replicated state checked: a detected step
@@ -1094,10 +1096,7 @@ fn ctx(shared: &Shared, step_at: Option<u64>) -> Ctx {
     let fence = shared.fence.load(Acquire);
     Ctx {
         fence: step_at.map_or(fence, |s| fence.min(s)),
-        rank: shared
-            .rank
-            .load(Relaxed)
-            .min(u64::from(crate::blocks::MAX_RANK)) as u8,
+        ranks: crate::blocks::Ranks::unpack(shared.ranks.load(Acquire)),
     }
 }
 
@@ -1436,9 +1435,9 @@ impl Rt {
         let Some(r) = self.replica.as_mut() else {
             return 0;
         };
-        let mut withdraw = false;
         let mut written = 0;
-        for (o, out) in self.outs.iter_mut().enumerate() {
+        for o in 0..self.outs.len() {
+            let out = &mut self.outs[o];
             let Some(writer) = out.writer.as_deref_mut() else {
                 continue;
             };
@@ -1454,7 +1453,7 @@ impl Rt {
             };
             let ctx = ctx(&r.shared, self.step_at);
             let statuses = &r.shared.statuses[o];
-            withdraw |= out
+            let mut withdraw = out
                 .hold
                 .advance(ctx, statuses, &mut changes, &mut sink)
                 .withdraw;
@@ -1468,9 +1467,11 @@ impl Rt {
             if sink.wrote {
                 written |= 1 << o;
             }
-        }
-        if withdraw {
-            withdraw_all(&mut self.outs, r, &self.counters);
+            // On every output before the next one advances: none commits a
+            // block after this one withheld one.
+            if withdraw {
+                withdraw_all(&mut self.outs, r, &self.counters);
+            }
         }
         written
     }
@@ -2724,7 +2725,7 @@ mod tests {
         Replica {
             shared: Arc::new(Shared {
                 fence: AtomicU64::new(0),
-                rank: AtomicU64::new(0),
+                ranks: AtomicU64::new(0),
                 self_report: AtomicBool::new(false),
                 steps_cleared: AtomicU64::new(0),
                 statuses: Vec::new(),

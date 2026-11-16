@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicU64;
 use gungraun::prelude::*;
 use gungraun::{Callgrind, EventKind};
 use samplez::blocks::{
-    Changes, Ctx, HEALTHY, Hold, PageHash, Pages, Sink, StatusChange, Statuses, fingerprint,
+    Changes, Ctx, HEALTHY, Hold, PageHash, Pages, Ranks, Sink, StatusChange, Statuses, fingerprint,
 };
 use samplez_dsp::strip::{CompParams, DEFAULT_BANDS, EqBand, GateParams, Strip, StripParam};
 
@@ -73,7 +73,10 @@ impl Out {
             dropped: &self.dropped,
             output: 0,
         };
-        let ctx = Ctx { fence, rank: 0 };
+        let ctx = Ctx {
+            fence,
+            ranks: Ranks::flat(0),
+        };
         self.hold.compute(
             k,
             &self.data,
@@ -91,7 +94,10 @@ impl Out {
             dropped: &self.dropped,
             output: 0,
         };
-        let ctx = Ctx { fence, rank: 0 };
+        let ctx = Ctx {
+            fence,
+            ranks: Ranks::flat(0),
+        };
         self.hold
             .advance(ctx, &self.statuses, &mut changes, &mut Null);
     }

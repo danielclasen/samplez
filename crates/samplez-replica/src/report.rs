@@ -4,7 +4,7 @@
 //! last heard from every other voter (one relay hop) and the entries it
 //! lists for the addressee.
 
-use samplez::blocks::{BlockStatus, Range};
+use samplez::blocks::{BlockStatus, Range, Standing};
 use serde::{Deserialize, Serialize};
 
 use crate::entry::NodeId;
@@ -105,6 +105,11 @@ pub struct Own {
     pub clock: ClockFlags,
     /// Per output, the statuses of its latest blocks.
     pub statuses: Vec<Vec<Run>>,
+    /// Per output, whether it commits: an output standing `withdrawn` or
+    /// idle since k0 stands for `withheld` on every block from k0 up to
+    /// `processed` without another status.
+    #[serde(default)]
+    pub standing: Vec<Standing>,
     pub unwritten: Vec<Unwritten>,
     /// buildLead: samples a generation-needing entry is stamped ahead of
     /// the earliest index, covering this replica's generation builds.
@@ -128,6 +133,9 @@ pub struct Heard {
 pub struct Listed {
     pub id: StoredLogId,
     pub at_index: u64,
+    /// A `Baseline`: it ranks the replica, and is never unresolved.
+    #[serde(default)]
+    pub baseline: bool,
 }
 
 /// `statuses` of consecutive blocks, a none for a block without one, as
