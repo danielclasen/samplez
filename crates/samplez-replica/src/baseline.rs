@@ -52,9 +52,11 @@ pub(crate) struct LeaderView<'a> {
 /// The leader's decisions, counted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {
-    /// `Baseline` entries appended under the no-committer rule.
+    /// `Baseline` entries appended under the no-committer rule, or
+    /// naming a committing replica while none is named.
     pub named: u64,
-    /// Renames of a baseline that stopped committing or was diverged.
+    /// Renames of a baseline that stopped committing, was diverged or
+    /// left the audio voters.
     pub renamed: u64,
     /// `Diverged` verdicts appended.
     pub verdicts: u64,
@@ -117,7 +119,14 @@ impl Leader {
     fn baseline(&mut self, v: &LeaderView) -> Option<Baseline> {
         let anyone = v.audio.iter().any(committing);
         let Some(current) = v.baseline else {
-            return (!anyone).then(|| self.no_committer(v))?;
+            if !anyone {
+                return self.no_committer(v);
+            }
+            // One voter commits without waiting for its entry: a set grown
+            // from it names the top committing replica.
+            let b = self.rename(v, None)?;
+            self.counts.named += 1;
+            return Some(b);
         };
         let named = v.audio.iter().find(|a| a.id == current.replica);
         if !anyone {
@@ -126,7 +135,12 @@ impl Leader {
             }
             return self.no_committer(v);
         }
-        let n = named?;
+        // Left the audio voters: it commits no more.
+        let Some(n) = named else {
+            let b = self.rename(v, None)?;
+            self.counts.renamed += 1;
+            return Some(b);
+        };
         let renamed = if self.against == Some(n.id) {
             true
         } else if committing(n) {
@@ -142,14 +156,20 @@ impl Leader {
         if !renamed {
             return None;
         }
-        // The highest-ranked replica committing the latest blocks.
+        let b = self.rename(v, Some(n.id))?;
+        self.counts.renamed += 1;
+        Some(b)
+    }
+
+    /// A `Baseline` naming the highest-ranked replica committing the
+    /// latest blocks other than `from`.
+    fn rename(&mut self, v: &LeaderView, from: Option<NodeId>) -> Option<Baseline> {
         let next = v
             .audio
             .iter()
-            .filter(|a| a.id != n.id && committing(a))
+            .filter(|a| Some(a.id) != from && committing(a))
             .min_by_key(|a| ((v.rank)(a.id), a.id))?;
         self.against = None;
-        self.counts.renamed += 1;
         Some(Baseline {
             replica: next.id,
             order: order(v, next.id),
@@ -619,5 +639,46 @@ mod tests {
         assert!(named(&f.decide(&mut leader)).is_none());
         tokio::time::advance(INFLIGHT).await;
         assert!(named(&f.decide(&mut leader)).is_some());
+    }
+
+    fn committing_own(k: u64) -> Own {
+        Own {
+            standing: vec![Standing::Committing { from: 0 }],
+            ..own(ReplicaState::Committing, k)
+        }
+    }
+
+    /// A replica committing while no `Baseline` is applied (one voter
+    /// commits without its entry) is named once the set grows.
+    #[tokio::test(start_paused = true)]
+    async fn a_committing_replica_is_named_while_none_is() {
+        let k = 1_000_000;
+        let f = Fixture::new(vec![
+            (a(0), false, committing_own(k)),
+            (a(1), false, own(ReplicaState::Withdrawn, k)),
+            (a(2), false, own(ReplicaState::Withdrawn, k)),
+        ]);
+        let mut leader = Leader::default();
+        assert_eq!(named(&f.decide(&mut leader)), Some(a(0)));
+        assert_eq!(leader.counts.named, 1);
+    }
+
+    /// A baseline no longer among the audio voters is renamed to the top
+    /// committing replica.
+    #[tokio::test(start_paused = true)]
+    async fn a_baseline_that_left_the_voters_is_renamed() {
+        let k = 1_000_000;
+        let mut f = Fixture::new(vec![
+            (a(0), false, own(ReplicaState::Withdrawn, k)),
+            (a(1), false, committing_own(k)),
+        ]);
+        f.baseline = Some(Baseline {
+            replica: a(5),
+            order: Vec::new(),
+            at_index: 0,
+        });
+        let mut leader = Leader::default();
+        assert_eq!(named(&f.decide(&mut leader)), Some(a(1)));
+        assert_eq!(leader.counts.renamed, 1);
     }
 }
