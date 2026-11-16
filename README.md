@@ -100,7 +100,8 @@ state publishes F (`set_fence`), the ranks (`set_ranks`: one up to a
 block, another from it on, and the rank of a withdrawn replica's fills),
 and evidence (`commit_through`, for the whole block or up to a sample
 index inside it), and withholds blocks (`withhold`). An output commits
-only from its commit start (`commit_from`), the first page boundary of
+only from its commit start (`commit_from`, dropped again before it takes
+by `cancel_commit_start`), the first page boundary of
 1024 samples in a block it computes, and stops at `stop_at`; such a block
 is split and its status covers one range. `standing` reads whether an
 output commits, from which sample, or since which block it does not. A healthy block with F past it and nothing held before

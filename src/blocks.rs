@@ -713,6 +713,12 @@ impl Hold {
         self.start_from = Some(min_k);
     }
 
+    /// Drops a requested commit start that has not taken: the output goes
+    /// on as it is. One that took is no longer pending.
+    pub fn cancel_commit_start(&mut self) {
+        self.start_from = None;
+    }
+
     /// Stops committing at sample index `p`: the block holding it commits
     /// `[kB, p)`, and the output is withdrawn from `p` on.
     pub fn stop_at(&mut self, p: u64) {
@@ -2630,6 +2636,43 @@ mod tests {
             fill: 17,
         };
         assert_eq!(Ranks::unpack(ranks.pack()), ranks);
+    }
+
+    /// A cancelled commit start never takes, whether the output is idle
+    /// or withdrawn; one requested after it does, and a cancel after one
+    /// took changes nothing.
+    #[test]
+    fn a_cancelled_commit_start_never_takes() {
+        let p = K0 * B + PAGE;
+        let kp = p / B;
+        let mut t = T::new(false);
+        t.hold.commit_from(K0);
+        t.hold.cancel_commit_start();
+        for j in K0..=kp {
+            t.compute(j, Some(HEALTHY));
+        }
+        assert_eq!(t.statuses.standing(), Standing::Idle { since: 0 });
+        assert!(t.sink.writes.is_empty());
+
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        t.withdraw();
+        t.hold.commit_from(kp);
+        t.hold.cancel_commit_start();
+        for j in K0 + 1..=kp + 1 {
+            t.compute(j, DEGRADED);
+        }
+        assert!(matches!(t.statuses.standing(), Standing::Withdrawn { .. }));
+        t.hold.commit_from(kp + 2);
+        let next = ((kp + 2) * B).next_multiple_of(PAGE);
+        for j in kp + 2..=next / B {
+            t.compute(j, Some(HEALTHY));
+        }
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: next });
+        t.hold.cancel_commit_start();
+        t.compute(next / B + 1, Some(HEALTHY));
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: next });
+        t.sink.check();
     }
 
     /// A withdrawn replica keeps a requested commit start when one of its

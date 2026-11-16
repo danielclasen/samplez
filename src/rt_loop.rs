@@ -324,6 +324,8 @@ pub(crate) enum Control {
     /// Commit `output` from the first page boundary in a block at or
     /// after `min_k`.
     CommitFrom { output: usize, min_k: u64 },
+    /// Drop `output`'s requested commit start, unless it took.
+    CancelCommitStart { output: usize },
     /// Stop committing `output` at sample index `at`.
     StopAt { output: usize, at: u64 },
     /// The replica is withdrawn: every output commits through only.
@@ -1610,6 +1612,9 @@ impl Rt {
         while let Ok(c) = r.control.pop() {
             match c {
                 Control::CommitFrom { output, min_k } => self.outs[output].hold.commit_from(min_k),
+                Control::CancelCommitStart { output } => {
+                    self.outs[output].hold.cancel_commit_start()
+                }
                 Control::StopAt { output, at } => self.outs[output].hold.stop_at(at),
                 Control::Withdraw => withdraw_all(&mut self.outs, r, &self.counters),
                 Control::Unresolved { id, at_index } => {

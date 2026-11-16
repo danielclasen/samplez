@@ -1553,6 +1553,15 @@ impl Engine {
         self.control(Control::CommitFrom { output, min_k })
     }
 
+    /// Replicated mode: drops output `output`'s requested commit start
+    /// ([`Engine::commit_from`]) unless the output took it already: a
+    /// commit start named on a decision taken back. Controls apply in
+    /// the order sent, so a commit start sent after it stands.
+    pub fn cancel_commit_start(&self, output: usize) -> Result<(), ControlError> {
+        self.output_index(output)?;
+        self.control(Control::CancelCommitStart { output })
+    }
+
     /// Replicated mode: output `output` stops committing at sample index
     /// `at`: the block holding it commits `[kB, at)`, reported `committed
     /// up to at`, withholds `[at, (k + 1)B)` without a cause, and the
