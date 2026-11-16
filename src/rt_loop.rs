@@ -131,6 +131,8 @@ pub struct Counters {
     pub handovers_missed: AtomicU64,
     /// Pending entries a hand-over found no room for.
     pub handover_entries_lost: AtomicU64,
+    /// Blocks not computed for want of a core, withheld.
+    pub blocks_without_core: AtomicU64,
     /// Page hashes the supervisor could not pass on: the replicated
     /// state's channel was full.
     pub page_hashes_unsent: AtomicU64,
@@ -328,6 +330,9 @@ pub(crate) enum Control {
     Unresolved { id: LogId, at_index: u64 },
     /// Entry `id` is decided.
     Resolved { id: LogId },
+    /// The core is dropped: no block is computed until a hand-over
+    /// installs one.
+    DropCore,
 }
 
 /// Unresolved entries the RT thread holds, and the capacity of the
@@ -986,6 +991,9 @@ pub(crate) struct Rt {
     /// A replay clone: computes off the RT thread from past input, writes
     /// nothing and hashes every page it computes whole.
     pub replay: bool,
+    /// The engine holds a core: false from a dropped core until a
+    /// hand-over installs one.
+    pub core: bool,
     pub cmd: Consumer<Command>,
     pub entries: Consumer<RtEntry>,
     pub ret: Producer<Returned>,
@@ -1318,7 +1326,17 @@ impl Rt {
                     *s = GroupWait::Skipped;
                 }
             }
-            self.take_handover(if catchup.is_empty() { k } else { catchup.start });
+            let first = if catchup.is_empty() { k } else { catchup.start };
+            self.take_handover(first);
+            if !self.core {
+                // No block is computed: each is withheld, held blocks
+                // still move.
+                self.no_core(first, k + 1);
+                let deadline = time::deadline(&self.api, k, self.block, self.margin);
+                self.sleep_until(deadline);
+                next = Some(k + 1);
+                continue;
+            }
             for k in catchup {
                 let deadline = time::deadline(&self.api, k, self.block, self.margin);
                 self.process(k, deadline);
@@ -1563,6 +1581,10 @@ impl Rt {
                     }
                 }
                 Control::Resolved { id } => r.unresolved.retain(|e| e.0 != id),
+                Control::DropCore => {
+                    self.core = false;
+                    withdraw_all(&mut self.outs, r, &self.counters);
+                }
             }
         }
     }
@@ -1578,6 +1600,23 @@ impl Rt {
             add(&self.counters.status_changes_dropped, 1);
         }
         withdraw_all(&mut self.outs, r, &self.counters);
+    }
+
+    /// Blocks `[from, to)` are not computed for want of a core: withheld,
+    /// cause no core, on every output; the replica stays withdrawn.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    fn no_core(&mut self, from: u64, to: u64) {
+        add(&self.counters.heartbeat_blocks, 1);
+        self.advance_holds(None);
+        let Some(r) = self.replica.as_mut() else {
+            return;
+        };
+        add(&self.counters.blocks_withheld, to - from);
+        add(&self.counters.blocks_without_core, to - from);
+        if r.changes.push(StatusChange::NoCore { from, to }).is_err() {
+            add(&self.counters.status_changes_dropped, 1);
+        }
+        self.counters.processed.store(to, Release);
     }
 
     /// Makes `generation` the one of input domain `domain` and hands the
@@ -2150,6 +2189,7 @@ impl Rt {
                 for p in self.outs.iter_mut().filter_map(|o| o.pages.as_mut()) {
                     p.restart();
                 }
+                self.core = true;
                 &self.counters.handovers_installed
             }
             Answer::Generation => &self.counters.handovers_generation,

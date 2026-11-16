@@ -34,7 +34,10 @@ use crate::rt_loop::{
     Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared, Slot, SlotStats,
     Telemetry, UNRESOLVED,
 };
-use crate::transfer::{Answer, CopyError, Core, CoreCopy, Handover, Replay, ReplayError};
+use crate::transfer::{
+    Answer, CopyError, Core, CoreCopy, Handover, ProductState, Replay, ReplayError, SlotCore,
+    change_of,
+};
 
 const COMMAND_RING: usize = 64;
 const RETURN_RING: usize = 64;
@@ -708,6 +711,7 @@ fn replay_rt(
         taken: 0,
         skip_upto: 0,
         replay: true,
+        core: true,
         cmd: none(),
         entries: none(),
         ret: sink(),
@@ -1029,6 +1033,7 @@ impl Engine {
             taken: 0,
             skip_upto: 0,
             replay: false,
+            core: true,
             cmd: cmd_rx,
             entries: entry_rx,
             ret: ret_tx,
@@ -1753,6 +1758,105 @@ impl Engine {
     /// next call: if that hand-over was installed, the unresolved entries
     /// become its core's.
     pub fn hand_over(&self, replay: &mut Replay, timeout: Duration) -> Result<u64, ReplayError> {
+        // Up to the last block the RT thread computed, before the first
+        // attempt.
+        replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
+        self.offer(timeout, |j, core| {
+            replay.run(j);
+            replay.rt.capture(core);
+            (replay.next - 1, replay.last_id)
+        })
+    }
+
+    /// Replicated mode with more than one voter: drops the RT thread's
+    /// core. The RT thread keeps its writers, hold rings and statuses but
+    /// computes no block: each is withheld, cause [`Cause::NoCore`], and
+    /// the replica is withdrawn, until [`Engine::install_product`] or
+    /// [`Engine::hand_over`] installs a core.
+    pub fn drop_core(&self) -> Result<(), ControlError> {
+        if self.transfer.is_none() {
+            return Err(ControlError::Invalid(
+                "the engine is not replicated with more than one voter".to_owned(),
+            ));
+        }
+        self.control(Control::DropCore)
+    }
+
+    /// Replicated mode with more than one voter: builds a core from
+    /// `state` off the RT thread, its targets at their values, its fades
+    /// and ramps cold, its pending entries and the generation this engine
+    /// holds pending, and installs it at a block boundary as a replay is
+    /// handed over. Returns the block the core followed.
+    pub fn install_product(
+        &self,
+        state: &ProductState,
+        timeout: Duration,
+    ) -> Result<u64, ReplayError> {
+        let (n, m) = self.shape;
+        let slots = self.config.inputs.len();
+        if state.gains.len() != n
+            || state.gains.iter().any(|row| row.len() != m)
+            || state.up.len() != slots
+        {
+            return Err(ReplayError::Invalid(format!(
+                "a product state of the shape {n} x {m} with {slots} inputs"
+            )));
+        }
+        let mut pending = Vec::with_capacity(state.pending.len());
+        for (id, at_index, entry) in &state.pending {
+            pending.push(RtEntry {
+                id: *id,
+                at_index: *at_index,
+                change: change_of(entry),
+            });
+        }
+        pending.sort_by_key(|e| (e.at_index, e.id));
+        if pending.len() > PENDING_CHANGES {
+            return Err(ReplayError::Full);
+        }
+        let pending_gen = self.status().generation.pending;
+        self.offer(timeout, |j, core| {
+            for (i, row) in state.gains.iter().enumerate() {
+                for (o, &g) in row.iter().enumerate() {
+                    let _ = core.matrix.set(i, o, g, 0);
+                }
+            }
+            core.pos = Some((j + 1) * self.block);
+            core.ramp_end = 0;
+            core.pending.clear();
+            core.pending.extend_from_slice(&pending);
+            core.page_entries.clear();
+            core.entries_page = None;
+            core.entries_lost = false;
+            for (c, &up) in core.slots.iter_mut().zip(&state.up) {
+                *c = SlotCore {
+                    up,
+                    held: false,
+                    fade_start: None,
+                    silenced_last: true,
+                    xfade: None,
+                };
+            }
+            core.awaiting_gen.clear();
+            core.pending_gen = pending_gen;
+            core.unresolved.clear();
+            core.late_routes.clear();
+            core.late_lost_until = 0;
+            (j, state.last_id)
+        })
+    }
+
+    /// Passes the cores `make` fills to the RT thread until one is
+    /// installed or `timeout` passes. The RT thread installs a core only
+    /// before the block after the core's: each attempt waits for it to
+    /// compute a block, has `make` fill a core for that block at once and
+    /// passes it on before the RT thread's next wake. `make` returns the
+    /// block the core follows and the highest log id it knew.
+    fn offer(
+        &self,
+        timeout: Duration,
+        mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
+    ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
             return Err(ReplayError::Invalid(
                 "the engine is not replicated with more than one voter".to_owned(),
@@ -1808,11 +1912,8 @@ impl Engine {
                 t.spare = Some(core);
                 return Err(ReplayError::Timeout);
             }
-            // Up to the last block the RT thread computed, then the step
-            // to the next one: the RT thread sleeps after it until its
-            // next wake, which installs a core for that block.
-            let p = processed();
-            replay.run(p.saturating_sub(1));
+            // The step to the next block: the RT thread sleeps after it
+            // until its next wake, which installs a core for that block.
             let p = processed();
             while processed() == p {
                 if Instant::now() >= deadline {
@@ -1821,13 +1922,12 @@ impl Engine {
                 }
                 std::thread::sleep(poll);
             }
-            replay.run(processed().saturating_sub(1));
-            replay.rt.capture(&mut core);
+            let (j, last_id) = make(processed().saturating_sub(1), &mut core);
             t.seq += 1;
             let h = Handover {
                 seq: t.seq,
-                j: replay.next - 1,
-                last_id: replay.last_id,
+                j,
+                last_id,
                 core,
                 answer: Answer::Waiting,
             };

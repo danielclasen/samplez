@@ -63,9 +63,11 @@ pub enum Cause {
     NoSlot,
     /// Fenced by a detected clock step with no ring to hold it: one voter.
     ClockStep,
+    /// Not computed: the engine holds no core while the replica starts.
+    NoCore,
 }
 
-const CAUSES: [Cause; 11] = [
+const CAUSES: [Cause; 12] = [
     Cause::None,
     Cause::Skip,
     Cause::Overflow,
@@ -77,6 +79,7 @@ const CAUSES: [Cause; 11] = [
     Cause::Released,
     Cause::NoSlot,
     Cause::ClockStep,
+    Cause::NoCore,
 ];
 
 /// The samples of block k a status covers. A block split at P carries
@@ -420,6 +423,12 @@ pub enum StatusChange {
     /// Blocks `[from, to)` were skipped, on every output: `withheld` at
     /// the skip, cause [`Cause::Skip`].
     Skipped {
+        from: u64,
+        to: u64,
+    },
+    /// Blocks `[from, to)` were not computed, on every output: the engine
+    /// held no core. `withheld` there, cause [`Cause::NoCore`].
+    NoCore {
         from: u64,
         to: u64,
     },

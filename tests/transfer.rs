@@ -11,8 +11,10 @@ use common::{
     B, Domain, Pilot, copy_core as copy, new_id, processed, start_held, start_held_with, wait_for,
 };
 use common::{MARGIN, config, diagonal};
-use samplez::blocks::{PAGE, PageHash};
-use samplez::{BlockVerdict, CopyError, Engine, Entry, InputState, ReplayError, Replication};
+use samplez::blocks::{PAGE, PageHash, StatusChange};
+use samplez::{
+    BlockVerdict, CopyError, Engine, Entry, InputState, ProductState, ReplayError, Replication,
+};
 
 /// The copy holds the state after block k0: entries due by then applied
 /// with their ramps run out, later ones pending, the input's log state,
@@ -108,6 +110,7 @@ struct Hashed {
     e: Engine,
     hashes: Receiver<PageHash>,
     verdicts: Receiver<BlockVerdict>,
+    statuses: Receiver<StatusChange>,
 }
 
 /// Samples of a gain ramp: about two pages, so the pages a ramp runs
@@ -126,11 +129,12 @@ fn hashed(domain: &Domain, src: &str) -> Hashed {
     let (report_tx, _reports) = sync_channel(64);
     let (hash_tx, hashes) = sync_channel(1 << 16);
     let (verdict_tx, verdicts) = sync_channel(1 << 16);
+    let (status_tx, statuses) = sync_channel(1 << 16);
     let process = samplez::rt::setup_process(&config.rt);
     let replication = Replication {
         voters: 2,
         reports: report_tx,
-        statuses: None,
+        statuses: Some(status_tx),
         hashes: Some(hash_tx),
     };
     let e = Engine::start_replicated(config, process, Some(verdict_tx), replication).unwrap();
@@ -142,6 +146,7 @@ fn hashed(domain: &Domain, src: &str) -> Hashed {
         e,
         hashes,
         verdicts,
+        statuses,
     }
 }
 
@@ -436,4 +441,63 @@ fn a_replay_names_its_silenced_blocks() {
     assert_eq!(replay.silenced(), (k0 + 1..k0 + 11).collect::<Vec<_>>());
     assert_eq!(replay.silenced(), Vec::<u64>::new());
     b.e.stop();
+}
+
+/// With its core dropped the RT thread computes no block: each is
+/// withheld, cause no core, the ranges sent without a gap, and none is
+/// written or metered. A core built from product state is installed at a
+/// block boundary: computing resumes at the block after it, never a block
+/// twice, with the product's targets in place and no ramp to them.
+#[test]
+fn a_dropped_core_withholds_until_a_product_core_is_installed() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    h.e.drop_core().unwrap();
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 50
+    });
+    let state = ProductState {
+        gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
+        up: vec![true],
+        pending: Vec::new(),
+        last_id: 0,
+    };
+    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    // At the targets from the first block on, with no ramp to them.
+    let core = common::copy_core(&h.e).core;
+    assert_eq!(
+        (core.gain(0, 0), core.gain(1, 1), core.gain(0, 1)),
+        (0.25, 0.5, 0.0)
+    );
+    assert!(core.input_up(0));
+    wait_for(Duration::from_secs(5), "computing again", || {
+        processed(&h.e) > j + 20
+    });
+
+    let ranges: Vec<(u64, u64)> = h
+        .statuses
+        .try_iter()
+        .filter_map(|s| match s {
+            StatusChange::NoCore { from, to } => Some((from, to)),
+            _ => None,
+        })
+        .collect();
+    assert!(!ranges.is_empty());
+    assert!(ranges.windows(2).all(|w| w[0].1 == w[1].0), "{ranges:?}");
+    let (from, to) = (ranges[0].0, ranges.last().unwrap().1);
+    assert_eq!(
+        to,
+        j + 1,
+        "the last block without a core is the one installed after"
+    );
+    let computed: Vec<u64> = h.verdicts.try_iter().map(|v| v.k).collect();
+    assert!(
+        computed.iter().all(|k| !(from..to).contains(k)),
+        "a block without a core computed"
+    );
+    assert!(computed.contains(&(j + 1)) && computed.contains(&(from - 1)));
+    h.e.stop();
 }

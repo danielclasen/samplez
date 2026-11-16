@@ -163,20 +163,10 @@ impl Replay {
         if id <= self.last_id {
             return Ok(());
         }
-        let change = match *entry {
-            Entry::Gain {
-                input,
-                output,
-                gain,
-            } => Change::Gain {
-                input,
-                output,
-                gain,
-            },
-            Entry::InputDown { slot } => Change::InputDown { slot },
-            Entry::Strip { slot, param } => Change::Strip { slot, param },
-            Entry::InputUp { .. } | Entry::Route { .. } => return Err(ReplayError::Generation),
-        };
+        let change = change_of(entry);
+        if change.needs_generation() {
+            return Err(ReplayError::Generation);
+        }
         let b = self.rt.block;
         if !at_index.is_multiple_of(b) || at_index < self.next * b {
             return Err(ReplayError::Late { id, at_index });
@@ -243,6 +233,40 @@ impl Replay {
     pub fn silenced(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.silenced)
     }
+}
+
+/// The change log entry `entry` makes on the RT thread.
+pub(crate) fn change_of(entry: &Entry) -> Change {
+    match *entry {
+        Entry::Gain {
+            input,
+            output,
+            gain,
+        } => Change::Gain {
+            input,
+            output,
+            gain,
+        },
+        Entry::InputDown { slot } => Change::InputDown { slot },
+        Entry::InputUp { slot } => Change::InputUp { slot },
+        Entry::Route { slot, .. } => Change::Route { slot },
+        Entry::Strip { slot, param } => Change::Strip { slot, param },
+    }
+}
+
+/// The product state an engine core is built from
+/// ([`Engine::install_product`](crate::Engine::install_product)).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductState {
+    /// The gain targets: one row per input channel, one column per output
+    /// channel.
+    pub gains: Vec<Vec<f32>>,
+    /// Per input slot whether it is up in the log.
+    pub up: Vec<bool>,
+    /// Committed entries not applied yet: log id, `at_index` and entry.
+    pub pending: Vec<(LogId, u64, Entry)>,
+    /// The highest log id the state folds in.
+    pub last_id: LogId,
 }
 
 /// Why a replay was not built, took no entry, or was not handed over.
