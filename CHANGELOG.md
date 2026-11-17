@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/danielclasen/samplez/compare/v0.3.0...v0.4.0) (2026-11-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **service:** Identity has a new public field, name.
+* **engine:** config::Input gains flow_channels and samplez_mxl::input::InputConfig gains flow_channels; code building these structs field by field has to set them.
+
+### Features
+
+* **engine:** select an input's legs from the channels of a wider flow ([#45](https://github.com/danielclasen/samplez/issues/45)) ([ad13e0b](https://github.com/danielclasen/samplez/commit/ad13e0ba025f8a3834b71846fa59288bc042aef6))
+* **service:** carry the user's display name in Identity ([#44](https://github.com/danielclasen/samplez/issues/44)) ([361f704](https://github.com/danielclasen/samplez/commit/361f704fa2a227ddf405678ea5e254c9e7e781df))
+
 ## [0.3.0](https://github.com/danielclasen/samplez/compare/v0.2.0...v0.3.0) (2026-11-17)
 
 

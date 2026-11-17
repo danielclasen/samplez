@@ -1,6 +1,6 @@
 [package]
 name = "samplez-replica"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -18,9 +18,9 @@ hyper-util = { version = "=0.1.21", features = ["tokio"] }
 libc = "=0.2.191"
 openraft = "=0.9.26"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
-samplez = { path = "../..", version = "0.3.0" }
-samplez-mxl = { path = "../samplez-mxl", version = "0.3.0" }
-samplez-service = { path = "../samplez-service", version = "0.3.0" }
+samplez = { path = "../..", version = "0.4.0" }
+samplez-mxl = { path = "../samplez-mxl", version = "0.4.0" }
+samplez-service = { path = "../samplez-service", version = "0.4.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 tokio = { version = "=1.54.1", features = ["macros", "net", "rt", "sync", "time"] }
