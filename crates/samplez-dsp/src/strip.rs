@@ -253,7 +253,10 @@ pub const DEFAULT_BANDS: [EqBand; EQ_BANDS] = [
 /// unchanged: trims at 0 dB, no leg inverted, high-pass, equaliser, gate
 /// and compressor off, the bands at [`DEFAULT_BANDS`], the high-pass at
 /// 80 Hz, the dynamics after the equaliser.
+///
+/// A strip deserializes only as one [`Strip::is_valid`] takes.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "Unchecked")]
 pub struct Strip {
     legs: usize,
     ramp: u32,
@@ -277,6 +280,63 @@ pub struct Strip {
     alt_eq: [[[f32; 2]; MAX_LEGS]; EQ_BANDS],
     alt_gate: Gate,
     alt_comp: Comp,
+}
+
+/// A strip as its serde form carries it, before it is checked.
+#[derive(serde::Deserialize)]
+struct Unchecked {
+    legs: usize,
+    ramp: u32,
+    trim_db: f32,
+    leg_trim_db: [f32; MAX_LEGS],
+    inverted: [bool; MAX_LEGS],
+    gain: [Ramp; MAX_LEGS],
+    hpf_enabled: bool,
+    hpf_freq: f32,
+    hpf: Svf<MAX_LEGS>,
+    eq_enabled: bool,
+    bands: [EqBand; EQ_BANDS],
+    eq: [Svf<MAX_LEGS>; EQ_BANDS],
+    gate: Gate,
+    comp: Comp,
+    dynamics_before_eq: bool,
+    fade: Ramp,
+    alt_eq: [[[f32; 2]; MAX_LEGS]; EQ_BANDS],
+    alt_gate: Gate,
+    alt_comp: Comp,
+}
+
+impl TryFrom<Unchecked> for Strip {
+    type Error = &'static str;
+
+    fn try_from(u: Unchecked) -> Result<Strip, Self::Error> {
+        let s = Strip {
+            legs: u.legs,
+            ramp: u.ramp,
+            trim_db: u.trim_db,
+            leg_trim_db: u.leg_trim_db,
+            inverted: u.inverted,
+            gain: u.gain,
+            hpf_enabled: u.hpf_enabled,
+            hpf_freq: u.hpf_freq,
+            hpf: u.hpf,
+            eq_enabled: u.eq_enabled,
+            bands: u.bands,
+            eq: u.eq,
+            gate: u.gate,
+            comp: u.comp,
+            dynamics_before_eq: u.dynamics_before_eq,
+            fade: u.fade,
+            alt_eq: u.alt_eq,
+            alt_gate: u.alt_gate,
+            alt_comp: u.alt_comp,
+        };
+        if s.is_valid() {
+            Ok(s)
+        } else {
+            Err("a strip state no strip holds")
+        }
+    }
 }
 
 impl Strip {
@@ -1708,6 +1768,28 @@ mod tests {
         assert_eq!(s.gain[0].target(), LEG_GAIN_MAX);
         assert_eq!(s.gain[1].target(), -LEG_GAIN_MAX);
         assert!(s.is_valid());
+    }
+
+    /// A strip deserializes only as a valid one: a serde form of one
+    /// with no legs, which `process` would index past, or a NaN state is
+    /// refused, a valid one comes back bit for bit.
+    #[test]
+    fn a_strip_deserializes_only_valid() {
+        let mut s = busy(3);
+        let mut buf: Vec<f32> = (0..3 * 96).map(|n| (n as f32 * 0.05).sin()).collect();
+        s.process(&mut buf, 96);
+        let wire = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<Strip>(&wire).unwrap(), s);
+        let refused = |what: &str, f: &dyn Fn(&mut Strip)| {
+            let mut bad = s.clone();
+            f(&mut bad);
+            let wire = serde_json::to_string(&bad).unwrap();
+            assert!(serde_json::from_str::<Strip>(&wire).is_err(), "{what}");
+        };
+        refused("no legs", &|s| s.legs = 0);
+        refused("legs beyond a strip", &|s| s.legs = MAX_LEGS + 1);
+        refused("a NaN state", &|s| s.eq[2].state[1][0] = f32::NAN);
+        refused("a trim out of range", &|s| s.trim_db = 30.0);
     }
 
     /// A strip holding a value none reaches is not valid: a NaN or an

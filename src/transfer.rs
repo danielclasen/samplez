@@ -114,9 +114,10 @@ impl Core {
 
     /// Whether everything this core holds is a value an engine holds:
     /// every index at most [`INDEX_MAX`], every gain one a ramp takes,
-    /// every strip parameter within its range (legs aside), every strip
-    /// one [`Strip::is_valid`] takes, the lists within their capacities. A core from another replica is checked
-    /// when decoded.
+    /// every strip parameter within its range (legs aside), the lists
+    /// within their capacities. A core from another replica is checked
+    /// when decoded; a strip in it is checked as it deserializes
+    /// ([`Strip::is_valid`]).
     fn sane(&self) -> bool {
         let index = |i: u64| i <= INDEX_MAX;
         let entry = |e: &RtEntry| {
@@ -131,7 +132,6 @@ impl Core {
             s.fade_start.is_none_or(index)
                 && s.xfade.is_none_or(index)
                 && s.strip_pos.is_none_or(index)
-                && s.strip.as_ref().is_none_or(Strip::is_valid)
         };
         let ats = |list: &[(LogId, u64)]| list.iter().all(|&(_, at)| index(at));
         self.pos.is_none_or(index)
