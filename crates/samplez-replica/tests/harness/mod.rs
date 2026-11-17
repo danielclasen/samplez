@@ -426,9 +426,6 @@ pub struct Fake {
     /// Commit starts the supervisor named, `(output, min_k)`, and cancels.
     pub commit_starts: Vec<(usize, u64)>,
     pub cancels: Vec<usize>,
-    /// Engine cores dropped and rebuilt.
-    pub drops: u64,
-    pub rebuilds: u64,
     /// Blocks `[from, to)` whose samples differ from every other replica's
     /// by a factor `1 + by`, in what is hashed, not in what is written: content
     /// diverged.
@@ -885,13 +882,6 @@ impl Audio for FakeAudio {
     fn withdraw(&self) {
         self.step();
         self.lock().withdraw_all();
-    }
-    fn drop_engine(&self) {
-        self.lock().drops += 1;
-    }
-    fn rebuild_engine(&self) -> bool {
-        self.lock().rebuilds += 1;
-        true
     }
     fn ranks(&self, ranks: Ranks) {
         let tai = self.clock.tai_ns();
