@@ -406,6 +406,7 @@ async fn a_killed_leader_and_baseline_is_renamed_to_a_survivor() {
             replica: leader,
             order: Vec::new(),
             at_index: 0,
+            key: None,
         }));
         until("the leader named", 2, || {
             ids.iter()

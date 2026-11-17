@@ -139,6 +139,11 @@ pub struct Baseline {
     pub replica: NodeId,
     pub order: Vec<NodeId>,
     pub at_index: u64,
+    /// The named replica's compatibility key ([`crate::rollout`]): the
+    /// key every replica compares its own with; none when it reported
+    /// none.
+    #[serde(default)]
+    pub key: Option<u64>,
 }
 
 /// What an entry does once applied.

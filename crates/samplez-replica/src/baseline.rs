@@ -50,6 +50,8 @@ pub(crate) struct LeaderView<'a> {
     pub floor: u64,
     /// Rank now under the latest `Baseline`, 0 the top.
     pub rank: &'a dyn Fn(NodeId) -> u8,
+    /// The audio StatefulSet's target revision ([`crate::rollout`]).
+    pub target: Option<&'a str>,
 }
 
 /// The leader's decisions, counted.
@@ -65,6 +67,9 @@ pub struct Counts {
     pub verdicts: u64,
     /// Pages without a strict majority hash among two or more.
     pub disagreements: u64,
+    /// `Baseline` entries naming a target-revision replica with another
+    /// key than the baseline's: key hand-overs.
+    pub handed_over: u64,
 }
 
 #[derive(Debug, Default)]
@@ -138,6 +143,10 @@ impl Leader {
             self.against = None;
         }
         let anyone = v.audio.iter().any(committing);
+        if anyone && let Some(b) = self.hand_over(v) {
+            self.counts.handed_over += 1;
+            return Some(b);
+        }
         let Some(current) = v.baseline else {
             if !anyone {
                 return self.no_committer(v);
@@ -181,6 +190,53 @@ impl Leader {
         Some(b)
     }
 
+    /// The key hand-over: in a rollout that changes the key, a `Baseline`
+    /// naming the top target-revision replica with the target's key once
+    /// it is a candidate, has applied the latest `Baseline` and reports
+    /// no block withheld for a cause. A replica passed over, or one that
+    /// never learned of its naming, is named again only then.
+    fn hand_over(&mut self, v: &LeaderView) -> Option<Baseline> {
+        let target = v.target?;
+        let current = v.baseline?;
+        let at_target = |a: &&Voter| {
+            a.own
+                .is_some_and(|o| o.key.is_some() && o.revision.as_deref() == Some(target))
+        };
+        let key = v.audio.iter().filter(at_target).find_map(|a| a.own?.key)?;
+        // A `Baseline` named before any key was reported carries none:
+        // the named replica's report tells it.
+        let base_key = current.key.or_else(|| {
+            v.audio
+                .iter()
+                .find(|a| a.id == current.replica)
+                .and_then(|a| a.own?.key)
+        });
+        if base_key.is_none_or(|k| k == key) {
+            return None;
+        }
+        let n = v
+            .audio
+            .iter()
+            .filter(at_target)
+            .filter(|a| {
+                let own = a.own.expect("reported");
+                own.key == Some(key)
+                    && candidate(v, a)
+                    && own.baseline == Some((current.replica, current.at_index))
+                    // One that computes nothing reports every block
+                    // withheld.
+                    && (own.state == Some(ReplicaState::VersionMismatch) || !withheld_from(own, 0))
+            })
+            .min_by_key(|a| ((v.rank)(a.id), a.id))?;
+        self.against = None;
+        Some(Baseline {
+            replica: n.id,
+            order: order(v, n.id),
+            at_index: 0,
+            key: Some(key),
+        })
+    }
+
     /// A `Baseline` naming the highest-ranked replica committing the
     /// latest blocks other than `from`.
     fn rename(&mut self, v: &LeaderView, from: Option<NodeId>) -> Option<Baseline> {
@@ -194,6 +250,7 @@ impl Leader {
             replica: next.id,
             order: order(v, next.id),
             at_index: 0,
+            key: next.own.and_then(|o| o.key),
         })
     }
 
@@ -202,7 +259,9 @@ impl Leader {
     /// bound.
     fn about_to_commit(&self, v: &LeaderView, n: &Voter, b: &Baseline) -> bool {
         let p = b.at_index.next_multiple_of(PAGE);
-        candidate(v, n)
+        // Readiness does not move P: a named replica not ready at P holds
+        // its degraded blocks as usual.
+        candidate_unready(v, n)
             && !n.own.is_some_and(|o| withheld_from(o, p / v.timing.block))
             && !lapsed(v, n, p)
     }
@@ -224,6 +283,7 @@ impl Leader {
             replica: top.id,
             order: order(v, top.id),
             at_index: 0,
+            key: top.own.and_then(|o| o.key),
         })
     }
 
@@ -352,12 +412,16 @@ fn names_silent(own: &Own, n: NodeId, b: &Baseline, t: &Timing) -> bool {
 /// block for a cause at or after its P) only once its reports show that
 /// `Baseline` applied and a clean page since.
 fn candidate(v: &LeaderView, a: &Voter) -> bool {
+    a.own.is_some_and(|own| own.ready || filling(own)) && candidate_unready(v, a)
+}
+
+/// [`candidate`] whether ready or not.
+fn candidate_unready(v: &LeaderView, a: &Voter) -> bool {
     let Some(own) = a.own else { return false };
     if a.silent
         || v.judged.contains(&a.id)
         || own.clock.unverified
         || v.disrupting == Some(a.id)
-        || !(own.ready || filling(own))
         || own.state == Some(ReplicaState::Starting)
     {
         return false;
@@ -500,6 +564,7 @@ mod tests {
                 timing: &self.timing,
                 floor: index_at(7_000_000),
                 rank: &rank,
+                target: None,
             };
             leader.decide(&v, Instant::now())
         }
@@ -569,6 +634,7 @@ mod tests {
             replica: a(0),
             order: Vec::new(),
             at_index: p - 1,
+            key: None,
         };
         let mut f = Fixture::new(vec![
             (a(0), false, own(ReplicaState::Withdrawn, k)),
@@ -625,6 +691,7 @@ mod tests {
             replica: a(0),
             order: Vec::new(),
             at_index: 0,
+            key: None,
         };
         let committing = || Own {
             standing: vec![Standing::Committing { from: 0 }],
@@ -741,6 +808,7 @@ mod tests {
             replica: a(5),
             order: Vec::new(),
             at_index: 0,
+            key: None,
         });
         let mut leader = Leader::default();
         assert_eq!(named(&f.decide(&mut leader)), Some(a(1)));
@@ -813,6 +881,7 @@ mod tests {
             replica: a(1),
             order: Vec::new(),
             at_index: 0,
+            key: None,
         };
         let mut f = Fixture::new(vec![
             (a(0), false, committing_own(k)),
@@ -851,6 +920,7 @@ mod tests {
             replica: a(0),
             order: Vec::new(),
             at_index: p - 1,
+            key: None,
         };
         let bound = p + PAGE + index_at(18_000_000) + index_at(7_000_000);
         let past = bound / B + 1;

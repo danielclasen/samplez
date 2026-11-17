@@ -339,6 +339,7 @@ mod tests {
             replica,
             order: Vec::new(),
             at_index: 0,
+            key: None,
         }
     }
 

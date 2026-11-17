@@ -25,6 +25,7 @@ pub mod net;
 pub mod peer;
 pub mod rank;
 pub mod report;
+pub mod rollout;
 pub mod schedule;
 pub mod session;
 pub mod snapshot;
@@ -455,6 +456,18 @@ impl<P: Product> Replica<P> {
         Ok(())
     }
 
+    /// Gives contact the compatibility key and the revisions of a rollout
+    /// ([`rollout`]); without, every replica's key is equal.
+    pub fn rollout(&self, rollout: Arc<dyn rollout::Rollout>) -> Result<(), String> {
+        let contact = self
+            .shared
+            .contact
+            .get()
+            .ok_or_else(|| "contact does not run".to_owned())?;
+        contact.set_rollout(rollout);
+        Ok(())
+    }
+
     /// Contact as status shows it, once started.
     pub fn contact_metrics(&self) -> Option<contact::Metrics> {
         self.shared.contact.get().map(|c| c.metrics())
@@ -805,6 +818,9 @@ impl Shared {
                 }
                 if let Body::Baseline(b) = &mut body {
                     b.at_index = b.at_index.max(stamp.earliest);
+                    if self.contact.get().is_some_and(|c| c.hands_over(b)) {
+                        b.at_index = rollout::hand_over_at(b.at_index, self.settings.block);
+                    }
                 }
                 let request = Request {
                     stamp: stamp.stamp,

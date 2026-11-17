@@ -133,6 +133,13 @@ pub struct Own {
     /// [`MAX_LISTED`]: the leader decides them.
     #[serde(default)]
     pub unresolved: Vec<Listed>,
+    /// The replica's compatibility key ([`crate::rollout`]); none for
+    /// the witness.
+    #[serde(default)]
+    pub key: Option<u64>,
+    /// The pod's revision, its `controller-revision-hash` label.
+    #[serde(default)]
+    pub revision: Option<String>,
 }
 
 /// One page of one output as the sender computed it (plan 2.11, page

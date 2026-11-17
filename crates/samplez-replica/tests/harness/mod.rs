@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+use samplez_replica::rollout::Fixed;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -437,6 +438,14 @@ pub struct Fake {
     pub fingerprints: Vec<(u64, u64, u64)>,
     /// A generation its pending entries need is not built.
     pub generation_pending: bool,
+    /// The engine's core is dropped: every block is skipped, withheld
+    /// without a status word, until it is rebuilt.
+    pub no_core: bool,
+    /// Cores dropped and rebuilt.
+    pub drops: u64,
+    pub rebuilds: u64,
+    /// Stops the supervisor named, `(output, at)`.
+    pub stops: Vec<(usize, u64)>,
 }
 
 impl Fake {
@@ -644,6 +653,10 @@ impl FakeAudio {
         let Some(target) = target else {
             return;
         };
+        if st.no_core {
+            st.computed = Some(target);
+            return;
+        }
         let first = st.computed.map_or(target, |c| c + 1);
         let b = self.timing.block;
         for k in first..=target {
@@ -865,6 +878,27 @@ impl Audio for FakeAudio {
         {
             out.hold.cancel_commit_start();
         }
+    }
+    fn stop_at(&self, output: usize, at: u64) {
+        self.step();
+        let mut st = self.lock();
+        st.stops.push((output, at));
+        if let Some(out) = st.outputs.get_mut(output) {
+            out.hold.stop_at(at);
+        }
+    }
+    fn drop_engine(&self) {
+        self.step();
+        let mut st = self.lock();
+        st.drops += 1;
+        st.no_core = true;
+    }
+    fn rebuild_engine(&self) -> bool {
+        self.step();
+        let mut st = self.lock();
+        st.rebuilds += 1;
+        st.no_core = false;
+        true
     }
 }
 
@@ -1302,6 +1336,11 @@ pub struct Set {
     _panics: PanicGuard,
     replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
     audios: BTreeMap<NodeId, Arc<FakeAudio>>,
+    /// Per replica, the compatibility key and revision it starts with
+    /// next; key 1 at revision `r1` when not set.
+    versions: BTreeMap<NodeId, (u64, String)>,
+    rollouts: BTreeMap<NodeId, Arc<Fixed>>,
+    target: Option<String>,
 }
 
 impl Set {
@@ -1331,6 +1370,9 @@ impl Set {
             _panics: PanicGuard::new(),
             replicas: BTreeMap::new(),
             audios: BTreeMap::new(),
+            versions: BTreeMap::new(),
+            rollouts: BTreeMap::new(),
+            target: None,
         };
         for &(id, s) in &set.options.kernel_offsets {
             set.clocks[&id].set_kernel_offset(s);
@@ -1436,6 +1478,15 @@ impl Set {
             replica
                 .contact(timing, Arc::new(Tai(clock)), engine)
                 .expect("contact starts");
+            let (key, revision) = self
+                .versions
+                .get(&id)
+                .cloned()
+                .unwrap_or((1, "r1".to_owned()));
+            let rollout = Fixed::new(key, Some(revision));
+            rollout.set_target(self.target.clone());
+            replica.rollout(rollout.clone()).expect("contact runs");
+            self.rollouts.insert(id, rollout);
             if let Some(audio) = audio {
                 self.audios.insert(id, audio);
             }
@@ -1453,6 +1504,20 @@ impl Set {
         links.replicas.insert(id, replica.clone());
         drop(links);
         self.replicas.insert(id, replica);
+    }
+
+    /// `id` starts with compatibility key `key` at `revision` from its
+    /// next restart on: its pod rolled to that revision.
+    pub fn set_version(&mut self, id: NodeId, key: u64, revision: &str) {
+        self.versions.insert(id, (key, revision.to_owned()));
+    }
+
+    /// The audio StatefulSet's target revision, as every replica reads it.
+    pub fn set_target(&mut self, target: Option<&str>) {
+        self.target = target.map(str::to_owned);
+        for r in self.rollouts.values() {
+            r.set_target(self.target.clone());
+        }
     }
 
     /// Stops `id` as a process crash would: its peers stop reaching it at

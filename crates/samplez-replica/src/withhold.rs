@@ -477,6 +477,7 @@ mod tests {
         fn ranks(&self, _: Ranks) {}
         fn commit_from(&self, _: usize, _: u64, _: u64) {}
         fn cancel_commit_start(&self, _: usize) {}
+        fn stop_at(&self, _: usize, _: u64) {}
     }
 
     fn a(o: u16) -> NodeId {

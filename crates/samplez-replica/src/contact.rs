@@ -184,6 +184,10 @@ pub trait Audio: Send + Sync + 'static {
     fn commit_from(&self, output: usize, min_k: u64, seen: u64);
     /// Drops output `output`'s commit start unless it took.
     fn cancel_commit_start(&self, output: usize);
+    /// Output `output` stops committing at sample index `at`, a page
+    /// boundary: the block holding it commits `[kB, at)` and the output
+    /// is withdrawn from there (a key hand-over).
+    fn stop_at(&self, output: usize, at: u64);
     /// Entry `index`, given as unresolved, is decided: its blocks are no
     /// longer degraded for it.
     fn resolved(&self, _index: u64) {}
@@ -562,6 +566,8 @@ struct State {
     verdicts: Vec<(u64, u64)>,
     realised: Vec<bool>,
     generation_ready: bool,
+    /// The key, revision and target revision of a rollout, once given.
+    rollout: Option<Arc<dyn crate::rollout::Rollout>>,
     own: Own,
     status_changes_lost: u64,
     entries_refused: u64,
@@ -784,6 +790,7 @@ impl Contact {
                 verdicts: Vec::new(),
                 realised: Vec::new(),
                 generation_ready: true,
+                rollout: None,
                 own: Own::default(),
                 status_changes_lost: 0,
                 entries_refused: 0,
@@ -794,6 +801,20 @@ impl Contact {
 
     pub fn timing(&self) -> Timing {
         self.timing
+    }
+
+    /// Whether `b` hands the baseline over to another key than the
+    /// latest `Baseline` applied carries.
+    pub(crate) fn hands_over(&self, b: &Baseline) -> bool {
+        self.log
+            .baseline()
+            .is_some_and(|cur| crate::state::differs(cur.key, b.key))
+    }
+
+    /// The compatibility key and revisions of a rollout
+    /// ([`crate::rollout`]): without, every key is equal.
+    pub fn set_rollout(&self, rollout: Arc<dyn crate::rollout::Rollout>) {
+        self.lock().rollout = Some(rollout);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -1016,6 +1037,10 @@ impl Contact {
             st.generation_ready = sample.generation_ready;
             st.clock_steps = sample.clock_steps;
             st.pages.fold(self.id, &st.own.pages);
+            if let Some(r) = &st.rollout {
+                st.own.key = Some(r.key());
+                st.own.revision = r.revision();
+            }
         } else {
             st.own.clock.tai_offset_s = self.clocks.tai_offset_s();
         }
@@ -1623,8 +1648,9 @@ impl Contact {
             Some((r, passed)) if k < passed => r.of(k, false),
             _ => baselines.rank(k, self.id, &audio_voters, &t),
         };
-        let class = match st.life.as_ref().map(Life::state) {
-            Some(ReplicaState::Diverged) => crate::rank::Class::Diverged,
+        let class = match st.life.as_ref() {
+            Some(l) if l.state() == ReplicaState::Diverged => crate::rank::Class::Diverged,
+            Some(l) if l.filler() => crate::rank::Class::Filler,
             _ => crate::rank::Class::Demoted,
         };
         let fill = crate::rank::demoted(self.id, &audio_voters, class);
@@ -1730,6 +1756,7 @@ impl Contact {
             ready,
             alone: st.members.voters().len() == 1,
             baseline: baseline.as_ref(),
+            key: st.own.key,
             excluded: st.judged.contains(&self.id),
             peers: copies
                 .iter()
@@ -1885,6 +1912,7 @@ impl Contact {
             .collect();
         let counted = self.counted(st, now);
         let baseline = self.log.baseline();
+        let target = st.rollout.as_ref().and_then(|r| r.target());
         let ms = Duration::from_millis(1).as_nanos() as u64;
         let q = |h: &Histogram| h.quantile(0.9999);
         let delta = st
@@ -1954,6 +1982,7 @@ impl Contact {
             timing: &t,
             floor,
             rank: &rank,
+            target: target.as_deref(),
         };
         let mut out = st.leader.decide(&view, now);
         // Re-decisions follow a rename at once: the entries the new
@@ -2727,6 +2756,7 @@ mod tests {
         fn ranks(&self, _: Ranks) {}
         fn commit_from(&self, _: usize, _: u64, _: u64) {}
         fn cancel_commit_start(&self, _: usize) {}
+        fn stop_at(&self, _: usize, _: u64) {}
     }
 
     impl Engine {

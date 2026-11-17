@@ -320,6 +320,12 @@ impl Audio for EngineAudio {
         }
     }
 
+    fn stop_at(&self, output: usize, at: u64) {
+        if let Err(e) = self.engine.stop_at(output, at) {
+            tracing::warn!(output, at, error = %e, "the engine refused a stop");
+        }
+    }
+
     fn resolved(&self, index: u64) {
         if let Err(e) = self.engine.resolved(index) {
             tracing::warn!(index, error = %e, "the engine refused a resolution");
