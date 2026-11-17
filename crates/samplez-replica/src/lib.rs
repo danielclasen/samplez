@@ -1103,7 +1103,7 @@ async fn write(
                 let mut items = vec![item];
                 while let Ok(queued) = queued.try_recv() {
                     match queued {
-                        Queued::Command(item) if bytes + item.command.size() <= MAX_ENTRY_BYTES => {
+                        Queued::Command(item) if joins(&items[0].command, bytes, &item.command) => {
                             bytes += item.command.size();
                             items.push(item);
                         }
@@ -1117,6 +1117,13 @@ async fn write(
             }
         }
     }
+}
+
+/// Whether `next` joins the entry `first` opened, of `bytes` command
+/// bytes: within [`MAX_ENTRY_BYTES`], and asking for the index `first`
+/// asks for, so that every command of an entry applies at one index.
+fn joins(first: &Command, bytes: usize, next: &Command) -> bool {
+    bytes + next.size() <= MAX_ENTRY_BYTES && next.at_index == first.at_index
 }
 
 fn resolution_of(resolution: entry::Resolution) -> Resolution {
@@ -1390,6 +1397,35 @@ mod tests {
     use std::path::PathBuf;
 
     const ID: NodeId = 7;
+
+    /// An entry carries commands asking for one index only: the engine
+    /// applies a log entry at one index, so a command asking for a later
+    /// one is not folded into an entry applied earlier.
+    #[test]
+    fn commands_asking_for_other_indexes_take_entries_of_their_own() {
+        let command = |at_index, bytes: usize| Command {
+            origin: Origin {
+                principal: "p".into(),
+                session: "s".into(),
+                role: samplez_service::Role::Operator,
+                connection: "c".into(),
+            },
+            id: "1".into(),
+            at_index,
+            body: vec![0; bytes],
+        };
+        let first = command(None, 10);
+        assert!(joins(&first, 10, &command(None, 10)));
+        assert!(!joins(&first, 10, &command(Some(4800), 10)));
+        assert!(!joins(&command(Some(4800), 10), 10, &command(None, 10)));
+        assert!(joins(
+            &command(Some(4800), 10),
+            10,
+            &command(Some(4800), 10)
+        ));
+        let size = command(None, 0).size();
+        assert!(!joins(&first, MAX_ENTRY_BYTES - size, &command(None, 1)));
+    }
 
     /// A network that reaches no one; a set of one voter sends nothing.
     struct Nobody;
