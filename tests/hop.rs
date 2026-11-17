@@ -1,6 +1,7 @@
 //! The engine end to end on real libmxl flows: one hop, a gain change,
 //! two replicas, a chain of three, a killed and restarted producer, an
-//! input offset, two inputs with one pruned, a late producer, a vanished
+//! input offset, two inputs with one pruned, a late producer, a flow
+//! whose first commit comes after its input was pruned, a vanished
 //! domain, a foreign writer on the output and the `samplez-hop` binary.
 //! Runs without the test harness, one scenario at a time so their timing
 //! does not interfere, and re-executes itself as a producer process that
@@ -55,6 +56,10 @@ fn main() {
         (
             "late_producer_is_silenced_and_gets_a_margin_warning",
             late_producer,
+        ),
+        (
+            "input_pruned_at_head_0_is_re_added_once_its_late_head_advances",
+            head_zero_at_attach,
         ),
         (
             "input_whose_domain_vanished_is_re_added_once_it_is_back",
@@ -703,6 +708,43 @@ impl OutputA<'_> {
         }
         self.checked += vs.len() as u64;
     }
+}
+
+/// The flow exists with its head at 0 when the input attaches, as a copy
+/// of a flow on another node does before the copy's first commit, so the
+/// input is pruned. Then the flow commits at the clock, its head 24
+/// samples inside the margin of the block it ends: every block can be
+/// read on time, and the input is re-added once its head advanced for a
+/// second, though no poll finds the head a block clear of the margin.
+fn head_zero_at_attach() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let (_pilot, gate) = Pilot::gated(&domain.0, &src, 1, B, MARGIN - B / 2);
+    let cfg = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&dst, 1)],
+        vec![vec![1.0]],
+        MARGIN,
+    );
+    let (engine, _rx) = start(cfg);
+    let state = || engine.status().inputs[0].state;
+    wait_for(5 * SECOND, "input pruned at head 0", || {
+        state() == InputState::Pruned
+    });
+    std::thread::sleep(SECOND / 2);
+    assert_eq!(state(), InputState::Pruned);
+
+    gate.store(true, Relaxed);
+    wait_for(5 * SECOND, "input re-added", || {
+        state() == InputState::Attached
+    });
+    let copied = || engine.status().inputs[0].counters.copied;
+    let before = copied();
+    wait_for(5 * SECOND, "blocks read after the re-add", || {
+        copied() > before + 100
+    });
+    common::stop(engine);
 }
 
 /// The input's domain directory is removed: the poll instance cannot be
