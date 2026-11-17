@@ -56,6 +56,12 @@ pub trait Product: Default + Send + 'static {
     /// Replaces the state with a saved one.
     fn load(&mut self, saved: &[u8]) -> Result<(), String>;
 
+    /// The product paths `command` sets. The leader restamps an
+    /// unresolved entry only for the paths no later committed entry sets,
+    /// and voids it when none is left, so a restamp never undoes a later
+    /// value.
+    fn paths(&self, command: &[u8]) -> Vec<String>;
+
     /// The input slot a `Route` body re-routes, so the state machine keeps
     /// only the latest passed route per slot; none keeps every distinct
     /// passed route.
@@ -142,6 +148,10 @@ pub struct StateMachine<P> {
     /// The restamps behind a restamped entry, by the log index it is
     /// known under now, with its at_index: a fourth is never appended.
     pub restamps: BTreeMap<u64, (u32, u64)>,
+    /// The first decision applied on each (log index, term), by its own
+    /// log index, with the at_index it is kept until: a later decision on
+    /// the same id is a copy and changes nothing.
+    pub decided: BTreeMap<(u64, u64), (u64, u64)>,
     pub baseline: Option<Baseline>,
     pub verdicts: BTreeMap<NodeId, bool>,
     /// The replica the latest `ClockVerdict` judging one named.
@@ -180,6 +190,7 @@ impl<P: Product> StateMachine<P> {
             pending: BTreeMap::new(),
             terms: BTreeMap::new(),
             restamps: BTreeMap::new(),
+            decided: BTreeMap::new(),
             baseline: None,
             verdicts: BTreeMap::new(),
             latest_judged: None,
@@ -209,6 +220,14 @@ impl<P: Product> StateMachine<P> {
             && request.body.decides().is_none()
         {
             self.terms.insert(revision, (term, at));
+        }
+        if let Some(named) = request.body.decides() {
+            let until = self
+                .terms
+                .get(&named.0)
+                .map_or(self.highest_stamp, |&(_, at)| at)
+                .max(request.at_index().unwrap_or(0));
+            self.decided.entry(named).or_insert((revision, until));
         }
         let response = self.apply_body(revision, term, request);
         self.prune();
@@ -340,6 +359,7 @@ impl<P: Product> StateMachine<P> {
         let pending = &self.pending;
         self.terms
             .retain(|index, &mut (_, at)| at >= passed || pending.contains_key(index));
+        self.decided.retain(|_, &mut (_, until)| until >= passed);
     }
 
     /// Applies every command of an entry, then makes its changes one delta
@@ -458,6 +478,7 @@ impl<P: Product> StateMachine<P> {
             pending: self.pending.clone(),
             terms: self.terms.clone(),
             restamps: self.restamps.clone(),
+            decided: self.decided.iter().map(|(k, v)| (*k, *v)).collect(),
             baseline: self.baseline.clone(),
             verdicts: self.verdicts.clone(),
             latest_judged: self.latest_judged,
@@ -477,6 +498,7 @@ impl<P: Product> StateMachine<P> {
         self.pending = saved.pending;
         self.terms = saved.terms;
         self.restamps = saved.restamps;
+        self.decided = saved.decided.into_iter().collect();
         self.baseline = saved.baseline;
         self.verdicts = saved.verdicts;
         self.latest_judged = saved.latest_judged;
@@ -588,6 +610,9 @@ pub(crate) mod tests {
         }
         fn text(&self) -> String {
             serde_json::to_string(&self.values).expect("encodes")
+        }
+        fn paths(&self, command: &[u8]) -> Vec<String> {
+            vec![parse(command).0]
         }
         fn save(&self) -> Vec<u8> {
             serde_json::to_vec(&(&self.values, self.applied)).expect("encodes")

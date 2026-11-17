@@ -262,6 +262,19 @@ pub trait LogView: Send + Sync + 'static {
     fn installs(&self) -> u64 {
         0
     }
+    /// The log index of the first decision the state machine applied on
+    /// (`index`, `term`).
+    fn decided(&self, _index: u64, _term: u64) -> Option<u64> {
+        None
+    }
+    /// The term of the entry at `index`, while it is known.
+    fn term_at(&self, index: u64) -> Option<u64> {
+        self.log_id_at(index).map(|id| id.term)
+    }
+    /// The product paths `command` sets.
+    fn paths(&self, _command: &[u8]) -> Vec<String> {
+        Vec::new()
+    }
     /// The restamps behind the entry at `index`, as applied.
     fn restamps(&self, _index: u64) -> u32 {
         0
@@ -297,6 +310,15 @@ impl<P: Product> LogView for Store<P> {
     }
     fn installs(&self) -> u64 {
         Store::installs(self)
+    }
+    fn decided(&self, index: u64, term: u64) -> Option<u64> {
+        Store::decided(self, index, term)
+    }
+    fn term_at(&self, index: u64) -> Option<u64> {
+        Store::term_at(self, index)
+    }
+    fn paths(&self, command: &[u8]) -> Vec<String> {
+        Store::paths(self, command)
     }
     fn restamps(&self, index: u64) -> u32 {
         Store::restamps(self, index)
@@ -926,7 +948,6 @@ impl Contact {
             st.realised = sample.realised;
             st.generation_ready = sample.generation_ready;
             st.pages.fold(self.id, &st.own.pages);
-            st.own.unresolved = Self::unresolved(st);
         }
         st.judged = self.log.judged();
         st.lead.roll();
@@ -966,6 +987,10 @@ impl Contact {
         self.fence(st, tai);
         self.decide(st, tai);
         self.live(st, now, tai);
+        // After the decisions known committed were acted on.
+        if self.audio.is_some() {
+            st.own.unresolved = Self::unresolved(st);
+        }
 
         // Reports.
         if !voters.contains(&self.id) {
@@ -1157,7 +1182,7 @@ impl Contact {
                 continue;
             }
             if let Some(audio) = &self.audio {
-                match self.engine_request(&request) {
+                match self.engine_request(id.index, &request) {
                     Some(engine) => audio.appended(id.index, &engine),
                     None => audio.appended(id.index, &request),
                 }
@@ -1214,27 +1239,103 @@ impl Contact {
     /// What the engine applies for a `Restamp`: the entry it names, under
     /// whatever restamps lie behind that, at the restamp's at_index; none
     /// for every other entry, which goes to the engine as it is.
-    fn engine_request(&self, request: &Request) -> Option<Request> {
-        let Body::Restamp { at_index, .. } = request.body else {
+    fn engine_request(&self, index: u64, request: &Request) -> Option<Request> {
+        let Body::Restamp {
+            revision,
+            term,
+            at_index,
+            ref paths,
+        } = request.body
+        else {
             return None;
         };
-        let mut of = request.body.decides()?.0;
-        // Each restamp names the one before it; at most three lie behind
-        // an entry, and a missing one ends the walk.
+        // Only the first decision on an id moves it: a copy appended by a
+        // stalled or a new leader would apply the entry a second time.
+        if self.first_decision(revision, term) != Some(index) {
+            return Some(Request {
+                stamp: request.stamp,
+                body: Body::Void { revision, term },
+            });
+        }
+        let (_, original) = self.original(revision)?;
+        let mut body = original.body;
+        crate::state_machine::restamp(&mut body, at_index);
+        // Only the paths the restamp names: a later committed entry set
+        // the rest.
+        if let Body::Commands(commands) = &mut body
+            && !paths.is_empty()
+        {
+            commands.retain(|c| self.log.paths(&c.body).iter().all(|p| paths.contains(p)));
+        }
+        Some(Request {
+            stamp: request.stamp,
+            body,
+        })
+    }
+
+    /// The entry behind the restamps ending at `index`, with its own log
+    /// index; at most [`crate::decide::RESTAMPS_MAX`] lie behind one, and
+    /// a missing one ends the walk.
+    fn original(&self, mut index: u64) -> Option<(u64, Request)> {
         for _ in 0..=crate::decide::RESTAMPS_MAX {
-            let named = self.log.request(of)?;
+            let named = self.log.request(index)?;
             match named.body {
-                Body::Restamp { revision, .. } => of = revision,
-                mut body => {
-                    crate::state_machine::restamp(&mut body, at_index);
-                    return Some(Request {
-                        stamp: request.stamp,
-                        body,
-                    });
-                }
+                Body::Restamp { revision, .. } => index = revision,
+                _ => return Some((index, named)),
             }
         }
         None
+    }
+
+    /// The log index of the first decision on (`index`, `term`): the one
+    /// the state machine applied, else the first the log holds.
+    fn first_decision(&self, index: u64, term: u64) -> Option<u64> {
+        if let Some(d) = self.log.decided(index, term) {
+            return Some(d);
+        }
+        let mut first = None;
+        self.log.entries_after(index, &mut |id, request| {
+            if first.is_none() && request.body.decides() == Some((index, term)) {
+                first = Some(id.index);
+            }
+        });
+        first
+    }
+
+    /// The paths of the entry restamped up to `index` that no entry
+    /// committed after it, up to `committed`, sets: none when none is
+    /// left; empty for an engine entry no later one supersedes.
+    fn remaining(&self, index: u64, committed: u64) -> Option<Vec<String>> {
+        let (from, original) = self.original(index)?;
+        let mut later = Vec::new();
+        self.log.entries_after(from, &mut |id, request| {
+            if id.index <= committed {
+                later.push(request.clone());
+            }
+        });
+        match &original.body {
+            Body::Commands(commands) => {
+                let mut paths: Vec<String> = commands
+                    .iter()
+                    .flat_map(|c| self.log.paths(&c.body))
+                    .collect();
+                paths.sort();
+                paths.dedup();
+                for request in &later {
+                    if let Body::Commands(set) = &request.body {
+                        for c in set {
+                            let set_later = self.log.paths(&c.body);
+                            paths.retain(|p| !set_later.contains(p));
+                        }
+                    }
+                }
+                (!paths.is_empty()).then_some(paths)
+            }
+            _ => (!later
+                .iter()
+                .any(|r| crate::decide::supersedes(&original, r)))
+            .then(Vec::new),
+        }
     }
 
     /// A snapshot replaced the state up to `applied`: the engine is built
@@ -1605,11 +1706,10 @@ impl Contact {
                 continue;
             }
             // Applied here: its own committed entry, handed to the engine.
-            let applied = revision <= st.handed
-                && self
-                    .log
-                    .log_id_at(revision)
-                    .is_none_or(|id| id.term == term);
+            // Applied here: an entry of this term it was handed. An index
+            // whose term this replica no longer knows was never one it
+            // can tell it applied.
+            let applied = revision <= st.handed && self.log.term_at(revision) == Some(term);
             if applied && let Some(life) = st.life.as_mut() {
                 st.counts.contradicted += 1;
                 life.contradicted(audio);
@@ -1624,6 +1724,11 @@ impl Contact {
         st.purge_points.retain(|&(index, _)| index > known);
         for after in verdicts {
             st.counts.purge_points += 1;
+            // The rebuild from product state past `after` supersedes every
+            // unresolved entry at or below it: none is reported again.
+            st.given
+                .retain(|k, _| k.0 > after || k.0 & UNLISTED_BIT != 0);
+            st.awaiting.retain(|k, _| k.0 > after);
             self.begin_restart(st, after);
         }
         let covered = known.min(st.told);
@@ -1732,25 +1837,18 @@ impl Contact {
         let log = &self.log;
         let committed = st.known_committed;
         let own_term_committed = log.log_id_at(committed).is_some_and(|id| id.term == term);
-        let superseded = |index: u64| {
-            let Some(earlier) = log.request(index) else {
-                return false;
-            };
-            let mut later = false;
-            log.entries_after(index, &mut |id, request| {
-                later |= id.index <= committed && crate::decide::supersedes(&earlier, request);
-            });
-            later
-        };
+        let remaining = |index: u64| self.remaining(index, committed);
         let restamps = |index: u64| log.restamps(index);
         let log_id_at = |index: u64| log.log_id_at(index);
+        let decided = |index: u64, term: u64| self.first_decision(index, term).is_some();
         let leader_log = crate::decide::LeaderLog {
             log_id_at: &log_id_at,
             committed,
             purged: log.purged(),
             own_term_committed,
             restamps: &restamps,
-            superseded: &superseded,
+            remaining: &remaining,
+            decided: &decided,
         };
         let mut decided = st
             .decider
@@ -2331,6 +2429,9 @@ mod tests {
         fn installs(&self) -> u64 {
             self.0.lock().unwrap().installs
         }
+        fn paths(&self, command: &[u8]) -> Vec<String> {
+            vec![crate::state_machine::tests::parse(command).0]
+        }
     }
 
     /// Records what contact hands the engine. Its step flag shows once
@@ -2885,6 +2986,170 @@ mod tests {
         f.tick();
         assert!(f.engine.calls().contains(&"rebuild".to_owned()));
         f.tick();
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+    }
+
+    fn restamp_of(revision: u64, at_index: u64, paths: &[&str]) -> Body {
+        Body::Restamp {
+            revision,
+            term: 1,
+            at_index,
+            paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+        }
+    }
+
+    /// A second decision on one id, appended by a stalled or a new leader
+    /// that did not see the first, never hands the entry to the engine
+    /// again: only the first decision in log order moves it.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_restamp_of_one_entry_never_reaches_the_engine() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let at = index_at(T0) + 400 * 48;
+        f.log.push(1, 1, Some(at));
+        f.insert(2, restamp_of(1, at + 96, &[]));
+        f.insert(3, restamp_of(1, at + 192, &[]));
+        f.contact.log_changed();
+        let handed: Vec<(u64, Option<u64>)> = f
+            .engine
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(i, r)| (*i, r.body.at_index().filter(|_| r.body.decides().is_none())))
+            .collect();
+        assert_eq!(
+            handed,
+            [(1, Some(at)), (2, Some(at + 96)), (3, None)],
+            "the copy carries no engine entry"
+        );
+    }
+
+    /// A restamp never undoes a later committed value: a restamped slot
+    /// change that a later entry on the same slot overtook is left with
+    /// nothing to restamp, and of a commands entry only the paths no later
+    /// entry sets remain, which is all the engine gets of it.
+    #[tokio::test(start_paused = true)]
+    async fn a_restamp_keeps_only_what_no_later_committed_entry_sets() {
+        use crate::state_machine::tests::command;
+        let f = fixture(&[&[1, 2, 3]]);
+        let at = index_at(T0) + 400 * 48;
+        f.log.push(1, 1, Some(at));
+        f.insert(2, restamp_of(1, at + 96, &[]));
+        assert_eq!(f.contact.remaining(2, 2), Some(Vec::new()), "nothing later");
+        f.insert(
+            3,
+            Body::InputUp {
+                slot: 0,
+                at_index: at + 480,
+            },
+        );
+        assert_eq!(
+            f.contact.remaining(2, 3),
+            None,
+            "the restamp's original entry, overtaken on its slot"
+        );
+        let commands = |cs: &[(&str, &str)]| {
+            Body::Commands(
+                cs.iter()
+                    .map(|(id, body)| {
+                        let mut c = command("s", id, body);
+                        c.at_index = Some(at);
+                        c
+                    })
+                    .collect(),
+            )
+        };
+        f.insert(10, commands(&[("a", "gain=1@1"), ("b", "pan=1@1")]));
+        f.insert(11, commands(&[("c", "gain=2@2")]));
+        assert_eq!(f.contact.remaining(10, 11), Some(vec!["pan".to_owned()]));
+        f.insert(12, commands(&[("d", "pan=2@2")]));
+        assert_eq!(f.contact.remaining(10, 12), None);
+        assert_eq!(
+            f.contact.remaining(10, 11),
+            Some(vec!["pan".to_owned()]),
+            "uncommitted"
+        );
+        f.insert(13, restamp_of(10, at + 960, &["pan"]));
+        let engine = f
+            .contact
+            .engine_request(13, &f.log.request(13).unwrap())
+            .unwrap();
+        match engine.body {
+            Body::Commands(cs) => {
+                let ids: Vec<&str> = cs.iter().map(|c| c.id.as_str()).collect();
+                assert_eq!(ids, ["b"]);
+                assert_eq!(cs[0].at_index, Some(at + 960));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A void naming an id at an index whose term this replica no longer
+    /// knows, purged from its own log, is no decision on an entry it
+    /// applied: it does not diverge.
+    #[tokio::test(start_paused = true)]
+    async fn a_void_on_an_index_this_log_purged_does_not_diverge() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        f.log.push(1, 4, None);
+        f.insert(
+            5,
+            Body::Void {
+                revision: 3,
+                term: 7,
+            },
+        );
+        f.apply(5);
+        f.contact.log_changed();
+        f.tick();
+        f.tick();
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert_eq!(f.contact.metrics().contradicted, 0);
+    }
+
+    /// One purge-point verdict leads to exactly one rebuild: the entries
+    /// it supersedes are no longer held unresolved, so they are neither
+    /// reported again nor given to the rebuilt engine.
+    #[tokio::test(start_paused = true)]
+    async fn one_purge_point_verdict_rebuilds_once_and_clears_what_it_supersedes() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let timing = Timing::defaults(B);
+        let at = index_at(T0) + 40 * 48;
+        f.log.push(1, 1, Some(at));
+        f.contact.log_changed();
+        f.clock.set(timing.apply_deadline(at));
+        let reported = |f: &Fixture| -> Vec<u64> {
+            f.tick()[0]
+                .2
+                .own
+                .unresolved
+                .iter()
+                .map(|l| l.id.index)
+                .collect()
+        };
+        assert_eq!(reported(&f), [1]);
+        f.insert(
+            2,
+            Body::PurgePoint {
+                replica: 1,
+                index: 1,
+            },
+        );
+        f.apply(2);
+        f.engine.calls();
+        f.contact.log_changed();
+        for _ in 0..20 {
+            assert_eq!(reported(&f), Vec::<u64>::new());
+        }
+        let calls = f.engine.calls();
+        let count = |c: &str| calls.iter().filter(|x| *x == c).count();
+        assert_eq!((count("drop"), count("rebuild")), (1, 1), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("unresolved")),
+            "{calls:?}"
+        );
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
     }
 

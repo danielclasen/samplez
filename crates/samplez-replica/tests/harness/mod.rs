@@ -99,6 +99,10 @@ impl Product for Paths {
         let values: Vec<String> = values.iter().map(|(p, v)| format!("{p}={v}")).collect();
         format!("{} from {}", values.join(","), origins.join(","))
     }
+    fn paths(&self, command: &[u8]) -> Vec<String> {
+        vec![parse(command).0]
+    }
+
     fn text(&self) -> String {
         serde_json::to_string(&self.values).expect("encodes")
     }

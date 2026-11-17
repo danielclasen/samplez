@@ -45,9 +45,12 @@ pub(crate) struct LeaderLog<'a> {
     pub own_term_committed: bool,
     /// The restamps behind the entry at an index.
     pub restamps: &'a dyn Fn(u64) -> u32,
-    /// Whether a committed entry after the one at the first index sets
-    /// every engine target that one sets.
-    pub superseded: &'a dyn Fn(u64) -> bool,
+    /// The paths of the entry at an index, through the restamps behind
+    /// it, that no later committed entry sets: none when every one is set
+    /// later; empty for an engine entry still to restamp whole.
+    pub remaining: &'a dyn Fn(u64) -> Option<Vec<String>>,
+    /// A decision on (index, term) is in the log, committed or not.
+    pub decided: &'a dyn Fn(u64, u64) -> bool,
 }
 
 /// What the leader decided this period.
@@ -73,10 +76,22 @@ pub struct Counts {
 #[derive(Debug, Default)]
 pub(crate) struct Decider {
     inflight: BTreeMap<(u64, u64, u64), Instant>,
+    /// What the reports showed of an entry's block while its commit was
+    /// not yet known here: the statuses a report carries span only the
+    /// latest blocks, so a commit learned later would find none.
+    seen: BTreeMap<(u64, u64, u64), Seen>,
     pub counts: Counts,
 }
 
 type Key = (u64, u64, u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// The baseline committed the block with the entry applied.
+    Stands,
+    /// The baseline committed it without the entry, or nobody did.
+    Decide,
+}
 
 fn key(id: StoredLogId) -> Key {
     (id.index, id.term, id.node)
@@ -120,6 +135,7 @@ impl Decider {
     /// Leadership is lost: a new term decides again from the reports.
     pub fn step_down(&mut self) {
         self.inflight.clear();
+        self.seen.clear();
     }
 
     /// The decisions on the entries the live audio replicas report
@@ -151,7 +167,10 @@ impl Decider {
         let base = baseline.and_then(|b| live.iter().find(|a| a.id == b.replica));
         let next = renamed.and_then(|b| live.iter().find(|a| a.id == b.replica));
         for (k, (id, at, by)) in reported {
-            if id.index & UNLISTED_BIT != 0 || self.inflight.contains_key(&k) {
+            if id.index & UNLISTED_BIT != 0
+                || self.inflight.contains_key(&k)
+                || (log.decided)(id.index, id.term)
+            {
                 continue;
             }
             if (log.log_id_at)(id.index) != Some(id) {
@@ -176,35 +195,49 @@ impl Decider {
                 self.hold(k, now);
                 continue;
             }
-            if id.index > log.committed {
-                continue;
-            }
             let kb = at / timing.block;
             // A newly named baseline holding it unresolved: re-decided
             // with the rename.
             let on_next = next.is_some_and(|n| n.own.is_some_and(|o| lists(o, id)));
-            let decide = match base.and_then(|b| b.own) {
-                _ if on_next => true,
-                Some(own) if committed(own, kb, timing.block) => {
-                    if !lists(own, id) {
-                        // It stands: applied where the baseline committed.
-                        self.counts.stood += 1;
-                        out.contradicting.extend(by);
-                        continue;
-                    }
-                    true
+            let now_seen = match base.and_then(|b| b.own) {
+                _ if on_next => Some(Seen::Decide),
+                Some(own) if committed(own, kb, timing.block) => Some(if lists(own, id) {
+                    Seen::Decide
+                } else {
+                    Seen::Stands
+                }),
+                // Nobody committed the block: every live audio replica
+                // withheld it or is silent about it.
+                _ if !live.is_empty()
+                    && live.iter().all(|a| a.own.is_some_and(|o| withheld(o, kb))) =>
+                {
+                    Some(Seen::Decide)
                 }
-                _ => {
-                    // Nobody committed the block: every live audio replica
-                    // withheld it or is silent about it.
-                    !live.is_empty() && live.iter().all(|a| a.own.is_some_and(|o| withheld(o, kb)))
-                }
+                _ => None,
             };
-            if !decide {
+            if let Some(seen) = now_seen {
+                self.seen.insert(k, seen);
+                while self.seen.len() > INFLIGHT_MAX {
+                    self.seen.pop_first();
+                }
+            }
+            if id.index > log.committed {
                 continue;
             }
+            match self.seen.get(&k) {
+                None => continue,
+                Some(Seen::Stands) => {
+                    // It stands: applied where the baseline committed.
+                    self.counts.stood += 1;
+                    out.contradicting.extend(by);
+                    continue;
+                }
+                Some(Seen::Decide) => {}
+            }
+            self.seen.remove(&k);
             let late = (log.restamps)(id.index);
-            if late >= RESTAMPS_MAX || (log.superseded)(id.index) {
+            let remaining = (log.remaining)(id.index);
+            if late >= RESTAMPS_MAX || remaining.is_none() {
                 if late >= RESTAMPS_MAX {
                     self.counts.command_late += 1;
                 }
@@ -220,7 +253,7 @@ impl Decider {
                     revision: id.index,
                     term: id.term,
                     at_index: 0,
-                    paths: Vec::new(),
+                    paths: remaining.unwrap_or_default(),
                 });
             }
             self.hold(k, now);
@@ -316,6 +349,7 @@ mod tests {
         own_term: bool,
         restamps: u32,
         superseded: bool,
+        decided: bool,
     }
 
     impl Default for Log {
@@ -327,6 +361,7 @@ mod tests {
                 own_term: true,
                 restamps: 0,
                 superseded: false,
+                decided: false,
             }
         }
     }
@@ -347,14 +382,16 @@ mod tests {
             .collect();
         let held = |i: u64| log.held.iter().copied().find(|h| h.index == i);
         let restamps = |_| log.restamps;
-        let superseded = |_| log.superseded;
+        let remaining = |_| (!log.superseded).then(Vec::new);
+        let decided = |_, _| log.decided;
         let view = LeaderLog {
             log_id_at: &held,
             committed: log.committed,
             purged: log.purged,
             own_term_committed: log.own_term,
             restamps: &restamps,
-            superseded: &superseded,
+            remaining: &remaining,
+            decided: &decided,
         };
         let b = base.map(baseline);
         d.decide(
@@ -401,6 +438,80 @@ mod tests {
             decide(&mut d, &owns, Some(1), &Log::default()).append,
             [restamp(7, 2)],
             "decided again once the first is not seen in the log"
+        );
+    }
+
+    /// A decision the log holds, committed or not, is never appended again:
+    /// not after the in-flight window lapses (a stalled leader), nor by a
+    /// new leader. Only the log says whether the id was decided.
+    #[tokio::test(start_paused = true)]
+    async fn an_id_the_log_holds_a_decision_on_is_not_decided_again() {
+        let e = id(7, 2);
+        let owns = vec![
+            (1, false, own(Kind::Committed, &[e])),
+            (2, false, own(Kind::Committed, &[e])),
+        ];
+        let mut d = Decider::default();
+        assert_eq!(
+            decide(&mut d, &owns, Some(1), &Log::default()).append,
+            [restamp(7, 2)]
+        );
+        let held = Log {
+            decided: true,
+            ..Log::default()
+        };
+        tokio::time::advance(INFLIGHT).await;
+        assert_eq!(decide(&mut d, &owns, Some(1), &held).append, []);
+        d.step_down();
+        assert_eq!(
+            decide(&mut Decider::default(), &owns, Some(1), &held).append,
+            []
+        );
+    }
+
+    /// Partly superseded: the restamp names the paths left.
+    #[tokio::test(start_paused = true)]
+    async fn a_restamp_names_only_the_paths_no_later_entry_sets() {
+        let e = id(7, 2);
+        let owns = [(1, false, own(Kind::Committed, &[e]))];
+        let audio: Vec<Voter> = owns
+            .iter()
+            .map(|(id, silent, own)| Voter {
+                id: *id,
+                silent: *silent,
+                own: Some(own),
+            })
+            .collect();
+        let held = |i: u64| (i == 7).then_some(e);
+        let zero = |_| 0;
+        let left = |_| Some(vec!["pan".to_owned()]);
+        let no = |_, _| false;
+        let view = LeaderLog {
+            log_id_at: &held,
+            committed: 9,
+            purged: 0,
+            own_term_committed: true,
+            restamps: &zero,
+            remaining: &left,
+            decided: &no,
+        };
+        let b = baseline(1);
+        let out = Decider::default().decide(
+            &audio,
+            Some(&b),
+            None,
+            &view,
+            &Timing::defaults(B),
+            Instant::now(),
+        );
+        assert_eq!(
+            out.append,
+            [Body::Restamp {
+                revision: 7,
+                term: 2,
+                at_index: 0,
+                paths: vec!["pan".into()],
+            }]
         );
     }
 
@@ -536,14 +647,16 @@ mod tests {
         let log = Log::default();
         let held = |i: u64| log.held.iter().copied().find(|h| h.index == i);
         let zero = |_| 0;
-        let no = |_| false;
+        let whole = |_| Some(Vec::new());
+        let no = |_, _| false;
         let view = LeaderLog {
             log_id_at: &held,
             committed: 9,
             purged: 0,
             own_term_committed: true,
             restamps: &zero,
-            superseded: &no,
+            remaining: &whole,
+            decided: &no,
         };
         let (old, new) = (baseline(1), baseline(2));
         let mut d = Decider::default();

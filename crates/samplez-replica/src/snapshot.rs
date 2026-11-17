@@ -28,6 +28,10 @@ pub struct Replicated {
     /// [`crate::state_machine::StateMachine::restamps`].
     #[serde(default)]
     pub restamps: BTreeMap<u64, (u32, u64)>,
+    /// [`crate::state_machine::StateMachine::decided`], as pairs: JSON
+    /// keys are strings only.
+    #[serde(default)]
+    pub decided: Vec<((u64, u64), (u64, u64))>,
     pub baseline: Option<Baseline>,
     /// The latest `ClockVerdict` per replica.
     pub verdicts: BTreeMap<NodeId, bool>,

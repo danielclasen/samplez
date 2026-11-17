@@ -213,6 +213,11 @@ fn replace(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
 }
 
 impl<P: Product> Store<P> {
+    /// The product paths `command` sets.
+    pub fn paths(&self, command: &[u8]) -> Vec<String> {
+        self.lock().sm.product.paths(command)
+    }
+
     /// Opens the storage in `dir`, creating it when absent, with `product`
     /// as the empty state the snapshot (if any) is loaded into.
     pub fn open(dir: &Path, product: P, limits: Limits) -> io::Result<Store<P>> {
@@ -363,6 +368,23 @@ impl<P> Store<P> {
                 f(e.log_id, request);
             }
         }
+    }
+
+    /// The first decision applied on (`index`, `term`), by its log
+    /// index.
+    pub fn decided(&self, index: u64, term: u64) -> Option<u64> {
+        self.lock().sm.decided.get(&(index, term)).map(|&(d, _)| d)
+    }
+
+    /// The term of the entry at `index`: from the log, else from the
+    /// state machine while the entry can still be decided.
+    pub fn term_at(&self, index: u64) -> Option<u64> {
+        let inner = self.lock();
+        inner
+            .log
+            .get(&index)
+            .map(|e| e.log_id.term)
+            .or_else(|| inner.sm.terms.get(&index).map(|&(t, _)| t))
     }
 
     /// Snapshots installed from a leader since the store was opened.
