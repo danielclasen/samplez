@@ -62,6 +62,8 @@ struct Inner<P> {
     membership: StoredMembershipConfig,
     snapshot: Option<StoredSnapshot>,
     snapshots_built: u64,
+    /// Snapshots installed from a leader since the store was opened.
+    installs: u64,
 }
 
 /// One replica's storage. Clones share it.
@@ -263,6 +265,7 @@ impl<P: Product> Store<P> {
             membership,
             snapshot,
             snapshots_built: 0,
+            installs: 0,
         };
         for record in records {
             inner.replay(record);
@@ -360,6 +363,11 @@ impl<P> Store<P> {
                 f(e.log_id, request);
             }
         }
+    }
+
+    /// Snapshots installed from a leader since the store was opened.
+    pub fn installs(&self) -> u64 {
+        self.lock().installs
     }
 
     /// The index of the last purged log id, 0 for none.
@@ -668,6 +676,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         inner.last_applied = stored.last_applied;
         inner.membership = stored.membership.clone();
         inner.snapshot = Some(stored);
+        inner.installs += 1;
         Ok(())
     }
 

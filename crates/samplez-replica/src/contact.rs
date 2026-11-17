@@ -258,6 +258,10 @@ pub trait LogView: Send + Sync + 'static {
     fn purged(&self) -> u64 {
         0
     }
+    /// Snapshots installed from a leader so far.
+    fn installs(&self) -> u64 {
+        0
+    }
     /// The restamps behind the entry at `index`, as applied.
     fn restamps(&self, _index: u64) -> u32 {
         0
@@ -290,6 +294,9 @@ impl<P: Product> LogView for Store<P> {
     }
     fn purged(&self) -> u64 {
         self.purged_index()
+    }
+    fn installs(&self) -> u64 {
+        Store::installs(self)
     }
     fn restamps(&self, index: u64) -> u32 {
         Store::restamps(self, index)
@@ -475,6 +482,8 @@ struct State {
     /// Back in `starting` until the applied index passes this and the
     /// engine is rebuilt from product state.
     restart: Option<u64>,
+    /// The log's snapshot installs acted on.
+    installs_seen: u64,
     fence: Option<u64>,
     /// The ranks last published, with the first block F had not passed
     /// then: blocks below it keep their rank.
@@ -607,6 +616,7 @@ impl Contact {
         first_seq: u64,
     ) -> Contact {
         let applied = log.applied();
+        let installs_seen = log.installs();
         let mut scheduled = BTreeMap::new();
         let mut generation_at = None;
         // Entries the engine applies later, purged ones included, for
@@ -671,6 +681,7 @@ impl Contact {
                 decisions: Vec::new(),
                 purge_points: Vec::new(),
                 restart: None,
+                installs_seen,
                 fence: None,
                 ranks: None,
                 baselines,
@@ -1130,15 +1141,15 @@ impl Contact {
         self.log.entries_after(st.told, &mut |id, request| {
             appended.push((id, request.clone()));
         });
-        // The log no longer holds the entry after the last one told, and
-        // applied past it: a snapshot was installed.
-        let applied = self.log.applied();
-        if applied > st.told
-            && appended
-                .first()
-                .is_none_or(|(id, _)| id.index > st.told + 1)
-        {
+        // A snapshot was installed: the state jumped past entries this
+        // replica may never have held. A purge of its own log after its
+        // own snapshot is none: it applied every entry purged.
+        let installs = self.log.installs();
+        if installs > st.installs_seen {
+            st.installs_seen = installs;
+            let applied = self.log.applied();
             self.installed(st, applied);
+            appended.retain(|(id, _)| id.index > applied);
         }
         let mut new = Vec::new();
         for (id, request) in appended {
@@ -2258,6 +2269,7 @@ mod tests {
         committed: Option<StoredLogId>,
         applied: u64,
         pending: Vec<(u64, Body)>,
+        installs: u64,
     }
 
     #[derive(Default)]
@@ -2315,6 +2327,9 @@ mod tests {
         }
         fn disrupting(&self) -> Option<NodeId> {
             None
+        }
+        fn installs(&self) -> u64 {
+            self.0.lock().unwrap().installs
         }
     }
 
@@ -2805,8 +2820,18 @@ mod tests {
         let f = fixture(&[&[1, 2, 3]]);
         f.tick();
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        // Its own log purged past what contact was told: no install.
+        f.apply(5);
+        f.contact.log_changed();
+        f.tick();
+        assert_eq!(
+            f.state(),
+            Some(ReplicaState::Withdrawn),
+            "a purge is no install"
+        );
         f.engine.rebuilds.store(false, Ordering::SeqCst);
         f.apply(10);
+        f.log.0.lock().unwrap().installs += 1;
         f.engine.calls();
         f.contact.log_changed();
         f.tick();
