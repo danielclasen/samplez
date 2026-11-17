@@ -585,6 +585,19 @@ impl Log {
     }
 }
 
+/// A product state's strip parameters, per slot, folded to the last value
+/// per parameter key, off the RT thread: it sets at most one per slot and
+/// key at an install, however long the lists.
+fn product_strips(strips: &[Vec<StripParam>]) -> Vec<(usize, StripParam)> {
+    let mut folded = std::collections::BTreeMap::new();
+    for (slot, params) in strips.iter().enumerate() {
+        for &param in params {
+            folded.insert((slot, batch::strip_key(&param)), param);
+        }
+    }
+    folded.into_iter().map(|((slot, _), p)| (slot, p)).collect()
+}
+
 /// Whether input slot `slot` exists and has a strip that takes `param`:
 /// one of 1 to [`MAX_LEGS`] channels.
 fn check_strip(config: &Config, slot: usize, param: &StripParam) -> Result<(), String> {
@@ -1293,6 +1306,7 @@ impl Engine {
             ramp: u64::from(config.ramp_samples),
             dirty: vec![true; in_domains.len()],
             reroute: vec![0; in_domains.len()],
+            product: None,
             pollers: (0..in_domains.len()).map(|_| None).collect(),
             poll_errors: vec![None; in_domains.len()],
             rebuild_errors: vec![None; in_domains.len()],
@@ -2118,16 +2132,15 @@ impl Engine {
                 "a product state of the shape {n} x {m} with {slots} inputs"
             )));
         }
-        let mut strips = Vec::new();
         for (slot, (flow, params)) in state.flows.iter().zip(&state.strips).enumerate() {
             self.config
                 .check_input_flow(slot, flow)
                 .map_err(|e| ReplayError::Invalid(e.0))?;
-            for &param in params {
-                check_strip(&self.config, slot, &param).map_err(ReplayError::Invalid)?;
-                strips.push((slot, param));
+            for param in params {
+                check_strip(&self.config, slot, param).map_err(ReplayError::Invalid)?;
             }
         }
+        let strips = product_strips(&state.strips);
         // The entries of one log entry are adjacent and fold into one.
         let mut pending = Vec::with_capacity(state.pending.len());
         let mut batches = Vec::new();
@@ -2467,6 +2480,15 @@ struct Job {
     stage: Stage,
 }
 
+/// What a product state still needs handed to the RT thread before
+/// `done` is sent: per input domain its generation, and the front job's
+/// sent before it.
+struct ProductHandOver {
+    done: SyncSender<()>,
+    domains: Vec<bool>,
+    resend: bool,
+}
+
 enum Stage {
     /// Waits for the job before it.
     Waiting,
@@ -2502,6 +2524,8 @@ struct Supervisor {
     /// another flow: the next generation built starts their readers
     /// anew.
     reroute: Vec<u64>,
+    /// A product state's generations not all handed over yet.
+    product: Option<ProductHandOver>,
     pollers: Vec<Option<Pollers>>,
     /// The last failure to create each input domain's poll instance and
     /// generation, logged once per change of its text.
@@ -2572,6 +2596,7 @@ impl Supervisor {
             self.page_hashes();
             self.meters();
             self.log_messages();
+            self.hand_product();
             // Committed entries the ring had no room for.
             self.log.lock().expect("log lock").flush();
             self.jobs();
@@ -3027,8 +3052,13 @@ impl Supervisor {
         let produced = self.counters.produced.load(Acquire);
         let mut prune_after = vec![u64::MAX; n];
         let mut held = 0u64;
-        // The slots a product state moved to another flow.
-        let mut rerouted = std::mem::take(&mut self.reroute[d]);
+        // The slots a product state moved to another flow, for the
+        // domain's own generation only: a job's crossfades from its index.
+        let mut rerouted = if job.is_none() {
+            std::mem::take(&mut self.reroute[d])
+        } else {
+            0
+        };
         for (slot, limit) in prune_after.iter_mut().enumerate() {
             if self.input_domain(slot) != d {
                 continue;
@@ -3186,10 +3216,7 @@ impl Supervisor {
                 // A generation sent for one is handed back unused by the
                 // next one sent.
                 LogMsg::Dropped { upto } => self.jobs.retain(|j| j.id > upto),
-                LogMsg::Product { up, flows, done } => {
-                    self.product(&up, flows);
-                    let _ = done.try_send(());
-                }
+                LogMsg::Product { up, flows, done } => self.product(&up, flows, done),
             }
         }
     }
@@ -3274,8 +3301,11 @@ impl Supervisor {
     /// Takes the slots' state and flows of a product state: a slot on
     /// another flow moves to it at once, no crossfade, its reader state
     /// started anew in the generation's `rerouted`. Every domain's
-    /// generation is built anew and handed to the RT thread.
-    fn product(&mut self, up: &[bool], flows: Vec<String>) {
+    /// generation is built anew on them and handed to the RT thread, and
+    /// so is the generation a job built or sent before them, which read
+    /// the old flows; `done` is sent once all are handed over
+    /// ([`Supervisor::hand_product`]).
+    fn product(&mut self, up: &[bool], flows: Vec<String>, done: SyncSender<()>) {
         for (slot, flow) in flows.into_iter().enumerate() {
             self.slots[slot].up = up[slot];
             self.status().inputs[slot].up = up[slot];
@@ -3294,11 +3324,80 @@ impl Supervisor {
             let d = self.input_domain(slot);
             self.reroute[d] |= bit(slot);
         }
-        for d in 0..self.dirty.len() {
-            self.dirty[d] = true;
-            if self.cmd.slots() > 0 {
-                self.rebuild(d);
+        // A generation built and not sent is built again when sent.
+        for j in &mut self.jobs {
+            if matches!(j.stage, Stage::Built(..)) {
+                j.stage = Stage::Waiting;
             }
+        }
+        let resend = self
+            .jobs
+            .front()
+            .is_some_and(|j| matches!(j.stage, Stage::Sent(_)));
+        self.product = Some(ProductHandOver {
+            done,
+            domains: vec![true; self.dirty.len()],
+            resend,
+        });
+        self.hand_product();
+    }
+
+    /// Hands the generations a product state needs to the RT thread while
+    /// the command ring has room, the rest at later ticks: each domain's,
+    /// built on the slots' flows, and the front job's again when it was
+    /// sent before, under its entry's id, which the RT thread takes in
+    /// place of the one it holds. Then sends `done`.
+    fn hand_product(&mut self) {
+        let Some(mut p) = self.product.take() else {
+            return;
+        };
+        for d in 0..p.domains.len() {
+            if !p.domains[d] || self.cmd.slots() == 0 {
+                continue;
+            }
+            let Some((generation, held)) = self.build(d, None) else {
+                continue;
+            };
+            let command = Command::Generation {
+                domain: d,
+                generation,
+            };
+            if self.cmd.push(command).is_ok() {
+                p.domains[d] = false;
+                self.dirty[d] = false;
+                self.adopt(d, held, 0);
+            }
+        }
+        if p.resend
+            && self.cmd.slots() > 0
+            && let Some(j) = self.jobs.pop_front()
+        {
+            if let Stage::Sent(_) = j.stage
+                && let Some((generation, held)) = self.build(j.domain, Some(&j))
+            {
+                let command = Command::Pending {
+                    id: j.id,
+                    domain: j.domain,
+                    generation,
+                };
+                if self.cmd.push(command).is_err() {
+                    unreachable!("a free command slot was checked");
+                }
+                p.resend = false;
+                self.jobs.push_front(Job {
+                    stage: Stage::Sent(held),
+                    ..j
+                });
+            } else {
+                // Done with meanwhile, or not built: at the next tick.
+                p.resend = matches!(j.stage, Stage::Sent(_));
+                self.jobs.push_front(j);
+            }
+        }
+        if p.domains.iter().any(|&d| d) || p.resend {
+            self.product = Some(p);
+        } else {
+            let _ = p.done.try_send(());
         }
     }
 
@@ -3711,6 +3810,22 @@ mod tests {
         assert_eq!(ids, (11..=PENDING_CHANGES as u64 + 10).collect::<Vec<_>>());
         log.flush();
         assert_eq!(rx.slots(), 26);
+    }
+
+    /// A product state's strip parameters reach the RT thread folded to
+    /// the last value per slot and key: a list of every value a parameter
+    /// took would otherwise be set one by one in one wake.
+    #[test]
+    fn product_strip_parameters_fold_to_the_last_value_per_key() {
+        let trim = |db| StripParam::Trim { db };
+        let leg = StripParam::LegTrim { leg: 1, db: 2.0 };
+        let mut history: Vec<StripParam> = (0..1000).map(|n| trim(-(n % 20) as f32)).collect();
+        history.push(leg);
+        history.push(trim(-9.0));
+        assert_eq!(
+            product_strips(&[history, vec![trim(-1.0), trim(-2.0)]]),
+            [(0, trim(-9.0)), (0, leg), (1, trim(-2.0))]
+        );
     }
 
     /// A full reset ring says so, not that gain changes are outstanding.

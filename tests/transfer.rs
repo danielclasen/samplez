@@ -119,11 +119,18 @@ struct Hashed {
 const RAMP: u32 = 2048;
 
 fn hashed(domain: &Domain, src: &str) -> Hashed {
+    hashed_with(domain, &[(src, 2)])
+}
+
+/// [`hashed`] over the inputs `inputs`, as (flow, channels), one output
+/// channel per input channel.
+fn hashed_with(domain: &Domain, inputs: &[(&str, u32)]) -> Hashed {
+    let channels = inputs.iter().map(|i| i.1).sum::<u32>();
     let mut config = config(
         &domain.0,
-        &[(src, 2)],
-        &[(&new_id(), 2)],
-        diagonal(2, 1.0),
+        inputs,
+        &[(&new_id(), channels)],
+        diagonal(channels as usize, 1.0),
         MARGIN,
     );
     config.ramp_samples = RAMP;
@@ -1397,4 +1404,100 @@ fn a_copy_holds_every_unresolved_entry_given_before_it() {
         h.e.resolved(id).unwrap();
     }
     h.e.stop();
+}
+
+/// A product state that moves an input to another flow while a log
+/// entry's generation for another input of its domain is built, or sent,
+/// on the old flows: that generation is built again on the new ones, so
+/// when the entry swaps it in, the moved input stays on its new flow, its
+/// old flow gone, and the pages equal those of an engine that moved it
+/// through the log.
+#[test]
+fn a_product_state_rebuilds_a_generation_built_on_the_old_flows() {
+    for sent in [false, true] {
+        common::undisturbed(|| product_over_a_pending_generation(sent));
+    }
+}
+
+fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
+    let domain = Domain::new();
+    let (src0, src1, next0, next1) = (new_id(), new_id(), new_id(), new_id());
+    let _p0 = Pilot::start(&domain.0, &src0, 1, B, 0);
+    let old1 = Pilot::start(&domain.0, &src1, 1, B, 0);
+    let _n0 = Pilot::start(&domain.0, &next0, 1, B, 0);
+    let _n1 = Pilot::start(&domain.0, &next1, 1, B, 0);
+    let inputs = [(src0.as_str(), 1), (src1.as_str(), 1)];
+    let (a, b) = (hashed_with(&domain, &inputs), hashed_with(&domain, &inputs));
+    let route = |slot, flow: &str| Entry::Route {
+        slot,
+        flow_id: flow.to_owned(),
+    };
+    // Input 1 moves to next1 now on a, through the product state on b.
+    a.e.append(1, (now_block() + 20) * B, route(1, &next1))
+        .unwrap();
+    a.e.commit(1);
+    // Input 0's re-route, far enough ahead to be pending on b throughout.
+    let at = (now_block() + 400) * B;
+    a.e.append(2, at, route(0, &next0)).unwrap();
+    a.e.commit(2);
+    b.e.drop_core().unwrap();
+    b.e.append(2, at, route(0, &next0)).unwrap();
+    if sent {
+        b.e.commit(2);
+    }
+    let pending = |e: &Engine| e.status().generation;
+    wait_for(Duration::from_secs(5), "entry 2's generation built", || {
+        let g = pending(&b.e);
+        g.pending == Some(2) && g.ready
+    });
+    let state = ProductState {
+        gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        up: vec![true, true],
+        flows: vec![src0.clone(), next1.clone()],
+        strips: vec![Vec::new(), Vec::new()],
+        pending: if sent {
+            vec![(2, at, route(0, &next0))]
+        } else {
+            Vec::new()
+        },
+        last_id: if sent { 2 } else { 1 },
+    };
+    let j = b.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    if !sent {
+        b.e.commit(2);
+    }
+    // Input 1's old flow is gone: read, it is silenced.
+    drop(old1);
+    let from = ((j + 1) * B + 2 * u64::from(RAMP)).div_ceil(PAGE);
+    let end = (at + 2 * u64::from(RAMP)) / B + 8 * PAGE / B;
+    wait_for(Duration::from_secs(10), "past entry 2", || {
+        processed(&a.e) > end && processed(&b.e) > end
+    });
+    let late: Vec<u64> = b
+        .verdicts
+        .try_iter()
+        .filter(|v| v.silenced & 0b10 != 0 && v.k * B >= from * PAGE)
+        .map(|v| v.k)
+        .collect();
+    assert!(
+        late.is_empty(),
+        "input 1 read its old flow in {} blocks from {:?}",
+        late.len(),
+        late.first()
+    );
+    assert_eq!(b.e.status().inputs[1].flow_id, next1);
+    assert_eq!(b.e.status().inputs[0].flow_id, next0);
+    let (pa, pb) = (a.pages(), b.pages());
+    let disturbed = a.disturbed();
+    let after = (at + 2 * u64::from(RAMP)).div_ceil(PAGE);
+    for p in after..after + 6 {
+        if disturbed.contains(&p) {
+            return Err(format!("page {p} disturbed"));
+        }
+        let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+            return Err(format!("page {p} not hashed by both"));
+        };
+        assert_eq!(hb.hash, ha.hash, "page {p}");
+    }
+    Ok(())
 }

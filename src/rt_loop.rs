@@ -1818,10 +1818,14 @@ impl Rt {
                     } else if id > self.last_entry || self.mix.holds(id) {
                         // Its entry is pending, or still in the entry ring
                         // behind a full pending list.
-                        if let Some((old, _, g)) =
-                            self.pending_gen.replace((id, domain, generation))
-                        {
-                            self.gen_unused(old, g);
+                        match self.pending_gen.replace((id, domain, generation)) {
+                            // Built again for the same entry, as after a
+                            // product state: the entry still awaits it.
+                            Some((old, _, g)) if old == id => {
+                                self.give_back(Returned::Generation(g));
+                            }
+                            Some((old, _, g)) => self.gen_unused(old, g),
+                            None => {}
                         }
                     } else {
                         self.gen_unused(id, generation);
