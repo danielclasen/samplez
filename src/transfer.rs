@@ -622,6 +622,22 @@ mod tests {
         assert!(CoreCopy::decode(&copy.encode()).is_ok());
     }
 
+    /// A matrix the size of which a peer names beyond the coefficient
+    /// limit is refused before anything is allocated for it: 2^40 inputs
+    /// would abort the process on the allocation.
+    #[test]
+    fn a_matrix_beyond_the_coefficient_limit_is_refused() {
+        let copy = copy();
+        let wire = serde_json::to_string(&copy.core.matrix).unwrap();
+        let huge = wire.replacen("\"inputs\":2", &format!("\"inputs\":{}", 1u64 << 40), 1);
+        assert_ne!(wire, huge);
+        let encoded = copy.encode().replacen(&wire, &huge, 1);
+        assert!(matches!(
+            CoreCopy::decode(&encoded),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
     /// A core of another shape, or with an entry outside the engine,
     /// does not fit it.
     #[test]

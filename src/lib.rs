@@ -23,6 +23,7 @@ pub use engine::{
 };
 pub use meters::{InputMeters, OutputMeters};
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};
+pub use samplez_dsp::MAX_COEFFICIENTS;
 pub use transfer::{
     CopyError, Core, CoreCopy, DecodeError, ENGINE_VERSION, ProductState, Replay, ReplayError,
 };
