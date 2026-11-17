@@ -400,6 +400,8 @@ impl std::error::Error for ControlError {}
 struct ReplicaControl {
     ring: rtrb::Producer<Control>,
     unresolved: Vec<LogId>,
+    /// The number of controls pushed to the ring.
+    sent: u64,
 }
 
 /// The off-RT side of core copies: at most one buffer is with the RT
@@ -408,6 +410,9 @@ struct Transfer {
     cores: rtrb::Producer<Box<Core>>,
     copies: rtrb::Consumer<CoreCopy>,
     in_flight: bool,
+    /// The number of controls pushed when the buffer in flight was sent,
+    /// all of them taken by the RT thread before it fills that buffer.
+    in_flight_after: u64,
     handovers: rtrb::Producer<Handover>,
     handed: rtrb::Consumer<Handover>,
     /// A hand-over is with the RT thread.
@@ -1055,6 +1060,7 @@ impl Engine {
                     cores: cores_tx,
                     copies: copies_rx,
                     in_flight: false,
+                    in_flight_after: 0,
                     handovers: handovers_tx,
                     handed: handed_rx,
                     handing: false,
@@ -1086,6 +1092,7 @@ impl Engine {
             let control = ReplicaControl {
                 ring: control_tx,
                 unresolved: Vec::with_capacity(UNRESOLVED),
+                sent: 0,
             };
             (
                 Some((shared, Mutex::new(control))),
@@ -1759,7 +1766,9 @@ impl Engine {
             }
             _ => {}
         }
-        control.ring.push(c).map_err(|_| ControlError::Full)
+        control.ring.push(c).map_err(|_| ControlError::Full)?;
+        control.sent += 1;
+        Ok(())
     }
 
     /// Replicated mode: publishes F, the end index of the highest block up
@@ -1925,40 +1934,55 @@ impl Engine {
     /// history after `k0` (`historySlackMs`), which a copy of history
     /// rings needs; the engine keeps no delay line, so it holds the core
     /// alone. A copy left behind by a timeout is returned by the next
-    /// call. Calls serialise: one buffer is with the RT thread at a time.
-    /// The copy holds every control sent before the call, such as an
-    /// entry given as unresolved.
+    /// call unless a control was sent after its buffer. Calls serialise:
+    /// one buffer is with the RT thread at a time. The copy holds every
+    /// control sent before the call, such as an entry given as
+    /// unresolved.
     pub fn copy_core(&self, timeout: Duration) -> Result<CoreCopy, CopyError> {
         let (Some((shared, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
             return Err(CopyError::NotReplicated);
         };
         let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + timeout;
-        if !t.in_flight {
-            // The RT thread takes controls at the start of a wake and copies
-            // after a block: a buffer sent while a control waits could be
-            // filled in the wake before the one that takes the control.
-            // Sent once every control was taken, it is filled after them.
-            while control.lock().expect("control lock").ring.slots() < UNRESOLVED {
-                if Instant::now() >= deadline {
-                    return Err(CopyError::Timeout);
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            let (n, m, slots, page) = t.shape;
-            let mut core = t
-                .spare
-                .take()
-                .unwrap_or_else(|| Box::new(Core::new(n, m, slots, page)));
-            core.prepare();
-            if t.cores.push(core).is_err() {
-                unreachable!("one buffer is with the RT thread at most");
-            }
-            t.in_flight = true;
-        }
+        let before = control.lock().expect("control lock").sent;
         let copy = loop {
+            if !t.in_flight {
+                // The RT thread takes controls at the start of a wake and
+                // copies after a block: a buffer sent while a control waits
+                // could be filled in the wake before the one that takes the
+                // control. Sent once every control was taken, it is filled
+                // after them.
+                let sent = loop {
+                    let c = control.lock().expect("control lock");
+                    if c.ring.slots() == UNRESOLVED {
+                        break c.sent;
+                    }
+                    drop(c);
+                    if Instant::now() >= deadline {
+                        return Err(CopyError::Timeout);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let (n, m, slots, page) = t.shape;
+                let mut core = t
+                    .spare
+                    .take()
+                    .unwrap_or_else(|| Box::new(Core::new(n, m, slots, page)));
+                core.prepare();
+                if t.cores.push(core).is_err() {
+                    unreachable!("one buffer is with the RT thread at most");
+                }
+                t.in_flight = true;
+                t.in_flight_after = sent;
+            }
             if let Ok(copy) = t.copies.pop() {
                 t.in_flight = false;
+                // A buffer an earlier call left behind can predate controls
+                // sent since: it is filled again.
+                if t.in_flight_after < before {
+                    t.spare = Some(copy.core);
+                    continue;
+                }
                 break copy;
             }
             if Instant::now() >= deadline {
