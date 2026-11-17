@@ -25,9 +25,16 @@ use crate::entry::{Body, Request};
 use crate::report::{ClockFlags, Own, Page, Unwritten, page_digest, runs};
 use crate::resync::{CoreReply, Resynced, Source};
 
-/// Turns a log entry into the engine entry it applies, with its index;
-/// none for an entry the engine does not apply.
-pub type Translate = Box<dyn Fn(&Request) -> Option<(u64, Entry)> + Send + Sync>;
+/// Turns a log entry into the engine entries it applies, in order, with
+/// the index they share; none, or no entries, for an entry the engine does
+/// not apply. The commands of one `Commands` entry ask for one index
+/// ([`Request::at_index`]). The engine folds the entries into one batch
+/// bounded by its shape ([`Engine::append_batch`]), so a command of any
+/// number of entries applies whole at its index.
+pub type Translate = Box<dyn Fn(&Request) -> Option<Translated> + Send + Sync>;
+
+/// A log entry's index and the engine entries it applies there.
+pub type Translated = (u64, Vec<Entry>);
 
 /// The product state, as applied, that a dropped engine core is rebuilt
 /// from; none while it cannot be read.
@@ -47,20 +54,21 @@ const REPLAY_WAIT: Duration = Duration::from_secs(2);
 const HANDOVER_TRY: Duration = Duration::from_millis(20);
 
 /// The engine entry of an `InputDown` or `InputUp` body; a product's
-/// [`Translate`] adds the entries only it can read, such as a route.
-pub fn input_entry(request: &Request) -> Option<(u64, Entry)> {
+/// [`Translate`] adds the entries only it can read, such as a route or a
+/// command's gains and strip parameters.
+pub fn input_entry(request: &Request) -> Option<Translated> {
     match request.body {
         Body::InputDown { slot, at_index } => Some((
             at_index,
-            Entry::InputDown {
+            vec![Entry::InputDown {
                 slot: slot as usize,
-            },
+            }],
         )),
         Body::InputUp { slot, at_index } => Some((
             at_index,
-            Entry::InputUp {
+            vec![Entry::InputUp {
                 slot: slot as usize,
-            },
+            }],
         )),
         _ => None,
     }
@@ -267,8 +275,8 @@ impl Audio for EngineAudio {
     }
 
     fn appended(&self, index: u64, request: &Request) {
-        if let Some((at_index, entry)) = (self.translate)(request)
-            && let Err(e) = self.engine.append(index, at_index, entry)
+        if let Some((at_index, entries)) = (self.translate)(request)
+            && let Err(e) = self.engine.append_batch(index, at_index, &entries)
         {
             self.refused(index, &e);
         }
@@ -391,13 +399,30 @@ impl Audio for EngineAudio {
         let deadline = Instant::now() + REPLAY_WAIT;
         let mut after = core.last_id;
         let j = loop {
-            for (index, request) in source.entries(after) {
+            let entries: Vec<(u64, Option<Translated>)> = source
+                .entries(after)
+                .into_iter()
+                .map(|(index, request)| (index, (self.translate)(&request)))
+                .collect();
+            // The lowest index of the entries from each one on.
+            let mut lowest = vec![u64::MAX; entries.len() + 1];
+            for (n, (_, t)) in entries.iter().enumerate().rev() {
+                lowest[n] = lowest[n + 1].min(t.as_ref().map_or(u64::MAX, |t| t.0));
+            }
+            for (n, (index, translated)) in entries.into_iter().enumerate() {
                 after = index;
-                if let Some((at_index, entry)) = (self.translate)(&request) {
-                    replay
-                        .append(index, at_index, &entry)
-                        .map_err(|e| e.to_string())?;
+                let Some((at_index, list)) = translated else {
+                    continue;
+                };
+                let mut appended = replay.append_batch(index, at_index, &list);
+                if appended == Err(ReplayError::Full) {
+                    // Its pending list holds the entries before this one:
+                    // the replay computes up to the first index still to
+                    // come, which applies those due by then.
+                    replay.run_to((lowest[n] / self.block).saturating_sub(1));
+                    appended = replay.append_batch(index, at_index, &list);
                 }
+                appended.map_err(|e| e.to_string())?;
             }
             if !source.go() {
                 return Err("given up before the hand-over".to_owned());
