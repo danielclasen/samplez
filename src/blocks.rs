@@ -726,6 +726,9 @@ pub struct Hold {
     start_seq: u64,
     /// A requested stop at a sample index.
     stop_at: Option<u64>,
+    /// Withdrawn by a stop at a block boundary right after a block it
+    /// committed, and filling on from there.
+    stopped: bool,
     /// The block after the last one computed.
     next: u64,
     /// Blocks withheld by the RT thread, and ring overflows.
@@ -779,6 +782,7 @@ impl Hold {
             cause_at: None,
             start_seq: 0,
             stop_at: None,
+            stopped: false,
             next: 0,
             withheld: 0,
             overflows: 0,
@@ -863,6 +867,7 @@ impl Hold {
         self.frontier = None;
         self.start_from = None;
         self.stop_at = None;
+        self.stopped = false;
         for n in 0..self.pending.len() {
             let p = self.pending[n].status;
             let cur = statuses.get(p.k).unwrap_or(p);
@@ -899,6 +904,7 @@ impl Hold {
             self.start_from = None;
         }
         self.stop_at = None;
+        self.stopped = false;
         if self.mode == Mode::Idle {
             return;
         }
@@ -1105,8 +1111,14 @@ impl Hold {
             } else {
                 start.next_multiple_of(PAGE)
             };
-            if at < end {
+            // An output filling on from a stop takes it only in a block
+            // that starts on a page boundary: inside a block it would end
+            // the fill below the commit start, and with the stop no other
+            // member need commit that part of the page.
+            let filling_on = self.stopped && self.frontier == Some(start);
+            if at < end && !(filling_on && at > start) {
                 self.start_from = None;
+                self.stopped = false;
                 self.mode = Mode::Committing;
                 statuses.set_standing(Standing::Committing { from: at });
                 self.frontier = Some(at);
@@ -1134,6 +1146,8 @@ impl Hold {
                         // this member: it fills on from there.
                         if p != start || self.frontier != Some(start) {
                             self.frontier = None;
+                        } else {
+                            self.stopped = true;
                         }
                     } else {
                         range = Range::UpTo(p);
@@ -2153,6 +2167,44 @@ mod tests {
         if !((K0 + 2) * B).is_multiple_of(PAGE) {
             assert_eq!(t.kind(K0 + 2), Some(Kind::Withheld));
         }
+    }
+
+    /// A commit start requested while the output fills on contiguously
+    /// after a stop at a block boundary takes in the first block that
+    /// starts on a page boundary: taken inside a block, it would end the
+    /// fill below the commit start and leave that part of the page to no
+    /// member. Every sample from the stop on is written once.
+    #[test]
+    fn a_contiguous_fill_takes_a_commit_start_at_a_page_aligned_block() {
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        t.hold.stop_at((K0 + 1) * B);
+        t.compute(K0 + 1, Some(HEALTHY));
+        assert!(t.statuses.commit_through(K0 + 1, 0, None));
+        t.hold.commit_from(K0 + 2);
+        let mut k = K0 + 2;
+        loop {
+            t.compute(k, Some(HEALTHY));
+            if t.hold.mode() == Mode::Committing {
+                break;
+            }
+            let st = t.statuses.get(k).unwrap();
+            assert_eq!(st.range, Range::Whole, "block {k} filled in part");
+            assert!(t.statuses.commit_through(k, 0, None));
+            k += 1;
+            assert!(k < K0 + 2 * PAGE, "no commit start");
+        }
+        assert!((k * B).is_multiple_of(PAGE));
+        assert_eq!(t.statuses.standing(), Standing::Committing { from: k * B });
+        for j in k + 1..k + CAP as u64 + 2 {
+            t.compute(j, Some(HEALTHY));
+        }
+        let mut end = K0 * B;
+        for &(s, n) in &t.sink.writes {
+            assert_eq!(s, end, "a gap or an overlap at {s}");
+            end = s + n as u64;
+        }
+        assert!(end > k * B, "nothing written past the commit start");
     }
 
     /// After a backward clock step every open block of the ring is
