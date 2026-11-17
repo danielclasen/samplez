@@ -100,21 +100,27 @@ second, wherever it stands against the clock, and each `InputUp` or
 `truncate` and sends those reports out instead.
 
 A replicated log entry may carry any number of engine entries
-(`append_batch`). They are folded off the RT thread, per matrix
-coefficient, strip parameter and input slot the last value (an
-`InputDown`, `InputUp` or `Route` of a slot replaces the one before
-it), so the log entry's batch is bounded by the engine's shape. It
-takes one of the 64 places the RT thread holds for log entries before
-their index, the number of log entries the leader stamps ahead, and
-applies whole at its index, its gains first; a late one counts once in
-`command_late`. One with more than one `InputUp` or `Route` after
-folding, or with an entry refused alone, is refused whole when
-appended; one of no entries appends nothing. Spent batches return to
-the supervisor to be freed. Each core buffer holds 64 batches with room
-for any log entry, `4nm + nm/8 + 40k` bytes each for an `n` by `m`
-matrix and `k` strip parameter keys (10 plus two per leg per strip):
-about 12 KiB at 32 by 22 with 16 stereo strips, 1.1 MiB at the
-coefficient limit.
+(`append_batch`). They are folded off the RT thread: per matrix
+coefficient and strip parameter the last value; per input slot
+whether it is re-routed, goes down and comes up, an `InputUp` after an
+`InputDown` fading in from silence and a route kept whatever the
+state. The log entry's batch is bounded by the engine's shape, shared
+by reference and never changed once folded. It takes one of the 64
+places the RT thread holds for log entries before their index, the
+number the leader stamps ahead, and applies whole at its index, its
+gains first; one generation covers every slot it raises or re-routes,
+and a late one counts once in `command_late`. A log entry raising or
+re-routing inputs of more than one domain, or with an entry refused
+alone, is refused whole (`append_batch`, `admits`); `samplez-replica`
+asks before it orders a command and refuses it to its client
+(`invalid`), so no committed entry is refused. One of no entries
+appends nothing. A replicated engine refuses no committed entry for
+room: entries its ring has no room for wait in its log. The RT thread
+hands its spent batches to the supervisor to be freed, leaving the
+return ring room for the generations and writers it hands back; one it
+cannot hand off is leaked and counted in the status (`batches_leaked`).
+A matrix may have at most 651 coefficients per sample of the block, so
+that a batch setting all of them applies within one block.
 
 Each input of 1 to 8 channels has a strip: trim, per-leg trim and
 polarity, high-pass, a four-band equaliser, gate and compressor
