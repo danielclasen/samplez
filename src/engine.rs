@@ -341,6 +341,9 @@ pub struct Progress {
     pub status_changes_lost: u64,
     /// buildLead in samples ([`GenerationStatus::build_lead`]).
     pub build_lead: u64,
+    /// Times the engine dropped its core for committed entries its RT
+    /// thread did not take ([`Engine::commit`]).
+    pub log_overflows: u64,
 }
 
 /// How an engine that follows a replicated log takes part in its set.
@@ -435,6 +438,9 @@ enum LogMsg {
     Truncate { from: LogId },
     /// Uncommitted entry `id` was removed.
     Skip { id: LogId },
+    /// Committed entries up to `upto` were dropped before they reached
+    /// the RT thread, and the core with them.
+    Dropped { upto: LogId },
 }
 
 /// Appended entries not yet committed, and the producer of the RT
@@ -525,6 +531,24 @@ impl Log {
                 return;
             }
             self.submitted += 1;
+        }
+    }
+
+    /// The committed entries waiting for room in the ring.
+    fn waiting(&self) -> usize {
+        self.uncommitted
+            .iter()
+            .take_while(|q| q.entry.id <= self.committed)
+            .count()
+    }
+
+    /// Drops the committed entries waiting for room in the ring, and the
+    /// generations built for them: the core no longer follows the log.
+    fn drop_waiting(&mut self) {
+        let n = self.waiting();
+        let last = self.uncommitted.drain(..n).next_back().map(|q| q.entry.id);
+        if let Some(upto) = last {
+            let _ = self.sup.send(LogMsg::Dropped { upto });
         }
     }
 
@@ -637,6 +661,10 @@ fn history_kept(started: &Started, k0: u64, slack: u64) -> Result<(), u64> {
 
 /// The input slots of `config`'s shape, every one up, and the index in
 /// `config.domains` of each input domain they use.
+/// The committed entries a replicated engine keeps waiting for room in
+/// its entry ring at most ([`Engine::commit`]).
+pub const WAITING: usize = 4 * PENDING_CHANGES;
+
 /// A core buffer's shape: input and output channels, input slots and the
 /// room for one page's entries.
 type Shape = (usize, usize, usize, usize);
@@ -1551,8 +1579,9 @@ impl Engine {
 
     /// `entries` checked and folded, with the flows of the slots the
     /// fold re-routes: none for no change. Refused when an entry is, and
-    /// when the slots the fold raises or re-routes are of more than one
-    /// input domain: one generation is built for a log entry.
+    /// when the slots the entries' `InputUp`s and `Route`s name are of
+    /// more than one input domain: one generation is built for a log
+    /// entry.
     #[allow(clippy::type_complexity)]
     fn fold(
         &self,
@@ -1566,13 +1595,13 @@ impl Engine {
                 flows.insert(*slot, flow_id);
             }
         }
-        let (n, m) = self.shape;
-        let Some((change, batch)) = batch::fold(&changes, m, n * m).map_err(EntryError::Invalid)?
-        else {
-            return Ok(None);
-        };
-        let (up, routed) = change.generating();
-        let mut domains = slots_of(up | routed).map(|s| &self.config.inputs[s].domain);
+        // Every slot an `InputUp` or `Route` names, whether the fold keeps
+        // it or not: then every subset of the entries passes as well, as a
+        // restamp keeping some of a log entry's commands must.
+        let named = changes
+            .iter()
+            .fold(0, |m, c| m | (c.generating().0 | c.generating().1));
+        let mut domains = slots_of(named).map(|s| &self.config.inputs[s].domain);
         if let Some(first) = domains.next()
             && domains.any(|d| d != first)
         {
@@ -1582,6 +1611,12 @@ impl Engine {
                     .to_owned(),
             ));
         }
+        let (n, m) = self.shape;
+        let Some((change, batch)) = batch::fold(&changes, m, n * m).map_err(EntryError::Invalid)?
+        else {
+            return Ok(None);
+        };
+        let (_, routed) = change.generating();
         let routes = slots_of(routed).map(|s| (s, flows[&s].clone())).collect();
         Ok(Some((change, batch, routes)))
     }
@@ -1629,9 +1664,21 @@ impl Engine {
     }
 
     /// Commits the appended entries up to log id `up_to`: they go to the
-    /// RT thread, in log order.
+    /// RT thread, in log order. A replicated engine whose RT thread takes
+    /// none of them for so long that more than [`WAITING`] wait for room
+    /// drops them and its core: it no longer follows the log and is
+    /// rebuilt or resynced, its progress counting the drop in
+    /// `log_overflows`.
     pub fn commit(&self, up_to: LogId) {
-        self.log.lock().expect("log lock").commit(up_to);
+        let mut log = self.log.lock().expect("log lock");
+        log.commit(up_to);
+        if log.local.is_none() && log.waiting() > WAITING {
+            log.drop_waiting();
+            drop(log);
+            self.counters.log_overflows.fetch_add(1, Relaxed);
+            // Refused only with one voter, which has no core to drop.
+            let _ = self.drop_core();
+        }
     }
 
     /// Replicated mode: the appended log entry `id` is never applied, and
@@ -1820,6 +1867,7 @@ impl Engine {
             steps_cleared: shared.steps_cleared.load(Acquire),
             tai_offset_s: (offset != i64::MIN).then_some(offset),
             self_report: shared.self_report.load(Relaxed),
+            log_overflows: c.log_overflows.load(Relaxed),
             status_changes_lost: c.status_changes_dropped.load(Relaxed)
                 + c.status_changes_unsent.load(Relaxed),
             build_lead: self.build_lead.load(Relaxed),
@@ -3075,6 +3123,9 @@ impl Supervisor {
                 LogMsg::Skip { id } => self
                     .jobs
                     .retain(|j| j.id != id || matches!(j.stage, Stage::Sent(_))),
+                // A generation sent for one is handed back unused by the
+                // next one sent.
+                LogMsg::Dropped { upto } => self.jobs.retain(|j| j.id > upto),
             }
         }
     }
@@ -5296,6 +5347,35 @@ mod tests {
         assert_eq!(rt.mix.batches.len(), 1);
         assert_eq!(rt.slots[0].strip_pos, Some(48));
         assert!(rt.slots[0].up, "an InputDown applied without a core");
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Without a core, a batch whose strip parameters the replayed strips
+    /// hold already, marked so when taken, passes without setting them
+    /// again, which would restart their ramps.
+    #[test]
+    fn a_batch_passed_without_a_core_keeps_strips_the_core_brought() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-held-strips", 1);
+        let (mut rt, _ring) = rt_of(&e, &domain, "1d49");
+        let (change, batch) = batch_of(false);
+        let Change::Batch { up, routed, .. } = change else {
+            panic!("{change:?}")
+        };
+        let held = RtEntry {
+            id: 1,
+            at_index: 48,
+            change: Change::Batch {
+                strips: false,
+                up,
+                routed,
+            },
+        };
+        assert!(rt.mix.push_with(held, batch).is_ok());
+        rt.pass_entries(2);
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.slots[0].strip_pos, None, "a strip parameter set again");
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

@@ -142,6 +142,9 @@ pub struct Counters {
     /// Spent batches neither the return ring nor the RT thread's spent
     /// list had room for: leaked rather than freed on the RT thread.
     pub batches_leaked: AtomicU64,
+    /// Times a replicated engine dropped its core because more than
+    /// `WAITING` committed entries waited for room in its entry ring.
+    pub log_overflows: AtomicU64,
     /// Page hashes the supervisor could not pass on: the replicated
     /// state's channel was full.
     pub page_hashes_unsent: AtomicU64,
@@ -1931,9 +1934,11 @@ impl Rt {
             add(&self.counters.entries_without_core, 1);
             match e.change {
                 Change::Strip { slot, param } => self.set_strip(e, slot, param),
-                Change::Batch { .. } => {
+                Change::Batch { strips, .. } => {
                     let b = self.mix.take_batch(e.id);
-                    if let Some(b) = &b {
+                    // Without strips, its strip parameters are in the
+                    // strips the last replayed core brought.
+                    if let Some(b) = b.as_ref().filter(|_| strips) {
                         for &(slot, param) in &b.strips {
                             self.set_strip(e, slot as usize, param);
                         }

@@ -1198,3 +1198,59 @@ fn a_replay_folds_and_checks_a_log_entry_as_the_engine_does() {
     ));
     h.e.stop();
 }
+
+/// A core copied while a log entry's batch awaits its generation decodes,
+/// and a replay of it is refused as one with a generation in flight, which
+/// a joiner retries with a later copy, not as another engine's core.
+#[test]
+fn a_core_with_a_batch_awaiting_its_generation_decodes() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let mut wire: serde_json::Value = serde_json::from_str(&copy(&h.e).encode()).unwrap();
+    let at = wire["copy"]["core"]["pos"].as_u64().unwrap();
+    wire["copy"]["core"]["awaiting_gen"] = serde_json::json!([{
+        "id": wire["copy"]["last_id"],
+        "at_index": at,
+        "change": { "Batch": { "strips": true, "up": 1, "routed": 0 } },
+    }]);
+    let copy = samplez::CoreCopy::decode(&wire.to_string()).unwrap();
+    assert!(matches!(h.e.replay(copy), Err(ReplayError::Generation)));
+    h.e.stop();
+}
+
+/// A replicated engine whose RT thread takes no committed entry keeps at
+/// most `WAITING` of them waiting for room; past that it drops them and
+/// its core, counted, to be rebuilt, rather than hold them without bound.
+#[test]
+fn committed_entries_past_the_wait_bound_drop_the_core() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    // Far ahead: the RT thread holds 64 pending, the ring 64 more.
+    let at = (now_block() + 1_000_000) * B;
+    let held = 2 * 64 + samplez::engine::WAITING as u64;
+    for id in 1..=held + 1 {
+        let gain = Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: (id % 7) as f32 / 7.0,
+        };
+        h.e.append(id, at, gain).unwrap();
+        h.e.commit(id);
+        if id == 2 * 64 {
+            // The RT thread takes 64 off the ring at its next wakes.
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let overflows = c.log_overflows.load(Relaxed);
+        assert_eq!(overflows, u64::from(id > held), "after entry {id}");
+    }
+    assert_eq!(h.e.progress().unwrap().log_overflows, 1);
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 0
+    });
+    h.e.stop();
+}

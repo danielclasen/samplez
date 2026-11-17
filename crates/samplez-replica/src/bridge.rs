@@ -256,6 +256,7 @@ impl Audio for EngineAudio {
             realised: status.outputs.iter().map(|o| o.realised).collect(),
             generation_ready: status.generation.pending.is_none() || status.generation.ready,
             clock_steps: progress.steps,
+            log_overflows: progress.log_overflows,
         }
     }
 

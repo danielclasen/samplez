@@ -222,8 +222,8 @@ impl Core {
     }
 
     /// Whether each pending [`Change::Batch`] has its batch, sane and as
-    /// the change says, and no other batch is held; no entry awaiting its
-    /// generation is a batch, whose generation-needing entry awaits alone.
+    /// the change says, and no other batch is held. A batch awaiting its
+    /// generation was applied but for that and holds none.
     fn batches_match(&self) -> bool {
         let mut held = 0;
         for e in &self.pending {
@@ -240,10 +240,6 @@ impl Core {
             }
         }
         held == self.batches.len()
-            && !self
-                .awaiting_gen
-                .iter()
-                .any(|e| matches!(e.change, Change::Batch { .. }))
     }
 
     /// Whether this sane core is of an engine with `inputs` and `outputs`

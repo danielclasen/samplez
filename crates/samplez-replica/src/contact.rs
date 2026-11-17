@@ -243,6 +243,10 @@ pub struct Sample {
     pub generation_ready: bool,
     /// Clock steps the engine detected.
     pub clock_steps: u64,
+    /// Times the engine dropped its core for committed entries its RT
+    /// thread did not take: a rise returns the replica to `starting`,
+    /// rebuilt from product state.
+    pub log_overflows: u64,
 }
 
 /// The voters of the applied membership: one configuration, or two
@@ -601,6 +605,7 @@ struct State {
     own: Own,
     status_changes_lost: u64,
     entries_refused: u64,
+    log_overflows: u64,
     counts: Counts,
 }
 
@@ -827,6 +832,7 @@ impl Contact {
                 own: Own::default(),
                 status_changes_lost: 0,
                 entries_refused: 0,
+                log_overflows: 0,
                 counts: Counts::default(),
             }),
         }
@@ -1070,6 +1076,12 @@ impl Contact {
             st.generation_ready = sample.generation_ready;
             st.clock_steps = sample.clock_steps;
             st.pages.fold(self.id, &st.own.pages);
+            if sample.log_overflows > st.log_overflows {
+                st.log_overflows = sample.log_overflows;
+                // The engine dropped its core and committed entries with
+                // it: rebuilt from the state after them.
+                self.begin_restart(st, applied);
+            }
             if let Some(r) = &st.rollout {
                 st.own.key = Some(r.key());
                 st.own.revision = r.revision();
@@ -2960,6 +2972,7 @@ mod tests {
                 realised: Vec::new(),
                 generation_ready: true,
                 clock_steps: 0,
+                log_overflows: 0,
             }
         }
         fn fence(&self, end: u64) {

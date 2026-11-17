@@ -1049,7 +1049,9 @@ fn a_slot_routed_in_one_entry_keeps_its_route_and_its_state() {
 
 /// A log entry raising or re-routing inputs of two domains is refused
 /// before anything is appended: one generation is built for a log entry,
-/// and a generation is of one domain.
+/// and a generation is of one domain. Every slot an `InputUp` or `Route`
+/// names counts, also one a later entry cancels, so every subset of an
+/// admitted entry is admitted.
 #[test]
 fn a_log_entry_across_input_domains_is_refused() {
     let (a, b) = (Domain::new(), Domain::new());
@@ -1077,5 +1079,23 @@ fn a_log_entry_across_input_domains_is_refused() {
     );
     assert_eq!(e.append_batch(1, 48_000 * B, &[up(0), up(1)]), refused);
     assert_eq!(e.admits(&[up(0), Entry::InputDown { slot: 1 }]), Ok(()));
+    // Raising input 0 and dropping it again leaves one domain re-routed,
+    // but a restamp keeping only some of the commands may keep the raise:
+    // the entries are refused whole, so no subset of an admitted log
+    // entry is refused after its commit.
+    let route = Entry::Route {
+        slot: 1,
+        flow_id: new_id(),
+    };
+    let down = Entry::InputDown { slot: 0 };
+    assert!(e.admits(&[up(0), route.clone(), down.clone()]).is_err());
+    let admitted = [up(0), down, Entry::InputDown { slot: 1 }, up(0)];
+    for subset in 0..1u32 << admitted.len() {
+        let entries: Vec<Entry> = (0..admitted.len())
+            .filter(|n| subset & 1 << n != 0)
+            .map(|n| admitted[n].clone())
+            .collect();
+        assert_eq!(e.admits(&entries), Ok(()), "{entries:?}");
+    }
     e.stop();
 }

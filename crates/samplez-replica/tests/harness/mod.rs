@@ -478,6 +478,9 @@ pub struct Fake {
     pending_handover: Option<(u64, Vec<f32>)>,
     /// Rebuilds fail while set.
     pub rebuild_held: bool,
+    /// Times the engine dropped its core for committed entries its RT
+    /// thread did not take.
+    pub log_overflows: u64,
 }
 
 /// An open glitch: a state divergence that lasts until a resync or a
@@ -846,6 +849,7 @@ impl Audio for FakeAudio {
             realised: st.outputs.iter().map(|o| o.realised).collect(),
             generation_ready: !st.generation_pending,
             clock_steps: self.clock.steps(),
+            log_overflows: st.log_overflows,
         }
     }
     fn fence(&self, end: u64) {
