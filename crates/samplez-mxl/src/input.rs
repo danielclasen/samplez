@@ -43,11 +43,20 @@ pub struct Timing {
     pub resync_budget: u64,
 }
 
+/// The most channels a flow selection may name: every index is below it.
+pub const MAX_FLOW_CHANNELS: u32 = 64;
+
 /// One input slot's configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct InputConfig<'a> {
     pub flow_id: &'a str,
+    /// The input's legs.
     pub channels: u32,
+    /// `flowChannels`: the 0-based flow channel each leg reads, in leg
+    /// order, so `channels` long; an index may repeat. The flow needs at
+    /// least the highest index + 1 channels. Without it the input reads
+    /// every channel of a flow of exactly `channels`, in order.
+    pub flow_channels: Option<&'a [u32]>,
     /// `offsetSamples`.
     pub offset: i64,
 }
@@ -272,7 +281,10 @@ pub struct Generation {
 pub struct Input {
     reader: FlowReader,
     block: u64,
-    channels: usize,
+    /// The flow channel each leg reads.
+    legs: Vec<usize>,
+    /// The flow channels the read needs: the highest of `legs` + 1.
+    width: usize,
     offset: i64,
 }
 
@@ -300,8 +312,9 @@ impl Generation {
 
     /// Opens a reader reference for `slot`, checks the flow and adds the
     /// reader to the group. Refuses a flow whose configuration or
-    /// definition is not 48 kHz float32 audio with `cfg.channels` channels,
-    /// or whose readable history is shorter than the read window
+    /// definition is not 48 kHz float32 audio with the channels `cfg`
+    /// reads (see [`InputConfig::flow_channels`]), or whose readable
+    /// history is shorter than the read window
     /// `(maxCatchupBlocks + 2)B + margin + |offset|`. Returns the margin the
     /// producer needs when `timing.margin` is below
     /// `offset + maxCommitBatchSizeHint + B`.
@@ -335,6 +348,7 @@ impl Generation {
         if slot >= self.inputs.len() {
             return Err(Error::Format(format!("no input slot {slot}")));
         }
+        let legs = legs(cfg)?;
         let reader = FlowReader::open(&self.instance, cfg.flow_id)?;
         let info = reader.config()?;
         // SAFETY: both union members are structs of integers, so any bytes
@@ -346,7 +360,7 @@ impl Generation {
             || rate.denominator == 0
             || i128::from(rate.numerator) * i128::from(RATE.denominator)
                 != i128::from(RATE.numerator) * i128::from(rate.denominator)
-            || cont.channelCount != cfg.channels
+            || !fits(cfg, cont.channelCount)
         {
             return Err(Error::Format(format!(
                 "flow {}: format {}, rate {}/{}, {} channels; expected audio, 48000/1, {}",
@@ -355,7 +369,7 @@ impl Generation {
                 rate.numerator,
                 rate.denominator,
                 cont.channelCount,
-                cfg.channels
+                wanted(cfg)
             )));
         }
         check_flow_def(&self.instance.flow_def(cfg.flow_id)?, cfg)?;
@@ -386,7 +400,8 @@ impl Generation {
         let input = Some(Input {
             reader,
             block: timing.block,
-            channels: cont.channelCount as usize,
+            width: legs.iter().max().map_or(0, |&c| c + 1),
+            legs,
             offset: cfg.offset,
         });
         if outgoing {
@@ -451,23 +466,68 @@ impl Generation {
     }
 }
 
+/// The flow channel each leg of `cfg` reads: `flowChannels`, or every
+/// channel in order. Refuses a selection that is not `channels` long or
+/// names a channel at or above [`MAX_FLOW_CHANNELS`].
+pub fn legs(cfg: &InputConfig) -> Result<Vec<usize>> {
+    let Some(sel) = cfg.flow_channels else {
+        return Ok((0..cfg.channels as usize).collect());
+    };
+    if sel.len() != cfg.channels as usize {
+        return Err(Error::Format(format!(
+            "flow {}: flowChannels names {} channels, the input has {}",
+            cfg.flow_id,
+            sel.len(),
+            cfg.channels
+        )));
+    }
+    if let Some(c) = sel.iter().find(|&&c| c >= MAX_FLOW_CHANNELS) {
+        return Err(Error::Format(format!(
+            "flow {}: flowChannels index {c} is not below {MAX_FLOW_CHANNELS}",
+            cfg.flow_id
+        )));
+    }
+    Ok(sel.iter().map(|&c| c as usize).collect())
+}
+
+/// Whether a flow of `count` channels has the channels `cfg` reads:
+/// exactly `channels` without a selection, else more than the highest
+/// selected index.
+fn fits(cfg: &InputConfig, count: u32) -> bool {
+    match cfg.flow_channels {
+        None => count == cfg.channels,
+        Some(sel) => sel.iter().all(|&c| c < count),
+    }
+}
+
+/// The channel count `cfg` wants, for an error.
+fn wanted(cfg: &InputConfig) -> String {
+    match cfg.flow_channels.and_then(|s| s.iter().max()) {
+        None => format!("{} channels", cfg.channels),
+        Some(&max) => format!("at least {} channels", max + 1),
+    }
+}
+
 fn check_flow_def(def: &str, cfg: &InputConfig) -> Result<()> {
     let v: serde_json::Value = serde_json::from_str(def)
         .map_err(|e| Error::Format(format!("flow {}: definition: {e}", cfg.flow_id)))?;
     // The rate is checked on the normalised grainRate of the config info.
     // libmxl's flow parser reads numbers as doubles and defaults an absent
     // channel_count to 1.
+    let count = v.get("channel_count").map_or(Some(1.0), |c| c.as_f64());
     let ok = v["format"] == "urn:x-nmos:format:audio"
         && v["media_type"] == "audio/float32"
         && v["bit_depth"].as_f64() == Some(32.0)
-        && v.get("channel_count").map_or(Some(1.0), |c| c.as_f64())
-            == Some(f64::from(cfg.channels));
+        && count.is_some_and(|n| {
+            n.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&n) && fits(cfg, n as u32)
+        });
     if ok {
         Ok(())
     } else {
         Err(Error::Format(format!(
-            "flow {}: definition is not 48 kHz float32 audio with {} channels: {def}",
-            cfg.flow_id, cfg.channels
+            "flow {}: definition is not 48 kHz float32 audio with {}: {def}",
+            cfg.flow_id,
+            wanted(cfg)
         )))
     }
 }
@@ -585,8 +645,14 @@ impl Input {
         Ok(pages)
     }
 
+    /// The flow channel each leg reads.
+    pub fn legs(&self) -> &[usize] {
+        &self.legs
+    }
+
     /// RT. Reads block `k`, the range `[kB + offset, (k + 1)B + offset)`,
-    /// into `dst`, planar with B samples per channel:
+    /// into `dst`, planar with B samples per leg, each leg copied from the
+    /// flow channel it selects:
     /// 1. a range starting below `state.last_end` is not read;
     /// 2. unless `group` is [`GroupWait::Ok`], the head from
     ///    `mxlFlowReaderGetRuntimeInfo` is checked and a range ending above
@@ -595,8 +661,9 @@ impl Input {
     /// 3. `mxlFlowReaderGetSamplesNonBlocking((k + 1)B + offset, B)`, both
     ///    fragments copied out at once.
     ///
-    /// `dst` must hold channels x B samples, else the outcome is
-    /// `Other(MXL_ERR_INVALID_ARG)`. It is zeroed for every outcome but
+    /// `dst` must hold legs x B samples, else the outcome is
+    /// `Other(MXL_ERR_INVALID_ARG)`, as it is for a flow that no longer
+    /// has the selected channels. It is zeroed for every outcome but
     /// [`Outcome::Copy`].
     pub fn read(
         &self,
@@ -634,7 +701,7 @@ impl Input {
     ) -> Outcome {
         let b = self.block;
         let n = b as usize;
-        if self.channels.checked_mul(n) != Some(dst.len()) {
+        if self.legs.len().checked_mul(n) != Some(dst.len()) {
             return Outcome::Other(MXL_ERR_INVALID_ARG);
         }
         let Some(end) = k
@@ -678,14 +745,18 @@ impl Input {
             MXL_ERR_FLOW_INVALID => return Outcome::Invalid,
             status => return Outcome::Other(status),
         }
+        if self.width > slice.count {
+            return Outcome::Other(MXL_ERR_INVALID_ARG);
+        }
         let [f0, f1] = slice.base.fragments;
         let width = size_of::<f32>();
-        for (ch, out) in dst.chunks_exact_mut(n).take(slice.count).enumerate() {
+        for (out, &ch) in dst.chunks_exact_mut(n).zip(&self.legs) {
             let (a, rest) = out.split_at_mut((f0.size / width).min(n));
             let second = (f1.size / width).min(rest.len());
             // SAFETY: libmxl returned two fragments of `f0.size` and
             // `f1.size` bytes inside channel 0 of the mapped ring, and
-            // channel `ch < slice.count` lies `ch * stride` bytes on. At most
+            // channel `ch < width <= slice.count` (checked above) lies
+            // `ch * stride` bytes on. At most
             // those sizes are copied, into `out`, which holds `n` samples.
             // Bytes are copied, so no alignment is assumed.
             unsafe {

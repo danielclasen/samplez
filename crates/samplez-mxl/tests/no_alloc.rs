@@ -10,7 +10,7 @@ use std::cell::Cell;
 
 use common::{B, Domain, RawWriter, TIMING, api, input, new_id};
 use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
-use samplez_mxl::input::{Generation, GroupWait, Outcome, SlotState};
+use samplez_mxl::input::{Generation, GroupWait, InputConfig, Outcome, SlotState};
 use samplez_mxl::output::{self, Creation, OutputConfig, Write};
 use samplez_mxl::{Instance, time};
 
@@ -105,4 +105,34 @@ fn rt_functions_do_not_allocate() {
 
     assert_eq!(after - before, 0);
     assert_eq!(counts, [99; 7]);
+}
+
+/// A read of two legs out of a 16-channel flow allocates nothing either.
+#[test]
+fn a_selected_read_does_not_allocate() {
+    const K0: u64 = 4_000_000;
+    let api = api();
+    let domain = Domain::new();
+    let src = new_id();
+    let mut w = RawWriter::create(&api, &domain.0, &src, 16);
+    w.blocks(K0..K0 + 300);
+    let mut g = Generation::new(&api, &domain.0, 1).unwrap();
+    let cfg = InputConfig {
+        flow_channels: Some(&[7, 2]),
+        ..input(&src, 2, 0)
+    };
+    g.attach(0, &cfg, &TIMING).unwrap();
+    let mut buf = vec![0.0f32; 2 * B as usize];
+    let r = g.input(0).unwrap();
+    let mut s = SlotState::default();
+    let mut copied = 0;
+
+    let before = allocations();
+    for k in K0 + 200..K0 + 299 {
+        copied += u64::from(r.read(&mut s, k, &GroupWait::Ok, &mut buf) == Outcome::Copy);
+    }
+    let after = allocations();
+
+    assert_eq!(after - before, 0);
+    assert_eq!(copied, 99);
 }

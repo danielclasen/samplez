@@ -101,6 +101,7 @@ pub fn input(flow_id: &str, channels: u32, offset: i64) -> InputConfig<'_> {
     InputConfig {
         flow_id,
         channels,
+        flow_channels: None,
         offset,
     }
 }

@@ -269,6 +269,7 @@ jobs:
                 the_rt_thread_passes_rtsan the_rt_thread_passes_rtsan_holding_blocks \
                 the_rt_thread_passes_rtsan_with_strips \
                 a_writer_refuses_in_the_real_time_context \
+                a_selected_read_runs_in_the_real_time_context \
                 engine::tests::the_failure_paths_run_on_the_rt_thread \
                 engine::tests::page_hashes_leave_out_the_pages_a_skip_cut \
                 engine::tests::a_handover_the_rt_thread_passed_is_refused; do

@@ -11,8 +11,8 @@ use mxl_sys::{
     MXL_ERR_OUT_OF_RANGE_TOO_EARLY,
 };
 use samplez_mxl::input::{
-    FROZEN_PROBE_BLOCKS, Generation, GroupWait, Outcome, Poll, PolledFlow, RECOVERY_NS, Recovery,
-    SlotState, Timing,
+    FROZEN_PROBE_BLOCKS, Generation, GroupWait, InputConfig, Outcome, Poll, PolledFlow,
+    RECOVERY_NS, Recovery, SlotState, Timing,
 };
 use samplez_mxl::{Error, Instance, time};
 
@@ -412,6 +412,86 @@ fn a_new_generation_reads_the_same_samples_and_outlives_the_old_one() {
             assert_eq!(dst, expected(channels[slot], k, offsets[slot]));
         }
     }
+}
+
+/// Legs [2, 3] and [7] of a 16-channel flow, each channel carrying its
+/// own signal, read exactly those channels; the same channel may feed two
+/// legs.
+#[test]
+fn a_selection_reads_the_named_channels_of_a_wide_flow() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let mut writer = RawWriter::create(&api, &domain.0, &id, 16);
+    writer.blocks(K0..K0 + 400);
+    let mut g = Generation::new(&api, &domain.0, 3).unwrap();
+    let sel: [&[u32]; 3] = [&[2, 3], &[7], &[15, 0, 15]];
+    for (slot, legs) in sel.iter().enumerate() {
+        let cfg = InputConfig {
+            flow_channels: Some(legs),
+            ..input(&id, legs.len() as u32, 0)
+        };
+        assert_eq!(g.attach(slot, &cfg, &TIMING).unwrap(), None);
+    }
+    for (slot, legs) in sel.iter().enumerate() {
+        let input = g.input(slot).unwrap();
+        let mut state = SlotState::default();
+        let mut dst = vec![f32::NAN; legs.len() * B as usize];
+        // Across the ring's wrap, as in the unselected read.
+        for k in K0 + 250..K0 + 399 {
+            assert_eq!(
+                input.read(&mut state, k, &GroupWait::Ok, &mut dst),
+                Outcome::Copy
+            );
+            let want: Vec<f32> = legs
+                .iter()
+                .flat_map(|&c| (k * B..(k + 1) * B).map(move |i| sample(c as usize, i)))
+                .collect();
+            assert_eq!(dst, want, "legs {legs:?} block {k}");
+        }
+        // A buffer sized for the flow rather than the legs is refused.
+        let mut flow_wide = vec![0.0; 16 * B as usize];
+        assert_eq!(
+            input.read(&mut state, K0 + 399, &GroupWait::Ok, &mut flow_wide),
+            Outcome::Other(MXL_ERR_INVALID_ARG)
+        );
+    }
+}
+
+/// A flow narrower than the highest selected index + 1, or a flow of
+/// other than `channels` channels without a selection, is refused.
+#[test]
+fn attach_refuses_a_flow_without_the_selected_channels() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let _w = RawWriter::create(&api, &domain.0, &id, 16);
+    let mut g = Generation::new(&api, &domain.0, 1).unwrap();
+    let with = |legs: &'static [u32]| InputConfig {
+        flow_channels: Some(legs),
+        ..input(&id, legs.len() as u32, 0)
+    };
+    let refused = g.attach(0, &with(&[15, 16]), &TIMING).unwrap_err();
+    assert!(
+        refused.to_string().contains("at least 17 channels"),
+        "{refused}"
+    );
+    assert!(matches!(
+        g.attach(0, &input(&id, 2, 0), &TIMING),
+        Err(Error::Format(_))
+    ));
+    // The selection's length is the input's legs.
+    let short = InputConfig {
+        flow_channels: Some(&[0]),
+        ..input(&id, 2, 0)
+    };
+    assert!(matches!(
+        g.attach(0, &short, &TIMING),
+        Err(Error::Format(_))
+    ));
+    assert!(!g.has_inputs());
+    assert!(g.attach(0, &with(&[15]), &TIMING).is_ok());
+    assert_eq!(g.input(0).unwrap().legs(), [15]);
 }
 
 #[test]

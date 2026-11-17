@@ -4,7 +4,8 @@
 //! syscall) inside it aborts the process. The run covers input generation
 //! swaps, a re-route crossfade, a gain ramp, output commits, output,
 //! meter and input metering and loudness resets, strips with every unit
-//! on, a writer's refusals, and,
+//! on, a writer's refusals, a read of selected channels of a wide flow,
+//! and,
 //! for a replicated engine, every path of the hold ring
 //! (`common::hold_scenario`): holding, withholding and overflow, with its
 //! pages hashed and strip entries applied. The lib test
@@ -26,6 +27,7 @@ use std::time::Duration;
 use common::{B, Domain, MARGIN, Pilot, config, new_id, start, wait_for};
 use samplez::InputState;
 use samplez_mxl::Instance;
+use samplez_mxl::input::{Generation, GroupWait, Input, InputConfig, Outcome, SlotState, Timing};
 use samplez_mxl::output::{self, Creation, FlowWriter, OutputConfig, Write};
 
 const PROBE: &str = "SAMPLEZ_RTSAN_PROBE";
@@ -204,4 +206,58 @@ fn the_rt_thread_passes_rtsan_holding_blocks() {
     );
     assert_eq!(engine.status().rt_panic, None);
     engine.stop();
+}
+
+/// Reads block `k` of `input` in a real-time function.
+#[sanitize(realtime = "nonblocking")]
+fn read_in_rt(input: &Input, state: &mut SlotState, k: u64, dst: &mut [f32]) -> Outcome {
+    input.read(state, k, &GroupWait::Ok, dst)
+}
+
+/// Two legs read out of a 16-channel flow, run in the real-time context.
+#[test]
+fn a_selected_read_runs_in_the_real_time_context() {
+    const K: u64 = 1_000_000;
+    let domain = Domain::new();
+    let id = new_id();
+    let api = common::api();
+    let instance = Instance::new(&api, &domain.0).unwrap();
+    let cfg = OutputConfig {
+        flow_id: &id,
+        label: "rtsan selection",
+        group: "samplez-test",
+        role: "Audio",
+        channels: 16,
+        block: B,
+        batch: B,
+    };
+    let Creation::Created { writer: mut w, .. } = output::create(&instance, &cfg).unwrap() else {
+        panic!("flow not created");
+    };
+    let data: Vec<f32> = (0..16 * B as usize)
+        .map(|i| (i / B as usize) as f32)
+        .collect();
+    assert_eq!(w.write_block(K, &data), Write::Committed);
+    let mut g = Generation::new(&api, &domain.0, 1).unwrap();
+    let input = InputConfig {
+        flow_id: &id,
+        channels: 2,
+        flow_channels: Some(&[9, 4]),
+        offset: 0,
+    };
+    let timing = Timing {
+        block: B,
+        margin: 0,
+        max_catchup_blocks: 0,
+        resync_budget: 0,
+    };
+    g.attach(0, &input, &timing).unwrap();
+    let mut state = SlotState::default();
+    let mut dst = vec![0.0f32; 2 * B as usize];
+    assert_eq!(
+        read_in_rt(g.input(0).unwrap(), &mut state, K, &mut dst),
+        Outcome::Copy
+    );
+    assert!(dst[..B as usize].iter().all(|&v| v == 9.0));
+    assert!(dst[B as usize..].iter().all(|&v| v == 4.0));
 }

@@ -43,11 +43,26 @@ releases its writers, which deletes the output flows.
 Further keys and their defaults: `maxCatchupBlocks` 2, `pruneAfterBlocks`
 50, `rampSamples` 480, `holdMs` 10, `contactWindowMs` 8,
 `historySlackMs` 50, `resyncBudgetMs` 50, per input
-`offsetSamples` 0, per input and output `loudnessChannels` (one of `L`,
+`offsetSamples` 0 and `flowChannels` (below), per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
 Table 3; without it every channel weighs 1), and `meters`, each with a
 `name`, `channels` and `loudnessChannels`: matrix columns after the
 outputs' that are computed and metered and written to no flow.
+
+An input's `channels` are its legs: its matrix rows, meter and strip.
+Without `flowChannels` the input reads a flow of exactly that many
+channels, in order. `flowChannels` names the 0-based flow channel each
+leg reads, in leg order, as many as `channels`, each below 64; an index
+may repeat, so `[0, 0]` feeds one channel to both legs of a stereo
+input. The input then reads any flow with more channels than the
+highest index, the flow it is configured with and every flow a `Route`
+moves it to, and copies only the selected channels: one copy per leg,
+however wide the flow. Legs 7 and 8 of a 16-channel flow:
+
+```json
+{ "name": "in", "domain": "a", "flowId": "5fbec3b1-1b0f-417d-9059-8b94a47197ed",
+  "channels": 2, "flowChannels": [6, 7] }
+```
 
 Each output's and each meter's status carries its meters: sample peak,
 RMS and true peak per channel over the last 100 ms, the largest true
