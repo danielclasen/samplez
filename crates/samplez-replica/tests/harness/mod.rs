@@ -52,10 +52,62 @@ pub const BLOCK: u64 = 48;
 /// One value per path, set by `path=value@seq`: a seq not above the last
 /// applied on its path is refused stale, as faderz orders its commands, and
 /// the value a path holds already is unchanged.
+///
+/// `touch path@seq` and `release path@seq` take and give back a session's
+/// touch ownership of a path, ordered by one seq per (session, path): one
+/// not above the last applied for its (session, path) is refused stale. A
+/// touch of a path another session owns changes nothing and is counted in
+/// `conflicts`. A lease expiry releases what its session owns.
 #[derive(Default)]
 pub struct Paths {
     pub values: BTreeMap<String, (String, u64)>,
     pub applied: u64,
+    /// Path -> the session owning it.
+    pub owners: BTreeMap<String, String>,
+    /// (session, path) -> the last touch or release seq applied.
+    pub touches: BTreeMap<(String, String), u64>,
+    pub conflicts: u64,
+}
+
+impl Paths {
+    /// The paths `session` owns.
+    pub fn owned_by(&self, session: &str) -> Vec<String> {
+        self.owners
+            .iter()
+            .filter(|(_, s)| *s == session)
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    fn touch(&mut self, origin: &Origin, text: &str) -> Effect<(String, String)> {
+        let (verb, rest) = text.split_once(' ').expect("verb path@seq");
+        let (path, seq) = rest.split_once('@').expect("path@seq");
+        let seq: u64 = seq.parse().expect("seq");
+        let key = (origin.session.clone(), path.to_owned());
+        if self.touches.get(&key).is_some_and(|last| *last >= seq) {
+            return Effect::Stale;
+        }
+        self.touches.insert(key, seq);
+        self.applied += 1;
+        let owner = self.owners.get(path).cloned();
+        match verb {
+            "touch" if owner.as_deref() == Some(&origin.session) => Effect::Unchanged,
+            "touch" if owner.is_some() => {
+                self.conflicts += 1;
+                Effect::Unchanged
+            }
+            "touch" => {
+                self.owners.insert(path.into(), origin.session.clone());
+                Effect::Changed((format!("touch:{path}"), origin.session.clone()))
+            }
+            "release" if owner.as_deref() == Some(&origin.session) => {
+                self.owners.remove(path);
+                Effect::Changed((format!("touch:{path}"), String::new()))
+            }
+            "release" => Effect::Unchanged,
+            verb => panic!("unknown verb {verb}"),
+        }
+    }
 }
 
 fn parse(command: &[u8]) -> (String, String, u64) {
@@ -68,7 +120,11 @@ fn parse(command: &[u8]) -> (String, String, u64) {
 impl Product for Paths {
     type Change = (String, String);
 
-    fn apply(&mut self, _origin: &Origin, command: &[u8]) -> Effect<(String, String)> {
+    fn apply(&mut self, origin: &Origin, command: &[u8]) -> Effect<(String, String)> {
+        let text = std::str::from_utf8(command).expect("utf-8");
+        if text.starts_with("touch ") || text.starts_with("release ") {
+            return self.touch(origin, text);
+        }
         let (path, value, seq) = parse(command);
         if self.values.get(&path).is_some_and(|(_, last)| *last >= seq) {
             return Effect::Stale;
@@ -80,8 +136,13 @@ impl Product for Paths {
         }
         Effect::Changed((path, value))
     }
-    fn expire(&mut self, _session: &SessionKey) -> Effect<(String, String)> {
-        Effect::Unchanged
+    fn expire(&mut self, session: &SessionKey) -> Effect<(String, String)> {
+        let owned = self.owned_by(&session.session);
+        if owned.is_empty() {
+            return Effect::Unchanged;
+        }
+        self.owners.retain(|_, s| *s != session.session);
+        Effect::Changed(("expired".into(), owned.join(",")))
     }
     fn forget(&mut self, _session: &SessionKey) {}
     fn delta(&self, _stamp: u64, changes: &[Changed<'_, (String, String)>]) -> String {
@@ -100,6 +161,14 @@ impl Product for Paths {
         format!("{} from {}", values.join(","), origins.join(","))
     }
     fn paths(&self, command: &[u8]) -> Vec<String> {
+        let text = std::str::from_utf8(command).expect("utf-8");
+        if let Some(rest) = text
+            .strip_prefix("touch ")
+            .or_else(|| text.strip_prefix("release "))
+        {
+            let (path, _) = rest.split_once('@').expect("path@seq");
+            return vec![path.to_owned()];
+        }
         vec![parse(command).0]
     }
 
@@ -107,10 +176,26 @@ impl Product for Paths {
         serde_json::to_string(&self.values).expect("encodes")
     }
     fn save(&self) -> Vec<u8> {
-        serde_json::to_vec(&(&self.values, self.applied)).expect("encodes")
+        let touches: Vec<_> = self.touches.iter().collect();
+        let saved = (
+            &self.values,
+            self.applied,
+            &self.owners,
+            touches,
+            self.conflicts,
+        );
+        serde_json::to_vec(&saved).expect("encodes")
     }
     fn load(&mut self, saved: &[u8]) -> Result<(), String> {
-        (self.values, self.applied) = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
+        let touches: Vec<((String, String), u64)>;
+        (
+            self.values,
+            self.applied,
+            self.owners,
+            touches,
+            self.conflicts,
+        ) = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
+        self.touches = touches.into_iter().collect();
         Ok(())
     }
 }

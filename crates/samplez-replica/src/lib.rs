@@ -25,6 +25,7 @@ pub mod peer;
 pub mod rank;
 pub mod report;
 pub mod schedule;
+pub mod session;
 pub mod snapshot;
 pub mod state;
 pub mod state_machine;
@@ -344,6 +345,12 @@ impl<P: Product> Replica<P> {
         if let Some(voters) = voters {
             tokio::spawn(membership::reconcile(shared.clone(), voters));
         }
+        tokio::spawn(session::expire(
+            shared.clone(),
+            store.clone(),
+            queue.clone(),
+            estimate.clone(),
+        ));
         Ok(Replica {
             shared,
             store,
@@ -1104,7 +1111,12 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     /// it leads, as its own quorum, also without [`Replica::begin`]. A
     /// learner, the witness, which serves no clients, and a replica no
     /// leader counts, such as one removed from the voters while it was
-    /// down, answer [`Reason::NotCommitable`].
+    /// down, answer [`Reason::NotCommitable`]. So does, with contact
+    /// running, an audio replica E does not count
+    /// ([`contact::Contact::counts_self`]): clock-unverified, judged by a
+    /// `ClockVerdict`, fenced on a detected clock step, or flagged by a
+    /// self-report while E counts a replica free of flags; with E
+    /// counting nobody every replica does.
     fn replica(&self) -> ReplicaInfo {
         let metrics = self.shared.raft.metrics().borrow().clone();
         let applied = metrics.last_applied.map_or(0, |id| id.index);
@@ -1131,7 +1143,11 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                 && voter
                 && slot_of(self.id()) != Slot::Witness
                 && (alone || self.shared.counted.load(Ordering::SeqCst))
-                && !self.shared.contact.get().is_some_and(|c| c.engine_failed()),
+                && self
+                    .shared
+                    .contact
+                    .get()
+                    .is_none_or(|c| !c.engine_failed() && c.counts_self()),
         }
     }
 
@@ -1255,6 +1271,8 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                 "the witness serves no clients"
             } else if self.shared.contact.get().is_some_and(|c| c.engine_failed()) {
                 "the engine refused a log entry"
+            } else if self.shared.contact.get().is_some_and(|c| !c.counts_self()) {
+                "clock_unverified"
             } else {
                 "no leader counts this replica as a voter"
             };

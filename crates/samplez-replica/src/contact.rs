@@ -1994,6 +1994,16 @@ impl Contact {
         self.lock().entries_refused > 0
     }
 
+    /// Whether E counts this replica ([`Contact::counted`]); always for
+    /// the witness, which E never counts. A replica E does not count takes
+    /// no client writes: its stamps are outside E's frame.
+    pub fn counts_self(&self) -> bool {
+        self.audio.is_none()
+            || self
+                .counted(&self.lock(), Instant::now())
+                .contains(&self.id)
+    }
+
     /// Reports from a majority of voters, itself included, within w, as
     /// of the last report period.
     pub fn in_contact(&self) -> bool {
