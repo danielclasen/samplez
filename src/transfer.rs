@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Matrix, Strip};
+use samplez_dsp::{Matrix, Strip, StripParam};
 use samplez_mxl::time;
 use serde::{Deserialize, Serialize};
 
@@ -313,6 +313,9 @@ pub(crate) struct Handover {
     /// strips. A core built from product state was computed with neither
     /// and keeps the RT thread's.
     pub replayed: bool,
+    /// Strip parameters set at the install index, by slot: the product
+    /// state's. Built off the RT thread and handed back with the core.
+    pub strips: Vec<(usize, StripParam)>,
     pub answer: Answer,
 }
 
@@ -566,6 +569,12 @@ pub struct ProductState {
     pub gains: Vec<Vec<f32>>,
     /// Per input slot whether it is up in the log.
     pub up: Vec<bool>,
+    /// Per input slot the flow it reads in the log, its last `Route`'s
+    /// or its configured one.
+    pub flows: Vec<String>,
+    /// Per input slot the strip parameters the log set, as values: each
+    /// one set again at the install, the strip's own state kept.
+    pub strips: Vec<Vec<StripParam>>,
     /// Committed entries not applied yet: log id, `at_index` and entry;
     /// the entries of one log entry adjacent, in order, folded as
     /// [`crate::Engine::append_batch`] folds them.

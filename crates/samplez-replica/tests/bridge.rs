@@ -356,6 +356,8 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
         Some(samplez::ProductState {
             gains: vec![vec![1.0]],
             up: vec![true],
+            flows: vec!["5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned()],
+            strips: vec![Vec::new()],
             pending: Vec::new(),
             last_id: 0,
         })
@@ -937,4 +939,149 @@ fn a_two_source_recall_applies_on_every_replica() {
         assert_eq!(audio.sample().entries_refused, 0);
         assert_eq!(e.counters().command_late.load(Ordering::Relaxed), 0);
     }
+}
+
+const ROUTED: &str = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b9e";
+
+/// A command re-routing input 0 to [`ROUTED`] and trimming its strip.
+fn route_and_trim(request: &Request) -> Option<Translated> {
+    let Body::Commands(_) = &request.body else {
+        return input_entry(request);
+    };
+    let entries = vec![
+        Entry::Route {
+            slot: 0,
+            flow_id: ROUTED.to_owned(),
+        },
+        Entry::Strip {
+            slot: 0,
+            param: StripParam::Trim { db: -6.0 },
+        },
+    ];
+    Some((request.at_index()?, entries))
+}
+
+/// A replica rebuilt from product state, as after a snapshot install,
+/// gets the flow a `Route` moved a slot to and the strip parameters the
+/// log set: from the rebuild on its slot reads the new flow, its old one
+/// gone, and its pages equal those of a replica that applied the entry.
+#[test]
+fn a_rebuilt_replica_reads_the_routed_flow_with_its_strip_parameters() {
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        match rebuild_after_a_route() {
+            Ok(()) => return,
+            Err(why) => {
+                eprintln!("run disturbed ({why}): running it again");
+                seen.push(why);
+            }
+        }
+    }
+    panic!("every run was disturbed: {seen:?}");
+}
+
+fn rebuild_after_a_route() -> Result<(), String> {
+    let domain = Domain::new();
+    std::fs::write(
+        domain.0.join("options.json"),
+        r#"{"urn:x-mxl:option:history_duration/v1.0": 1000000000}"#,
+    )
+    .unwrap();
+    let input = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b9d";
+    let old = Pilot::start(&domain, input);
+    let _routed = Pilot::start(&domain, ROUTED);
+    let (donor, donor_audio) = bridge_on(
+        &domain,
+        1 << 12,
+        [input, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f06"],
+        Box::new(route_and_trim),
+    );
+    let (joiner, joiner_audio) = bridge_on(
+        &domain,
+        1 << 12,
+        [input, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f07"],
+        Box::new(route_and_trim),
+    );
+    let joiner_audio = joiner_audio.with_rebuild(Box::new(|| {
+        Some(samplez::ProductState {
+            gains: vec![vec![1.0]],
+            up: vec![true],
+            flows: vec![ROUTED.to_owned()],
+            strips: vec![vec![StripParam::Trim { db: -6.0 }]],
+            pending: Vec::new(),
+            last_id: 1,
+        })
+    }));
+    let processed = |e: &Engine| e.progress().and_then(|p| p.processed).unwrap_or(0);
+    wait_for("both read the input", || {
+        [&donor, &joiner]
+            .iter()
+            .all(|e| e.status().inputs[0].state == InputState::Attached && processed(e) > 0)
+    });
+    let at = (processed(&donor) + 40) * B;
+    let request = Request {
+        stamp: at,
+        body: Body::Commands(vec![Command {
+            origin: Origin {
+                principal: "p".into(),
+                session: "s".into(),
+                role: Role::Operator,
+                connection: "c".into(),
+            },
+            id: "1".into(),
+            at_index: Some(at),
+            body: b"route".to_vec(),
+        }]),
+    };
+    donor_audio.appended(1, &request);
+    donor_audio.committed(1);
+    // The joiner's state jumps past entry 1, as a snapshot install does.
+    joiner_audio.drop_engine();
+    wait_for("the index passed", || processed(&donor) > at / B + 10);
+    wait_for("rebuilt", || joiner_audio.rebuild_engine());
+    let rebuilt = processed(&joiner);
+    drop(old);
+    let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
+    let from = ((rebuilt + 1) * B + 2 * 480).div_ceil(PAGE) + 2;
+    let end = (from + 6) * PAGE / B;
+    let (mut pd, mut pj) = (BTreeMap::new(), BTreeMap::new());
+    let keep = |pages: &mut BTreeMap<u64, Page>, audio: &EngineAudio| {
+        for p in audio.sample().own.pages {
+            pages.insert(p.page, p);
+        }
+    };
+    let silenced_from = std::cell::Cell::new(None);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while [&donor, &joiner]
+        .iter()
+        .any(|e| processed(e) <= end + PAGE / B)
+    {
+        assert!(Instant::now() < deadline, "pages within 10 s");
+        if silenced_from.get().is_none() && processed(&joiner) * B >= from * PAGE {
+            silenced_from.set(Some(silenced(&joiner)));
+        }
+        keep(&mut pd, &donor_audio);
+        keep(&mut pj, &joiner_audio);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    keep(&mut pd, &donor_audio);
+    keep(&mut pj, &joiner_audio);
+    assert_eq!(
+        silenced(&joiner),
+        silenced_from.get().unwrap(),
+        "the joiner read its old flow"
+    );
+    let mut compared = 0;
+    for p in from..end * B / PAGE {
+        let (Some(d), Some(j)) = (pd.get(&p), pj.get(&p)) else {
+            continue;
+        };
+        assert_eq!(j.hash, d.hash, "page {p}");
+        compared += 1;
+    }
+    if compared < 3 {
+        return Err(format!("{compared} pages compared"));
+    }
+    assert_eq!(joiner.status().inputs[0].flow_id, ROUTED);
+    Ok(())
 }

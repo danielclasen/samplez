@@ -1790,7 +1790,21 @@ impl Rt {
             }
             let Ok(cmd) = self.cmd.pop() else { return };
             match cmd {
-                Command::Generation { domain, generation } => self.install(domain, generation),
+                Command::Generation { domain, generation } => {
+                    // Slots a product state moved to another flow read it
+                    // anew from here, no crossfade.
+                    let rerouted = generation.rerouted;
+                    self.install(domain, generation);
+                    for i in slots_of(rerouted) {
+                        let slot = &mut self.slots[i];
+                        let s = &mut slot.state;
+                        s.last_end = None;
+                        s.head = 0;
+                        s.frozen_late_blocks = 0;
+                        s.invalid = false;
+                        slot.xfade = None;
+                    }
+                }
                 Command::Pending {
                     id,
                     domain,
@@ -2678,6 +2692,20 @@ impl Rt {
         let counter = match h.answer {
             Answer::Installed => {
                 self.install_core(&mut h.core, h.last_id, h.replayed);
+                // A product state's strip parameters, from the install on.
+                let e = RtEntry {
+                    id: h.last_id,
+                    at_index: first * self.block,
+                    change: Change::Batch {
+                        strips: true,
+                        up: 0,
+                        routed: 0,
+                    },
+                };
+                for n in 0..h.strips.len() {
+                    let (slot, param) = h.strips[n];
+                    self.set_strip(e, slot, param);
+                }
                 // The page holding the boundary mixes both states: no
                 // record.
                 for p in self.outs.iter_mut().filter_map(|o| o.pages.as_mut()) {

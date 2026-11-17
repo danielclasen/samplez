@@ -39,13 +39,23 @@ use crate::resync::{CoreReply, Resynced, Source};
 /// give another replica's engine an entry it refuses after its commit.
 /// The check holds for replicas of the leader's engine version and shape,
 /// which the compatibility key ([`crate::rollout::key`]) tells apart.
+///
+/// A `Commands` entry must translate to the concatenation of what each of
+/// its commands translates to alone, in order: a restamp keeps some of an
+/// entry's commands, and the engine admits every subset of the entries of
+/// an admitted entry, not every translation of a subset of its commands.
 pub type Translate = Box<dyn Fn(&Request) -> Option<Translated> + Send + Sync>;
 
 /// A log entry's index and the engine entries it applies there.
 pub type Translated = (u64, Vec<Entry>);
 
 /// The product state, as applied, that a dropped engine core is rebuilt
-/// from; none while it cannot be read.
+/// from; none while it cannot be read. It holds everything the log set
+/// that the engine plays: the gains, each slot's state, flow and strip
+/// parameters, and the committed entries not applied yet, since a
+/// rebuild follows a snapshot install, a purge-point verdict or an engine
+/// that dropped committed entries, whose effects reach the engine through
+/// it alone.
 pub type Rebuild = Box<dyn Fn() -> Option<samplez::ProductState> + Send + Sync>;
 
 /// How long a rebuild waits for the RT thread to take the core.

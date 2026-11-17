@@ -813,6 +813,13 @@ pub fn hold_scenario(e: &Engine) {
     let state = samplez::ProductState {
         gains: vec![vec![1.0]],
         up: vec![true],
+        flows: e
+            .status()
+            .inputs
+            .iter()
+            .map(|i| i.flow_id.clone())
+            .collect(),
+        strips: vec![Vec::new()],
         pending: Vec::new(),
         // Folds in the entries applied before the drop.
         last_id: id,

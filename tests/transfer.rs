@@ -615,6 +615,10 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
     let mut state = ProductState {
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: Vec::new(),
         last_id: 0,
     };
@@ -692,6 +696,10 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
     let state = ProductState {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: Vec::new(),
         last_id: 1,
     };
@@ -724,6 +732,10 @@ fn a_product_entry_the_install_passed_is_folded_in() {
     let state = ProductState {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: vec![(
             1,
             at,
@@ -840,6 +852,10 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
         let state = ProductState {
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
+
+            flows: vec![src.clone()],
+
+            strips: vec![Vec::new()],
             pending: vec![(1, at, strip)],
             last_id: 1,
         };
@@ -884,6 +900,10 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
     let state = ProductState {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: Vec::new(),
         last_id: 1,
     };
@@ -967,6 +987,10 @@ fn a_route_the_core_carried_is_not_applied_again() {
     let state = ProductState {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: vec![(1, at, route)],
         last_id: 1,
     };
@@ -1253,4 +1277,100 @@ fn committed_entries_past_the_wait_bound_drop_the_core() {
         c.blocks_without_core.load(Relaxed) > 0
     });
     h.e.stop();
+}
+
+/// An engine that dropped committed entries past the wait bound, a
+/// `Route` and a `Trim` among them, is rebuilt from a product state that
+/// holds what they set: from the rebuild on the slot reads the new flow,
+/// its old one gone, and its strip holds the trim, the pages equal to
+/// those of an engine that applied both at their index.
+#[test]
+fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let (src, next) = (new_id(), new_id());
+        let old = Pilot::start(&domain.0, &src, 2, B, 0);
+        let _next = Pilot::start(&domain.0, &next, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        let trim = StripParam::Trim { db: -6.0 };
+        let changes = [
+            Entry::Route {
+                slot: 0,
+                flow_id: next.clone(),
+            },
+            Entry::Strip {
+                slot: 0,
+                param: trim,
+            },
+        ];
+        // b's RT thread holds 64 entries far ahead pending and 64 in its
+        // ring; what commits next waits, up to the bound.
+        let far = (now_block() + 1_000_000) * B;
+        let filler = |id: u64| Entry::Gain {
+            input: 1,
+            output: 1,
+            gain: (id % 7) as f32 / 7.0,
+        };
+        for id in 1..=128 {
+            b.e.append(id, far, filler(id)).unwrap();
+            b.e.commit(id);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let at = (now_block() + 40) * B;
+        a.e.append_batch(1, at, &changes).unwrap();
+        a.e.commit(1);
+        b.e.append_batch(129, at, &changes).unwrap();
+        b.e.commit(129);
+        let last = 129 + samplez::engine::WAITING as u64;
+        for id in 130..=last {
+            b.e.append(id, far, filler(id)).unwrap();
+            b.e.commit(id);
+        }
+        if b.e.counters().log_overflows.load(Relaxed) != 1 {
+            return Err("no overflow at the bound".into());
+        }
+        wait_for(Duration::from_secs(5), "the entries' index passed", || {
+            processed(&b.e) > at / B + 10
+        });
+        let state = ProductState {
+            gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            up: vec![true],
+            flows: vec![next.clone()],
+            strips: vec![vec![trim]],
+            pending: Vec::new(),
+            last_id: last,
+        };
+        let j = b.e.install_product(&state, Duration::from_secs(2)).unwrap();
+        // A slot still on the old flow is silenced from here.
+        drop(old);
+        let from = ((j + 1) * B + 2 * u64::from(RAMP)).div_ceil(PAGE);
+        let end = (from + 8) * PAGE / B + PAGE / B;
+        wait_for(Duration::from_secs(10), "pages compared", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        let (pa, pb) = (a.pages(), b.pages());
+        let silenced: Vec<u64> = b
+            .verdicts
+            .try_iter()
+            .filter(|v| v.silenced != 0 && v.k * B >= from * PAGE)
+            .map(|v| v.k)
+            .collect();
+        assert!(
+            silenced.is_empty(),
+            "the slot read its old flow: {silenced:?}"
+        );
+        let disturbed = a.disturbed();
+        for p in from..from + 8 {
+            if disturbed.contains(&p) {
+                return Err(format!("page {p} disturbed"));
+            }
+            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+                return Err(format!("page {p} not hashed by both"));
+            };
+            assert_eq!(hb.hash, ha.hash, "page {p}");
+        }
+        let s = b.e.status();
+        assert_eq!(s.inputs[0].flow_id, next);
+        Ok(())
+    });
 }

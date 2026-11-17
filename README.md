@@ -237,7 +237,12 @@ replaces the strips; one built from product state leaves them.
 thread (targets at their values, fades and ramps cold, the pending
 entries, no unresolved entry; the RT thread keeps its pending generation)
 and installs it through the same block-boundary hand-over as a replay;
-the first block committed after it follows the withdrawn rules.
+the first block committed after it follows the withdrawn rules. The
+product state also names each slot's flow and strip parameters: the
+supervisor hands over generations reading those flows before the core,
+a slot on another flow moving to it with no crossfade, and the strip
+parameters are set from the install's index, each strip keeping its own
+state.
 
 In `samplez-replica` every audio replica starts clock-unverified, which
 drops its engine's core until it verifies, and a snapshot install or a

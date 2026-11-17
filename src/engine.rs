@@ -441,6 +441,14 @@ enum LogMsg {
     /// Committed entries up to `upto` were dropped before they reached
     /// the RT thread, and the core with them.
     Dropped { upto: LogId },
+    /// A core built from product state is about to be installed: per
+    /// slot whether it is up and the flow it reads. The generations
+    /// reading them are handed to the RT thread before `done` is sent.
+    Product {
+        up: Vec<bool>,
+        flows: Vec<String>,
+        done: SyncSender<()>,
+    },
 }
 
 /// Appended entries not yet committed, and the producer of the RT
@@ -1284,6 +1292,7 @@ impl Engine {
             lead,
             ramp: u64::from(config.ramp_samples),
             dirty: vec![true; in_domains.len()],
+            reroute: vec![0; in_domains.len()],
             pollers: (0..in_domains.len()).map(|_| None).collect(),
             poll_errors: vec![None; in_domains.len()],
             rebuild_errors: vec![None; in_domains.len()],
@@ -1676,7 +1685,10 @@ impl Engine {
             log.drop_waiting();
             drop(log);
             self.counters.log_overflows.fetch_add(1, Relaxed);
-            // Refused only with one voter, which has no core to drop.
+            // Refused with one voter, which has no core to drop, and while
+            // the control ring is full: the replica reads the overflow in
+            // its next report period's sample and drops the core then
+            // (`Audio::drop_engine`), before its rebuild replaces it.
             let _ = self.drop_core();
         }
     }
@@ -2045,7 +2057,7 @@ impl Engine {
         // Up to the last block the RT thread computed, before the first
         // attempt.
         replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
-        self.offer(timeout, true, |j, core| {
+        self.offer(timeout, true, &[], |j, core| {
             replay.run(j);
             replay.rt.capture(core);
             (replay.next - 1, replay.last_id)
@@ -2087,10 +2099,22 @@ impl Engine {
         if state.gains.len() != n
             || state.gains.iter().any(|row| row.len() != m)
             || state.up.len() != slots
+            || state.flows.len() != slots
+            || state.strips.len() != slots
         {
             return Err(ReplayError::Invalid(format!(
                 "a product state of the shape {n} x {m} with {slots} inputs"
             )));
+        }
+        let mut strips = Vec::new();
+        for (slot, (flow, params)) in state.flows.iter().zip(&state.strips).enumerate() {
+            self.config
+                .check_input_flow(slot, flow)
+                .map_err(|e| ReplayError::Invalid(e.0))?;
+            for &param in params {
+                check_strip(&self.config, slot, &param).map_err(ReplayError::Invalid)?;
+                strips.push((slot, param));
+            }
         }
         // The entries of one log entry are adjacent and fold into one.
         let mut pending = Vec::with_capacity(state.pending.len());
@@ -2114,7 +2138,24 @@ impl Engine {
             return Err(ReplayError::Full);
         }
         let batch = |id: LogId| batches.iter().find(|b| b.0 == id).map(|b| &*b.1);
-        self.offer(timeout, false, |j, core| {
+        // The supervisor takes the slots' state and flows, and hands the
+        // generations reading them over, before the core: a slot the core
+        // has up reads its flow once installed.
+        let (done, applied) = mpsc::sync_channel(1);
+        let _ = self
+            .log
+            .lock()
+            .expect("log lock")
+            .sup
+            .send(LogMsg::Product {
+                up: state.up.clone(),
+                flows: state.flows.clone(),
+                done,
+            });
+        if applied.recv_timeout(timeout).is_err() {
+            return Err(ReplayError::Timeout { passed: 0 });
+        }
+        self.offer(timeout, false, &strips, |j, core| {
             for (i, row) in state.gains.iter().enumerate() {
                 for (o, &g) in row.iter().enumerate() {
                     let _ = core.matrix.set(i, o, g, 0);
@@ -2203,6 +2244,7 @@ impl Engine {
         &self,
         timeout: Duration,
         replayed: bool,
+        strips: &[(usize, StripParam)],
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
@@ -2295,6 +2337,7 @@ impl Engine {
                 last_id,
                 core,
                 replayed,
+                strips: strips.to_vec(),
                 answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
@@ -2443,6 +2486,10 @@ struct Supervisor {
     slots: Vec<SupSlot>,
     /// Input domains whose generation is to be rebuilt.
     dirty: Vec<bool>,
+    /// Per input domain, the slots, by bit, a product state moved to
+    /// another flow: the next generation built starts their readers
+    /// anew.
+    reroute: Vec<u64>,
     pollers: Vec<Option<Pollers>>,
     /// The last failure to create each input domain's poll instance and
     /// generation, logged once per change of its text.
@@ -2968,7 +3015,8 @@ impl Supervisor {
         let produced = self.counters.produced.load(Acquire);
         let mut prune_after = vec![u64::MAX; n];
         let mut held = 0u64;
-        let mut rerouted = 0u64;
+        // The slots a product state moved to another flow.
+        let mut rerouted = std::mem::take(&mut self.reroute[d]);
         for (slot, limit) in prune_after.iter_mut().enumerate() {
             if self.input_domain(slot) != d {
                 continue;
@@ -3126,6 +3174,10 @@ impl Supervisor {
                 // A generation sent for one is handed back unused by the
                 // next one sent.
                 LogMsg::Dropped { upto } => self.jobs.retain(|j| j.id > upto),
+                LogMsg::Product { up, flows, done } => {
+                    self.product(&up, flows);
+                    let _ = done.try_send(());
+                }
             }
         }
     }
@@ -3205,6 +3257,37 @@ impl Supervisor {
             }
         }
         self.adopt(j.domain, held, targets);
+    }
+
+    /// Takes the slots' state and flows of a product state: a slot on
+    /// another flow moves to it at once, no crossfade, its reader state
+    /// started anew in the generation's `rerouted`. Every domain's
+    /// generation is built anew and handed to the RT thread.
+    fn product(&mut self, up: &[bool], flows: Vec<String>) {
+        for (slot, flow) in flows.into_iter().enumerate() {
+            self.slots[slot].up = up[slot];
+            self.status().inputs[slot].up = up[slot];
+            if flow == self.slots[slot].flow {
+                continue;
+            }
+            self.release_poll(slot);
+            if let SupState::Pruned { recovery, held } = &mut self.slots[slot].state {
+                *recovery = Recovery::default();
+                *held = false;
+            }
+            self.slots[slot].reported = false;
+            self.slots[slot].routing = None;
+            self.slots[slot].flow = flow.clone();
+            self.status().inputs[slot].flow_id = flow;
+            let d = self.input_domain(slot);
+            self.reroute[d] |= bit(slot);
+        }
+        for d in 0..self.dirty.len() {
+            self.dirty[d] = true;
+            if self.cmd.slots() > 0 {
+                self.rebuild(d);
+            }
+        }
     }
 
     /// Puts the spent batches the RT thread leaked in the status, and
@@ -4773,6 +4856,7 @@ mod tests {
             last_id: copy.last_id,
             core: copy.core,
             replayed: true,
+            strips: Vec::new(),
             answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
@@ -5500,6 +5584,7 @@ mod tests {
                 last_id: replay.last_id,
                 core,
                 replayed: true,
+                strips: Vec::new(),
                 answer: Answer::Waiting,
             };
             assert!(t.handovers.push(h).is_ok());
@@ -5546,7 +5631,7 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5), "no stall");
         }
         let mut calls = Vec::new();
-        let _ = e.offer(Duration::from_secs(1), true, |j, _| {
+        let _ = e.offer(Duration::from_secs(1), true, &[], |j, _| {
             calls.push((j, processed()));
             (j, 0)
         });
@@ -5590,7 +5675,7 @@ mod tests {
             Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
         };
         let before = cpu();
-        let err = e.offer(Duration::from_millis(300), true, |j, _| (j, 0));
+        let err = e.offer(Duration::from_millis(300), true, &[], |j, _| (j, 0));
         let spent = cpu() - before;
         assert!(matches!(err, Err(ReplayError::Timeout { .. })), "{err:?}");
         assert!(spent < Duration::from_millis(100), "{spent:?} of CPU");
@@ -5608,7 +5693,7 @@ mod tests {
         let before = e.counters.handovers_passed.load(Relaxed);
         // Each core follows a block two behind the last one computed:
         // every attempt is refused.
-        let err = e.offer(Duration::from_millis(300), true, |j, _| {
+        let err = e.offer(Duration::from_millis(300), true, &[], |j, _| {
             (j.saturating_sub(2), 0)
         });
         let refused = e.counters.handovers_passed.load(Relaxed) - before;
