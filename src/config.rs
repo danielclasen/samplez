@@ -431,9 +431,11 @@ impl Config {
         }
         let per_block = self.block_size as usize * COEFFICIENTS_PER_BLOCK_SAMPLE;
         if coefficients > per_block {
+            let needed = coefficients.div_ceil(COEFFICIENTS_PER_BLOCK_SAMPLE);
             return fail(format!(
-                "{coefficients} matrix coefficients, at most {per_block} at blockSize {}: a \
-                 batch setting all of them applies in one block",
+                "{coefficients} matrix coefficients, at most {COEFFICIENTS_PER_BLOCK_SAMPLE} per \
+                 sample of the block, {per_block} at blockSize {}, so that a batch setting all \
+                 of them applies in one block; a blockSize of at least {needed} takes them",
                 self.block_size
             ));
         }
@@ -626,7 +628,8 @@ mod tests {
         parse(&v).unwrap();
         shape(&mut v, 4096);
         let e = parse(&v).unwrap_err().to_string();
-        assert!(e.contains("applies in one block"), "{e}");
+        assert!(e.contains("at most 651 per sample of the block"), "{e}");
+        assert!(e.contains("a blockSize of at least 51 takes them"), "{e}");
         v["blockSize"] = serde_json::json!(64);
         parse(&v).unwrap();
     }

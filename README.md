@@ -119,8 +119,12 @@ room: entries its ring has no room for wait in its log. The RT thread
 hands its spent batches to the supervisor to be freed, leaving the
 return ring room for the generations and writers it hands back; one it
 cannot hand off is leaked and counted in the status (`batches_leaked`).
-A matrix may have at most 651 coefficients per sample of the block, so
-that a batch setting all of them applies within one block.
+A matrix may have at most 651 coefficients per sample of the block
+(`COEFFICIENTS_PER_BLOCK_SAMPLE`), so that a batch setting all of them
+applies within one block: 31,248 at a `blockSize` of 48. A larger
+matrix takes a larger `blockSize`, the whole 2^18 coefficients one of
+at least 403; a configuration beyond the limit is refused, naming the
+`blockSize` its matrix needs.
 
 Each input of 1 to 8 channels has a strip: trim, per-leg trim and
 polarity, high-pass, a four-band equaliser, gate and compressor
