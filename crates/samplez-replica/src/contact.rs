@@ -224,6 +224,8 @@ pub trait LogView: Send + Sync + 'static {
     fn pending(&self, f: &mut dyn FnMut(u64, &Body));
     /// The replicas the latest applied `ClockVerdict` judges.
     fn judged(&self) -> BTreeSet<NodeId>;
+    /// The replica the latest applied `ClockVerdict` judging one named.
+    fn latest_judged(&self) -> Option<NodeId>;
     /// The latest applied `Baseline`.
     fn baseline(&self) -> Option<Baseline>;
     /// The voter holding the disruption slot.
@@ -254,6 +256,9 @@ impl<P: Product> LogView for Store<P> {
                 .map(|(&id, _)| id)
                 .collect()
         })
+    }
+    fn latest_judged(&self) -> Option<NodeId> {
+        self.with_state(|sm| sm.latest_judged)
     }
     fn baseline(&self) -> Option<Baseline> {
         self.with_state(|sm| sm.baseline.clone())
@@ -342,6 +347,8 @@ struct Peer {
     offset_ns: Option<i64>,
     /// Its magnitude over the exchanges, ns.
     offsets: Histogram,
+    /// The latest offsets, for their rolling MAD.
+    thetas: crate::clock::Thetas,
     delay: Histogram,
     gaps: Histogram,
     gaps_over_window: u64,
@@ -416,6 +423,7 @@ struct State {
     /// Every voter's page hashes, this one's included.
     pages: PageBook,
     leader: Leader,
+    clock: crate::clock::Judge,
     /// The audio `/readyz` term, as of the last period in contact; none
     /// before the first.
     serving: Option<bool>,
@@ -492,6 +500,10 @@ pub struct Metrics {
     /// `replica_disagreement`: the last page this voter judged as leader
     /// had no strict majority hash.
     pub replica_disagreement: bool,
+    /// The clock check from this voter's offsets.
+    pub clock: crate::clock::Status,
+    /// `ClockVerdict` entries appended while this voter led.
+    pub clock_verdicts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -592,6 +604,7 @@ impl Contact {
                 life,
                 pages: PageBook::default(),
                 leader: Leader::default(),
+                clock: crate::clock::Judge::default(),
                 serving: None,
                 verdicts: Vec::new(),
                 realised: Vec::new(),
@@ -690,6 +703,7 @@ impl Contact {
             let offset = (((t2 - t1) + (t3 - t4)) / 2) as i64;
             peer.offset_ns = Some(offset);
             peer.offsets.add(offset.unsigned_abs());
+            peer.thetas.add(offset, (delay.max(0) / 2) as u64);
         }
         st.withhold.fold(self.id, report.from, &report.own);
         st.pages.fold(report.from, &report.own.pages);
@@ -1376,7 +1390,9 @@ impl Contact {
 
     /// This voter does not lead ([`crate::baseline::Leader::step_down`]).
     pub fn not_leading(&self) {
-        self.lock().leader.step_down();
+        let mut st = self.lock();
+        st.leader.step_down();
+        st.clock.step_down();
     }
 
     /// The leader's decisions this period ([`crate::baseline`]): none
@@ -1439,7 +1455,77 @@ impl Contact {
             floor,
             rank: &rank,
         };
-        st.leader.decide(&view, now)
+        let mut out = st.leader.decide(&view, now);
+        let (audio, witness) = self.clock_readings(st, now);
+        let clock = crate::clock::View {
+            audio,
+            witness,
+            judged: &st.judged,
+            latest_judged: self.log.latest_judged(),
+            baseline: baseline.as_ref().map(|b| b.replica),
+            guard_ns: time_of(t.clock_guard),
+        };
+        out.extend(st.clock.decide(&clock, now));
+        out
+    }
+
+    /// Every voter's clock as this one sees it: the audio voters by
+    /// ordinal, and the witness.
+    fn clock_readings(
+        &self,
+        st: &State,
+        now: Instant,
+    ) -> (Vec<crate::clock::Reading>, Option<crate::clock::Reading>) {
+        use crate::membership::{Slot, slot_of};
+        let fresh = self.timing.contact_window + self.timing.hold;
+        let copies = self.copies(st, now);
+        let reading = |id: NodeId| {
+            let copy = copies.iter().find(|(c, _, _)| *c == id);
+            let flags = copy.map(|(_, _, own)| own.clock).unwrap_or_default();
+            let (theta_ns, mad_ns, delay_ns) = if id == self.id {
+                (Some(0), 0, 0)
+            } else {
+                st.peers.get(&id).map_or((None, 0, 0), |p| {
+                    let best = p.thetas.best();
+                    (best.map(|b| b.0), p.thetas.mad(), best.map_or(0, |b| b.1))
+                })
+            };
+            crate::clock::Reading {
+                id,
+                theta_ns,
+                mad_ns,
+                delay_ns,
+                self_report: flags.self_report || flags.step_fence,
+                verified: !flags.unverified,
+                silent: id != self.id && copy.is_none_or(|(_, age, _)| *age > fresh),
+            }
+        };
+        let audio = crate::rank::audio_voters(&st.members)
+            .into_iter()
+            .map(reading)
+            .collect();
+        let witness = st
+            .members
+            .voters()
+            .into_iter()
+            .find(|&id| slot_of(id) == Slot::Witness)
+            .map(reading);
+        (audio, witness)
+    }
+
+    /// The clock check as this voter sees it: every audio replica's deviation, or an unverified one's
+    /// offset to the witness, and `replica_clock_tie`.
+    fn clock_status(&self, st: &State, now: Instant) -> crate::clock::Status {
+        let (audio, witness) = self.clock_readings(st, now);
+        crate::clock::compare(&crate::clock::View {
+            audio,
+            witness,
+            judged: &st.judged,
+            latest_judged: self.log.latest_judged(),
+            baseline: self.log.baseline().map(|b| b.replica),
+            guard_ns: time_of(self.timing.clock_guard),
+        })
+        .status
     }
 
     /// Drops scheduled entries every voter reported committed.
@@ -1704,6 +1790,8 @@ impl Contact {
             replica: st.life.as_ref().map(|l| l.metrics),
             leader: st.leader.counts,
             replica_disagreement: st.leader.disagreement,
+            clock: self.clock_status(&st, Instant::now()),
+            clock_verdicts: st.clock.verdicts,
         }
     }
 }
@@ -1882,6 +1970,9 @@ mod tests {
             for (index, body) in &self.0.lock().unwrap().pending {
                 f(*index, body);
             }
+        }
+        fn latest_judged(&self) -> Option<NodeId> {
+            None
         }
         fn judged(&self) -> BTreeSet<NodeId> {
             BTreeSet::new()

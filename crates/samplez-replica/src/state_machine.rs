@@ -97,6 +97,8 @@ pub struct StateMachine<P> {
     pub pending: BTreeMap<u64, Body>,
     pub baseline: Option<Baseline>,
     pub verdicts: BTreeMap<NodeId, bool>,
+    /// The replica the latest `ClockVerdict` judging one named.
+    pub latest_judged: Option<NodeId>,
     pub slot: Option<Disruption>,
     /// Each session's last renewal, as a stamping index.
     pub leases: BTreeMap<SessionKey, u64>,
@@ -131,6 +133,7 @@ impl<P: Product> StateMachine<P> {
             pending: BTreeMap::new(),
             baseline: None,
             verdicts: BTreeMap::new(),
+            latest_judged: None,
             slot: None,
             leases: BTreeMap::new(),
             ended: BTreeMap::new(),
@@ -168,6 +171,9 @@ impl<P: Product> StateMachine<P> {
             }
             Body::ClockVerdict { replica, judged } => {
                 self.verdicts.insert(*replica, *judged);
+                if *judged {
+                    self.latest_judged = Some(*replica);
+                }
                 Response::default()
             }
             // Acted on by the replica it names, as its commit becomes
@@ -326,6 +332,7 @@ impl<P: Product> StateMachine<P> {
             pending: self.pending.clone(),
             baseline: self.baseline.clone(),
             verdicts: self.verdicts.clone(),
+            latest_judged: self.latest_judged,
             slot: self.slot.clone(),
             dedup: self.dedup.save(),
             leases: self.leases.iter().map(|(k, v)| (k.clone(), *v)).collect(),
@@ -342,6 +349,7 @@ impl<P: Product> StateMachine<P> {
         self.pending = saved.pending;
         self.baseline = saved.baseline;
         self.verdicts = saved.verdicts;
+        self.latest_judged = saved.latest_judged;
         self.slot = saved.slot;
         self.leases = saved.leases.into_iter().collect();
         self.ended = saved.ended.into_iter().collect();
