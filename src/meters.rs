@@ -1,5 +1,6 @@
-//! The supervisor's side of output metering: meter records from the RT
-//! thread become per output peaks, true peaks and loudness.
+//! The supervisor's side of metering: meter records from the RT thread
+//! become peaks, true peaks and loudness per output and configured meter,
+//! and peaks, RMS and momentary loudness per input.
 //!
 //! Meters do not feed the output, so they are outside the output hashes
 //! of plan 2.11. A loudness reset applies at a sample index. From it on,
@@ -54,7 +55,31 @@ pub struct OutputMeters {
     pub since: Option<u64>,
 }
 
-/// Turns the records of one output into [`OutputMeters`].
+/// Meter readings of one input after its strip, as an output's: no
+/// true peak, and of the loudness the momentary only.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputMeters {
+    /// The last 100 ms window the readings cover.
+    pub window: Option<u64>,
+    /// Per channel, the largest absolute sample value of that window.
+    pub peak: Vec<f32>,
+    /// Per channel, the RMS level of that window, referenced to a sine.
+    pub rms: Vec<f32>,
+    /// Momentary loudness in LUFS, weighted by the input's
+    /// `loudnessChannels`; `None` until 400 ms were measured.
+    pub momentary: Option<f64>,
+}
+
+impl InputMeters {
+    pub(crate) fn update(&mut self, m: &OutputMeters) {
+        self.window = m.window;
+        self.peak.clone_from(&m.peak);
+        self.rms.clone_from(&m.rms);
+        self.momentary = m.momentary;
+    }
+}
+
+/// Turns the records of one meter into [`OutputMeters`].
 pub(crate) struct OutputLoudness {
     weights: Vec<f64>,
     loudness: Loudness,
@@ -200,7 +225,7 @@ mod tests {
     fn rec(seq: u64, channel: u32, slice: u64, sum_sq: f64) -> MeterRecord {
         MeterRecord {
             seq,
-            output: 0,
+            meter: 0,
             channel,
             slice,
             frames: SLICE as u32,

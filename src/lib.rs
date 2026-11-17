@@ -19,9 +19,9 @@ pub mod transfer;
 pub use config::Config;
 pub use engine::{
     ClockStatus, ControlError, Engine, Entry, EntryError, GainError, GenerationStatus, InputState,
-    InputStatus, OutputStatus, Progress, Replication, Report, ResetError, Status,
+    InputStatus, MeterStatus, OutputStatus, Progress, Replication, Report, ResetError, Status,
 };
-pub use meters::OutputMeters;
+pub use meters::{InputMeters, OutputMeters};
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};
 pub use transfer::{CopyError, Core, CoreCopy, ProductState, Replay, ReplayError};
 

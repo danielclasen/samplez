@@ -17,7 +17,9 @@ use std::sync::atomic::{
 use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
 use rtrb::{Consumer, Producer};
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{KWeighting, Matrix, PlanarBuffer, Ramp, Started, Strip, StripParam, TruePeak};
+use samplez_dsp::{
+    KWeighting, Matrix, PlanarBuffer, Ramp, Started, Strip, StripParam, TruePeak, accumulate,
+};
 use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{FlowWriter, Write};
 use samplez_mxl::{MxlApi, time};
@@ -551,6 +553,13 @@ impl Slot {
     }
 }
 
+/// A meter on channels of a buffer the RT thread computes: one
+/// configured meter's matrix columns, or one input slot after its strip.
+pub(crate) struct Metered {
+    pub first_channel: usize,
+    pub meter: OutMeter,
+}
+
 pub(crate) struct Out {
     pub first_channel: usize,
     pub channels: usize,
@@ -571,20 +580,23 @@ const WINDOW: u64 = samplez_dsp::WINDOW;
 /// window.
 const TP_HISTORY: usize = TruePeak::HISTORY;
 
-/// One output channel's meter values over one slice, the samples
+/// One metered channel's values over one slice, the samples
 /// `[slice * SLICE, (slice + 1) * SLICE)`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MeterRecord {
     /// Counts every record the RT thread produced, sent or not, so a gap
     /// shows that one was lost.
     pub seq: u64,
-    pub output: u32,
+    /// The meter: the outputs, then the configured meters, then the
+    /// inputs, each in configuration order.
+    pub meter: u32,
     pub channel: u32,
     pub slice: u64,
     /// Samples of the slice that were computed; fewer than [`SLICE`]
     /// after a skipped block or at the start.
     pub frames: u32,
     pub peak: f32,
+    /// 0 for an input, whose meter has no true peak.
     pub true_peak: f32,
     /// Sum of squares of the K-weighted samples.
     pub sum_sq: f64,
@@ -595,19 +607,20 @@ pub(crate) struct MeterRecord {
     pub reset: bool,
 }
 
-/// Restarts the loudness measurement of `output` at the first 100 ms
-/// window starting at or after `at_index`. A reset replaces one still
-/// pending for the same output.
+/// Restarts the loudness measurement of `meter`, an output or a
+/// configured meter as [`MeterRecord::meter`] numbers them, at the first
+/// 100 ms window starting at or after `at_index`. A reset replaces one
+/// still pending for the same meter.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LoudnessReset {
-    pub output: usize,
+    pub meter: usize,
     pub at_index: u64,
 }
 
-/// Per output channel: sample peak, true peak and K-weighted power of
-/// the slice in progress, sent at its end.
+/// Per metered channel: sample peak, true peak (none on an input) and
+/// K-weighted power of the slice in progress, sent at its end.
 pub(crate) struct OutMeter {
-    pub tp: TruePeak,
+    pub tp: Option<TruePeak>,
     pub kw: KWeighting,
     /// The slice in progress.
     pub slice: Option<u64>,
@@ -630,7 +643,15 @@ pub(crate) struct OutMeter {
 impl OutMeter {
     pub fn new(channels: usize) -> Self {
         Self {
-            tp: TruePeak::new(channels, SLICE as usize),
+            tp: Some(TruePeak::new(channels, SLICE as usize)),
+            ..Self::without_true_peak(channels)
+        }
+    }
+
+    /// An input's meter: sample peak, power and K-weighted power only.
+    pub fn without_true_peak(channels: usize) -> Self {
+        Self {
+            tp: None,
             kw: KWeighting::new(channels),
             slice: None,
             reset_at: None,
@@ -661,8 +682,10 @@ impl OutMeter {
         // of the discontinuity. Its history restarts from silence, and the
         // outputs of the next 11 samples, which reach back into it, are
         // not measured.
-        if self.next.is_some_and(|x| x != start) {
-            self.tp.reset();
+        if self.next.is_some_and(|x| x != start)
+            && let Some(tp) = &mut self.tp
+        {
+            tp.reset();
             self.tp_skip = TP_HISTORY;
         }
         self.next = Some(start + frames as u64);
@@ -689,23 +712,17 @@ impl OutMeter {
             let len = ((slice + 1) * SLICE - index).min((frames - n) as u64) as usize;
             for c in 0..self.peak.len() {
                 let x = &buf.channel(first + c)[n..n + len];
-                let peak = &mut self.peak[c];
-                let plain = &mut self.plain_sum_sq[c];
-                for &v in x {
-                    let a = v.abs();
-                    if a > *peak || a.is_nan() {
-                        *peak = a;
+                accumulate(x, &mut self.peak[c], &mut self.plain_sum_sq[c]);
+                if let Some(tp) = &mut self.tp {
+                    let skip = self.tp_skip.min(len);
+                    if skip > 0 {
+                        tp.process(c, &x[..skip]);
                     }
-                    *plain += f64::from(v) * f64::from(v);
-                }
-                let skip = self.tp_skip.min(len);
-                if skip > 0 {
-                    self.tp.process(c, &x[..skip]);
-                }
-                if skip < len {
-                    let tp = self.tp.process(c, &x[skip..]);
-                    if tp > self.true_peak[c] || tp.is_nan() {
-                        self.true_peak[c] = tp;
+                    if skip < len {
+                        let v = tp.process(c, &x[skip..]);
+                        if v > self.true_peak[c] || v.is_nan() {
+                            self.true_peak[c] = v;
+                        }
                     }
                 }
                 self.sum_sq[c] += self.kw.process(c, x);
@@ -727,7 +744,7 @@ impl OutMeter {
         for c in 0..self.peak.len() {
             let r = MeterRecord {
                 seq: *sink.seq,
-                output: sink.output,
+                meter: sink.meter,
                 channel: c as u32,
                 slice,
                 frames: self.frames,
@@ -751,9 +768,9 @@ impl OutMeter {
     }
 }
 
-/// Where an output's meter records go.
+/// Where a meter's records go.
 struct MeterSink<'a> {
-    output: u32,
+    meter: u32,
     ring: &'a mut Producer<MeterRecord>,
     seq: &'a mut u64,
     counters: &'a Counters,
@@ -990,6 +1007,10 @@ pub(crate) struct Rt {
     pub statuses: Vec<GroupWait>,
     pub slots: Vec<Slot>,
     pub outs: Vec<Out>,
+    /// The configured meters, on the matrix columns after the outputs'.
+    pub buses: Vec<Metered>,
+    /// Each input slot's meter, after its strip.
+    pub taps: Vec<Metered>,
     pub mix: Mix,
     pub inbuf: PlanarBuffer,
     pub outbuf: PlanarBuffer,
@@ -2112,25 +2133,37 @@ impl Rt {
         self.counters.processed.store(k + 1, Release);
 
         while let Ok(r) = self.resets.pop() {
-            self.outs[r.output].meter.reset_at = Some(r.at_index.div_ceil(WINDOW) * WINDOW);
+            let at = Some(r.at_index.div_ceil(WINDOW) * WINDOW);
+            match r.meter.checked_sub(self.outs.len()) {
+                None => self.outs[r.meter].meter.reset_at = at,
+                Some(m) => self.buses[m].meter.reset_at = at,
+            }
         }
         // Every computed block is metered, written or not: the meters
-        // follow the engine's output, not a flow's state. After the
-        // writes, since nothing written depends on them.
-        for (o, out) in self.outs.iter_mut().enumerate() {
+        // follow the engine's output, not a flow's state; and every input
+        // after its strip, read or silenced. After the writes, since
+        // nothing written depends on them.
+        let outs = self
+            .outs
+            .iter_mut()
+            .map(|o| (&mut o.meter, o.first_channel, false));
+        let buses = self
+            .buses
+            .iter_mut()
+            .map(|m| (&mut m.meter, m.first_channel, false));
+        let taps = self
+            .taps
+            .iter_mut()
+            .map(|m| (&mut m.meter, m.first_channel, true));
+        for (i, (meter, first, input)) in outs.chain(buses).chain(taps).enumerate() {
             let mut sink = MeterSink {
-                output: o as u32,
+                meter: i as u32,
                 ring: &mut self.meters,
                 seq: &mut self.meter_seq,
                 counters: &self.counters,
             };
-            out.meter.add(
-                &mut sink,
-                out.first_channel,
-                &self.outbuf,
-                k * self.block,
-                b,
-            );
+            let buf = if input { &self.inbuf } else { &self.outbuf };
+            meter.add(&mut sink, first, buf, k * self.block, b);
         }
 
         let done = self.now();
@@ -2385,7 +2418,7 @@ mod tests {
                 }
             }
             let mut sink = MeterSink {
-                output: 0,
+                meter: 0,
                 ring: &mut tx,
                 seq: &mut seq,
                 counters: &counters,
@@ -2458,7 +2491,7 @@ mod tests {
                 *s = 0.8 * (std::f32::consts::TAU * n as f32 / B as f32).cos();
             }
             let mut sink = MeterSink {
-                output: 0,
+                meter: 0,
                 ring: &mut tx,
                 seq: &mut seq,
                 counters: &counters,
@@ -2501,7 +2534,7 @@ mod tests {
                     *s = a * (std::f32::consts::TAU * n as f32 / B as f32).cos();
                 }
                 let mut sink = MeterSink {
-                    output: 0,
+                    meter: 0,
                     ring: &mut tx,
                     seq: &mut seq,
                     counters: &counters,
@@ -2516,6 +2549,51 @@ mod tests {
                 after.iter().all(|p| p.to_bits() == after[0].to_bits()) && after[0] < 0.11,
                 "resumed at block {resume}: {peaks:?}"
             );
+        }
+    }
+
+    /// An input's meter measures what an output's does but the true peak:
+    /// the same sample peaks and powers, bit for bit, and a true peak of 0.
+    #[test]
+    fn an_input_meter_is_an_output_meter_without_true_peak() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(1 << 12);
+        let counters = Counters::default();
+        let mut seq = 0;
+        let (mut out, mut input) = (OutMeter::new(2), OutMeter::without_true_peak(2));
+        let mut buf = PlanarBuffer::new(2, B as usize);
+        let mut records = [Vec::new(), Vec::new()];
+        for k in 0..40 {
+            for c in 0..2 {
+                for (n, s) in buf.channel_mut(c).iter_mut().enumerate() {
+                    let i = k * B + n as u64;
+                    *s = ((i * 7919 + c as u64 * 31) % 1013) as f32 / 1013.0 - 0.5;
+                }
+            }
+            for (m, meter) in [&mut out, &mut input].into_iter().enumerate() {
+                let mut sink = MeterSink {
+                    meter: m as u32,
+                    ring: &mut tx,
+                    seq: &mut seq,
+                    counters: &counters,
+                };
+                meter.add(&mut sink, 0, &buf, k * B, B as usize);
+                while let Ok(r) = rx.pop() {
+                    records[m].push(r);
+                }
+            }
+        }
+        let [o, i] = &records;
+        assert_eq!(o.len(), 2 * 40 * B as usize / SLICE as usize);
+        assert_eq!(o.len(), i.len());
+        for (o, i) in o.iter().zip(i) {
+            assert_eq!(
+                (o.slice, o.channel, o.frames),
+                (i.slice, i.channel, i.frames)
+            );
+            assert_eq!(o.peak.to_bits(), i.peak.to_bits());
+            assert_eq!(o.sum_sq.to_bits(), i.sum_sq.to_bits());
+            assert_eq!(o.plain_sum_sq.to_bits(), i.plain_sum_sq.to_bits());
+            assert!(o.true_peak >= o.peak && i.true_peak == 0.0);
         }
     }
 

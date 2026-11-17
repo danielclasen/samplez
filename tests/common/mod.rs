@@ -222,6 +222,25 @@ pub fn config(
     Config::parse(&v.to_string()).unwrap()
 }
 
+/// Adds a meter of `channels` channels named `name`, input channel `i`
+/// feeding meter channel `i % channels` at `gain`.
+pub fn add_meter(config: &mut Config, name: &str, channels: u32, gain: f32) {
+    config.meters.push(samplez::config::Meter {
+        name: name.to_owned(),
+        channels,
+        loudness_channels: None,
+    });
+    for (i, row) in config.matrix.iter_mut().enumerate() {
+        row.extend((0..channels as usize).map(|j| {
+            if i % channels as usize == j {
+                gain
+            } else {
+                0.0
+            }
+        }));
+    }
+}
+
 pub fn diagonal(channels: usize, g: f32) -> Vec<Vec<f32>> {
     (0..channels)
         .map(|i| {

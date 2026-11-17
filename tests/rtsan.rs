@@ -2,8 +2,9 @@
 //! `-Zsanitizer=realtime --cfg samplez_rtsan` (CI's RTSan step), any call
 //! RTSan counts as blocking (allocation, pthread lock, sleep, blocking
 //! syscall) inside it aborts the process. The run covers input generation
-//! swaps, a re-route crossfade, a gain ramp, output commits, metering and
-//! a loudness reset, strips with every unit on, a writer's refusals, and,
+//! swaps, a re-route crossfade, a gain ramp, output commits, output,
+//! meter and input metering and loudness resets, strips with every unit
+//! on, a writer's refusals, and,
 //! for a replicated engine, every path of the hold ring
 //! (`common::hold_scenario`): holding, withholding and overflow, with its
 //! pages hashed and strip entries applied. The lib test
@@ -68,13 +69,9 @@ fn the_rt_thread_passes_rtsan() {
     let (src, dst) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
     let matrix = vec![vec![0.5, 0.0], vec![0.0, 0.5]];
-    let (engine, rx) = start(config(
-        &domain.0,
-        &[(&src, 2)],
-        &[(&dst, 2)],
-        matrix,
-        MARGIN,
-    ));
+    let mut cfg = config(&domain.0, &[(&src, 2)], &[(&dst, 2)], matrix, MARGIN);
+    common::add_meter(&mut cfg, "bus", 2, 0.5);
+    let (engine, rx) = start(cfg);
     let attached = || engine.status().inputs[0].state == InputState::Attached;
     wait_for(Duration::from_secs(5), "input attached", attached);
     wait_for(Duration::from_secs(5), "output realised", || {
@@ -85,6 +82,8 @@ fn the_rt_thread_passes_rtsan() {
     engine.set_gain(0, 0, 0.25, (index / B + 20) * B).unwrap();
     let reset = (index / B + 40) * B;
     engine.reset_loudness(0, reset).unwrap();
+    // The meter after the output.
+    engine.reset_loudness(1, reset).unwrap();
     std::thread::sleep(Duration::from_millis(500));
     // A re-route: a generation holding both flows, then one without the
     // old flow once the crossfade ended.
@@ -102,6 +101,11 @@ fn the_rt_thread_passes_rtsan() {
         "no crossfade seen"
     );
     assert!(verdicts.iter().any(|v| v.ramping), "no gain ramp seen");
+    let s = engine.status();
+    assert!(
+        s.meters[0].meters.window.is_some() && s.inputs[0].meters.window.is_some(),
+        "the meter and the input were not metered"
+    );
     assert!(verdicts.iter().filter(|v| v.written != 0).count() > 1_000);
     assert_eq!(engine.status().diverged, None);
     assert_eq!(engine.status().rt_panic, None);

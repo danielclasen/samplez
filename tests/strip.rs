@@ -1,6 +1,6 @@
 //! Strip entries on real libmxl flows: checked when appended or set,
 //! applied at their index to the legs of their slot, ramping as a strip
-//! run alone does.
+//! run alone does; and every input metered after its strip.
 
 mod common;
 
@@ -83,6 +83,51 @@ fn a_strip_entry_applies_at_its_index_to_its_leg() {
     }
     assert!(compared > 40, "{compared} blocks compared");
     assert_eq!(e.status().diverged, None);
+    common::stop(e);
+}
+
+/// Every input is metered after its strip and every meter after the
+/// matrix, whether an output carries them or not: an input that feeds
+/// only a meter, trimmed by 6 dB in its strip, reads the pilot's
+/// full-scale sines 6 dB down, the meter reads them at its gain on top,
+/// and the output the input does not feed reads silence.
+#[test]
+fn inputs_and_meters_no_output_carries_are_metered() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let silent = vec![vec![0.0], vec![0.0]];
+    let mut cfg = config(&domain.0, &[(&src, 2)], &[(&dst, 1)], silent, MARGIN);
+    common::add_meter(&mut cfg, "bus", 2, 0.5);
+    let (e, rx) = common::start(cfg);
+    wait_for(Duration::from_secs(5), "input attached", || {
+        e.status().inputs[0].state == InputState::Attached
+    });
+    let at = (now(&rx) + 100) * B;
+    e.set_strip(0, StripParam::Trim { db: -6.0 }, at).unwrap();
+    // A window that starts after the trim's ramp ended, the momentary
+    // loudness's 400 ms past it.
+    let after = |w: Option<u64>| w.is_some_and(|w| w * 4800 >= at + 5 * 4800);
+    wait_for(Duration::from_secs(10), "meters past the trim", || {
+        let s = e.status();
+        after(s.inputs[0].meters.window) && after(s.meters[0].meters.window)
+    });
+    let s = e.status();
+    let (input, meter) = (&s.inputs[0].meters, &s.meters[0].meters);
+    let db = |v: f32| 20.0 * f64::from(v).log10();
+    let near = |v: f32, want: f64| (db(v) - want).abs() < 0.05;
+    for c in 0..2 {
+        assert!(near(input.peak[c], -6.0), "input {input:?}");
+        // Referenced to a sine: a sine's RMS reads its peak.
+        assert!(near(input.rms[c], -6.0), "input {input:?}");
+        assert!(near(meter.peak[c], -12.02), "meter {meter:?}");
+        assert!(
+            near(meter.true_peak[c].max(meter.peak[c]), -12.02),
+            "meter {meter:?}"
+        );
+    }
+    assert!(input.momentary.is_some() && meter.momentary.is_some());
+    assert_eq!(s.outputs[0].meters.peak, [0.0]);
     common::stop(e);
 }
 

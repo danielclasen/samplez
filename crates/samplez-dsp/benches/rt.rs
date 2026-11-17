@@ -2,7 +2,8 @@
 //! by Gungraun (`cargo bench --bench rt`). Each benchmark processes one
 //! block of B = 48 samples at the largest shape measured here, 64 input
 //! channels to 96 output channels, on both dispatch paths, with every
-//! coefficient ramping; the strips, 64 mono ones, have one path. It also
+//! coefficient ramping; the strips, 64 mono ones, and the meters of the
+//! 64 input channels after them have one path. It also
 //! gates the RT parts of a resync at that shape: the matrix copy of the
 //! core and one block's history stores. The hard limits are the
 //! instruction counts measured in the builder image plus 10 %, rounded
@@ -15,7 +16,7 @@ use gungraun::{Callgrind, EventKind};
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
     CompParams, EqBand, GateParams, History, KWeighting, Matrix, Path, PlanarBuffer, Started,
-    Strip, StripParam, TruePeak,
+    Strip, StripParam, TruePeak, accumulate,
 };
 
 const B: usize = 48;
@@ -88,6 +89,31 @@ fn setup_meters(path: Path) -> (Path, TruePeak, KWeighting, PlanarBuffer) {
         TruePeak::new(OUTPUTS, B),
         KWeighting::new(OUTPUTS),
         signal(OUTPUTS),
+    )
+}
+
+// The input meters of one block, each input channel after its strip:
+// sample peak, sum of squares and K-weighting, as the RT loop meters
+// every input leg.
+#[library_benchmark]
+#[bench::block(setup = setup_input_meters, config = limit(INPUT_METERS))]
+fn input_meters(
+    (mut kw, mut peak, mut power, buf): (KWeighting, Vec<f32>, Vec<f64>, PlanarBuffer),
+) -> (KWeighting, Vec<f32>, Vec<f64>, PlanarBuffer) {
+    for c in 0..INPUTS {
+        let x = black_box(buf.channel(c));
+        accumulate(x, &mut peak[c], &mut power[c]);
+        power[c] += kw.process(c, x);
+    }
+    (kw, peak, power, buf)
+}
+
+fn setup_input_meters() -> (KWeighting, Vec<f32>, Vec<f64>, PlanarBuffer) {
+    (
+        KWeighting::new(INPUTS),
+        vec![0.0; INPUTS],
+        vec![0.0; INPUTS],
+        signal(INPUTS),
     )
 }
 
@@ -186,12 +212,16 @@ const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
 const METERS_SCALAR: u64 = 1_118_000;
 const METERS_AVX2: u64 = 303_000;
+const INPUT_METERS: u64 = 152_623;
 const STRIPS_RAMPING: u64 = 1_502_708;
 const STRIPS_SETTLED: u64 = 979_919;
 const STRIPS_RAMPING_FAST: u64 = 1_771_069;
 const STRIPS_SETTLED_FAST: u64 = 1_273_161;
 
-library_benchmark_group!(name = block, benchmarks = [matrix, meters, strip]);
+library_benchmark_group!(
+    name = block,
+    benchmarks = [matrix, meters, input_meters, strip]
+);
 library_benchmark_group!(name = transfer, benchmarks = [core_copy, history]);
 
 main!(library_benchmark_groups = block, transfer);
