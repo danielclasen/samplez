@@ -286,7 +286,9 @@ impl Life {
                 }
             }
         }
-        if v.excluded && self.state != ReplicaState::Diverged {
+        // A replica held in `starting` stays there; it diverges once it
+        // leaves.
+        if v.excluded && !matches!(self.state, ReplicaState::Diverged | ReplicaState::Starting) {
             self.diverge(audio);
         }
         self.taken(v);
@@ -676,8 +678,10 @@ impl Life {
             self.spent = Some(p);
         }
         self.ready_at = None;
-        self.state = ReplicaState::Starting;
-        audio.withdraw();
+        // A replica still starting has committed nothing to withdraw.
+        if std::mem::replace(&mut self.state, ReplicaState::Starting) != ReplicaState::Starting {
+            audio.withdraw();
+        }
     }
 
     fn diverge(&mut self, audio: &dyn Audio) {

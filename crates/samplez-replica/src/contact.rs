@@ -97,6 +97,10 @@ impl Timing {
 pub trait Clocks: Send + Sync + 'static {
     /// TAI time, ns.
     fn tai_ns(&self) -> u64;
+    /// The kernel TAI offset, CLOCK_TAI - CLOCK_REALTIME read back to
+    /// back and rounded to whole seconds. An audio replica reports the
+    /// RT thread's sample instead; the witness reports this one.
+    fn tai_offset_s(&self) -> Option<i64>;
 }
 
 /// `CLOCK_TAI`, the clock libmxl's `mxlGetTime` reads.
@@ -111,6 +115,21 @@ impl Clocks for SystemClocks {
         // SAFETY: `ts` is writable; CLOCK_TAI exists on Linux.
         unsafe { libc::clock_gettime(libc::CLOCK_TAI, &mut ts) };
         ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    fn tai_offset_s(&self) -> Option<i64> {
+        let read = |clock| {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `ts` is writable; both clocks exist on Linux.
+            unsafe { libc::clock_gettime(clock, &mut ts) };
+            i128::from(ts.tv_sec) * 1_000_000_000 + i128::from(ts.tv_nsec)
+        };
+        let tai = read(libc::CLOCK_TAI);
+        let real = read(libc::CLOCK_REALTIME);
+        Some((tai - real + 500_000_000).div_euclid(1_000_000_000) as i64)
     }
 }
 
@@ -190,6 +209,8 @@ pub struct Sample {
     pub realised: Vec<bool>,
     /// The generation its pending entries need is built, or none is.
     pub generation_ready: bool,
+    /// Clock steps the engine detected.
+    pub clock_steps: u64,
 }
 
 /// The voters of the applied membership: one configuration, or two
@@ -454,6 +475,7 @@ struct Counts {
     installs: u64,
     purge_points: u64,
     contradicted: u64,
+    clock_holds: u64,
 }
 
 struct State {
@@ -518,6 +540,19 @@ struct State {
     pages: PageBook,
     leader: Leader,
     clock: crate::clock::Judge,
+    verifier: crate::verify::Verifier,
+    horizon: crate::horizon::Horizon,
+    /// The clock hold has the replica in `starting`.
+    held: bool,
+    /// Clock steps the engine detected, as of the last sample.
+    clock_steps: u64,
+    /// What `replica_clock_unverified` names, and since when it has.
+    unverified: Vec<(NodeId, Option<i64>)>,
+    unverified_since: Option<Instant>,
+    /// Voters reporting TAI offset 0.
+    offset_zero: Vec<NodeId>,
+    #[cfg(test)]
+    verified_always: bool,
     decider: crate::decide::Decider,
     /// The audio `/readyz` term, as of the last period in contact; none
     /// before the first.
@@ -605,7 +640,30 @@ pub struct Metrics {
     pub clock: crate::clock::Status,
     /// `ClockVerdict` entries appended while this voter led.
     pub clock_verdicts: u64,
+    /// This voter is clock-verified.
+    pub verified: bool,
+    /// The kernel TAI offset it reports, whole seconds.
+    pub tai_offset_s: Option<i64>,
+    /// Every unverified replica and every voter whose offset is not the
+    /// set's (every voter while there is none), with its latest offset,
+    /// as status shows them at once.
+    pub clock_unverified: Vec<(NodeId, Option<i64>)>,
+    /// `replica_clock_unverified`: that list has been non-empty for
+    /// [`UNVERIFIED_DEBOUNCE`].
+    pub replica_clock_unverified: bool,
+    /// `replica_tai_offset_zero`: the voters reporting offset 0.
+    pub replica_tai_offset_zero: Vec<NodeId>,
+    /// The horizon holds this replica in `starting`.
+    pub horizon_held: bool,
+    /// Times the clock hold or the horizon took the replica to
+    /// `starting`, its engine dropped.
+    pub clock_holds: u64,
 }
+
+/// How long `replica_clock_unverified` waits before it raises, so the
+/// window around a leap second, in which the set has no offset for the
+/// nodes' clock spread plus one tick, raises nothing.
+pub const UNVERIFIED_DEBOUNCE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerMetrics {
@@ -712,6 +770,15 @@ impl Contact {
                 pages: PageBook::default(),
                 leader: Leader::default(),
                 clock: crate::clock::Judge::default(),
+                verifier: crate::verify::Verifier::default(),
+                horizon: crate::horizon::Horizon::default(),
+                held: false,
+                clock_steps: 0,
+                unverified: Vec::new(),
+                unverified_since: None,
+                offset_zero: Vec::new(),
+                #[cfg(test)]
+                verified_always: false,
                 decider: crate::decide::Decider::default(),
                 serving: None,
                 verdicts: Vec::new(),
@@ -947,10 +1014,14 @@ impl Contact {
             st.entries_refused = sample.entries_refused;
             st.realised = sample.realised;
             st.generation_ready = sample.generation_ready;
+            st.clock_steps = sample.clock_steps;
             st.pages.fold(self.id, &st.own.pages);
+        } else {
+            st.own.clock.tai_offset_s = self.clocks.tai_offset_s();
         }
         st.judged = self.log.judged();
         st.lead.roll();
+        self.verify(st, now);
 
         // Contact: reports from a majority, itself included, within w.
         let w = self.timing.contact_window;
@@ -1599,8 +1670,17 @@ impl Contact {
             return;
         }
         self.resolve(st, audio.as_ref());
+        // The clock hold: an unverified replica, or one beyond the
+        // horizon, returns to `starting` with its engine dropped, and is
+        // rebuilt only once the hold ends.
+        let held = !st.verifier.verified() || st.horizon.held();
+        if held && !st.held {
+            st.counts.clock_holds += 1;
+            self.begin_restart(st, self.log.applied());
+        }
+        st.held = held;
         let rebuilding = match st.restart {
-            Some(after) if self.log.applied() >= after && audio.rebuild_engine() => {
+            Some(after) if !held && self.log.applied() >= after && audio.rebuild_engine() => {
                 st.restart = None;
                 // The rebuilt core holds no unresolved entry: the ones
                 // still unresolved go to it again.
@@ -1909,6 +1989,94 @@ impl Contact {
 
     /// Every voter's clock as this one sees it: the audio voters by
     /// ordinal, and the witness.
+    /// Clock verification and the horizon for this period: sets the
+    /// unverified flag the reports carry and what
+    /// `replica_clock_unverified` and `replica_tai_offset_zero` name.
+    fn verify(&self, st: &mut State, now: Instant) {
+        use crate::verify::Voter;
+        st.own.clock.unverified = !st.verifier.verified();
+        let mut heard = BTreeMap::new();
+        heard.insert(
+            self.id,
+            Voter {
+                offset_s: st.own.clock.tai_offset_s,
+                theta_ns: Some(0),
+                delay_ns: 0,
+            },
+        );
+        let mut unverified = BTreeMap::new();
+        for (id, _, own) in self.copies(st, now) {
+            if own.clock.unverified {
+                unverified.insert(id, own.clock.tai_offset_s);
+            }
+            if id == self.id {
+                continue;
+            }
+            let best = st.peers.get(&id).and_then(|p| p.thetas.best());
+            heard.insert(
+                id,
+                Voter {
+                    offset_s: own.clock.tai_offset_s,
+                    theta_ns: best.map(|b| b.0),
+                    delay_ns: best.map_or(0, |b| b.1),
+                },
+            );
+        }
+        let counted = self.counted(st, now);
+        let view = crate::verify::View {
+            me: self.id,
+            members: &st.members,
+            heard: &heard,
+            counted: &counted,
+            guard_ns: time_of(self.timing.clock_guard),
+        };
+        let verifies = view.verifies();
+        let off = view.off_offset();
+        #[cfg(test)]
+        let verifies = verifies || st.verified_always;
+        st.verifier
+            .period(st.own.clock.tai_offset_s, st.clock_steps, || verifies);
+        let verified = st.verifier.verified();
+        st.own.clock.unverified = !verified;
+        if verified {
+            unverified.remove(&self.id);
+        } else {
+            unverified.insert(self.id, st.own.clock.tai_offset_s);
+        }
+        unverified.extend(off);
+        st.unverified = unverified.into_iter().collect();
+        st.unverified_since = if st.unverified.is_empty() {
+            None
+        } else {
+            st.unverified_since.or(Some(now))
+        };
+        let voters = st.members.voters();
+        st.offset_zero = heard
+            .iter()
+            .filter(|(id, v)| voters.contains(id) && v.offset_s == Some(0))
+            .map(|(&id, _)| id)
+            .collect();
+        // The horizon, for a verified audio replica E does not count.
+        let b = self.timing.block;
+        let end = st.own.processed.map(|k| (k + 1) * b);
+        let estimate = self.estimate_in(st, now);
+        let spread = st.e_spread.quantile(0.9999).unwrap_or(0);
+        st.horizon.period(
+            end.filter(|_| verified && self.audio.is_some()),
+            estimate,
+            counted.contains(&self.id),
+            index_at(self.timing.apply_guard_ns()),
+            spread,
+        );
+    }
+
+    /// Unit tests that drive the log, not the clock: this replica counts
+    /// as verified from its first period.
+    #[cfg(test)]
+    pub(crate) fn verified_always(&self) {
+        self.lock().verified_always = true;
+    }
+
     fn clock_readings(
         &self,
         st: &State,
@@ -2243,6 +2411,15 @@ impl Contact {
             replica_disagreement: st.leader.disagreement,
             clock: self.clock_status(&st, Instant::now()),
             clock_verdicts: st.clock.verdicts,
+            verified: st.verifier.verified(),
+            tai_offset_s: st.own.clock.tai_offset_s,
+            clock_unverified: st.unverified.clone(),
+            replica_clock_unverified: st
+                .unverified_since
+                .is_some_and(|t| since(Instant::now(), t) >= UNVERIFIED_DEBOUNCE),
+            replica_tai_offset_zero: st.offset_zero.clone(),
+            horizon_held: st.horizon.held(),
+            clock_holds: c.clock_holds,
         }
     }
 }
@@ -2356,6 +2533,9 @@ mod tests {
         fn tai_ns(&self) -> u64 {
             self.now
                 .fetch_add(self.step.load(Ordering::SeqCst), Ordering::SeqCst)
+        }
+        fn tai_offset_s(&self) -> Option<i64> {
+            Some(37)
         }
     }
 
@@ -2475,6 +2655,7 @@ mod tests {
                 entries_refused: 0,
                 realised: Vec::new(),
                 generation_ready: true,
+                clock_steps: 0,
             }
         }
         fn fence(&self, end: u64) {
@@ -2587,6 +2768,7 @@ mod tests {
             log.clone(),
             100,
         );
+        contact.verified_always();
         let configs: Vec<BTreeSet<NodeId>> = configs
             .iter()
             .map(|c| c.iter().copied().collect())
@@ -3439,6 +3621,7 @@ mod tests {
             f.log.clone(),
             1,
         );
+        contact.verified_always();
         contact.tick(f.members.clone());
         assert!(contact.stamp(false).is_ok());
         assert_eq!(contact.stamp(true), Err(StampRefusal::GenerationPending));
@@ -3467,6 +3650,7 @@ mod tests {
         let (clock, engine, log) = (f.clock.clone(), f.engine.clone(), f.log.clone());
         std::thread::spawn(move || {
             let contact = Contact::new(1, Timing::defaults(B), clock, Some(engine), log, 1);
+            contact.verified_always();
             let _ = tx.send(contact);
         });
         let contact = rx
