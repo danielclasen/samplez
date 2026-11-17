@@ -29,12 +29,12 @@ use crate::blocks::{
     BlockStatus, Cause, Hold, PAGE, PageHash, Pages, Ranks, Standing, StatusChange, Statuses,
 };
 use crate::config::Config;
-use crate::meters::{OutputLoudness, OutputMeters};
+use crate::meters::{InputMeters, OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
-    BlockVerdict, Change, Command, Control, Counters, Gen, LogId, LoudnessReset, MeterRecord, Mix,
-    Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared, Slot, SlotStats,
-    Telemetry, UNRESOLVED,
+    BlockVerdict, Change, Command, Control, Counters, Gen, LogId, LoudnessReset, MeterRecord,
+    Metered, Mix, Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared,
+    Slot, SlotStats, Telemetry, UNRESOLVED,
 };
 use crate::transfer::{
     Answer, CopyError, Core, CoreCopy, Handover, ProductState, Replay, ReplayError, SlotCore,
@@ -92,6 +92,8 @@ pub struct InputStatus {
     /// are on time.
     pub margin_warning: Option<u64>,
     pub counters: InputCounters,
+    /// The input after its strip, read or silenced.
+    pub meters: InputMeters,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +111,13 @@ pub struct OutputStatus {
     /// The flow's ring length and effective batch hints, once created.
     pub buffer_length: Option<u64>,
     pub hints: Option<(u32, u32)>,
+    pub meters: OutputMeters,
+}
+
+/// A configured meter: matrix columns written to no flow.
+#[derive(Clone, Debug)]
+pub struct MeterStatus {
+    pub name: String,
     pub meters: OutputMeters,
 }
 
@@ -163,6 +172,7 @@ pub struct Status {
     pub rt_panic: Option<String>,
     pub inputs: Vec<InputStatus>,
     pub outputs: Vec<OutputStatus>,
+    pub meters: Vec<MeterStatus>,
     /// Replicated mode with more than one voter: replay speed s, the
     /// blocks a replay clone computes per block period, measured at
     /// start-up on silence.
@@ -219,8 +229,9 @@ impl std::error::Error for GainError {}
 /// applied again once its ramp has ended changes nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
-    /// Ramps the gain from input channel `input` to output channel
-    /// `output` to `gain` over the ramp length.
+    /// Ramps the gain from input channel `input` to matrix column
+    /// `output`, an output channel or after them a meter channel, to
+    /// `gain` over the ramp length.
     Gain {
         input: usize,
         output: usize,
@@ -624,6 +635,30 @@ fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
     (slots, in_domains)
 }
 
+/// The configured meters on their matrix columns, after the outputs',
+/// and each input slot's meter on its channels.
+fn new_meters(config: &Config) -> (Vec<Metered>, Vec<Metered>) {
+    let mut channel = config.output_channels();
+    let mut buses = Vec::new();
+    for m in &config.meters {
+        buses.push(Metered {
+            first_channel: channel,
+            meter: OutMeter::new(m.channels as usize),
+        });
+        channel += m.channels as usize;
+    }
+    let mut channel = 0;
+    let mut taps = Vec::new();
+    for i in &config.inputs {
+        taps.push(Metered {
+            first_channel: channel,
+            meter: OutMeter::without_true_peak(i.channels as usize),
+        });
+        channel += i.channels as usize;
+    }
+    (buses, taps)
+}
+
 /// A replay clone of `config`'s shape: an engine computing off the RT
 /// thread from `gens`, writing nothing and hashing every page it computes
 /// whole into `hashes`, its entries and controls handed in directly.
@@ -636,7 +671,7 @@ fn replay_rt(
 ) -> Rt {
     let b = u64::from(config.block_size);
     let (slots, in_domains) = new_slots(config);
-    let (n, m) = (config.input_channels(), config.output_channels());
+    let (n, m) = (config.input_channels(), config.columns());
     let mut channel = 0;
     let outs = config
         .outputs
@@ -700,6 +735,10 @@ fn replay_rt(
         statuses: (0..in_domains.len()).map(|_| GroupWait::Skipped).collect(),
         slots,
         outs,
+        // Its meter records go nowhere: only the outputs' are computed,
+        // as they were before the configured and input meters.
+        buses: Vec::new(),
+        taps: Vec::new(),
         mix: Mix {
             page_entries: Vec::with_capacity(PENDING_CHANGES * PAGE.div_ceil(b) as usize),
             ..Mix::new(Matrix::new(n, m), b, config.ramp_samples)
@@ -855,11 +894,11 @@ impl Engine {
         }));
         let records = METER_RING_SECONDS
             * (samplez_mxl::SAMPLE_RATE as usize / SLICE as usize)
-            * config.output_channels();
+            * (config.columns() + config.input_channels());
         let (mut meter_tx, mut meter_rx) = rtrb::RingBuffer::new(records.max(1));
         let blank = MeterRecord {
             seq: 0,
-            output: 0,
+            meter: 0,
             channel: 0,
             slice: 0,
             frames: 0,
@@ -871,8 +910,9 @@ impl Engine {
         };
         while meter_tx.push(blank).is_ok() {}
         while meter_rx.pop().is_ok() {}
-        let (reset_tx, reset_rx) =
-            rtrb::RingBuffer::new((RESETS_PER_OUTPUT * config.outputs.len()).max(1));
+        let (reset_tx, reset_rx) = rtrb::RingBuffer::new(
+            (RESETS_PER_OUTPUT * (config.outputs.len() + config.meters.len())).max(1),
+        );
         let hold_blocks = config.hold_blocks();
         let alone = voters == 1;
         let hash_tx = hash_tx.filter(|_| reports.is_some() && !alone);
@@ -943,7 +983,7 @@ impl Engine {
                     spare: None,
                     shape: (
                         config.input_channels(),
-                        config.output_channels(),
+                        config.columns(),
                         config.inputs.len(),
                         page_entries,
                     ),
@@ -999,8 +1039,9 @@ impl Engine {
             });
             channel += o.channels as usize;
         }
-        let (n, m) = (config.input_channels(), config.output_channels());
+        let (n, m) = (config.input_channels(), config.columns());
         let mut matrix = Matrix::new(n, m);
+        let (buses, taps) = new_meters(&config);
         for (i, row) in config.matrix.iter().enumerate() {
             for (j, &g) in row.iter().enumerate() {
                 assert!(matrix.set(i, j, g, 0), "validated gain");
@@ -1023,6 +1064,8 @@ impl Engine {
             statuses: (0..in_domains.len()).map(|_| GroupWait::Skipped).collect(),
             slots,
             outs,
+            buses,
+            taps,
             mix: Mix {
                 page_entries: Vec::with_capacity(page_entries),
                 ..Mix::new(matrix, b, config.ramp_samples)
@@ -1090,6 +1133,7 @@ impl Engine {
                     margin_short: None,
                     margin_warning: None,
                     counters: InputCounters::default(),
+                    meters: InputMeters::default(),
                 })
                 .collect(),
             outputs: config
@@ -1107,6 +1151,14 @@ impl Engine {
                     meters: OutputMeters::default(),
                 })
                 .collect(),
+            meters: config
+                .meters
+                .iter()
+                .map(|m| MeterStatus {
+                    name: m.name.clone(),
+                    meters: OutputMeters::default(),
+                })
+                .collect(),
         }));
         let now = Instant::now();
         // Without MCL_FUTURE the pages of a new generation's rings are not
@@ -1115,15 +1167,24 @@ impl Engine {
         let margin = u64::from(config.reader_margin_samples);
         let lead = (u64::from(config.max_catchup_blocks) + 2) * b;
         let build_lead = Arc::new(AtomicU64::new(build_lead_samples(None, lead, b)));
-        let config_loudness = config
-            .outputs
-            .iter()
-            .map(|o| {
-                let w = o
-                    .loudness_weights()
-                    .expect("output checked by Config::parse");
-                OutputLoudness::new(w)
-            })
+        // Per meter, as MeterRecord numbers them: the outputs, the
+        // configured meters, the inputs.
+        let checked = "checked by Config::parse";
+        let config_loudness = (config.outputs.iter())
+            .map(|o| o.loudness_weights().expect(checked))
+            .chain(
+                config
+                    .meters
+                    .iter()
+                    .map(|m| m.loudness_weights().expect(checked)),
+            )
+            .chain(
+                config
+                    .inputs
+                    .iter()
+                    .map(|i| i.loudness_weights().expect(checked)),
+            )
+            .map(OutputLoudness::new)
             .collect();
         let sup = Supervisor {
             api: Arc::clone(&api),
@@ -1252,8 +1313,9 @@ impl Engine {
         &self.counters
     }
 
-    /// Ramps the gain from input channel `input` to output channel
-    /// `output` to `gain` over the configured ramp length, starting at
+    /// Ramps the gain from input channel `input` to matrix column
+    /// `output`, an output channel or after them a meter channel, to
+    /// `gain` over the configured ramp length, starting at
     /// sample index `at_index`, a multiple of the block size. Changes at
     /// one index apply in the order sent.
     ///
@@ -2055,8 +2117,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Restarts the loudness measurement of output `output` (the
-    /// integrated loudness, the loudness range, the maxima and the
+    /// Restarts the loudness measurement of `meter`, an output or, after
+    /// the outputs, a configured meter (the integrated loudness, the loudness range, the maxima and the
     /// validity) at the first 100 ms window starting at or after
     /// `at_index`, a multiple of the block size; the K-weighting starts
     /// from silence there, and the true-peak interpolator keeps the 11
@@ -2067,12 +2129,14 @@ impl Engine {
     /// computed those samples and reset at the same index agree there.
     /// `at_index`
     /// is refused below the same earliest index as [`Engine::set_gain`].
-    /// A reset replaces one still pending for the same output;
+    /// A reset replaces one still pending for the same meter;
     /// [`ResetError::Full`] when the reset ring is full.
-    pub fn reset_loudness(&self, output: usize, at_index: u64) -> Result<(), ResetError> {
-        if output >= self.status.lock().expect("status lock").outputs.len() {
-            return Err(ResetError::Invalid(format!("no output {output}")));
+    pub fn reset_loudness(&self, meter: usize, at_index: u64) -> Result<(), ResetError> {
+        let st = self.status.lock().expect("status lock");
+        if meter >= st.outputs.len() + st.meters.len() {
+            return Err(ResetError::Invalid(format!("no output or meter {meter}")));
         }
+        drop(st);
         if !at_index.is_multiple_of(self.block) {
             return Err(ResetError::Invalid(format!(
                 "at_index {at_index} is not a multiple of the block size {}",
@@ -2086,7 +2150,7 @@ impl Engine {
         if at_index < earliest {
             return Err(ResetError::TooNear { at_index, earliest });
         }
-        tx.push(LoudnessReset { output, at_index })
+        tx.push(LoudnessReset { meter, at_index })
             .map_err(|_| ResetError::Full)
     }
 
@@ -2332,12 +2396,21 @@ impl Supervisor {
                 self.loudness.iter_mut().for_each(OutputLoudness::gap);
             }
             self.next_meter_seq = r.seq + 1;
-            self.loudness[r.output as usize].record(&r);
+            self.loudness[r.meter as usize].record(&r);
         }
         if seen {
             let mut st = self.status();
-            for (o, l) in st.outputs.iter_mut().zip(&self.loudness) {
+            let st = &mut *st;
+            let (outs, rest) = self.loudness.split_at(st.outputs.len());
+            let (meters, inputs) = rest.split_at(st.meters.len());
+            for (o, l) in st.outputs.iter_mut().zip(outs) {
                 o.meters.clone_from(&l.meters);
+            }
+            for (m, l) in st.meters.iter_mut().zip(meters) {
+                m.meters.clone_from(&l.meters);
+            }
+            for (i, l) in st.inputs.iter_mut().zip(inputs) {
+                i.meters.update(&l.meters);
             }
         }
     }

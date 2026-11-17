@@ -10,6 +10,8 @@ use serde::Deserialize;
 /// verdicts carry one bit per input and per output.
 pub const MAX_INPUTS: usize = 64;
 pub const MAX_OUTPUTS: usize = 64;
+/// The most meters an engine takes.
+pub const MAX_METERS: usize = 64;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -54,8 +56,13 @@ pub struct Config {
     pub inputs: Vec<Input>,
     #[serde(default)]
     pub outputs: Vec<Output>,
-    /// Gain from each input channel (row) to each output channel (column),
-    /// channels numbered across inputs and outputs in configuration order.
+    /// Matrix columns that are computed and metered and written to no
+    /// flow, after the outputs' columns.
+    #[serde(default)]
+    pub meters: Vec<Meter>,
+    /// Gain from each input channel (row) to each output channel and then
+    /// each meter channel (column), channels numbered across inputs,
+    /// outputs and meters in configuration order.
     pub matrix: Vec<Vec<f32>>,
     #[serde(default)]
     pub rt: Rt,
@@ -77,6 +84,45 @@ pub struct Input {
     pub channels: u32,
     #[serde(default)]
     pub offset_samples: i64,
+    /// The loudness role of each channel, as for an output; weights the
+    /// momentary loudness of the input's meter.
+    #[serde(default)]
+    pub loudness_channels: Option<Vec<String>>,
+}
+
+impl Input {
+    /// The loudness weight of each channel.
+    pub fn loudness_weights(&self) -> Result<Vec<f64>, Error> {
+        loudness_weights(
+            "input",
+            &self.name,
+            self.channels,
+            self.loudness_channels.as_deref(),
+        )
+    }
+}
+
+/// Matrix columns metered like an output and written nowhere.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Meter {
+    pub name: String,
+    pub channels: u32,
+    /// The loudness role of each channel, as for an output.
+    #[serde(default)]
+    pub loudness_channels: Option<Vec<String>>,
+}
+
+impl Meter {
+    /// The loudness weight of each channel.
+    pub fn loudness_weights(&self) -> Result<Vec<f64>, Error> {
+        loudness_weights(
+            "meter",
+            &self.name,
+            self.channels,
+            self.loudness_channels.as_deref(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -99,31 +145,44 @@ pub struct Output {
 impl Output {
     /// The loudness weight of each channel.
     pub fn loudness_weights(&self) -> Result<Vec<f64>, Error> {
-        use samplez_dsp::weight;
-        let Some(names) = &self.loudness_channels else {
-            return Ok(vec![weight::FRONT; self.channels as usize]);
-        };
-        if names.len() != self.channels as usize {
-            return Err(Error(format!(
-                "output {}: loudnessChannels names {} channels, the output has {}",
-                self.name,
-                names.len(),
-                self.channels
-            )));
-        }
-        names
-            .iter()
-            .map(|n| match n.as_str() {
-                "L" | "R" | "C" => Ok(weight::FRONT),
-                "Ls" | "Rs" => Ok(weight::SURROUND),
-                "LFE" => Ok(weight::LFE),
-                _ => Err(Error(format!(
-                    "output {}: loudness channel {n:?} is not one of L, R, C, Ls, Rs, LFE",
-                    self.name
-                ))),
-            })
-            .collect()
+        loudness_weights(
+            "output",
+            &self.name,
+            self.channels,
+            self.loudness_channels.as_deref(),
+        )
     }
+}
+
+/// The loudness weight of each of `channels` channels named by `names`;
+/// every channel weighs 1 without names.
+fn loudness_weights(
+    what: &str,
+    name: &str,
+    channels: u32,
+    names: Option<&[String]>,
+) -> Result<Vec<f64>, Error> {
+    use samplez_dsp::weight;
+    let Some(names) = names else {
+        return Ok(vec![weight::FRONT; channels as usize]);
+    };
+    if names.len() != channels as usize {
+        return Err(Error(format!(
+            "{what} {name}: loudnessChannels names {} channels, the {what} has {channels}",
+            names.len(),
+        )));
+    }
+    names
+        .iter()
+        .map(|n| match n.as_str() {
+            "L" | "R" | "C" => Ok(weight::FRONT),
+            "Ls" | "Rs" => Ok(weight::SURROUND),
+            "LFE" => Ok(weight::LFE),
+            _ => Err(Error(format!(
+                "{what} {name}: loudness channel {n:?} is not one of L, R, C, Ls, Rs, LFE"
+            ))),
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -259,6 +318,15 @@ impl Config {
         self.outputs.iter().map(|o| o.channels as usize).sum()
     }
 
+    pub fn meter_channels(&self) -> usize {
+        self.meters.iter().map(|m| m.channels as usize).sum()
+    }
+
+    /// The matrix columns: the output channels, then the meter channels.
+    pub fn columns(&self) -> usize {
+        self.output_channels() + self.meter_channels()
+    }
+
     /// The hold ring of a replicated output in blocks: `D + w + 2B`
     /// samples, rounded up to whole blocks.
     pub fn hold_blocks(&self) -> usize {
@@ -333,9 +401,16 @@ impl Config {
                 self.outputs.len()
             ));
         }
+        if self.meters.len() > MAX_METERS {
+            return fail(format!(
+                "{} meters, at most {MAX_METERS}",
+                self.meters.len()
+            ));
+        }
         unique(self.domains.iter().map(|d| d.name.as_str()), "domain")?;
         unique(self.inputs.iter().map(|i| i.name.as_str()), "input")?;
         unique(self.outputs.iter().map(|o| o.name.as_str()), "output")?;
+        unique(self.meters.iter().map(|m| m.name.as_str()), "meter")?;
         unique(
             self.outputs.iter().map(|o| o.flow_id.as_str()),
             "output flow id",
@@ -347,6 +422,13 @@ impl Config {
             if i.channels == 0 {
                 return fail(format!("input {}: channels must be at least 1", i.name));
             }
+            i.loudness_weights()?;
+        }
+        for m in &self.meters {
+            if m.channels == 0 {
+                return fail(format!("meter {}: channels must be at least 1", m.name));
+            }
+            m.loudness_weights()?;
         }
         for o in &self.outputs {
             if self.domain(&o.domain).is_none() {
@@ -359,10 +441,11 @@ impl Config {
         for (slot, i) in self.inputs.iter().enumerate() {
             self.check_input_flow(slot, &i.flow_id)?;
         }
-        let (n, m) = (self.input_channels(), self.output_channels());
+        let (n, m) = (self.input_channels(), self.columns());
         if self.matrix.len() != n || self.matrix.iter().any(|row| row.len() != m) {
             return fail(format!(
-                "matrix must have {n} rows (input channels) of {m} gains (output channels)"
+                "matrix must have {n} rows (input channels) of {m} gains (output and meter \
+                 channels)"
             ));
         }
         if let Some(g) = self
@@ -596,6 +679,37 @@ mod tests {
         c["outputs"][0]["domain"] = serde_json::json!("b");
         assert!(parse(&c).is_ok());
         c["outputs"][0]["domain"] = serde_json::json!("a");
+        assert!(parse(&c).is_err());
+    }
+
+    /// A meter adds its channels as matrix columns after the outputs';
+    /// an input's and a meter's loudnessChannels are checked as an
+    /// output's.
+    #[test]
+    fn meters_take_matrix_columns_after_the_outputs() {
+        let mut c = base();
+        c["meters"] = serde_json::json!([{ "name": "aux", "channels": 2,
+                                           "loudnessChannels": ["L", "R"] }]);
+        assert!(parse(&c).is_err(), "the matrix has no meter columns");
+        c["matrix"] = serde_json::json!([[0.5, 1.0, 0.0], [0.5, 0.0, 1.0]]);
+        let p = parse(&c).unwrap();
+        assert_eq!(
+            (p.output_channels(), p.meter_channels(), p.columns()),
+            (1, 2, 3)
+        );
+        c["meters"][0]["loudnessChannels"] = serde_json::json!(["L"]);
+        assert!(parse(&c).is_err());
+        c["meters"][0]["loudnessChannels"] = serde_json::json!(["L", "R"]);
+        c["meters"][0]["channels"] = serde_json::json!(0);
+        c["matrix"] = serde_json::json!([[0.5], [0.5]]);
+        assert!(parse(&c).is_err(), "a meter of no channels");
+        let mut c = base();
+        c["inputs"][0]["loudnessChannels"] = serde_json::json!(["L", "R"]);
+        assert_eq!(
+            parse(&c).unwrap().inputs[0].loudness_weights().unwrap(),
+            [1.0, 1.0]
+        );
+        c["inputs"][0]["loudnessChannels"] = serde_json::json!(["L", "X"]);
         assert!(parse(&c).is_err());
     }
 

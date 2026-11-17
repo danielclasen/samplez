@@ -43,16 +43,22 @@ releases its writers, which deletes the output flows.
 Further keys and their defaults: `maxCatchupBlocks` 2, `pruneAfterBlocks`
 50, `rampSamples` 480, `holdMs` 10, `contactWindowMs` 8,
 `historySlackMs` 50, `resyncBudgetMs` 50, per input
-`offsetSamples` 0, per output `loudnessChannels` (one of `L`, `R`, `C`,
-`Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5 Table 3;
-without it every channel weighs 1).
+`offsetSamples` 0, per input and output `loudnessChannels` (one of `L`,
+`R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
+Table 3; without it every channel weighs 1), and `meters`, each with a
+`name`, `channels` and `loudnessChannels`: matrix columns after the
+outputs' that are computed and metered and written to no flow.
 
-Each output's status carries its meters: sample peak, RMS and true peak
-per channel over the last 100 ms, the largest true peak, and momentary,
-short-term and integrated loudness and loudness range per EBU R 128.
+Each output's and each meter's status carries its meters: sample peak,
+RMS and true peak per channel over the last 100 ms, the largest true
+peak, and momentary, short-term and integrated loudness and loudness
+range per EBU R 128. Each input's status carries the sample peak and
+RMS per channel and the momentary loudness of the input after its
+strip, read or silenced; it has no true peak.
 RMS is referenced to a sine as in AES17: the root mean square times the
 square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
-`Engine::reset_loudness` restarts the measurement at a sample index. A
+`Engine::reset_loudness` restarts the measurement of an output or a
+meter at a sample index. A
 meter record lost on the way from the RT thread, samples not metered
 after an overrun, or an infinite or NaN sample mark integrated loudness
 and loudness range invalid until the next reset.
@@ -208,8 +214,8 @@ uncontended std lock, which makes no libc call, nor
 and the other blocking std primitives listed in `clippy.toml` in the RT
 modules. `cargo bench --bench rt` in samplez, samplez-dsp and
 samplez-mxl fails when the instruction count of the hold ring's paths,
-the page hashes, the strip calls of the RT loop, a block's DSP, the
-matrix copy of the core, a block's history stores or an output commit,
+the page hashes, the strip calls of the RT loop, a block's DSP and
+input meters, the matrix copy of the core, a block's history stores or an output commit,
 gap zero-fill included, exceeds the limit in the benchmark. One failure
 path is
 excepted from the no-allocation rule, and its probe is allowed by call

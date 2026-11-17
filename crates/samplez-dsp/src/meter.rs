@@ -1,5 +1,19 @@
 use crate::PlanarBuffer;
 
+/// Raises `peak` to the largest absolute sample of `x` and adds the
+/// squares of its samples to `sum_sq`, in f64. A NaN sample makes the
+/// peak NaN, and it stays NaN.
+#[inline]
+pub fn accumulate(x: &[f32], peak: &mut f32, sum_sq: &mut f64) {
+    for &v in x {
+        let a = v.abs();
+        if a > *peak || a.is_nan() {
+            *peak = a;
+        }
+        *sum_sq += f64::from(v) * f64::from(v);
+    }
+}
+
 /// Sample peak and sum of squares per channel, accumulated over blocks
 /// until [`Meters::reset`]. A NaN sample makes both NaN until the reset.
 #[derive(Clone, Debug)]
@@ -22,13 +36,7 @@ impl Meters {
     pub fn process(&mut self, buf: &PlanarBuffer, frames: usize) {
         assert_eq!(buf.channels(), self.peak.len());
         for (ch, (peak, sum_sq)) in self.peak.iter_mut().zip(&mut self.sum_sq).enumerate() {
-            for &s in &buf.channel(ch)[..frames] {
-                let a = s.abs();
-                if a > *peak || a.is_nan() {
-                    *peak = a;
-                }
-                *sum_sq += f64::from(s) * f64::from(s);
-            }
+            accumulate(&buf.channel(ch)[..frames], peak, sum_sq);
         }
         self.frames += frames as u64;
     }

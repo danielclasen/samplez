@@ -3,10 +3,10 @@
 //! swaps, a prune and the `InputDown` it brings, an `InputUp` whose
 //! generation is swapped in at its index with a fade-in, a re-route
 //! crossfade, a gain ramp, strip entries switching every strip unit on
-//! across a prune and a re-add, output metering and a loudness reset, and,
-//! for a replicated engine, every path of the hold ring (see
-//! `common::hold_scenario`) with its pages hashed. libmxl's own C++
-//! allocations are not seen by this allocator.
+//! across a prune and a re-add, output, meter and input metering and
+//! loudness resets, and, for a replicated engine, every path of the hold
+//! ring (see `common::hold_scenario`) with its pages hashed. libmxl's own
+//! C++ allocations are not seen by this allocator.
 
 mod common;
 
@@ -121,13 +121,9 @@ fn rt_thread_allocates_nothing() {
     let (src, dst) = (new_id(), new_id());
     let pilot = Pilot::start(&domain.0, &src, 2, B, 0);
     let matrix = vec![vec![0.5, 0.0], vec![0.0, 0.5]];
-    let (engine, rx) = start(config(
-        &domain.0,
-        &[(&src, 2)],
-        &[(&dst, 2)],
-        matrix,
-        MARGIN,
-    ));
+    let mut cfg = config(&domain.0, &[(&src, 2)], &[(&dst, 2)], matrix, MARGIN);
+    common::add_meter(&mut cfg, "bus", 2, 0.5);
+    let (engine, rx) = start(cfg);
     RT_TID.store(engine.status().rt.thread.tid, Relaxed);
     let attached = || engine.status().inputs[0].state == InputState::Attached;
     wait_for(Duration::from_secs(5), "input attached", attached);
@@ -147,6 +143,8 @@ fn rt_thread_allocates_nothing() {
     }
     let reset = (index / B + 40) * B;
     engine.reset_loudness(0, reset).unwrap();
+    // The meter after the output.
+    engine.reset_loudness(1, reset).unwrap();
     // The same id again: polled, re-added in a new generation, faded in.
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
     wait_for(Duration::from_secs(10), "input re-added", attached);
@@ -173,6 +171,11 @@ fn rt_thread_allocates_nothing() {
     assert_eq!(engine.status().generation.pending, None);
     assert_eq!(engine.status().diverged, None);
     assert!(verdicts.iter().any(|v| v.ramping), "no gain ramp seen");
+    let s = engine.status();
+    assert!(
+        s.meters[0].meters.window.is_some() && s.inputs[0].meters.window.is_some(),
+        "the meter and the input were not metered"
+    );
     let m = engine.status().outputs[0].meters.clone();
     assert_eq!(m.since, Some(reset.div_ceil(4800) * 4800), "{m:?}");
     assert!(
