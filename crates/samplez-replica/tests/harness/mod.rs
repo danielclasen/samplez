@@ -1011,9 +1011,12 @@ impl Audio for FakeAudio {
         })
     }
     /// The replay catches up within `catch_up` blocks and hands over.
+    /// `source` is read before the fake's lock is taken: it takes
+    /// contact's lock, which contact holds while it calls into the fake.
     fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, String> {
         self.step();
         let _ = source.entries(core.last_id);
+        let go = source.go();
         let mut st = self.lock();
         if !st.resyncs {
             return Err("resyncs are off".to_owned());
@@ -1022,7 +1025,7 @@ impl Audio for FakeAudio {
             st.failing -= 1;
             return Err("a replay failed".to_owned());
         }
-        if !source.go() {
+        if !go {
             return Err("given up".to_owned());
         }
         let donor: Vec<f32> = serde_json::from_str(&core.core).map_err(|e| e.to_string())?;

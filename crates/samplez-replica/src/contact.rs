@@ -215,7 +215,9 @@ pub trait Audio: Send + Sync + 'static {
     /// A joiner's side: replays `core` from past input with the committed
     /// log entries after its last log id that `source` gives, and hands
     /// the replayed state to the RT thread at a block boundary while
-    /// `source` says go. Blocks until handed over or failed.
+    /// `source` says go. Blocks until handed over or failed. `source`
+    /// takes contact's lock, which contact holds while it calls the other
+    /// methods here: no lock those take may be held across a call to it.
     fn resync(&self, _core: &CoreReply, _source: &dyn Source) -> Result<Resynced, String> {
         Err("no engine to resync".to_owned())
     }

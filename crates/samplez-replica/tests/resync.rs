@@ -6,13 +6,15 @@
 
 mod harness;
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{BLOCK, FOR_GOOD, Options, Set};
+use harness::{BLOCK, Clock, FOR_GOOD, FakeAudio, Options, Set};
 use samplez::blocks::PAGE;
-use samplez_replica::contact::{Timing, index_at};
+use samplez_replica::contact::{Audio, Timing, index_at};
 use samplez_replica::entry::{Baseline, Body, NodeId, Request};
 use samplez_replica::membership::{Slot, node_id, slot_of};
+use samplez_replica::resync::{CoreReply, Source};
 use samplez_replica::state::ReplicaState;
 use tokio::time::{Instant, sleep};
 
@@ -273,6 +275,40 @@ async fn x_stopped_while_r_starts_after_a_snapshot_install() {
         assert!(!w.has(i), "sample {i} committed while starting");
     }
     assert!(committed_after(&set, r, due(&set, r) - 3 * PAGE / BLOCK));
+}
+
+/// The fake's replay reads its source with its own lock free. Contact
+/// holds its lock while it calls into the fake, and the source takes that
+/// lock: read under the fake's lock, the replay's blocking thread and the
+/// runtime's thread each wait for the other's lock, and a paused-clock
+/// test stops for good, its deadlines never reached.
+#[test]
+fn the_fake_replay_reads_its_source_without_its_lock() {
+    struct Probe(Arc<FakeAudio>);
+    impl Source for Probe {
+        fn entries(&self, _after: u64) -> Vec<(u64, Request)> {
+            assert!(
+                self.0.state.try_lock().is_ok(),
+                "entries read under the lock"
+            );
+            Vec::new()
+        }
+        fn go(&self) -> bool {
+            assert!(self.0.state.try_lock().is_ok(), "go read under the lock");
+            true
+        }
+    }
+    let clock = Arc::new(Clock::new(Instant::now()));
+    let audio = Arc::new(FakeAudio::new(clock, Timing::defaults(BLOCK), 1, false));
+    audio.lock().resyncs = true;
+    let core = CoreReply {
+        k0: 0,
+        last_id: 0,
+        core: "[]".to_owned(),
+    };
+    audio
+        .resync(&core, &Probe(audio.clone()))
+        .expect("handed over");
 }
 
 /// The log index of the `Restamp`s and `Void`s `id`'s log holds on entry
