@@ -330,6 +330,32 @@ impl Kube {
     fn path(&self) -> String {
         format!("/api/v1/namespaces/{}/configmaps", self.namespace)
     }
+
+    /// `status.updateRevision` of the StatefulSet `name` in the marker's
+    /// namespace: the revision a rollout moves its pods to. None while
+    /// the StatefulSet reports none.
+    pub async fn update_revision(&self, name: &str) -> Result<Option<String>, String> {
+        let path = format!(
+            "/apis/apps/v1/namespaces/{}/statefulsets/{name}",
+            self.namespace
+        );
+        let (status, body) = self.call(Method::GET, &path, Vec::new()).await?;
+        if status != StatusCode::OK {
+            return Err(format!("GET {path}: {status}"));
+        }
+        #[derive(Deserialize)]
+        struct StatefulSet {
+            status: Option<SetStatus>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SetStatus {
+            update_revision: Option<String>,
+        }
+        let set: StatefulSet =
+            serde_json::from_slice(&body).map_err(|e| format!("StatefulSet {name}: {e}"))?;
+        Ok(set.status.and_then(|s| s.update_revision))
+    }
 }
 
 #[derive(Serialize, Deserialize)]

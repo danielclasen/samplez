@@ -704,6 +704,7 @@ async fn a_baseline_known_late_ranks_its_replica_demoted() {
             replica: late,
             order: vec![in_time],
             at_index: k * BLOCK,
+            key: None,
         }),
     };
     set.replica(leader)
@@ -764,6 +765,7 @@ async fn blocks_carry_the_rank_of_the_baseline_at_their_index() {
                 replica: first,
                 order: vec![other],
                 at_index: at * BLOCK,
+                key: None,
             }),
         };
         set.replica(leader)
@@ -806,6 +808,7 @@ async fn blocks_computed_in_one_catch_up_take_the_rank_of_their_index() {
                 replica: first,
                 order: vec![other],
                 at_index: at * BLOCK,
+                key: None,
             }),
         };
         set.replica(leader)
@@ -849,6 +852,7 @@ async fn a_baseline_learned_after_f_passed_a_block_leaves_its_rank() {
             replica: a(0),
             order: vec![a(1)],
             at_index: (due + 3) * BLOCK,
+            key: None,
         }),
     };
     set.replica(leader)

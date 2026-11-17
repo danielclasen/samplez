@@ -30,6 +30,9 @@ pub enum ReplicaState {
     /// Its output no longer follows the log or its peers: as withdrawn,
     /// never resuming on a hash match.
     Diverged,
+    /// Its compatibility key differs from the baseline's and it is no
+    /// old-key filler: it computes and commits nothing.
+    VersionMismatch,
 }
 
 impl ReplicaState {
@@ -123,6 +126,11 @@ pub fn filling(own: &Own) -> bool {
             .any(|run| run.status.kind == Kind::Committed && run.status.digest.is_none())
 }
 
+/// Whether two compatibility keys are known and differ.
+pub fn differs(a: Option<u64>, b: Option<u64>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a != b)
+}
+
 /// A peer as this replica's rules see it: its newest copy, direct or
 /// relayed.
 pub(crate) struct Seen<'a> {
@@ -143,6 +151,12 @@ pub(crate) struct View<'a> {
     pub alone: bool,
     /// The latest `Baseline` applied.
     pub baseline: Option<&'a Baseline>,
+    /// This replica's compatibility key ([`crate::rollout`]).
+    pub key: Option<u64>,
+    /// Retargets the engine's core from product state, with the entries
+    /// still unresolved given to it again; false to retry. The engine
+    /// keeps the generations built ([`samplez::Engine::install_product`]).
+    pub retarget: &'a dyn Fn() -> bool,
     /// Excluded by a `ClockVerdict`.
     pub excluded: bool,
     /// The other audio voters.
@@ -193,6 +207,10 @@ pub struct Metrics {
     /// Outputs resumed on a page-hash match, and mismatches.
     pub resumes: u64,
     pub divergences: u64,
+    /// Content discontinuities of a key hand-over: a commit start under
+    /// a `Baseline` whose key replaced another, and each fill of an
+    /// old-key filler.
+    pub version_switch_total: u64,
 }
 
 /// One audio replica's state and the commit starts it named.
@@ -216,6 +234,19 @@ pub(crate) struct Life {
     spent: Option<u64>,
     /// The highest fill block counted, per output.
     fills_counted: Vec<u64>,
+    /// The key of the latest `Baseline` seen, once one was.
+    base_key: Option<Option<u64>>,
+    /// An old-key filler from this P on: it fills through only, ranks
+    /// below every replica with the baseline's key and never resumes.
+    filler: Option<u64>,
+    /// The commit start the Named rule takes next follows a key
+    /// hand-over to this replica's key.
+    switching: bool,
+    /// Blocks up to here were withheld while the replica computed
+    /// nothing (`version_mismatch`): they spend no naming.
+    computed_from: Option<u64>,
+    /// The highest old-key fill block counted, per output.
+    switch_counted: Vec<u64>,
     /// When the last period was taken, TAI ns.
     last_tai: Option<u64>,
     withdrawn_ns: u64,
@@ -234,6 +265,11 @@ impl Life {
             named: None,
             spent: None,
             fills_counted: Vec::new(),
+            base_key: None,
+            filler: None,
+            switching: false,
+            computed_from: None,
+            switch_counted: Vec::new(),
             last_tai: None,
             withdrawn_ns: 0,
             metrics: Metrics::default(),
@@ -244,6 +280,11 @@ impl Life {
         self.state
     }
 
+    /// An old-key filler in a key hand-over (plan 2.11, Baseline).
+    pub fn filler(&self) -> bool {
+        self.filler.is_some()
+    }
+
     /// One report period.
     pub fn step(&mut self, v: &View, audio: &dyn Audio) {
         let outputs = v.own.standing.len();
@@ -251,6 +292,7 @@ impl Life {
         self.starts.resize(outputs, None);
         self.committed_end.resize(outputs, None);
         self.fills_counted.resize(outputs, 0);
+        self.switch_counted.resize(outputs, 0);
         self.note_starts(v.own);
         let b = v.timing.block;
         if let Some(last) = self.last_tai
@@ -261,7 +303,9 @@ impl Life {
         self.last_tai = Some(v.tai);
         self.metrics.withdrawn_seconds_total = self.withdrawn_ns as f64 / 1e9;
         for o in 0..outputs {
-            if let Some(w) = last_withheld(v.own, o) {
+            if let Some(w) = last_withheld(v.own, o)
+                && self.computed_from.is_none_or(|f| w > f)
+            {
                 self.withheld[o] = self.withheld[o].max(Some(w));
             }
             for run in v.own.statuses.get(o).into_iter().flatten() {
@@ -284,6 +328,15 @@ impl Life {
                     self.metrics.succession_discontinuity_total += last - from;
                     self.fills_counted[o] = last;
                 }
+                // Each fill of an old-key filler.
+                if self.filler.is_some_and(|p| (last + 1) * b > p)
+                    && s.digest.is_none()
+                    && last > self.switch_counted[o]
+                {
+                    let from = self.switch_counted[o].max(s.k.saturating_sub(1));
+                    self.metrics.version_switch_total += last - from;
+                    self.switch_counted[o] = last;
+                }
             }
         }
         // A replica held in `starting` stays there; it diverges once it
@@ -292,6 +345,7 @@ impl Life {
             self.diverge(audio);
         }
         self.taken(v);
+        self.keys(v, audio);
         self.note_naming(v, audio);
         self.leave_starting(v);
         self.follow_standing(v);
@@ -358,6 +412,10 @@ impl Life {
             if let Some(end) = s.end_before {
                 self.metrics.resume_gap_samples += from.saturating_sub(end);
             }
+            if matches!(s.why, Why::Named(_)) && self.switching && !s.filling {
+                self.switching = false;
+                self.metrics.version_switch_total += 1;
+            }
             match s.why {
                 Why::Named(_) if !s.filling => self.metrics.succession_discontinuity_total += 1,
                 Why::Resume => self.metrics.resumes += 1,
@@ -373,12 +431,19 @@ impl Life {
         let Some(p) = v.own.processed else { return };
         self.ready_at = Some(p);
         self.state = ReplicaState::Withdrawn;
+        let named = v.baseline.is_some_and(|b| b.replica == v.me);
+        if !named && differs(v.key, v.baseline.and_then(|b| b.key)) {
+            self.state = ReplicaState::VersionMismatch;
+        }
     }
 
     /// Committing while an output commits and none is withdrawn; withdrawn
     /// on the engine's withdrawal.
     fn follow_standing(&mut self, v: &View) {
-        if self.state == ReplicaState::Starting {
+        if matches!(
+            self.state,
+            ReplicaState::Starting | ReplicaState::VersionMismatch
+        ) {
             return;
         }
         let realised = |o: usize| v.realised.get(o).copied().unwrap_or(true);
@@ -444,6 +509,17 @@ impl Life {
         let Some(processed) = v.own.processed else {
             return;
         };
+        // Named, a replica that computes nothing retargets its core from
+        // product state first, and commits once it took it.
+        if self.state == ReplicaState::VersionMismatch {
+            // Refused, and retried, while a generation the core names is
+            // not built: it never hands over without it.
+            if !(v.retarget)() {
+                return;
+            }
+            self.computed_from = Some(processed);
+            self.state = ReplicaState::Withdrawn;
+        }
         let min_k = match self.named {
             Some((_, Some(k))) => k,
             _ => {
@@ -471,6 +547,82 @@ impl Life {
                 filling,
                 reference: self.reference(o),
             });
+        }
+    }
+
+    /// The key hand-over (plan 2.11, Baseline). Once the latest `Baseline`
+    /// carries another key than this replica's, a replica that had the
+    /// previous baseline's key is an old-key filler from P: committing,
+    /// it commits up to P (`committed up to P` on the block holding P);
+    /// demoted and not excluded, it fills as before. It turns
+    /// `version_mismatch` once a second replica with the baseline's key
+    /// commits; any other replica is `version_mismatch` at once. Once the
+    /// baseline's key is its own again it is no filler, and one in
+    /// `version_mismatch` retargets its core and is withdrawn, its resume
+    /// reference that moment.
+    fn keys(&mut self, v: &View, audio: &dyn Audio) {
+        let Some(b) = v.baseline else { return };
+        let now = b.key;
+        let before = self.base_key.replace(now);
+        let mine = v.key;
+        if !differs(mine, now) {
+            // Back to its key before its stop at P took: the stop lapses
+            // and the output goes on committing.
+            if self.filler.take().is_some() {
+                for (o, s) in v.own.standing.iter().enumerate() {
+                    if matches!(s, Standing::Committing { .. }) {
+                        audio.stop_at(o, u64::MAX);
+                    }
+                }
+            }
+            if before != Some(now) && b.replica == v.me && before.is_some_and(|k| differs(mine, k))
+            {
+                self.switching = true;
+            }
+            if self.state == ReplicaState::VersionMismatch && (v.retarget)() {
+                self.computed_from = v.own.processed;
+                self.ready_at = v.own.processed;
+                self.state = ReplicaState::Withdrawn;
+            }
+            return;
+        }
+        if self.state == ReplicaState::Starting {
+            return;
+        }
+        let handed_over = before.is_some_and(|k| k != now && !differs(mine, k));
+        if handed_over && self.state != ReplicaState::VersionMismatch && !v.excluded {
+            let p = b.at_index.next_multiple_of(PAGE);
+            self.filler = Some(p);
+            self.cancel(audio, |_| true);
+            for (o, s) in v.own.standing.iter().enumerate() {
+                if matches!(s, Standing::Committing { .. }) {
+                    audio.stop_at(o, p);
+                }
+            }
+            self.state = ReplicaState::Withdrawn;
+            return;
+        }
+        // The baseline moved on from another key than its own: no filler.
+        if before.is_some_and(|k| k != now && differs(mine, k)) {
+            self.filler = None;
+        }
+        let second = v
+            .peers
+            .iter()
+            .filter(|x| {
+                !x.silent
+                    && x.own.key.is_some()
+                    && x.own.key == now
+                    && x.own.state == Some(ReplicaState::Committing)
+            })
+            .count()
+            >= 2;
+        if self.state != ReplicaState::VersionMismatch && (self.filler.is_none() || second) {
+            self.filler = None;
+            self.state = ReplicaState::VersionMismatch;
+            self.cancel(audio, |_| true);
+            audio.withdraw();
+            audio.drop_engine();
         }
     }
 
@@ -533,7 +685,8 @@ impl Life {
         if !matches!(
             self.state,
             ReplicaState::Withdrawn | ReplicaState::Committing
-        ) || self.starts[o].is_some()
+        ) || self.filler.is_some()
+            || self.starts[o].is_some()
             || matches!(v.own.standing[o], Standing::Committing { .. })
             || !v.realised.get(o).copied().unwrap_or(true)
         {
@@ -640,7 +793,10 @@ impl Life {
     /// committed lies after that page, committing now or not, or the
     /// replica is diverged already.
     pub fn verdict(&mut self, page: u64, own: &Own, realised: &[bool], audio: &dyn Audio) {
-        if matches!(self.state, ReplicaState::Diverged | ReplicaState::Starting) {
+        if matches!(
+            self.state,
+            ReplicaState::Diverged | ReplicaState::Starting | ReplicaState::VersionMismatch
+        ) {
             return;
         }
         self.note_starts(own);
@@ -662,7 +818,10 @@ impl Life {
     /// Diverged at once: the replica applied an entry the log restamped
     /// or voided, so its state contradicts the log's decision.
     pub fn contradicted(&mut self, audio: &dyn Audio) {
-        if matches!(self.state, ReplicaState::Diverged | ReplicaState::Starting) {
+        if matches!(
+            self.state,
+            ReplicaState::Diverged | ReplicaState::Starting | ReplicaState::VersionMismatch
+        ) {
             return;
         }
         self.diverge(audio);
@@ -678,6 +837,7 @@ impl Life {
             self.spent = Some(p);
         }
         self.ready_at = None;
+        self.filler = None;
         // A replica still starting has committed nothing to withdraw.
         if std::mem::replace(&mut self.state, ReplicaState::Starting) != ReplicaState::Starting {
             audio.withdraw();
@@ -767,6 +927,16 @@ mod tests {
         fn cancel_commit_start(&self, output: usize) {
             self.0.lock().unwrap().push(format!("cancel {output}"));
         }
+        fn stop_at(&self, output: usize, at: u64) {
+            self.0.lock().unwrap().push(format!("stop {output} {at}"));
+        }
+        fn drop_engine(&self) {
+            self.0.lock().unwrap().push("drop".into());
+        }
+        fn rebuild_engine(&self) -> bool {
+            self.0.lock().unwrap().push("rebuild".into());
+            true
+        }
     }
 
     fn me() -> NodeId {
@@ -804,6 +974,8 @@ mod tests {
             ready: true,
             alone: false,
             baseline,
+            key: None,
+            retarget: &|| calls.rebuild_engine(),
             excluded: false,
             above: peers.iter().map(|p| p.id).collect(),
             peers,
@@ -848,6 +1020,7 @@ mod tests {
             replica: me(),
             order: Vec::new(),
             at_index,
+            key: None,
         }
     }
 

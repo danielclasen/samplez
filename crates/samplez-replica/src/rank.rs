@@ -272,6 +272,7 @@ mod tests {
             replica,
             order: order.to_vec(),
             at_index,
+            key: None,
         }
     }
 

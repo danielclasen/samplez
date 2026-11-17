@@ -19,6 +19,10 @@ use crate::blocks::PageHash;
 use crate::engine::Entry;
 use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRESOLVED};
 
+/// The engine version a core's encoding carries: a core is replayed only
+/// by the engine that copied it.
+pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// An input slot's part of the core.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct SlotCore {

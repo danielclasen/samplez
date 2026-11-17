@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+use samplez_replica::rollout::Fixed;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -425,9 +426,6 @@ pub struct Fake {
     /// Commit starts the supervisor named, `(output, min_k)`, and cancels.
     pub commit_starts: Vec<(usize, u64)>,
     pub cancels: Vec<usize>,
-    /// Engine cores dropped and rebuilt.
-    pub drops: u64,
-    pub rebuilds: u64,
     /// Blocks `[from, to)` whose samples differ from every other replica's
     /// by a factor `1 + by`, in what is hashed, not in what is written: content
     /// diverged.
@@ -437,6 +435,29 @@ pub struct Fake {
     pub fingerprints: Vec<(u64, u64, u64)>,
     /// A generation its pending entries need is not built.
     pub generation_pending: bool,
+    /// The engine's core is dropped: every block is skipped, withheld
+    /// without a status word, until it is rebuilt.
+    pub no_core: bool,
+    /// Cores dropped and rebuilt.
+    pub drops: u64,
+    pub rebuilds: u64,
+    /// Stops the supervisor named, `(output, at)`.
+    pub stops: Vec<(usize, u64)>,
+    /// Blocks `[from, to)` skipped and withheld for a cause; for
+    /// `ClockStep`, a detected clock step, with the step fence
+    /// self-reported.
+    pub stepped: Vec<(u64, u64, Cause)>,
+    /// A stop at `u64::MAX`, letting a pending stop lapse, is recorded and
+    /// not applied: it arrives after the stop took.
+    pub lapse_late: bool,
+    /// Rebuilds refused: a generation the core names was not built.
+    pub refused_rebuilds: u64,
+    /// Entries the core holds unresolved: a rebuilt core holds none.
+    pub core_unresolved: BTreeSet<u64>,
+    /// The length of `unresolved` at each rebuild.
+    pub rebuilt_at: Vec<usize>,
+    /// Entries resolved, with the length of `unresolved` then.
+    pub resolved: Vec<(u64, usize)>,
 }
 
 impl Fake {
@@ -644,9 +665,28 @@ impl FakeAudio {
         let Some(target) = target else {
             return;
         };
+        if st.no_core {
+            st.computed = Some(target);
+            return;
+        }
         let first = st.computed.map_or(target, |c| c + 1);
+        if !st.stepped.is_empty() {
+            st.flags.step_fence = st
+                .stepped
+                .iter()
+                .any(|&(a, z, c)| c == Cause::ClockStep && (a..z).contains(&target));
+        }
         let b = self.timing.block;
         for k in first..=target {
+            if let Some(&(_, _, cause)) = st.stepped.iter().find(|&&(a, z, _)| (a..z).contains(&k))
+            {
+                for out in &mut st.outputs {
+                    out.statuses.withhold(k, cause);
+                }
+                st.withdraw(true);
+                st.computed = Some(k);
+                continue;
+            }
             let ctx = st.ctx();
             let digest = st.digest(k);
             let data: Vec<f32> = (k * b..(k + 1) * b).map(|i| i as f32).collect();
@@ -807,8 +847,16 @@ impl Audio for FakeAudio {
         self.lock().committed.push((up_to, tai));
     }
     fn unresolved(&self, index: u64, at_index: u64) -> bool {
-        self.lock().unresolved.push((index, at_index));
+        let mut st = self.lock();
+        st.unresolved.push((index, at_index));
+        st.core_unresolved.insert(index);
         true
+    }
+    fn resolved(&self, index: u64) {
+        let mut st = self.lock();
+        let n = st.unresolved.len();
+        st.resolved.push((index, n));
+        st.core_unresolved.remove(&index);
     }
     fn skip(&self, index: u64) {
         self.lock().skipped.push(index);
@@ -835,13 +883,6 @@ impl Audio for FakeAudio {
         self.step();
         self.lock().withdraw_all();
     }
-    fn drop_engine(&self) {
-        self.lock().drops += 1;
-    }
-    fn rebuild_engine(&self) -> bool {
-        self.lock().rebuilds += 1;
-        true
-    }
     fn ranks(&self, ranks: Ranks) {
         let tai = self.clock.tai_ns();
         self.lock().ranks.push((tai, ranks));
@@ -865,6 +906,38 @@ impl Audio for FakeAudio {
         {
             out.hold.cancel_commit_start();
         }
+    }
+    fn stop_at(&self, output: usize, at: u64) {
+        self.step();
+        let mut st = self.lock();
+        st.stops.push((output, at));
+        if at == u64::MAX && st.lapse_late {
+            return;
+        }
+        if let Some(out) = st.outputs.get_mut(output) {
+            out.hold.stop_at(at);
+        }
+    }
+    fn drop_engine(&self) {
+        self.step();
+        let mut st = self.lock();
+        st.drops += 1;
+        st.no_core = true;
+    }
+    /// Refused while a generation the core names is not built.
+    fn rebuild_engine(&self) -> bool {
+        self.step();
+        let mut st = self.lock();
+        if st.generation_pending {
+            st.refused_rebuilds += 1;
+            return false;
+        }
+        st.rebuilds += 1;
+        st.no_core = false;
+        st.core_unresolved.clear();
+        let n = st.unresolved.len();
+        st.rebuilt_at.push(n);
+        true
     }
 }
 
@@ -1302,6 +1375,11 @@ pub struct Set {
     _panics: PanicGuard,
     replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
     audios: BTreeMap<NodeId, Arc<FakeAudio>>,
+    /// Per replica, the compatibility key and revision it starts with
+    /// next; key 1 at revision `r1` when not set.
+    versions: BTreeMap<NodeId, (u64, String)>,
+    rollouts: BTreeMap<NodeId, Arc<Fixed>>,
+    target: Option<String>,
 }
 
 impl Set {
@@ -1331,6 +1409,9 @@ impl Set {
             _panics: PanicGuard::new(),
             replicas: BTreeMap::new(),
             audios: BTreeMap::new(),
+            versions: BTreeMap::new(),
+            rollouts: BTreeMap::new(),
+            target: None,
         };
         for &(id, s) in &set.options.kernel_offsets {
             set.clocks[&id].set_kernel_offset(s);
@@ -1436,6 +1517,15 @@ impl Set {
             replica
                 .contact(timing, Arc::new(Tai(clock)), engine)
                 .expect("contact starts");
+            let (key, revision) = self
+                .versions
+                .get(&id)
+                .cloned()
+                .unwrap_or((1, "r1".to_owned()));
+            let rollout = Fixed::new(key, Some(revision));
+            rollout.set_target(self.target.clone());
+            replica.rollout(rollout.clone()).expect("contact runs");
+            self.rollouts.insert(id, rollout);
             if let Some(audio) = audio {
                 self.audios.insert(id, audio);
             }
@@ -1453,6 +1543,20 @@ impl Set {
         links.replicas.insert(id, replica.clone());
         drop(links);
         self.replicas.insert(id, replica);
+    }
+
+    /// `id` starts with compatibility key `key` at `revision` from its
+    /// next restart on: its pod rolled to that revision.
+    pub fn set_version(&mut self, id: NodeId, key: u64, revision: &str) {
+        self.versions.insert(id, (key, revision.to_owned()));
+    }
+
+    /// The audio StatefulSet's target revision, as every replica reads it.
+    pub fn set_target(&mut self, target: Option<&str>) {
+        self.target = target.map(str::to_owned);
+        for r in self.rollouts.values() {
+            r.set_target(self.target.clone());
+        }
     }
 
     /// Stops `id` as a process crash would: its peers stop reaching it at
