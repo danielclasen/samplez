@@ -752,6 +752,7 @@ fn replay_rt(
         taken: 0,
         skip_upto: 0,
         install_at: 0,
+        install_strips: false,
         replay: true,
         core: true,
         cmd: none(),
@@ -1079,6 +1080,7 @@ impl Engine {
             taken: 0,
             skip_upto: 0,
             install_at: 0,
+            install_strips: false,
             replay: false,
             core: true,
             cmd: cmd_rx,
@@ -1809,7 +1811,7 @@ impl Engine {
             .expect("checked above");
         let (slots, in_domains) = new_slots(&self.config);
         let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
-        if !c.fits(n, m, &legs, page) {
+        if !c.fits(n, m, &legs, self.config.ramp_samples, page) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -1861,7 +1863,7 @@ impl Engine {
         let (hashes_tx, hashes) = rtrb::RingBuffer::new(4 * self.config.outputs.len().max(1));
         let (control, control_rx) = rtrb::RingBuffer::new(UNRESOLVED);
         let mut rt = replay_rt(&self.config, &self.api, gens, hashes_tx, control_rx);
-        rt.install_core(c, copy.last_id);
+        rt.install_core(c, copy.last_id, true);
         Ok(Replay {
             rt: Box::new(rt),
             hashes,
@@ -1987,13 +1989,12 @@ impl Engine {
             core.page_entries.clear();
             core.entries_page = None;
             core.entries_lost = false;
+            // The RT thread keeps its strips.
             for (c, &up) in core.slots.iter_mut().zip(&up) {
                 *c = SlotCore {
                     up,
-                    held: false,
-                    fade_start: None,
                     silenced_last: true,
-                    xfade: None,
+                    ..SlotCore::default()
                 };
             }
             core.awaiting_gen.clear();
@@ -2013,13 +2014,13 @@ impl Engine {
     /// before the block after the core's: each attempt waits for it to
     /// compute a block, has `make` fill a core for that block at once and
     /// passes it on before the RT thread's next wake. `make` returns the
-    /// block the core follows and the highest log id it knew. With
-    /// `names_gen` the core must name the pending generation the RT
-    /// thread holds.
+    /// block the core follows and the highest log id it knew. A
+    /// `replayed` core must name the pending generation the RT thread
+    /// holds, and its strips are installed.
     fn offer(
         &self,
         timeout: Duration,
-        names_gen: bool,
+        replayed: bool,
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
@@ -2109,7 +2110,7 @@ impl Engine {
                 j,
                 last_id,
                 core,
-                names_gen,
+                replayed,
                 answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
@@ -4530,7 +4531,7 @@ mod tests {
             j: copy.k0,
             last_id: copy.last_id,
             core: copy.core,
-            names_gen: true,
+            replayed: true,
             answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
@@ -4666,7 +4667,7 @@ mod tests {
         };
         rt.awaiting_gen.push(route);
         rt.slots[0].held = true;
-        rt.install_core(&core, 5);
+        rt.install_core(&core, 5, true);
         assert_eq!(rt.awaiting_gen, [route]);
         assert!(rt.slots[0].held);
         e.stop();
@@ -4674,8 +4675,8 @@ mod tests {
     }
 
     /// Without a core a strip entry whose index passed still reaches its
-    /// slot's strip, which the slot keeps across the drop: a core
-    /// installed later holds no strip, so the entry would be lost.
+    /// slot's strip, which the slot keeps across the drop: a core built
+    /// from product state holds no strip, so the entry would be lost.
     #[test]
     fn a_strip_entry_due_without_a_core_reaches_the_strip() {
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
@@ -4717,7 +4718,8 @@ mod tests {
         assert_eq!(rt.counters.entries_without_core.load(Relaxed), 2);
 
         // A strip entry the core knew, pending here, whose index the core
-        // passed: the core holds no strip, so it applies at the install.
+        // passed: a product core holds no strip, so it applies at the
+        // install.
         let gain = StripParam::Trim { db: -3.0 };
         assert!(rt.mix.push(entry(
             4,
@@ -4732,7 +4734,7 @@ mod tests {
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
-        rt.install_core(&core, 4);
+        rt.install_core(&core, 4, false);
         assert!(rt.mix.pending.is_empty());
         assert_eq!(rt.slots[0].strip_pos, Some(192));
         let mut set = samplez_dsp::Strip::new(1, config.ramp_samples);
@@ -4803,7 +4805,7 @@ mod tests {
                 j: stale,
                 last_id: replay.last_id,
                 core,
-                names_gen: true,
+                replayed: true,
                 answer: Answer::Waiting,
             };
             assert!(t.handovers.push(h).is_ok());

@@ -145,9 +145,9 @@ log entries applied in it and whether the page was committed whole.
 For a resync, `Engine::copy_core` has the RT thread copy the engine's
 core after the next block k0 into a buffer allocated off it: the matrix
 with its ramps, the pending entries and those applied in the page in
-progress, each input's log state and fades, the entries waiting for a
-generation and the pending generation's entry id, and the unresolved
-entries. Meters, hold rings, statuses and readers stay with the replica.
+progress, each input's log state and fades, each strip with its filter
+and dynamics state and position, the entries waiting for a generation
+and the pending generation's entry id, and the unresolved entries. Meters, hold rings, statuses and readers stay with the replica.
 History rings (`History` in samplez-dsp) hold a delay plus
 `historySlackMs` of slack as relaxed atomic bit patterns; the RT thread
 publishes the block it starts before it stores any history sample, and a
@@ -183,11 +183,11 @@ at start-up on silence.
 the engine version; `CoreCopy::decode` refuses a core of another version
 or one holding a value no engine holds (an index beyond 2^62, a gain or
 strip parameter out of range, a ramp past its length, a matrix beyond
-`MAX_COEFFICIENTS`, 2^18, which configurations are held to as well), and
-`Engine::replay` one of another shape or with an entry outside the
-engine. Strip state is not part of the core: a replica keeps its own
-across a hand-over, so a resync with strips active converges only as
-far as their state already agrees.
+`MAX_COEFFICIENTS`, 2^18, which configurations are held to as well, a
+strip `Strip::is_valid` refuses: a non-finite state, an envelope, pole
+or ramp out of its range, a filter target other than its parameters'),
+and `Engine::replay` one of another shape, with strips of other legs or
+ramp length, or with an entry outside the engine.
 
 `Engine::drop_core` drops the RT thread's core while the replica starts:
 the RT thread keeps its writers, flows, hold rings and statuses, computes
@@ -195,7 +195,8 @@ no block and withholds each one, overrun skips included, cause `NoCore`
 (`StatusChange::NoCore` ranges), with the replica withdrawn. Entries
 needing no generation whose index passes meanwhile are taken off the
 pending list, strip entries applied to the strips the slots keep and the
-others not, and the core installed next must know them.
+others not, and the core installed next must know them. A replayed core
+replaces the strips; one built from product state leaves them.
 `Engine::install_product` builds a core from product state off the RT
 thread (targets at their values, fades and ramps cold, the pending
 entries, no unresolved entry; the RT thread keeps its pending generation)
