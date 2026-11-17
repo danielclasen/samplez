@@ -22,6 +22,12 @@ pub struct Replicated {
     /// Entries the engine applies at a future at_index, and the decisions
     /// on them (restamped, voided), by revision.
     pub pending: BTreeMap<u64, Body>,
+    /// [`crate::state_machine::StateMachine::terms`].
+    #[serde(default)]
+    pub terms: BTreeMap<u64, (u64, u64)>,
+    /// [`crate::state_machine::StateMachine::restamps`].
+    #[serde(default)]
+    pub restamps: BTreeMap<u64, (u32, u64)>,
     pub baseline: Option<Baseline>,
     /// The latest `ClockVerdict` per replica.
     pub verdicts: BTreeMap<NodeId, bool>,

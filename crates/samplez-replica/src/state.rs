@@ -657,6 +657,29 @@ impl Life {
         self.diverge(audio);
     }
 
+    /// Diverged at once: the replica applied an entry the log restamped
+    /// or voided, so its state contradicts the log's decision.
+    pub fn contradicted(&mut self, audio: &dyn Audio) {
+        if matches!(self.state, ReplicaState::Diverged | ReplicaState::Starting) {
+            return;
+        }
+        self.diverge(audio);
+    }
+
+    /// Back to `starting` after a snapshot install or a purge-point
+    /// verdict: whatever the running engine computed no longer follows
+    /// the log, so nothing more of it is committed. The replica leaves
+    /// `starting` once ready, with an engine rebuilt from product state.
+    pub fn restart(&mut self, audio: &dyn Audio) {
+        self.cancel(audio, |_| true);
+        if let Some((p, _)) = self.named.take() {
+            self.spent = Some(p);
+        }
+        self.ready_at = None;
+        self.state = ReplicaState::Starting;
+        audio.withdraw();
+    }
+
     fn diverge(&mut self, audio: &dyn Audio) {
         self.state = ReplicaState::Diverged;
         self.metrics.divergences += 1;

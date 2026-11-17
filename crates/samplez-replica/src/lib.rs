@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod bridge;
 pub mod clock;
 pub mod contact;
+pub mod decide;
 pub mod dedup;
 pub mod entry;
 pub mod log_store;

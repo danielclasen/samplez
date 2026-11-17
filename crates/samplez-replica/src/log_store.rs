@@ -362,6 +362,16 @@ impl<P> Store<P> {
         }
     }
 
+    /// The index of the last purged log id, 0 for none.
+    pub fn purged_index(&self) -> u64 {
+        self.lock().last_purged.map_or(0, |id| id.index)
+    }
+
+    /// The restamps behind the entry at `index`, as applied.
+    pub fn restamps(&self, index: u64) -> u32 {
+        self.lock().sm.restamps.get(&index).map_or(0, |&(n, _)| n)
+    }
+
     /// Calls `f` with the log index and body of every entry the engine
     /// applies at a future index, as the state machine holds them, purged
     /// ones included.
@@ -600,7 +610,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
             inner.last_applied = Some(id);
             responses.push(match &entry.payload {
                 EntryPayload::Blank => Response::default(),
-                EntryPayload::Normal(request) => inner.sm.apply(id.index, request),
+                EntryPayload::Normal(request) => inner.sm.apply_at(id.index, id.term, request),
                 EntryPayload::Membership(membership) => {
                     inner.membership = StoredMembershipConfig {
                         log_id: Some(id),

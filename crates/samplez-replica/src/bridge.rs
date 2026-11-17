@@ -27,6 +27,13 @@ use crate::report::{ClockFlags, Own, Page, Unwritten, page_digest, runs};
 /// none for an entry the engine does not apply.
 pub type Translate = Box<dyn Fn(&Request) -> Option<(u64, Entry)> + Send + Sync>;
 
+/// The product state, as applied, that a dropped engine core is rebuilt
+/// from; none while it cannot be read.
+pub type Rebuild = Box<dyn Fn() -> Option<samplez::ProductState> + Send + Sync>;
+
+/// How long a rebuild waits for the RT thread to take the core.
+const REBUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The engine entry of an `InputDown` or `InputUp` body; a product's
 /// [`Translate`] adds the entries only it can read, such as a route.
 pub fn input_entry(request: &Request) -> Option<(u64, Entry)> {
@@ -110,6 +117,7 @@ pub struct EngineAudio {
     unwritten: Mutex<Unwrittens>,
     /// Appended entries the engine refused.
     refused: AtomicU64,
+    rebuild: Option<Rebuild>,
 }
 
 impl EngineAudio {
@@ -135,6 +143,7 @@ impl EngineAudio {
             block: timing.block,
             window: samples.div_ceil(timing.block) + 1,
             refused: AtomicU64::new(0),
+            rebuild: None,
             unwritten: Mutex::new(Unwrittens {
                 changes,
                 kept: VecDeque::new(),
@@ -142,6 +151,14 @@ impl EngineAudio {
                 pages: (0..outputs).map(|_| VecDeque::new()).collect(),
             }),
         }
+    }
+
+    /// Where a core dropped on a snapshot install or a purge-point
+    /// verdict is rebuilt from; without it the replica stays in
+    /// `starting`.
+    pub fn with_rebuild(mut self, rebuild: Rebuild) -> EngineAudio {
+        self.rebuild = Some(rebuild);
+        self
     }
 
     /// The engine's refusal of an appended entry: the engine then lacks
@@ -299,6 +316,31 @@ impl Audio for EngineAudio {
     fn cancel_commit_start(&self, output: usize) {
         if let Err(e) = self.engine.cancel_commit_start(output) {
             tracing::warn!(output, error = %e, "the engine refused a commit start's cancel");
+        }
+    }
+
+    fn resolved(&self, index: u64) {
+        if let Err(e) = self.engine.resolved(index) {
+            tracing::warn!(index, error = %e, "the engine refused a resolution");
+        }
+    }
+
+    fn drop_engine(&self) {
+        if let Err(e) = self.engine.drop_core() {
+            tracing::error!(error = %e, "the engine refused to drop its core");
+        }
+    }
+
+    fn rebuild_engine(&self) -> bool {
+        let Some(state) = self.rebuild.as_ref().and_then(|r| r()) else {
+            return false;
+        };
+        match self.engine.install_product(&state, REBUILD_WAIT) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(error = ?e, "the engine core was not rebuilt");
+                false
+            }
         }
     }
 }
