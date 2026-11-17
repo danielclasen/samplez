@@ -240,7 +240,9 @@ impl CoreCopy {
         }
         let copy: CoreCopy =
             serde_json::from_value(wire.copy).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-        if !copy.core.sane() || copy.k0 > INDEX_MAX {
+        // A block number: its first index stays within INDEX_MAX at the
+        // largest block size.
+        if !copy.core.sane() || copy.k0 > INDEX_MAX / 1024 {
             return Err(DecodeError::Malformed(
                 "a core holding a value no engine holds".to_owned(),
             ));
@@ -604,6 +606,20 @@ mod tests {
             matches!(CoreCopy::decode(&encoded), Err(DecodeError::Malformed(_))),
             "a ramp position past its length"
         );
+    }
+
+    /// A core after a block whose index would overflow at the largest
+    /// block size is refused.
+    #[test]
+    fn a_core_after_a_block_beyond_any_index_is_refused() {
+        let mut copy = copy();
+        copy.k0 = INDEX_MAX / 1024 + 1;
+        assert!(matches!(
+            CoreCopy::decode(&copy.encode()),
+            Err(DecodeError::Malformed(_))
+        ));
+        copy.k0 = INDEX_MAX / 1024;
+        assert!(CoreCopy::decode(&copy.encode()).is_ok());
     }
 
     /// A core of another shape, or with an entry outside the engine,
