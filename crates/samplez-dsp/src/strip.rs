@@ -250,7 +250,7 @@ pub const DEFAULT_BANDS: [EqBand; EQ_BANDS] = [
 /// unchanged: trims at 0 dB, no leg inverted, high-pass, equaliser, gate
 /// and compressor off, the bands at [`DEFAULT_BANDS`], the high-pass at
 /// 80 Hz, the dynamics after the equaliser.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Strip {
     legs: usize,
     ramp: u32,
@@ -320,6 +320,48 @@ impl Strip {
         self.legs
     }
 
+    /// The samples a change ramps over.
+    pub fn ramp(&self) -> u32 {
+        self.ramp
+    }
+
+    /// Whether the strip holds what one built by [`Strip::new`] and
+    /// changed by its methods holds, as far as the state shows without
+    /// its history: 1 to [`MAX_LEGS`] legs, every parameter within its
+    /// range, each leg's gain ramping to the gain of its trims and
+    /// polarity, each filter section to the coefficients of its
+    /// parameters, the dynamics within their ranges, and every ramp and
+    /// state valid and finite. A strip decoded from a peer is checked
+    /// with it before it runs.
+    pub fn is_valid(&self) -> bool {
+        let trim = |db: &f32| TRIM_DB.contains(db);
+        let finite = |states: &[[[f32; 2]; MAX_LEGS]; EQ_BANDS]| {
+            states.iter().flatten().flatten().all(|v| v.is_finite())
+        };
+        (1..=MAX_LEGS).contains(&self.legs)
+            && trim(&self.trim_db)
+            && self.leg_trim_db.iter().all(trim)
+            && self.gain.iter().all(Ramp::is_valid)
+            && (0..self.legs).all(|leg| self.gain[leg].target == self.gain_of(leg))
+            && HPF_FREQ.contains(&self.hpf_freq)
+            && self.hpf.is_valid(
+                Shape::HighPass {
+                    freq: self.hpf_freq,
+                },
+                self.hpf_enabled,
+            )
+            && self.bands.iter().all(|b| b.refusal().is_ok())
+            && (self.eq.iter().zip(&self.bands))
+                .all(|(eq, band)| eq.is_valid(band.shape(), self.eq_enabled))
+            && self.gate.is_valid()
+            && self.comp.is_valid()
+            && self.fade.is_within(0.0..=1.0)
+            && (self.fade.target == 0.0 || self.fade.target == 1.0)
+            && finite(&self.alt_eq)
+            && self.alt_gate.is_valid()
+            && self.alt_comp.is_valid()
+    }
+
     /// Sets `param` from the next sample processed on, ramping over the
     /// strip's ramp length. Returns false and changes nothing when
     /// [`StripParam::check`] refuses it; a refusal does not allocate.
@@ -371,12 +413,16 @@ impl Strip {
         true
     }
 
-    fn retarget_gain(&mut self, leg: usize) {
+    /// The gain of leg `leg`'s trims and polarity.
+    fn gain_of(&self, leg: usize) -> f32 {
         let db = f64::from(self.trim_db) + f64::from(self.leg_trim_db[leg]);
         let g = libm::pow(10.0, db / 20.0) as f32;
-        let g = if self.inverted[leg] { -g } else { g };
+        if self.inverted[leg] { -g } else { g }
+    }
+
+    fn retarget_gain(&mut self, leg: usize) {
         // Within +-40 dB, so within MAX_GAIN.
-        let _ = self.gain[leg].set_target(g, self.ramp);
+        let _ = self.gain[leg].set_target(self.gain_of(leg), self.ramp);
     }
 
     fn retarget_band(&mut self, band: usize) {
@@ -1424,5 +1470,131 @@ mod tests {
         s.process(&mut silence, 48);
         crate::restore_mxcsr(saved);
         assert!(silence.iter().all(|v| v.to_bits() == 0));
+    }
+
+    /// A value within `r`, now and then at a bound.
+    fn pick(rng: &mut crate::test_util::Rng, r: &RangeInclusive<f32>) -> f32 {
+        match rng.below(8) {
+            0 => *r.start(),
+            1 => *r.end(),
+            _ => r.start() + (rng.unit() + 1.0) / 2.0 * (r.end() - r.start()),
+        }
+    }
+
+    /// A parameter within its range.
+    fn param(rng: &mut crate::test_util::Rng, legs: usize) -> StripParam {
+        let on = rng.below(4) != 0;
+        match rng.below(9) {
+            0 => StripParam::Trim {
+                db: pick(rng, &TRIM_DB),
+            },
+            1 => StripParam::LegTrim {
+                leg: rng.below(legs),
+                db: pick(rng, &TRIM_DB),
+            },
+            2 => StripParam::Polarity {
+                leg: rng.below(legs),
+                inverted: on,
+            },
+            3 => StripParam::Hpf {
+                enabled: on,
+                freq: pick(rng, &HPF_FREQ),
+            },
+            4 => StripParam::Eq { enabled: on },
+            5 => StripParam::EqBand {
+                band: rng.below(EQ_BANDS),
+                value: EqBand {
+                    kind: [BandType::LowShelf, BandType::Peak, BandType::HighShelf][rng.below(3)],
+                    freq: pick(rng, &EQ_FREQ),
+                    gain_db: pick(rng, &EQ_GAIN_DB),
+                    q: pick(rng, &EQ_Q),
+                },
+            },
+            6 => StripParam::Gate(GateParams {
+                enabled: on,
+                threshold_db: pick(rng, &GATE_THRESHOLD_DB),
+                range_db: pick(rng, &GATE_RANGE_DB),
+                attack_ms: pick(rng, &ATTACK_MS),
+                release_ms: pick(rng, &RELEASE_MS),
+            }),
+            7 => StripParam::Comp(CompParams {
+                enabled: on,
+                threshold_db: pick(rng, &COMP_THRESHOLD_DB),
+                ratio: pick(rng, &COMP_RATIO),
+                attack_ms: pick(rng, &ATTACK_MS),
+                release_ms: pick(rng, &RELEASE_MS),
+                knee_db: pick(rng, &COMP_KNEE_DB),
+                makeup_db: pick(rng, &MAKEUP_DB),
+            }),
+            _ => StripParam::DynamicsBeforeEq { enabled: on },
+        }
+    }
+
+    /// Every state a strip reaches through its methods is one
+    /// [`Strip::is_valid`] takes, parameters at their bounds, crossfades
+    /// and ramps cut short and samples skipped included: a check refusing
+    /// one would refuse a donor's core for good.
+    #[test]
+    fn every_state_a_strip_reaches_is_valid() {
+        let mut rng = crate::test_util::Rng::new(0x5713_c0de);
+        for legs in [1, 2, MAX_LEGS] {
+            let mut s = Strip::new(legs, [0, 48, 480][legs % 3]);
+            assert!(s.is_valid());
+            let mut index = 0u64;
+            for _ in 0..3000 {
+                match rng.below(6) {
+                    0 | 1 => assert!(s.set(param(&mut rng, legs))),
+                    2 => {
+                        let frames = rng.below(200);
+                        s.advance(frames);
+                        index += frames as u64;
+                        s.align(index);
+                    }
+                    _ => {
+                        let frames = 1 + rng.below(128);
+                        let mut buf: Vec<f32> = (0..legs * frames).map(|_| rng.sample()).collect();
+                        s.process(&mut buf, frames);
+                        index += frames as u64;
+                    }
+                }
+                assert!(s.is_valid(), "{s:?}");
+            }
+        }
+    }
+
+    /// A strip holding a value none reaches is not valid: a NaN or an
+    /// infinity in its state, a ramp out of range, a parameter out of
+    /// its range. The dynamics' own are checked with them.
+    #[test]
+    fn a_strip_holding_a_value_none_reaches_is_not_valid() {
+        let mut base = Strip::new(2, 48);
+        assert!(base.set(StripParam::Comp(CompParams {
+            enabled: true,
+            threshold_db: -30.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 5000.0,
+            knee_db: 6.0,
+            makeup_db: 3.0,
+        })));
+        assert!(base.set(StripParam::Eq { enabled: true }));
+        let mut burst: Vec<f32> = (0..960).map(|n| (n as f32 * 0.1).sin()).collect();
+        base.process(&mut burst, 480);
+        assert!(base.is_valid());
+        let invalid = |what: &str, f: &dyn Fn(&mut Strip)| {
+            let mut s = base.clone();
+            f(&mut s);
+            assert!(!s.is_valid(), "{what}");
+        };
+        invalid("NaN filter state", &|s| s.eq[0].state[1][0] = f32::NAN);
+        invalid("infinite crossfade state", &|s| {
+            s.alt_eq[2][0][1] = f32::INFINITY
+        });
+        invalid("infinite leg gain", &|s| s.gain[0].c0 = f32::INFINITY);
+        invalid("NaN trim", &|s| s.trim_db = f32::NAN);
+        invalid("ramp past its length", &|s| s.fade.pos = s.fade.len + 1);
+        invalid("fade to neither order", &|s| s.fade.target = 0.5);
+        invalid("band out of range", &|s| s.bands[0].q = 100.0);
+        invalid("legs beyond a strip", &|s| s.legs = MAX_LEGS + 1);
     }
 }

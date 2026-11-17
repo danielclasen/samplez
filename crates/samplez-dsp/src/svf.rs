@@ -86,9 +86,24 @@ fn neutral() -> Coefficients {
     [warp(1000.0) as f32, 1.0, 1.0, 0.0, 0.0]
 }
 
+/// The coefficients a section set to `shape` ramps to: those of the
+/// shape, or its `g` and `k` with the input passed unchanged when not
+/// `on`.
+fn target_of(shape: Shape, on: bool) -> Coefficients {
+    let mut target = coefficients(shape);
+    if !on {
+        target[2..].copy_from_slice(&[1.0, 0.0, 0.0]);
+    }
+    target
+}
+
 /// One filter section over up to `L` legs: coefficients shared by the
 /// legs, state per leg.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(bound(
+    serialize = "[[f32; 2]; L]: serde::Serialize",
+    deserialize = "[[f32; 2]; L]: serde::Deserialize<'de>"
+))]
 pub(crate) struct Svf<const L: usize> {
     c0: Coefficients,
     step: Coefficients,
@@ -175,10 +190,7 @@ impl<const L: usize> Svf<L> {
     /// Equal targets on a section that is not ramping change nothing; a
     /// section off and staying off jumps, as nothing of it is heard.
     pub(crate) fn set(&mut self, shape: Shape, on: bool, len: u32) {
-        let mut target = coefficients(shape);
-        if !on {
-            target[2..].copy_from_slice(&[1.0, 0.0, 0.0]);
-        }
+        let target = target_of(shape, on);
         if !self.is_ramping() && target == self.target {
             return;
         }
@@ -201,6 +213,24 @@ impl<const L: usize> Svf<L> {
         self.pos = 0;
         self.target = target;
         self.a = a_of(&target);
+    }
+
+    /// Whether the section holds what one last set to `shape`, on or
+    /// not, holds: that shape's target, a ramp whose first and last
+    /// values are finite with `g` and `k` positive, so every value of it
+    /// is stable, within [`crate::MAX_RAMP_LEN`] and its position within
+    /// it, and a finite state.
+    pub(crate) fn is_valid(&self, shape: Shape, on: bool) -> bool {
+        let target = target_of(shape, on);
+        let stable = |c: Coefficients| c.iter().all(|v| v.is_finite()) && c[0] > 0.0 && c[1] > 0.0;
+        self.target == target
+            && self.a == a_of(&target)
+            && self.c0.iter().chain(&self.step).all(|v| v.is_finite())
+            && stable(self.at(0))
+            && stable(self.at(self.len.saturating_sub(1)))
+            && self.len <= crate::MAX_RAMP_LEN
+            && self.pos <= self.len
+            && self.state.iter().flatten().all(|v| v.is_finite())
     }
 
     /// Moves the coefficient ramp `frames` samples on without processing.

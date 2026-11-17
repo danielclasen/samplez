@@ -70,6 +70,23 @@ impl Ramp {
         self.target
     }
 
+    /// Whether the ramp holds what [`Ramp::new`] and [`Ramp::set_target`]
+    /// give: both ends valid gains, a finite step, a length within
+    /// [`MAX_RAMP_LEN`] and a position within the length. A ramp decoded
+    /// from a peer is checked with it.
+    pub fn is_valid(&self) -> bool {
+        valid_gain(self.c0)
+            && valid_gain(self.target)
+            && self.step.is_finite()
+            && self.len <= MAX_RAMP_LEN
+            && self.pos <= self.len
+    }
+
+    /// Whether the ramp is valid and both its ends lie within `range`.
+    pub(crate) fn is_within(&self, range: core::ops::RangeInclusive<f32>) -> bool {
+        self.is_valid() && range.contains(&self.c0) && range.contains(&self.target)
+    }
+
     pub fn is_active(&self) -> bool {
         self.pos < self.len
     }

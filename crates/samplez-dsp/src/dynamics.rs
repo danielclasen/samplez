@@ -66,7 +66,7 @@ fn pole(ms: f32, len: u32) -> f32 {
 
 /// The one-pole coefficients of a time constant over one sample and
 /// over one [`GAIN_INTERVAL`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Pole {
     sample: f32,
     interval: f32,
@@ -78,6 +78,11 @@ impl Pole {
             sample: pole(ms, 1),
             interval: pole(ms, GAIN_INTERVAL),
         }
+    }
+
+    /// Both coefficients in `[0, 1)`, as [`Pole::new`] gives them.
+    fn is_valid(&self) -> bool {
+        (0.0..1.0).contains(&self.sample) && (0.0..1.0).contains(&self.interval)
     }
 
     /// The coefficient over a run of `len` samples.
@@ -184,7 +189,7 @@ fn key(buf: &[f32], legs: usize, frames: usize, n: usize) -> f32 {
 /// [`GAIN_INTERVAL`], and `next` the one set for the intervals after it.
 /// Run every sample, the gain is held at the one computed for the
 /// sample.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Interval {
     peak: f32,
     phase: u32,
@@ -206,6 +211,22 @@ impl Interval {
         len: GAIN_INTERVAL,
         next: GAIN_INTERVAL,
     };
+
+    /// Whether the interval holds what a unit's does between two samples:
+    /// a position within it, runs of 1 or [`GAIN_INTERVAL`] samples, a
+    /// finite key and gains within `[0, 1]`, which both units' gains are.
+    fn is_valid(&self) -> bool {
+        let run = |len: u32| len == 1 || len == GAIN_INTERVAL;
+        let gain = |g: f32| (0.0..=1.0).contains(&g);
+        self.phase < GAIN_INTERVAL
+            && run(self.len)
+            && run(self.next)
+            && self.peak.is_finite()
+            && self.peak >= 0.0
+            && gain(self.from)
+            && gain(self.to)
+            && (-1.0..=1.0).contains(&self.step)
+    }
 
     /// Sets the samples per run of the gain computer from the next
     /// multiple of [`GAIN_INTERVAL`] on, or at once at one with the gain
@@ -328,7 +349,7 @@ impl Interval {
 
 /// A unit's switch: its effect `1 + w * (gain - 1)` with `w` ramping
 /// between 0 and 1.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Wet(Ramp);
 
 impl Wet {
@@ -343,6 +364,11 @@ impl Wet {
     /// Off and not ramping.
     fn is_off(&self) -> bool {
         !self.0.is_active() && self.0.target() == 0.0
+    }
+
+    /// Ramping within `[0, 1]` to 0 or 1.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.0.is_within(0.0..=1.0) && (self.0.target == 0.0 || self.0.target == 1.0)
     }
 }
 
@@ -380,7 +406,7 @@ pub struct CompParams {
     pub makeup_db: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Gate {
     wet: Wet,
     threshold: f32,
@@ -516,6 +542,25 @@ impl Gate {
         self.interval.align(index);
     }
 
+    /// Whether the gate holds values a gate set within the parameter
+    /// ranges holds: threshold, reopen level and floor gains within
+    /// `[0, 1]`, range and smoothed gain within the range limit, a hold
+    /// within [`GATE_HOLD`], valid poles, switch and interval.
+    pub(crate) fn is_valid(&self) -> bool {
+        let unit = |g: f32| (0.0..=1.0).contains(&g);
+        let range = -*crate::strip::GATE_RANGE_DB.end()..=0.0;
+        self.wet.is_valid()
+            && unit(self.threshold)
+            && unit(self.reopen)
+            && range.contains(&self.range_db)
+            && unit(self.floor)
+            && self.attack.is_valid()
+            && self.release.is_valid()
+            && range.contains(&self.y)
+            && self.hold <= GATE_HOLD
+            && self.interval.is_valid()
+    }
+
     /// Whether the gate passes every input unchanged until it is set
     /// again: off, or a range of 0 dB with the gain at 0 dB.
     pub(crate) fn is_identity(&self) -> bool {
@@ -523,7 +568,7 @@ impl Gate {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Comp {
     wet: Wet,
     threshold_db: f32,
@@ -663,6 +708,29 @@ impl Comp {
     /// sample index `index`.
     pub(crate) fn align(&mut self, index: u64) {
         self.interval.align(index);
+    }
+
+    /// Whether the compressor holds values a compressor set within the
+    /// parameter ranges holds: threshold and knee within theirs, a slope
+    /// of a ratio within it, the knee's start gain within `(0, 1]`, a
+    /// makeup ramp within its range, a finite smoothed gain of no more
+    /// than 0 dB, valid poles, switch and interval.
+    pub(crate) fn is_valid(&self) -> bool {
+        use crate::strip::{COMP_KNEE_DB, COMP_RATIO, COMP_THRESHOLD_DB, MAKEUP_DB};
+        let slope = 1.0 / *COMP_RATIO.end() - 1.0..=0.0;
+        let makeup = 1.0..=db_to_gain(*MAKEUP_DB.end());
+        self.wet.is_valid()
+            && COMP_THRESHOLD_DB.contains(&self.threshold_db)
+            && slope.contains(&self.slope)
+            && COMP_KNEE_DB.contains(&self.knee_db)
+            && self.knee_start > 0.0
+            && self.knee_start <= 1.0
+            && self.attack.is_valid()
+            && self.release.is_valid()
+            && self.makeup.is_within(makeup)
+            && self.y.is_finite()
+            && self.y <= 0.0
+            && self.interval.is_valid()
     }
 
     /// Whether the compressor passes every input unchanged until it is
@@ -1324,5 +1392,46 @@ mod tests {
         a.process(&mut x, 1, 300);
         b.advance(300);
         assert_eq!(a, b);
+    }
+
+    /// A gate or compressor holding a value none reaches is not valid: a
+    /// NaN gain or key, a gain beyond its range, a pole of no decay, a
+    /// hold or phase beyond its length.
+    #[test]
+    fn a_unit_holding_a_value_none_reaches_is_not_valid() {
+        let mut g = Gate::new();
+        g.set(&gate(-40.0, 30.0), 48);
+        let mut c = Comp::new();
+        c.set(&comp(-30.0, 4.0, 6.0, 3.0), 48);
+        let mut burst: Vec<f32> = (0..480).map(|n| (n as f32 * 0.1).sin()).collect();
+        g.process(&mut burst, 1, 480);
+        c.process(&mut burst, 1, 480);
+        assert!(g.is_valid() && c.is_valid());
+        let gate_invalid = |what: &str, f: &dyn Fn(&mut Gate)| {
+            let mut u = g;
+            f(&mut u);
+            assert!(!u.is_valid(), "gate {what}");
+        };
+        let comp_invalid = |what: &str, f: &dyn Fn(&mut Comp)| {
+            let mut u = c;
+            f(&mut u);
+            assert!(!u.is_valid(), "compressor {what}");
+        };
+        gate_invalid("NaN gain", &|u| u.y = f32::NAN);
+        gate_invalid("gain below its range", &|u| u.y = -81.0);
+        gate_invalid("hold beyond its length", &|u| u.hold = GATE_HOLD + 1);
+        gate_invalid("floor above unity", &|u| u.floor = 2.0);
+        gate_invalid("switch to neither", &|u| u.wet.0.target = 0.5);
+        comp_invalid("NaN gain", &|u| u.y = f32::NAN);
+        comp_invalid("gain above 0 dB", &|u| u.y = 1.0);
+        comp_invalid("NaN key", &|u| u.interval.peak = f32::NAN);
+        comp_invalid("phase beyond the interval", &|u| {
+            u.interval.phase = GAIN_INTERVAL
+        });
+        comp_invalid("run of neither length", &|u| u.interval.next = 3);
+        comp_invalid("interval gain above unity", &|u| u.interval.to = 1.5);
+        comp_invalid("pole of no decay", &|u| u.release.sample = 1.0);
+        comp_invalid("slope beyond the ratio", &|u| u.slope = -2.0);
+        comp_invalid("makeup beyond its range", &|u| u.makeup.target = 100.0);
     }
 }
