@@ -424,6 +424,39 @@ async fn a_re_routed_n_retargets_only_once_its_generation_is_built() {
     assert_eq!(from(&set, n), Some(p), "N commits from P");
 }
 
+/// An aborted rollout: the target goes back to r1 while N is named but
+/// cannot retarget, its generation not built. An old-key replica is named
+/// again with key 1 and commits, N never commits, and every page stays
+/// whole on a member.
+#[tokio::test(start_paused = true)]
+async fn an_aborted_rollout_names_an_old_key_replica_again() {
+    let (mut set, ids, n) = roll(vec![a(0), a(1), witness()], false).await;
+    mismatched(&set, n).await;
+    set.audio(n).lock().generation_pending = true;
+    set.set_target(Some("r2"));
+    let p = named(&set, a(0), n).await;
+    until("a retarget refused", 1, || {
+        set.audio(n).lock().refused_rebuilds > 0
+    })
+    .await;
+    set.set_target(Some("r1"));
+    until("an old-key replica named again", 10, || {
+        baseline(&set, a(0)).is_some_and(|b| b.replica != n && b.key == Some(1))
+    })
+    .await;
+    let old = baseline(&set, a(0)).unwrap().replica;
+    until("the old-key replica committing", 10, || {
+        committing(&set, old)
+    })
+    .await;
+    sleep(Duration::from_millis(300)).await;
+    assert!(!committing(&set, n), "N committing");
+    assert_eq!(set.audio(n).lock().rebuilds, 0, "N retargeted");
+    writes_none(&set, n, p - PAGE, page_now(&set, old) * PAGE);
+    assert_eq!(state(&set, n), Some(ReplicaState::VersionMismatch));
+    pages_whole(&set, &ids, p / PAGE - 2, page_now(&set, old) - 1);
+}
+
 /// A fenced N: blocks withheld at and after P while its output, never
 /// started, stands idle, for a detected clock step (with the step fence
 /// reported) or for skips. N is not named again while it withholds: the
