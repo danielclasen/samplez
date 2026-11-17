@@ -203,12 +203,26 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - name: Step the clock inside a VM
         run: |
+          # The packages come from a fixed Debian snapshot at exact
+          # versions, so the guest kernel and vng change only with a diff.
           docker run --rm --device /dev/kvm -v "$PWD/vm:/vm" samplez-builder:ci bash -euo pipefail -c '
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
-            apt-get install -y -qq --no-install-recommends \
-              virtme-ng qemu-system-x86 linux-image-amd64 busybox-static > /dev/null
-            vng --run /boot/vmlinuz-* --memory 2G --cpus 2 --rwdir /vm --exec \
+            snapshot=http://snapshot.debian.org/archive
+            printf "%s\n" \
+              "Types: deb" "URIs: $snapshot/debian/20261027T000000Z" \
+              "Suites: trixie trixie-updates" "Components: main" \
+              "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" \
+              "Check-Valid-Until: no" "" \
+              "Types: deb" "URIs: $snapshot/debian-security/20261027T000000Z" \
+              "Suites: trixie-security" "Components: main" \
+              "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" \
+              "Check-Valid-Until: no" > /etc/apt/sources.list.d/debian.sources
+            kernel=6.12.113+deb13-amd64
+            apt-get -o Acquire::Retries=5 update -qq
+            apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends \
+              virtme-ng=1.35-1 qemu-system-x86=1:10.0.13+ds-0+deb13u1 \
+              "linux-image-$kernel=6.12.113-1" busybox-static=1:1.37.0-6+b9 > /dev/null
+            vng --run "/boot/vmlinuz-$kernel" --memory 2G --cpus 2 --rwdir /vm --exec \
               "cd /vm && SAMPLEZ_VM_CLOCK=1 SAMPLEZ_LEAP_A_DAY=/vm/leap-a-day ./vm_clock --test-threads=1 --nocapture"
           ' 2>&1 | tee vm.log
           grep -q "test result: ok. 2 passed" vm.log
