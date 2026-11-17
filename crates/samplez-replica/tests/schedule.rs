@@ -111,8 +111,8 @@ async fn a_replica_with_a_flag_is_counted_only_when_every_one_has_one() {
         .replica(leader)
         .submit(&owner("s"), "1", Bytes::from("gain=1@1"))
         .await
-        .expect_err("nothing is stamped while E counts nobody");
-    assert_eq!(refused.reason, Reason::Unavailable);
+        .expect_err("no replica takes client writes while E counts nobody");
+    assert_eq!(refused.reason, Reason::NotCommitable);
 }
 
 #[tokio::test(start_paused = true)]
