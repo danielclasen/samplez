@@ -157,7 +157,7 @@ fn an_adjtimex_offset_step_unverifies_the_replica() {
     std::thread::sleep(Duration::from_millis(100));
     let mut v = Verifier::default();
     let (offset, steps) = clock(&audio);
-    v.period(offset, steps, || true);
+    v.period(offset, steps, None, tokio::time::Instant::now(), || true);
     assert!(v.verified());
     // Forward: the RT thread detects a backward step only at its next
     // wake, up to the step's length later.
@@ -166,7 +166,13 @@ fn an_adjtimex_offset_step_unverifies_the_replica() {
     let (after, steps_after) = clock(&audio);
     assert_eq!(after, Some(37), "the sample after the step");
     assert_eq!(steps_after, steps + 1, "one step");
-    v.period(after, steps_after, || false);
+    v.period(
+        after,
+        steps_after,
+        None,
+        tokio::time::Instant::now(),
+        || false,
+    );
     assert!(!v.verified(), "an offset change across a step unverifies");
 }
 
@@ -201,7 +207,7 @@ fn a_leap_second_moves_the_offset_without_a_step() {
         if offset == Some(37) {
             misses_before = Some(misses);
         }
-        v.period(offset, steps, || true);
+        v.period(offset, steps, None, tokio::time::Instant::now(), || true);
         assert!(v.verified(), "verification ended at offset {offset:?}");
         samples.push((Instant::now(), offset, steps, gap, misses));
         if offset == Some(38)

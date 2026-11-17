@@ -192,6 +192,12 @@ entries, no unresolved entry; the RT thread keeps its pending generation)
 and installs it through the same block-boundary hand-over as a replay;
 the first block committed after it follows the withdrawn rules.
 
+In `samplez-replica` every audio replica starts clock-unverified, which
+drops its engine's core until it verifies, and a snapshot install or a
+lag beyond the horizon drops it again. The core is rebuilt only from the
+product state that `EngineAudio::with_rebuild` supplies: a product that
+embeds the replica without one leaves every replica in `starting`.
+
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
 against CLOCK_MONOTONIC at each wake, when it also samples the kernel
 TAI offset (CLOCK_TAI - CLOCK_REALTIME); the status reports both, and

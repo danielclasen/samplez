@@ -2031,11 +2031,17 @@ impl Contact {
             guard_ns: time_of(self.timing.clock_guard),
         };
         let verifies = view.verifies();
+        let conflict = view.conflict();
         let off = view.off_offset();
         #[cfg(test)]
         let verifies = verifies || st.verified_always;
-        st.verifier
-            .period(st.own.clock.tai_offset_s, st.clock_steps, || verifies);
+        st.verifier.period(
+            st.own.clock.tai_offset_s,
+            st.clock_steps,
+            conflict,
+            now,
+            || verifies,
+        );
         let verified = st.verifier.verified();
         st.own.clock.unverified = !verified;
         if verified {

@@ -27,13 +27,16 @@ impl Horizon {
         apply_guard: u64,
         spread: u64,
     ) -> bool {
-        let lag = match (processed_end, estimate) {
-            (Some(p), Some(e)) if !counted => e.saturating_sub(p),
-            _ => {
-                self.held = false;
-                return false;
-            }
+        if counted {
+            self.held = false;
+            return false;
+        }
+        // Without both, nothing is known: the hold stands as it is, so a
+        // dropped engine that reports no processed block is not released.
+        let (Some(p), Some(e)) = (processed_end, estimate) else {
+            return self.held;
         };
+        let lag = e.saturating_sub(p);
         if self.held {
             self.held = lag > apply_guard.saturating_sub(spread);
         } else {
@@ -72,7 +75,18 @@ mod tests {
         assert!(!h.period(Some(0), Some(20 * GUARD), true, GUARD, S));
         assert!(h.period(Some(0), Some(20 * GUARD), false, GUARD, S));
         assert!(!h.period(Some(0), Some(20 * GUARD), true, GUARD, S));
-        // Without an estimate nothing is compared.
+        // Without an estimate nothing is compared and nothing is held.
         assert!(!h.period(Some(0), None, false, GUARD, S));
+    }
+
+    #[test]
+    fn a_held_replica_reporting_no_processed_block_stays_held() {
+        let mut h = Horizon::default();
+        assert!(h.period(Some(0), Some(20 * GUARD), false, GUARD, S));
+        // A dropped engine reports none: no release, so no rebuild.
+        for _ in 0..3 {
+            assert!(h.period(None, Some(20 * GUARD), false, GUARD, S));
+        }
+        assert!(h.period(Some(0), None, false, GUARD, S));
     }
 }

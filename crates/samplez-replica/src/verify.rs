@@ -17,6 +17,9 @@
 //! applies, ends nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use crate::contact::Members;
 use crate::entry::NodeId;
@@ -105,6 +108,19 @@ impl View<'_> {
         }
     }
 
+    /// The largest difference, seconds, between this replica's offset and
+    /// that of another replica E counts; none when they all agree.
+    pub fn conflict(&self) -> Option<u64> {
+        let own = self.offset_of(self.me)?;
+        self.counted
+            .iter()
+            .filter(|&&id| id != self.me)
+            .filter_map(|&id| self.offset_of(id))
+            .map(|o| o.abs_diff(own))
+            .filter(|&d| d > 0)
+            .max()
+    }
+
     /// The voters `replica_clock_unverified` names beside the unverified
     /// replicas: those whose offset is not the set's (every voter while
     /// there is none, a voter not heard then named without an offset).
@@ -119,12 +135,20 @@ impl View<'_> {
     }
 }
 
+/// How long a counted replica may report an offset one second from this
+/// one's before this one loses verification: the window around a leap
+/// second, in which nodes move at their own UTC midnight.
+pub const LEAP_SPREAD: Duration = Duration::from_secs(2);
+
 /// One replica's verification across report periods.
 #[derive(Debug, Default)]
 pub struct Verifier {
     verified: bool,
-    /// The offset and the detected-step count of the last period.
-    last: Option<(Option<i64>, u64)>,
+    /// The offset it last verified on, and the detected-step count then.
+    on: Option<(Option<i64>, u64)>,
+    /// Since when a counted replica has reported an offset one second
+    /// from this one's.
+    leap_since: Option<Instant>,
 }
 
 impl Verifier {
@@ -132,22 +156,54 @@ impl Verifier {
         self.verified
     }
 
-    /// One period: `offset` and `steps` as sampled now, `verifies` the
-    /// exchange's verdict. A verified replica whose offset changed across
-    /// a step detected since the last period is unverified, and verifies
-    /// again no earlier than the next period, so whatever follows it sees
-    /// it unverified once.
-    pub fn period(&mut self, offset: Option<i64>, steps: u64, verifies: impl FnOnce() -> bool) {
-        let lost = self.verified
-            && self
-                .last
-                .is_some_and(|(before, s)| steps > s && offset != before);
-        if lost {
-            self.verified = false;
-        } else if !self.verified {
-            self.verified = verifies();
+    /// One period: `offset` and `steps` as sampled now, `conflict` the
+    /// largest difference, in seconds, between this replica's offset and
+    /// that of another replica E counts, `verifies` the exchange's verdict.
+    ///
+    /// A verified replica is unverified once a step was detected since it
+    /// verified and its offset is not the one it verified on, whichever
+    /// period each of the two shows in (a step that leaves the offset as
+    /// it was is taken as the new count); and once a replica E counts
+    /// reports an offset more than one second from its own, or one second
+    /// from it for longer than [`LEAP_SPREAD`]. A verified replica that
+    /// verifies again with no step since moves to the offset it reports,
+    /// so a leap second ends nothing. An unverified replica verifies again
+    /// no earlier than the next period.
+    pub fn period(
+        &mut self,
+        offset: Option<i64>,
+        steps: u64,
+        conflict: Option<u64>,
+        now: Instant,
+        verifies: impl FnOnce() -> bool,
+    ) {
+        self.leap_since = match conflict {
+            Some(1) => self.leap_since.or(Some(now)),
+            _ => None,
+        };
+        // A step that left the offset as it verified it changes nothing:
+        // a later leap second must not read as a change across it.
+        if let Some((on, s)) = &mut self.on
+            && steps > *s
+            && offset == *on
+        {
+            *s = steps;
         }
-        self.last = Some((offset, steps));
+        let stepped = self.on.is_some_and(|(on, s)| steps > s && offset != on);
+        let split = conflict.is_some_and(|d| d > 1)
+            || self
+                .leap_since
+                .is_some_and(|t| now.saturating_duration_since(t) >= LEAP_SPREAD);
+        if self.verified && (stepped || split) {
+            self.verified = false;
+            self.on = None;
+            return;
+        }
+        let steady = self.on.is_none_or(|(_, s)| steps == s);
+        if (!self.verified || steady) && verifies() {
+            self.verified = true;
+            self.on = Some((offset, steps));
+        }
     }
 }
 
@@ -405,30 +461,105 @@ mod tests {
         assert_eq!(v.off_offset().len(), 3);
     }
 
+    fn at_ms(ms: u64) -> Instant {
+        // A paused clock is not needed: only differences are read.
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now) + Duration::from_millis(ms)
+    }
+
     #[test]
     fn verification_ends_only_on_an_offset_change_across_a_detected_step() {
         let mut v = Verifier::default();
-        v.period(Some(37), 0, || true);
+        v.period(Some(37), 0, None, at_ms(0), || true);
         assert!(v.verified());
-        // A leap second: the offset moves, no step.
-        v.period(Some(38), 0, || false);
+        // A leap second: the offset moves, no step; it verifies on 38.
+        v.period(Some(38), 0, None, at_ms(10), || true);
         assert!(v.verified());
         // A step without an offset change.
-        v.period(Some(38), 1, || false);
+        v.period(Some(38), 1, None, at_ms(20), || true);
         assert!(v.verified());
         // A step with one: unverified for at least this period.
-        v.period(Some(0), 2, || true);
+        v.period(Some(0), 2, None, at_ms(30), || true);
         assert!(!v.verified());
-        v.period(Some(0), 2, || true);
+        v.period(Some(0), 2, None, at_ms(40), || true);
         assert!(v.verified());
+    }
+
+    #[test]
+    fn a_leap_after_a_step_without_an_offset_change_ends_nothing() {
+        // leap-a-day sets the time just before midnight (a step, offset
+        // unchanged), then the kernel inserts the leap (offset, no step).
+        let mut v = Verifier::default();
+        v.period(Some(37), 0, None, at_ms(0), || true);
+        v.period(Some(37), 1, None, at_ms(10), || false);
+        v.period(Some(38), 1, None, at_ms(20), || false);
+        assert!(v.verified());
+    }
+
+    #[test]
+    fn an_offset_seen_a_period_before_its_step_still_unverifies() {
+        // ADJ_TAI between the RT thread's clock read and its offset read:
+        // the new offset shows in period N, the step only in N + 1.
+        let mut v = Verifier::default();
+        v.period(Some(37), 4, None, at_ms(0), || true);
+        v.period(Some(0), 4, None, at_ms(10), || false);
+        assert!(v.verified(), "no step yet");
+        v.period(Some(0), 5, None, at_ms(20), || false);
+        assert!(!v.verified(), "the step that moved the offset");
+    }
+
+    #[test]
+    fn a_counted_replica_on_another_offset_unverifies_beyond_the_leap_spread() {
+        let mut v = Verifier::default();
+        v.period(Some(37), 0, None, at_ms(0), || true);
+        // 37 apart: at once.
+        v.period(Some(37), 0, Some(37), at_ms(10), || true);
+        assert!(!v.verified());
+        // One second apart, as around a leap: only past LEAP_SPREAD.
+        let mut v = Verifier::default();
+        v.period(Some(37), 0, None, at_ms(0), || true);
+        v.period(Some(37), 0, Some(1), at_ms(100), || false);
+        v.period(Some(37), 0, Some(1), at_ms(1_900), || false);
+        assert!(v.verified());
+        v.period(Some(37), 0, None, at_ms(2_000), || true);
+        v.period(Some(37), 0, Some(1), at_ms(2_100), || false);
+        assert!(v.verified(), "the spread restarts once they agree");
+        v.period(Some(37), 0, Some(1), at_ms(4_100), || false);
+        assert!(!v.verified());
+    }
+
+    #[test]
+    fn two_cold_starts_on_different_offsets_unverify_once_they_hear_each_other() {
+        // A verified on 37 with B; B steps to 0; C verifies on 0 with B
+        // before it hears A. Once each counts the other, both lose.
+        let ids = [a(0), a(1), a(2)];
+        let m = members(&ids);
+        let h = heard(&[(a(0), at(37)), (a(1), at(0)), (a(2), at(0))]);
+        let c: BTreeSet<_> = [a(0), a(2)].into();
+        for me in [a(0), a(2)] {
+            let view = View {
+                me,
+                members: &m,
+                heard: &h,
+                counted: &c,
+                guard_ns: GUARD,
+            };
+            assert_eq!(view.conflict(), Some(37));
+            let mut v = Verifier::default();
+            v.period(view.offset_of(me), 0, None, at_ms(0), || true);
+            v.period(view.offset_of(me), 0, view.conflict(), at_ms(10), || {
+                view.verifies()
+            });
+            assert!(!v.verified(), "{me}");
+        }
     }
 
     #[test]
     fn an_unverified_replica_waits_for_an_exchange() {
         let mut v = Verifier::default();
-        v.period(Some(37), 0, || false);
+        v.period(Some(37), 0, None, at_ms(0), || false);
         assert!(!v.verified());
-        v.period(Some(37), 0, || true);
+        v.period(Some(37), 0, None, at_ms(10), || true);
         assert!(v.verified());
     }
 }
