@@ -179,6 +179,16 @@ generation is tried again; one missing an entry returns
 The status reports the replay speed s, blocks per block period, measured
 at start-up on silence.
 
+`CoreCopy::encode` gives a copy as another replica takes it, JSON with
+the engine version; `CoreCopy::decode` refuses a core of another version
+or one holding a value no engine holds (an index beyond 2^62, a gain or
+strip parameter out of range, a ramp past its length, a matrix beyond
+`MAX_COEFFICIENTS`, 2^18, which configurations are held to as well), and
+`Engine::replay` one of another shape or with an entry outside the
+engine. Strip state is not part of the core: a replica keeps its own
+across a hand-over, so a resync with strips active converges only as
+far as their state already agrees.
+
 `Engine::drop_core` drops the RT thread's core while the replica starts:
 the RT thread keeps its writers, flows, hold rings and statuses, computes
 no block and withholds each one, overrun skips included, cause `NoCore`

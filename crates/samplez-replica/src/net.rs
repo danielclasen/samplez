@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use futures_util::future::BoxFuture;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper::{Method, Request, StatusCode, header};
 use hyper_util::rt::TokioIo;
@@ -73,7 +73,8 @@ async fn handshake(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static) -> 
     Ok(sender)
 }
 
-/// One request on `sender`: the status and the whole body.
+/// One request on `sender`: the status and the whole body, refused
+/// beyond [`crate::peer::MAX_RESPONSE`].
 pub(crate) async fn send(
     sender: &mut Sender,
     request: Request<Full<Bytes>>,
@@ -84,8 +85,7 @@ pub(crate) async fn send(
         .await
         .map_err(io::Error::other)?;
     let status = response.status();
-    let body = response
-        .into_body()
+    let body = Limited::new(response.into_body(), crate::peer::MAX_RESPONSE)
         .collect()
         .await
         .map_err(io::Error::other)?;
@@ -469,5 +469,41 @@ impl SnapshotWire {
             snapshot_id: self.id,
         };
         (self.vote.into(), meta, self.offset, self.done)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An answer one byte beyond the cap is refused, read up to it only;
+    /// one at the cap is taken.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_answer_beyond_the_cap_is_refused() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for len in [crate::peer::MAX_RESPONSE, crate::peer::MAX_RESPONSE + 1] {
+                let (mut tcp, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = tcp.read(&mut buf);
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {len}\r\n\r\n");
+                let _ = tcp.write_all(head.as_bytes());
+                let _ = tcp.write_all(&vec![b'x'; len]);
+            }
+        });
+        for (len, taken) in [
+            (crate::peer::MAX_RESPONSE, true),
+            (crate::peer::MAX_RESPONSE + 1, false),
+        ] {
+            let mut sender = connect(&addr, None).await.unwrap();
+            let sent = send(
+                &mut sender,
+                request(Method::POST, "x", "/peer/any", Vec::new()),
+            )
+            .await;
+            assert_eq!(sent.is_ok(), taken, "an answer of {len} bytes");
+        }
     }
 }

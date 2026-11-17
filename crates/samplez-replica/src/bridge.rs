@@ -13,15 +13,17 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use samplez::blocks::{
     BlockStatus, Cause, HEALTHY, Kind, PAGE, PageHash, Range, Ranks, Standing, StatusChange,
 };
-use samplez::{Engine, Entry, EntryError};
+use samplez::{CopyError, CoreCopy, Engine, Entry, EntryError, ReplayError};
 
 use crate::contact::{Audio, Sample, Timing};
 use crate::entry::{Body, Request};
 use crate::report::{ClockFlags, Own, Page, Unwritten, page_digest, runs};
+use crate::resync::{CoreReply, Resynced, Source};
 
 /// Turns a log entry into the engine entry it applies, with its index;
 /// none for an entry the engine does not apply.
@@ -32,7 +34,17 @@ pub type Translate = Box<dyn Fn(&Request) -> Option<(u64, Entry)> + Send + Sync>
 pub type Rebuild = Box<dyn Fn() -> Option<samplez::ProductState> + Send + Sync>;
 
 /// How long a rebuild waits for the RT thread to take the core.
-const REBUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+const REBUILD_WAIT: Duration = Duration::from_millis(100);
+
+/// How long a donor waits for its RT thread to copy the core, and how
+/// often it copies again when the history slack passed meanwhile.
+const COPY_WAIT: Duration = Duration::from_millis(100);
+const COPY_TRIES: usize = 3;
+
+/// How long a joiner's replay may run on before it gives up, and how long
+/// each hand-over is tried before the log is read again.
+const REPLAY_WAIT: Duration = Duration::from_secs(2);
+const HANDOVER_TRY: Duration = Duration::from_millis(20);
 
 /// The engine entry of an `InputDown` or `InputUp` body; a product's
 /// [`Translate`] adds the entries only it can read, such as a route.
@@ -349,6 +361,77 @@ impl Audio for EngineAudio {
                 false
             }
         }
+    }
+
+    fn copy_core(&self) -> Option<CoreReply> {
+        for _ in 0..COPY_TRIES {
+            match self.engine.copy_core(COPY_WAIT) {
+                Ok(copy) => {
+                    return Some(CoreReply {
+                        k0: copy.k0,
+                        last_id: copy.last_id,
+                        core: copy.encode(),
+                    });
+                }
+                // The history slack passed while it was copied: again.
+                Err(CopyError::Passed { .. }) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "no engine core copied for a resync");
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, String> {
+        let copy = CoreCopy::decode(&core.core).map_err(|e| e.to_string())?;
+        let unresolved = copy.core.unresolved().to_vec();
+        let mut replay = self.engine.replay(copy).map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + REPLAY_WAIT;
+        let mut after = core.last_id;
+        let j = loop {
+            for (index, request) in source.entries(after) {
+                after = index;
+                if let Some((at_index, entry)) = (self.translate)(&request) {
+                    replay
+                        .append(index, at_index, &entry)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            if !source.go() {
+                return Err("given up before the hand-over".to_owned());
+            }
+            replay.run_to(u64::MAX);
+            match self.engine.hand_over(&mut replay, HANDOVER_TRY) {
+                Ok(j) => break j,
+                // An entry the replay lacks, or a block passed: the log
+                // and the replay are read again.
+                Err(ReplayError::Missed { .. } | ReplayError::Timeout { .. })
+                    if Instant::now() < deadline => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        // A page holding a block computed with an input silenced depends
+        // on more than the input and the log: not compared.
+        let silenced = replay.silenced();
+        let block = self.block;
+        let touched = |p: &PageHash| {
+            silenced
+                .iter()
+                .any(|&k| k * block < (p.page + 1) * PAGE && (k + 1) * block > p.page * PAGE)
+        };
+        let pages = replay
+            .pages()
+            .iter()
+            .filter(|p| !touched(p))
+            .map(|p| page_of(p, block, |_| None))
+            .collect();
+        Ok(Resynced {
+            j,
+            pages,
+            unresolved,
+        })
     }
 }
 

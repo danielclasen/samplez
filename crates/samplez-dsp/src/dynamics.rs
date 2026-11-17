@@ -347,7 +347,7 @@ impl Wet {
 }
 
 /// Gate parameters, the faderz `Gate`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GateParams {
     pub enabled: bool,
     /// dBFS; the gate opens when the key reaches it.
@@ -362,7 +362,7 @@ pub struct GateParams {
 }
 
 /// Compressor parameters, the faderz `Comp` plus a knee.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompParams {
     pub enabled: bool,
     /// dBFS.

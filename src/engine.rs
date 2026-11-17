@@ -1802,19 +1802,35 @@ impl Engine {
             ));
         }
         let c = &copy.core;
-        let next = (copy.k0 + 1) * self.block;
+        let (n, m, _, page) = self
+            .transfer
+            .as_ref()
+            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).shape)
+            .expect("checked above");
+        let (slots, in_domains) = new_slots(&self.config);
+        let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
+        if !c.fits(n, m, &legs, page) {
+            return Err(ReplayError::Invalid(
+                "the core is of another engine shape".to_owned(),
+            ));
+        }
+        let next = copy
+            .k0
+            .checked_add(1)
+            .and_then(|k| k.checked_mul(self.block))
+            .filter(|&n| n <= crate::transfer::INDEX_MAX)
+            .ok_or_else(|| ReplayError::Invalid(format!("a core after block {}", copy.k0)))?;
         let ramp = u64::from(self.config.ramp_samples);
         let generating = c.pending_gen.is_some()
             || !c.awaiting_gen.is_empty()
             || c.slots
                 .iter()
-                .any(|s| s.xfade.is_some_and(|x| next < x + ramp))
+                .any(|s| s.xfade.is_some_and(|x| next < x.saturating_add(ramp)))
             || c.pending.iter().any(|e| e.change.needs_generation());
         if generating {
             return Err(ReplayError::Generation);
         }
         let status = self.status();
-        let (slots, in_domains) = new_slots(&self.config);
         let timing = Timing {
             block: self.block,
             margin: self.margin,
@@ -4724,6 +4740,30 @@ mod tests {
         set.advance(192 - 48);
         assert!(set.set(gain));
         assert_eq!(rt.slots[0].strip.as_ref(), Some(&set));
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A core whose block number leaves the index range at this block
+    /// size is refused, not overflowed.
+    #[test]
+    fn a_core_after_a_block_beyond_any_index_is_not_replayed() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("replay-k0", 1);
+        let copy = || loop {
+            match e.copy_core(Duration::from_secs(2)) {
+                Err(CopyError::Passed { .. }) => continue,
+                c => break c.unwrap(),
+            }
+        };
+        for k0 in [u64::MAX, crate::transfer::INDEX_MAX] {
+            let mut c = copy();
+            c.k0 = k0;
+            assert!(
+                matches!(e.replay(c), Err(ReplayError::Invalid(m)) if m.contains("after block")),
+                "a core after block {k0}"
+            );
+        }
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

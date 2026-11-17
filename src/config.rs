@@ -409,6 +409,15 @@ impl Config {
                 self.outputs.len()
             ));
         }
+        let coefficients = self.input_channels().saturating_mul(self.columns());
+        if coefficients > samplez_dsp::MAX_COEFFICIENTS {
+            return fail(format!(
+                "{} input channels by {} output and meter channels, at most {} matrix coefficients",
+                self.input_channels(),
+                self.columns(),
+                samplez_dsp::MAX_COEFFICIENTS
+            ));
+        }
         if self.meters.len() > MAX_METERS {
             return fail(format!(
                 "{} meters, at most {MAX_METERS}",
@@ -568,6 +577,17 @@ mod tests {
         assert_eq!(c.resync_budget_samples(), 2400);
         // D + w + 2B: 864 + 96 samples.
         assert_eq!(c.hold_blocks() as u64 * 48, 960);
+    }
+
+    /// A matrix beyond `MAX_COEFFICIENTS` is refused with the
+    /// configuration, as a replica refuses a core holding one.
+    #[test]
+    fn a_matrix_beyond_the_coefficient_limit_is_refused() {
+        let mut v = base();
+        v["inputs"][0]["channels"] = serde_json::json!(1024);
+        v["outputs"][0]["channels"] = serde_json::json!(512);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("matrix coefficients"), "{e}");
     }
 
     #[test]

@@ -63,7 +63,7 @@ pub const RELEASE_MS: RangeInclusive<f32> = 5.0..=5000.0;
 /// and from Q 0.707 up the steepest shelf whose response stays between 0
 /// dB and its gain. A higher Q would add a resonant peak and dip beside
 /// the shelf, +23 dB at Q 2 on an 18 dB shelf.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BandType {
     /// Shelf below `freq`, half its gain at `freq` (RBJ lowShelf).
     LowShelf,
@@ -74,7 +74,7 @@ pub enum BandType {
 }
 
 /// One equaliser band. A band at 0 dB passes its input unchanged.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EqBand {
     pub kind: BandType,
     /// Hz, within [`EQ_FREQ`].
@@ -119,7 +119,7 @@ fn shelf_q(gain_db: f32, q: f32) -> f32 {
 }
 
 /// One parameter of a strip, set to an absolute value.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StripParam {
     /// Gain of every leg, dB within [`TRIM_DB`].
     Trim { db: f32 },

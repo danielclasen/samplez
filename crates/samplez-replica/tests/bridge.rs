@@ -13,6 +13,7 @@ use samplez_replica::bridge::{EngineAudio, PAGES_REPORTED, input_entry};
 use samplez_replica::contact::{Audio, Timing};
 use samplez_replica::entry::{Body, Request};
 use samplez_replica::report::{page_digest, status_of};
+use samplez_replica::resync::Source;
 
 const B: u64 = 48;
 
@@ -346,4 +347,46 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
             .is_some_and(|k| k > dropped_at + 4)
     });
     wait_for("the core rebuilt", || audio.rebuild_engine());
+}
+
+struct Feed(bool);
+
+impl Source for Feed {
+    fn entries(&self, _after: u64) -> Vec<(u64, Request)> {
+        Vec::new()
+    }
+    fn go(&self) -> bool {
+        self.0
+    }
+}
+
+/// A resync between two engines through the bridge: the donor's core,
+/// encoded, is replayed on the joiner, which hands it over at a block
+/// boundary and holds the donor's unresolved entry; told to stop, a
+/// joiner hands nothing over.
+#[test]
+fn a_donors_core_is_replayed_and_handed_over_on_the_joiner() {
+    let (da, db) = (Domain::new(), Domain::new());
+    let (donor, donor_audio) = bridge(&da, 64);
+    let (joiner, joiner_audio) = bridge(&db, 64);
+    let processed = |e: &Engine| e.progress().and_then(|p| p.processed);
+    wait_for("both compute", || {
+        processed(&donor).is_some() && processed(&joiner).is_some()
+    });
+    let at = (processed(&donor).unwrap() + 100_000) * B;
+    donor.unresolved(9, at).unwrap();
+    let installed = || {
+        joiner
+            .counters()
+            .handovers_installed
+            .load(Ordering::Relaxed)
+    };
+    let core = donor_audio.copy_core().expect("a core");
+    let r = joiner_audio.resync(&core, &Feed(true)).unwrap();
+    assert!(r.j >= core.k0, "handed over after {} from {}", r.j, core.k0);
+    assert_eq!(r.unresolved, vec![(9, at)]);
+    assert_eq!(installed(), 1);
+    let core = donor_audio.copy_core().expect("a core");
+    assert!(joiner_audio.resync(&core, &Feed(false)).is_err());
+    assert_eq!(installed(), 1, "no hand-over once told to stop");
 }

@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use samplez_dsp::Matrix;
 use samplez_mxl::time;
+use serde::{Deserialize, Serialize};
 
 use crate::blocks::PageHash;
 use crate::engine::Entry;
@@ -23,8 +24,13 @@ use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRES
 /// by the engine that copied it.
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The highest sample index a decoded core may hold: far beyond any
+/// running engine's, and low enough that adding a ramp or a block to it
+/// cannot overflow.
+pub(crate) const INDEX_MAX: u64 = 1 << 62;
+
 /// An input slot's part of the core.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SlotCore {
     pub up: bool,
     pub held: bool,
@@ -34,7 +40,7 @@ pub(crate) struct SlotCore {
 }
 
 /// The core of an engine after a block.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Core {
     pub(crate) matrix: Matrix,
     pub(crate) pos: Option<u64>,
@@ -98,6 +104,68 @@ impl Core {
     pub fn unresolved(&self) -> &[(LogId, u64)] {
         &self.unresolved
     }
+
+    /// Whether everything this core holds is a value an engine holds:
+    /// every index at most [`INDEX_MAX`], every gain one a ramp takes,
+    /// every strip parameter within its range (legs aside), the lists
+    /// within their capacities. A core from another replica is checked
+    /// when decoded.
+    fn sane(&self) -> bool {
+        let index = |i: u64| i <= INDEX_MAX;
+        let entry = |e: &RtEntry| {
+            index(e.at_index)
+                && match e.change {
+                    Change::Gain { gain, .. } => samplez_dsp::valid_gain(gain),
+                    Change::Strip { param, .. } => param.check(usize::MAX).is_ok(),
+                    _ => true,
+                }
+        };
+        let slot = |s: &SlotCore| s.fade_start.is_none_or(index) && s.xfade.is_none_or(index);
+        let ats = |list: &[(LogId, u64)]| list.iter().all(|&(_, at)| index(at));
+        self.pos.is_none_or(index)
+            && index(self.ramp_end)
+            && self.entries_page.is_none_or(index)
+            && index(self.late_lost_until)
+            && self.slots.iter().all(slot)
+            && ats(&self.page_entries)
+            && ats(&self.unresolved)
+            && ats(&self.late_routes)
+            && self.pending.len() <= PENDING_CHANGES
+            && self.awaiting_gen.len() <= PENDING_CHANGES
+            && self.unresolved.len() <= UNRESOLVED
+            && self.late_routes.len() <= PENDING_CHANGES
+            && self.pending.iter().chain(&self.awaiting_gen).all(entry)
+    }
+
+    /// Whether this sane core is of an engine with `inputs` and `outputs`
+    /// channels, input slots of `legs` legs each and room for
+    /// `page_entries` entries of one page's fingerprint, every entry
+    /// within them: checked before a replay installs it.
+    pub(crate) fn fits(
+        &self,
+        inputs: usize,
+        outputs: usize,
+        legs: &[usize],
+        page_entries: usize,
+    ) -> bool {
+        let slots = legs.len();
+        let entry = |e: &RtEntry| match e.change {
+            Change::Gain { input, output, .. } => input < inputs && output < outputs,
+            Change::InputDown { slot } | Change::InputUp { slot } | Change::Route { slot } => {
+                slot < slots
+            }
+            Change::Strip { slot, param } => slot < slots && param.check(legs[slot]).is_ok(),
+        };
+        let shape = (
+            self.matrix.inputs(),
+            self.matrix.outputs(),
+            self.slots.len(),
+        );
+        self.sane()
+            && shape == (inputs, outputs, slots)
+            && self.page_entries.len() <= page_entries
+            && self.pending.iter().chain(&self.awaiting_gen).all(entry)
+    }
 }
 
 /// A replayed core after block `j`, which knew the log entries up to
@@ -134,11 +202,75 @@ pub(crate) enum Answer {
 
 /// The core after block `k0`, and the highest log id the RT thread had
 /// taken: entries after it reach a replica from its own log.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoreCopy {
     pub k0: u64,
     pub last_id: LogId,
     pub core: Box<Core>,
 }
+
+#[derive(Serialize)]
+struct WireOut<'a> {
+    engine: &'a str,
+    copy: &'a CoreCopy,
+}
+
+#[derive(Deserialize)]
+struct WireIn {
+    engine: String,
+    copy: serde_json::Value,
+}
+
+impl CoreCopy {
+    /// The copy as another replica takes it, with [`ENGINE_VERSION`].
+    pub fn encode(&self) -> String {
+        let wire = WireOut {
+            engine: ENGINE_VERSION,
+            copy: self,
+        };
+        serde_json::to_string(&wire).expect("a core encodes")
+    }
+
+    /// A copy [`CoreCopy::encode`] made, by an engine of this version.
+    pub fn decode(encoded: &str) -> Result<CoreCopy, DecodeError> {
+        let wire: WireIn =
+            serde_json::from_str(encoded).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+        if wire.engine != ENGINE_VERSION {
+            return Err(DecodeError::Version(wire.engine));
+        }
+        let copy: CoreCopy =
+            serde_json::from_value(wire.copy).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+        // A block number: its first index stays within INDEX_MAX at the
+        // largest block size.
+        if !copy.core.sane() || copy.k0 > INDEX_MAX / 1024 {
+            return Err(DecodeError::Malformed(
+                "a core holding a value no engine holds".to_owned(),
+            ));
+        }
+        Ok(copy)
+    }
+}
+
+/// Why [`CoreCopy::decode`] returned no copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// Copied by an engine of this other version.
+    Version(String),
+    Malformed(String),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::Version(v) => {
+                write!(f, "a core of engine {v}, this engine is {ENGINE_VERSION}")
+            }
+            DecodeError::Malformed(m) => write!(f, "a malformed core: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
 
 /// A replay clone ([`Engine::replay`](crate::Engine::replay)): the
 /// engine's computation from a donor's core, off the RT thread, on past
@@ -352,3 +484,173 @@ impl std::fmt::Display for CopyError {
 }
 
 impl std::error::Error for CopyError {}
+
+#[cfg(test)]
+mod tests {
+    use samplez_dsp::StripParam;
+
+    use super::*;
+
+    fn copy() -> CoreCopy {
+        let mut core = Core::new(2, 2, 2, 8);
+        assert!(core.matrix.set(1, 0, 0.5, 48));
+        assert!(core.matrix.set(0, 1, 0.25, 0));
+        core.pos = Some(4800);
+        core.ramp_end = 4848;
+        core.pending.push(RtEntry {
+            id: 7,
+            at_index: 9600,
+            change: Change::Strip {
+                slot: 1,
+                param: StripParam::Trim { db: -3.0 },
+            },
+        });
+        core.page_entries.push((6, 4752));
+        core.slots[1] = SlotCore {
+            up: true,
+            held: false,
+            fade_start: Some(480),
+            silenced_last: true,
+            xfade: None,
+        };
+        core.unresolved.push((9, 1 << 40));
+        CoreCopy {
+            k0: 99,
+            last_id: 7,
+            core: Box::new(core),
+        }
+    }
+
+    /// The copy another replica decodes is the copy encoded: the matrix
+    /// with its ramps, the entries and the slot state.
+    #[test]
+    fn a_core_decodes_to_the_copy_encoded() {
+        let copy = copy();
+        let decoded = CoreCopy::decode(&copy.encode()).unwrap();
+        assert_eq!(decoded, copy);
+        assert_eq!(decoded.core.gain(1, 0), copy.core.gain(1, 0));
+    }
+
+    /// A core copied by another engine version is refused: its state may
+    /// mean something else here.
+    #[test]
+    fn a_core_of_another_engine_version_is_refused() {
+        let encoded = copy().encode().replacen(ENGINE_VERSION, "0.0.0-other", 1);
+        assert_eq!(
+            CoreCopy::decode(&encoded),
+            Err(DecodeError::Version("0.0.0-other".to_owned()))
+        );
+    }
+
+    /// A core whose matrix names an input out of range is refused before
+    /// anything indexes by it.
+    #[test]
+    fn a_matrix_out_of_range_is_refused() {
+        let encoded = copy().encode().replace("\"input\":1", "\"input\":5");
+        assert!(matches!(
+            CoreCopy::decode(&encoded),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
+    /// Each class of value a peer can send that no engine holds is
+    /// refused when decoded, before a replay or the RT thread indexes,
+    /// adds or applies it.
+    #[test]
+    fn a_core_holding_a_value_no_engine_holds_is_refused() {
+        let refused = |what: &str, f: &dyn Fn(&mut Core)| {
+            let mut copy = copy();
+            f(&mut copy.core);
+            assert!(
+                matches!(
+                    CoreCopy::decode(&copy.encode()),
+                    Err(DecodeError::Malformed(_))
+                ),
+                "{what}"
+            );
+        };
+        refused("next index", &|c| c.pos = Some(u64::MAX));
+        refused("ramp end", &|c| c.ramp_end = u64::MAX);
+        refused("entries page", &|c| c.entries_page = Some(u64::MAX));
+        refused("late-route bound", &|c| c.late_lost_until = u64::MAX);
+        refused("crossfade start", &|c| c.slots[0].xfade = Some(u64::MAX));
+        refused("fade start", &|c| c.slots[0].fade_start = Some(u64::MAX));
+        refused("page entry", &|c| c.page_entries.push((8, u64::MAX)));
+        refused("unresolved", &|c| c.unresolved.push((8, u64::MAX)));
+        refused("late route", &|c| c.late_routes.push((8, u64::MAX)));
+        refused("entry index", &|c| c.pending[0].at_index = u64::MAX);
+        refused("gain", &|c| {
+            c.pending.push(RtEntry {
+                id: 8,
+                at_index: 9600,
+                change: Change::Gain {
+                    input: 0,
+                    output: 0,
+                    gain: 1.0e9,
+                },
+            })
+        });
+        refused("strip parameter", &|c| {
+            c.pending[0].change = Change::Strip {
+                slot: 1,
+                param: StripParam::Trim { db: 1000.0 },
+            }
+        });
+        refused("pending list", &|c| {
+            let e = c.pending[0];
+            c.pending.resize(PENDING_CHANGES + 1, e)
+        });
+        // The first ramp is the one of length 48 at position 0.
+        let encoded = copy().encode().replacen("\"pos\":0", "\"pos\":49", 1);
+        assert!(
+            matches!(CoreCopy::decode(&encoded), Err(DecodeError::Malformed(_))),
+            "a ramp position past its length"
+        );
+    }
+
+    /// A core after a block whose index would overflow at the largest
+    /// block size is refused.
+    #[test]
+    fn a_core_after_a_block_beyond_any_index_is_refused() {
+        let mut copy = copy();
+        copy.k0 = INDEX_MAX / 1024 + 1;
+        assert!(matches!(
+            CoreCopy::decode(&copy.encode()),
+            Err(DecodeError::Malformed(_))
+        ));
+        copy.k0 = INDEX_MAX / 1024;
+        assert!(CoreCopy::decode(&copy.encode()).is_ok());
+    }
+
+    /// A matrix the size of which a peer names beyond the coefficient
+    /// limit is refused before anything is allocated for it: 2^40 inputs
+    /// would abort the process on the allocation.
+    #[test]
+    fn a_matrix_beyond_the_coefficient_limit_is_refused() {
+        let copy = copy();
+        let wire = serde_json::to_string(&copy.core.matrix).unwrap();
+        let huge = wire.replacen("\"inputs\":2", &format!("\"inputs\":{}", 1u64 << 40), 1);
+        assert_ne!(wire, huge);
+        let encoded = copy.encode().replacen(&wire, &huge, 1);
+        assert!(matches!(
+            CoreCopy::decode(&encoded),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
+    /// A core of another shape, or with an entry outside the engine,
+    /// does not fit it.
+    #[test]
+    fn a_core_fits_only_its_own_shape() {
+        let mut copy = copy();
+        assert!(copy.core.fits(2, 2, &[1, 1], 8));
+        assert!(!copy.core.fits(2, 3, &[1, 1], 8));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 0));
+        copy.core.pending.push(RtEntry {
+            id: 8,
+            at_index: 9648,
+            change: Change::InputDown { slot: 2 },
+        });
+        assert!(!copy.core.fits(2, 2, &[1, 1], 8));
+    }
+}

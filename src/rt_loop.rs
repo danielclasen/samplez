@@ -403,7 +403,7 @@ pub type LogId = u64;
 
 /// What a committed log entry changes. Each sets an absolute target, so
 /// one applied again once its ramp has ended changes nothing.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Change {
     /// Ramps one matrix coefficient to `gain`.
     Gain {
@@ -440,7 +440,7 @@ impl Change {
 /// A committed log entry, applied at sample index `at_index`, a multiple
 /// of B. Entries have a ring of their own, so a full pending list never
 /// holds back a generation or a writer.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RtEntry {
     pub id: LogId,
     pub at_index: u64,

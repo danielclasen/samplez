@@ -61,7 +61,7 @@ async fn start_with(ids: Vec<NodeId>, kernel_offsets: Offsets, unverified: bool)
 /// Its engine dropped and not rebuilt since.
 fn dropped(set: &Set, id: NodeId) -> bool {
     let f = set.audio(id).lock();
-    f.drops > f.rebuilds
+    f.drops.len() > f.rebuilds.len()
 }
 
 fn audio(set: &Set) -> Vec<NodeId> {
@@ -273,10 +273,11 @@ async fn one_voter_verifies_on_its_own_offset_and_again_after_an_offset_step() {
         let set = start(vec![a(0)], vec![(a(0), offset)]).await;
         until("verified", 5, || metrics(&set, a(0)).verified).await;
         let holds = metrics(&set, a(0)).clock_holds;
-        let rebuilds = set.audio(a(0)).lock().rebuilds;
+        let rebuilds = set.audio(a(0)).lock().rebuilds.len();
         set.clock(a(0)).step_kernel_offset(to);
         until("held and rebuilt", 5, || {
-            metrics(&set, a(0)).clock_holds > holds && set.audio(a(0)).lock().rebuilds > rebuilds
+            metrics(&set, a(0)).clock_holds > holds
+                && set.audio(a(0)).lock().rebuilds.len() > rebuilds
         })
         .await;
         until("verified on the new offset", 5, || {
@@ -411,7 +412,7 @@ async fn a_verified_replica_beyond_the_horizon_is_held_and_rebuilt_once() {
     let set = start(ids.clone(), Vec::new()).await;
     committing(&set, &ids).await;
     let holds = metrics(&set, a(2)).clock_holds;
-    let rebuilds = set.audio(a(2)).lock().rebuilds;
+    let rebuilds = set.audio(a(2)).lock().rebuilds.len();
     set.clock(a(2)).set_tai_offset(-20_000_000_000);
     until("held by the horizon", 10, || {
         let m = metrics(&set, a(2));
@@ -432,5 +433,9 @@ async fn a_verified_replica_beyond_the_horizon_is_held_and_rebuilt_once() {
     // No second rebuild while its lag settles.
     sleep(Duration::from_secs(1)).await;
     assert_eq!(metrics(&set, a(2)).clock_holds, holds + 1, "one hold");
-    assert_eq!(set.audio(a(2)).lock().rebuilds, rebuilds + 1, "one rebuild");
+    assert_eq!(
+        set.audio(a(2)).lock().rebuilds.len(),
+        rebuilds + 1,
+        "one rebuild"
+    );
 }

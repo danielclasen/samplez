@@ -20,9 +20,10 @@ use crate::Shared;
 use crate::baseline::{Leader, LeaderView, Voter};
 use crate::entry::{Baseline, Body, NodeId, Request};
 use crate::log_store::Store;
-use crate::peer::PeerRequest;
+use crate::peer::{PeerRequest, PeerResponse};
 use crate::rank::Baselines;
 use crate::report::{Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report, Slack};
+use crate::resync::{CoreReply, Resynced, Source};
 use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
 use crate::state::{Life, PageBook, ReplicaState, Seen, View};
@@ -59,11 +60,15 @@ pub struct Timing {
     pub clock_guard: u64,
     /// `maxApplyLeadMs`.
     pub max_apply_lead: Duration,
+    /// `resyncBudgetMs`: a resync handing over later than this from
+    /// asking for the core warns.
+    pub resync_budget: Duration,
 }
 
 impl Timing {
     /// The defaults at block size `block`: p 2 ms, w 8 ms, D 10 ms, a
-    /// margin of 576 samples, clockGuard half of it, maxApplyLead 50 ms.
+    /// margin of 576 samples, clockGuard half of it, maxApplyLead 50 ms,
+    /// resyncBudget 50 ms.
     pub fn defaults(block: u64) -> Timing {
         Timing {
             block,
@@ -73,6 +78,7 @@ impl Timing {
             hold: Duration::from_millis(10),
             clock_guard: 288,
             max_apply_lead: Duration::from_millis(50),
+            resync_budget: Duration::from_millis(50),
         }
     }
 
@@ -199,6 +205,19 @@ pub trait Audio: Send + Sync + 'static {
     /// installs it; false when that failed and is to be retried.
     fn rebuild_engine(&self) -> bool {
         true
+    }
+    /// A donor's side of a resync: the engine's core after the block it
+    /// computes next, encoded with the engine version; none when it
+    /// copied none.
+    fn copy_core(&self) -> Option<CoreReply> {
+        None
+    }
+    /// A joiner's side: replays `core` from past input with the committed
+    /// log entries after its last log id that `source` gives, and hands
+    /// the replayed state to the RT thread at a block boundary while
+    /// `source` says go. Blocks until handed over or failed.
+    fn resync(&self, _core: &CoreReply, _source: &dyn Source) -> Result<Resynced, String> {
+        Err("no engine to resync".to_owned())
     }
 }
 
@@ -531,6 +550,8 @@ struct State {
     /// Back in `starting` until the applied index passes this and the
     /// engine is rebuilt from product state.
     restart: Option<u64>,
+    /// The resync attempt in progress and the counts.
+    resync: crate::resync::Tracker,
     /// The log's snapshot installs acted on.
     installs_seen: u64,
     fence: Option<u64>,
@@ -638,6 +659,8 @@ pub struct Metrics {
     pub hold_floor_unmet: bool,
     /// The audio replica's state and its moves; none for the witness.
     pub replica: Option<crate::state::Metrics>,
+    /// The resyncs of this audio replica.
+    pub resync: crate::resync::Metrics,
     /// The decisions taken while this voter led.
     pub leader: crate::baseline::Counts,
     /// `replica_disagreement`: the last page this voter judged as leader
@@ -768,6 +791,7 @@ impl Contact {
                 decisions: Vec::new(),
                 purge_points: Vec::new(),
                 restart: None,
+                resync: crate::resync::Tracker::default(),
                 installs_seen,
                 fence: None,
                 ranks: None,
@@ -1458,6 +1482,8 @@ impl Contact {
     /// `after` and its engine was rebuilt from product state.
     fn begin_restart(&self, st: &mut State, after: u64) {
         st.restart = Some(st.restart.map_or(after, |a| a.max(after)));
+        // The engine is rebuilt from product state: no resync hands over.
+        st.resync.abandon(Instant::now());
         if let (Some(audio), Some(life)) = (&self.audio, st.life.as_mut()) {
             life.restart(audio.as_ref());
             audio.drop_engine();
@@ -1650,7 +1676,7 @@ impl Contact {
             _ => baselines.rank(k, self.id, &audio_voters, &t),
         };
         let class = match st.life.as_ref() {
-            Some(l) if l.state() == ReplicaState::Diverged => crate::rank::Class::Diverged,
+            Some(l) if l.state().diverged() => crate::rank::Class::Diverged,
             Some(l) if l.filler() => crate::rank::Class::Filler,
             _ => crate::rank::Class::Demoted,
         };
@@ -1786,6 +1812,9 @@ impl Contact {
         };
         life.step(&view, audio.as_ref());
         let state = life.state();
+        if state == ReplicaState::Committing {
+            st.resync.committing();
+        }
         st.own.state = Some(state);
         st.own.ready = ready;
         st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
@@ -2401,6 +2430,156 @@ impl Contact {
         Ok(Stamp { stamp, earliest })
     }
 
+    /// A resync to start: this audio replica is diverged, not
+    /// clock-unverified or excluded, no attempt runs and the last ended
+    /// [`crate::resync::RETRY`] ago, and a committing donor reported
+    /// within `w + D`. Returns the attempt's epoch, the donor and its
+    /// address.
+    pub fn resync_due(&self) -> Option<(u64, NodeId, String)> {
+        self.audio.as_ref()?;
+        let now = Instant::now();
+        let mut st = self.lock();
+        let st = &mut *st;
+        let diverged = st.life.as_ref()?.state() == ReplicaState::Diverged;
+        if !diverged || st.own.clock.unverified || st.judged.contains(&self.id) {
+            return None;
+        }
+        let fresh = self.timing.contact_window + self.timing.hold;
+        let audio_voters = crate::rank::audio_voters(&st.members);
+        let donor = {
+            let peers: Vec<(NodeId, bool, &Own)> = self
+                .copies(st, now)
+                .into_iter()
+                .filter(|(id, _, _)| {
+                    *id != self.id && audio_voters.contains(id) && !st.judged.contains(id)
+                })
+                .map(|(id, age, own)| (id, age > fresh, own))
+                .collect();
+            crate::resync::donor(self.log.baseline().map(|b| b.replica), &peers)?
+        };
+        let addr = st.members.addrs.get(&donor)?.clone();
+        let epoch = st.resync.start(now)?;
+        Some((epoch, donor, addr))
+    }
+
+    /// The donor's core for attempt `epoch` arrived: the replica turns
+    /// `resync`. False when the attempt is no longer current or the
+    /// replica no longer diverged, which gives the attempt up.
+    pub fn resync_arrived(&self, epoch: u64) -> bool {
+        let mut st = self.lock();
+        let arrived = st.resync.current(epoch) && st.life.as_mut().is_some_and(Life::resyncing);
+        if !arrived {
+            st.resync.abandon(Instant::now());
+        }
+        arrived
+    }
+
+    /// Whether attempt `epoch` may still hand over: current, and the
+    /// replica resyncing.
+    pub fn resync_go(&self, epoch: u64) -> bool {
+        let st = self.lock();
+        st.resync.current(epoch)
+            && st
+                .life
+                .as_ref()
+                .is_some_and(|l| l.state() == ReplicaState::Resync)
+    }
+
+    /// Attempt `epoch` with `donor` ended. A hand-over whose replayed
+    /// pages all equal the donor's reported ones leaves the replica to
+    /// resume on its next matched page, holding the donor's unresolved
+    /// entries as its own; anything else leaves it diverged, to try again.
+    pub fn resync_ended(&self, epoch: u64, donor: NodeId, result: Result<Resynced, String>) {
+        let Some(audio) = self.audio.clone() else {
+            return;
+        };
+        let now = Instant::now();
+        let mut st = self.lock();
+        let st = &mut *st;
+        let result = result.and_then(|r| {
+            match crate::resync::mismatch(&r.pages, |o, q| st.pages.get(donor, o, q).copied()) {
+                Some(q) => Err(format!("replayed page {q} differs from the donor's")),
+                None => Ok(r),
+            }
+        });
+        if !st
+            .resync
+            .end(epoch, result.is_ok(), self.timing.resync_budget, now)
+        {
+            return;
+        }
+        let Some(life) = st.life.as_mut() else { return };
+        let r = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(donor, error = %e, "a resync failed");
+                life.resync_failed();
+                return;
+            }
+        };
+        life.handed_over(r.j);
+        // The donor's unresolved entries are this replica's now: the
+        // log's decision on them reaches both alike.
+        let inherited: BTreeMap<u64, u64> = r.unresolved.iter().copied().collect();
+        st.given.retain(|k, _| inherited.contains_key(&k.0));
+        for (&index, &at) in &inherited {
+            if st.given.keys().any(|k| k.0 == index) {
+                continue;
+            }
+            if index & UNLISTED_BIT != 0 {
+                st.given.insert((index, 0, 0), at);
+                st.unlisted.entry(index).or_insert(st.known_committed);
+                continue;
+            }
+            let decided = self.log.log_id_at(index).filter(|id| {
+                self.log
+                    .decided(index, id.term)
+                    .is_none_or(|d| st.decisions.iter().any(|x| x.0 == d))
+            });
+            match decided {
+                Some(id) => {
+                    st.given.insert(key(id), at);
+                }
+                // Decided and acted on already, or purged with its
+                // decision: resolved.
+                None => audio.resolved(index),
+            }
+        }
+    }
+
+    /// The committed log entries after index `after`, as the engine
+    /// applies them, for a resync's replay.
+    pub fn replay_entries(&self, after: u64) -> Vec<(u64, Request)> {
+        let committed = self.log.committed().map_or(0, |c| c.index);
+        let mut out = Vec::new();
+        self.log.entries_after(after, &mut |id, request| {
+            if id.index <= committed {
+                out.push((id.index, request.clone()));
+            }
+        });
+        out.into_iter()
+            .map(|(index, request)| {
+                let engine = self.engine_request(index, &request).unwrap_or(request);
+                (index, engine)
+            })
+            .collect()
+    }
+
+    /// The donor's side of a resync: the core, while this audio replica
+    /// commits.
+    pub fn copy_core(&self) -> Result<CoreReply, String> {
+        let audio = self.audio.clone().ok_or("the witness holds no engine")?;
+        let committing = self
+            .lock()
+            .life
+            .as_ref()
+            .is_some_and(|l| l.state() == ReplicaState::Committing);
+        if !committing {
+            return Err("not committing".to_owned());
+        }
+        audio.copy_core().ok_or_else(|| "no core copied".to_owned())
+    }
+
     pub fn metrics(&self) -> Metrics {
         let st = self.lock();
         let c = &st.counts;
@@ -2455,6 +2634,7 @@ impl Contact {
                 _ => false,
             },
             replica: st.life.as_ref().map(|l| l.metrics),
+            resync: st.resync.metrics,
             leader: st.leader.counts,
             replica_disagreement: st.leader.disagreement,
             clock: self.clock_status(&st, Instant::now()),
@@ -2518,6 +2698,9 @@ pub(crate) async fn run(
                         .or_insert_with(|| send(shared.clone(), to, contact.timing.contact_window))
                         .send_replace(Some((addr, report)));
                 }
+                if let Some((epoch, donor, addr)) = contact.resync_due() {
+                    tokio::spawn(resync(shared.clone(), contact.clone(), epoch, donor, addr));
+                }
                 // Decisions are the leader's, and pause in an election.
                 if shared.leads() {
                     let term = shared.raft.metrics().borrow().current_term;
@@ -2540,6 +2723,65 @@ pub(crate) async fn run(
                 contact.log_changed();
             }
         }
+    }
+}
+
+/// One resync attempt: the donor's core over the peer listener, then the
+/// replay and hand-over off the async workers.
+async fn resync(
+    shared: Arc<Shared>,
+    contact: Arc<Contact>,
+    epoch: u64,
+    donor: NodeId,
+    addr: String,
+) {
+    let within = crate::resync::FETCH_WITHIN;
+    let core = match shared
+        .peers
+        .call(Some(donor), &addr, PeerRequest::Core, within)
+        .await
+    {
+        Ok(Ok(PeerResponse::Core(core))) => Ok(core),
+        Ok(Ok(_)) => Err("an answer other than a core".to_owned()),
+        Ok(Err(refused)) => Err(format!("refused: {refused:?}")),
+        Err(e) => Err(e),
+    };
+    let core = match core {
+        Ok(core) => core,
+        Err(e) => {
+            contact.resync_ended(epoch, donor, Err(format!("no core from {donor}: {e}")));
+            return;
+        }
+    };
+    let Some(audio) = contact.audio.clone() else {
+        return;
+    };
+    if !contact.resync_arrived(epoch) {
+        return;
+    }
+    let feed = Feed {
+        contact: contact.clone(),
+        epoch,
+    };
+    let result = tokio::task::spawn_blocking(move || audio.resync(&core, &feed))
+        .await
+        .unwrap_or_else(|e| Err(format!("the replay panicked: {e}")));
+    contact.resync_ended(epoch, donor, result);
+}
+
+/// The log and the go-ahead a resync's replay reads.
+struct Feed {
+    contact: Arc<Contact>,
+    epoch: u64,
+}
+
+impl Source for Feed {
+    fn entries(&self, after: u64) -> Vec<(u64, Request)> {
+        self.contact.replay_entries(after)
+    }
+
+    fn go(&self) -> bool {
+        self.contact.resync_go(self.epoch)
     }
 }
 

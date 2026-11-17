@@ -17,7 +17,7 @@ pub fn valid_gain(gain: f32) -> bool {
 /// `c0 + n * step` with `step = (target - c0) / len`, computed from `n`
 /// directly rather than by accumulation. From sample `len` on the value is
 /// `target` exactly.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Ramp {
     pub(crate) c0: f32,
     pub(crate) step: f32,

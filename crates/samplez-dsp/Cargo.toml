@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 libm = "0.2.16"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 gungraun = "=0.20.0"

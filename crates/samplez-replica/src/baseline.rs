@@ -287,7 +287,7 @@ impl Leader {
     fn no_committer(&mut self, v: &LeaderView) -> Option<Baseline> {
         let top = v.audio.iter().filter(|a| candidate(v, a)).min_by_key(|a| {
             let own = a.own.expect("a candidate reported");
-            let class = if own.state == Some(ReplicaState::Diverged) {
+            let class = if own.state.is_some_and(ReplicaState::diverged) {
                 Class::Diverged
             } else {
                 Class::Demoted
@@ -355,7 +355,7 @@ impl Leader {
                 let reported = |id: NodeId| {
                     v.audio
                         .iter()
-                        .any(|a| a.id == id && state(a) == Some(ReplicaState::Diverged))
+                        .any(|a| a.id == id && state(a).is_some_and(ReplicaState::diverged))
                 };
                 // Judged again once a verdict in flight on the replica it
                 // diverges clears: that one may be ignored as stale.

@@ -31,7 +31,7 @@ impl Path {
 }
 
 /// One nonzero or ramping coefficient of an output.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Term {
     pub(crate) input: usize,
     pub(crate) ramp: Ramp,
@@ -51,12 +51,74 @@ pub(crate) struct Term {
 /// infinity on an input with coefficient 0 does not reach the output, and
 /// a route passes -0.0, NaN payloads and, under DAZ, denormals unchanged
 /// where the sum would not.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "MatrixWire", try_from = "MatrixWire")]
 pub struct Matrix {
     inputs: usize,
     /// Per output, the nonzero or ramping coefficients sorted by input.
     columns: Vec<Vec<Term>>,
     path: Path,
+}
+
+/// The most coefficients a matrix holds, input channels times output
+/// channels: an engine configuration beyond it is refused, and so is a
+/// serialised matrix, before anything is allocated for it.
+pub const MAX_COEFFICIENTS: usize = 1 << 18;
+
+/// A matrix as [`Matrix`]'s serde form carries it: its coefficients and
+/// ramps. Every path gives the same output, so the receiver runs on its
+/// own [`Path::best`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MatrixWire {
+    inputs: usize,
+    columns: Vec<Vec<Term>>,
+}
+
+impl From<Matrix> for MatrixWire {
+    fn from(m: Matrix) -> MatrixWire {
+        MatrixWire {
+            inputs: m.inputs,
+            columns: m.columns,
+        }
+    }
+}
+
+impl TryFrom<MatrixWire> for Matrix {
+    type Error = String;
+
+    /// Refuses a matrix of more than [`MAX_COEFFICIENTS`] coefficients,
+    /// before allocating it, and a column with an input out of range, out of order or
+    /// twice, or a ramp a matrix never holds: a gain beyond
+    /// [`crate::MAX_GAIN`] or not finite, a length beyond
+    /// [`crate::MAX_RAMP_LEN`], a position past its length.
+    fn try_from(w: MatrixWire) -> Result<Matrix, String> {
+        let size = w.inputs.checked_mul(w.columns.len());
+        if size.is_none_or(|n| n > MAX_COEFFICIENTS) {
+            return Err(format!(
+                "a matrix of {} inputs and {} outputs, at most {MAX_COEFFICIENTS} coefficients",
+                w.inputs,
+                w.columns.len()
+            ));
+        }
+        let mut m = Matrix::new(w.inputs, w.columns.len());
+        for (dst, col) in m.columns.iter_mut().zip(w.columns) {
+            let ordered = col.windows(2).all(|t| t[0].input < t[1].input);
+            let inside = col.iter().all(|t| t.input < w.inputs);
+            let finite = col.iter().all(|t| {
+                let r = &t.ramp;
+                valid_gain(r.c0)
+                    && valid_gain(r.target)
+                    && r.step.is_finite()
+                    && r.len <= crate::ramp::MAX_RAMP_LEN
+                    && r.pos <= r.len
+            });
+            if !(ordered && inside && finite) {
+                return Err("a matrix column out of range, order or finite values".to_owned());
+            }
+            dst.extend(col);
+        }
+        Ok(m)
+    }
 }
 
 impl Clone for Matrix {
