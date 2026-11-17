@@ -81,7 +81,15 @@ pub struct Input {
     pub name: String,
     pub domain: String,
     pub flow_id: String,
+    /// The input's legs: its matrix rows, meter and strip width.
     pub channels: u32,
+    /// The 0-based flow channel each leg reads, `channels` long, each
+    /// below `samplez_mxl::input::MAX_FLOW_CHANNELS`; an index may repeat.
+    /// The input then reads any flow with more channels than the highest
+    /// index, and so does every flow a `Route` moves it to. Without it the
+    /// flow has exactly `channels` channels, read in order.
+    #[serde(default)]
+    pub flow_channels: Option<Vec<u32>>,
     #[serde(default)]
     pub offset_samples: i64,
     /// The loudness role of each channel, as for an output; weights the
@@ -422,6 +430,8 @@ impl Config {
             if i.channels == 0 {
                 return fail(format!("input {}: channels must be at least 1", i.name));
             }
+            samplez_mxl::input::legs(&self.input_config(i, &i.flow_id))
+                .map_err(|e| Error(format!("input {}: {e}", i.name)))?;
             i.loudness_weights()?;
         }
         for m in &self.meters {
@@ -479,6 +489,20 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    /// The samplez-mxl attach parameters of `i` reading `flow_id`.
+    pub fn input_config<'a>(
+        &self,
+        i: &'a Input,
+        flow_id: &'a str,
+    ) -> samplez_mxl::input::InputConfig<'a> {
+        samplez_mxl::input::InputConfig {
+            flow_id,
+            channels: i.channels,
+            flow_channels: i.flow_channels.as_deref(),
+            offset: i.offset_samples,
+        }
     }
 
     pub fn output_config<'a>(&self, o: &'a Output) -> samplez_mxl::output::OutputConfig<'a> {
@@ -711,6 +735,38 @@ mod tests {
         );
         c["inputs"][0]["loudnessChannels"] = serde_json::json!(["L", "X"]);
         assert!(parse(&c).is_err());
+    }
+
+    /// A selection names one flow channel per leg, below
+    /// MAX_FLOW_CHANNELS; without one the input reads the flow in order.
+    #[test]
+    fn flow_channels_name_one_flow_channel_per_leg() {
+        let max = samplez_mxl::input::MAX_FLOW_CHANNELS;
+        let mut c = base();
+        assert_eq!(parse(&c).unwrap().inputs[0].flow_channels, None);
+        for ok in [
+            serde_json::json!([2, 3]),
+            serde_json::json!([7, 7]),
+            serde_json::json!([max - 1, 0]),
+        ] {
+            c["inputs"][0]["flowChannels"] = ok.clone();
+            let p = parse(&c).unwrap();
+            assert_eq!(serde_json::json!(p.inputs[0].flow_channels), ok, "{ok}");
+        }
+        for bad in [
+            serde_json::json!([7]),
+            serde_json::json!([0, 1, 2]),
+            serde_json::json!([]),
+            serde_json::json!([0, max]),
+            serde_json::json!([0, -1]),
+        ] {
+            c["inputs"][0]["flowChannels"] = bad.clone();
+            assert!(parse(&c).is_err(), "{bad}");
+        }
+        c["inputs"][0]["channels"] = serde_json::json!(1);
+        c["inputs"][0]["flowChannels"] = serde_json::json!([7]);
+        c["matrix"] = serde_json::json!([[0.5]]);
+        assert!(parse(&c).is_ok());
     }
 
     /// JSON has no NaN, so the gain is set on a parsed configuration.

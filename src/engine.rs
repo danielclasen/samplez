@@ -19,8 +19,7 @@ use std::time::{Duration, Instant};
 use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{Matrix, PlanarBuffer, Started, StripParam};
 use samplez_mxl::input::{
-    Counters as InputCounters, Generation, GroupWait, InputConfig, Poll, PolledFlow, Recovery,
-    Timing,
+    Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, Recovery, Timing,
 };
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
@@ -1832,11 +1831,9 @@ impl Engine {
                 if slot.domain != d || input.state != InputState::Attached {
                     continue;
                 }
-                let cfg = InputConfig {
-                    flow_id: &input.flow_id,
-                    channels: slot.channels as u32,
-                    offset: slot.offset,
-                };
+                let cfg = self
+                    .config
+                    .input_config(&self.config.inputs[i], &input.flow_id);
                 g.attach(i, &cfg, &timing).map_err(attach)?;
             }
             gens.push(Some(Box::new(Gen {
@@ -2779,13 +2776,6 @@ impl Supervisor {
             let current = self.slots[slot].flow.clone();
             let wanted = !matches!(self.slots[slot].state, SupState::Pruned { .. });
             let cfg = &self.config.inputs[slot];
-            fn input<'a>(cfg: &crate::config::Input, flow_id: &'a str) -> InputConfig<'a> {
-                InputConfig {
-                    flow_id,
-                    channels: cfg.channels,
-                    offset: cfg.offset_samples,
-                }
-            }
             // The flow a re-route leaves is read until its crossfade ends.
             let outgoing = match (flow, &self.slots[slot].routing) {
                 (Some(f), _) if f != current && wanted => Some(current.clone()),
@@ -2793,7 +2783,11 @@ impl Supervisor {
                 _ => None,
             };
             if let Some(old) = outgoing
-                && let Err(e) = generation.attach_outgoing(slot, &input(cfg, &old), &self.timing)
+                && let Err(e) = generation.attach_outgoing(
+                    slot,
+                    &self.config.input_config(cfg, &old),
+                    &self.timing,
+                )
             {
                 log(format_args!("input {}: flow {old} left: {e}", cfg.name));
             }
@@ -2802,7 +2796,7 @@ impl Supervisor {
                 continue;
             }
             let flow_id = flow.unwrap_or(&current);
-            match generation.attach(slot, &input(cfg, flow_id), &self.timing) {
+            match generation.attach(slot, &self.config.input_config(cfg, flow_id), &self.timing) {
                 Ok(short) => {
                     held |= 1 << slot;
                     let hint = generation

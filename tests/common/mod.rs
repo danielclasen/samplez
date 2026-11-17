@@ -465,6 +465,7 @@ impl Checker {
             let cfg = InputConfig {
                 flow_id: &self.flow_id,
                 channels: self.channels as u32,
+                flow_channels: None,
                 offset: 0,
             };
             let timing = Timing {
@@ -608,6 +609,7 @@ pub fn read_blocks(domain: &Path, flow_id: &str, channels: usize, ks: Range<u64>
     let cfg = InputConfig {
         flow_id,
         channels: channels as u32,
+        flow_channels: None,
         offset: 0,
     };
     let timing = Timing {

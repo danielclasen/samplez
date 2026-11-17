@@ -126,6 +126,7 @@ fn head(domain: &Domain, flow_id: &str) -> u64 {
     let cfg = InputConfig {
         flow_id,
         channels: 1,
+        flow_channels: None,
         offset: 0,
     };
     let timing = Timing {
