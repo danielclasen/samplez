@@ -324,6 +324,15 @@ pub fn user(claims: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The user's display name a token gives: `preferred_username`, else
+/// `name`, each as [`auth::display_name`] leaves it.
+pub fn name(claims: &Value) -> Option<String> {
+    ["preferred_username", "name"]
+        .iter()
+        .filter_map(|c| claims[*c].as_str())
+        .find_map(auth::display_name)
+}
+
 /// `n` random bytes in base64url without padding.
 pub(crate) fn random(n: usize) -> Result<String, Error> {
     let mut buf = vec![0u8; n];
@@ -743,6 +752,7 @@ impl Oidc {
         Some(Identity {
             role: role(&values, &c.operator_role, c.viewer_role.as_deref())?,
             user: Some(user(claims)?),
+            name: name(claims),
         })
     }
 
@@ -1422,6 +1432,28 @@ mod tests {
         assert_eq!(role(&["faderz-operator-x"], op, Some("v")), None);
     }
 
+    /// The display name is `preferred_username`, else `name`, and never
+    /// the email or subject id the user falls back to.
+    #[test]
+    fn the_name_is_never_an_email_or_a_subject() {
+        let both = json!({ "preferred_username": "alice", "name": "Alice A", "email": "a@x", "sub": "s1" });
+        assert_eq!(name(&both).as_deref(), Some("alice"));
+        let named =
+            json!({ "preferred_username": "", "name": "Alice A", "email": "a@x", "sub": "s1" });
+        assert_eq!(name(&named).as_deref(), Some("Alice A"));
+        let blank = json!({ "preferred_username": "\n\u{202e} ", "name": " Alice A\n" });
+        assert_eq!(
+            name(&blank).as_deref(),
+            Some("Alice A"),
+            "a claim with nothing left after cleaning gives way to the next"
+        );
+        let long = json!({ "preferred_username": "x".repeat(300) });
+        assert_eq!(name(&long).unwrap().len(), auth::DISPLAY_NAME_CHARS);
+        let bare = json!({ "email": "a@x", "sub": "s1" });
+        assert_eq!(user(&bare).as_deref(), Some("a@x"));
+        assert_eq!(name(&bare), None);
+    }
+
     #[test]
     fn pkce_challenge_is_rfc_7636_s256() {
         // RFC 7636 appendix B.
@@ -1624,6 +1656,7 @@ mod tests {
         p.set(|b| b.keys = json!({ "keys": [new.jwk()] }));
         let (id, _) = oidc.bearer(&access(&new, &p.issuer)).await.unwrap();
         assert_eq!(id.user.as_deref(), Some("alice"));
+        assert_eq!(id.name.as_deref(), Some("alice"));
         assert_eq!(p.hits(), (1, 2), "read again for the new kid");
         oidc.bearer(&access(&new, &p.issuer)).await.unwrap();
         assert_eq!(p.hits(), (1, 2), "the known kid needs no read");

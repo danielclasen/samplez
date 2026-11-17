@@ -62,7 +62,30 @@ pub struct Identity {
     /// The user named by the proxy or by the OpenID provider's token;
     /// `None` in the other modes and for a static bearer token.
     pub user: Option<String>,
+    /// The user's display name: the user the proxy names, or the OpenID
+    /// provider's `preferred_username`, else its `name` claim, never the
+    /// email or subject id `user` falls back to; `None` when the token has
+    /// neither, and in the other modes and for a static bearer token.
+    pub name: Option<String>,
     pub role: Role,
+}
+
+/// The most characters [`Identity::name`] has.
+pub const DISPLAY_NAME_CHARS: usize = 64;
+
+/// `raw` as [`Identity::name`] carries it: without control characters
+/// (newlines among them) and bidirectional formatting characters, trimmed,
+/// and cut to [`DISPLAY_NAME_CHARS`] characters; `None` when nothing is
+/// left.
+pub fn display_name(raw: &str) -> Option<String> {
+    let bidi = |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let kept: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !bidi(*c))
+        .collect();
+    let cut: String = kept.trim().chars().take(DISPLAY_NAME_CHARS).collect();
+    let name = cut.trim_end();
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,6 +547,7 @@ impl Auth {
                     let (expiry, id) = token_session(&key, c, now)?;
                     let operator = Identity {
                         user: None,
+                        name: None,
                         role: Role::Operator,
                     };
                     (!self.is_revoked(&id)).then_some((operator, id, expiry))
@@ -598,6 +622,7 @@ impl Auth {
         let token = bearer_token(value).ok_or(Refused::UNAUTHORIZED)?;
         let operator = Identity {
             user: None,
+            name: None,
             role: Role::Operator,
         };
         let secret = match listener {
@@ -667,6 +692,7 @@ impl Auth {
 
         let operator = Identity {
             user: None,
+            name: None,
             role: Role::Operator,
         };
         let path = req.uri().path();
@@ -736,6 +762,7 @@ impl Auth {
             .ok_or(Refused(StatusCode::FORBIDDEN, "no group with a role"))?;
         Ok(Identity {
             user: Some(user.to_owned()),
+            name: display_name(user),
             role,
         })
     }
@@ -888,7 +915,8 @@ fn tag_valid(key: &[u8], domain: &[u8], parts: &[&str], tag: &str) -> bool {
 
 const OIDC_SESSION: &[u8] = b"samplez-oidc-session:";
 
-/// `<expiry>.<role>.<user, base64url>.<id>.<tag>`; `id` is base64url and
+/// `<expiry>.<role>.<user, base64url>.<name, base64url>.<id>.<tag>`,
+/// `name` empty when there is none; `id` is base64url and
 /// names the session for its sign-out.
 fn oidc_session_value(key: &[u8], expiry: u64, id: &str, identity: &Identity) -> String {
     let role = match identity.role {
@@ -896,16 +924,22 @@ fn oidc_session_value(key: &[u8], expiry: u64, id: &str, identity: &Identity) ->
         Role::Viewer => "viewer",
     };
     let user = oidc::encode_user(identity.user.as_deref().unwrap_or_default());
+    let name = oidc::encode_user(identity.name.as_deref().unwrap_or_default());
     let expiry = expiry.to_string();
-    let tag = hex(&signed(key, OIDC_SESSION, &[&expiry, role, &user, id]));
-    format!("{expiry}.{role}.{user}.{id}.{tag}")
+    let tag = hex(&signed(
+        key,
+        OIDC_SESSION,
+        &[&expiry, role, &user, &name, id],
+    ));
+    format!("{expiry}.{role}.{user}.{name}.{id}.{tag}")
 }
 
 /// The identity, id and expiry of a current `oidc` mode session cookie
 /// no longer than `ttl` seconds from `now`.
 fn oidc_session(key: &[u8], value: &str, now: u64, ttl: u64) -> Option<(Identity, String, u64)> {
     let mut parts = value.split('.');
-    let (expiry, role, user, id, tag) = (
+    let (expiry, role, user, name, id, tag) = (
+        parts.next()?,
         parts.next()?,
         parts.next()?,
         parts.next()?,
@@ -917,7 +951,7 @@ fn oidc_session(key: &[u8], value: &str, now: u64, ttl: u64) -> Option<(Identity
         || at <= now
         || at > now + ttl
         || id.is_empty()
-        || !tag_valid(key, OIDC_SESSION, &[expiry, role, user, id], tag)
+        || !tag_valid(key, OIDC_SESSION, &[expiry, role, user, name, id], tag)
     {
         return None;
     }
@@ -928,6 +962,7 @@ fn oidc_session(key: &[u8], value: &str, now: u64, ttl: u64) -> Option<(Identity
     };
     let identity = Identity {
         user: Some(oidc::decode_user(user)?),
+        name: Some(oidc::decode_user(name)?).filter(|n| !n.is_empty()),
         role,
     };
     Some((identity, id.to_owned(), at))
@@ -1116,6 +1151,34 @@ pub(crate) async fn session(
 mod tests {
     use super::*;
 
+    /// A display name goes to other users: it carries no control or
+    /// bidirectional formatting characters and no more than 64 characters,
+    /// and one with nothing else is none.
+    #[test]
+    fn a_display_name_is_cleaned_and_capped() {
+        assert_eq!(display_name("  alice  ").as_deref(), Some("alice"));
+        assert_eq!(
+            display_name("al\nice\r\t\u{0}\u{7f}").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            display_name("\u{202e}eci\u{2066}la\u{200f}").as_deref(),
+            Some("ecila")
+        );
+        let long = "\u{e9}".repeat(100);
+        let capped = display_name(&long).unwrap();
+        assert_eq!(capped.chars().count(), DISPLAY_NAME_CHARS);
+        assert_eq!(capped, "\u{e9}".repeat(DISPLAY_NAME_CHARS));
+        assert_eq!(
+            display_name(&format!("{} x", "a".repeat(63))).as_deref(),
+            Some("a".repeat(63).as_str()),
+            "no trailing space where the cut falls"
+        );
+        assert_eq!(display_name(""), None);
+        assert_eq!(display_name(" \n\u{202e}\t "), None);
+        assert_eq!(display_name("J\u{f6}rg").as_deref(), Some("J\u{f6}rg"));
+    }
+
     #[test]
     fn session_expires_and_follows_the_token() {
         let t = 1_000_000;
@@ -1136,6 +1199,7 @@ mod tests {
         let ttl = 3600;
         let alice = Identity {
             user: Some("alice.o'neil@example".into()),
+            name: Some("Alice O'Neil".into()),
             role: Role::Viewer,
         };
         let v = oidc_session_value(b"key", t + 60, "sid1", &alice);
@@ -1156,6 +1220,20 @@ mod tests {
             None,
             "longer than the session lifetime"
         );
+        let mut renamed: Vec<&str> = v.split('.').collect();
+        let mallory = oidc::encode_user("Mallory");
+        renamed[3] = &mallory;
+        assert_eq!(
+            got(&renamed.join("."), b"key", t),
+            None,
+            "the name is signed"
+        );
+        let unnamed = Identity {
+            name: None,
+            ..alice.clone()
+        };
+        let v = oidc_session_value(b"key", t + 60, "sid1", &unnamed);
+        assert_eq!(got(&v, b"key", t), Some(unnamed), "no name stays none");
         assert_eq!(got(&format!("{v}.x"), b"key", t), None);
         assert_eq!(got("", b"key", t), None);
     }
@@ -1178,6 +1256,7 @@ mod tests {
         let auth = oidc_auth();
         let identity = Identity {
             user: Some("alice".into()),
+            name: Some("alice".into()),
             role: Role::Operator,
         };
         let now = now();

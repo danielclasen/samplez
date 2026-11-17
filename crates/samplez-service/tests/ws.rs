@@ -300,7 +300,11 @@ impl Sink<Message> for ChannelSocket {
 
 fn connect(sessions: &Arc<Sessions>, role: Role, n: u32) -> Connect {
     Connect {
-        identity: Identity { user: None, role },
+        identity: Identity {
+            user: None,
+            name: None,
+            role,
+        },
         owner: Owner {
             principal: "anonymous".into(),
             session: format!("s{n}"),

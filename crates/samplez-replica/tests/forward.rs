@@ -626,6 +626,7 @@ async fn a_follower_catches_a_client_up_to_what_its_leader_committed() {
     let connect = Connect {
         identity: Identity {
             user: None,
+            name: None,
             role: Role::Operator,
         },
         owner: owner("c"),
