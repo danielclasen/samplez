@@ -1812,6 +1812,9 @@ impl Contact {
         };
         life.step(&view, audio.as_ref());
         let state = life.state();
+        if state == ReplicaState::Committing {
+            st.resync.committing();
+        }
         st.own.state = Some(state);
         st.own.ready = ready;
         st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
@@ -2447,7 +2450,9 @@ impl Contact {
             let peers: Vec<(NodeId, bool, &Own)> = self
                 .copies(st, now)
                 .into_iter()
-                .filter(|(id, _, _)| *id != self.id && audio_voters.contains(id))
+                .filter(|(id, _, _)| {
+                    *id != self.id && audio_voters.contains(id) && !st.judged.contains(id)
+                })
                 .map(|(id, age, own)| (id, age > fresh, own))
                 .collect();
             crate::resync::donor(self.log.baseline().map(|b| b.replica), &peers)?

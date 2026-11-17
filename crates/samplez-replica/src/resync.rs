@@ -47,8 +47,12 @@ pub trait Source: Send + Sync {
     fn go(&self) -> bool;
 }
 
-/// How long a failed or abandoned attempt waits before the next one.
+/// How long the next attempt waits after one ended: [`RETRY`], doubled
+/// after each attempt up to [`RETRY_MAX`], back to [`RETRY`] once the
+/// replica commits again. A replica whose replayed state never matches
+/// asks its donor for a core at most every [`RETRY_MAX`].
 pub const RETRY: Duration = Duration::from_millis(100);
+pub const RETRY_MAX: Duration = Duration::from_secs(10);
 
 /// How long a joiner waits for the donor's core.
 pub const FETCH_WITHIN: Duration = Duration::from_secs(1);
@@ -69,6 +73,8 @@ pub struct Metrics {
     pub budget_exceeded: bool,
     /// From asking for the core to the hand-over, the latest.
     pub last: Option<Duration>,
+    /// How long the next attempt waits after the last one ended.
+    pub backoff: Duration,
 }
 
 /// The attempt in progress and the counts.
@@ -80,14 +86,17 @@ pub(crate) struct Tracker {
     /// The attempt in progress, from when its core was asked for.
     running: Option<(u64, Instant)>,
     ended: Option<Instant>,
+    /// The backoff after the next attempt ends, none for [`RETRY`].
+    wait: Option<Duration>,
     pub metrics: Metrics,
 }
 
 impl Tracker {
-    /// A new attempt, unless one runs or the last ended less than
-    /// [`RETRY`] ago.
+    /// A new attempt, unless one runs or the last ended less than the
+    /// backoff ago.
     pub fn start(&mut self, now: Instant) -> Option<u64> {
-        if self.running.is_some() || self.ended.is_some_and(|e| now < e + RETRY) {
+        let wait = self.metrics.backoff;
+        if self.running.is_some() || self.ended.is_some_and(|e| now < e + wait) {
             return None;
         }
         self.epoch += 1;
@@ -102,11 +111,26 @@ impl Tracker {
     }
 
     /// Gives up the attempt in progress: its answer, when it comes, is
-    /// not acted on, and the next attempt waits [`RETRY`].
+    /// not acted on, and the next attempt waits the backoff.
     pub fn abandon(&mut self, now: Instant) {
         if self.running.take().is_some() {
-            self.ended = Some(now);
+            self.ended(now);
         }
+    }
+
+    /// The replica commits again: the next resync waits [`RETRY`] only.
+    pub fn committing(&mut self) {
+        self.wait = None;
+        self.metrics.backoff = RETRY;
+    }
+
+    /// An attempt ended at `now`: the next waits the backoff, which
+    /// doubles for the one after.
+    fn ended(&mut self, now: Instant) {
+        self.ended = Some(now);
+        let wait = self.wait.unwrap_or(RETRY);
+        self.metrics.backoff = wait;
+        self.wait = Some((wait * 2).min(RETRY_MAX));
     }
 
     /// Ends attempt `epoch`; `handed` when the RT thread took its state.
@@ -119,7 +143,7 @@ impl Tracker {
             return false;
         }
         self.running = None;
-        self.ended = Some(now);
+        self.ended(now);
         if handed {
             let took = now - began;
             self.metrics.handovers += 1;
@@ -140,12 +164,15 @@ impl Tracker {
     }
 }
 
-/// The donor: a fresh committing audio replica, the baseline first, else
-/// the lowest node id.
+/// The donor: a fresh, clock-verified committing audio replica, the
+/// baseline first, else the lowest node id. The caller leaves out the
+/// replicas a `ClockVerdict` excludes.
 pub(crate) fn donor(baseline: Option<NodeId>, peers: &[(NodeId, bool, &Own)]) -> Option<NodeId> {
     let committing: Vec<NodeId> = peers
         .iter()
-        .filter(|(_, silent, own)| !silent && own.state == Some(ReplicaState::Committing))
+        .filter(|(_, silent, own)| {
+            !silent && own.state == Some(ReplicaState::Committing) && !own.clock.unverified
+        })
         .map(|&(id, _, _)| id)
         .collect();
     baseline
@@ -203,6 +230,12 @@ mod tests {
         assert_eq!(donor(Some(2), &peers), Some(3), "a withdrawn baseline");
         assert_eq!(donor(Some(1), &peers), Some(3), "a silent baseline");
         assert_eq!(donor(None, &[(2, false, &w)]), None);
+        let mut unverified = own(ReplicaState::Committing);
+        unverified.clock.unverified = true;
+        assert_eq!(
+            donor(Some(4), &[(4, false, &unverified), (6, false, &c)]),
+            Some(6)
+        );
     }
 
     #[test]
@@ -235,5 +268,31 @@ mod tests {
         );
         assert!(t.metrics.budget_exceeded);
         assert_eq!(t.metrics.over_budget, 1);
+    }
+
+    /// Attempts that never bring the replica back wait twice as long each
+    /// time, up to the cap, hand-over or not; committing again resets it.
+    #[test]
+    fn the_wait_doubles_to_its_cap_until_the_replica_commits() {
+        let mut t = Tracker::default();
+        let budget = Duration::from_millis(50);
+        let mut now = Instant::now();
+        let mut waits = Vec::new();
+        for n in 0..10 {
+            let e = t.start(now).expect("due");
+            assert!(t.end(e, n % 2 == 0, budget, now));
+            let wait = t.metrics.backoff;
+            assert_eq!(t.start(now + wait - Duration::from_millis(1)), None);
+            waits.push(wait);
+            now += wait;
+        }
+        assert_eq!(waits[0], RETRY);
+        assert_eq!(waits[1], RETRY * 2);
+        assert_eq!(*waits.last().unwrap(), RETRY_MAX);
+        assert_eq!(t.metrics.attempts, 10);
+        t.committing();
+        let e = t.start(now).unwrap();
+        assert!(t.end(e, false, budget, now));
+        assert_eq!(t.metrics.backoff, RETRY);
     }
 }

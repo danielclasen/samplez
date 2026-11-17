@@ -529,10 +529,16 @@ impl Life {
             self.cancel(audio, |why| why == Why::Named(p));
             return;
         }
-        if matches!(
-            self.state,
-            ReplicaState::Starting | ReplicaState::Committing
-        ) {
+        // Resyncing before its hand-over: a commit start taken between the
+        // replay's go-ahead and the hand-over would commit the state the
+        // hand-over then replaces.
+        let replaying = self.state == ReplicaState::Resync && self.handed.is_none();
+        if replaying
+            || matches!(
+                self.state,
+                ReplicaState::Starting | ReplicaState::Committing
+            )
+        {
             return;
         }
         let Some(processed) = v.own.processed else {
@@ -1209,6 +1215,34 @@ mod tests {
         assert_eq!(life.state(), ReplicaState::Diverged);
         assert_eq!(calls.take(), ["withdraw"]);
         assert_eq!(life.metrics.divergences, 1);
+    }
+
+    /// A replica resyncing takes no commit start under a `Baseline`
+    /// naming it until its replayed state is handed over: one taken before
+    /// would commit the state the hand-over replaces.
+    #[test]
+    fn a_resyncing_replica_takes_no_naming_before_its_hand_over() {
+        let idle = Standing::Idle { since: 0 };
+        let calls = Calls::default();
+        let mut life = Life::new();
+        step(&mut life, &own(K, idle), None, &calls);
+        life.contradicted(&calls);
+        assert!(life.resyncing());
+        calls.take();
+        let b = naming((K + 10) * B);
+        step(&mut life, &own(K + 1, idle), Some(&b), &calls);
+        step(&mut life, &own(K + 2, idle), Some(&b), &calls);
+        assert!(
+            !calls.take().iter().any(|c| c.starts_with("from")),
+            "named while replaying"
+        );
+        life.handed_over(K + 2);
+        step(&mut life, &own(K + 3, idle), Some(&b), &calls);
+        assert!(
+            calls.take().iter().any(|c| c.starts_with("from")),
+            "named once handed over"
+        );
+        assert_eq!(life.state(), ReplicaState::Resync);
     }
 
     /// A named replica diverged by a verdict stays diverged under the
