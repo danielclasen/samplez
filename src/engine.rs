@@ -262,7 +262,8 @@ pub enum EntryError {
     /// slot's strip does not take, an index that is not a multiple of the
     /// block size, or an entry the engine's log mode does not take.
     Invalid(String),
-    /// [`PENDING_CHANGES`] entries are outstanding.
+    /// [`PENDING_CHANGES`] entries are outstanding on an engine keeping
+    /// its own log; a replicated log refuses none for room.
     Full,
     /// Log id `id` is not above the last one appended, `last`.
     Order { id: LogId, last: LogId },
@@ -467,8 +468,13 @@ struct LocalLog {
 static STAMP_LATE: AtomicBool = AtomicBool::new(false);
 
 impl Log {
-    /// Appends `e`; `consumed` is the RT thread's count of entries taken
-    /// off its list, so committed entries never exceed what it holds.
+    /// Appends `e`. The engine's own log refuses it while
+    /// [`PENDING_CHANGES`] entries are outstanding, `consumed` being the RT
+    /// thread's count of entries taken off its list, so its committed
+    /// entries never exceed what the RT thread holds. A replicated log
+    /// refuses no entry for room: its leader refuses one before ordering
+    /// it, and a committed entry the ring has no room for waits here until
+    /// it has ([`Log::flush`]), applied late should its index pass.
     fn append(
         &mut self,
         e: RtEntry,
@@ -483,7 +489,7 @@ impl Log {
             });
         }
         let outstanding = self.submitted - consumed + self.uncommitted.len() as u64;
-        if outstanding >= PENDING_CHANGES as u64 {
+        if self.local.is_some() && outstanding >= PENDING_CHANGES as u64 {
             return Err(EntryError::Full);
         }
         let (up, _) = e.change.generating();
@@ -502,25 +508,33 @@ impl Log {
     }
 
     fn commit(&mut self, up_to: LogId) {
+        self.committed = self.committed.max(up_to.min(self.last));
+        self.flush();
+    }
+
+    /// Pushes the committed entries waiting to the ring while it has
+    /// room, in log order.
+    fn flush(&mut self) {
         while let Some(q) = self.uncommitted.pop_front() {
-            if q.entry.id > up_to {
+            if q.entry.id > self.committed {
                 self.uncommitted.push_front(q);
-                break;
+                return;
             }
-            // append keeps the outstanding entries within the ring.
-            if self.ring.push(q).is_err() {
-                unreachable!("the entry ring holds every outstanding entry");
+            if let Err(rtrb::PushError::Full(q)) = self.ring.push(q) {
+                self.uncommitted.push_front(q);
+                return;
             }
             self.submitted += 1;
         }
-        self.committed = self.committed.max(up_to.min(self.last));
     }
 
     /// Removes uncommitted entry `id`, and the generation built for it;
     /// false when no uncommitted entry has that id.
     fn skip(&mut self, id: LogId) -> bool {
         let before = self.uncommitted.len();
-        self.uncommitted.retain(|q| q.entry.id != id);
+        let committed = self.committed;
+        self.uncommitted
+            .retain(|q| q.entry.id != id || q.entry.id <= committed);
         let skipped = self.uncommitted.len() < before;
         if skipped {
             let _ = self.sup.send(LogMsg::Skip { id });
@@ -2451,6 +2465,8 @@ impl Supervisor {
             self.page_hashes();
             self.meters();
             self.log_messages();
+            // Committed entries the ring had no room for.
+            self.log.lock().expect("log lock").flush();
             self.jobs();
             if last_poll.elapsed() >= POLL_PERIOD {
                 last_poll = Instant::now();
@@ -3508,6 +3524,12 @@ mod tests {
         log.append(e(2, down), None, Vec::new(), 0).unwrap();
         log.commit(2);
         assert_eq!(rx.pop().unwrap().entry.id, 2);
+        // The engine's own log refuses what the RT thread has no room for.
+        log.local = Some(LocalLog {
+            up: Vec::new(),
+            last_at: Vec::new(),
+            gen_at: 0,
+        });
         for id in 3..=PENDING_CHANGES as u64 {
             log.append(e(id, down), None, Vec::new(), 0).unwrap();
         }
@@ -3517,6 +3539,32 @@ mod tests {
         );
         log.append(e(PENDING_CHANGES as u64 + 1, down), None, Vec::new(), 1)
             .unwrap();
+    }
+
+    /// A replicated log refuses no entry for room: a replica whose RT
+    /// thread lags keeps the committed entries its ring has no room for
+    /// and passes them on as the ring drains, rather than refuse one,
+    /// which would stop it taking writes while the others apply it.
+    #[test]
+    fn a_replicated_log_keeps_what_its_ring_has_no_room_for() {
+        let (mut log, mut rx, _msgs) = log();
+        let down = Change::InputDown { slot: 0 };
+        let n = PENDING_CHANGES as u64 + 36;
+        for id in 1..=n {
+            log.append(e(id, down), None, Vec::new(), 0).unwrap();
+        }
+        log.commit(n);
+        assert_eq!(rx.slots(), PENDING_CHANGES);
+        assert!(!log.skip(n), "a committed entry skipped");
+        for id in 1..=10 {
+            assert_eq!(rx.pop().unwrap().entry.id, id);
+        }
+        log.flush();
+        assert_eq!(rx.slots(), PENDING_CHANGES);
+        let ids: Vec<LogId> = std::iter::from_fn(|| rx.pop().ok().map(|q| q.entry.id)).collect();
+        assert_eq!(ids, (11..=PENDING_CHANGES as u64 + 10).collect::<Vec<_>>());
+        log.flush();
+        assert_eq!(rx.slots(), 26);
     }
 
     /// A full reset ring says so, not that gain changes are outstanding.
