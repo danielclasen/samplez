@@ -113,9 +113,14 @@ and a late one counts once in `command_late`. A log entry raising or
 re-routing inputs of more than one domain, or with an entry refused
 alone, is refused whole (`append_batch`, `admits`); `samplez-replica`
 asks before it orders a command and refuses it to its client
-(`invalid`), so no committed entry is refused. One of no entries
+(`invalid`), so no committed entry is refused; an entry carries at most
+64 commands, which bounds those checks. The domain check covers every
+slot an `InputUp` or `Route` names, so every subset of an admitted
+entry, which a restamp may keep, is admitted too. One of no entries
 appends nothing. A replicated engine refuses no committed entry for
-room: entries its ring has no room for wait in its log. The RT thread
+room: up to 256 its ring has no room for wait in its log; past that it
+drops them and its core (`log_overflows`) and the replica is rebuilt
+from product state. The RT thread
 hands its spent batches to the supervisor to be freed, leaving the
 return ring room for the generations and writers it hands back; one it
 cannot hand off is leaked and counted in the status (`batches_leaked`).
