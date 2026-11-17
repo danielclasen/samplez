@@ -62,10 +62,10 @@ pub struct Identity {
     /// The user named by the proxy or by the OpenID provider's token;
     /// `None` in the other modes and for a static bearer token.
     pub user: Option<String>,
-    /// The user's display name: the OpenID provider's
-    /// `preferred_username`, else its `name` claim. Never an email or a
-    /// subject id; `None` when the token has neither, and in every other
-    /// mode.
+    /// The user's display name: the user the proxy names, or the OpenID
+    /// provider's `preferred_username`, else its `name` claim, never the
+    /// email or subject id `user` falls back to; `None` when the token has
+    /// neither, and in the other modes and for a static bearer token.
     pub name: Option<String>,
     pub role: Role,
 }
@@ -744,7 +744,7 @@ impl Auth {
             .ok_or(Refused(StatusCode::FORBIDDEN, "no group with a role"))?;
         Ok(Identity {
             user: Some(user.to_owned()),
-            name: None,
+            name: Some(user.to_owned()),
             role,
         })
     }

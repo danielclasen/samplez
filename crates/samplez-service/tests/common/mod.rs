@@ -306,13 +306,18 @@ pub fn config(mode: &str, test: &str) -> serde_json::Value {
 }
 
 pub fn product() -> Router {
-    Router::new().route(
-        "/whoami",
-        get(|Extension(id): Extension<Identity>| async move {
-            format!("{:?} {:?}", id.role, id.user)
-        })
-        .post(|| async { "changed" }),
-    )
+    Router::new()
+        .route(
+            "/whoami",
+            get(|Extension(id): Extension<Identity>| async move {
+                format!("{:?} {:?}", id.role, id.user)
+            })
+            .post(|| async { "changed" }),
+        )
+        .route(
+            "/whoname",
+            get(|Extension(id): Extension<Identity>| async move { format!("{:?}", id.name) }),
+        )
 }
 
 pub fn service_from(config: serde_json::Value, ops: Ops, state: Arc<FakeState>) -> Service {

@@ -302,6 +302,11 @@ async fn a_browser_signs_in_with_the_code_flow_and_pkce() {
         send(&api, with(get_req(WHOAMI))).await.2,
         "Operator Some(\"alice\")"
     );
+    assert_eq!(
+        send(&api, with(get_req("/api/v1/whoname"))).await.2,
+        "Some(\"alice\")",
+        "the display name outlives the sign-in in the cookie"
+    );
     assert_eq!(status(&api, with(write_req(WHOAMI))).await, StatusCode::OK);
     let (_, _, body) = send(&api, with(get_req("/api/v1/session"))).await;
     assert_eq!(
