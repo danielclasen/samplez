@@ -60,6 +60,11 @@ pub struct Matrix {
     path: Path,
 }
 
+/// The most coefficients a matrix holds, input channels times output
+/// channels: an engine configuration beyond it is refused, and so is a
+/// serialised matrix, before anything is allocated for it.
+pub const MAX_COEFFICIENTS: usize = 1 << 18;
+
 /// A matrix as [`Matrix`]'s serde form carries it: its coefficients and
 /// ramps. Every path gives the same output, so the receiver runs on its
 /// own [`Path::best`].
@@ -81,11 +86,20 @@ impl From<Matrix> for MatrixWire {
 impl TryFrom<MatrixWire> for Matrix {
     type Error = String;
 
-    /// Refuses a column with an input out of range, out of order or
+    /// Refuses a matrix of more than [`MAX_COEFFICIENTS`] coefficients,
+    /// before allocating it, and a column with an input out of range, out of order or
     /// twice, or a ramp a matrix never holds: a gain beyond
     /// [`crate::MAX_GAIN`] or not finite, a length beyond
     /// [`crate::MAX_RAMP_LEN`], a position past its length.
     fn try_from(w: MatrixWire) -> Result<Matrix, String> {
+        let size = w.inputs.checked_mul(w.columns.len());
+        if size.is_none_or(|n| n > MAX_COEFFICIENTS) {
+            return Err(format!(
+                "a matrix of {} inputs and {} outputs, at most {MAX_COEFFICIENTS} coefficients",
+                w.inputs,
+                w.columns.len()
+            ));
+        }
         let mut m = Matrix::new(w.inputs, w.columns.len());
         for (dst, col) in m.columns.iter_mut().zip(w.columns) {
             let ordered = col.windows(2).all(|t| t[0].input < t[1].input);
