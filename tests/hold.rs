@@ -485,7 +485,12 @@ fn no_block_commits_at_once_after_a_withheld_one() {
         let domain = Domain::new();
         let (src, out) = (new_id(), new_id());
         let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
-        let (e, _changes) = start(&domain, &src, &out, 10);
+        // The fills from the page boundary after the withheld blocks get
+        // no evidence and stay in the ring, up to 25 blocks and a poll
+        // past it: a ring of 400 ms holds them all, where the 20 blocks
+        // of holdMs 10 overflow whenever that boundary lies just after
+        // them.
+        let (e, _changes) = start(&domain, &src, &out, 400);
         let _guard = w.guard(&e, false);
         e.set_fence(u64::MAX).unwrap();
         let from = processed(&e) + 2;
