@@ -134,7 +134,18 @@ fn reports_carry_every_recent_status_though_the_change_channel_overflows() {
     // An output commits from its commit start: before it, its blocks
     // take no status.
     engine.commit_from(0, 0).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    // The window: D + w + 2p at 48 kHz, one more block.
+    let window = (22 * 48u64).div_ceil(B) + 1;
+    // Until the engine has a status word for every block of a window and
+    // the channel lost changes: however long start-up and the commit
+    // start take on a loaded machine.
+    wait_for("a window of status words and changes lost", || {
+        let progress = engine.progress().unwrap();
+        progress.status_changes_lost > 0
+            && progress.processed.is_some_and(|p| {
+                p + 1 >= window && (p + 1 - window..=p).all(|k| engine.block_status(0, k).is_some())
+            })
+    });
     let sample = audio.sample();
     let processed = sample.own.processed.expect("blocks computed");
     let progress = engine.progress().unwrap();
@@ -144,8 +155,6 @@ fn reports_carry_every_recent_status_though_the_change_channel_overflows() {
         "the channel had room for every change: the test proves nothing"
     );
     let runs = &sample.own.statuses[0];
-    // The window: D + w + 2p at 48 kHz, one more block.
-    let window = (22 * 48u64).div_ceil(B) + 1;
     for k in processed + 1 - window..=processed {
         assert!(
             status_of(runs, k).is_some(),
