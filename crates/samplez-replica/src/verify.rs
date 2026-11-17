@@ -109,9 +109,15 @@ impl View<'_> {
     }
 
     /// The largest difference, seconds, between this replica's offset and
-    /// that of another replica E counts; none when they all agree.
+    /// that of another replica E counts, while this replica's offset is
+    /// not the one a strict majority of the voters reports by their latest
+    /// reports; none when they agree or the majority is with it. So a set
+    /// split by one bad node unverifies that node, and a tie both sides.
     pub fn conflict(&self) -> Option<u64> {
         let own = self.offset_of(self.me)?;
+        if self.members.majority(|id| self.offset_of(id) == Some(own)) {
+            return None;
+        }
         self.counted
             .iter()
             .filter(|&&id| id != self.me)
@@ -199,7 +205,13 @@ impl Verifier {
             self.on = None;
             return;
         }
-        let steady = self.on.is_none_or(|(_, s)| steps == s);
+        // With no step since, it moves only by a leap second: an offset
+        // that moved further is a step not counted yet, which the next
+        // period shows, even where the replica is the only one E counts
+        // and so verifies against itself.
+        let steady = self.on.is_none_or(|(on, s)| {
+            steps == s && on.zip(offset).is_none_or(|(a, b)| a.abs_diff(b) <= 1)
+        });
         if (!self.verified || steady) && verifies() {
             self.verified = true;
             self.on = Some((offset, steps));
@@ -528,30 +540,71 @@ mod tests {
         assert!(!v.verified());
     }
 
+    /// Whether `me`, verified, stays so once it counts `counted` with the
+    /// voters at `offsets`, ms after the conflict first shows.
+    fn after_conflict(ids: &[NodeId], offsets: &[i64], me: NodeId, ms: u64) -> bool {
+        let m = members(ids);
+        let voters: Vec<_> = ids
+            .iter()
+            .zip(offsets)
+            .map(|(&id, &o)| (id, at(o)))
+            .collect();
+        let h = heard(&voters);
+        let c: BTreeSet<_> = ids.iter().copied().filter(|&id| id != W).collect();
+        let view = View {
+            me,
+            members: &m,
+            heard: &h,
+            counted: &c,
+            guard_ns: GUARD,
+        };
+        let mut v = Verifier::default();
+        v.period(view.offset_of(me), 0, None, at_ms(0), || true);
+        v.period(view.offset_of(me), 0, view.conflict(), at_ms(10), || false);
+        v.period(
+            view.offset_of(me),
+            0,
+            view.conflict(),
+            at_ms(10 + ms),
+            || false,
+        );
+        v.verified()
+    }
+
     #[test]
-    fn two_cold_starts_on_different_offsets_unverify_once_they_hear_each_other() {
-        // A verified on 37 with B; B steps to 0; C verifies on 0 with B
-        // before it hears A. Once each counts the other, both lose.
-        let ids = [a(0), a(1), a(2)];
-        let m = members(&ids);
-        let h = heard(&[(a(0), at(37)), (a(1), at(0)), (a(2), at(0))]);
-        let c: BTreeSet<_> = [a(0), a(2)].into();
-        for me in [a(0), a(2)] {
-            let view = View {
-                me,
-                members: &m,
-                heard: &h,
-                counted: &c,
-                guard_ns: GUARD,
-            };
-            assert_eq!(view.conflict(), Some(37));
-            let mut v = Verifier::default();
-            v.period(view.offset_of(me), 0, None, at_ms(0), || true);
-            v.period(view.offset_of(me), 0, view.conflict(), at_ms(10), || {
-                view.verifies()
-            });
-            assert!(!v.verified(), "{me}");
-        }
+    fn a_split_set_unverifies_only_the_replicas_off_the_majority() {
+        // {37, 37, 0}: only the replica at 0, at once.
+        let three = [a(0), a(1), a(2)];
+        assert!(after_conflict(&three, &[37, 37, 0], a(0), 0));
+        assert!(after_conflict(&three, &[37, 37, 0], a(1), 0));
+        assert!(!after_conflict(&three, &[37, 37, 0], a(2), 0));
+        // A replica whose ADJ_TAI raced its reads, with the witness at
+        // 37: only it.
+        let two_w = [a(0), a(1), W];
+        assert!(after_conflict(&two_w, &[37, 0, 37], a(0), 0));
+        assert!(!after_conflict(&two_w, &[37, 0, 37], a(1), 0));
+        // A node that missed a leap second: only it, once the spread
+        // passed; nobody before.
+        assert!(after_conflict(&three, &[38, 38, 37], a(2), 1_000));
+        assert!(!after_conflict(&three, &[38, 38, 37], a(2), 3_000));
+        assert!(after_conflict(&three, &[38, 38, 37], a(0), 3_000));
+        assert!(after_conflict(&three, &[38, 38, 37], a(1), 3_000));
+        // A tie: both.
+        let two = [a(0), a(1)];
+        assert!(!after_conflict(&two, &[37, 0], a(0), 0));
+        assert!(!after_conflict(&two, &[37, 0], a(1), 0));
+    }
+
+    #[test]
+    fn an_offset_racing_its_step_on_the_only_counted_replica_unverifies() {
+        // The only replica E counts verifies against itself, so verifies()
+        // holds in period N on the new offset; the step counted in N + 1
+        // must still unverify it.
+        let mut v = Verifier::default();
+        v.period(Some(37), 4, None, at_ms(0), || true);
+        v.period(Some(0), 4, None, at_ms(10), || true);
+        v.period(Some(0), 5, None, at_ms(20), || true);
+        assert!(!v.verified());
     }
 
     #[test]
