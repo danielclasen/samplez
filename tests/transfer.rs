@@ -1374,3 +1374,27 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
         Ok(())
     });
 }
+
+/// A copy holds every entry given as unresolved before it was asked for:
+/// the RT thread takes controls at the start of a wake and copies after a
+/// block, so a copy asked for right after the control could be taken in
+/// the wake before the one that applies it, and a joiner would lack the
+/// entry.
+#[test]
+fn a_copy_holds_every_unresolved_entry_given_before_it() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let far = (now_block() + 1_000_000) * B;
+    for id in 1..=200 {
+        h.e.unresolved(id, far).unwrap();
+        let c = copy(&h.e);
+        assert!(
+            c.core.unresolved().iter().any(|u| u.0 == id),
+            "entry {id} given before the copy and not in it"
+        );
+        h.e.resolved(id).unwrap();
+    }
+    h.e.stop();
+}

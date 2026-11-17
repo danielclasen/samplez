@@ -1912,12 +1912,25 @@ impl Engine {
     /// rings needs; the engine keeps no delay line, so it holds the core
     /// alone. A copy left behind by a timeout is returned by the next
     /// call. Calls serialise: one buffer is with the RT thread at a time.
+    /// The copy holds every control sent before the call, such as an
+    /// entry given as unresolved.
     pub fn copy_core(&self, timeout: Duration) -> Result<CoreCopy, CopyError> {
-        let (Some((shared, _)), Some(transfer)) = (&self.replica, &self.transfer) else {
+        let (Some((shared, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
             return Err(CopyError::NotReplicated);
         };
         let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + timeout;
         if !t.in_flight {
+            // The RT thread takes controls at the start of a wake and copies
+            // after a block: a buffer sent while a control waits could be
+            // filled in the wake before the one that takes the control.
+            // Sent once every control was taken, it is filled after them.
+            while control.lock().expect("control lock").ring.slots() < UNRESOLVED {
+                if Instant::now() >= deadline {
+                    return Err(CopyError::Timeout);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             let (n, m, slots, page) = t.shape;
             let mut core = t
                 .spare
@@ -1929,7 +1942,6 @@ impl Engine {
             }
             t.in_flight = true;
         }
-        let deadline = Instant::now() + timeout;
         let copy = loop {
             if let Ok(copy) = t.copies.pop() {
                 t.in_flight = false;
