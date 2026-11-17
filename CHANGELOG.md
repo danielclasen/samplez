@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.5.0](https://github.com/danielclasen/samplez/compare/v0.4.0...v0.5.0) (2026-11-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** ReplicaState gains Resync, PeerRequest and PeerResponse gain Core, Timing gains resync_budget, and contact Metrics gains resync. A replica of this version reports a state older peers cannot decode.
+* **replica:** Baseline has a key field, ReplicaState a VersionMismatch variant, Own key and revision fields, and the Audio trait a required stop_at method.
+* **replica:** Body::Restamp and Body::Void carry the term of the entry they name, Body gains PurgePoint, Contact::decisions takes the leader's term, and contact::Metrics gains fields.
+
+### Features
+
+* **replica:** decide unresolved entries in the log ([#48](https://github.com/danielclasen/samplez/issues/48)) ([da07b05](https://github.com/danielclasen/samplez/commit/da07b05a946bd4b862b3ccc0176f7433c88a400c))
+* **replica:** end session leases and refuse writes E does not count ([#51](https://github.com/danielclasen/samplez/issues/51)) ([f892c58](https://github.com/danielclasen/samplez/commit/f892c5863d6cde3f20d1785305762f76a3ccb64b))
+* **replica:** hand over the compatibility key in a rollout ([#54](https://github.com/danielclasen/samplez/issues/54)) ([ff3c030](https://github.com/danielclasen/samplez/commit/ff3c03077d15acdbdad7eb9f744c89cc3ac5a12d))
+* **replica:** judge clocks against the verified replicas ([#47](https://github.com/danielclasen/samplez/issues/47)) ([6ffe037](https://github.com/danielclasen/samplez/commit/6ffe037a9e5499e2750e7f8a0d62be74d38d12dc))
+* **replica:** resync a diverged replica from a donor ([#52](https://github.com/danielclasen/samplez/issues/52)) ([f26d011](https://github.com/danielclasen/samplez/commit/f26d011af14813e1a7ec3cd29b56542c18e2d653))
+* **replica:** verify TAI offsets and hold unverified replicas ([#53](https://github.com/danielclasen/samplez/issues/53)) ([96fbb0a](https://github.com/danielclasen/samplez/commit/96fbb0abca70f31a497d2e33f1984dad6c0a6ba0))
+
+
+### Bug Fixes
+
+* **replica:** stop a running replica before the harness restarts it ([#49](https://github.com/danielclasen/samplez/issues/49)) ([d2c8612](https://github.com/danielclasen/samplez/commit/d2c8612a1bdac4154170d6923b91ef93ecbe4cb4))
+
 ## [0.4.0](https://github.com/danielclasen/samplez/compare/v0.3.0...v0.4.0) (2026-11-17)
 
 
