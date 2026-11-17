@@ -446,6 +446,14 @@ pub struct Fake {
     pub rebuilds: u64,
     /// Stops the supervisor named, `(output, at)`.
     pub stops: Vec<(usize, u64)>,
+    /// Rebuilds refused: a generation the core names was not built.
+    pub refused_rebuilds: u64,
+    /// Entries the core holds unresolved: a rebuilt core holds none.
+    pub core_unresolved: BTreeSet<u64>,
+    /// The length of `unresolved` at each rebuild.
+    pub rebuilt_at: Vec<usize>,
+    /// Entries resolved, with the length of `unresolved` then.
+    pub resolved: Vec<(u64, usize)>,
 }
 
 impl Fake {
@@ -820,8 +828,16 @@ impl Audio for FakeAudio {
         self.lock().committed.push((up_to, tai));
     }
     fn unresolved(&self, index: u64, at_index: u64) -> bool {
-        self.lock().unresolved.push((index, at_index));
+        let mut st = self.lock();
+        st.unresolved.push((index, at_index));
+        st.core_unresolved.insert(index);
         true
+    }
+    fn resolved(&self, index: u64) {
+        let mut st = self.lock();
+        let n = st.unresolved.len();
+        st.resolved.push((index, n));
+        st.core_unresolved.remove(&index);
     }
     fn skip(&self, index: u64) {
         self.lock().skipped.push(index);
@@ -893,11 +909,19 @@ impl Audio for FakeAudio {
         st.drops += 1;
         st.no_core = true;
     }
+    /// Refused while a generation the core names is not built.
     fn rebuild_engine(&self) -> bool {
         self.step();
         let mut st = self.lock();
+        if st.generation_pending {
+            st.refused_rebuilds += 1;
+            return false;
+        }
         st.rebuilds += 1;
         st.no_core = false;
+        st.core_unresolved.clear();
+        let n = st.unresolved.len();
+        st.rebuilt_at.push(n);
         true
     }
 }

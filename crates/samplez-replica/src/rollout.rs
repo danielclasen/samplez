@@ -11,10 +11,16 @@ use samplez::blocks::PAGE;
 
 use crate::bootstrap::Kube;
 
-/// The compatibility key of an engine of version `engine` running a
-/// shape and the config that affects output, encoded as `output`:
-/// XXH3-64 over both, each prefixed with its length.
-pub fn key(engine: &str, output: &[u8]) -> u64 {
+/// The compatibility key of this engine ([`samplez::ENGINE_VERSION`])
+/// running a shape and the config that affects output, encoded as
+/// `output`.
+pub fn key(output: &[u8]) -> u64 {
+    key_of(samplez::ENGINE_VERSION, output)
+}
+
+/// XXH3-64 over the engine version and `output`, each prefixed with its
+/// length.
+fn key_of(engine: &str, output: &[u8]) -> u64 {
     let mut h = xxhash_rust::xxh3::Xxh3Default::new();
     for part in [engine.as_bytes(), output] {
         h.update(&(part.len() as u64).to_le_bytes());
@@ -106,11 +112,12 @@ mod tests {
     /// config, and the two parts do not run into each other.
     #[test]
     fn the_key_follows_engine_version_and_output_config() {
-        let k = key("0.4.0", b"shape");
-        assert_eq!(k, key("0.4.0", b"shape"));
-        assert_ne!(k, key("0.5.0", b"shape"));
-        assert_ne!(k, key("0.4.0", b"shape2"));
-        assert_ne!(key("0.4.0s", b"hape"), k);
+        let k = key_of("0.4.0", b"shape");
+        assert_eq!(k, key_of("0.4.0", b"shape"));
+        assert_ne!(k, key_of("0.5.0", b"shape"));
+        assert_ne!(k, key_of("0.4.0", b"shape2"));
+        assert_ne!(key_of("0.4.0s", b"hape"), k);
+        assert_eq!(key(b"shape"), key_of(samplez::ENGINE_VERSION, b"shape"));
     }
 
     /// A hand-over's P is a block boundary: at B = 48 every third page

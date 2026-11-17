@@ -1748,6 +1748,17 @@ impl Contact {
             .copied()
             .filter(|&id| id != self.id && st.baselines.rank(k, id, &audio_voters, &t) < mine)
             .collect();
+        let given = &st.given;
+        let retarget = || {
+            if !audio.rebuild_engine() {
+                return false;
+            }
+            // The rebuilt core holds no unresolved entry.
+            for (&(index, _, _), &at) in given {
+                let _ = audio.unresolved(index, at);
+            }
+            true
+        };
         let life = st.life.as_mut().expect("checked above");
         let view = View {
             me: self.id,
@@ -1757,6 +1768,7 @@ impl Contact {
             alone: st.members.voters().len() == 1,
             baseline: baseline.as_ref(),
             key: st.own.key,
+            retarget: &retarget,
             excluded: st.judged.contains(&self.id),
             peers: copies
                 .iter()

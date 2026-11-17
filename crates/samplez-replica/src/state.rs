@@ -153,6 +153,10 @@ pub(crate) struct View<'a> {
     pub baseline: Option<&'a Baseline>,
     /// This replica's compatibility key ([`crate::rollout`]).
     pub key: Option<u64>,
+    /// Retargets the engine's core from product state, with the entries
+    /// still unresolved given to it again; false to retry. The engine
+    /// keeps the generations built ([`samplez::Engine::install_product`]).
+    pub retarget: &'a dyn Fn() -> bool,
     /// Excluded by a `ClockVerdict`.
     pub excluded: bool,
     /// The other audio voters.
@@ -508,7 +512,9 @@ impl Life {
         // Named, a replica that computes nothing retargets its core from
         // product state first, and commits once it took it.
         if self.state == ReplicaState::VersionMismatch {
-            if !audio.rebuild_engine() {
+            // Refused, and retried, while a generation the core names is
+            // not built: it never hands over without it.
+            if !(v.retarget)() {
                 return;
             }
             self.computed_from = Some(processed);
@@ -565,7 +571,7 @@ impl Life {
             {
                 self.switching = true;
             }
-            if self.state == ReplicaState::VersionMismatch && audio.rebuild_engine() {
+            if self.state == ReplicaState::VersionMismatch && (v.retarget)() {
                 self.computed_from = v.own.processed;
                 self.ready_at = v.own.processed;
                 self.state = ReplicaState::Withdrawn;
@@ -961,6 +967,7 @@ mod tests {
             alone: false,
             baseline,
             key: None,
+            retarget: &|| calls.rebuild_engine(),
             excluded: false,
             above: peers.iter().map(|p| p.id).collect(),
             peers,

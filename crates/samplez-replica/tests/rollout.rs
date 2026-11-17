@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use harness::{BLOCK, Options, Set};
 use samplez::blocks::{PAGE, Standing};
-use samplez_replica::contact::Timing;
-use samplez_replica::entry::{Baseline, NodeId};
+use samplez_replica::contact::{Timing, index_at};
+use samplez_replica::entry::{Baseline, Body, NodeId};
 use samplez_replica::membership::{Slot, node_id, slot_of};
 use samplez_replica::state::ReplicaState;
 use samplez_service::ReplicatedState;
@@ -122,6 +122,12 @@ fn ready(set: &Set, id: NodeId) -> bool {
 /// Starts `ids`, waits for every audio replica committing, and rolls the
 /// highest ordinal to key 2 at revision `r2`, the target.
 async fn roll_last(ids: Vec<NodeId>) -> (Set, Vec<NodeId>, NodeId) {
+    roll(ids, true).await
+}
+
+/// As [`roll_last`]; without `target` the StatefulSet reports no target
+/// revision yet, so nothing is handed over.
+async fn roll(ids: Vec<NodeId>, target: bool) -> (Set, Vec<NodeId>, NodeId) {
     let mut set = start(ids).await;
     let ids = audio(&set);
     until("every audio replica committing", 5, || {
@@ -129,7 +135,9 @@ async fn roll_last(ids: Vec<NodeId>) -> (Set, Vec<NodeId>, NodeId) {
     })
     .await;
     let n = *ids.last().unwrap();
-    set.set_target(Some("r2"));
+    if target {
+        set.set_target(Some("r2"));
+    }
     set.set_version(n, 2, "r2");
     set.restart(n).await;
     (set, ids, n)
@@ -208,6 +216,7 @@ async fn n_unready_at_p_commits_from_p_through_its_degraded_blocks() {
     let (set, ids, n) = roll_last(vec![a(0), a(1), witness()]).await;
     let p = named(&set, a(0), n).await;
     let kp = p / BLOCK;
+    until("N retargeted", 10, || set.audio(n).lock().rebuilds == 1).await;
     {
         let mut fake = set.audio(n).lock();
         fake.generation_pending = true;
@@ -324,4 +333,93 @@ async fn superseded_and_rolled_back_rollouts_follow_the_target() {
     assert_eq!(state(&set, n), Some(ReplicaState::VersionMismatch));
     let p = baseline(&set, a(1)).unwrap().at_index;
     pages_whole(&set, &ids, p / PAGE - 2, page_now(&set, a(0)) - 1);
+}
+
+async fn mismatched(set: &Set, n: NodeId) {
+    until("N version_mismatch", 10, || {
+        state(set, n) == Some(ReplicaState::VersionMismatch)
+    })
+    .await;
+}
+
+/// A `version_mismatch` N named and learning late an entry stamped in the
+/// same window: the entry is unresolved on N when its core is retargeted
+/// from product state, and the retargeted core is given it again, so N
+/// holds no unresolved entry the log has not decided below its first
+/// computed block. N commits and the baseline does not move back.
+#[tokio::test(start_paused = true)]
+async fn a_retargeted_core_is_given_the_entries_still_unresolved() {
+    let (mut set, _, n) = roll(vec![a(0), a(1), witness()], false).await;
+    mismatched(&set, n).await;
+    let leader = set.leader().await;
+    assert_ne!(leader, n);
+    set.net.stall(n, Duration::from_millis(60));
+    let at = (index_at(set.clock(leader).tai_ns()) + 40 * 48).next_multiple_of(BLOCK);
+    set.replica(leader).append(Body::InputDown {
+        slot: 0,
+        at_index: at,
+    });
+    set.set_target(Some("r2"));
+    sleep(Duration::from_millis(100)).await;
+    set.net.unstall(n);
+    until("N committing", 10, || committing(&set, n)).await;
+    sleep(Duration::from_millis(200)).await;
+    let fake = set.audio(n).lock();
+    let index = fake
+        .unresolved
+        .iter()
+        .find(|&&(_, x)| x == at)
+        .map(|&(i, _)| i)
+        .expect("the entry unresolved on N");
+    let rebuilt = fake.rebuilt_at[0];
+    let given =
+        |range: std::ops::Range<usize>| fake.unresolved[range].iter().any(|&(i, _)| i == index);
+    let resolved_before = fake
+        .resolved
+        .iter()
+        .any(|&(i, k)| i == index && k <= rebuilt);
+    assert!(given(0..rebuilt), "unresolved before the retarget");
+    assert!(!resolved_before, "decided before the retarget");
+    assert!(
+        given(rebuilt..fake.unresolved.len()),
+        "the retargeted core was not given the unresolved entry"
+    );
+    drop(fake);
+    assert_eq!(handed_over(&set), 1, "the baseline moved back");
+    assert_eq!(baseline(&set, a(0)).unwrap().replica, n);
+}
+
+/// A `version_mismatch` N whose input was re-routed while it computed
+/// nothing: named, it is not ready until the routed generation is built,
+/// and its core is not retargeted before; P does not move and N is not
+/// renamed meanwhile. Once the generation is built it commits.
+#[tokio::test(start_paused = true)]
+async fn a_re_routed_n_retargets_only_once_its_generation_is_built() {
+    let (mut set, _, n) = roll(vec![a(0), a(1), witness()], false).await;
+    mismatched(&set, n).await;
+    set.audio(n).lock().generation_pending = true;
+    set.set_target(Some("r2"));
+    let p = named(&set, a(0), n).await;
+    until("a retarget refused", 1, || {
+        set.audio(n).lock().refused_rebuilds > 0
+    })
+    .await;
+    assert_eq!(
+        set.audio(n).lock().rebuilds,
+        0,
+        "retargeted without its generation"
+    );
+    assert_eq!(state(&set, n), Some(ReplicaState::VersionMismatch));
+    set.audio(n).lock().generation_pending = false;
+    until("N committing", 10, || committing(&set, n)).await;
+    assert_eq!(set.audio(n).lock().rebuilds, 1);
+    assert_eq!(
+        baseline(&set, a(0))
+            .unwrap()
+            .at_index
+            .next_multiple_of(PAGE),
+        p
+    );
+    assert_eq!(handed_over(&set), 1, "N renamed");
+    assert_eq!(from(&set, n), Some(p), "N commits from P");
 }
