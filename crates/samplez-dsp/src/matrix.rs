@@ -31,7 +31,7 @@ impl Path {
 }
 
 /// One nonzero or ramping coefficient of an output.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Term {
     pub(crate) input: usize,
     pub(crate) ramp: Ramp,
@@ -51,12 +51,54 @@ pub(crate) struct Term {
 /// infinity on an input with coefficient 0 does not reach the output, and
 /// a route passes -0.0, NaN payloads and, under DAZ, denormals unchanged
 /// where the sum would not.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "MatrixWire", try_from = "MatrixWire")]
 pub struct Matrix {
     inputs: usize,
     /// Per output, the nonzero or ramping coefficients sorted by input.
     columns: Vec<Vec<Term>>,
     path: Path,
+}
+
+/// A matrix as [`Matrix`]'s serde form carries it: its coefficients and
+/// ramps. Every path gives the same output, so the receiver runs on its
+/// own [`Path::best`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MatrixWire {
+    inputs: usize,
+    columns: Vec<Vec<Term>>,
+}
+
+impl From<Matrix> for MatrixWire {
+    fn from(m: Matrix) -> MatrixWire {
+        MatrixWire {
+            inputs: m.inputs,
+            columns: m.columns,
+        }
+    }
+}
+
+impl TryFrom<MatrixWire> for Matrix {
+    type Error = String;
+
+    /// Refuses a column with an input out of range, out of order or
+    /// twice, or a ramp that is not finite: the RT thread indexes by it.
+    fn try_from(w: MatrixWire) -> Result<Matrix, String> {
+        let mut m = Matrix::new(w.inputs, w.columns.len());
+        for (dst, col) in m.columns.iter_mut().zip(w.columns) {
+            let ordered = col.windows(2).all(|t| t[0].input < t[1].input);
+            let inside = col.iter().all(|t| t.input < w.inputs);
+            let finite = col.iter().all(|t| {
+                let r = &t.ramp;
+                r.c0.is_finite() && r.step.is_finite() && r.target.is_finite()
+            });
+            if !(ordered && inside && finite) {
+                return Err("a matrix column out of range, order or finite values".to_owned());
+            }
+            dst.extend(col);
+        }
+        Ok(m)
+    }
 }
 
 impl Clone for Matrix {

@@ -179,6 +179,11 @@ generation is tried again; one missing an entry returns
 The status reports the replay speed s, blocks per block period, measured
 at start-up on silence.
 
+`CoreCopy::encode` gives a copy as another replica takes it, JSON with
+the engine version; `CoreCopy::decode` refuses a core of another version
+or one whose matrix names an input out of range, and `Engine::replay`
+one of another shape or with an entry outside the engine.
+
 `Engine::drop_core` drops the RT thread's core while the replica starts:
 the RT thread keeps its writers, flows, hold rings and statuses, computes
 no block and withholds each one, overrun skips included, cause `NoCore`

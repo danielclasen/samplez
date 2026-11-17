@@ -1802,6 +1802,16 @@ impl Engine {
             ));
         }
         let c = &copy.core;
+        let (n, m, slots, page) = self
+            .transfer
+            .as_ref()
+            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).shape)
+            .expect("checked above");
+        if !c.fits(n, m, slots, page) {
+            return Err(ReplayError::Invalid(
+                "the core is of another engine shape".to_owned(),
+            ));
+        }
         let next = (copy.k0 + 1) * self.block;
         let ramp = u64::from(self.config.ramp_samples);
         let generating = c.pending_gen.is_some()

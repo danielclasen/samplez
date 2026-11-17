@@ -229,6 +229,8 @@ fn a_replayed_core_computes_the_donors_pages() {
             return Err(format!("copied after block {}, past entry 2", copy.k0));
         }
         let k0 = copy.k0;
+        // As a joiner takes it from the donor: encoded.
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
         let mut replay = b.e.replay(copy).unwrap();
         replay
             .append(

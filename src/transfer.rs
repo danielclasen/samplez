@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use samplez_dsp::Matrix;
 use samplez_mxl::time;
+use serde::{Deserialize, Serialize};
 
 use crate::blocks::PageHash;
 use crate::engine::Entry;
@@ -24,7 +25,7 @@ use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRES
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// An input slot's part of the core.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SlotCore {
     pub up: bool,
     pub held: bool,
@@ -34,7 +35,7 @@ pub(crate) struct SlotCore {
 }
 
 /// The core of an engine after a block.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Core {
     pub(crate) matrix: Matrix,
     pub(crate) pos: Option<u64>,
@@ -98,6 +99,37 @@ impl Core {
     pub fn unresolved(&self) -> &[(LogId, u64)] {
         &self.unresolved
     }
+
+    /// Whether this core is of an engine with `inputs` and `outputs`
+    /// channels, `slots` input slots and room for `page_entries` entries
+    /// of one page's fingerprint, every entry it holds within them: a
+    /// decoded core is checked before a replay installs it.
+    pub(crate) fn fits(
+        &self,
+        inputs: usize,
+        outputs: usize,
+        slots: usize,
+        page_entries: usize,
+    ) -> bool {
+        let entry = |e: &RtEntry| match e.change {
+            Change::Gain { input, output, .. } => input < inputs && output < outputs,
+            Change::InputDown { slot }
+            | Change::InputUp { slot }
+            | Change::Route { slot }
+            | Change::Strip { slot, .. } => slot < slots,
+        };
+        (
+            self.matrix.inputs(),
+            self.matrix.outputs(),
+            self.slots.len(),
+        ) == (inputs, outputs, slots)
+            && self.page_entries.len() <= page_entries
+            && self.pending.len() <= PENDING_CHANGES
+            && self.awaiting_gen.len() <= PENDING_CHANGES
+            && self.unresolved.len() <= UNRESOLVED
+            && self.late_routes.len() <= PENDING_CHANGES
+            && self.pending.iter().chain(&self.awaiting_gen).all(entry)
+    }
 }
 
 /// A replayed core after block `j`, which knew the log entries up to
@@ -134,11 +166,66 @@ pub(crate) enum Answer {
 
 /// The core after block `k0`, and the highest log id the RT thread had
 /// taken: entries after it reach a replica from its own log.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoreCopy {
     pub k0: u64,
     pub last_id: LogId,
     pub core: Box<Core>,
 }
+
+#[derive(Serialize)]
+struct WireOut<'a> {
+    engine: &'a str,
+    copy: &'a CoreCopy,
+}
+
+#[derive(Deserialize)]
+struct WireIn {
+    engine: String,
+    copy: serde_json::Value,
+}
+
+impl CoreCopy {
+    /// The copy as another replica takes it, with [`ENGINE_VERSION`].
+    pub fn encode(&self) -> String {
+        let wire = WireOut {
+            engine: ENGINE_VERSION,
+            copy: self,
+        };
+        serde_json::to_string(&wire).expect("a core encodes")
+    }
+
+    /// A copy [`CoreCopy::encode`] made, by an engine of this version.
+    pub fn decode(encoded: &str) -> Result<CoreCopy, DecodeError> {
+        let wire: WireIn =
+            serde_json::from_str(encoded).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+        if wire.engine != ENGINE_VERSION {
+            return Err(DecodeError::Version(wire.engine));
+        }
+        serde_json::from_value(wire.copy).map_err(|e| DecodeError::Malformed(e.to_string()))
+    }
+}
+
+/// Why [`CoreCopy::decode`] returned no copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// Copied by an engine of this other version.
+    Version(String),
+    Malformed(String),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::Version(v) => {
+                write!(f, "a core of engine {v}, this engine is {ENGINE_VERSION}")
+            }
+            DecodeError::Malformed(m) => write!(f, "a malformed core: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
 
 /// A replay clone ([`Engine::replay`](crate::Engine::replay)): the
 /// engine's computation from a donor's core, off the RT thread, on past
@@ -352,3 +439,88 @@ impl std::fmt::Display for CopyError {
 }
 
 impl std::error::Error for CopyError {}
+
+#[cfg(test)]
+mod tests {
+    use samplez_dsp::StripParam;
+
+    use super::*;
+
+    fn copy() -> CoreCopy {
+        let mut core = Core::new(2, 2, 2, 8);
+        assert!(core.matrix.set(1, 0, 0.5, 48));
+        assert!(core.matrix.set(0, 1, 0.25, 0));
+        core.pos = Some(4800);
+        core.ramp_end = 4848;
+        core.pending.push(RtEntry {
+            id: 7,
+            at_index: 9600,
+            change: Change::Strip {
+                slot: 1,
+                param: StripParam::Trim { db: -3.0 },
+            },
+        });
+        core.page_entries.push((6, 4752));
+        core.slots[1] = SlotCore {
+            up: true,
+            held: false,
+            fade_start: Some(480),
+            silenced_last: true,
+            xfade: None,
+        };
+        core.unresolved.push((9, 1 << 40));
+        CoreCopy {
+            k0: 99,
+            last_id: 7,
+            core: Box::new(core),
+        }
+    }
+
+    /// The copy another replica decodes is the copy encoded: the matrix
+    /// with its ramps, the entries and the slot state.
+    #[test]
+    fn a_core_decodes_to_the_copy_encoded() {
+        let copy = copy();
+        let decoded = CoreCopy::decode(&copy.encode()).unwrap();
+        assert_eq!(decoded, copy);
+        assert_eq!(decoded.core.gain(1, 0), copy.core.gain(1, 0));
+    }
+
+    /// A core copied by another engine version is refused: its state may
+    /// mean something else here.
+    #[test]
+    fn a_core_of_another_engine_version_is_refused() {
+        let encoded = copy().encode().replacen(ENGINE_VERSION, "0.0.0-other", 1);
+        assert_eq!(
+            CoreCopy::decode(&encoded),
+            Err(DecodeError::Version("0.0.0-other".to_owned()))
+        );
+    }
+
+    /// A core whose matrix names an input out of range is refused before
+    /// anything indexes by it.
+    #[test]
+    fn a_matrix_out_of_range_is_refused() {
+        let encoded = copy().encode().replace("\"input\":1", "\"input\":5");
+        assert!(matches!(
+            CoreCopy::decode(&encoded),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
+    /// A core of another shape, or with an entry outside the engine,
+    /// does not fit it.
+    #[test]
+    fn a_core_fits_only_its_own_shape() {
+        let mut copy = copy();
+        assert!(copy.core.fits(2, 2, 2, 8));
+        assert!(!copy.core.fits(2, 3, 2, 8));
+        assert!(!copy.core.fits(2, 2, 2, 0));
+        copy.core.pending.push(RtEntry {
+            id: 8,
+            at_index: 9648,
+            change: Change::InputDown { slot: 2 },
+        });
+        assert!(!copy.core.fits(2, 2, 2, 8));
+    }
+}
