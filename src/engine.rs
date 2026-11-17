@@ -4825,6 +4825,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(domain);
     }
 
+    /// An entry consumed through a replayed core counts as taken, whether
+    /// the RT thread held it pending at the install, which drops it as
+    /// known, or the ring delivers it after, which skips it as known: a
+    /// product core that knew less, installed next, would lose it from
+    /// the matrix for good, so the hand-over check
+    /// (`last_taken > last_id`) refuses that core as Missed.
+    #[test]
+    fn an_entry_taken_through_a_replayed_core_refuses_a_core_knowing_less() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("taken-through-core", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d13", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d14", "label": "taken",
+                          "group": "taken", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (mut ring, entries) = rtrb::RingBuffer::new(4);
+        rt.entries = entries;
+        let gain = |id, at_index| RtEntry {
+            id,
+            at_index,
+            change: Change::Gain {
+                input: 0,
+                output: 0,
+                gain: 0.5,
+            },
+        };
+        // Entry 2 pending here, entry 3 still in the ring: the replayed
+        // core knew both and applied them.
+        assert!(rt.mix.push(gain(2, 48)));
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        rt.install_core(&core, 3, true);
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.mix.last_taken, 2, "dropped at the install");
+        // Delivered between the replayed install and the next one.
+        assert!(ring.push(gain(3, 96)).is_ok());
+        rt.take_entries();
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.mix.last_taken, 3, "skipped as known");
+        // A product core that knew entries up to 1 is refused.
+        assert!(rt.mix.last_taken > 1);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
     /// A core whose block number leaves the index range at this block
     /// size is refused, not overflowed.
     #[test]

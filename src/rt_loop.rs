@@ -1584,6 +1584,8 @@ impl Rt {
                 if !entry.change.in_core(false) && entry.at_index < self.install_at {
                     self.apply(entry);
                 }
+                // Taken through the core, as one on the pending list.
+                self.mix.last_taken = self.mix.last_taken.max(entry.id);
                 continue;
             }
             let _ = self.mix.push(entry);
@@ -2279,6 +2281,13 @@ impl Rt {
         m.matrix.copy_from(&c.matrix);
         m.pos = c.pos;
         m.ramp_end = c.ramp_end;
+        // An entry dropped here as known is taken through the core: a
+        // later core that did not know it must be refused as Missed.
+        for e in &m.pending {
+            if e.id <= last_id {
+                m.last_taken = m.last_taken.max(e.id);
+            }
+        }
         m.pending.retain(|e| e.id > last_id);
         for e in &c.pending {
             if !m.holds(e.id) && !m.push(*e) {
