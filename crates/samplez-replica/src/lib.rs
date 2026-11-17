@@ -25,6 +25,7 @@ pub mod net;
 pub mod peer;
 pub mod rank;
 pub mod report;
+pub mod resync;
 pub mod rollout;
 pub mod schedule;
 pub mod session;
@@ -591,6 +592,20 @@ impl<P: Product> Replica<P> {
                     contact.receive(*report);
                 }
                 Ok(PeerResponse::Reported)
+            }
+            PeerRequest::Core => {
+                let contact = shared
+                    .contact
+                    .get()
+                    .cloned()
+                    .ok_or_else(|| Refused::Unavailable("contact does not run".to_owned()))?;
+                // The engine copies after its next block: off the async
+                // workers.
+                tokio::task::spawn_blocking(move || contact.copy_core())
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+                    .map(PeerResponse::Core)
+                    .map_err(Refused::Unavailable)
             }
             PeerRequest::Member => Ok(PeerResponse::Member(
                 shared.raft.is_initialized().await.unwrap_or(false),

@@ -33,13 +33,25 @@ pub enum ReplicaState {
     /// Its compatibility key differs from the baseline's and it is no
     /// old-key filler: it computes and commits nothing.
     VersionMismatch,
+    /// Diverged, replaying a donor's core to hand it over; after the
+    /// hand-over it resumes on a hash match.
+    Resync,
 }
 
 impl ReplicaState {
     /// Demoted (plan 2.11, Baseline): ranks below every replica that is
     /// not.
     pub fn demoted(self) -> bool {
-        matches!(self, ReplicaState::Withdrawn | ReplicaState::Diverged)
+        matches!(
+            self,
+            ReplicaState::Withdrawn | ReplicaState::Diverged | ReplicaState::Resync
+        )
+    }
+
+    /// Diverged or resyncing: ranked as diverged, no Resume before a
+    /// hand-over, and each fill is a succession discontinuity.
+    pub fn diverged(self) -> bool {
+        matches!(self, ReplicaState::Diverged | ReplicaState::Resync)
     }
 }
 
@@ -247,6 +259,11 @@ pub(crate) struct Life {
     computed_from: Option<u64>,
     /// The highest old-key fill block counted, per output.
     switch_counted: Vec<u64>,
+    /// The block after which a resync's state was handed over, while it
+    /// waits for its first matched page.
+    handed: Option<u64>,
+    /// A Resume commit start took after the hand-over: one matched page.
+    matched: bool,
     /// When the last period was taken, TAI ns.
     last_tai: Option<u64>,
     withdrawn_ns: u64,
@@ -270,6 +287,8 @@ impl Life {
             switching: false,
             computed_from: None,
             switch_counted: Vec::new(),
+            handed: None,
+            matched: false,
             last_tai: None,
             withdrawn_ns: 0,
             metrics: Metrics::default(),
@@ -320,10 +339,7 @@ impl Life {
                 };
                 self.committed_end[o] = self.committed_end[o].max(Some(end));
                 // Each fill of a diverged replica.
-                if self.state == ReplicaState::Diverged
-                    && s.digest.is_none()
-                    && last > self.fills_counted[o]
-                {
+                if self.state.diverged() && s.digest.is_none() && last > self.fills_counted[o] {
                     let from = self.fills_counted[o].max(s.k.saturating_sub(1));
                     self.metrics.succession_discontinuity_total += last - from;
                     self.fills_counted[o] = last;
@@ -340,7 +356,8 @@ impl Life {
             }
         }
         // A replica held in `starting` stays there; it diverges once it
-        // leaves.
+        // leaves. Excluded, a replica resyncing is diverged again: no
+        // hand-over.
         if v.excluded && !matches!(self.state, ReplicaState::Diverged | ReplicaState::Starting) {
             self.diverge(audio);
         }
@@ -418,7 +435,10 @@ impl Life {
             }
             match s.why {
                 Why::Named(_) if !s.filling => self.metrics.succession_discontinuity_total += 1,
-                Why::Resume => self.metrics.resumes += 1,
+                Why::Resume => {
+                    self.metrics.resumes += 1;
+                    self.matched |= self.handed.is_some();
+                }
                 _ => {}
             }
         }
@@ -460,9 +480,16 @@ impl Life {
             ReplicaState::Committing if withdrawn || !committing => {
                 self.state = ReplicaState::Withdrawn
             }
+            // Handed over: committing once a commit start Resume named
+            // on a matched page took.
+            ReplicaState::Resync if self.matched && committing && !withdrawn => {
+                self.state = ReplicaState::Committing;
+                self.handed = None;
+                self.matched = false;
+            }
             // A diverged replica commits again only by the Named rule,
             // under a naming it has not spent.
-            ReplicaState::Diverged
+            ReplicaState::Diverged | ReplicaState::Resync
                 if committing
                     && !withdrawn
                     && self.named.is_some_and(|(p, _)| {
@@ -473,7 +500,9 @@ impl Life {
                                 .any(|s| matches!(s, Standing::Committing { from } if *from >= p))
                     }) =>
             {
-                self.state = ReplicaState::Committing
+                self.state = ReplicaState::Committing;
+                self.handed = None;
+                self.matched = false;
             }
             ReplicaState::Withdrawn if committing && !withdrawn => {
                 self.state = ReplicaState::Committing
@@ -651,7 +680,10 @@ impl Life {
     /// Resume's reference for output `o`: its last block withheld for a
     /// cause, or the block processed when it became ready.
     fn reference(&self, o: usize) -> u64 {
-        self.withheld[o].max(self.ready_at).unwrap_or(0)
+        self.withheld[o]
+            .max(self.ready_at)
+            .max(self.handed)
+            .unwrap_or(0)
     }
 
     /// One voter commits once ready.
@@ -682,10 +714,13 @@ impl Life {
     /// after its reference, against every committing replica that
     /// committed it (the next page when none did).
     fn resume(&mut self, o: usize, v: &View, audio: &dyn Audio) {
-        if !matches!(
-            self.state,
-            ReplicaState::Withdrawn | ReplicaState::Committing
-        ) || self.filler.is_some()
+        let handed = self.state == ReplicaState::Resync && self.handed.is_some();
+        if !(handed
+            || matches!(
+                self.state,
+                ReplicaState::Withdrawn | ReplicaState::Committing
+            ))
+            || self.filler.is_some()
             || self.starts[o].is_some()
             || matches!(v.own.standing[o], Standing::Committing { .. })
             || !v.realised.get(o).copied().unwrap_or(true)
@@ -793,10 +828,12 @@ impl Life {
     /// committed lies after that page, committing now or not, or the
     /// replica is diverged already.
     pub fn verdict(&mut self, page: u64, own: &Own, realised: &[bool], audio: &dyn Audio) {
-        if matches!(
-            self.state,
-            ReplicaState::Diverged | ReplicaState::Starting | ReplicaState::VersionMismatch
-        ) {
+        if self.state.diverged()
+            || matches!(
+                self.state,
+                ReplicaState::Starting | ReplicaState::VersionMismatch
+            )
+        {
             return;
         }
         self.note_starts(own);
@@ -827,12 +864,44 @@ impl Life {
         self.diverge(audio);
     }
 
+    /// A donor's core arrived for a diverged replica: `resync`. False
+    /// when the replica is no longer diverged.
+    pub fn resyncing(&mut self) -> bool {
+        if self.state != ReplicaState::Diverged {
+            return false;
+        }
+        self.state = ReplicaState::Resync;
+        self.handed = None;
+        self.matched = false;
+        true
+    }
+
+    /// The RT thread took the replayed state after block `j`: the replica
+    /// resumes on the first page it computes wholly after `j` that
+    /// matches the committing replicas'.
+    pub fn handed_over(&mut self, j: u64) {
+        if self.state == ReplicaState::Resync {
+            self.handed = Some(j);
+        }
+    }
+
+    /// The resync failed: diverged again, to retry with a newer core.
+    pub fn resync_failed(&mut self) {
+        if self.state == ReplicaState::Resync {
+            self.state = ReplicaState::Diverged;
+            self.handed = None;
+            self.matched = false;
+        }
+    }
+
     /// Back to `starting` after a snapshot install or a purge-point
     /// verdict: whatever the running engine computed no longer follows
     /// the log, so nothing more of it is committed. The replica leaves
     /// `starting` once ready, with an engine rebuilt from product state.
     pub fn restart(&mut self, audio: &dyn Audio) {
         self.cancel(audio, |_| true);
+        self.handed = None;
+        self.matched = false;
         if let Some((p, _)) = self.named.take() {
             self.spent = Some(p);
         }
@@ -846,6 +915,8 @@ impl Life {
 
     fn diverge(&mut self, audio: &dyn Audio) {
         self.state = ReplicaState::Diverged;
+        self.handed = None;
+        self.matched = false;
         self.metrics.divergences += 1;
         self.cancel(audio, |_| true);
         // Committing again by the Named rule needs a later `Baseline`.

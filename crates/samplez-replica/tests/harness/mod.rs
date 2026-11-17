@@ -37,11 +37,12 @@ use samplez_replica::bootstrap::{Bootstrap, Marker, Markers, Volume, random_id};
 use samplez_replica::bridge::{PAGES_REPORTED, page_of, word_or_skip};
 use samplez_replica::contact::{self, Audio, Clocks, Sample, Timing};
 use samplez_replica::dedup::Limits;
-use samplez_replica::entry::Request;
+use samplez_replica::entry::{Body, Request};
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
 use samplez_replica::membership::{Slot, slot_of};
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest, PeerResponse};
 use samplez_replica::report::{ClockFlags, Own, Page, Report, Run, runs};
+use samplez_replica::resync::{CoreReply, Resynced, Source};
 use samplez_replica::state_machine::{Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
 use samplez_service::{Owner, ReplicatedState, Role};
@@ -438,9 +439,10 @@ pub struct Fake {
     /// The engine's core is dropped: every block is skipped, withheld
     /// without a status word, until it is rebuilt.
     pub no_core: bool,
-    /// Cores dropped and rebuilt.
-    pub drops: u64,
-    pub rebuilds: u64,
+    /// Engine drops, and rebuilds from product state, at the block last
+    /// computed.
+    pub drops: Vec<Option<u64>>,
+    pub rebuilds: Vec<Option<u64>>,
     /// Stops the supervisor named, `(output, at)`.
     pub stops: Vec<(usize, u64)>,
     /// Blocks `[from, to)` skipped and withheld for a cause; for
@@ -458,7 +460,29 @@ pub struct Fake {
     pub rebuilt_at: Vec<usize>,
     /// Entries resolved, with the length of `unresolved` then.
     pub resolved: Vec<(u64, usize)>,
+    /// Copies a core for a resync and takes one: off, a donor copies
+    /// none and a diverged replica stays diverged.
+    pub resyncs: bool,
+    /// Cores copied as a donor.
+    pub cores_copied: u64,
+    /// Hand-overs taken, `(k0, j)`: the donor's core after `k0`, the RT
+    /// thread on from it after `j`.
+    pub handovers: Vec<(u64, u64)>,
+    /// A hand-over comes this many blocks after the block computed when
+    /// the core arrived: the replay's catch-up.
+    pub catch_up: u64,
+    /// The next this many resyncs fail.
+    pub failing: u32,
+    /// The state a hand-over installs after its block: the donor's open
+    /// glitches.
+    pending_handover: Option<(u64, Vec<f32>)>,
+    /// Rebuilds fail while set.
+    pub rebuild_held: bool,
 }
+
+/// An open glitch: a state divergence that lasts until a resync or a
+/// rebuild replaces the state.
+pub const FOR_GOOD: u64 = u64::MAX;
 
 impl Fake {
     fn digest(&self, k: u64) -> u64 {
@@ -678,6 +702,21 @@ impl FakeAudio {
         }
         let b = self.timing.block;
         for k in first..=target {
+            if let Some((j, _)) = st.pending_handover
+                && k == j + 1
+            {
+                let (_, donor) = st.pending_handover.take().expect("checked");
+                for g in &mut st.glitched {
+                    g.1 = g.1.min(k);
+                }
+                st.glitched
+                    .extend(donor.into_iter().map(|by| (k, FOR_GOOD, by)));
+                // The page holding the boundary mixes both states: no
+                // record.
+                for out in &mut st.outputs {
+                    out.pages.restart();
+                }
+            }
             if let Some(&(_, _, cause)) = st.stepped.iter().find(|&&(a, z, _)| (a..z).contains(&k))
             {
                 for out in &mut st.outputs {
@@ -921,10 +960,13 @@ impl Audio for FakeAudio {
     fn drop_engine(&self) {
         self.step();
         let mut st = self.lock();
-        st.drops += 1;
+        let at = st.computed;
+        st.drops.push(at);
         st.no_core = true;
     }
-    /// Refused while a generation the core names is not built.
+    /// Rebuilt from product state: whatever state diverged is gone.
+    /// Refused while a generation the core names is not built, and
+    /// failed while held.
     fn rebuild_engine(&self) -> bool {
         self.step();
         let mut st = self.lock();
@@ -932,12 +974,66 @@ impl Audio for FakeAudio {
             st.refused_rebuilds += 1;
             return false;
         }
-        st.rebuilds += 1;
+        if st.rebuild_held {
+            return false;
+        }
+        let at = st.computed;
+        let k = at.map_or(0, |c| c + 1);
+        for g in &mut st.glitched {
+            g.1 = g.1.min(k);
+        }
+        st.rebuilds.push(at);
         st.no_core = false;
         st.core_unresolved.clear();
         let n = st.unresolved.len();
         st.rebuilt_at.push(n);
         true
+    }
+    /// The open glitches as of the next block, in place of an engine core.
+    fn copy_core(&self) -> Option<CoreReply> {
+        self.step();
+        let mut st = self.lock();
+        if !st.resyncs {
+            return None;
+        }
+        st.cores_copied += 1;
+        let k0 = st.computed?;
+        let open: Vec<f32> = st
+            .glitched
+            .iter()
+            .filter(|g| g.0 <= k0 + 1 && g.1 > k0 + 1)
+            .map(|g| g.2)
+            .collect();
+        Some(CoreReply {
+            k0,
+            last_id: 0,
+            core: serde_json::to_string(&open).expect("encodes"),
+        })
+    }
+    /// The replay catches up within `catch_up` blocks and hands over.
+    fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, String> {
+        self.step();
+        let _ = source.entries(core.last_id);
+        let mut st = self.lock();
+        if !st.resyncs {
+            return Err("resyncs are off".to_owned());
+        }
+        if st.failing > 0 {
+            st.failing -= 1;
+            return Err("a replay failed".to_owned());
+        }
+        if !source.go() {
+            return Err("given up".to_owned());
+        }
+        let donor: Vec<f32> = serde_json::from_str(&core.core).map_err(|e| e.to_string())?;
+        let j = st.computed.unwrap_or(0) + st.catch_up;
+        st.pending_handover = Some((j, donor));
+        st.handovers.push((core.k0, j));
+        Ok(Resynced {
+            j,
+            pages: Vec::new(),
+            unresolved: Vec::new(),
+        })
     }
 }
 
@@ -1621,6 +1717,66 @@ impl Set {
                 "revision {revision} not applied within 30 s"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Forces a snapshot install on `follower`, which must not lead: cut
+    /// off from openraft's RPCs (peer requests still flow), it falls
+    /// behind an entry the leader appends, snapshots and purges; once its
+    /// RPCs flow again the leader can only send it the snapshot. Returns
+    /// once it installed one. The set needs `max_in_snapshot_log_to_keep`
+    /// 0 and no snapshot policy of its own.
+    pub async fn force_install(&self, follower: NodeId) {
+        let leader = self.leader().await;
+        assert_ne!(leader, follower, "the follower leads");
+        let installs = self.replica(follower).store().installs();
+        let others: Vec<NodeId> = self.running().filter(|&id| id != follower).collect();
+        for &id in &others {
+            self.net.cut_raft(follower, id);
+        }
+        let store = self.replica(leader).store();
+        let before = store.applied_index();
+        let at = (contact::index_at(self.clock(leader).tai_ns()) + RATE).next_multiple_of(BLOCK);
+        self.replica(leader).append(Body::InputDown {
+            slot: 0,
+            at_index: at,
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.applied_index() <= before {
+            assert!(Instant::now() < deadline, "the entry applied on the leader");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let index = store.applied_index();
+        let raft = self.replica(leader).raft().clone();
+        raft.trigger().snapshot().await.expect("snapshot");
+        while raft
+            .metrics()
+            .borrow()
+            .snapshot
+            .is_none_or(|id| id.index < index)
+        {
+            assert!(Instant::now() < deadline, "the leader's snapshot");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        raft.trigger().purge_log(index).await.expect("purge");
+        while raft
+            .metrics()
+            .borrow()
+            .purged
+            .is_none_or(|id| id.index < index)
+        {
+            assert!(Instant::now() < deadline, "the leader's purge");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        {
+            let mut links = self.net.links();
+            links
+                .cut_raft
+                .retain(|&(a, b)| a != follower && b != follower);
+        }
+        while self.replica(follower).store().installs() == installs {
+            assert!(Instant::now() < deadline, "{follower} installed a snapshot");
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
 }

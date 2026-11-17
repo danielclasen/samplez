@@ -191,7 +191,7 @@ async fn a_key_changing_rollout_hands_over_at_p() {
             // A second replica with N's key resumes on N's pages; the
             // remaining old-key filler then commits nothing at all.
             let second = old[1];
-            let drops = set.audio(old[0]).lock().drops;
+            let drops = set.audio(old[0]).lock().drops.len();
             set.set_version(second, 2, "r2");
             set.restart(second).await;
             until("the second new-key replica committing", 10, || {
@@ -203,7 +203,7 @@ async fn a_key_changing_rollout_hands_over_at_p() {
             })
             .await;
             assert_eq!(
-                set.audio(old[0]).lock().drops,
+                set.audio(old[0]).lock().drops.len(),
                 drops + 1,
                 "its core dropped"
             );
@@ -220,12 +220,12 @@ async fn a_key_changing_rollout_hands_over_at_p() {
 async fn n_unready_at_p_commits_from_p_through_its_degraded_blocks() {
     let (mut set, ids, n) = roll(vec![a(0), a(1), witness()], false).await;
     mismatched(&set, n).await;
-    let rebuilds = set.audio(n).lock().rebuilds;
+    let rebuilds = set.audio(n).lock().rebuilds.len();
     set.set_target(Some("r2"));
     let p = named(&set, a(0), n).await;
     let kp = p / BLOCK;
     until("N retargeted", 10, || {
-        set.audio(n).lock().rebuilds == rebuilds + 1
+        set.audio(n).lock().rebuilds.len() == rebuilds + 1
     })
     .await;
     {
@@ -409,7 +409,7 @@ async fn a_retargeted_core_is_given_the_entries_still_unresolved() {
 async fn a_re_routed_n_retargets_only_once_its_generation_is_built() {
     let (mut set, _, n) = roll(vec![a(0), a(1), witness()], false).await;
     mismatched(&set, n).await;
-    let rebuilds = set.audio(n).lock().rebuilds;
+    let rebuilds = set.audio(n).lock().rebuilds.len();
     set.audio(n).lock().generation_pending = true;
     set.set_target(Some("r2"));
     let p = named(&set, a(0), n).await;
@@ -418,14 +418,14 @@ async fn a_re_routed_n_retargets_only_once_its_generation_is_built() {
     })
     .await;
     assert_eq!(
-        set.audio(n).lock().rebuilds,
+        set.audio(n).lock().rebuilds.len(),
         rebuilds,
         "retargeted without its generation"
     );
     assert_eq!(state(&set, n), Some(ReplicaState::VersionMismatch));
     set.audio(n).lock().generation_pending = false;
     until("N committing", 10, || committing(&set, n)).await;
-    assert_eq!(set.audio(n).lock().rebuilds, rebuilds + 1);
+    assert_eq!(set.audio(n).lock().rebuilds.len(), rebuilds + 1);
     assert_eq!(
         baseline(&set, a(0))
             .unwrap()
@@ -445,7 +445,7 @@ async fn a_re_routed_n_retargets_only_once_its_generation_is_built() {
 async fn an_aborted_rollout_names_an_old_key_replica_again() {
     let (mut set, ids, n) = roll(vec![a(0), a(1), witness()], false).await;
     mismatched(&set, n).await;
-    let rebuilds = set.audio(n).lock().rebuilds;
+    let rebuilds = set.audio(n).lock().rebuilds.len();
     set.audio(n).lock().generation_pending = true;
     set.set_target(Some("r2"));
     let p = named(&set, a(0), n).await;
@@ -465,7 +465,7 @@ async fn an_aborted_rollout_names_an_old_key_replica_again() {
     .await;
     sleep(Duration::from_millis(300)).await;
     assert!(!committing(&set, n), "N committing");
-    assert_eq!(set.audio(n).lock().rebuilds, rebuilds, "N retargeted");
+    assert_eq!(set.audio(n).lock().rebuilds.len(), rebuilds, "N retargeted");
     writes_none(&set, n, p - PAGE, page_now(&set, old) * PAGE);
     assert_eq!(state(&set, n), Some(ReplicaState::VersionMismatch));
     pages_whole(&set, &ids, p / PAGE - 2, page_now(&set, old) - 1);

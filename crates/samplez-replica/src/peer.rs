@@ -66,6 +66,8 @@ pub enum PeerRequest {
     ReadIndex,
     /// A voter's side report ([`crate::contact`]).
     Report(Box<Report>),
+    /// A committing audio replica's engine core, for a resync.
+    Core,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +79,7 @@ pub enum PeerResponse {
     Member(bool),
     ReadIndex(u64),
     Reported,
+    Core(crate::resync::CoreReply),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
