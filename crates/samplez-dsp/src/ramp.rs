@@ -2,6 +2,12 @@
 /// f32 and as i32 in the SIMD kernels.
 pub const MAX_RAMP_LEN: u32 = 1 << 24;
 
+/// Longest ramp whose every value lies between its ends. A longer one can
+/// pass its target by one ulp at its last samples, as the rounded step
+/// times a position above 2^23 does, so a check holding a ramp to the
+/// range of its ends would refuse a state it reached.
+pub const MAX_EXACT_RAMP_LEN: u32 = 1 << 23;
+
 /// Largest gain magnitude a ramp accepts, +120 dB. With both ends of a
 /// ramp within it, `target - c0` and every ramp value stay finite.
 pub const MAX_GAIN: f32 = 1.0e6;
@@ -70,6 +76,23 @@ impl Ramp {
         self.target
     }
 
+    /// Whether the ramp holds what [`Ramp::new`] and [`Ramp::set_target`]
+    /// give: both ends valid gains, a finite step, a length within
+    /// [`MAX_RAMP_LEN`] and a position within the length. A ramp decoded
+    /// from a peer is checked with it.
+    pub fn is_valid(&self) -> bool {
+        valid_gain(self.c0)
+            && valid_gain(self.target)
+            && self.step.is_finite()
+            && self.len <= MAX_RAMP_LEN
+            && self.pos <= self.len
+    }
+
+    /// Whether the ramp is valid and both its ends lie within `range`.
+    pub(crate) fn is_within(&self, range: core::ops::RangeInclusive<f32>) -> bool {
+        self.is_valid() && range.contains(&self.c0) && range.contains(&self.target)
+    }
+
     pub fn is_active(&self) -> bool {
         self.pos < self.len
     }
@@ -124,6 +147,39 @@ impl Ramp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last values of a ramp, whether they lie between its ends.
+    fn ends_hold(c0: f32, target: f32, len: u32) -> bool {
+        let mut r = Ramp::new(c0);
+        assert!(r.set_target(target, len));
+        let (lo, hi) = (c0.min(target), c0.max(target));
+        (len.saturating_sub(3)..len).all(|k| (lo..=hi).contains(&r.value_at(k)))
+    }
+
+    /// A ramp of up to [`MAX_EXACT_RAMP_LEN`] samples stays between its
+    /// ends, at that length and below, across ends within the leg gain
+    /// range; a longer one can pass its target, -80.378 dB to 100 over
+    /// 13407885 samples ending at 100.0000076.
+    #[test]
+    fn a_ramp_up_to_the_exact_length_stays_between_its_ends() {
+        assert!(!ends_hold(-80.378_47, 100.0, 13_407_885));
+        let mut rng = crate::test_util::Rng::new(0x2a3e_77c1);
+        for i in 0..20_000 {
+            let len = match i % 4 {
+                0 => MAX_EXACT_RAMP_LEN,
+                1 => MAX_EXACT_RAMP_LEN - rng.below(1000) as u32,
+                _ => 2 + rng.below(MAX_EXACT_RAMP_LEN as usize - 1) as u32,
+            };
+            let c0 = rng.unit() * 100.0;
+            let target = match rng.below(4) {
+                0 => 100.0,
+                1 => -100.0,
+                2 => 1.0,
+                _ => rng.unit() * 100.0,
+            };
+            assert!(ends_hold(c0, target, len), "{c0} -> {target} over {len}");
+        }
+    }
 
     #[test]
     fn valid_gain_refuses_nan_and_infinities() {

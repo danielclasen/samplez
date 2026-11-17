@@ -752,6 +752,7 @@ fn replay_rt(
         taken: 0,
         skip_upto: 0,
         install_at: 0,
+        strips_upto: 0,
         replay: true,
         core: true,
         cmd: none(),
@@ -1079,6 +1080,7 @@ impl Engine {
             taken: 0,
             skip_upto: 0,
             install_at: 0,
+            strips_upto: 0,
             replay: false,
             core: true,
             cmd: cmd_rx,
@@ -1809,7 +1811,7 @@ impl Engine {
             .expect("checked above");
         let (slots, in_domains) = new_slots(&self.config);
         let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
-        if !c.fits(n, m, &legs, page) {
+        if !c.fits(n, m, &legs, self.config.ramp_samples, page) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -1861,7 +1863,7 @@ impl Engine {
         let (hashes_tx, hashes) = rtrb::RingBuffer::new(4 * self.config.outputs.len().max(1));
         let (control, control_rx) = rtrb::RingBuffer::new(UNRESOLVED);
         let mut rt = replay_rt(&self.config, &self.api, gens, hashes_tx, control_rx);
-        rt.install_core(c, copy.last_id);
+        rt.install_core(c, copy.last_id, true);
         Ok(Replay {
             rt: Box::new(rt),
             hashes,
@@ -1987,13 +1989,12 @@ impl Engine {
             core.page_entries.clear();
             core.entries_page = None;
             core.entries_lost = false;
+            // The RT thread keeps its strips.
             for (c, &up) in core.slots.iter_mut().zip(&up) {
                 *c = SlotCore {
                     up,
-                    held: false,
-                    fade_start: None,
                     silenced_last: true,
-                    xfade: None,
+                    ..SlotCore::default()
                 };
             }
             core.awaiting_gen.clear();
@@ -2013,13 +2014,13 @@ impl Engine {
     /// before the block after the core's: each attempt waits for it to
     /// compute a block, has `make` fill a core for that block at once and
     /// passes it on before the RT thread's next wake. `make` returns the
-    /// block the core follows and the highest log id it knew. With
-    /// `names_gen` the core must name the pending generation the RT
-    /// thread holds.
+    /// block the core follows and the highest log id it knew. A
+    /// `replayed` core must name the pending generation the RT thread
+    /// holds, and its strips are installed.
     fn offer(
         &self,
         timeout: Duration,
-        names_gen: bool,
+        replayed: bool,
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
@@ -2109,7 +2110,7 @@ impl Engine {
                 j,
                 last_id,
                 core,
-                names_gen,
+                replayed,
                 answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
@@ -4530,7 +4531,7 @@ mod tests {
             j: copy.k0,
             last_id: copy.last_id,
             core: copy.core,
-            names_gen: true,
+            replayed: true,
             answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
@@ -4666,7 +4667,7 @@ mod tests {
         };
         rt.awaiting_gen.push(route);
         rt.slots[0].held = true;
-        rt.install_core(&core, 5);
+        rt.install_core(&core, 5, true);
         assert_eq!(rt.awaiting_gen, [route]);
         assert!(rt.slots[0].held);
         e.stop();
@@ -4674,8 +4675,8 @@ mod tests {
     }
 
     /// Without a core a strip entry whose index passed still reaches its
-    /// slot's strip, which the slot keeps across the drop: a core
-    /// installed later holds no strip, so the entry would be lost.
+    /// slot's strip, which the slot keeps across the drop: a core built
+    /// from product state holds no strip, so the entry would be lost.
     #[test]
     fn a_strip_entry_due_without_a_core_reaches_the_strip() {
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
@@ -4717,7 +4718,8 @@ mod tests {
         assert_eq!(rt.counters.entries_without_core.load(Relaxed), 2);
 
         // A strip entry the core knew, pending here, whose index the core
-        // passed: the core holds no strip, so it applies at the install.
+        // passed: a product core holds no strip, so it applies at the
+        // install.
         let gain = StripParam::Trim { db: -3.0 };
         assert!(rt.mix.push(entry(
             4,
@@ -4732,7 +4734,7 @@ mod tests {
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
-        rt.install_core(&core, 4);
+        rt.install_core(&core, 4, false);
         assert!(rt.mix.pending.is_empty());
         assert_eq!(rt.slots[0].strip_pos, Some(192));
         let mut set = samplez_dsp::Strip::new(1, config.ramp_samples);
@@ -4740,6 +4742,195 @@ mod tests {
         set.advance(192 - 48);
         assert!(set.set(gain));
         assert_eq!(rt.slots[0].strip.as_ref(), Some(&set));
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A product core that knew less than an earlier replayed one: a
+    /// strip entry the replayed core's strips hold, delivered by the ring
+    /// only after both, is not applied again, which would restart its
+    /// ramp; a gain entry the product core did not know is taken as new,
+    /// not skipped as known, which would lose it.
+    #[test]
+    fn a_product_core_knowing_less_than_a_replayed_one_loses_and_repeats_nothing() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("product-below-replay", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d11", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d12", "label": "below",
+                          "group": "below", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (mut ring, entries) = rtrb::RingBuffer::new(4);
+        rt.entries = entries;
+        let hpf = StripParam::Hpf {
+            enabled: true,
+            freq: 200.0,
+        };
+        let strip = RtEntry {
+            id: 3,
+            at_index: 48,
+            change: Change::Strip {
+                slot: 0,
+                param: hpf,
+            },
+        };
+        let gain = RtEntry {
+            id: 2,
+            at_index: 1440,
+            change: Change::Gain {
+                input: 0,
+                output: 0,
+                gain: 0.5,
+            },
+        };
+        // The replayed core knew entries up to 3 and applied the strip
+        // entry at 48; its strip, 432 samples into the ramp, is installed.
+        let mut replayed = samplez_dsp::Strip::new(1, config.ramp_samples);
+        assert!(replayed.set(hpf));
+        replayed.advance(480 - 48);
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        core.slots[0].strip = Some(replayed.clone());
+        core.slots[0].strip_pos = Some(480);
+        rt.install_core(&core, 3, true);
+        assert_eq!(rt.slots[0].strip.as_ref(), Some(&replayed));
+        // A product core that knew entries up to 1 only.
+        rt.capture(&mut core);
+        core.pos = Some(960);
+        core.pending.clear();
+        rt.install_core(&core, 1, false);
+        // The ring delivers both now.
+        assert!(ring.push(strip).is_ok() && ring.push(gain).is_ok());
+        rt.take_entries();
+        assert_eq!(rt.slots[0].strip.as_ref(), Some(&replayed), "applied again");
+        assert!(
+            rt.mix.holds(2),
+            "the gain entry the product core missed is lost"
+        );
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// An entry consumed through a replayed core counts as taken, whether
+    /// the RT thread held it pending at the install, which drops it as
+    /// known, or the ring delivers it after, which skips it as known: a
+    /// product core that knew less, installed next, would lose it from
+    /// the matrix for good, so the hand-over check
+    /// (`last_taken > last_id`) refuses that core as Missed.
+    #[test]
+    fn an_entry_taken_through_a_replayed_core_refuses_a_core_knowing_less() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("taken-through-core", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d13", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d14", "label": "taken",
+                          "group": "taken", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (mut ring, entries) = rtrb::RingBuffer::new(4);
+        rt.entries = entries;
+        let gain = |id, at_index| RtEntry {
+            id,
+            at_index,
+            change: Change::Gain {
+                input: 0,
+                output: 0,
+                gain: 0.5,
+            },
+        };
+        // Entry 2 pending here, entry 3 still in the ring: the replayed
+        // core knew both and applied them.
+        assert!(rt.mix.push(gain(2, 48)));
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        rt.install_core(&core, 3, true);
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.mix.last_taken, 2, "dropped at the install");
+        // Delivered between the replayed install and the next one.
+        assert!(ring.push(gain(3, 96)).is_ok());
+        rt.take_entries();
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.mix.last_taken, 3, "skipped as known");
+        // A product core that knew entries up to 1 is refused.
+        assert!(rt.mix.last_taken > 1);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A strip entry the replayed strips hold, delivered by the ring after
+    /// the install, counts as taken: another replayed core that knew
+    /// less would replace the strips with ones lacking it, so the
+    /// hand-over check (`last_taken > last_id`) refuses that core.
+    #[test]
+    fn a_strip_entry_held_by_the_strips_refuses_a_replayed_core_knowing_less() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("strip-taken", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d15", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d16", "label": "held",
+                          "group": "held", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (mut ring, entries) = rtrb::RingBuffer::new(4);
+        rt.entries = entries;
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        rt.install_core(&core, 3, true);
+        // Strip entry 3, applied by the replay, delivered after the install.
+        let strip = RtEntry {
+            id: 3,
+            at_index: 48,
+            change: Change::Strip {
+                slot: 0,
+                param: StripParam::Trim { db: -6.0 },
+            },
+        };
+        assert!(ring.push(strip).is_ok());
+        rt.take_entries();
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.mix.last_taken, 3, "skipped as held by the strips");
+        // A replayed core that knew entries up to 2 is refused.
+        assert!(rt.mix.last_taken > 2);
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }
@@ -4803,7 +4994,7 @@ mod tests {
                 j: stale,
                 last_id: replay.last_id,
                 core,
-                names_gen: true,
+                replayed: true,
                 answer: Answer::Waiting,
             };
             assert!(t.handovers.push(h).is_ok());

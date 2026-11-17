@@ -27,6 +27,7 @@
 //! sample index alone, not on how the samples are split into blocks.
 
 use crate::Ramp;
+use crate::strip::{ATTACK_MS, RELEASE_MS};
 use crate::svf::SAMPLE_RATE;
 
 /// Gate hold after the key last reached the threshold: 30 ms, longer
@@ -66,7 +67,7 @@ fn pole(ms: f32, len: u32) -> f32 {
 
 /// The one-pole coefficients of a time constant over one sample and
 /// over one [`GAIN_INTERVAL`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Pole {
     sample: f32,
     interval: f32,
@@ -78,6 +79,14 @@ impl Pole {
             sample: pole(ms, 1),
             interval: pole(ms, GAIN_INTERVAL),
         }
+    }
+
+    /// Both coefficients at least 0 and at most those of [`Pole::new`]
+    /// at `max_ms`, the longest time constant of the pole's range: a
+    /// pole's coefficients grow with its time constant.
+    fn is_valid(&self, max_ms: f32) -> bool {
+        let max = Pole::new(max_ms);
+        (0.0..=max.sample).contains(&self.sample) && (0.0..=max.interval).contains(&self.interval)
     }
 
     /// The coefficient over a run of `len` samples.
@@ -165,6 +174,9 @@ fn smooth(y: f32, target: f32, a: f32) -> f32 {
     }
 }
 
+/// The largest magnitude of the legs at sample `n`, at most `f32::MAX`:
+/// a NaN fails the comparison and an infinity is taken as `f32::MAX`, so
+/// the key an interval keeps is finite whatever the input.
 #[inline]
 fn key(buf: &[f32], legs: usize, frames: usize, n: usize) -> f32 {
     let mut k = 0.0f32;
@@ -174,7 +186,7 @@ fn key(buf: &[f32], legs: usize, frames: usize, n: usize) -> f32 {
             k = v;
         }
     }
-    k
+    k.min(f32::MAX)
 }
 
 /// The interval of the gain computer running: the largest key so far,
@@ -184,7 +196,7 @@ fn key(buf: &[f32], legs: usize, frames: usize, n: usize) -> f32 {
 /// [`GAIN_INTERVAL`], and `next` the one set for the intervals after it.
 /// Run every sample, the gain is held at the one computed for the
 /// sample.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Interval {
     peak: f32,
     phase: u32,
@@ -206,6 +218,23 @@ impl Interval {
         len: GAIN_INTERVAL,
         next: GAIN_INTERVAL,
     };
+
+    /// Whether the interval holds what a unit's does between two samples:
+    /// a position within it, runs of 1 or [`GAIN_INTERVAL`] samples, a
+    /// finite key, gains within `[0, 1]`, which both units' gains are,
+    /// and a step of at most the distance between two over an interval.
+    fn is_valid(&self) -> bool {
+        let run = |len: u32| len == 1 || len == GAIN_INTERVAL;
+        let gain = |g: f32| (0.0..=1.0).contains(&g);
+        self.phase < GAIN_INTERVAL
+            && run(self.len)
+            && run(self.next)
+            && self.peak.is_finite()
+            && self.peak >= 0.0
+            && gain(self.from)
+            && gain(self.to)
+            && self.step.abs() <= 1.0 / GAIN_INTERVAL as f32
+    }
 
     /// Sets the samples per run of the gain computer from the next
     /// multiple of [`GAIN_INTERVAL`] on, or at once at one with the gain
@@ -328,7 +357,7 @@ impl Interval {
 
 /// A unit's switch: its effect `1 + w * (gain - 1)` with `w` ramping
 /// between 0 and 1.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Wet(Ramp);
 
 impl Wet {
@@ -343,6 +372,11 @@ impl Wet {
     /// Off and not ramping.
     fn is_off(&self) -> bool {
         !self.0.is_active() && self.0.target() == 0.0
+    }
+
+    /// Ramping within `[0, 1]` to 0 or 1.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.0.is_within(0.0..=1.0) && (self.0.target == 0.0 || self.0.target == 1.0)
     }
 }
 
@@ -380,7 +414,7 @@ pub struct CompParams {
     pub makeup_db: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Gate {
     wet: Wet,
     threshold: f32,
@@ -516,6 +550,25 @@ impl Gate {
         self.interval.align(index);
     }
 
+    /// Whether the gate holds values a gate set within the parameter
+    /// ranges holds: threshold, reopen level and floor gains within
+    /// `[0, 1]`, range and smoothed gain within the range limit, a hold
+    /// within [`GATE_HOLD`], valid poles, switch and interval.
+    pub(crate) fn is_valid(&self) -> bool {
+        let unit = |g: f32| (0.0..=1.0).contains(&g);
+        let range = -*crate::strip::GATE_RANGE_DB.end()..=0.0;
+        self.wet.is_valid()
+            && unit(self.threshold)
+            && unit(self.reopen)
+            && range.contains(&self.range_db)
+            && unit(self.floor)
+            && self.attack.is_valid(*ATTACK_MS.end())
+            && self.release.is_valid(*RELEASE_MS.end())
+            && range.contains(&self.y)
+            && self.hold <= GATE_HOLD
+            && self.interval.is_valid()
+    }
+
     /// Whether the gate passes every input unchanged until it is set
     /// again: off, or a range of 0 dB with the gain at 0 dB.
     pub(crate) fn is_identity(&self) -> bool {
@@ -523,7 +576,14 @@ impl Gate {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// The lowest smoothed gain a compressor reaches, dB: its target is
+/// `slope (key - threshold)`, the key at most `f32::MAX`, 770.6 dBFS, the
+/// threshold at least -60 dBFS and the slope at least `1 / 20 - 1`, so
+/// at most 789.1 dB of reduction, and the smoothed gain moves between
+/// targets.
+pub(crate) const COMP_GAIN_MIN_DB: f32 = -800.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Comp {
     wet: Wet,
     threshold_db: f32,
@@ -663,6 +723,28 @@ impl Comp {
     /// sample index `index`.
     pub(crate) fn align(&mut self, index: u64) {
         self.interval.align(index);
+    }
+
+    /// Whether the compressor holds values a compressor set within the
+    /// parameter ranges holds: threshold and knee within theirs, a slope
+    /// of a ratio within it, the knee's start gain within `(0, 1]`, a
+    /// makeup ramp within its range, a smoothed gain within
+    /// [`COMP_GAIN_MIN_DB`] and 0 dB, valid poles, switch and interval.
+    pub(crate) fn is_valid(&self) -> bool {
+        use crate::strip::{COMP_KNEE_DB, COMP_RATIO, COMP_THRESHOLD_DB, MAKEUP_DB};
+        let slope = 1.0 / *COMP_RATIO.end() - 1.0..=0.0;
+        let makeup = 1.0..=db_to_gain(*MAKEUP_DB.end());
+        self.wet.is_valid()
+            && COMP_THRESHOLD_DB.contains(&self.threshold_db)
+            && slope.contains(&self.slope)
+            && COMP_KNEE_DB.contains(&self.knee_db)
+            && self.knee_start > 0.0
+            && self.knee_start <= 1.0
+            && self.attack.is_valid(*ATTACK_MS.end())
+            && self.release.is_valid(*RELEASE_MS.end())
+            && self.makeup.is_within(makeup)
+            && (COMP_GAIN_MIN_DB..=0.0).contains(&self.y)
+            && self.interval.is_valid()
     }
 
     /// Whether the compressor passes every input unchanged until it is
@@ -1324,5 +1406,98 @@ mod tests {
         a.process(&mut x, 1, 300);
         b.advance(300);
         assert_eq!(a, b);
+    }
+
+    /// A gate or compressor holding a value none reaches is not valid: a
+    /// NaN gain or key, a gain beyond its range, a pole of no decay, a
+    /// hold or phase beyond its length.
+    #[test]
+    fn a_unit_holding_a_value_none_reaches_is_not_valid() {
+        let mut g = Gate::new();
+        g.set(&gate(-40.0, 30.0), 48);
+        let mut c = Comp::new();
+        c.set(&comp(-30.0, 4.0, 6.0, 3.0), 48);
+        let mut burst: Vec<f32> = (0..480).map(|n| (n as f32 * 0.1).sin()).collect();
+        g.process(&mut burst, 1, 480);
+        c.process(&mut burst, 1, 480);
+        assert!(g.is_valid() && c.is_valid());
+        let gate_invalid = |what: &str, f: &dyn Fn(&mut Gate)| {
+            let mut u = g;
+            f(&mut u);
+            assert!(!u.is_valid(), "gate {what}");
+        };
+        let comp_invalid = |what: &str, f: &dyn Fn(&mut Comp)| {
+            let mut u = c;
+            f(&mut u);
+            assert!(!u.is_valid(), "compressor {what}");
+        };
+        gate_invalid("NaN gain", &|u| u.y = f32::NAN);
+        gate_invalid("gain below its range", &|u| u.y = -81.0);
+        gate_invalid("hold beyond its length", &|u| u.hold = GATE_HOLD + 1);
+        gate_invalid("floor above unity", &|u| u.floor = 2.0);
+        gate_invalid("switch to neither", &|u| u.wet.0.target = 0.5);
+        comp_invalid("NaN gain", &|u| u.y = f32::NAN);
+        comp_invalid("gain above 0 dB", &|u| u.y = 1.0);
+        comp_invalid("NaN key", &|u| u.interval.peak = f32::NAN);
+        comp_invalid("phase beyond the interval", &|u| {
+            u.interval.phase = GAIN_INTERVAL
+        });
+        comp_invalid("run of neither length", &|u| u.interval.next = 3);
+        comp_invalid("interval gain above unity", &|u| u.interval.to = 1.5);
+        comp_invalid("pole of no decay", &|u| u.release.sample = 1.0);
+        let slowest = |ms: f32| Pole::new(ms * 1.01);
+        gate_invalid("attack slower than the longest", &|u| {
+            u.attack.interval = slowest(*ATTACK_MS.end()).interval
+        });
+        gate_invalid("release slower than the longest", &|u| {
+            u.release.sample = slowest(*RELEASE_MS.end()).sample
+        });
+        comp_invalid("attack slower than the longest", &|u| {
+            u.attack.sample = slowest(*ATTACK_MS.end()).sample
+        });
+        comp_invalid("release slower than the longest", &|u| {
+            u.release.interval = 0.999_999_94
+        });
+        comp_invalid("gain beyond any reduction", &|u| u.y = -801.0);
+        comp_invalid("step beyond one interval", &|u| u.interval.step = -0.13);
+        comp_invalid("slope beyond the ratio", &|u| u.slope = -2.0);
+        comp_invalid("makeup beyond its range", &|u| u.makeup.target = 100.0);
+    }
+
+    /// The lowest smoothed gain a compressor reaches is within
+    /// [`COMP_GAIN_MIN_DB`]: at ratio 20 and threshold -60 dBFS, the
+    /// widest of the ranges, a key of `f32::MAX`, 128 octaves or 770.6
+    /// dBFS, is 830.6 dB over and takes `(1 / 20 - 1) 830.6`, -789.1 dB;
+    /// a compressor fed `f32::MAX` and infinities settles there.
+    #[test]
+    fn the_largest_reduction_is_within_its_bound() {
+        let ratio = *crate::strip::COMP_RATIO.end();
+        let threshold = *crate::strip::COMP_THRESHOLD_DB.start();
+        let key_db = log2(f32::MAX) * DB_PER_OCTAVE;
+        let largest = (1.0 / ratio - 1.0) * (key_db - threshold);
+        assert!((-790.0..-789.0).contains(&largest), "{largest}");
+        assert!(largest > COMP_GAIN_MIN_DB);
+        let mut c = Comp::new();
+        c.set(
+            &CompParams {
+                enabled: true,
+                threshold_db: threshold,
+                ratio,
+                attack_ms: *ATTACK_MS.start(),
+                release_ms: 50.0,
+                knee_db: 0.0,
+                makeup_db: 0.0,
+            },
+            0,
+        );
+        let mut lowest = 0.0f32;
+        for n in 0..2000 {
+            let x = if n % 3 == 0 { f32::INFINITY } else { f32::MAX };
+            let mut buf = [x; 48];
+            c.process(&mut buf, 1, 48);
+            lowest = lowest.min(c.y);
+            assert!(c.is_valid(), "{c:?}");
+        }
+        assert!((COMP_GAIN_MIN_DB..-789.0).contains(&lowest), "{lowest}");
     }
 }

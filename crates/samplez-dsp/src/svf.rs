@@ -10,13 +10,39 @@
 //! filter stays stable at every intermediate value, since `g > 0` and
 //! `k > 0` throughout. The state runs in f32, one leg after the other,
 //! in a fixed order of operations without FMA. After each block a state
-//! below -400 dB is set to zero, so silence decays to exact zeros.
+//! below -400 dB is set to zero, so silence decays to exact zeros, and so
+//! is one above +600 dB or not finite, which only a non-finite or
+//! overflowing input leaves, so the section recovers at the next block.
 
 /// Sample rate the coefficients are computed for.
 pub const SAMPLE_RATE: f64 = 48_000.0;
 
 /// State magnitude set to zero after each block: -400 dB.
 const FLUSH: f32 = 1.0e-20;
+
+/// Largest state magnitude kept after a block: +600 dB.
+pub(crate) const STATE_MAX: f32 = 1.0e30;
+
+/// The box every coefficient a section ramps to lies in, `g` and `k`
+/// above their lower bound, which is 0: the largest are `g` 6.3 (a high
+/// shelf at 20 kHz and +18 dB), `k` 28.2, `m0` 7.9, `m1` -64.3 (a high
+/// shelf at +18 dB and Q 0.1) and 24.6, and `m2` +-6.9. A ramp is linear,
+/// so one whose ends lie in it stays in it.
+pub(crate) const COEFFICIENTS_LOW: Coefficients = [0.0, 0.0, 0.0, -72.0, -8.0];
+pub(crate) const COEFFICIENTS_HIGH: Coefficients = [8.0, 32.0, 8.0, 32.0, 8.0];
+
+/// Whether `c` lies within [`COEFFICIENTS_LOW`] and [`COEFFICIENTS_HIGH`],
+/// `g` and `k` above 0, which keeps a section stable.
+pub(crate) fn within_box(c: &Coefficients) -> bool {
+    let low = |i: usize| {
+        if i < 2 {
+            c[i] > COEFFICIENTS_LOW[i]
+        } else {
+            c[i] >= COEFFICIENTS_LOW[i]
+        }
+    };
+    (0..5).all(|i| low(i) && c[i] <= COEFFICIENTS_HIGH[i])
+}
 
 /// `(g, k, m0, m1, m2)`.
 pub(crate) type Coefficients = [f32; 5];
@@ -86,9 +112,24 @@ fn neutral() -> Coefficients {
     [warp(1000.0) as f32, 1.0, 1.0, 0.0, 0.0]
 }
 
+/// The coefficients a section set to `shape` ramps to: those of the
+/// shape, or its `g` and `k` with the input passed unchanged when not
+/// `on`.
+fn target_of(shape: Shape, on: bool) -> Coefficients {
+    let mut target = coefficients(shape);
+    if !on {
+        target[2..].copy_from_slice(&[1.0, 0.0, 0.0]);
+    }
+    target
+}
+
 /// One filter section over up to `L` legs: coefficients shared by the
 /// legs, state per leg.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(bound(
+    serialize = "[[f32; 2]; L]: serde::Serialize",
+    deserialize = "[[f32; 2]; L]: serde::Deserialize<'de>"
+))]
 pub(crate) struct Svf<const L: usize> {
     c0: Coefficients,
     step: Coefficients,
@@ -100,6 +141,12 @@ pub(crate) struct Svf<const L: usize> {
     a: [f32; 3],
     /// `(ic1eq, ic2eq)` per leg.
     pub(crate) state: [[f32; 2]; L],
+}
+
+/// Whether every state lies within [`STATE_MAX`], as one after a block
+/// does; a NaN does not.
+pub(crate) fn valid_states(states: &[[f32; 2]]) -> bool {
+    states.iter().flatten().all(|v| v.abs() <= STATE_MAX)
 }
 
 #[inline]
@@ -175,10 +222,7 @@ impl<const L: usize> Svf<L> {
     /// Equal targets on a section that is not ramping change nothing; a
     /// section off and staying off jumps, as nothing of it is heard.
     pub(crate) fn set(&mut self, shape: Shape, on: bool, len: u32) {
-        let mut target = coefficients(shape);
-        if !on {
-            target[2..].copy_from_slice(&[1.0, 0.0, 0.0]);
-        }
+        let target = target_of(shape, on);
         if !self.is_ramping() && target == self.target {
             return;
         }
@@ -201,6 +245,23 @@ impl<const L: usize> Svf<L> {
         self.pos = 0;
         self.target = target;
         self.a = a_of(&target);
+    }
+
+    /// Whether the section holds what one last set to `shape`, on or
+    /// not, holds: that shape's target, a ramp whose first and last
+    /// values lie within the coefficient box ([`within_box`]), so every
+    /// value of it does and is stable, within [`crate::MAX_RAMP_LEN`] and
+    /// its position within it, and states within [`STATE_MAX`].
+    pub(crate) fn is_valid(&self, shape: Shape, on: bool) -> bool {
+        let target = target_of(shape, on);
+        self.target == target
+            && self.a == a_of(&target)
+            && self.c0.iter().chain(&self.step).all(|v| v.is_finite())
+            && within_box(&self.at(0))
+            && within_box(&self.at(self.len.saturating_sub(1)))
+            && self.len <= crate::MAX_RAMP_LEN
+            && self.pos <= self.len
+            && valid_states(&self.state)
     }
 
     /// Moves the coefficient ramp `frames` samples on without processing.
@@ -249,9 +310,10 @@ impl<const L: usize> Svf<L> {
             // A state below FLUSH is set to zero: the trapezoidal
             // integrators can stop on a small value once their increment
             // underflows, under FTZ/DAZ or rounding, and silence must
-            // reach exact zeros.
+            // reach exact zeros. One above STATE_MAX, or a NaN, which
+            // fails both comparisons, is set to zero too.
             for v in &mut s {
-                if v.abs() < FLUSH {
+                if !(FLUSH..=STATE_MAX).contains(&v.abs()) {
                     *v = 0.0;
                 }
             }

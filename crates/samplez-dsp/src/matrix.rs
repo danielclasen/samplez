@@ -87,10 +87,11 @@ impl TryFrom<MatrixWire> for Matrix {
     type Error = String;
 
     /// Refuses a matrix of more than [`MAX_COEFFICIENTS`] coefficients,
-    /// before allocating it, and a column with an input out of range, out of order or
-    /// twice, or a ramp a matrix never holds: a gain beyond
-    /// [`crate::MAX_GAIN`] or not finite, a length beyond
-    /// [`crate::MAX_RAMP_LEN`], a position past its length.
+    /// before allocating it, and a column with an input out of range,
+    /// out of order or twice, or a ramp a matrix never holds
+    /// ([`crate::Ramp::is_valid`]): a gain beyond [`crate::MAX_GAIN`] or
+    /// not finite, a length beyond [`crate::MAX_RAMP_LEN`], a position
+    /// past its length.
     fn try_from(w: MatrixWire) -> Result<Matrix, String> {
         let size = w.inputs.checked_mul(w.columns.len());
         if size.is_none_or(|n| n > MAX_COEFFICIENTS) {
@@ -104,14 +105,7 @@ impl TryFrom<MatrixWire> for Matrix {
         for (dst, col) in m.columns.iter_mut().zip(w.columns) {
             let ordered = col.windows(2).all(|t| t[0].input < t[1].input);
             let inside = col.iter().all(|t| t.input < w.inputs);
-            let finite = col.iter().all(|t| {
-                let r = &t.ramp;
-                valid_gain(r.c0)
-                    && valid_gain(r.target)
-                    && r.step.is_finite()
-                    && r.len <= crate::ramp::MAX_RAMP_LEN
-                    && r.pos <= r.len
-            });
+            let finite = col.iter().all(|t| t.ramp.is_valid());
             if !(ordered && inside && finite) {
                 return Err("a matrix column out of range, order or finite values".to_owned());
             }

@@ -15,6 +15,7 @@ use samplez::blocks::{PAGE, PageHash, StatusChange};
 use samplez::{
     BlockVerdict, CopyError, Engine, Entry, InputState, ProductState, ReplayError, Replication,
 };
+use samplez_dsp::{BandType, CompParams, EqBand, GateParams, StripParam};
 
 /// The copy holds the state after block k0: entries due by then applied
 /// with their ramps run out, later ones pending, the input's log state,
@@ -334,6 +335,125 @@ fn a_replayed_core_computes_the_donors_pages() {
     });
 }
 
+/// Sets strip parameter `param` of input slot 0 from `at`.
+fn strip(e: &Engine, id: u64, at: u64, param: StripParam) {
+    e.append(id, at, Entry::Strip { slot: 0, param }).unwrap();
+    e.commit(id);
+}
+
+/// A high-pass, a bell, a gate and a compressor whose release is
+/// `release_ms`, its threshold `threshold_db`.
+fn strips(release_ms: f32, threshold_db: f32) -> [StripParam; 5] {
+    let bell = EqBand {
+        kind: BandType::Peak,
+        freq: 1100.0,
+        gain_db: 9.0,
+        q: 2.0,
+    };
+    [
+        StripParam::Hpf {
+            enabled: true,
+            freq: 120.0,
+        },
+        StripParam::Eq { enabled: true },
+        StripParam::EqBand {
+            band: 1,
+            value: bell,
+        },
+        StripParam::Gate(GateParams {
+            enabled: true,
+            threshold_db: -40.0,
+            range_db: 30.0,
+            attack_ms: 0.5,
+            release_ms: 300.0,
+        }),
+        StripParam::Comp(CompParams {
+            enabled: true,
+            threshold_db,
+            ratio: 6.0,
+            attack_ms: 2.0,
+            release_ms,
+            knee_db: 6.0,
+            makeup_db: 4.0,
+        }),
+    ]
+}
+
+/// The resync row with strips active: a joiner whose strips diverged
+/// replays a donor's core copied while the donor's compressor releases
+/// over the longest time constant after a 20 dB drop, and from the
+/// hand-over on computes the donor's pages bit for bit, as the replay
+/// does before it. The core carries each strip's filter and dynamics
+/// state: a joiner keeping its own would differ from the donor until
+/// both envelopes settled, and with strips set apart, for good.
+#[test]
+fn a_replayed_core_carries_the_strips_mid_envelope() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        // Entries 1 to 5 set the strips, apart on the joiner.
+        let at1 = (now_block() + 20) * B;
+        let (donor, joiner) = (strips(5000.0, -30.0), strips(50.0, -20.0));
+        for (id, (pa, pb)) in (1..).zip(donor.into_iter().zip(joiner)) {
+            strip(&a.e, id, at1, pa);
+            strip(&b.e, id, at1, pb);
+        }
+        // Entry 6 drops the level once the compressor settled: the
+        // donor's releases over 5 s from there.
+        let at6 = at1 + 300 * B;
+        let drop = StripParam::Trim { db: -20.0 };
+        strip(&a.e, 6, at6, drop);
+        strip(&b.e, 6, at6, drop);
+        let ramped = (at6 + u64::from(RAMP)) / B + PAGE / B;
+        wait_for(Duration::from_secs(5), "level dropped", || {
+            processed(&a.e) > ramped && processed(&b.e) > ramped
+        });
+        let copy = copy(&a.e);
+        let k0 = copy.k0;
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+        let mut replay = b.e.replay(copy).unwrap();
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        // Within a second of the drop: the release has seconds to run.
+        if (j + 1) * B > at6 + 48_000 {
+            return Err(format!("handed over at block {j}, past the release"));
+        }
+        // Before the hand-over the strips set apart differ; from it on
+        // the joiner computes the donor's pages.
+        let before = (k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE;
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        let end = (from + 8) * PAGE / B + PAGE / B;
+        wait_for(Duration::from_secs(10), "pages compared", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        let (pa, pb) = (a.pages(), b.pages());
+        let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+        let differ = before
+            .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
+            .count();
+        assert!(differ > 0, "the joiner never diverged");
+        for p in from..from + 8 {
+            if disturbed.contains(&p) {
+                return Err(format!("page {p} disturbed"));
+            }
+            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+                return Err(format!("page {p} not hashed by both"));
+            };
+            assert_eq!(
+                (hb.hash, hb.fingerprint),
+                (ha.hash, ha.fingerprint),
+                "page {p}"
+            );
+        }
+        Ok(())
+    });
+}
+
 /// An entry the replay applied before the hand-over, which reaches the
 /// joiner's RT thread only after it, is not taken again: its index
 /// passed, it would count late and degrade blocks the donor computed
@@ -628,10 +748,9 @@ fn a_product_entry_the_install_passed_is_folded_in() {
 }
 
 /// A strip entry the replay applied, which reaches the joiner's RT thread
-/// only after the hand-over, still sets the joiner's strip: the core
-/// holds no strip, so skipped as known it would leave the strip at its
-/// old setting for good, every page after differing from the donor's
-/// with equal fingerprints.
+/// only after the hand-over, is in the strip the core hands over: the
+/// joiner computes the donor's pages with it, and taking it again would
+/// count it late.
 #[test]
 fn a_strip_entry_the_replay_applied_still_reaches_the_strip() {
     common::undisturbed(|| {

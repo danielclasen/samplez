@@ -1898,6 +1898,7 @@ dependencies = [
  "gungraun",
  "libm",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

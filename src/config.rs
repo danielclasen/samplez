@@ -28,7 +28,8 @@ pub struct Config {
     #[serde(default = "default_prune")]
     pub prune_after_blocks: u32,
     /// Length of every gain ramp and input fade in samples, at most
-    /// `samplez_dsp::MAX_RAMP_LEN`.
+    /// `samplez_dsp::MAX_EXACT_RAMP_LEN`, the longest whose values never
+    /// pass its ends, which a decoded strip is held to.
     #[serde(default = "default_ramp")]
     pub ramp_samples: u32,
     /// Replicated mode: D, how long past a block's deadline T_k a fenced
@@ -387,11 +388,11 @@ impl Config {
                 self.history_slack_ms, self.block_size
             ));
         }
-        if self.ramp_samples > samplez_dsp::MAX_RAMP_LEN {
+        if self.ramp_samples > samplez_dsp::MAX_EXACT_RAMP_LEN {
             return fail(format!(
                 "rampSamples {} is above {}",
                 self.ramp_samples,
-                samplez_dsp::MAX_RAMP_LEN
+                samplez_dsp::MAX_EXACT_RAMP_LEN
             ));
         }
         if !(1..=99).contains(&self.rt.priority) {
@@ -669,7 +670,7 @@ mod tests {
             ("rt", serde_json::json!({ "priority": 0 })),
             (
                 "rampSamples",
-                serde_json::json!(samplez_dsp::MAX_RAMP_LEN + 1),
+                serde_json::json!(samplez_dsp::MAX_EXACT_RAMP_LEN + 1),
             ),
             (
                 "outputs",
@@ -713,7 +714,7 @@ mod tests {
     #[test]
     fn limits_and_flows_are_checked() {
         let mut c = base();
-        c["rampSamples"] = serde_json::json!(samplez_dsp::MAX_RAMP_LEN);
+        c["rampSamples"] = serde_json::json!(samplez_dsp::MAX_EXACT_RAMP_LEN);
         assert!(parse(&c).is_ok());
         // The same flow id in another domain is another flow.
         let mut c = base();

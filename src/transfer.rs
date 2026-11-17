@@ -3,16 +3,18 @@
 //!
 //! The core is the engine state output depends on apart from delay lines:
 //! the matrix with its ramps, the entries pending and applied in the page
-//! in progress, each input slot's log state and fades, the entries waiting
-//! for their generation and the pending generation's entry id, and the
-//! unresolved entries with the late re-routes. Meters, hold rings, block
-//! statuses, page hashes in progress and the readers stay with the
-//! replica. The RT thread copies it into a buffer allocated off the RT
-//! thread, of the same shape, so the copy allocates nothing.
+//! in progress, each input slot's log state, fades and strip with its
+//! position, the entries waiting for their generation and the pending
+//! generation's entry id, and the unresolved entries with the late
+//! re-routes. Meters, hold rings, block statuses, page hashes in progress
+//! and the readers stay with the replica. The RT thread copies it into a
+//! buffer allocated off the RT thread, of the same shape, so the copy
+//! allocates nothing.
 
 use std::sync::atomic::Ordering::Relaxed;
 
-use samplez_dsp::Matrix;
+use samplez_dsp::strip::MAX_LEGS;
+use samplez_dsp::{Matrix, Strip};
 use samplez_mxl::time;
 use serde::{Deserialize, Serialize};
 
@@ -30,13 +32,18 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const INDEX_MAX: u64 = 1 << 62;
 
 /// An input slot's part of the core.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SlotCore {
     pub up: bool,
     pub held: bool,
     pub fade_start: Option<u64>,
     pub silenced_last: bool,
     pub xfade: Option<u64>,
+    /// The slot's strip, its filter and dynamics state included, and the
+    /// index of the next sample it processes. A core built from product
+    /// state holds none and leaves the RT thread's.
+    pub strip: Option<Strip>,
+    pub strip_pos: Option<u64>,
 }
 
 /// The core of an engine after a block.
@@ -109,7 +116,8 @@ impl Core {
     /// every index at most [`INDEX_MAX`], every gain one a ramp takes,
     /// every strip parameter within its range (legs aside), the lists
     /// within their capacities. A core from another replica is checked
-    /// when decoded.
+    /// when decoded; a strip in it is checked as it deserializes
+    /// ([`Strip::is_valid`]).
     fn sane(&self) -> bool {
         let index = |i: u64| i <= INDEX_MAX;
         let entry = |e: &RtEntry| {
@@ -120,7 +128,11 @@ impl Core {
                     _ => true,
                 }
         };
-        let slot = |s: &SlotCore| s.fade_start.is_none_or(index) && s.xfade.is_none_or(index);
+        let slot = |s: &SlotCore| {
+            s.fade_start.is_none_or(index)
+                && s.xfade.is_none_or(index)
+                && s.strip_pos.is_none_or(index)
+        };
         let ats = |list: &[(LogId, u64)]| list.iter().all(|&(_, at)| index(at));
         self.pos.is_none_or(index)
             && index(self.ramp_end)
@@ -138,17 +150,24 @@ impl Core {
     }
 
     /// Whether this sane core is of an engine with `inputs` and `outputs`
-    /// channels, input slots of `legs` legs each and room for
-    /// `page_entries` entries of one page's fingerprint, every entry
-    /// within them: checked before a replay installs it.
+    /// channels, input slots of `legs` legs each, strips ramping over
+    /// `ramp` samples and room for `page_entries` entries of one page's
+    /// fingerprint, every entry within them: checked before a replay
+    /// installs it. A slot has a strip of its legs exactly when it is at
+    /// most [`MAX_LEGS`] wide.
     pub(crate) fn fits(
         &self,
         inputs: usize,
         outputs: usize,
         legs: &[usize],
+        ramp: u32,
         page_entries: usize,
     ) -> bool {
         let slots = legs.len();
+        let strip = |(s, &legs): (&SlotCore, &usize)| match &s.strip {
+            Some(strip) => strip.legs() == legs && strip.ramp() == ramp,
+            None => legs > MAX_LEGS,
+        };
         let entry = |e: &RtEntry| match e.change {
             Change::Gain { input, output, .. } => input < inputs && output < outputs,
             Change::InputDown { slot } | Change::InputUp { slot } | Change::Route { slot } => {
@@ -165,6 +184,7 @@ impl Core {
             && shape == (inputs, outputs, slots)
             && self.page_entries.len() <= page_entries
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
+            && self.slots.iter().zip(legs).all(strip)
     }
 }
 
@@ -177,10 +197,11 @@ pub(crate) struct Handover {
     pub j: u64,
     pub last_id: LogId,
     pub core: Box<Core>,
-    /// The core names the pending generation it was computed with, which
-    /// the RT thread must hold. A core built from product state was
-    /// computed with none and keeps the RT thread's.
-    pub names_gen: bool,
+    /// The core is a replay's: it names the pending generation it was
+    /// computed with, which the RT thread must hold, and holds the
+    /// strips. A core built from product state was computed with neither
+    /// and keeps the RT thread's.
+    pub replayed: bool,
     pub answer: Answer,
 }
 
@@ -487,9 +508,54 @@ impl std::error::Error for CopyError {}
 
 #[cfg(test)]
 mod tests {
-    use samplez_dsp::StripParam;
+    use samplez_dsp::{BandType, CompParams, EqBand, GateParams, StripParam};
+    use serde_json::{Value, json};
 
     use super::*;
+
+    /// A strip mid-envelope: high-pass, a bell, gate and a compressor of
+    /// the longest release on, after a burst over the threshold.
+    fn strip() -> Strip {
+        let mut s = Strip::new(1, 48);
+        let bell = EqBand {
+            kind: BandType::Peak,
+            freq: 1000.0,
+            gain_db: 6.0,
+            q: 1.0,
+        };
+        for p in [
+            StripParam::Hpf {
+                enabled: true,
+                freq: 80.0,
+            },
+            StripParam::Eq { enabled: true },
+            StripParam::EqBand {
+                band: 1,
+                value: bell,
+            },
+            StripParam::Gate(GateParams {
+                enabled: true,
+                threshold_db: -50.0,
+                range_db: 40.0,
+                attack_ms: 1.0,
+                release_ms: 200.0,
+            }),
+            StripParam::Comp(CompParams {
+                enabled: true,
+                threshold_db: -30.0,
+                ratio: 4.0,
+                attack_ms: 5.0,
+                release_ms: 5000.0,
+                knee_db: 6.0,
+                makeup_db: 3.0,
+            }),
+        ] {
+            assert!(s.set(p));
+        }
+        let mut burst: Vec<f32> = (0..480).map(|n| 0.8 * (n as f32 * 0.13).sin()).collect();
+        s.process(&mut burst, 480);
+        s
+    }
 
     fn copy() -> CoreCopy {
         let mut core = Core::new(2, 2, 2, 8);
@@ -506,12 +572,19 @@ mod tests {
             },
         });
         core.page_entries.push((6, 4752));
+        core.slots[0] = SlotCore {
+            strip: Some(Strip::new(1, 48)),
+            strip_pos: Some(4800),
+            ..SlotCore::default()
+        };
         core.slots[1] = SlotCore {
             up: true,
             held: false,
             fade_start: Some(480),
             silenced_last: true,
             xfade: None,
+            strip: Some(strip()),
+            strip_pos: Some(4800),
         };
         core.unresolved.push((9, 1 << 40));
         CoreCopy {
@@ -522,7 +595,8 @@ mod tests {
     }
 
     /// The copy another replica decodes is the copy encoded: the matrix
-    /// with its ramps, the entries and the slot state.
+    /// with its ramps, the entries and the slot state, the strips' filter
+    /// and dynamics state bit for bit.
     #[test]
     fn a_core_decodes_to_the_copy_encoded() {
         let copy = copy();
@@ -540,6 +614,123 @@ mod tests {
             CoreCopy::decode(&encoded),
             Err(DecodeError::Version("0.0.0-other".to_owned()))
         );
+    }
+
+    /// A strip state a peer sends that no strip holds is refused when
+    /// decoded, before the RT thread runs it: a value beyond f32 decodes
+    /// as an infinity and would turn every sample after it into one, an
+    /// envelope, pole or ramp out of its range runs the dynamics outside
+    /// anything their parameters give, a filter target other than its
+    /// parameters' may be unstable, and a state array longer than a
+    /// strip's is refused before anything is allocated for it.
+    #[test]
+    fn a_strip_state_no_strip_holds_is_refused() {
+        let wire: Value = serde_json::from_str(&copy().encode()).unwrap();
+        let refused = |what: &str, f: &dyn Fn(&mut Value)| {
+            let mut wire = wire.clone();
+            f(&mut wire["copy"]["core"]["slots"][1]);
+            assert!(
+                matches!(
+                    CoreCopy::decode(&wire.to_string()),
+                    Err(DecodeError::Malformed(_))
+                ),
+                "{what}"
+            );
+        };
+        // NaN has no JSON form: it encodes as null, which no f32 takes.
+        refused("NaN filter state", &|s| {
+            s["strip"]["hpf"]["state"][0][0] = Value::Null
+        });
+        refused("infinite equaliser state", &|s| {
+            s["strip"]["eq"][1]["state"][0][1] = json!(1e39)
+        });
+        refused("infinite crossfade state", &|s| {
+            s["strip"]["alt_eq"][0][0][0] = json!(-1e39)
+        });
+        refused("gate gain below its range", &|s| {
+            s["strip"]["gate"]["y"] = json!(-200.0)
+        });
+        refused("compressor gain above 0 dB", &|s| {
+            s["strip"]["comp"]["y"] = json!(3.0)
+        });
+        refused("smoother pole of no decay", &|s| {
+            s["strip"]["comp"]["release"]["sample"] = json!(1.5)
+        });
+        refused("gate hold beyond its length", &|s| {
+            s["strip"]["gate"]["hold"] = json!(1 << 30)
+        });
+        refused("gain interval phase", &|s| {
+            s["strip"]["comp"]["interval"]["phase"] = json!(samplez_dsp::strip::GAIN_INTERVAL)
+        });
+        refused("makeup beyond its range", &|s| {
+            s["strip"]["comp"]["makeup"]["target"] = json!(100.0)
+        });
+        refused("ramp past its length", &|s| {
+            s["strip"]["fade"]["len"] = json!(10);
+            s["strip"]["fade"]["pos"] = json!(11);
+        });
+        refused("filter target of other parameters", &|s| {
+            s["strip"]["hpf_freq"] = json!(100.0)
+        });
+        refused("filter ramp through an unstable value", &|s| {
+            s["strip"]["hpf"]["len"] = json!(100);
+            s["strip"]["hpf"]["step"][0] = json!(-1.0);
+        });
+        // Finite and stable, but beyond any coefficient a section ramps
+        // to: 3e38 x + 3e38 v1 + 3e38 v2 overflows on an ordinary sample
+        // for the 2^24 samples of the ramp.
+        refused("filter mix starting beyond any target", &|s| {
+            let hpf = &mut s["strip"]["hpf"];
+            let len = f64::from(samplez_dsp::MAX_RAMP_LEN);
+            let target: Vec<f64> = (0..5).map(|i| hpf["target"][i].as_f64().unwrap()).collect();
+            let c0 = [target[0], target[1], 3e38, 3e38, 3e38];
+            for i in 0..5 {
+                hpf["c0"][i] = json!(c0[i]);
+                hpf["step"][i] = json!((target[i] - c0[i]) / len);
+            }
+            hpf["len"] = json!(samplez_dsp::MAX_RAMP_LEN);
+            hpf["pos"] = json!(0);
+        });
+        refused("filter mix ending beyond any target", &|s| {
+            s["strip"]["eq"][1]["len"] = json!(100);
+            s["strip"]["eq"][1]["step"][3] = json!(10.0);
+        });
+        // Finite, but 2 v1 - s0 overflows within a sample.
+        refused("filter state beyond any a block leaves", &|s| {
+            s["strip"]["hpf"]["state"][0][0] = json!(3e38)
+        });
+        refused("crossfade state beyond any a block leaves", &|s| {
+            s["strip"]["alt_eq"][0][0][1] = json!(1e31)
+        });
+        refused("leg gain beyond any trim", &|s| {
+            s["strip"]["gain"][0]["c0"] = json!(1.0e5)
+        });
+        refused("compressor gain beyond any reduction", &|s| {
+            s["strip"]["comp"]["y"] = json!(-1.0e38)
+        });
+        refused("release slower than the longest", &|s| {
+            s["strip"]["comp"]["release"]["interval"] = json!(0.999_999_94)
+        });
+        refused("gain step beyond one interval", &|s| {
+            s["strip"]["gate"]["interval"]["step"] = json!(0.5)
+        });
+        refused("leg gain of other trims", &|s| {
+            s["strip"]["trim_db"] = json!(3.0)
+        });
+        refused("trim out of range", &|s| {
+            s["strip"]["trim_db"] = json!(60.0)
+        });
+        refused("legs beyond a strip", &|s| {
+            s["strip"]["legs"] = json!(1u64 << 40)
+        });
+        refused("no legs", &|s| s["strip"]["legs"] = json!(0));
+        refused("state array beyond a strip's legs", &|s| {
+            s["strip"]["hpf"]["state"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!([0.0, 0.0]))
+        });
+        refused("strip position", &|s| s["strip_pos"] = json!(u64::MAX));
     }
 
     /// A core whose matrix names an input out of range is refused before
@@ -643,14 +834,22 @@ mod tests {
     #[test]
     fn a_core_fits_only_its_own_shape() {
         let mut copy = copy();
-        assert!(copy.core.fits(2, 2, &[1, 1], 8));
-        assert!(!copy.core.fits(2, 3, &[1, 1], 8));
-        assert!(!copy.core.fits(2, 2, &[1, 1], 0));
+        assert!(copy.core.fits(2, 2, &[1, 1], 48, 8));
+        assert!(!copy.core.fits(2, 3, &[1, 1], 48, 8));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 0));
+        // Strips of other legs, another ramp, or none on a narrow slot;
+        // a slot wider than a strip has none.
+        assert!(!copy.core.fits(2, 2, &[1, 2], 48, 8));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 480, 8));
+        copy.core.slots[0].strip = None;
+        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 8));
+        assert!(copy.core.fits(2, 2, &[MAX_LEGS + 1, 1], 48, 8));
+        copy.core.slots[0].strip = Some(Strip::new(1, 48));
         copy.core.pending.push(RtEntry {
             id: 8,
             at_index: 9648,
             change: Change::InputDown { slot: 2 },
         });
-        assert!(!copy.core.fits(2, 2, &[1, 1], 8));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 8));
     }
 }

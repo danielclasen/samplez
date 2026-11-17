@@ -27,7 +27,7 @@ use samplez_mxl::{MxlApi, time};
 use crate::blocks::{
     Cause, Changes, Ctx, Hold, Kind, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
-use crate::transfer::{Answer, Core, CoreCopy, Handover, SlotCore};
+use crate::transfer::{Answer, Core, CoreCopy, Handover};
 
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
@@ -429,11 +429,17 @@ impl Change {
     }
 
     /// Whether a core holds what this change did once applied: a gain
-    /// change is in the matrix and an `InputDown` in the slot state, but
-    /// a strip's settings and a swapped-in generation stay with the RT
-    /// thread, so an entry making them must still reach it.
-    pub fn in_core(&self) -> bool {
-        matches!(self, Change::Gain { .. } | Change::InputDown { .. })
+    /// change is in the matrix, an `InputDown` in the slot state and a
+    /// strip entry in the strip of a core holding `strips`, but a
+    /// swapped-in generation, and the strips under a core built from
+    /// product state, stay with the RT thread, so an entry making them
+    /// must still reach it.
+    pub fn in_core(&self, strips: bool) -> bool {
+        match self {
+            Change::Gain { .. } | Change::InputDown { .. } => true,
+            Change::Strip { .. } => strips,
+            Change::InputUp { .. } | Change::Route { .. } => false,
+        }
     }
 }
 
@@ -1028,12 +1034,19 @@ pub(crate) struct Rt {
     pub last_entry: LogId,
     /// Entries taken from the entry ring.
     pub taken: u64,
-    /// The highest log id a handed-over core knew: an entry up to it
-    /// taken from the ring later is pending or applied already.
+    /// The highest log id the last handed-over core knew: an entry up to
+    /// it taken from the ring later is pending or applied already. A
+    /// later core that knew less replaces the state of an earlier one, so
+    /// an entry it did not know is taken as new.
     pub skip_upto: LogId,
     /// The first sample index the last handed-over core computed: an
     /// entry the core knew at or past it was on the core's pending list.
     pub install_at: u64,
+    /// The highest log id the last replayed core knew: its strips stay
+    /// until the next replayed core, a core built from product state
+    /// leaving them, so a strip entry up to it is in them or was on that
+    /// core's pending list.
+    pub strips_upto: LogId,
     /// A replay clone: computes off the RT thread from past input, writes
     /// nothing and hashes every page it computes whole.
     pub replay: bool,
@@ -1195,13 +1208,14 @@ fn capture_core(
     c.entries_page = m.entries_page;
     c.entries_lost = m.entries_lost;
     for (d, s) in c.slots.iter_mut().zip(slots) {
-        *d = SlotCore {
-            up: s.up,
-            held: s.held,
-            fade_start: s.fade_start,
-            silenced_last: s.silenced_last,
-            xfade: s.xfade,
-        };
+        d.up = s.up;
+        d.held = s.held;
+        d.fade_start = s.fade_start;
+        d.silenced_last = s.silenced_last;
+        d.xfade = s.xfade;
+        // A strip holds no heap memory: the copy allocates nothing.
+        d.strip.clone_from(&s.strip);
+        d.strip_pos = s.strip_pos;
     }
     c.awaiting_gen.clear();
     c.awaiting_gen.extend_from_slice(awaiting);
@@ -1543,7 +1557,7 @@ impl Rt {
     /// Moves committed entries from the entry ring to the pending list
     /// while it has room.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    fn take_entries(&mut self) {
+    pub(crate) fn take_entries(&mut self) {
         while self.mix.pending.len() < PENDING_CHANGES
             && let Ok(entry) = self.entries.pop()
         {
@@ -1554,6 +1568,14 @@ impl Rt {
             if self.mix.holds(entry.id) {
                 continue;
             }
+            let strip = matches!(entry.change, Change::Strip { .. });
+            if strip && entry.id <= self.strips_upto {
+                // In the strips the last replayed core brought, or on
+                // its pending list, applied here at its index; taken
+                // through that core.
+                self.mix.last_taken = self.mix.last_taken.max(entry.id);
+                continue;
+            }
             if entry.id <= self.skip_upto {
                 // The core knew it. It holds what a gain change or an
                 // InputDown did; any other entry below the install it
@@ -1561,9 +1583,11 @@ impl Rt {
                 // that entry is applied as on time. One at or past the
                 // install was on the core's pending list, applied here at
                 // its index.
-                if !entry.change.in_core() && entry.at_index < self.install_at {
+                if !entry.change.in_core(false) && entry.at_index < self.install_at {
                     self.apply(entry);
                 }
+                // Taken through the core, as one on the pending list.
+                self.mix.last_taken = self.mix.last_taken.max(entry.id);
                 continue;
             }
             let _ = self.mix.push(entry);
@@ -2236,21 +2260,22 @@ impl Rt {
     }
 
     /// Makes `c`, a core that knew the entries up to `last_id`, the
-    /// state: the next block computed is the one after it. Entries
-    /// pending here that the core did not know stay pending; one that
-    /// finds no room is counted in `handover_entries_lost`. A pending
-    /// entry the core knew whose index it passed and whose effect it
-    /// does not hold, an `InputUp` or `Route` held back for want of a
-    /// core or a strip entry, applies once the core is in, as on time:
-    /// its generation is swapped in, a crossfade anchored at its index,
-    /// or the strip set from its index.
+    /// state, its strips too with `strips`: the next block computed is
+    /// the one after it. Entries pending here that the core did not know
+    /// stay pending; one that finds no room is counted in
+    /// `handover_entries_lost`. A pending entry the core knew whose index
+    /// it passed and whose effect it does not hold, an `InputUp` or
+    /// `Route` held back for want of a core, or a strip entry under a
+    /// core without strips, applies once the core is in, as on time: its
+    /// generation is swapped in, a crossfade anchored at its index, or
+    /// the strip set from its index.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    pub(crate) fn install_core(&mut self, c: &Core, last_id: LogId) {
+    pub(crate) fn install_core(&mut self, c: &Core, last_id: LogId, strips: bool) {
         let m = &mut self.mix;
         let next = c.pos.unwrap_or(0);
         m.due.clear();
         for e in &m.pending {
-            if e.id <= last_id && !e.change.in_core() && e.at_index < next {
+            if e.id <= last_id && !e.change.in_core(strips) && e.at_index < next {
                 // Room: due holds as many as pending.
                 m.due.push((*e, false));
             }
@@ -2258,6 +2283,13 @@ impl Rt {
         m.matrix.copy_from(&c.matrix);
         m.pos = c.pos;
         m.ramp_end = c.ramp_end;
+        // An entry dropped here as known is taken through the core: a
+        // later core that did not know it must be refused as Missed.
+        for e in &m.pending {
+            if e.id <= last_id {
+                m.last_taken = m.last_taken.max(e.id);
+            }
+        }
         m.pending.retain(|e| e.id > last_id);
         for e in &c.pending {
             if !m.holds(e.id) && !m.push(*e) {
@@ -2274,6 +2306,12 @@ impl Rt {
             d.fade_start = s.fade_start;
             d.silenced_last = s.silenced_last;
             d.xfade = s.xfade;
+            if strips {
+                // Of the same legs, `Core::fits` checked: the copy
+                // allocates nothing.
+                d.strip.clone_from(&s.strip);
+                d.strip_pos = s.strip_pos;
+            }
         }
         // An entry applied here before its generation arrived keeps
         // waiting for it: the core knew the entry, a refusal as Missed says
@@ -2297,8 +2335,11 @@ impl Rt {
             r.late_routes.extend_from_slice(&c.late_routes);
             r.late_lost_until = c.late_lost_until;
         }
-        self.skip_upto = self.skip_upto.max(last_id);
+        self.skip_upto = last_id;
         self.install_at = next;
+        if strips {
+            self.strips_upto = last_id;
+        }
         for n in 0..self.mix.due.len() {
             let (e, _) = self.mix.due[n];
             self.apply(e);
@@ -2330,7 +2371,7 @@ impl Rt {
         };
         h.answer = if h.j + 1 != first {
             Answer::Passed
-        } else if h.names_gen && h.core.pending_gen != self.pending_gen.as_ref().map(|p| p.0) {
+        } else if h.replayed && h.core.pending_gen != self.pending_gen.as_ref().map(|p| p.0) {
             Answer::Generation
         } else if self.mix.last_taken > h.last_id {
             Answer::Missed(self.mix.last_taken)
@@ -2339,7 +2380,7 @@ impl Rt {
         };
         let counter = match h.answer {
             Answer::Installed => {
-                self.install_core(&h.core, h.last_id);
+                self.install_core(&h.core, h.last_id, h.replayed);
                 // The page holding the boundary mixes both states: no
                 // record.
                 for p in self.outs.iter_mut().filter_map(|o| o.pages.as_mut()) {
@@ -2394,6 +2435,7 @@ pub fn lint_probe(m: &std::sync::Mutex<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transfer::SlotCore;
 
     /// The meter records of one output channel pair from block `first`
     /// on, with a loudness reset at index `reset`, of a signal that is a
@@ -2878,10 +2920,15 @@ mod tests {
         m.page_entries.extend([(3, 2 * B), (4, 3 * B)]);
         m.entries_page = Some(1);
         m.entries_lost = true;
-        let slots = [
+        let mut slots = [
             slot(true, true, Some(5 * B), false, Some(18 * B)),
             slot(false, false, None, true, None),
         ];
+        let mut strip = Strip::new(1, 480);
+        assert!(strip.set(StripParam::Trim { db: -6.0 }));
+        strip.process(&mut [0.5; 48], 48);
+        slots[0].strip = Some(strip.clone());
+        slots[0].strip_pos = Some(20 * B);
         let awaiting = [entry(Change::InputUp { slot: 0 }, 19 * B)];
         let mut r = replica();
         r.unresolved.extend([(8, 21 * B), (9, 30 * B)]);
@@ -2905,6 +2952,8 @@ mod tests {
                     fade_start: Some(5 * B),
                     silenced_last: false,
                     xfade: Some(18 * B),
+                    strip: Some(strip),
+                    strip_pos: Some(20 * B),
                 },
                 SlotCore {
                     up: false,
@@ -2912,6 +2961,8 @@ mod tests {
                     fade_start: None,
                     silenced_last: true,
                     xfade: None,
+                    strip: None,
+                    strip_pos: None,
                 },
             ],
             awaiting_gen: awaiting.to_vec(),
