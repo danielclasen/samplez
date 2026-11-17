@@ -70,6 +70,24 @@ pub struct Identity {
     pub role: Role,
 }
 
+/// The most characters [`Identity::name`] has.
+pub const DISPLAY_NAME_CHARS: usize = 64;
+
+/// `raw` as [`Identity::name`] carries it: without control characters
+/// (newlines among them) and bidirectional formatting characters, trimmed,
+/// and cut to [`DISPLAY_NAME_CHARS`] characters; `None` when nothing is
+/// left.
+pub fn display_name(raw: &str) -> Option<String> {
+    let bidi = |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let kept: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !bidi(*c))
+        .collect();
+    let cut: String = kept.trim().chars().take(DISPLAY_NAME_CHARS).collect();
+    let name = cut.trim_end();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Listener {
     Api,
@@ -744,7 +762,7 @@ impl Auth {
             .ok_or(Refused(StatusCode::FORBIDDEN, "no group with a role"))?;
         Ok(Identity {
             user: Some(user.to_owned()),
-            name: Some(user.to_owned()),
+            name: display_name(user),
             role,
         })
     }
@@ -1132,6 +1150,34 @@ pub(crate) async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A display name goes to other users: it carries no control or
+    /// bidirectional formatting characters and no more than 64 characters,
+    /// and one with nothing else is none.
+    #[test]
+    fn a_display_name_is_cleaned_and_capped() {
+        assert_eq!(display_name("  alice  ").as_deref(), Some("alice"));
+        assert_eq!(
+            display_name("al\nice\r\t\u{0}\u{7f}").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            display_name("\u{202e}eci\u{2066}la\u{200f}").as_deref(),
+            Some("ecila")
+        );
+        let long = "\u{e9}".repeat(100);
+        let capped = display_name(&long).unwrap();
+        assert_eq!(capped.chars().count(), DISPLAY_NAME_CHARS);
+        assert_eq!(capped, "\u{e9}".repeat(DISPLAY_NAME_CHARS));
+        assert_eq!(
+            display_name(&format!("{} x", "a".repeat(63))).as_deref(),
+            Some("a".repeat(63).as_str()),
+            "no trailing space where the cut falls"
+        );
+        assert_eq!(display_name(""), None);
+        assert_eq!(display_name(" \n\u{202e}\t "), None);
+        assert_eq!(display_name("J\u{f6}rg").as_deref(), Some("J\u{f6}rg"));
+    }
 
     #[test]
     fn session_expires_and_follows_the_token() {

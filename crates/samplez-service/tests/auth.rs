@@ -350,6 +350,14 @@ async fn proxy_mode_api_listener() {
         .header("X-Forwarded-User", "alice")
         .header("X-Forwarded-Groups", "ops");
     assert_eq!(send(&api, named).await.2, "Some(\"alice\")");
+    let spaced = get_req("/api/v1/whoname")
+        .header("X-Forwarded-User", " alice ")
+        .header("X-Forwarded-Groups", "ops");
+    assert_eq!(
+        send(&api, spaced).await.2,
+        "Some(\"alice\")",
+        "the proxy's user is cleaned like a token's"
+    );
     assert_eq!(
         status(&api, as_user("strangers")).await,
         StatusCode::FORBIDDEN

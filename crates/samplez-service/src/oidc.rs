@@ -325,13 +325,12 @@ pub fn user(claims: &Value) -> Option<String> {
 }
 
 /// The user's display name a token gives: `preferred_username`, else
-/// `name`.
+/// `name`, each as [`auth::display_name`] leaves it.
 pub fn name(claims: &Value) -> Option<String> {
     ["preferred_username", "name"]
         .iter()
         .filter_map(|c| claims[*c].as_str())
-        .find(|n| !n.is_empty())
-        .map(str::to_owned)
+        .find_map(auth::display_name)
 }
 
 /// `n` random bytes in base64url without padding.
@@ -1442,6 +1441,14 @@ mod tests {
         let named =
             json!({ "preferred_username": "", "name": "Alice A", "email": "a@x", "sub": "s1" });
         assert_eq!(name(&named).as_deref(), Some("Alice A"));
+        let blank = json!({ "preferred_username": "\n\u{202e} ", "name": " Alice A\n" });
+        assert_eq!(
+            name(&blank).as_deref(),
+            Some("Alice A"),
+            "a claim with nothing left after cleaning gives way to the next"
+        );
+        let long = json!({ "preferred_username": "x".repeat(300) });
+        assert_eq!(name(&long).unwrap().len(), auth::DISPLAY_NAME_CHARS);
         let bare = json!({ "email": "a@x", "sub": "s1" });
         assert_eq!(user(&bare).as_deref(), Some("a@x"));
         assert_eq!(name(&bare), None);
