@@ -1540,27 +1540,30 @@ mod tests {
     #[test]
     fn every_state_a_strip_reaches_is_valid() {
         let mut rng = crate::test_util::Rng::new(0x5713_c0de);
-        for legs in [1, 2, MAX_LEGS] {
-            let mut s = Strip::new(legs, [0, 48, 480][legs % 3]);
-            assert!(s.is_valid());
-            let mut index = 0u64;
-            for _ in 0..3000 {
-                match rng.below(6) {
-                    0 | 1 => assert!(s.set(param(&mut rng, legs))),
-                    2 => {
-                        let frames = rng.below(200);
-                        s.advance(frames);
-                        index += frames as u64;
-                        s.align(index);
+        for legs in 1..=MAX_LEGS {
+            for ramp in [0, 48, 480] {
+                let mut s = Strip::new(legs, ramp);
+                assert!(s.is_valid());
+                let mut index = 0u64;
+                for _ in 0..1500 {
+                    match rng.below(6) {
+                        0 | 1 => assert!(s.set(param(&mut rng, legs))),
+                        2 => {
+                            let frames = rng.below(200);
+                            s.advance(frames);
+                            index += frames as u64;
+                            s.align(index);
+                        }
+                        _ => {
+                            let frames = 1 + rng.below(128);
+                            let mut buf: Vec<f32> =
+                                (0..legs * frames).map(|_| rng.sample()).collect();
+                            s.process(&mut buf, frames);
+                            index += frames as u64;
+                        }
                     }
-                    _ => {
-                        let frames = 1 + rng.below(128);
-                        let mut buf: Vec<f32> = (0..legs * frames).map(|_| rng.sample()).collect();
-                        s.process(&mut buf, frames);
-                        index += frames as u64;
-                    }
+                    assert!(s.is_valid(), "legs {legs} ramp {ramp}: {s:?}");
                 }
-                assert!(s.is_valid(), "{s:?}");
             }
         }
     }
