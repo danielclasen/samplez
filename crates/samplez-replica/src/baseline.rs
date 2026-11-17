@@ -86,6 +86,12 @@ pub(crate) struct Leader {
     /// then: void once another is applied.
     against: Option<(NodeId, Option<Baseline>)>,
     pub counts: Counts,
+    /// Replicas a `Baseline` named that were passed over before they
+    /// committed: how often in a row, and when the hand-over may name one
+    /// again. A named replica's withheld blocks need not show (an output
+    /// that never committed stands idle and says nothing), so this, not
+    /// its statuses, keeps the hand-over from naming it every period.
+    failed: BTreeMap<NodeId, (u32, Instant)>,
     /// `replica_disagreement`: the last page judged had no strict majority.
     pub disagreement: bool,
 }
@@ -120,7 +126,17 @@ impl Leader {
             return out;
         }
         self.inflight = None;
-        if let Some(b) = self.baseline(v) {
+        self.failed
+            .retain(|id, _| !v.audio.iter().any(|a| a.id == *id && committing(a)));
+        if let Some(b) = self.baseline(v, now) {
+            if let Some(cur) = v.baseline
+                && cur.replica != b.replica
+                && !v.audio.iter().any(|a| a.id == cur.replica && committing(a))
+            {
+                let f = self.failed.entry(cur.replica).or_insert((0, now));
+                f.0 += 1;
+                f.1 = now + INFLIGHT * 2u32.pow((f.0 - 1).min(5));
+            }
             self.inflight = Some((now, v.baseline.cloned()));
             out.push(Body::Baseline(b));
         }
@@ -134,7 +150,7 @@ impl Leader {
     }
 
     /// The `Baseline` to append, if any.
-    fn baseline(&mut self, v: &LeaderView) -> Option<Baseline> {
+    fn baseline(&mut self, v: &LeaderView, now: Instant) -> Option<Baseline> {
         if self
             .against
             .as_ref()
@@ -143,7 +159,7 @@ impl Leader {
             self.against = None;
         }
         let anyone = v.audio.iter().any(committing);
-        if anyone && let Some(b) = self.hand_over(v) {
+        if anyone && let Some(b) = self.hand_over(v, now) {
             self.counts.handed_over += 1;
             return Some(b);
         }
@@ -195,7 +211,7 @@ impl Leader {
     /// it is a candidate, has applied the latest `Baseline` and reports
     /// no block withheld for a cause. A replica passed over, or one that
     /// never learned of its naming, is named again only then.
-    fn hand_over(&mut self, v: &LeaderView) -> Option<Baseline> {
+    fn hand_over(&mut self, v: &LeaderView, now: Instant) -> Option<Baseline> {
         let target = v.target?;
         let current = v.baseline?;
         let at_target = |a: &&Voter| {
@@ -221,6 +237,7 @@ impl Leader {
             .filter(|a| {
                 let own = a.own.expect("reported");
                 own.key == Some(key)
+                    && self.failed.get(&a.id).is_none_or(|&(_, until)| now >= until)
                     && candidate(v, a)
                     && own.baseline == Some((current.replica, current.at_index))
                     // One that computes nothing reports every block

@@ -446,9 +446,13 @@ pub struct Fake {
     pub rebuilds: u64,
     /// Stops the supervisor named, `(output, at)`.
     pub stops: Vec<(usize, u64)>,
-    /// Blocks `[from, to)` a detected clock step skips: withheld at the
-    /// step, cause `ClockStep`, with the step fence self-reported.
-    pub stepped: Vec<(u64, u64)>,
+    /// Blocks `[from, to)` skipped and withheld for a cause; for
+    /// `ClockStep`, a detected clock step, with the step fence
+    /// self-reported.
+    pub stepped: Vec<(u64, u64, Cause)>,
+    /// A stop at `u64::MAX`, letting a pending stop lapse, is recorded and
+    /// not applied: it arrives after the stop took.
+    pub lapse_late: bool,
     /// Rebuilds refused: a generation the core names was not built.
     pub refused_rebuilds: u64,
     /// Entries the core holds unresolved: a rebuilt core holds none.
@@ -670,13 +674,17 @@ impl FakeAudio {
         }
         let first = st.computed.map_or(target, |c| c + 1);
         if !st.stepped.is_empty() {
-            st.flags.step_fence = st.stepped.iter().any(|&(a, z)| (a..z).contains(&target));
+            st.flags.step_fence = st
+                .stepped
+                .iter()
+                .any(|&(a, z, c)| c == Cause::ClockStep && (a..z).contains(&target));
         }
         let b = self.timing.block;
         for k in first..=target {
-            if st.stepped.iter().any(|&(a, z)| (a..z).contains(&k)) {
+            if let Some(&(_, _, cause)) = st.stepped.iter().find(|&&(a, z, _)| (a..z).contains(&k))
+            {
                 for out in &mut st.outputs {
-                    out.statuses.withhold(k, Cause::ClockStep);
+                    out.statuses.withhold(k, cause);
                 }
                 st.withdraw(true);
                 st.computed = Some(k);
@@ -913,6 +921,9 @@ impl Audio for FakeAudio {
         self.step();
         let mut st = self.lock();
         st.stops.push((output, at));
+        if at == u64::MAX && st.lapse_late {
+            return;
+        }
         if let Some(out) = st.outputs.get_mut(output) {
             out.hold.stop_at(at);
         }

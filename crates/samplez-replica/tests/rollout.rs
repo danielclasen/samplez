@@ -10,7 +10,7 @@ mod harness;
 use std::time::Duration;
 
 use harness::{BLOCK, Options, Set};
-use samplez::blocks::{PAGE, Standing};
+use samplez::blocks::{Cause, PAGE, Standing};
 use samplez_replica::contact::{Timing, index_at};
 use samplez_replica::entry::{Baseline, Body, NodeId};
 use samplez_replica::membership::{Slot, node_id, slot_of};
@@ -424,19 +424,31 @@ async fn a_re_routed_n_retargets_only_once_its_generation_is_built() {
     assert_eq!(from(&set, n), Some(p), "N commits from P");
 }
 
-/// A fenced N: a detected clock step withholds its blocks at and after
-/// P while its output, never started, stands idle. N is no candidate
-/// while it reports the step fence: the old-key replica is named
-/// meanwhile and the output goes on on it, N is not named again while
-/// fenced, and once the fence lifts the hand-over completes.
+/// A fenced N: blocks withheld at and after P while its output, never
+/// started, stands idle, for a detected clock step (with the step fence
+/// reported) or for skips. N is not named again while it withholds: the
+/// old-key replica is named meanwhile and goes on committing through P,
+/// also when the lapse of its stop at P arrives after the stop took; once
+/// N withholds no more the hand-over completes.
 #[tokio::test(start_paused = true)]
 async fn a_fenced_n_is_not_named_again_while_fenced() {
+    for (cause, late) in [
+        (Cause::ClockStep, false),
+        (Cause::ClockStep, true),
+        (Cause::Skip, false),
+    ] {
+        fenced(cause, late).await;
+    }
+}
+
+async fn fenced(cause: Cause, late: bool) {
     let (mut set, ids, n) = roll(vec![a(0), a(1), witness()], false).await;
     mismatched(&set, n).await;
+    set.audio(a(0)).lock().lapse_late = late;
     let now = set.audio(n).due().unwrap();
     // 0.6 s of blocks.
     let span = 600 * 48 / BLOCK;
-    set.audio(n).lock().stepped.push((now, now + span));
+    set.audio(n).lock().stepped.push((now, now + span, cause));
     set.set_target(Some("r2"));
     let p = named(&set, a(0), n).await;
     until("the old-key replica named again", 10, || {
@@ -451,7 +463,11 @@ async fn a_fenced_n_is_not_named_again_while_fenced() {
         set.audio(n).due().unwrap() > now + span
     })
     .await;
-    assert_eq!(handed_over(&set), 1, "N named again while fenced");
+    assert_eq!(
+        handed_over(&set),
+        1,
+        "{cause:?}: N named again while fenced"
+    );
     until("N committing", 10, || committing(&set, n)).await;
     assert_eq!(handed_over(&set), 2);
     sleep(Duration::from_millis(100)).await;
