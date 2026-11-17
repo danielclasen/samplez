@@ -32,6 +32,12 @@ use crate::{Replica, net};
 /// entries of [`crate::MAX_ENTRY_BYTES`].
 pub const MAX_BODY: usize = 8 << 20;
 
+/// The largest answer a replica reads: [`MAX_BODY`] beside the largest
+/// legal engine core, whose matrix of at most
+/// [`samplez::MAX_COEFFICIENTS`] terms encodes each in under 128
+/// bytes of JSON.
+pub const MAX_RESPONSE: usize = MAX_BODY + samplez::MAX_COEFFICIENTS * 128;
+
 /// A client command as the replica that first received it forwards it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Forwarded {
