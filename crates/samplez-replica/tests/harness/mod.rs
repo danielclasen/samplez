@@ -216,6 +216,10 @@ pub struct Clock {
     offset: AtomicI64,
     /// Added to the TAI clock, ns.
     tai_offset: AtomicI64,
+    /// The kernel TAI offset, whole seconds, and the clock steps the
+    /// replica's engine detected.
+    kernel_offset: AtomicI64,
+    steps: AtomicU64,
     /// Told on the next read: a test's hook into the moment a replica
     /// stamps an entry, between its leadership check and the proposal.
     on_read: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -223,6 +227,42 @@ pub struct Clock {
 }
 
 impl Clock {
+    /// A clock at TAI offset 37 s.
+    pub fn new(base: Instant) -> Clock {
+        Clock {
+            base,
+            offset: AtomicI64::new(0),
+            tai_offset: AtomicI64::new(0),
+            kernel_offset: AtomicI64::new(37),
+            steps: AtomicU64::new(0),
+            on_read: Mutex::new(None),
+            stall: Mutex::new(None),
+        }
+    }
+
+    pub fn kernel_offset(&self) -> i64 {
+        self.kernel_offset.load(Ordering::Relaxed)
+    }
+
+    pub fn steps(&self) -> u64 {
+        self.steps.load(Ordering::Relaxed)
+    }
+
+    /// Sets the kernel TAI offset without a clock step, as the kernel's
+    /// leap second (STA_INS) or a node configured before its pod starts.
+    pub fn set_kernel_offset(&self, s: i64) {
+        self.kernel_offset.store(s, Ordering::Relaxed);
+    }
+
+    /// Steps the kernel TAI offset as `adjtimex` does: CLOCK_TAI moves by
+    /// the difference and the engine detects the step.
+    pub fn step_kernel_offset(&self, s: i64) {
+        let before = self.kernel_offset.swap(s, Ordering::Relaxed);
+        self.tai_offset
+            .fetch_add((s - before) * 1_000_000_000, Ordering::Relaxed);
+        self.steps.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn samples(&self) -> u64 {
         if let Some(read) = self.on_read.lock().expect("clock lock poisoned").take() {
             let _ = read.send(());
@@ -289,6 +329,10 @@ pub struct Tai(pub Arc<Clock>);
 impl Clocks for Tai {
     fn tai_ns(&self) -> u64 {
         self.0.tai_ns()
+    }
+
+    fn tai_offset_s(&self) -> Option<i64> {
+        Some(self.0.kernel_offset())
     }
 }
 
@@ -381,6 +425,9 @@ pub struct Fake {
     /// Commit starts the supervisor named, `(output, min_k)`, and cancels.
     pub commit_starts: Vec<(usize, u64)>,
     pub cancels: Vec<usize>,
+    /// Engine cores dropped and rebuilt.
+    pub drops: u64,
+    pub rebuilds: u64,
     /// Blocks `[from, to)` whose samples differ from every other replica's
     /// by a factor `1 + by`, in what is hashed, not in what is written: content
     /// diverged.
@@ -700,7 +747,10 @@ impl Audio for FakeAudio {
         Sample {
             own: Own {
                 processed,
-                clock: st.flags,
+                clock: ClockFlags {
+                    tai_offset_s: Some(self.clock.kernel_offset()),
+                    ..st.flags
+                },
                 statuses: self.statuses(&st),
                 standing: st.outputs.iter().map(|o| o.statuses.standing()).collect(),
                 unwritten: Vec::new(),
@@ -716,6 +766,7 @@ impl Audio for FakeAudio {
             entries_refused: st.entries_refused,
             realised: st.outputs.iter().map(|o| o.realised).collect(),
             generation_ready: !st.generation_pending,
+            clock_steps: self.clock.steps(),
         }
     }
     fn fence(&self, end: u64) {
@@ -783,6 +834,13 @@ impl Audio for FakeAudio {
     fn withdraw(&self) {
         self.step();
         self.lock().withdraw_all();
+    }
+    fn drop_engine(&self) {
+        self.lock().drops += 1;
+    }
+    fn rebuild_engine(&self) -> bool {
+        self.lock().rebuilds += 1;
+        true
     }
     fn ranks(&self, ranks: Ranks) {
         let tai = self.clock.tai_ns();
@@ -1208,6 +1266,11 @@ pub struct Options {
     /// Each [`FakeAudio`] records the commit starts its supervisor names
     /// and applies none ([`FakeAudio::manual`]): the test names them.
     pub manual: bool,
+    /// Kernel TAI offsets, whole seconds, set before the replicas start;
+    /// every other node is at 37.
+    pub kernel_offsets: Vec<(NodeId, i64)>,
+    /// The offsets verify nobody: start waits for readiness only.
+    pub unverified: bool,
 }
 
 impl Default for Options {
@@ -1223,6 +1286,8 @@ impl Default for Options {
             ids: None,
             outputs: 0,
             manual: false,
+            kernel_offsets: Vec::new(),
+            unverified: false,
         }
     }
 }
@@ -1252,13 +1317,7 @@ impl Set {
         let clocks = ids
             .iter()
             .map(|&id| {
-                let clock = Clock {
-                    base,
-                    offset: AtomicI64::new(0),
-                    tai_offset: AtomicI64::new(0),
-                    on_read: Mutex::new(None),
-                    stall: Mutex::new(None),
-                };
+                let clock = Clock::new(base);
                 (id, Arc::new(clock))
             })
             .collect();
@@ -1273,6 +1332,9 @@ impl Set {
             replicas: BTreeMap::new(),
             audios: BTreeMap::new(),
         };
+        for &(id, s) in &set.options.kernel_offsets {
+            set.clocks[&id].set_kernel_offset(s);
+        }
         for id in set.ids() {
             set.restart(id).await;
         }
@@ -1284,7 +1346,8 @@ impl Set {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !set.replicas.iter().all(|(&id, r)| {
             let info = r.replica();
-            info.ready && (slot_of(id) == Slot::Witness || info.commitable)
+            info.ready
+                && (slot_of(id) == Slot::Witness || info.commitable || set.options.unverified)
         }) {
             assert!(
                 Instant::now() < deadline,
@@ -1329,15 +1392,7 @@ impl Set {
         let clock = self
             .clocks
             .entry(id)
-            .or_insert_with(|| {
-                Arc::new(Clock {
-                    base,
-                    offset: AtomicI64::new(0),
-                    tai_offset: AtomicI64::new(0),
-                    on_read: Mutex::new(None),
-                    stall: Mutex::new(None),
-                })
-            })
+            .or_insert_with(|| Arc::new(Clock::new(base)))
             .clone();
         let settings = Settings {
             id,

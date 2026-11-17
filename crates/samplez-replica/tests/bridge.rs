@@ -317,3 +317,33 @@ fn reports_carry_the_latest_page_hashes() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// The horizon reads the processed block while the engine is dropped: the
+/// RT thread keeps moving it without a core, so a dropped replica keeps
+/// reporting one, and a rebuild installs a core again.
+#[test]
+fn a_dropped_engine_keeps_reporting_its_processed_block() {
+    let domain = Domain::new();
+    let (_engine, audio) = bridge(&domain, 1 << 12);
+    let audio = audio.with_rebuild(Box::new(|| {
+        Some(samplez::ProductState {
+            gains: vec![vec![1.0]],
+            up: vec![true],
+            pending: Vec::new(),
+            last_id: 0,
+        })
+    }));
+    wait_for("a block processed", || {
+        audio.sample().own.processed.is_some()
+    });
+    audio.drop_engine();
+    let dropped_at = audio.sample().own.processed.expect("processed");
+    wait_for("blocks processed without a core", || {
+        audio
+            .sample()
+            .own
+            .processed
+            .is_some_and(|k| k > dropped_at + 4)
+    });
+    wait_for("the core rebuilt", || audio.rebuild_engine());
+}

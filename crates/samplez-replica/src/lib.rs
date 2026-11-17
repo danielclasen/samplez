@@ -18,6 +18,7 @@ pub mod contact;
 pub mod decide;
 pub mod dedup;
 pub mod entry;
+pub mod horizon;
 pub mod log_store;
 pub mod membership;
 pub mod net;
@@ -30,6 +31,7 @@ pub mod snapshot;
 pub mod state;
 pub mod state_machine;
 pub mod verdict;
+pub mod verify;
 pub mod withhold;
 
 use std::collections::{BTreeMap, VecDeque};

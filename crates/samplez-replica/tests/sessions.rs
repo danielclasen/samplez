@@ -317,14 +317,15 @@ async fn a_replica_e_does_not_count_refuses_client_writes() {
     };
 
     // Unverified: out of E, not commitable, refused; the others serve.
-    set.audio(a).lock().flags.unverified = true;
+    // An adjtimex step of its kernel TAI offset unverifies it.
+    set.clock(a).step_kernel_offset(0);
     not_commitable(&set, a).await;
     let refused = refusal(&set, a, "1").await;
     assert_eq!(refused.reason, Reason::NotCommitable);
     assert_eq!(refused.detail, "clock_unverified");
     send(set.replica(b), "s", "2", "gain=2@2").await;
     send(set.replica(leader), "s", "3", "gain=3@3").await;
-    set.audio(a).lock().flags.unverified = false;
+    set.clock(a).step_kernel_offset(37);
     set.commitable(a).await;
     send(set.replica(a), "s", "4", "gain=4@4").await;
 
