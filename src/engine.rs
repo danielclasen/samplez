@@ -4884,6 +4884,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(domain);
     }
 
+    /// A strip entry the replayed strips hold, delivered by the ring after
+    /// the install, counts as taken: another replayed core that knew
+    /// less would replace the strips with ones lacking it, so the
+    /// hand-over check (`last_taken > last_id`) refuses that core.
+    #[test]
+    fn a_strip_entry_held_by_the_strips_refuses_a_replayed_core_knowing_less() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("strip-taken", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d15", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d16", "label": "held",
+                          "group": "held", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (mut ring, entries) = rtrb::RingBuffer::new(4);
+        rt.entries = entries;
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        rt.install_core(&core, 3, true);
+        // Strip entry 3, applied by the replay, delivered after the install.
+        let strip = RtEntry {
+            id: 3,
+            at_index: 48,
+            change: Change::Strip {
+                slot: 0,
+                param: StripParam::Trim { db: -6.0 },
+            },
+        };
+        assert!(ring.push(strip).is_ok());
+        rt.take_entries();
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.mix.last_taken, 3, "skipped as held by the strips");
+        // A replayed core that knew entries up to 2 is refused.
+        assert!(rt.mix.last_taken > 2);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
     /// A core whose block number leaves the index range at this block
     /// size is refused, not overflowed.
     #[test]

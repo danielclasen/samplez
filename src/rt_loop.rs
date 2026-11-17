@@ -1571,7 +1571,9 @@ impl Rt {
             let strip = matches!(entry.change, Change::Strip { .. });
             if strip && entry.id <= self.strips_upto {
                 // In the strips the last replayed core brought, or on
-                // its pending list, applied here at its index.
+                // its pending list, applied here at its index; taken
+                // through that core.
+                self.mix.last_taken = self.mix.last_taken.max(entry.id);
                 continue;
             }
             if entry.id <= self.skip_upto {
