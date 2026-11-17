@@ -1,19 +1,24 @@
 //! The engine bridge against a real replicated engine on an MXL domain:
 //! what reports carry of it, and what contact hands it.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use samplez::blocks::{HEALTHY, PAGE};
-use samplez::{Config, Engine, Replication};
+use samplez::{Config, Engine, Entry, InputState, Replication};
+use samplez_dsp::StripParam;
+use samplez_mxl::output::{self, Creation, OutputConfig};
+use samplez_mxl::{Instance, time};
 use samplez_replica::bootstrap::random_id;
-use samplez_replica::bridge::{EngineAudio, PAGES_REPORTED, input_entry};
+use samplez_replica::bridge::{EngineAudio, PAGES_REPORTED, Translate, Translated, input_entry};
 use samplez_replica::contact::{Audio, Timing};
-use samplez_replica::entry::{Body, Request};
-use samplez_replica::report::{page_digest, status_of};
+use samplez_replica::entry::{Body, Command, Origin, Request};
+use samplez_replica::report::{Page, page_digest, status_of};
 use samplez_replica::resync::Source;
+use samplez_service::Role;
 
 const B: u64 = 48;
 
@@ -60,19 +65,44 @@ fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
 /// A replicated engine of three voters, one input whose flow nobody
 /// writes, one output; its status channel holds `changes`.
 fn bridge(domain: &Domain, changes: usize) -> (Arc<Engine>, EngineAudio) {
+    bridge_on(
+        domain,
+        changes,
+        [
+            "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a",
+            "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01",
+        ],
+        Box::new(input_entry),
+    )
+}
+
+/// [`bridge`] with input and output flows `flows` and `translate`.
+fn bridge_on(
+    domain: &Domain,
+    changes: usize,
+    flows: [&str; 2],
+    translate: Translate,
+) -> (Arc<Engine>, EngineAudio) {
     let v = serde_json::json!({
         "blockSize": B,
         "readerMarginSamples": 960,
         "libmxl": libmxl(),
         "domains": [{ "name": "d", "path": domain.0 }],
-        "inputs": [{ "name": "in0", "domain": "d",
-                     "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a", "channels": 1 }],
-        "outputs": [{ "name": "out0", "domain": "d",
-                      "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01", "label": "bridge",
+        "inputs": [{ "name": "in0", "domain": "d", "flowId": flows[0], "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d", "flowId": flows[1], "label": "bridge",
                       "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
         "matrix": [[1.0]],
         "rt": { "rtCpu": "none" },
     });
+    bridge_of(&v, changes, translate)
+}
+
+/// [`bridge`] of configuration `v`.
+fn bridge_of(
+    v: &serde_json::Value,
+    changes: usize,
+    translate: Translate,
+) -> (Arc<Engine>, EngineAudio) {
     let config = Config::parse(&v.to_string()).unwrap();
     let (reports, _) = std::sync::mpsc::sync_channel(64);
     let (status_tx, status_rx) = std::sync::mpsc::sync_channel(changes);
@@ -85,18 +115,14 @@ fn bridge(domain: &Domain, changes: usize) -> (Arc<Engine>, EngineAudio) {
         hashes: Some(hash_tx),
     };
     let engine = Arc::new(Engine::start_replicated(config, process, None, replication).unwrap());
-    wait_for("output realised", || engine.status().outputs[0].realised);
+    wait_for("outputs realised", || {
+        engine.status().outputs.iter().all(|o| o.realised)
+    });
     let timing = Timing {
         margin: 960,
         ..Timing::defaults(B)
     };
-    let audio = EngineAudio::new(
-        engine.clone(),
-        status_rx,
-        hash_rx,
-        &timing,
-        Box::new(input_entry),
-    );
+    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, &timing, translate);
     (engine, audio)
 }
 
@@ -389,4 +415,427 @@ fn a_donors_core_is_replayed_and_handed_over_on_the_joiner() {
     let core = donor_audio.copy_core().expect("a core");
     assert!(joiner_audio.resync(&core, &Feed(false)).is_err());
     assert_eq!(installed(), 1, "no hand-over once told to stop");
+}
+
+/// A mixer's translation: each command `<gain> <trim>` of a `Commands`
+/// entry ramps the coefficient to `gain` and trims the input's strip by
+/// `trim` dB, two engine entries for one command.
+fn mixer(request: &Request) -> Option<(u64, Vec<Entry>)> {
+    let Body::Commands(commands) = &request.body else {
+        return input_entry(request);
+    };
+    let mut entries = Vec::new();
+    for c in commands {
+        let text = std::str::from_utf8(&c.body).ok()?;
+        let (gain, trim) = text.split_once(' ')?;
+        entries.push(Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: gain.parse().ok()?,
+        });
+        entries.push(Entry::Strip {
+            slot: 0,
+            param: StripParam::Trim {
+                db: trim.parse().ok()?,
+            },
+        });
+    }
+    Some((request.at_index()?, entries))
+}
+
+/// A sine on flow `id`, written block by block as libmxl's clock passes
+/// each block, until dropped.
+struct Pilot {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Pilot {
+    fn start(domain: &Domain, id: &str) -> Pilot {
+        let api = samplez_mxl::load(&libmxl()).unwrap();
+        let instance = Instance::new(&api, &domain.0).unwrap();
+        let cfg = OutputConfig {
+            flow_id: id,
+            label: "pilot",
+            group: "pilot",
+            role: "Audio",
+            channels: 1,
+            block: B,
+            batch: B,
+        };
+        let Creation::Created { mut writer, .. } = output::create(&instance, &cfg).unwrap() else {
+            panic!("pilot flow {id} not created");
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let mut next = None;
+            let mut data = vec![0.0f32; B as usize];
+            while !flag.load(Ordering::Relaxed) {
+                let idx = time::timestamp_to_index(&api, time::now(&api));
+                if let Some(due) = (idx / B).checked_sub(1) {
+                    for k in next.unwrap_or(due)..=due {
+                        for (i, v) in data.iter_mut().enumerate() {
+                            let n = (k * B + i as u64) % 48;
+                            *v = (2.0 * std::f32::consts::PI * n as f32 / 48.0).sin();
+                        }
+                        writer.write_block(k, &data);
+                    }
+                    next = Some(due + 1);
+                }
+                let k = next.unwrap_or(0);
+                time::sleep_until(&api, time::index_to_timestamp(&api, (k + 1) * B));
+            }
+            drop(writer);
+            drop(instance);
+        });
+        Pilot {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Pilot {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            t.join().unwrap();
+        }
+    }
+}
+
+/// A log entry carrying several engine entries keeps a resynced replica
+/// equal to its donor: the joiner learns the log entry, a mixer command
+/// of a gain and a strip entry, only from the log after the donor's core,
+/// replays it whole and from the hand-over computes the donor's pages
+/// through both ramps. A joiner missing either entry computes other
+/// pages from the log entry's index on.
+#[test]
+fn a_command_of_several_entries_keeps_a_resynced_replica_equal() {
+    undisturbed(|| resync_after(1));
+}
+
+/// A resync while a console is busy: more log entries commit between
+/// the donor's core and the replay than the replay holds pending at once.
+/// It replays them as it appends them and the joiner computes the
+/// donor's pages from the hand-over on.
+#[test]
+fn a_resync_takes_more_entries_than_it_holds_pending() {
+    undisturbed(|| resync_after(100));
+}
+
+/// Runs `scenario` until a run is not disturbed, four times at most.
+fn undisturbed(scenario: impl Fn() -> Result<(), String>) {
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        match scenario() {
+            Ok(()) => return,
+            Err(why) => {
+                eprintln!("run disturbed ({why}): running it again");
+                seen.push(why);
+            }
+        }
+    }
+    panic!("every run was disturbed: {seen:?}");
+}
+
+struct Log(Vec<(u64, Request)>);
+
+impl Source for Log {
+    fn entries(&self, after: u64) -> Vec<(u64, Request)> {
+        self.0.iter().filter(|(i, _)| *i > after).cloned().collect()
+    }
+    fn go(&self) -> bool {
+        true
+    }
+}
+
+/// A donor's core copied, then `n` mixer commands committed on the
+/// donor, each 40 blocks ahead as it is appended, which a joiner learns
+/// only from the log in its resync.
+fn resync_after(n: u64) -> Result<(), String> {
+    let domain = Domain::new();
+    // A second of history: the replay reads from the donor's core on.
+    std::fs::write(
+        domain.0.join("options.json"),
+        r#"{"urn:x-mxl:option:history_duration/v1.0": 1000000000}"#,
+    )
+    .unwrap();
+    let input = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8d";
+    let _pilot = Pilot::start(&domain, input);
+    let (donor, donor_audio) = bridge_on(
+        &domain,
+        1 << 12,
+        [input, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f04"],
+        Box::new(mixer),
+    );
+    let (joiner, joiner_audio) = bridge_on(
+        &domain,
+        1 << 12,
+        [input, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f05"],
+        Box::new(mixer),
+    );
+    wait_for("both read the input", || {
+        [&donor, &joiner].iter().all(|e| {
+            e.status().inputs[0].state == InputState::Attached
+                && e.progress().and_then(|p| p.processed).is_some()
+        })
+    });
+    // Past the fade-in from the attach.
+    std::thread::sleep(Duration::from_millis(200));
+    let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
+    let silenced_before = silenced(&donor) + silenced(&joiner);
+    let core = donor_audio.copy_core().ok_or("no core copied")?;
+    let mut log = Vec::new();
+    let mut at = 0;
+    for id in 1..=n {
+        let processed = donor.progress().and_then(|p| p.processed).unwrap();
+        at = (processed + 40) * B;
+        let command = Command {
+            origin: Origin {
+                principal: "p".into(),
+                session: "s".into(),
+                role: Role::Operator,
+                connection: "c".into(),
+            },
+            id: id.to_string(),
+            at_index: Some(at),
+            body: format!("0.{} -{}", 5 + id % 4, id % 7).into_bytes(),
+        };
+        let request = Request {
+            stamp: at,
+            body: Body::Commands(vec![command]),
+        };
+        assert_eq!(mixer(&request).map(|(_, e)| e.len()), Some(2));
+        donor_audio.appended(id, &request);
+        donor_audio.committed(id);
+        log.push((id, request));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(donor_audio.sample().entries_refused, 0);
+    let r = joiner_audio.resync(&core, &Log(log))?;
+    // Past both ramps, by four pages.
+    let ramp = 480;
+    let end = (at + ramp) / B + 4 * PAGE / B;
+    let (mut pd, mut pj) = (BTreeMap::new(), BTreeMap::new());
+    let keep = |pages: &mut BTreeMap<u64, Page>, audio: &EngineAudio| {
+        for p in audio.sample().own.pages {
+            pages.insert(p.page, p);
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while [&donor, &joiner]
+        .iter()
+        .any(|e| e.progress().and_then(|p| p.processed).unwrap_or(0) <= end + PAGE / B)
+    {
+        assert!(Instant::now() < deadline, "pages within 10 s");
+        keep(&mut pd, &donor_audio);
+        keep(&mut pj, &joiner_audio);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    keep(&mut pd, &donor_audio);
+    keep(&mut pj, &joiner_audio);
+    if silenced(&donor) + silenced(&joiner) > silenced_before {
+        return Err("an input block silenced".into());
+    }
+    let from = ((r.j + 1) * B).div_ceil(PAGE);
+    let mut compared = 0;
+    for p in from..=end * B / PAGE {
+        let (Some(d), Some(j)) = (pd.get(&p), pj.get(&p)) else {
+            continue;
+        };
+        if (d.hash, d.fingerprint) != (j.hash, j.fingerprint) {
+            return Err(format!("page {p} differs"));
+        }
+        if p >= at / PAGE {
+            compared += 1;
+        }
+    }
+    if compared < 4 {
+        return Err(format!(
+            "{compared} pages from the log entry's index compared"
+        ));
+    }
+    assert_eq!(joiner.counters().command_late.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+/// Rows and columns of the large shape: 16 stereo channels, or four
+/// inputs of eight legs, to programme, four auxes, four mix-minus and
+/// two monitor buses, all stereo.
+const ROWS: usize = 32;
+const COLUMNS: usize = 22;
+
+/// A scene recall: every coefficient of the matrix and every strip
+/// parameter of the four strips, each set twice, 1616 engine entries for
+/// one command; the gains scaled by the command's body.
+fn scene(request: &Request) -> Option<Translated> {
+    let Body::Commands(commands) = &request.body else {
+        return None;
+    };
+    let scale: f32 = std::str::from_utf8(&commands[0].body).ok()?.parse().ok()?;
+    let mut entries = Vec::new();
+    for pass in [0.5, 1.0] {
+        for input in 0..ROWS {
+            for output in 0..COLUMNS {
+                entries.push(Entry::Gain {
+                    input,
+                    output,
+                    gain: pass * scene_gain(scale, input, output),
+                });
+            }
+        }
+        for slot in 0..ROWS / 8 {
+            for param in strip_params(pass) {
+                entries.push(Entry::Strip { slot, param });
+            }
+        }
+    }
+    Some((request.at_index()?, entries))
+}
+
+fn scene_gain(scale: f32, input: usize, output: usize) -> f32 {
+    scale * ((input * COLUMNS + output) % 7) as f32 / 7.0
+}
+
+/// Every parameter of a strip of eight legs.
+fn strip_params(pass: f32) -> Vec<StripParam> {
+    use samplez_dsp::{BandType, CompParams, EqBand, GateParams};
+    let mut params = vec![
+        StripParam::Trim { db: -3.0 * pass },
+        StripParam::Hpf {
+            enabled: true,
+            freq: 80.0,
+        },
+        StripParam::Eq { enabled: true },
+        StripParam::Gate(GateParams {
+            enabled: true,
+            threshold_db: -50.0,
+            range_db: 30.0,
+            attack_ms: 1.0,
+            release_ms: 200.0,
+        }),
+        StripParam::Comp(CompParams {
+            enabled: true,
+            threshold_db: -20.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 300.0,
+            knee_db: 6.0,
+            makeup_db: 2.0,
+        }),
+        StripParam::DynamicsBeforeEq { enabled: true },
+    ];
+    for leg in 0..8 {
+        params.push(StripParam::LegTrim { leg, db: pass });
+        params.push(StripParam::Polarity {
+            leg,
+            inverted: leg % 2 == 0,
+        });
+    }
+    for band in 0..4 {
+        params.push(StripParam::EqBand {
+            band,
+            value: EqBand {
+                kind: BandType::Peak,
+                freq: 250.0 * (band + 1) as f32,
+                gain_db: 3.0 * pass,
+                q: 1.0,
+            },
+        });
+    }
+    params
+}
+
+/// Every replica takes a run of 64 scene recalls of 1616 engine entries
+/// each, as many log entries as the leader stamps ahead, refusing none,
+/// and applies the last one whole at its index: a log entry's size is
+/// bounded by the engine's shape, not by a count of engine entries, and
+/// the engine holds as many log entries as the leader stamps ahead.
+#[test]
+fn scene_recalls_on_a_large_shape_apply_on_every_replica() {
+    let domains: Vec<Domain> = (0..3).map(|_| Domain::new()).collect();
+    let replicas: Vec<(Arc<Engine>, EngineAudio)> = domains
+        .iter()
+        .enumerate()
+        .map(|(r, domain)| {
+            let flow = |n: usize| format!("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd{r:02x}{n:02x}");
+            let v = serde_json::json!({
+                "blockSize": B,
+                "readerMarginSamples": 960,
+                "libmxl": libmxl(),
+                "domains": [{ "name": "d", "path": domain.0 }],
+                "inputs": (0..ROWS / 8).map(|n| serde_json::json!({
+                    "name": format!("in{n}"), "domain": "d", "flowId": flow(n),
+                    "channels": 8 })).collect::<Vec<_>>(),
+                "outputs": (0..2).map(|n| serde_json::json!({
+                    "name": format!("out{n}"), "domain": "d", "flowId": flow(0x10 + n),
+                    "label": "scene", "group": "samplez-test", "role": format!("Audio {n}"),
+                    "channels": COLUMNS / 2 })).collect::<Vec<_>>(),
+                "matrix": vec![vec![0.0; COLUMNS]; ROWS],
+                "rt": { "rtCpu": "none" },
+            });
+            bridge_of(&v, 1 << 12, Box::new(scene))
+        })
+        .collect();
+    let processed = |e: &Engine| e.progress().and_then(|p| p.processed);
+    wait_for("every replica computes", || {
+        replicas.iter().all(|(e, _)| processed(e).is_some())
+    });
+    let first = replicas
+        .iter()
+        .map(|(e, _)| processed(e).unwrap())
+        .max()
+        .unwrap();
+    let recalls = 64u64;
+    let at = |id: u64| (first + 500 + id) * B;
+    for id in 1..=recalls {
+        let request = Request {
+            stamp: at(id),
+            body: Body::Commands(vec![Command {
+                origin: Origin {
+                    principal: "p".into(),
+                    session: "s".into(),
+                    role: Role::Operator,
+                    connection: "c".into(),
+                },
+                id: id.to_string(),
+                at_index: Some(at(id)),
+                body: (id as f32 / recalls as f32).to_string().into_bytes(),
+            }]),
+        };
+        assert_eq!(scene(&request).map(|(_, e)| e.len()), Some(1616));
+        for (_, audio) in &replicas {
+            audio.appended(id, &request);
+        }
+    }
+    for (_, audio) in &replicas {
+        audio.committed(recalls);
+    }
+    let end = at(recalls) / B + 480 / B + 2;
+    wait_for("the last recall ramped", || {
+        replicas.iter().all(|(e, _)| processed(e) > Some(end))
+    });
+    for (e, audio) in &replicas {
+        assert_eq!(audio.sample().entries_refused, 0);
+        let c = e.counters();
+        assert_eq!(c.command_late.load(Ordering::Relaxed), 0);
+        assert_eq!(c.strip_refused.load(Ordering::Relaxed), 0);
+        let copy = loop {
+            match e.copy_core(Duration::from_secs(2)) {
+                Err(samplez::CopyError::Passed { .. }) => continue,
+                c => break c.unwrap(),
+            }
+        };
+        for input in 0..ROWS {
+            for output in 0..COLUMNS {
+                assert_eq!(
+                    copy.core.gain(input, output),
+                    scene_gain(1.0, input, output),
+                    "{input} -> {output}"
+                );
+            }
+        }
+    }
 }

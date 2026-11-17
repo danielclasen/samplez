@@ -1927,6 +1927,7 @@ dependencies = [
  "rtrb",
  "rustls",
  "samplez",
+ "samplez-dsp",
  "samplez-mxl",
  "samplez-service",
  "serde",
