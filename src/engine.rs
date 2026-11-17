@@ -1802,12 +1802,14 @@ impl Engine {
             ));
         }
         let c = &copy.core;
-        let (n, m, slots, page) = self
+        let (n, m, _, page) = self
             .transfer
             .as_ref()
             .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).shape)
             .expect("checked above");
-        if !c.fits(n, m, slots, page) {
+        let (slots, in_domains) = new_slots(&self.config);
+        let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
+        if !c.fits(n, m, &legs, page) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -1818,13 +1820,12 @@ impl Engine {
             || !c.awaiting_gen.is_empty()
             || c.slots
                 .iter()
-                .any(|s| s.xfade.is_some_and(|x| next < x + ramp))
+                .any(|s| s.xfade.is_some_and(|x| next < x.saturating_add(ramp)))
             || c.pending.iter().any(|e| e.change.needs_generation());
         if generating {
             return Err(ReplayError::Generation);
         }
         let status = self.status();
-        let (slots, in_domains) = new_slots(&self.config);
         let timing = Timing {
             block: self.block,
             margin: self.margin,

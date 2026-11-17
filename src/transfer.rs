@@ -24,6 +24,11 @@ use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRES
 /// by the engine that copied it.
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The highest sample index a decoded core may hold: far beyond any
+/// running engine's, and low enough that adding a ramp or a block to it
+/// cannot overflow.
+pub(crate) const INDEX_MAX: u64 = 1 << 62;
+
 /// An input slot's part of the core.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SlotCore {
@@ -100,34 +105,65 @@ impl Core {
         &self.unresolved
     }
 
-    /// Whether this core is of an engine with `inputs` and `outputs`
-    /// channels, `slots` input slots and room for `page_entries` entries
-    /// of one page's fingerprint, every entry it holds within them: a
-    /// decoded core is checked before a replay installs it.
-    pub(crate) fn fits(
-        &self,
-        inputs: usize,
-        outputs: usize,
-        slots: usize,
-        page_entries: usize,
-    ) -> bool {
-        let entry = |e: &RtEntry| match e.change {
-            Change::Gain { input, output, .. } => input < inputs && output < outputs,
-            Change::InputDown { slot }
-            | Change::InputUp { slot }
-            | Change::Route { slot }
-            | Change::Strip { slot, .. } => slot < slots,
+    /// Whether everything this core holds is a value an engine holds:
+    /// every index at most [`INDEX_MAX`], every gain one a ramp takes,
+    /// every strip parameter within its range (legs aside), the lists
+    /// within their capacities. A core from another replica is checked
+    /// when decoded.
+    fn sane(&self) -> bool {
+        let index = |i: u64| i <= INDEX_MAX;
+        let entry = |e: &RtEntry| {
+            index(e.at_index)
+                && match e.change {
+                    Change::Gain { gain, .. } => samplez_dsp::valid_gain(gain),
+                    Change::Strip { param, .. } => param.check(usize::MAX).is_ok(),
+                    _ => true,
+                }
         };
-        (
-            self.matrix.inputs(),
-            self.matrix.outputs(),
-            self.slots.len(),
-        ) == (inputs, outputs, slots)
-            && self.page_entries.len() <= page_entries
+        let slot = |s: &SlotCore| s.fade_start.is_none_or(index) && s.xfade.is_none_or(index);
+        let ats = |list: &[(LogId, u64)]| list.iter().all(|&(_, at)| index(at));
+        self.pos.is_none_or(index)
+            && index(self.ramp_end)
+            && self.entries_page.is_none_or(index)
+            && index(self.late_lost_until)
+            && self.slots.iter().all(slot)
+            && ats(&self.page_entries)
+            && ats(&self.unresolved)
+            && ats(&self.late_routes)
             && self.pending.len() <= PENDING_CHANGES
             && self.awaiting_gen.len() <= PENDING_CHANGES
             && self.unresolved.len() <= UNRESOLVED
             && self.late_routes.len() <= PENDING_CHANGES
+            && self.pending.iter().chain(&self.awaiting_gen).all(entry)
+    }
+
+    /// Whether this sane core is of an engine with `inputs` and `outputs`
+    /// channels, input slots of `legs` legs each and room for
+    /// `page_entries` entries of one page's fingerprint, every entry
+    /// within them: checked before a replay installs it.
+    pub(crate) fn fits(
+        &self,
+        inputs: usize,
+        outputs: usize,
+        legs: &[usize],
+        page_entries: usize,
+    ) -> bool {
+        let slots = legs.len();
+        let entry = |e: &RtEntry| match e.change {
+            Change::Gain { input, output, .. } => input < inputs && output < outputs,
+            Change::InputDown { slot } | Change::InputUp { slot } | Change::Route { slot } => {
+                slot < slots
+            }
+            Change::Strip { slot, param } => slot < slots && param.check(legs[slot]).is_ok(),
+        };
+        let shape = (
+            self.matrix.inputs(),
+            self.matrix.outputs(),
+            self.slots.len(),
+        );
+        self.sane()
+            && shape == (inputs, outputs, slots)
+            && self.page_entries.len() <= page_entries
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
     }
 }
@@ -202,7 +238,14 @@ impl CoreCopy {
         if wire.engine != ENGINE_VERSION {
             return Err(DecodeError::Version(wire.engine));
         }
-        serde_json::from_value(wire.copy).map_err(|e| DecodeError::Malformed(e.to_string()))
+        let copy: CoreCopy =
+            serde_json::from_value(wire.copy).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+        if !copy.core.sane() || copy.k0 > INDEX_MAX {
+            return Err(DecodeError::Malformed(
+                "a core holding a value no engine holds".to_owned(),
+            ));
+        }
+        Ok(copy)
     }
 }
 
@@ -508,19 +551,74 @@ mod tests {
         ));
     }
 
+    /// Each class of value a peer can send that no engine holds is
+    /// refused when decoded, before a replay or the RT thread indexes,
+    /// adds or applies it.
+    #[test]
+    fn a_core_holding_a_value_no_engine_holds_is_refused() {
+        let refused = |what: &str, f: &dyn Fn(&mut Core)| {
+            let mut copy = copy();
+            f(&mut copy.core);
+            assert!(
+                matches!(
+                    CoreCopy::decode(&copy.encode()),
+                    Err(DecodeError::Malformed(_))
+                ),
+                "{what}"
+            );
+        };
+        refused("next index", &|c| c.pos = Some(u64::MAX));
+        refused("ramp end", &|c| c.ramp_end = u64::MAX);
+        refused("entries page", &|c| c.entries_page = Some(u64::MAX));
+        refused("late-route bound", &|c| c.late_lost_until = u64::MAX);
+        refused("crossfade start", &|c| c.slots[0].xfade = Some(u64::MAX));
+        refused("fade start", &|c| c.slots[0].fade_start = Some(u64::MAX));
+        refused("page entry", &|c| c.page_entries.push((8, u64::MAX)));
+        refused("unresolved", &|c| c.unresolved.push((8, u64::MAX)));
+        refused("late route", &|c| c.late_routes.push((8, u64::MAX)));
+        refused("entry index", &|c| c.pending[0].at_index = u64::MAX);
+        refused("gain", &|c| {
+            c.pending.push(RtEntry {
+                id: 8,
+                at_index: 9600,
+                change: Change::Gain {
+                    input: 0,
+                    output: 0,
+                    gain: 1.0e9,
+                },
+            })
+        });
+        refused("strip parameter", &|c| {
+            c.pending[0].change = Change::Strip {
+                slot: 1,
+                param: StripParam::Trim { db: 1000.0 },
+            }
+        });
+        refused("pending list", &|c| {
+            let e = c.pending[0];
+            c.pending.resize(PENDING_CHANGES + 1, e)
+        });
+        // The first ramp is the one of length 48 at position 0.
+        let encoded = copy().encode().replacen("\"pos\":0", "\"pos\":49", 1);
+        assert!(
+            matches!(CoreCopy::decode(&encoded), Err(DecodeError::Malformed(_))),
+            "a ramp position past its length"
+        );
+    }
+
     /// A core of another shape, or with an entry outside the engine,
     /// does not fit it.
     #[test]
     fn a_core_fits_only_its_own_shape() {
         let mut copy = copy();
-        assert!(copy.core.fits(2, 2, 2, 8));
-        assert!(!copy.core.fits(2, 3, 2, 8));
-        assert!(!copy.core.fits(2, 2, 2, 0));
+        assert!(copy.core.fits(2, 2, &[1, 1], 8));
+        assert!(!copy.core.fits(2, 3, &[1, 1], 8));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 0));
         copy.core.pending.push(RtEntry {
             id: 8,
             at_index: 9648,
             change: Change::InputDown { slot: 2 },
         });
-        assert!(!copy.core.fits(2, 2, 2, 8));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 8));
     }
 }

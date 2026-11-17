@@ -82,7 +82,9 @@ impl TryFrom<MatrixWire> for Matrix {
     type Error = String;
 
     /// Refuses a column with an input out of range, out of order or
-    /// twice, or a ramp that is not finite: the RT thread indexes by it.
+    /// twice, or a ramp a matrix never holds: a gain beyond
+    /// [`crate::MAX_GAIN`] or not finite, a length beyond
+    /// [`crate::MAX_RAMP_LEN`], a position past its length.
     fn try_from(w: MatrixWire) -> Result<Matrix, String> {
         let mut m = Matrix::new(w.inputs, w.columns.len());
         for (dst, col) in m.columns.iter_mut().zip(w.columns) {
@@ -90,7 +92,11 @@ impl TryFrom<MatrixWire> for Matrix {
             let inside = col.iter().all(|t| t.input < w.inputs);
             let finite = col.iter().all(|t| {
                 let r = &t.ramp;
-                r.c0.is_finite() && r.step.is_finite() && r.target.is_finite()
+                valid_gain(r.c0)
+                    && valid_gain(r.target)
+                    && r.step.is_finite()
+                    && r.len <= crate::ramp::MAX_RAMP_LEN
+                    && r.pos <= r.len
             });
             if !(ordered && inside && finite) {
                 return Err("a matrix column out of range, order or finite values".to_owned());
