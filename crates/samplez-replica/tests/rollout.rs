@@ -423,3 +423,37 @@ async fn a_re_routed_n_retargets_only_once_its_generation_is_built() {
     assert_eq!(handed_over(&set), 1, "N renamed");
     assert_eq!(from(&set, n), Some(p), "N commits from P");
 }
+
+/// A fenced N: a detected clock step withholds its blocks at and after
+/// P while its output, never started, stands idle. N is no candidate
+/// while it reports the step fence: the old-key replica is named
+/// meanwhile and the output goes on on it, N is not named again while
+/// fenced, and once the fence lifts the hand-over completes.
+#[tokio::test(start_paused = true)]
+async fn a_fenced_n_is_not_named_again_while_fenced() {
+    let (mut set, ids, n) = roll(vec![a(0), a(1), witness()], false).await;
+    mismatched(&set, n).await;
+    let now = set.audio(n).due().unwrap();
+    // 0.6 s of blocks.
+    let span = 600 * 48 / BLOCK;
+    set.audio(n).lock().stepped.push((now, now + span));
+    set.set_target(Some("r2"));
+    let p = named(&set, a(0), n).await;
+    until("the old-key replica named again", 10, || {
+        baseline(&set, a(0)).is_some_and(|b| b.replica == a(0))
+    })
+    .await;
+    until("the old-key replica committing", 10, || {
+        committing(&set, a(0))
+    })
+    .await;
+    until("past N's step", 10, || {
+        set.audio(n).due().unwrap() > now + span
+    })
+    .await;
+    assert_eq!(handed_over(&set), 1, "N named again while fenced");
+    until("N committing", 10, || committing(&set, n)).await;
+    assert_eq!(handed_over(&set), 2);
+    sleep(Duration::from_millis(100)).await;
+    pages_whole(&set, &ids, p / PAGE - 2, page_now(&set, n) - 1);
+}

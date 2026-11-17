@@ -566,7 +566,15 @@ impl Life {
         let before = self.base_key.replace(now);
         let mine = v.key;
         if !differs(mine, now) {
-            self.filler = None;
+            // Back to its key before its stop at P took: the stop lapses
+            // and the output goes on committing.
+            if self.filler.take().is_some() {
+                for (o, s) in v.own.standing.iter().enumerate() {
+                    if matches!(s, Standing::Committing { .. }) {
+                        audio.stop_at(o, u64::MAX);
+                    }
+                }
+            }
             if before != Some(now) && b.replica == v.me && before.is_some_and(|k| differs(mine, k))
             {
                 self.switching = true;

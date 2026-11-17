@@ -186,7 +186,8 @@ pub trait Audio: Send + Sync + 'static {
     fn cancel_commit_start(&self, output: usize);
     /// Output `output` stops committing at sample index `at`, a page
     /// boundary: the block holding it commits `[kB, at)` and the output
-    /// is withdrawn from there (a key hand-over).
+    /// is withdrawn from there (a key hand-over); `u64::MAX` lets a
+    /// pending stop lapse.
     fn stop_at(&self, output: usize, at: u64);
     /// Entry `index`, given as unresolved, is decided: its blocks are no
     /// longer degraded for it.

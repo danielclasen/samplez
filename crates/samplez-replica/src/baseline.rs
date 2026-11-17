@@ -421,6 +421,10 @@ fn candidate_unready(v: &LeaderView, a: &Voter) -> bool {
     if a.silent
         || v.judged.contains(&a.id)
         || own.clock.unverified
+        // Fenced by a clock step it detected: its withheld blocks may
+        // not show, since an output that never committed stands idle
+        // and an idle output's statuses say nothing.
+        || own.clock.step_fence
         || v.disrupting == Some(a.id)
         || own.state == Some(ReplicaState::Starting)
     {

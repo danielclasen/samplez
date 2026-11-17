@@ -446,6 +446,9 @@ pub struct Fake {
     pub rebuilds: u64,
     /// Stops the supervisor named, `(output, at)`.
     pub stops: Vec<(usize, u64)>,
+    /// Blocks `[from, to)` a detected clock step skips: withheld at the
+    /// step, cause `ClockStep`, with the step fence self-reported.
+    pub stepped: Vec<(u64, u64)>,
     /// Rebuilds refused: a generation the core names was not built.
     pub refused_rebuilds: u64,
     /// Entries the core holds unresolved: a rebuilt core holds none.
@@ -666,8 +669,19 @@ impl FakeAudio {
             return;
         }
         let first = st.computed.map_or(target, |c| c + 1);
+        if !st.stepped.is_empty() {
+            st.flags.step_fence = st.stepped.iter().any(|&(a, z)| (a..z).contains(&target));
+        }
         let b = self.timing.block;
         for k in first..=target {
+            if st.stepped.iter().any(|&(a, z)| (a..z).contains(&k)) {
+                for out in &mut st.outputs {
+                    out.statuses.withhold(k, Cause::ClockStep);
+                }
+                st.withdraw(true);
+                st.computed = Some(k);
+                continue;
+            }
             let ctx = st.ctx();
             let digest = st.digest(k);
             let data: Vec<f32> = (k * b..(k + 1) * b).map(|i| i as f32).collect();
