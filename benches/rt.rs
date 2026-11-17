@@ -8,6 +8,10 @@
 //! dynamics order crossfading, and through the same strips without gate
 //! and compressor, the order flipped at once; the most strip entries one
 //! wake applies, and a skip.
+//! And on the sets a log entry's batch makes at its index when it holds
+//! every coefficient: of the largest matrix a configuration of B = 48
+//! takes (`COEFFICIENTS_PER_BLOCK_SAMPLE`), set within one block, and of
+//! the coefficient limit, 2^18, which only a block of 512 or more takes.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -419,4 +423,43 @@ library_benchmark_group!(
     ]
 );
 
-main!(library_benchmark_groups = hold, pages, strips);
+/// A matrix of `inputs` by `outputs` at rest, and the batch of a recall
+/// setting every coefficient, in the order a batch sets them.
+fn recall(inputs: usize, outputs: usize) -> (samplez_dsp::Matrix, Vec<(usize, usize, f32)>) {
+    let sets = (0..inputs)
+        .flat_map(|i| (0..outputs).map(move |o| (i, o, ((i + o) % 7) as f32 / 7.0 + 0.1)))
+        .collect();
+    (samplez_dsp::Matrix::new(inputs, outputs), sets)
+}
+
+/// The largest matrix a configuration of B = 48 takes: 176 by 177,
+/// within 48 x 651 coefficients.
+fn recall_at_block_limit() -> (samplez_dsp::Matrix, Vec<(usize, usize, f32)>) {
+    recall(176, 177)
+}
+
+fn recall_at_coefficient_limit() -> (samplez_dsp::Matrix, Vec<(usize, usize, f32)>) {
+    recall(512, 512)
+}
+
+#[library_benchmark]
+#[bench::block_limit(setup = recall_at_block_limit, config = limit(RECALL_BLOCK_LIMIT))]
+#[bench::coefficient_limit(
+    setup = recall_at_coefficient_limit,
+    config = limit(RECALL_COEFFICIENT_LIMIT)
+)]
+fn batch_recall(
+    (mut matrix, sets): (samplez_dsp::Matrix, Vec<(usize, usize, f32)>),
+) -> samplez_dsp::Matrix {
+    for &(i, o, g) in &sets {
+        black_box(matrix.set(i, o, g, 480));
+    }
+    matrix
+}
+
+const RECALL_BLOCK_LIMIT: u64 = 5_430_709;
+const RECALL_COEFFICIENT_LIMIT: u64 = 50_404_847;
+
+library_benchmark_group!(name = batches, benchmarks = [batch_recall]);
+
+main!(library_benchmark_groups = hold, pages, strips, batches);

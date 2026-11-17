@@ -9,6 +9,16 @@ use serde::Deserialize;
 /// The most inputs and the most outputs an engine takes: per-block
 /// verdicts carry one bit per input and per output.
 pub const MAX_INPUTS: usize = 64;
+
+/// The matrix coefficients a configuration may have per sample of its
+/// block. A log entry's batch sets every coefficient it holds at its
+/// index, in one block: a scene recall the whole matrix. A set takes
+/// 11 to 29 ns in the builder image up to 256 by 256 coefficients, and
+/// about 49 ns at the limit of 2^18, where cache misses dominate; at 32
+/// ns a set, a full matrix of this many coefficients per sample is set
+/// within one block period, 20.8 us a sample at 48 kHz. Above it a full
+/// recall would overrun the block it applies in.
+pub const COEFFICIENTS_PER_BLOCK_SAMPLE: usize = 651;
 pub const MAX_OUTPUTS: usize = 64;
 /// The most meters an engine takes.
 pub const MAX_METERS: usize = 64;
@@ -419,6 +429,14 @@ impl Config {
                 samplez_dsp::MAX_COEFFICIENTS
             ));
         }
+        let per_block = self.block_size as usize * COEFFICIENTS_PER_BLOCK_SAMPLE;
+        if coefficients > per_block {
+            return fail(format!(
+                "{coefficients} matrix coefficients, at most {per_block} at blockSize {}: a \
+                 batch setting all of them applies in one block",
+                self.block_size
+            ));
+        }
         if self.meters.len() > MAX_METERS {
             return fail(format!(
                 "{} meters, at most {MAX_METERS}",
@@ -589,6 +607,28 @@ mod tests {
         v["outputs"][0]["channels"] = serde_json::json!(512);
         let e = parse(&v).unwrap_err().to_string();
         assert!(e.contains("matrix coefficients"), "{e}");
+    }
+
+    /// A matrix whose every coefficient a batch could not set within one
+    /// block period is refused: at blockSize 48 one of 31,248
+    /// coefficients is taken, one of 32,768 refused, and taken at
+    /// blockSize 64.
+    #[test]
+    fn a_matrix_a_batch_cannot_set_in_one_block_is_refused() {
+        let mut v = base();
+        v["blockSize"] = serde_json::json!(48);
+        let shape = |v: &mut serde_json::Value, columns: usize| {
+            v["inputs"][0]["channels"] = serde_json::json!(8);
+            v["outputs"][0]["channels"] = serde_json::json!(columns);
+            v["matrix"] = serde_json::json!(vec![vec![0.0; columns]; 8]);
+        };
+        shape(&mut v, 3906);
+        parse(&v).unwrap();
+        shape(&mut v, 4096);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("applies in one block"), "{e}");
+        v["blockSize"] = serde_json::json!(64);
+        parse(&v).unwrap();
     }
 
     #[test]
