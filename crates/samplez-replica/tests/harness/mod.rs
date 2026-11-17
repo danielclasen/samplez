@@ -878,6 +878,26 @@ impl Audio for FakeAudio {
     fn appended(&self, index: u64, request: &Request) {
         self.lock().appended.push((index, request.at_index()));
     }
+    /// The engine refuses a command setting path `bad`, and an entry
+    /// holding more than one command setting path `pair`.
+    fn admits(&self, request: &Request) -> Result<(), String> {
+        let Body::Commands(commands) = &request.body else {
+            return Ok(());
+        };
+        let path = |p: &str| {
+            commands
+                .iter()
+                .filter(|c| c.body.starts_with(p.as_bytes()))
+                .count()
+        };
+        if path("bad=") > 0 {
+            return Err("path bad".into());
+        }
+        if path("pair=") > 1 {
+            return Err("two pairs".into());
+        }
+        Ok(())
+    }
     fn truncated(&self, from: u64) {
         self.lock().truncated.push(from);
     }

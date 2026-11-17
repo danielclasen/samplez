@@ -353,6 +353,10 @@ pub enum Reason {
     /// The command is larger than the replication orders; it was not
     /// ordered, and a resend is refused alike.
     TooLarge,
+    /// The command is one the engine would refuse once committed, such as
+    /// a value outside its configuration; it was not ordered, and a resend
+    /// is refused alike.
+    Invalid,
 }
 
 impl Reason {
@@ -362,6 +366,7 @@ impl Reason {
             Reason::NotCommitable => "not_commitable",
             Reason::Expired => "expired",
             Reason::TooLarge => "too_large",
+            Reason::Invalid => "invalid",
         }
     }
 }

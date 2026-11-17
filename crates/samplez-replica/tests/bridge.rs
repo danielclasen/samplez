@@ -839,3 +839,102 @@ fn scene_recalls_on_a_large_shape_apply_on_every_replica() {
         }
     }
 }
+
+const SOURCES: [&str; 4] = [
+    "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd3a00",
+    "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd3a01",
+    "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd3a02",
+    "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd3a03",
+];
+
+/// A recall's translation: `route` re-routes both inputs to the other
+/// two sources, `outside` sets a coefficient the engine does not have.
+fn recall(request: &Request) -> Option<Translated> {
+    let Body::Commands(commands) = &request.body else {
+        return None;
+    };
+    let entries = match &commands[0].body[..] {
+        b"route" => (0..2)
+            .map(|slot| Entry::Route {
+                slot,
+                flow_id: SOURCES[2 + slot].to_owned(),
+            })
+            .collect(),
+        _ => vec![Entry::Gain {
+            input: 5,
+            output: 0,
+            gain: 0.5,
+        }],
+    };
+    Some((request.at_index()?, entries))
+}
+
+/// A recall changing the sources of two inputs commits and applies on
+/// every replica, one generation re-routing both; a command the engine
+/// would refuse once committed is refused by every replica's check
+/// before it is ordered, so no replica counts a refused entry.
+#[test]
+fn a_two_source_recall_applies_on_every_replica() {
+    let domains: Vec<Domain> = (0..3).map(|_| Domain::new()).collect();
+    let replicas: Vec<(Arc<Engine>, EngineAudio)> = domains
+        .iter()
+        .map(|domain| {
+            let v = serde_json::json!({
+                "blockSize": B,
+                "readerMarginSamples": 960,
+                "libmxl": libmxl(),
+                "domains": [{ "name": "d", "path": domain.0 }],
+                "inputs": (0..2).map(|n| serde_json::json!({
+                    "name": format!("in{n}"), "domain": "d", "flowId": SOURCES[n],
+                    "channels": 1 })).collect::<Vec<_>>(),
+                "outputs": [{ "name": "out0", "domain": "d",
+                              "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f10",
+                              "label": "recall", "group": "samplez-test", "role": "Audio 0",
+                              "channels": 1 }],
+                "matrix": [[1.0], [1.0]],
+                "rt": { "rtCpu": "none" },
+            });
+            bridge_of(&v, 1 << 12, Box::new(recall))
+        })
+        .collect();
+    let processed = |e: &Engine| e.progress().and_then(|p| p.processed);
+    wait_for("every replica computes", || {
+        replicas.iter().all(|(e, _)| processed(e).is_some())
+    });
+    let first = replicas
+        .iter()
+        .map(|(e, _)| processed(e).unwrap())
+        .max()
+        .unwrap();
+    let at = (first + 300) * B;
+    let request = |body: &[u8]| Request {
+        stamp: at,
+        body: Body::Commands(vec![Command {
+            origin: Origin {
+                principal: "p".into(),
+                session: "s".into(),
+                role: Role::Operator,
+                connection: "c".into(),
+            },
+            id: "1".into(),
+            at_index: Some(at),
+            body: body.to_vec(),
+        }]),
+    };
+    for (_, audio) in &replicas {
+        assert!(audio.admits(&request(b"outside")).is_err());
+        assert_eq!(audio.admits(&request(b"route")), Ok(()));
+        audio.appended(1, &request(b"route"));
+        audio.committed(1);
+    }
+    wait_for("both inputs re-routed", || {
+        replicas.iter().all(|(e, _)| {
+            let s = e.status();
+            s.inputs[0].flow_id == SOURCES[2] && s.inputs[1].flow_id == SOURCES[3]
+        })
+    });
+    for (e, audio) in &replicas {
+        assert_eq!(audio.sample().entries_refused, 0);
+        assert_eq!(e.counters().command_late.load(Ordering::Relaxed), 0);
+    }
+}

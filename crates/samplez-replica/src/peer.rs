@@ -113,6 +113,9 @@ pub enum Refused {
     /// First received longer ago than the set deduplicates
     /// (`dedupRetentionS - ageGuard` of E): never ordered.
     Expired,
+    /// A command the engine would refuse once committed, with why: never
+    /// ordered.
+    Invalid(String),
     /// A leader asked for a read index that no majority acknowledged
     /// within the lease: the asker reads its own state, marked stale.
     CutOff,

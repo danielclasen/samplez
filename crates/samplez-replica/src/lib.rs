@@ -1099,11 +1099,28 @@ async fn write(
                 }
             }
             Queued::Command(item) => {
+                if let Err(why) = shared.admits(&[&item.command]) {
+                    let _ = item.reply.send(Err(Refused::Invalid(why)));
+                    continue;
+                }
                 let mut bytes = item.command.size();
                 let mut items = vec![item];
                 while let Ok(queued) = queued.try_recv() {
                     match queued {
-                        Queued::Command(item) if joins(&items[0].command, bytes, &item.command) => {
+                        // One the engine refuses with the entry's others
+                        // opens an entry of its own.
+                        Queued::Command(item)
+                            if joins(&items[0].command, bytes, &item.command)
+                                && shared
+                                    .admits(
+                                        &items
+                                            .iter()
+                                            .map(|i| &i.command)
+                                            .chain([&item.command])
+                                            .collect::<Vec<_>>(),
+                                    )
+                                    .is_ok() =>
+                        {
                             bytes += item.command.size();
                             items.push(item);
                         }
@@ -1116,6 +1133,29 @@ async fn write(
                 shared.order_commands(items, &estimate).await;
             }
         }
+    }
+}
+
+impl Shared {
+    /// Whether this replica's engine takes the entry `commands` make,
+    /// stamped at any index, once committed: checked before the entry is
+    /// ordered, so that no committed entry is refused
+    /// ([`contact::Audio::admits`]).
+    fn admits(&self, commands: &[&Command]) -> Result<(), String> {
+        let Some(contact) = self.contact.get() else {
+            return Ok(());
+        };
+        let commands = commands
+            .iter()
+            .map(|c| Command {
+                at_index: Some(c.at_index.unwrap_or(0)),
+                ..(*c).clone()
+            })
+            .collect();
+        contact.admits(&Request {
+            stamp: 0,
+            body: Body::Commands(commands),
+        })
     }
 }
 
@@ -1370,6 +1410,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                     Reason::Expired,
                     "first received too long ago",
                 )),
+                Err(Refused::Invalid(detail)) => Err(NotApplied::new(Reason::Invalid, detail)),
                 Err(_) => Err(NotApplied::new(Reason::Unavailable, "no leader")),
             }
         })

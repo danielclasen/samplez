@@ -286,6 +286,13 @@ impl Audio for EngineAudio {
         self.engine.truncate(from);
     }
 
+    fn admits(&self, request: &Request) -> Result<(), String> {
+        match (self.translate)(request) {
+            Some((_, entries)) => self.engine.admits(&entries).map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
     fn committed(&self, up_to: u64) {
         self.engine.commit(up_to);
     }

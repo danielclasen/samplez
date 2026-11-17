@@ -198,6 +198,12 @@ pub trait Audio: Send + Sync + 'static {
     /// Entry `index`, given as unresolved, is decided: its blocks are no
     /// longer degraded for it.
     fn resolved(&self, _index: u64) {}
+    /// Whether the engine takes `request` once committed, checked before
+    /// it is ordered: a committed entry the engine refused would stop
+    /// every replica taking writes.
+    fn admits(&self, _request: &Request) -> Result<(), String> {
+        Ok(())
+    }
     /// Drops the running engine's core: its state no longer follows the
     /// log (snapshot install, purge-point verdict).
     fn drop_engine(&self) {}
@@ -2233,6 +2239,12 @@ impl Contact {
             .min()
             .unwrap_or(0);
         st.scheduled = st.scheduled.split_off(&(lowest + 1));
+    }
+
+    /// Whether this replica's engine takes `request` once committed
+    /// ([`Audio::admits`]); the witness has none and takes any.
+    pub fn admits(&self, request: &Request) -> Result<(), String> {
+        self.audio.as_ref().map_or(Ok(()), |a| a.admits(request))
     }
 
     /// The engine refused an appended entry: the replica's output no
