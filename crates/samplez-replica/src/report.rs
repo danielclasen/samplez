@@ -129,6 +129,10 @@ pub struct Own {
     /// The page hashes of its latest pages, per output, oldest first.
     #[serde(default)]
     pub pages: Vec<Page>,
+    /// The entries it holds unresolved, lowest at_index first, at most
+    /// [`MAX_LISTED`]: the leader decides them.
+    #[serde(default)]
+    pub unresolved: Vec<Listed>,
 }
 
 /// One page of one output as the sender computed it (plan 2.11, page

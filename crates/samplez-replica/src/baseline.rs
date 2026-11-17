@@ -32,6 +32,9 @@ pub(crate) struct Voter<'a> {
 
 /// What the leader reads in one report period.
 pub(crate) struct LeaderView<'a> {
+    /// The replicas whose state contradicts the log's decision on an
+    /// entry: page verdict rule (1).
+    pub contradicting: &'a BTreeSet<NodeId>,
     /// The audio voters, by ordinal.
     pub audio: Vec<Voter<'a>>,
     pub judged: &'a BTreeSet<NodeId>,
@@ -271,8 +274,7 @@ impl Leader {
                     .iter()
                     .filter_map(|a| v.pages.get(a.id, o, *q).map(|p| (a.id, *p)))
                     .collect();
-                // (1) is decided with the log's decisions on entries.
-                let j = judge(&records, base, &BTreeSet::new());
+                let j = judge(&records, base, v.contradicting);
                 let reported = |id: NodeId| {
                     v.audio
                         .iter()
@@ -478,7 +480,9 @@ mod tests {
 
         fn decide(&self, leader: &mut Leader) -> Vec<Body> {
             let rank = |id: NodeId| self.owns.iter().position(|(x, _, _)| *x == id).unwrap() as u8;
+            let none = BTreeSet::new();
             let v = LeaderView {
+                contradicting: &none,
                 audio: self
                     .owns
                     .iter()

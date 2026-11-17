@@ -62,6 +62,8 @@ struct Inner<P> {
     membership: StoredMembershipConfig,
     snapshot: Option<StoredSnapshot>,
     snapshots_built: u64,
+    /// Snapshots installed from a leader since the store was opened.
+    installs: u64,
 }
 
 /// One replica's storage. Clones share it.
@@ -211,6 +213,11 @@ fn replace(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
 }
 
 impl<P: Product> Store<P> {
+    /// The product paths `command` sets.
+    pub fn paths(&self, command: &[u8]) -> Vec<String> {
+        self.lock().sm.product.paths(command)
+    }
+
     /// Opens the storage in `dir`, creating it when absent, with `product`
     /// as the empty state the snapshot (if any) is loaded into.
     pub fn open(dir: &Path, product: P, limits: Limits) -> io::Result<Store<P>> {
@@ -263,6 +270,7 @@ impl<P: Product> Store<P> {
             membership,
             snapshot,
             snapshots_built: 0,
+            installs: 0,
         };
         for record in records {
             inner.replay(record);
@@ -360,6 +368,38 @@ impl<P> Store<P> {
                 f(e.log_id, request);
             }
         }
+    }
+
+    /// The first decision applied on (`index`, `term`), by its log
+    /// index.
+    pub fn decided(&self, index: u64, term: u64) -> Option<u64> {
+        self.lock().sm.decided.get(&(index, term)).map(|&(d, _)| d)
+    }
+
+    /// The term of the entry at `index`: from the log, else from the
+    /// state machine while the entry can still be decided.
+    pub fn term_at(&self, index: u64) -> Option<u64> {
+        let inner = self.lock();
+        inner
+            .log
+            .get(&index)
+            .map(|e| e.log_id.term)
+            .or_else(|| inner.sm.terms.get(&index).map(|&(t, _)| t))
+    }
+
+    /// Snapshots installed from a leader since the store was opened.
+    pub fn installs(&self) -> u64 {
+        self.lock().installs
+    }
+
+    /// The index of the last purged log id, 0 for none.
+    pub fn purged_index(&self) -> u64 {
+        self.lock().last_purged.map_or(0, |id| id.index)
+    }
+
+    /// The restamps behind the entry at `index`, as applied.
+    pub fn restamps(&self, index: u64) -> u32 {
+        self.lock().sm.restamps.get(&index).map_or(0, |&(n, _)| n)
     }
 
     /// Calls `f` with the log index and body of every entry the engine
@@ -600,7 +640,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
             inner.last_applied = Some(id);
             responses.push(match &entry.payload {
                 EntryPayload::Blank => Response::default(),
-                EntryPayload::Normal(request) => inner.sm.apply(id.index, request),
+                EntryPayload::Normal(request) => inner.sm.apply_at(id.index, id.term, request),
                 EntryPayload::Membership(membership) => {
                     inner.membership = StoredMembershipConfig {
                         log_id: Some(id),
@@ -658,6 +698,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         inner.last_applied = stored.last_applied;
         inner.membership = stored.membership.clone();
         inner.snapshot = Some(stored);
+        inner.installs += 1;
         Ok(())
     }
 

@@ -55,6 +55,19 @@ pub trait Product: Default + Send + 'static {
 
     /// Replaces the state with a saved one.
     fn load(&mut self, saved: &[u8]) -> Result<(), String>;
+
+    /// The product paths `command` sets. The leader restamps an
+    /// unresolved entry only for the paths no later committed entry sets,
+    /// and voids it when none is left, so a restamp never undoes a later
+    /// value.
+    fn paths(&self, command: &[u8]) -> Vec<String>;
+
+    /// The input slot a `Route` body re-routes, so the state machine keeps
+    /// only the latest passed route per slot; none keeps every distinct
+    /// passed route.
+    fn route_slot(&self, _route: &[u8]) -> Option<u32> {
+        None
+    }
 }
 
 /// How the product applied a command or an expiry.
@@ -86,6 +99,38 @@ pub struct Change {
     pub text: String,
 }
 
+/// How far below the highest stamping index applied an engine entry's
+/// at_index lies before [`StateMachine::prune`] keeps only the latest per
+/// target: past the longest a restamp can lie behind (three restamps of
+/// at most a second each, the decision path's bound) at 48 kHz, and past
+/// the retention a resent copy can still be stamped in.
+pub const PASSED: u64 = 10 * 48_000;
+
+/// What an engine entry sets: one input slot's state, its route, or the
+/// master enable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Target {
+    Slot(u32),
+    Route(u32),
+    /// A route of a slot the product does not name, by its encoding.
+    Encoded(u64),
+    Master,
+}
+
+/// The target of an engine body: a route by the slot the product names,
+/// else by its encoding.
+fn target<P: Product>(product: &P, body: &Body) -> Option<Target> {
+    match body {
+        Body::InputDown { slot, .. } | Body::InputUp { slot, .. } => Some(Target::Slot(*slot)),
+        Body::Route { body, .. } => Some(match product.route_slot(body) {
+            Some(slot) => Target::Route(slot),
+            None => Target::Encoded(xxhash_rust::xxh3::xxh3_64(body)),
+        }),
+        Body::MasterEnable { .. } => Some(Target::Master),
+        _ => None,
+    }
+}
+
 /// Deltas held for clients that resume, the most recent first dropped
 /// last.
 const DELTAS_HELD: usize = 4096;
@@ -93,8 +138,20 @@ const DELTAS_HELD: usize = 4096;
 pub struct StateMachine<P> {
     pub product: P,
     pub dedup: Dedup,
-    /// Entries the engine applies at their at_index, by revision.
+    /// Entries the engine applies at their at_index, by log index: the
+    /// latest per target ([`StateMachine::prune`]) and every one ahead.
     pub pending: BTreeMap<u64, Body>,
+    /// The term and at_index of each entry with an at_index that can
+    /// still be decided, by log index: a decision naming another term at
+    /// that index names an entry this log does not hold.
+    pub terms: BTreeMap<u64, (u64, u64)>,
+    /// The restamps behind a restamped entry, by the log index it is
+    /// known under now, with its at_index: a fourth is never appended.
+    pub restamps: BTreeMap<u64, (u32, u64)>,
+    /// The first decision applied on each (log index, term), by its own
+    /// log index, with the at_index it is kept until: a later decision on
+    /// the same id is a copy and changes nothing.
+    pub decided: BTreeMap<(u64, u64), (u64, u64)>,
     pub baseline: Option<Baseline>,
     pub verdicts: BTreeMap<NodeId, bool>,
     /// The replica the latest `ClockVerdict` judging one named.
@@ -131,6 +188,9 @@ impl<P: Product> StateMachine<P> {
             product,
             dedup: Dedup::new(limits),
             pending: BTreeMap::new(),
+            terms: BTreeMap::new(),
+            restamps: BTreeMap::new(),
+            decided: BTreeMap::new(),
             baseline: None,
             verdicts: BTreeMap::new(),
             latest_judged: None,
@@ -145,10 +205,37 @@ impl<P: Product> StateMachine<P> {
         }
     }
 
-    /// Applies the request of the entry at log index `revision`.
+    /// Applies the request of the entry at log index `revision`, of term
+    /// 0.
     pub fn apply(&mut self, revision: u64, request: &Request) -> Response {
+        self.apply_at(revision, 0, request)
+    }
+
+    /// Applies the request of the entry at log index `revision` of term
+    /// `term`.
+    pub fn apply_at(&mut self, revision: u64, term: u64, request: &Request) -> Response {
         let stamp = request.stamp;
         self.forget_ended(stamp);
+        if let Some(at) = request.at_index()
+            && request.body.decides().is_none()
+        {
+            self.terms.insert(revision, (term, at));
+        }
+        if let Some(named) = request.body.decides() {
+            let until = self
+                .terms
+                .get(&named.0)
+                .map_or(self.highest_stamp, |&(_, at)| at)
+                .max(request.at_index().unwrap_or(0));
+            self.decided.entry(named).or_insert((revision, until));
+        }
+        let response = self.apply_body(revision, term, request);
+        self.prune();
+        response
+    }
+
+    fn apply_body(&mut self, revision: u64, term: u64, request: &Request) -> Response {
+        let stamp = request.stamp;
         match &request.body {
             Body::Commands(commands) => self.commands(stamp, commands),
             Body::Baseline(baseline) => {
@@ -157,18 +244,36 @@ impl<P: Product> StateMachine<P> {
             }
             Body::Restamp {
                 revision: of,
+                term: of_term,
                 at_index,
                 ..
             } => {
-                if let Some(body) = self.pending.get_mut(of) {
-                    restamp(body, *at_index);
+                // The entry is known under the restamp's id from here on.
+                if self.terms.get(of).is_some_and(|&(t, _)| t == *of_term) {
+                    self.terms.remove(of);
+                    if let Some(mut body) = self.pending.remove(of) {
+                        restamp(&mut body, *at_index);
+                        self.pending.insert(revision, body);
+                    }
+                    let behind = self.restamps.remove(of).map_or(0, |(n, _)| n);
+                    self.restamps.insert(revision, (behind + 1, *at_index));
+                    self.terms.insert(revision, (term, *at_index));
                 }
                 Response::default()
             }
-            Body::Void { revision: of } => {
-                self.pending.remove(of);
+            Body::Void {
+                revision: of,
+                term: of_term,
+            } => {
+                if self.terms.get(of).is_some_and(|&(t, _)| t == *of_term) {
+                    self.pending.remove(of);
+                    self.restamps.remove(of);
+                    self.terms.remove(of);
+                }
                 Response::default()
             }
+            // Acted on by the replica it names.
+            Body::PurgePoint { .. } => Response::default(),
             Body::ClockVerdict { replica, judged } => {
                 self.verdicts.insert(*replica, *judged);
                 if *judged {
@@ -214,6 +319,47 @@ impl<P: Product> StateMachine<P> {
                 Response::default()
             }
         }
+    }
+
+    /// Bounds [`StateMachine::pending`] and [`StateMachine::restamps`]:
+    /// an entry whose index lies more than [`PASSED`] below the highest
+    /// stamping index applied took effect on every engine or was decided,
+    /// so of those only the latest per target stays, which a rebuilt
+    /// engine starts from. Log entries carry absolute targets, so an
+    /// older one on the same target adds nothing. A restamp count goes
+    /// with its index passing too: the entry can be late no more.
+    fn prune(&mut self) {
+        let passed = self.highest_stamp.saturating_sub(PASSED);
+        let mut latest: BTreeMap<Target, u64> = BTreeMap::new();
+        let mut gone = Vec::new();
+        for (&index, body) in &self.pending {
+            let (Some(at), Some(target)) = (body.at_index(), target(&self.product, body)) else {
+                continue;
+            };
+            if at >= passed {
+                continue;
+            }
+            if let Some(older) = latest.insert(target, index) {
+                gone.push(older);
+            }
+        }
+        for index in gone {
+            self.pending.remove(&index);
+            self.terms.remove(&index);
+        }
+        let done: Vec<u64> = self
+            .restamps
+            .iter()
+            .filter(|&(_, &(_, at))| at < passed)
+            .map(|(&index, _)| index)
+            .collect();
+        for index in done {
+            self.restamps.remove(&index);
+        }
+        let pending = &self.pending;
+        self.terms
+            .retain(|index, &mut (_, at)| at >= passed || pending.contains_key(index));
+        self.decided.retain(|_, &mut (_, until)| until >= passed);
     }
 
     /// Applies every command of an entry, then makes its changes one delta
@@ -330,6 +476,9 @@ impl<P: Product> StateMachine<P> {
         Replicated {
             product: self.product.save(),
             pending: self.pending.clone(),
+            terms: self.terms.clone(),
+            restamps: self.restamps.clone(),
+            decided: self.decided.iter().map(|(k, v)| (*k, *v)).collect(),
             baseline: self.baseline.clone(),
             verdicts: self.verdicts.clone(),
             latest_judged: self.latest_judged,
@@ -347,6 +496,9 @@ impl<P: Product> StateMachine<P> {
         self.product.load(&saved.product)?;
         self.dedup = Dedup::load(limits, saved.dedup);
         self.pending = saved.pending;
+        self.terms = saved.terms;
+        self.restamps = saved.restamps;
+        self.decided = saved.decided.into_iter().collect();
         self.baseline = saved.baseline;
         self.verdicts = saved.verdicts;
         self.latest_judged = saved.latest_judged;
@@ -367,7 +519,13 @@ pub(crate) fn restamp(body: &mut Body, to: u64) {
         Body::InputDown { at_index, .. }
         | Body::InputUp { at_index, .. }
         | Body::Route { at_index, .. }
-        | Body::MasterEnable { at_index, .. } => *at_index = to,
+        | Body::MasterEnable { at_index, .. }
+        | Body::Restamp { at_index, .. } => *at_index = to,
+        Body::Commands(commands) => {
+            for c in commands {
+                c.at_index = Some(to);
+            }
+        }
         _ => {}
     }
 }
@@ -452,6 +610,9 @@ pub(crate) mod tests {
         }
         fn text(&self) -> String {
             serde_json::to_string(&self.values).expect("encodes")
+        }
+        fn paths(&self, command: &[u8]) -> Vec<String> {
+            vec![parse(command).0]
         }
         fn save(&self) -> Vec<u8> {
             serde_json::to_vec(&(&self.values, self.applied)).expect("encodes")
@@ -915,6 +1076,7 @@ pub(crate) mod tests {
                 stamp: 0,
                 body: Body::Restamp {
                     revision: 1,
+                    term: 0,
                     at_index: 1920,
                     paths: vec![],
                 },
@@ -924,10 +1086,193 @@ pub(crate) mod tests {
             4,
             &Request {
                 stamp: 0,
-                body: Body::Void { revision: 2 },
+                body: Body::Void {
+                    revision: 2,
+                    term: 0,
+                },
             },
         );
         assert_eq!(sm.pending.len(), 1);
-        assert_eq!(sm.pending[&1].at_index(), Some(1920));
+        assert_eq!(
+            sm.pending[&3].at_index(),
+            Some(1920),
+            "known under the restamp's id"
+        );
+        assert_eq!(sm.restamps[&3], (1, 1920));
+    }
+
+    fn at(stamp: u64, body: Body) -> Request {
+        Request { stamp, body }
+    }
+
+    /// Each restamp names the one before it and the count follows the
+    /// entry; a decision naming another term at that index is one on an
+    /// id this log does not hold and leaves its entry alone.
+    #[test]
+    fn restamps_follow_the_entry_and_a_decision_on_another_term_changes_nothing() {
+        let mut sm = machine();
+        let down = Body::InputDown {
+            slot: 1,
+            at_index: 960,
+        };
+        sm.apply_at(5, 2, &at(0, down));
+        sm.apply_at(
+            6,
+            3,
+            &at(
+                0,
+                Body::Void {
+                    revision: 5,
+                    term: 1,
+                },
+            ),
+        );
+        sm.apply_at(
+            7,
+            3,
+            &at(
+                0,
+                Body::Restamp {
+                    revision: 5,
+                    term: 1,
+                    at_index: 1920,
+                    paths: vec![],
+                },
+            ),
+        );
+        assert_eq!(sm.pending[&5].at_index(), Some(960), "term 1 is not held");
+        let mut of = (5, 2);
+        for (n, index) in [8u64, 9, 10].into_iter().enumerate() {
+            let restamp = Body::Restamp {
+                revision: of.0,
+                term: of.1,
+                at_index: 960 * (index - 6),
+                paths: vec![],
+            };
+            sm.apply_at(index, 3, &at(0, restamp));
+            assert_eq!(sm.restamps[&index].0, n as u32 + 1);
+            assert_eq!(sm.pending[&index].at_index(), Some(960 * (index - 6)));
+            of = (index, 3);
+        }
+        assert_eq!(sm.pending.len(), 1);
+        sm.apply_at(
+            11,
+            3,
+            &at(
+                0,
+                Body::Void {
+                    revision: 10,
+                    term: 3,
+                },
+            ),
+        );
+        assert!(sm.pending.is_empty() && sm.restamps.is_empty() && sm.terms.is_empty());
+    }
+
+    /// The Void the engine is handed in place of a repeat decision on an
+    /// id changes nothing: not once the entry was applied (pruned past,
+    /// so no longer pending), nor once it was restamped (known under the
+    /// restamp's id, which the repeat does not name).
+    #[test]
+    fn the_void_standing_in_for_a_repeat_decision_is_a_no_op() {
+        let mut sm = machine();
+        let down = Body::InputDown {
+            slot: 1,
+            at_index: 960,
+        };
+        sm.apply_at(5, 2, &at(0, down.clone()));
+        let restamp = Body::Restamp {
+            revision: 5,
+            term: 2,
+            at_index: 1920,
+            paths: vec![],
+        };
+        sm.apply_at(6, 3, &at(0, restamp));
+        let (pending, restamps) = (sm.pending.clone(), sm.restamps.clone());
+        sm.apply_at(
+            7,
+            3,
+            &at(
+                0,
+                Body::Void {
+                    revision: 5,
+                    term: 2,
+                },
+            ),
+        );
+        assert_eq!(
+            (&sm.pending, &sm.restamps),
+            (&pending, &restamps),
+            "restamped"
+        );
+        assert_eq!(sm.decided[&(5, 2)].0, 6, "the first decision stays the one");
+        // Applied: its index passed long ago and a later entry on the same
+        // slot leaves only that one pending.
+        let mut sm = machine();
+        sm.apply_at(5, 2, &at(0, down));
+        let up = Body::InputUp {
+            slot: 1,
+            at_index: 2 * PASSED,
+        };
+        sm.apply_at(6, 2, &at(4 * PASSED, up));
+        let pending = sm.pending.clone();
+        assert!(!pending.contains_key(&5));
+        sm.apply_at(
+            7,
+            3,
+            &at(
+                4 * PASSED,
+                Body::Void {
+                    revision: 5,
+                    term: 2,
+                },
+            ),
+        );
+        assert_eq!(sm.pending, pending, "applied");
+    }
+
+    /// Pending engine entries stay bounded: once an entry's index lies
+    /// [`PASSED`] below the highest stamp applied only the latest per
+    /// target is kept, entries ahead all are, and a snapshot carries the
+    /// terms and restamp counts.
+    #[test]
+    fn pending_keeps_the_latest_passed_entry_per_target() {
+        let mut sm = machine();
+        for n in 0..1000u64 {
+            let body = if n % 2 == 0 {
+                Body::InputDown {
+                    slot: (n % 4) as u32,
+                    at_index: n * 48,
+                }
+            } else {
+                Body::MasterEnable {
+                    enabled: n % 3 == 0,
+                    at_index: n * 48,
+                }
+            };
+            sm.apply_at(n + 1, 1, &at(n * 48, body));
+        }
+        let ahead = 1000 * 48;
+        sm.apply_at(
+            1001,
+            1,
+            &at(
+                ahead + PASSED,
+                Body::InputUp {
+                    slot: 0,
+                    at_index: ahead + 2 * PASSED,
+                },
+            ),
+        );
+        // Slots 0 and 2 and the master once each, and the one ahead.
+        assert_eq!(sm.pending.len(), 4, "{:?}", sm.pending.keys());
+        assert_eq!(sm.pending.len(), sm.terms.len());
+        assert!(sm.pending.contains_key(&1001));
+        let mut loaded = machine();
+        loaded
+            .load(sm.save(), Limits::defaults(48_000))
+            .expect("loads");
+        assert_eq!(loaded.terms, sm.terms);
+        assert_eq!(loaded.pending, sm.pending);
     }
 }

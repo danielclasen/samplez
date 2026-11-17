@@ -147,15 +147,23 @@ pub enum Body {
     /// Client commands, deduplicated by (principal, session, id).
     Commands(Vec<Command>),
     Baseline(Baseline),
-    /// Moves the pending entry at `revision` to `at_index`.
+    /// Applies the unresolved entry at log index `revision` of term
+    /// `term` at `at_index` instead, a fresh index the leader stamps; the
+    /// entry is then known under the restamp's own log id, which a later
+    /// restamp of it names. `paths` names the product paths it still sets
+    /// when only some are left; empty for the whole entry.
     Restamp {
         revision: u64,
+        term: u64,
         at_index: u64,
         paths: Vec<String>,
     },
-    /// Drops the pending entry at `revision` unapplied.
+    /// Drops the unresolved entry at log index `revision` of term `term`
+    /// unapplied. One naming an id the log does not hold at that index
+    /// changes no state; it resolves the id where a replica holds it.
     Void {
         revision: u64,
+        term: u64,
     },
     ClockVerdict {
         replica: NodeId,
@@ -167,6 +175,14 @@ pub enum Body {
     Diverged {
         replica: NodeId,
         page: u64,
+    },
+    /// The leader cannot tell the unresolved id `replica` reported from
+    /// the committed entry it purged at that index: `replica` returns to
+    /// `starting` and rebuilds its engine from its product state once its
+    /// applied index passed `index`.
+    PurgePoint {
+        replica: NodeId,
+        index: u64,
     },
     Disrupt(Option<Disruption>),
     /// Renews the leases of these sessions at the entry's stamping index.
@@ -210,7 +226,19 @@ impl Body {
             Body::InputDown { at_index, .. }
             | Body::InputUp { at_index, .. }
             | Body::Route { at_index, .. }
-            | Body::MasterEnable { at_index, .. } => Some(*at_index),
+            | Body::MasterEnable { at_index, .. }
+            | Body::Restamp { at_index, .. } => Some(*at_index),
+            _ => None,
+        }
+    }
+
+    /// The decision on an unresolved entry: the log index and term it
+    /// names.
+    pub fn decides(&self) -> Option<(u64, u64)> {
+        match self {
+            Body::Restamp { revision, term, .. } | Body::Void { revision, term } => {
+                Some((*revision, *term))
+            }
             _ => None,
         }
     }
