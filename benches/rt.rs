@@ -9,9 +9,10 @@
 //! and compressor, the order flipped at once; the most strip entries one
 //! wake applies, and a skip.
 //! And on the sets a log entry's batch makes at its index when it holds
-//! every coefficient: of the largest matrix a configuration of B = 48
-//! takes (`COEFFICIENTS_PER_BLOCK_SAMPLE`), set within one block, and of
-//! the coefficient limit, 2^18, which only a block of 512 or more takes.
+//! every coefficient of a populated, ramping matrix: of the largest
+//! matrix a configuration of B = 48 takes and of the largest any takes,
+//! at B = 1024 (`COEFFICIENTS_PER_BLOCK_SAMPLE`), set within a quarter of
+//! the block.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -423,31 +424,37 @@ library_benchmark_group!(
     ]
 );
 
-/// A matrix of `inputs` by `outputs` at rest, and the batch of a recall
-/// setting every coefficient, in the order a batch sets them.
+/// A matrix of `inputs` by `outputs` with every coefficient set and
+/// ramping, and the batch of a recall setting every coefficient anew, in
+/// the order a batch sets them.
 fn recall(inputs: usize, outputs: usize) -> (samplez_dsp::Matrix, Vec<(usize, usize, f32)>) {
+    let mut matrix = samplez_dsp::Matrix::new(inputs, outputs);
+    for i in 0..inputs {
+        for o in 0..outputs {
+            assert!(matrix.set(i, o, 0.5, 480));
+        }
+    }
     let sets = (0..inputs)
         .flat_map(|i| (0..outputs).map(move |o| (i, o, ((i + o) % 7) as f32 / 7.0 + 0.1)))
         .collect();
-    (samplez_dsp::Matrix::new(inputs, outputs), sets)
+    (matrix, sets)
 }
 
-/// The largest matrix a configuration of B = 48 takes: 176 by 177,
-/// within 48 x 651 coefficients.
-fn recall_at_block_limit() -> (samplez_dsp::Matrix, Vec<(usize, usize, f32)>) {
-    recall(176, 177)
+/// The largest matrix a configuration of B = 48 takes: 80 by 90, 48 x
+/// 150 coefficients.
+fn recall_at_block_48() -> (samplez_dsp::Matrix, Vec<(usize, usize, f32)>) {
+    recall(80, 90)
 }
 
-fn recall_at_coefficient_limit() -> (samplez_dsp::Matrix, Vec<(usize, usize, f32)>) {
-    recall(512, 512)
+/// The largest matrix any configuration takes: 384 by 400, 1024 x 150
+/// coefficients.
+fn recall_at_block_1024() -> (samplez_dsp::Matrix, Vec<(usize, usize, f32)>) {
+    recall(384, 400)
 }
 
 #[library_benchmark]
-#[bench::block_limit(setup = recall_at_block_limit, config = limit(RECALL_BLOCK_LIMIT))]
-#[bench::coefficient_limit(
-    setup = recall_at_coefficient_limit,
-    config = limit(RECALL_COEFFICIENT_LIMIT)
-)]
+#[bench::block_48(setup = recall_at_block_48, config = limit(RECALL_BLOCK_48))]
+#[bench::block_1024(setup = recall_at_block_1024, config = limit(RECALL_BLOCK_1024))]
 fn batch_recall(
     (mut matrix, sets): (samplez_dsp::Matrix, Vec<(usize, usize, f32)>),
 ) -> samplez_dsp::Matrix {
@@ -457,8 +464,8 @@ fn batch_recall(
     matrix
 }
 
-const RECALL_BLOCK_LIMIT: u64 = 5_430_709;
-const RECALL_COEFFICIENT_LIMIT: u64 = 50_404_847;
+const RECALL_BLOCK_48: u64 = 1_291_097;
+const RECALL_BLOCK_1024: u64 = 31_257_737;
 
 library_benchmark_group!(name = batches, benchmarks = [batch_recall]);
 
