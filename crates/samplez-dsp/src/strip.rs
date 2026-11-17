@@ -1562,6 +1562,75 @@ mod tests {
         }
     }
 
+    /// A strip on, high-pass, equaliser, gate and compressor, at the
+    /// largest trim.
+    fn busy(legs: usize) -> Strip {
+        let mut s = Strip::new(legs, 48);
+        let params = [
+            StripParam::Trim { db: 20.0 },
+            StripParam::Hpf {
+                enabled: true,
+                freq: 80.0,
+            },
+            StripParam::Eq { enabled: true },
+            StripParam::EqBand {
+                band: 3,
+                value: band(BandType::HighShelf, 4000.0, 18.0, 16.0),
+            },
+            StripParam::Gate(GateParams {
+                enabled: true,
+                threshold_db: -60.0,
+                range_db: 40.0,
+                attack_ms: 0.1,
+                release_ms: 50.0,
+            }),
+            StripParam::Comp(CompParams {
+                enabled: true,
+                threshold_db: -20.0,
+                ratio: 4.0,
+                attack_ms: 2.0,
+                release_ms: 50.0,
+                knee_db: 0.0,
+                makeup_db: 0.0,
+            }),
+        ];
+        for p in params {
+            assert!(s.set(p));
+        }
+        s
+    }
+
+    /// An infinity, a NaN or a sample whose gains overflow leaves a state
+    /// [`Strip::is_valid`] takes, so a replica that read one still donates
+    /// its core, and the strip recovers: a second later its output is
+    /// finite and the reference's, which never read one, to within
+    /// rounding of the states that took different paths.
+    #[test]
+    fn a_non_finite_input_leaves_a_valid_strip_that_recovers() {
+        let sine = |n: usize| 0.25 * (n as f32 * 0.07).sin();
+        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, f32::MAX] {
+            let (mut s, mut reference) = (busy(2), busy(2));
+            let mut index = 0;
+            for block in 0..1000 {
+                let mut buf: Vec<f32> = (0..96).map(|i| sine(index + i % 48)).collect();
+                let mut want = buf.clone();
+                if block == 10 {
+                    buf[5] = bad;
+                    buf[48 + 20] = bad;
+                }
+                s.process(&mut buf, 48);
+                reference.process(&mut want, 48);
+                assert!(s.is_valid(), "after {bad} in block {block}: {s:?}");
+                index += 48;
+                if block == 999 {
+                    for (x, y) in buf.iter().zip(&want) {
+                        assert!(x.is_finite() && (x - y).abs() < 1e-4, "{bad}: {x} {y}");
+                    }
+                }
+            }
+        }
+    }
+
     /// A strip holding a value none reaches is not valid: a NaN or an
     /// infinity in its state, a ramp out of range, a parameter out of
     /// its range. The dynamics' own are checked with them.

@@ -10,13 +10,18 @@
 //! filter stays stable at every intermediate value, since `g > 0` and
 //! `k > 0` throughout. The state runs in f32, one leg after the other,
 //! in a fixed order of operations without FMA. After each block a state
-//! below -400 dB is set to zero, so silence decays to exact zeros.
+//! below -400 dB is set to zero, so silence decays to exact zeros, and so
+//! is one above +600 dB or not finite, which only a non-finite or
+//! overflowing input leaves, so the section recovers at the next block.
 
 /// Sample rate the coefficients are computed for.
 pub const SAMPLE_RATE: f64 = 48_000.0;
 
 /// State magnitude set to zero after each block: -400 dB.
 const FLUSH: f32 = 1.0e-20;
+
+/// Largest state magnitude kept after a block: +600 dB.
+pub(crate) const STATE_MAX: f32 = 1.0e30;
 
 /// `(g, k, m0, m1, m2)`.
 pub(crate) type Coefficients = [f32; 5];
@@ -279,9 +284,10 @@ impl<const L: usize> Svf<L> {
             // A state below FLUSH is set to zero: the trapezoidal
             // integrators can stop on a small value once their increment
             // underflows, under FTZ/DAZ or rounding, and silence must
-            // reach exact zeros.
+            // reach exact zeros. One above STATE_MAX, or a NaN, which
+            // fails both comparisons, is set to zero too.
             for v in &mut s {
-                if v.abs() < FLUSH {
+                if !(FLUSH..=STATE_MAX).contains(&v.abs()) {
                     *v = 0.0;
                 }
             }

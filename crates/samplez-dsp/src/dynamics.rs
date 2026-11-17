@@ -170,6 +170,9 @@ fn smooth(y: f32, target: f32, a: f32) -> f32 {
     }
 }
 
+/// The largest magnitude of the legs at sample `n`, at most `f32::MAX`:
+/// a NaN fails the comparison and an infinity is taken as `f32::MAX`, so
+/// the key an interval keeps is finite whatever the input.
 #[inline]
 fn key(buf: &[f32], legs: usize, frames: usize, n: usize) -> f32 {
     let mut k = 0.0f32;
@@ -179,7 +182,7 @@ fn key(buf: &[f32], legs: usize, frames: usize, n: usize) -> f32 {
             k = v;
         }
     }
-    k
+    k.min(f32::MAX)
 }
 
 /// The interval of the gain computer running: the largest key so far,
