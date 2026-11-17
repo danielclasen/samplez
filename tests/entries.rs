@@ -946,16 +946,15 @@ fn a_re_route_crossfades_from_its_index_after_a_silent_block() {
 }
 
 /// A log entry re-routing two inputs of one domain gets one generation
-/// covering both, swapped in at its index: both read their new flows and
-/// neither is held silent for a generation still to come.
+/// covering both, swapped in at its index: both cross-fade from their
+/// flows to the new ones, which nobody writes, from that index on, sample
+/// for sample, and neither waits for a generation still to come.
 #[test]
 fn a_log_entry_re_routing_two_inputs_builds_one_generation() {
     let domain = Domain::new();
     let (src0, src1, next0, next1, out) = (new_id(), new_id(), new_id(), new_id(), new_id());
-    let _pilots: Vec<Pilot> = [&src0, &src1, &next0, &next1]
-        .iter()
-        .map(|id| Pilot::start(&domain.0, id, 1, B, 0))
-        .collect();
+    let _p0 = Pilot::start(&domain.0, &src0, 1, B, 0);
+    let _p1 = Pilot::start(&domain.0, &src1, 1, B, 0);
     let cfg = config(
         &domain.0,
         &[(&src0, 1), (&src1, 1)],
@@ -979,16 +978,26 @@ fn a_log_entry_re_routing_two_inputs_builds_one_generation() {
     e.append_batch(1, r, &routes).unwrap();
     e.commit(1);
     let mut seen = Vec::new();
-    wait_past(&rx, (r + u64::from(RAMP)) / B + 20, &mut seen);
+    let d = r + u64::from(RAMP);
+    wait_past(&rx, d / B + 20, &mut seen);
+    let range = r / B - 20..d / B + 20;
+    let x = common::read_blocks(&domain.0, &out, 2, range.clone());
+    for (i, k) in range.enumerate() {
+        let want = if k * B < r {
+            ramped(0, k, 1.0, 1.0, 0)
+        } else {
+            ramped(0, k, 1.0, 0.0, r)
+        };
+        for c in 0..2 {
+            assert!(block(&x, 2, i, c) == want, "block {k} of input {c}");
+        }
+    }
     let s = e.status();
     assert_eq!(
         (&*s.inputs[0].flow_id, &*s.inputs[1].flow_id),
         (&*next0, &*next1)
     );
     assert_eq!(e.counters().generation_late.load(Relaxed), 0);
-    for v in seen.iter().filter(|v| v.k * B >= r) {
-        assert_eq!(v.silenced, 0, "{v:?}");
-    }
     assert_eq!(s.diverged, None);
     common::stop(e);
 }
