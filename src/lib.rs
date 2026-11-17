@@ -8,6 +8,7 @@
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("samplez supports x86_64 only");
 
+mod batch;
 pub mod blocks;
 pub mod config;
 pub mod engine;

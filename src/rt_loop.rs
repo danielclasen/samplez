@@ -24,6 +24,7 @@ use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outco
 use samplez_mxl::output::{FlowWriter, Write};
 use samplez_mxl::{MxlApi, time};
 
+use crate::batch::Batch;
 use crate::blocks::{
     Cause, Changes, Ctx, Hold, Kind, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
@@ -138,6 +139,9 @@ pub struct Counters {
     /// Entries whose index passed without a core, taken off the pending
     /// list: strip entries applied to their strips, the others not.
     pub entries_without_core: AtomicU64,
+    /// Spent batches neither the return ring nor the RT thread's spent
+    /// list had room for: leaked rather than freed on the RT thread.
+    pub batches_leaked: AtomicU64,
     /// Page hashes the supervisor could not pass on: the replicated
     /// state's channel was full.
     pub page_hashes_unsent: AtomicU64,
@@ -421,11 +425,44 @@ pub(crate) enum Change {
     Route { slot: usize },
     /// Sets one parameter of the slot's strip from the index.
     Strip { slot: usize, param: StripParam },
+    /// The engine entries of one log entry, folded: its gains, strip
+    /// parameters (`strips` says whether it has any) and `InputDown`s in
+    /// a [`Batch`] the RT thread holds by log id, and at most one
+    /// generation-needing entry.
+    Batch {
+        strips: bool,
+        generation: Option<Generating>,
+    },
+}
+
+/// The generation-needing entry of a [`Change::Batch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Generating {
+    InputUp { slot: usize },
+    Route { slot: usize },
+}
+
+impl Generating {
+    pub fn change(self) -> Change {
+        match self {
+            Generating::InputUp { slot } => Change::InputUp { slot },
+            Generating::Route { slot } => Change::Route { slot },
+        }
+    }
 }
 
 impl Change {
     pub fn needs_generation(&self) -> bool {
-        matches!(self, Change::InputUp { .. } | Change::Route { .. })
+        self.generation().is_some()
+    }
+
+    /// The generation-needing entry the change is or holds.
+    pub fn generation(&self) -> Option<Change> {
+        match *self {
+            Change::InputUp { .. } | Change::Route { .. } => Some(*self),
+            Change::Batch { generation, .. } => generation.map(Generating::change),
+            _ => None,
+        }
     }
 
     /// Whether a core holds what this change did once applied: a gain
@@ -435,10 +472,14 @@ impl Change {
     /// product state, stay with the RT thread, so an entry making them
     /// must still reach it.
     pub fn in_core(&self, strips: bool) -> bool {
-        match self {
+        match *self {
             Change::Gain { .. } | Change::InputDown { .. } => true,
             Change::Strip { .. } => strips,
             Change::InputUp { .. } | Change::Route { .. } => false,
+            Change::Batch {
+                strips: has,
+                generation,
+            } => generation.is_none() && (strips || !has),
         }
     }
 }
@@ -453,13 +494,27 @@ pub(crate) struct RtEntry {
     pub change: Change,
 }
 
-/// Entries the RT thread holds before their index, and the capacity of
-/// the entry ring.
+/// A committed log entry as the entry ring carries it: a
+/// [`Change::Batch`] with its batch, allocated off the RT thread.
+pub(crate) struct RingEntry {
+    pub entry: RtEntry,
+    pub batch: Option<Box<Batch>>,
+}
+
+/// Log entries the RT thread holds before their index, and the capacity
+/// of the entry ring: one each, however many engine entries it folds, as
+/// the leader stamps at most `FUTURE_LIST` (the same 64) log entries
+/// ahead.
 pub(crate) const PENDING_CHANGES: usize = 64;
+
+/// Spent batches the RT thread keeps while the return ring is full.
+pub(crate) const SPENT: usize = 2 * PENDING_CHANGES;
 
 pub(crate) enum Returned {
     Generation(Box<Gen>),
     Writer(Box<FlowWriter>),
+    /// A batch applied, reported late or known already.
+    Batch(Box<Batch>),
 }
 
 pub(crate) struct Slot {
@@ -862,6 +917,9 @@ pub(crate) struct Mix {
     /// Pending entries, by `at_index`, in log order within one index.
     /// Capacity [`PENDING_CHANGES`], never exceeded.
     pub pending: Vec<RtEntry>,
+    /// The batch of each [`Change::Batch`] pending or due, by log id.
+    /// Capacity [`PENDING_CHANGES`], never exceeded: one per entry.
+    pub batches: Vec<(LogId, Box<Batch>)>,
     /// Entries other than gain changes taken off the pending list by the
     /// last [`Mix::to`], in order, each with whether it was late. They
     /// are applied by the loop.
@@ -890,6 +948,7 @@ impl Mix {
             pos: None,
             ramp_end: 0,
             pending: Vec::with_capacity(PENDING_CHANGES),
+            batches: Vec::with_capacity(PENDING_CHANGES),
             due: Vec::with_capacity(PENDING_CHANGES),
             applied: 0,
             last_taken: 0,
@@ -933,6 +992,30 @@ impl Mix {
         true
     }
 
+    /// Queues `entry` with its batch, a [`Change::Batch`]'s. The batch
+    /// back, and nothing queued, when [`PENDING_CHANGES`] are pending:
+    /// the caller hands it off the RT thread.
+    pub fn push_with(
+        &mut self,
+        entry: RtEntry,
+        batch: Option<Box<Batch>>,
+    ) -> Result<(), Option<Box<Batch>>> {
+        if !self.push(entry) {
+            return Err(batch);
+        }
+        if let Some(b) = batch {
+            // As many as pending entries: room.
+            self.batches.push((entry.id, b));
+        }
+        Ok(())
+    }
+
+    /// Takes the batch of entry `id` out of the list.
+    pub fn take_batch(&mut self, id: LogId) -> Option<Box<Batch>> {
+        let n = self.batches.iter().position(|b| b.0 == id)?;
+        Some(self.batches.swap_remove(n).1)
+    }
+
     /// Whether entry `id` is pending.
     pub fn holds(&self, id: LogId) -> bool {
         self.pending.iter().any(|c| c.id == id)
@@ -970,6 +1053,17 @@ impl Mix {
         {
             self.pending.remove(0);
             self.last_taken = self.last_taken.max(c.id);
+            if matches!(c.change, Change::Batch { .. }) {
+                // Its gains apply here, the rest with the other due
+                // entries; a late one is reported there.
+                if c.at_index >= pos {
+                    self.matrix.advance((c.at_index - pos) as usize);
+                    pos = c.at_index;
+                    self.batch_gains(c);
+                }
+                self.due.push((c, c.at_index < pos));
+                continue;
+            }
             let Change::Gain {
                 input,
                 output,
@@ -994,6 +1088,27 @@ impl Mix {
         }
         self.matrix.advance((start - pos) as usize);
         self.pos = Some(start + self.block);
+    }
+
+    /// Sets the gains of batch entry `c` at its index, the matrix there.
+    fn batch_gains(&mut self, c: RtEntry) {
+        let Mix {
+            matrix,
+            batches,
+            ramp,
+            ramp_end,
+            ..
+        } = self;
+        let Some((_, b)) = batches.iter().find(|b| b.0 == c.id) else {
+            return;
+        };
+        let columns = matrix.outputs();
+        b.gains.each(|k, gain| {
+            let (input, output) = (k / columns, k % columns);
+            if matrix.set(input, output, gain, *ramp) && matrix.is_ramping(input, output) {
+                *ramp_end = (*ramp_end).max(c.at_index + u64::from(*ramp));
+            }
+        });
     }
 
     /// Whether a coefficient ramp runs in block `k`.
@@ -1054,7 +1169,12 @@ pub(crate) struct Rt {
     /// hand-over installs one.
     pub core: bool,
     pub cmd: Consumer<Command>,
-    pub entries: Consumer<RtEntry>,
+    pub entries: Consumer<RingEntry>,
+    /// Spent batches the return ring had no room for. Capacity
+    /// [`SPENT`], never exceeded. Boxed as everywhere a batch goes: it
+    /// moves by pointer between the ring, this thread and core buffers.
+    #[allow(clippy::vec_box)]
+    pub spent: Vec<Box<Batch>>,
     pub ret: Producer<Returned>,
     pub tel: Producer<Telemetry>,
     pub meters: Producer<MeterRecord>,
@@ -1217,6 +1337,7 @@ fn capture_core(
         d.strip.clone_from(&s.strip);
         d.strip_pos = s.strip_pos;
     }
+    c.put_batches(&m.batches);
     c.awaiting_gen.clear();
     c.awaiting_gen.extend_from_slice(awaiting);
     c.pending_gen = pending_gen;
@@ -1555,42 +1676,98 @@ impl Rt {
     }
 
     /// Moves committed entries from the entry ring to the pending list
-    /// while it has room.
+    /// while it has room; an entry the list holds already needs none.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn take_entries(&mut self) {
-        while self.mix.pending.len() < PENDING_CHANGES
-            && let Ok(entry) = self.entries.pop()
-        {
-            self.taken += 1;
-            self.last_entry = self.last_entry.max(entry.id);
+        self.return_spent();
+        while let Ok(head) = self.entries.peek() {
             // A hand-over brought the entry in already, pending or
             // applied by the replay.
-            if self.mix.holds(entry.id) {
+            let held = self.mix.holds(head.entry.id);
+            if !held && self.mix.pending.len() >= PENDING_CHANGES {
+                return;
+            }
+            let Ok(RingEntry { entry, batch }) = self.entries.pop() else {
+                return;
+            };
+            self.taken += 1;
+            self.last_entry = self.last_entry.max(entry.id);
+            if held {
+                self.retire(batch);
                 continue;
             }
-            let strip = matches!(entry.change, Change::Strip { .. });
-            if strip && entry.id <= self.strips_upto {
-                // In the strips the last replayed core brought, or on
-                // its pending list, applied here at its index; taken
-                // through that core.
-                self.mix.last_taken = self.mix.last_taken.max(entry.id);
-                continue;
-            }
-            if entry.id <= self.skip_upto {
-                // The core knew it. It holds what a gain change or an
-                // InputDown did; any other entry below the install it
-                // applied without what it did reaching this thread, so
-                // that entry is applied as on time. One at or past the
-                // install was on the core's pending list, applied here at
-                // its index.
-                if !entry.change.in_core(false) && entry.at_index < self.install_at {
-                    self.apply(entry);
+            self.take(entry, batch);
+        }
+    }
+
+    /// Takes entry `entry`, with its batch, off the ring: pending, or
+    /// known to the last core installed.
+    fn take(&mut self, mut entry: RtEntry, mut batch: Option<Box<Batch>>) {
+        if entry.id <= self.strips_upto {
+            // Its strip parameters are in the strips the last replayed
+            // core brought, or on its pending list, applied here at its
+            // index; taken through that core.
+            match &mut entry.change {
+                Change::Strip { .. } => {
+                    self.mix.last_taken = self.mix.last_taken.max(entry.id);
+                    return;
                 }
-                // Taken through the core, as one on the pending list.
-                self.mix.last_taken = self.mix.last_taken.max(entry.id);
-                continue;
+                Change::Batch { strips, .. } => {
+                    *strips = false;
+                    if let Some(b) = batch.as_mut() {
+                        // Copies: nothing is freed.
+                        b.strips.clear();
+                    }
+                }
+                _ => {}
             }
-            let _ = self.mix.push(entry);
+        }
+        if entry.id <= self.skip_upto {
+            // The core knew it. It holds what gain changes and InputDowns
+            // did; what else an entry below the install did did not reach
+            // this thread, so that is applied as on time. One at or past
+            // the install was on the core's pending list, applied here at
+            // its index.
+            if !entry.change.in_core(false) && entry.at_index < self.install_at {
+                self.apply_known(entry, batch.as_deref(), true, true);
+            }
+            self.retire(batch);
+            // Taken through the core, as one on the pending list.
+            self.mix.last_taken = self.mix.last_taken.max(entry.id);
+            return;
+        }
+        if let Err(b) = self.mix.push_with(entry, batch) {
+            // Unreachable: room was checked.
+            self.retire(b);
+        }
+    }
+
+    /// Hands spent batch `batch` off the RT thread through the return
+    /// ring, or keeps it until the ring has room; one neither has room
+    /// for is leaked, never freed here. A replay frees it.
+    fn retire(&mut self, batch: Option<Box<Batch>>) {
+        let Some(b) = batch else { return };
+        if self.replay {
+            drop(b);
+            return;
+        }
+        if let Err(rtrb::PushError::Full(Returned::Batch(b))) = self.ret.push(Returned::Batch(b)) {
+            if self.spent.len() < self.spent.capacity() {
+                self.spent.push(b);
+            } else {
+                add(&self.counters.batches_leaked, 1);
+                std::mem::forget(b);
+            }
+        }
+    }
+
+    /// Passes the spent batches kept to the return ring while it has
+    /// room, leaving one slot for a command's return.
+    fn return_spent(&mut self) {
+        while self.ret.slots() > 1
+            && let Some(b) = self.spent.pop()
+        {
+            let _ = self.ret.push(Returned::Batch(b));
         }
     }
 
@@ -1727,10 +1904,12 @@ impl Rt {
 
     /// Without a core: takes the entries due by block `k` that need no
     /// generation off the pending list, so that a long spell neither
-    /// fills the list nor holds the log's entries back. A strip entry is
-    /// applied to its slot's strip, which stays with the slot; the others
-    /// pass unapplied. A core installed later must know them, as it must
-    /// know every entry taken.
+    /// fills the list nor holds the log's entries back. A strip entry, and
+    /// a batch's strip parameters, are applied to the slots' strips, which
+    /// stay with the slots; the rest passes unapplied. A batch holding a
+    /// generation-needing entry stays pending whole, as that entry does
+    /// alone. A core installed later must know them, as it must know every
+    /// entry taken.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn pass_entries(&mut self, k: u64) {
         let end = (k + 1) * self.block;
@@ -1743,11 +1922,18 @@ impl Rt {
             self.mix.pending.remove(i);
             self.mix.last_taken = self.mix.last_taken.max(e.id);
             add(&self.counters.entries_without_core, 1);
-            if let Change::Strip { slot, param } = e.change
-                && !self.slots[slot].set_strip(e.at_index, param)
-            {
-                add(&self.counters.strip_refused, 1);
-                self.send(Telemetry::StripRefused { entry: e });
+            match e.change {
+                Change::Strip { slot, param } => self.set_strip(e, slot, param),
+                Change::Batch { .. } => {
+                    let b = self.mix.take_batch(e.id);
+                    if let Some(b) = &b {
+                        for &(slot, param) in &b.strips {
+                            self.set_strip(e, slot as usize, param);
+                        }
+                    }
+                    self.retire(b);
+                }
+                _ => {}
             }
         }
         self.publish_consumed();
@@ -1835,13 +2021,76 @@ impl Rt {
         });
     }
 
+    /// Sets parameter `param` of slot `slot`'s strip from the index of
+    /// entry `e`, which carries it; a refusal is counted and reported.
+    fn set_strip(&mut self, e: RtEntry, slot: usize, param: StripParam) {
+        // Checked against the configuration that appended it; a slot of
+        // another width here refuses it.
+        if !self.slots[slot].set_strip(e.at_index, param) {
+            add(&self.counters.strip_refused, 1);
+            let entry = RtEntry {
+                change: Change::Strip { slot, param },
+                ..e
+            };
+            self.send(Telemetry::StripRefused { entry });
+        }
+    }
+
     /// Applies entry `e`, other than a gain change, at the start of the
-    /// block at its index. An entry that sets what the slot already has
-    /// starts nothing.
+    /// block at its index: a batch's `InputDown`s, strip parameters and
+    /// generation-needing entry, its gains set by [`Mix::to`]. An entry
+    /// that sets what the slot already has starts nothing.
     fn apply(&mut self, e: RtEntry) {
+        if let Change::Batch { .. } = e.change {
+            let b = self.mix.take_batch(e.id);
+            self.mix.applied_entry(&e);
+            if let Some(b) = &b {
+                for &slot in &b.downs {
+                    self.apply_change(RtEntry {
+                        change: Change::InputDown {
+                            slot: slot as usize,
+                        },
+                        ..e
+                    });
+                }
+            }
+            self.apply_known(e, b.as_deref(), false, true);
+            self.retire(b);
+            return;
+        }
         self.mix.applied_entry(&e);
+        self.apply_change(e);
+    }
+
+    /// Applies what of entry `e`, with batch `b`, a core does not hold:
+    /// its strip parameters with `strips`, and its generation-needing
+    /// entry; a single entry whole. Counted applied for the fingerprint
+    /// with `count`.
+    fn apply_known(&mut self, e: RtEntry, b: Option<&Batch>, count: bool, strips: bool) {
+        if count {
+            self.mix.applied_entry(&e);
+        }
+        let Change::Batch { generation, .. } = e.change else {
+            self.apply_change(e);
+            return;
+        };
+        if let Some(b) = b.filter(|_| strips) {
+            for &(slot, param) in &b.strips {
+                self.set_strip(e, slot as usize, param);
+            }
+        }
+        if let Some(g) = generation {
+            self.apply_change(RtEntry {
+                change: g.change(),
+                ..e
+            });
+        }
+    }
+
+    /// Applies change `e`, a single one other than a gain change.
+    fn apply_change(&mut self, e: RtEntry) {
         let slot = match e.change {
-            Change::Gain { .. } => return,
+            Change::Gain { .. } | Change::Batch { .. } => return,
             Change::InputDown { slot } => {
                 let s = &mut self.slots[slot];
                 if s.up {
@@ -1852,12 +2101,7 @@ impl Rt {
                 return;
             }
             Change::Strip { slot, param } => {
-                // Checked against the configuration that appended it; a
-                // slot of another width here refuses it.
-                if !self.slots[slot].set_strip(e.at_index, param) {
-                    add(&self.counters.strip_refused, 1);
-                    self.send(Telemetry::StripRefused { entry: e });
-                }
+                self.set_strip(e, slot, param);
                 return;
             }
             Change::InputUp { slot } | Change::Route { slot } => slot,
@@ -1903,6 +2147,8 @@ impl Rt {
             if let Some((id, _, g)) = self.pending_gen.take_if(|p| p.0 == e.id) {
                 self.gen_unused(id, g);
             }
+            let b = self.mix.take_batch(e.id);
+            self.retire(b);
         }
         self.mix.due.clear();
     }
@@ -2270,7 +2516,7 @@ impl Rt {
     /// generation is swapped in, a crossfade anchored at its index, or
     /// the strip set from its index.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    pub(crate) fn install_core(&mut self, c: &Core, last_id: LogId, strips: bool) {
+    pub(crate) fn install_core(&mut self, c: &mut Core, last_id: LogId, strips: bool) {
         let m = &mut self.mix;
         let next = c.pos.unwrap_or(0);
         m.due.clear();
@@ -2290,12 +2536,38 @@ impl Rt {
                 m.last_taken = m.last_taken.max(e.id);
             }
         }
-        m.pending.retain(|e| e.id > last_id);
-        for e in &c.pending {
-            if !m.holds(e.id) && !m.push(*e) {
-                add(&self.counters.handover_entries_lost, 1);
+        // The batches of the entries dropped go off the RT thread with the
+        // core; those of the entries applied below once applied.
+        let mut n = 0;
+        while let Some(&(id, _)) = self.mix.batches.get(n) {
+            if id > last_id || self.mix.due.iter().any(|d| d.0.id == id) {
+                n += 1;
+                continue;
+            }
+            let (_, b) = self.mix.batches.swap_remove(n);
+            if let Err(b) = c.keep(b) {
+                self.retire(Some(b));
             }
         }
+        let m = &mut self.mix;
+        m.pending.retain(|e| e.id > last_id);
+        for i in 0..c.pending.len() {
+            let e = c.pending[i];
+            if self.mix.holds(e.id) {
+                continue;
+            }
+            // The core's batch is taken, not copied: nothing allocates.
+            let b = c.take_batch(e.id);
+            if let Err(b) = self.mix.push_with(e, b) {
+                add(&self.counters.handover_entries_lost, 1);
+                if let Some(b) = b
+                    && let Err(b) = c.keep(b)
+                {
+                    self.retire(Some(b));
+                }
+            }
+        }
+        let m = &mut self.mix;
         m.page_entries.clear();
         m.page_entries.extend_from_slice(&c.page_entries);
         m.entries_page = c.entries_page;
@@ -2342,7 +2614,9 @@ impl Rt {
         }
         for n in 0..self.mix.due.len() {
             let (e, _) = self.mix.due[n];
-            self.apply(e);
+            let b = self.mix.take_batch(e.id);
+            self.apply_known(e, b.as_deref(), true, !strips);
+            self.retire(b);
         }
         self.mix.due.clear();
     }
@@ -2380,7 +2654,7 @@ impl Rt {
         };
         let counter = match h.answer {
             Answer::Installed => {
-                self.install_core(&h.core, h.last_id, h.replayed);
+                self.install_core(&mut h.core, h.last_id, h.replayed);
                 // The page holding the boundary mixes both states: no
                 // record.
                 for p in self.outs.iter_mut().filter_map(|o| o.pages.as_mut()) {
@@ -2935,7 +3209,7 @@ mod tests {
         r.late_routes.push((10, 25 * B));
         r.late_lost_until = 26 * B;
 
-        let mut c = Core::new(1, 1, 2, 4);
+        let mut c = Core::new((1, 1, 2, 4, 0));
         capture_core(&mut c, &m, &slots, &awaiting, Some(11), &r);
         let want = Core {
             matrix: m.matrix.clone(),
@@ -2970,6 +3244,8 @@ mod tests {
             unresolved: vec![(8, 21 * B), (9, 30 * B)],
             late_routes: vec![(10, 25 * B)],
             late_lost_until: 26 * B,
+            batches: Vec::new(),
+            spare: Default::default(),
         };
         assert_eq!(c, want);
         assert_eq!(c.pending.len(), 2);
