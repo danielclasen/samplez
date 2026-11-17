@@ -439,3 +439,25 @@ async fn a_verified_replica_beyond_the_horizon_is_held_and_rebuilt_once() {
         "one rebuild"
     );
 }
+
+/// An engine that dropped its core, and committed entries with it, for
+/// entries its RT thread did not take returns its replica to `starting`,
+/// rebuilt from product state once.
+#[tokio::test(start_paused = true)]
+async fn an_engine_that_dropped_committed_entries_is_rebuilt() {
+    let ids = vec![a(0), a(1), a(2)];
+    let set = start(ids.clone(), Vec::new()).await;
+    committing(&set, &ids).await;
+    let (drops, rebuilds) = {
+        let f = set.audio(a(2)).lock();
+        (f.drops.len(), f.rebuilds.len())
+    };
+    set.audio(a(2)).lock().log_overflows = 1;
+    until("dropped and rebuilt", 10, || {
+        let f = set.audio(a(2)).lock();
+        f.drops.len() > drops && f.rebuilds.len() > rebuilds
+    })
+    .await;
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(set.audio(a(2)).lock().rebuilds.len(), rebuilds + 1);
+}

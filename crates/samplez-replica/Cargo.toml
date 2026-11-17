@@ -32,6 +32,7 @@ xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["alloc", "sink"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "crypto", "ring"] }
 rtrb = "=0.3.6"
+samplez-dsp = { path = "../samplez-dsp", version = "0.5.0" }
 tokio = { version = "=1.54.1", features = ["macros", "net", "rt", "sync", "test-util", "time"] }
 
 # clippy.toml's blocking primitives: allowed here, denied in the RT

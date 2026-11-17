@@ -119,11 +119,18 @@ struct Hashed {
 const RAMP: u32 = 2048;
 
 fn hashed(domain: &Domain, src: &str) -> Hashed {
+    hashed_with(domain, &[(src, 2)])
+}
+
+/// [`hashed`] over the inputs `inputs`, as (flow, channels), one output
+/// channel per input channel.
+fn hashed_with(domain: &Domain, inputs: &[(&str, u32)]) -> Hashed {
+    let channels = inputs.iter().map(|i| i.1).sum::<u32>();
     let mut config = config(
         &domain.0,
-        &[(src, 2)],
-        &[(&new_id(), 2)],
-        diagonal(2, 1.0),
+        inputs,
+        &[(&new_id(), channels)],
+        diagonal(channels as usize, 1.0),
         MARGIN,
     );
     config.ramp_samples = RAMP;
@@ -615,6 +622,10 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
     let mut state = ProductState {
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: Vec::new(),
         last_id: 0,
     };
@@ -692,6 +703,10 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
     let state = ProductState {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: Vec::new(),
         last_id: 1,
     };
@@ -724,6 +739,10 @@ fn a_product_entry_the_install_passed_is_folded_in() {
     let state = ProductState {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: vec![(
             1,
             at,
@@ -840,6 +859,10 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
         let state = ProductState {
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
+
+            flows: vec![src.clone()],
+
+            strips: vec![Vec::new()],
             pending: vec![(1, at, strip)],
             last_id: 1,
         };
@@ -884,6 +907,10 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
     let state = ProductState {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: Vec::new(),
         last_id: 1,
     };
@@ -967,6 +994,10 @@ fn a_route_the_core_carried_is_not_applied_again() {
     let state = ProductState {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
+
+        flows: vec![src.clone()],
+
+        strips: vec![Vec::new()],
         pending: vec![(1, at, route)],
         last_id: 1,
     };
@@ -997,4 +1028,476 @@ fn a_route_the_core_carried_is_not_applied_again() {
         .collect();
     assert!(silenced.is_empty(), "silenced blocks {silenced:?}");
     h.e.stop();
+}
+
+/// One log entry's engine entries: two gain changes and a strip entry.
+fn scene() -> Vec<Entry> {
+    vec![
+        Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.75,
+        },
+        Entry::Gain {
+            input: 1,
+            output: 1,
+            gain: 0.25,
+        },
+        Entry::Strip {
+            slot: 0,
+            param: StripParam::Trim { db: -6.0 },
+        },
+    ]
+}
+
+/// Every engine entry of a log entry applies at its index: an engine
+/// taking them under one log id computes the pages of one taking each
+/// under a log id of its own at that index. The entry fingerprints name
+/// other log ids, so only the samples' hashes compare.
+#[test]
+fn a_log_entrys_entries_all_apply_at_its_index() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        // Past the fade-in from the attach.
+        let at = (now_block() + 200) * B;
+        a.e.append_batch(1, at, &scene()).unwrap();
+        a.e.commit(1);
+        for (id, entry) in (1..).zip(scene()) {
+            b.e.append(id, at, entry).unwrap();
+        }
+        b.e.commit(3);
+        let (from, to) = (at / PAGE, (at + u64::from(RAMP)) / PAGE + 4);
+        let end = (to + 1) * PAGE / B;
+        wait_for(Duration::from_secs(10), "pages compared", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        let (pa, pb) = (a.pages(), b.pages());
+        let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+        for p in from..to {
+            if disturbed.contains(&p) {
+                return Err(format!("page {p} disturbed"));
+            }
+            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+                return Err(format!("page {p} not hashed by both"));
+            };
+            assert_eq!(ha.hash, hb.hash, "page {p}");
+        }
+        for e in [&a.e, &b.e] {
+            assert_eq!(e.counters().command_late.load(Relaxed), 0);
+        }
+        Ok(())
+    });
+}
+
+/// A donor's core copied while a log entry of several engine entries is
+/// pending carries its batch, and a joiner replaying it computes the
+/// donor's pages bit for bit through their ramps and after the
+/// hand-over, the batch handed to its RT thread with the replayed core:
+/// a core without it would leave the joiner's pages apart from the
+/// donor's. A log entry of no engine entries leaves the replay as it is.
+#[test]
+fn a_core_copied_with_a_log_entry_pending_replays_all_of_it() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        // Entry 1 diverges the joiner.
+        let at1 = (now_block() + 20) * B;
+        gain(&a.e, 1, at1, 0, 1.0);
+        gain(&b.e, 1, at1, 0, 0.5);
+        let ramped = (at1 + u64::from(RAMP)) / B + 3 * PAGE / B;
+        wait_for(Duration::from_secs(5), "diverged", || {
+            processed(&a.e) > ramped && processed(&b.e) > ramped
+        });
+        let at2 = (now_block() + 60) * B;
+        for e in [&a.e, &b.e] {
+            e.append_batch(2, at2, &scene()).unwrap();
+            e.commit(2);
+        }
+        let mut copied = None;
+        for _ in 0..20 {
+            let c = copy(&a.e);
+            let held = c.core.pending().filter(|p| p.0 == 2).count();
+            assert!(held <= 1, "log entry 2 pending {held} times");
+            if held == 1 {
+                assert_eq!(c.last_id, 2);
+                copied = Some(c);
+                break;
+            }
+        }
+        let copy = copied.ok_or("log entry 2 never pending in a copy")?;
+        if (copy.k0 + 1) * B > at2 {
+            return Err(format!("copied after block {}, past entry 2", copy.k0));
+        }
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+        let mut replay = b.e.replay(copy).unwrap();
+        // Known to the core: nothing changes.
+        replay.append_batch(2, at2, &scene()).unwrap();
+        assert_eq!(replay.append_batch(3, 7, &[]), Ok(()));
+        let past2 = (at2 + u64::from(RAMP)) / B + PAGE / B;
+        while now_block() <= past2 + MARGIN / B + 2 {
+            std::thread::sleep(Duration::from_millis(5));
+            replay.run_to(now_block().saturating_sub(MARGIN / B + 2));
+        }
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        let end = j + 6 * PAGE / B;
+        wait_for(Duration::from_secs(10), "pages after the hand-over", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        let (pa, pb) = (a.pages(), b.pages());
+        let disturbed: Vec<u64> = a
+            .disturbed()
+            .into_iter()
+            .chain(b.disturbed())
+            .chain(touched(&replay.silenced()))
+            .collect();
+        let clean = |p: &u64| !disturbed.contains(p);
+        let replayed = replay.pages();
+        let mut ramp_pages = 0;
+        for h in replayed.iter().filter(|h| clean(&h.page)) {
+            let Some(d) = pa.get(&h.page) else { continue };
+            assert_eq!(
+                (h.hash, h.fingerprint),
+                (d.hash, d.fingerprint),
+                "replayed page {}",
+                h.page
+            );
+            if (at2 / PAGE..=(at2 + u64::from(RAMP)) / PAGE).contains(&h.page) {
+                ramp_pages += 1;
+            }
+        }
+        if ramp_pages < 2 {
+            return Err(format!("{ramp_pages} replayed pages of entry 2's ramps"));
+        }
+        let mut equal = 0;
+        for (p, hb) in pb.iter().filter(|(p, _)| **p * PAGE >= (j + 1) * B) {
+            let Some(ha) = pa.get(p).filter(|_| clean(p)) else {
+                continue;
+            };
+            assert_eq!(
+                (hb.hash, hb.fingerprint),
+                (ha.hash, ha.fingerprint),
+                "page {p}"
+            );
+            equal += 1;
+        }
+        if equal < 4 {
+            return Err(format!("{equal} pages after the hand-over compared"));
+        }
+        Ok(())
+    });
+}
+
+/// A replay folds a log entry and checks its entries as the engine does:
+/// an `InputUp` followed by an `InputDown` needs no generation, a
+/// `Route` with an `InputDown` keeps its route and needs one, and a
+/// coefficient outside the matrix is refused rather than set elsewhere.
+#[test]
+fn a_replay_folds_and_checks_a_log_entry_as_the_engine_does() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let mut replay = h.e.replay(copy(&h.e)).unwrap();
+    let at = (now_block() + 100) * B;
+    let (up, down) = (Entry::InputUp { slot: 0 }, Entry::InputDown { slot: 0 });
+    assert_eq!(replay.append_batch(1, at, &[up, down.clone()]), Ok(()));
+    let route = Entry::Route {
+        slot: 0,
+        flow_id: new_id(),
+    };
+    assert_eq!(
+        replay.append_batch(2, at, &[route, down]),
+        Err(ReplayError::Generation)
+    );
+    let outside = Entry::Gain {
+        input: 0,
+        output: 2,
+        gain: 0.5,
+    };
+    assert!(matches!(
+        replay.append_batch(3, at, &[outside]),
+        Err(ReplayError::Invalid(_))
+    ));
+    h.e.stop();
+}
+
+/// A core copied while a log entry's batch awaits its generation decodes,
+/// and a replay of it is refused as one with a generation in flight, which
+/// a joiner retries with a later copy, not as another engine's core.
+#[test]
+fn a_core_with_a_batch_awaiting_its_generation_decodes() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let mut wire: serde_json::Value = serde_json::from_str(&copy(&h.e).encode()).unwrap();
+    let at = wire["copy"]["core"]["pos"].as_u64().unwrap();
+    wire["copy"]["core"]["awaiting_gen"] = serde_json::json!([{
+        "id": wire["copy"]["last_id"],
+        "at_index": at,
+        "change": { "Batch": { "strips": true, "up": 1, "routed": 0 } },
+    }]);
+    let copy = samplez::CoreCopy::decode(&wire.to_string()).unwrap();
+    assert!(matches!(h.e.replay(copy), Err(ReplayError::Generation)));
+    h.e.stop();
+}
+
+/// A replicated engine whose RT thread takes no committed entry keeps at
+/// most `WAITING` of them waiting for room; past that it drops them and
+/// its core, counted, to be rebuilt, rather than hold them without bound.
+#[test]
+fn committed_entries_past_the_wait_bound_drop_the_core() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    // Far ahead: the RT thread holds 64 pending, the ring 64 more.
+    let at = (now_block() + 1_000_000) * B;
+    let held = 2 * 64 + samplez::engine::WAITING as u64;
+    for id in 1..=held + 1 {
+        let gain = Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: (id % 7) as f32 / 7.0,
+        };
+        h.e.append(id, at, gain).unwrap();
+        h.e.commit(id);
+        if id == 2 * 64 {
+            // The RT thread takes 64 off the ring at its next wakes.
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let overflows = c.log_overflows.load(Relaxed);
+        assert_eq!(overflows, u64::from(id > held), "after entry {id}");
+    }
+    assert_eq!(h.e.progress().unwrap().log_overflows, 1);
+    wait_for(Duration::from_secs(5), "blocks without a core", || {
+        c.blocks_without_core.load(Relaxed) > 0
+    });
+    h.e.stop();
+}
+
+/// An engine that dropped committed entries past the wait bound, a
+/// `Route` and a `Trim` among them, is rebuilt from a product state that
+/// holds what they set: from the rebuild on the slot reads the new flow,
+/// its old one gone, and its strip holds the trim, the pages equal to
+/// those of an engine that applied both at their index.
+#[test]
+fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let (src, next) = (new_id(), new_id());
+        let old = Pilot::start(&domain.0, &src, 2, B, 0);
+        let _next = Pilot::start(&domain.0, &next, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        let trim = StripParam::Trim { db: -6.0 };
+        let changes = [
+            Entry::Route {
+                slot: 0,
+                flow_id: next.clone(),
+            },
+            Entry::Strip {
+                slot: 0,
+                param: trim,
+            },
+        ];
+        // b's RT thread holds 64 entries far ahead pending and 64 in its
+        // ring; what commits next waits, up to the bound.
+        let far = (now_block() + 1_000_000) * B;
+        let filler = |id: u64| Entry::Gain {
+            input: 1,
+            output: 1,
+            gain: (id % 7) as f32 / 7.0,
+        };
+        for id in 1..=128 {
+            b.e.append(id, far, filler(id)).unwrap();
+            b.e.commit(id);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let at = (now_block() + 40) * B;
+        a.e.append_batch(1, at, &changes).unwrap();
+        a.e.commit(1);
+        b.e.append_batch(129, at, &changes).unwrap();
+        b.e.commit(129);
+        let last = 129 + samplez::engine::WAITING as u64;
+        for id in 130..=last {
+            b.e.append(id, far, filler(id)).unwrap();
+            b.e.commit(id);
+        }
+        if b.e.counters().log_overflows.load(Relaxed) != 1 {
+            return Err("no overflow at the bound".into());
+        }
+        wait_for(Duration::from_secs(5), "the entries' index passed", || {
+            processed(&b.e) > at / B + 10
+        });
+        let state = ProductState {
+            gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            up: vec![true],
+            flows: vec![next.clone()],
+            strips: vec![vec![trim]],
+            pending: Vec::new(),
+            last_id: last,
+        };
+        let j = b.e.install_product(&state, Duration::from_secs(2)).unwrap();
+        // A slot still on the old flow is silenced from here.
+        drop(old);
+        let from = ((j + 1) * B + 2 * u64::from(RAMP)).div_ceil(PAGE);
+        let end = (from + 8) * PAGE / B + PAGE / B;
+        wait_for(Duration::from_secs(10), "pages compared", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        let (pa, pb) = (a.pages(), b.pages());
+        let silenced: Vec<u64> = b
+            .verdicts
+            .try_iter()
+            .filter(|v| v.silenced != 0 && v.k * B >= from * PAGE)
+            .map(|v| v.k)
+            .collect();
+        assert!(
+            silenced.is_empty(),
+            "the slot read its old flow: {silenced:?}"
+        );
+        let disturbed = a.disturbed();
+        for p in from..from + 8 {
+            if disturbed.contains(&p) {
+                return Err(format!("page {p} disturbed"));
+            }
+            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+                return Err(format!("page {p} not hashed by both"));
+            };
+            assert_eq!(hb.hash, ha.hash, "page {p}");
+        }
+        let s = b.e.status();
+        assert_eq!(s.inputs[0].flow_id, next);
+        Ok(())
+    });
+}
+
+/// A copy holds every entry given as unresolved before it was asked for:
+/// the RT thread takes controls at the start of a wake and copies after a
+/// block, so a copy asked for right after the control could be taken in
+/// the wake before the one that applies it, and a joiner would lack the
+/// entry.
+#[test]
+fn a_copy_holds_every_unresolved_entry_given_before_it() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let far = (now_block() + 1_000_000) * B;
+    for id in 1..=200 {
+        h.e.unresolved(id, far).unwrap();
+        let c = copy(&h.e);
+        assert!(
+            c.core.unresolved().iter().any(|u| u.0 == id),
+            "entry {id} given before the copy and not in it"
+        );
+        h.e.resolved(id).unwrap();
+    }
+    h.e.stop();
+}
+
+/// A product state that moves an input to another flow while a log
+/// entry's generation for another input of its domain is built, or sent,
+/// on the old flows: that generation is built again on the new ones, so
+/// when the entry swaps it in, the moved input stays on its new flow, its
+/// old flow gone, and the pages equal those of an engine that moved it
+/// through the log.
+#[test]
+fn a_product_state_rebuilds_a_generation_built_on_the_old_flows() {
+    for sent in [false, true] {
+        common::undisturbed(|| product_over_a_pending_generation(sent));
+    }
+}
+
+fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
+    let domain = Domain::new();
+    let (src0, src1, next0, next1) = (new_id(), new_id(), new_id(), new_id());
+    let _p0 = Pilot::start(&domain.0, &src0, 1, B, 0);
+    let old1 = Pilot::start(&domain.0, &src1, 1, B, 0);
+    let _n0 = Pilot::start(&domain.0, &next0, 1, B, 0);
+    let _n1 = Pilot::start(&domain.0, &next1, 1, B, 0);
+    let inputs = [(src0.as_str(), 1), (src1.as_str(), 1)];
+    let (a, b) = (hashed_with(&domain, &inputs), hashed_with(&domain, &inputs));
+    let route = |slot, flow: &str| Entry::Route {
+        slot,
+        flow_id: flow.to_owned(),
+    };
+    // Input 1 moves to next1 now on a, through the product state on b.
+    a.e.append(1, (now_block() + 20) * B, route(1, &next1))
+        .unwrap();
+    a.e.commit(1);
+    // Input 0's re-route, far enough ahead to be pending on b throughout.
+    let at = (now_block() + 400) * B;
+    a.e.append(2, at, route(0, &next0)).unwrap();
+    a.e.commit(2);
+    b.e.drop_core().unwrap();
+    b.e.append(2, at, route(0, &next0)).unwrap();
+    if sent {
+        b.e.commit(2);
+    }
+    let pending = |e: &Engine| e.status().generation;
+    wait_for(Duration::from_secs(5), "entry 2's generation built", || {
+        let g = pending(&b.e);
+        g.pending == Some(2) && g.ready
+    });
+    let state = ProductState {
+        gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        up: vec![true, true],
+        flows: vec![src0.clone(), next1.clone()],
+        strips: vec![Vec::new(), Vec::new()],
+        pending: if sent {
+            vec![(2, at, route(0, &next0))]
+        } else {
+            Vec::new()
+        },
+        last_id: if sent { 2 } else { 1 },
+    };
+    let j = b.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    if !sent {
+        b.e.commit(2);
+    }
+    // Input 1's old flow is gone: read, it is silenced.
+    drop(old1);
+    let from = ((j + 1) * B + 2 * u64::from(RAMP)).div_ceil(PAGE);
+    let end = (at + 2 * u64::from(RAMP)) / B + 8 * PAGE / B;
+    wait_for(Duration::from_secs(10), "past entry 2", || {
+        processed(&a.e) > end && processed(&b.e) > end
+    });
+    let late: Vec<u64> = b
+        .verdicts
+        .try_iter()
+        .filter(|v| v.silenced & 0b10 != 0 && v.k * B >= from * PAGE)
+        .map(|v| v.k)
+        .collect();
+    assert!(
+        late.is_empty(),
+        "input 1 read its old flow in {} blocks from {:?}",
+        late.len(),
+        late.first()
+    );
+    assert_eq!(b.e.status().inputs[1].flow_id, next1);
+    assert_eq!(b.e.status().inputs[0].flow_id, next0);
+    let (pa, pb) = (a.pages(), b.pages());
+    let disturbed = a.disturbed();
+    let after = (at + 2 * u64::from(RAMP)).div_ceil(PAGE);
+    for p in after..after + 6 {
+        if disturbed.contains(&p) {
+            return Err(format!("page {p} disturbed"));
+        }
+        let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+            return Err(format!("page {p} not hashed by both"));
+        };
+        assert_eq!(hb.hash, ha.hash, "page {p}");
+    }
+    Ok(())
 }

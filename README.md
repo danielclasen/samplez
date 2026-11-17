@@ -99,6 +99,38 @@ second, wherever it stands against the clock, and each `InputUp` or
 `Engine::start_replicated` takes entries through `append`, `commit` and
 `truncate` and sends those reports out instead.
 
+A replicated log entry may carry any number of engine entries
+(`append_batch`). They are folded off the RT thread: per matrix
+coefficient and strip parameter the last value; per input slot
+whether it is re-routed, goes down and comes up, an `InputUp` after an
+`InputDown` fading in from silence and a route kept whatever the
+state. The log entry's batch is bounded by the engine's shape, shared
+by reference and never changed once folded. It takes one of the 64
+places the RT thread holds for log entries before their index, the
+number the leader stamps ahead, and applies whole at its index, its
+gains first; one generation covers every slot it raises or re-routes,
+and a late one counts once in `command_late`. A log entry raising or
+re-routing inputs of more than one domain, or with an entry refused
+alone, is refused whole (`append_batch`, `admits`); `samplez-replica`
+asks before it orders a command and refuses it to its client
+(`invalid`), so no committed entry is refused; an entry carries at most
+64 commands, which bounds those checks. The domain check covers every
+slot an `InputUp` or `Route` names, so every subset of an admitted
+entry, which a restamp may keep, is admitted too. One of no entries
+appends nothing. A replicated engine refuses no committed entry for
+room: up to 256 its ring has no room for wait in its log; past that it
+drops them and its core (`log_overflows`) and the replica is rebuilt
+from product state. The RT thread
+hands its spent batches to the supervisor to be freed, leaving the
+return ring room for the generations and writers it hands back; one it
+cannot hand off is leaked and counted in the status (`batches_leaked`).
+A matrix may have at most 150 coefficients per sample of the block
+(`COEFFICIENTS_PER_BLOCK_SAMPLE`), so that a batch setting all of them
+applies within a quarter of the block period: 7,200 at a `blockSize` of
+48, 153,600 at the largest, 1024. A larger matrix takes a larger
+`blockSize`; a configuration beyond the limit is refused, naming the
+`blockSize` its matrix needs.
+
 Each input of 1 to 8 channels has a strip: trim, per-leg trim and
 polarity, high-pass, a four-band equaliser, gate and compressor
 (`samplez_dsp::strip`). It runs on every block computed, after the
@@ -198,13 +230,19 @@ no block and withholds each one, overrun skips included, cause `NoCore`
 (`StatusChange::NoCore` ranges), with the replica withdrawn. Entries
 needing no generation whose index passes meanwhile are taken off the
 pending list, strip entries applied to the strips the slots keep and the
-others not, and the core installed next must know them. A replayed core
+others not, and the core installed next must know them; a batch holding
+an `InputUp` or `Route` stays pending whole. A replayed core
 replaces the strips; one built from product state leaves them.
 `Engine::install_product` builds a core from product state off the RT
 thread (targets at their values, fades and ramps cold, the pending
 entries, no unresolved entry; the RT thread keeps its pending generation)
 and installs it through the same block-boundary hand-over as a replay;
-the first block committed after it follows the withdrawn rules.
+the first block committed after it follows the withdrawn rules. The
+product state also names each slot's flow and strip parameters: the
+supervisor hands over generations reading those flows before the core,
+a slot on another flow moving to it with no crossfade, and the strip
+parameters are set from the install's index, each strip keeping its own
+state.
 
 In `samplez-replica` every audio replica starts clock-unverified, which
 drops its engine's core until it verifies, and a snapshot install or a

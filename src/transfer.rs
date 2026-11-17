@@ -11,16 +11,18 @@
 //! buffer allocated off the RT thread, of the same shape, so the copy
 //! allocates nothing.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Matrix, Strip};
+use samplez_dsp::{Matrix, Strip, StripParam};
 use samplez_mxl::time;
 use serde::{Deserialize, Serialize};
 
+use crate::batch::{self, Batch};
 use crate::blocks::PageHash;
 use crate::engine::Entry;
-use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRESOLVED};
+use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRESOLVED, slots_of};
 
 /// The engine version a core's encoding carries: a core is replayed only
 /// by the engine that copied it.
@@ -62,6 +64,23 @@ pub struct Core {
     pub(crate) unresolved: Vec<(LogId, u64)>,
     pub(crate) late_routes: Vec<(LogId, u64)>,
     pub(crate) late_lost_until: u64,
+    /// The batch of each [`Change::Batch`] pending, by log id.
+    pub(crate) batches: Vec<(LogId, Arc<Batch>)>,
+    /// The batches an install dropped, to leave the RT thread with the
+    /// buffer. Capacity [`PENDING_CHANGES`].
+    #[serde(skip)]
+    pub(crate) handed: Handed,
+}
+
+/// Batches a core buffer carries off the RT thread; never part of what a
+/// core holds.
+#[derive(Debug, Default)]
+pub(crate) struct Handed(pub Vec<Arc<Batch>>);
+
+impl PartialEq for Handed {
+    fn eq(&self, _: &Handed) -> bool {
+        true
+    }
 }
 
 impl Core {
@@ -83,6 +102,58 @@ impl Core {
             unresolved: Vec::with_capacity(UNRESOLVED),
             late_routes: Vec::with_capacity(PENDING_CHANGES),
             late_lost_until: 0,
+            batches: Vec::with_capacity(PENDING_CHANGES),
+            handed: Handed(Vec::with_capacity(PENDING_CHANGES)),
+        }
+    }
+
+    /// Off the RT thread, before a buffer goes to it: drops the batches
+    /// it carries, so the RT thread drops none, and makes room for as
+    /// many as it holds pending.
+    pub(crate) fn prepare(&mut self) {
+        self.batches.clear();
+        self.batches.reserve_exact(PENDING_CHANGES);
+        self.handed.0.clear();
+        self.handed.0.reserve_exact(PENDING_CHANGES);
+    }
+
+    /// Makes `batches` the core's, sharing them: nothing is allocated or
+    /// freed, the batches the buffer held kept with the handed ones.
+    pub(crate) fn put_batches(&mut self, batches: &[(LogId, Arc<Batch>)]) {
+        while let Some((_, b)) = self.batches.pop() {
+            self.keep_or_forget(b);
+        }
+        for (id, b) in batches {
+            if self.batches.len() == self.batches.capacity() {
+                debug_assert!(false, "a core without room for its batches");
+                return;
+            }
+            self.batches.push((*id, Arc::clone(b)));
+        }
+    }
+
+    /// Takes the batch of entry `id` out of the core.
+    pub(crate) fn take_batch(&mut self, id: LogId) -> Option<Arc<Batch>> {
+        let n = self.batches.iter().position(|b| b.0 == id)?;
+        Some(self.batches.swap_remove(n).1)
+    }
+
+    /// Keeps `batch` with the handed ones, to leave the RT thread with
+    /// the buffer; back when they are at capacity.
+    pub(crate) fn keep(&mut self, batch: Arc<Batch>) -> Result<(), Arc<Batch>> {
+        let handed = &mut self.handed.0;
+        if handed.len() < handed.capacity() {
+            handed.push(batch);
+            Ok(())
+        } else {
+            Err(batch)
+        }
+    }
+
+    fn keep_or_forget(&mut self, batch: Arc<Batch>) {
+        if let Err(b) = self.keep(batch) {
+            // A prepared buffer holds none: unreachable.
+            std::mem::forget(b);
         }
     }
 
@@ -147,6 +218,28 @@ impl Core {
             && self.unresolved.len() <= UNRESOLVED
             && self.late_routes.len() <= PENDING_CHANGES
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
+            && self.batches_match()
+    }
+
+    /// Whether each pending [`Change::Batch`] has its batch, sane and as
+    /// the change says, and no other batch is held. A batch awaiting its
+    /// generation was applied but for that and holds none.
+    fn batches_match(&self) -> bool {
+        let mut held = 0;
+        for e in &self.pending {
+            let Change::Batch { strips, .. } = e.change else {
+                continue;
+            };
+            held += 1;
+            let mut of = self.batches.iter().filter(|b| b.0 == e.id);
+            let (Some((_, b)), None) = (of.next(), of.next()) else {
+                return false;
+            };
+            if !b.sane() || (strips && b.strips.is_empty()) {
+                return false;
+            }
+        }
+        held == self.batches.len()
     }
 
     /// Whether this sane core is of an engine with `inputs` and `outputs`
@@ -168,13 +261,8 @@ impl Core {
             Some(strip) => strip.legs() == legs && strip.ramp() == ramp,
             None => legs > MAX_LEGS,
         };
-        let entry = |e: &RtEntry| match e.change {
-            Change::Gain { input, output, .. } => input < inputs && output < outputs,
-            Change::InputDown { slot } | Change::InputUp { slot } | Change::Route { slot } => {
-                slot < slots
-            }
-            Change::Strip { slot, param } => slot < slots && param.check(legs[slot]).is_ok(),
-        };
+        let entry = |e: &RtEntry| fits(&e.change, inputs, outputs, legs);
+        let batch = |(_, b): &(LogId, Arc<Batch>)| b.fits(inputs * outputs, legs);
         let shape = (
             self.matrix.inputs(),
             self.matrix.outputs(),
@@ -184,7 +272,30 @@ impl Core {
             && shape == (inputs, outputs, slots)
             && self.page_entries.len() <= page_entries
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
+            && self.batches.iter().all(batch)
             && self.slots.iter().zip(legs).all(strip)
+    }
+}
+
+/// Whether change `c` is within an engine of `inputs` and `outputs`
+/// channels and input slots of `legs` legs: a coefficient and a gain it
+/// has, a slot, and a strip parameter that slot's strip takes. A batch's
+/// own values are checked by [`Batch::fits`].
+pub(crate) fn fits(c: &Change, inputs: usize, outputs: usize, legs: &[usize]) -> bool {
+    let slots = legs.len();
+    match *c {
+        Change::Gain {
+            input,
+            output,
+            gain,
+        } => input < inputs && output < outputs && samplez_dsp::valid_gain(gain),
+        Change::InputDown { slot } | Change::InputUp { slot } | Change::Route { slot } => {
+            slot < slots
+        }
+        Change::Strip { slot, param } => {
+            slot < slots && legs[slot] <= MAX_LEGS && param.check(legs[slot]).is_ok()
+        }
+        Change::Batch { up, routed, .. } => slots_of(up | routed).all(|s| s < slots),
     }
 }
 
@@ -202,6 +313,9 @@ pub(crate) struct Handover {
     /// strips. A core built from product state was computed with neither
     /// and keeps the RT thread's.
     pub replayed: bool,
+    /// Strip parameters set at the install index, by slot: the product
+    /// state's. Built off the RT thread and handed back with the core.
+    pub strips: Vec<(usize, StripParam)>,
     pub answer: Answer,
 }
 
@@ -317,14 +431,43 @@ impl Replay {
         self.next
     }
 
-    /// Takes the committed log entry `id` at `at_index`; one the core
-    /// knew already changes nothing. Only entries that need no generation
-    /// replay; one whose index the replay computed is late.
+    /// Takes the committed log entry `id` at `at_index` of one engine
+    /// entry: [`Replay::append_batch`] of one.
     pub fn append(&mut self, id: LogId, at_index: u64, entry: &Entry) -> Result<(), ReplayError> {
-        if id <= self.last_id {
+        self.append_batch(id, at_index, std::slice::from_ref(entry))
+    }
+
+    /// Takes the committed log entry `id` at `at_index`, its engine
+    /// entries `entries` folded as [`crate::Engine::append_batch`] folds
+    /// them; one the core knew already, or of no entries, changes
+    /// nothing. Only entries that need no generation replay; one whose
+    /// index the replay computed is late.
+    pub fn append_batch(
+        &mut self,
+        id: LogId,
+        at_index: u64,
+        entries: &[Entry],
+    ) -> Result<(), ReplayError> {
+        if id <= self.last_id || entries.is_empty() {
             return Ok(());
         }
-        let change = change_of(entry);
+        let matrix = &self.rt.mix.matrix;
+        let (inputs, columns) = (matrix.inputs(), matrix.outputs());
+        let legs: Vec<usize> = self.rt.slots.iter().map(|s| s.channels).collect();
+        let changes: Vec<Change> = entries.iter().map(change_of).collect();
+        // The engine's checks: a donor took no entry outside them.
+        if !changes.iter().all(|c| fits(c, inputs, columns, &legs)) {
+            return Err(ReplayError::Invalid(format!(
+                "log entry {id} has an entry outside the engine"
+            )));
+        }
+        // Folded first, as the engine folds it: an `InputUp` followed by
+        // an `InputDown` of the slot needs no generation.
+        let folded =
+            batch::fold(&changes, columns, inputs * columns).map_err(ReplayError::Invalid)?;
+        let Some((change, batch)) = folded else {
+            return Ok(());
+        };
         if change.needs_generation() {
             return Err(ReplayError::Generation);
         }
@@ -337,7 +480,7 @@ impl Replay {
             at_index,
             change,
         };
-        if !self.rt.mix.push(e) {
+        if self.rt.mix.push_with(e, batch).is_err() {
             return Err(ReplayError::Full);
         }
         self.last_id = id;
@@ -373,6 +516,8 @@ impl Replay {
             let before = silenced(&self.rt);
             self.rt.control();
             self.rt.process(self.next, u64::MAX);
+            // The batches it spent, freed here, outside the computation.
+            self.rt.spent.clear();
             if silenced(&self.rt) != before {
                 self.silenced.push(self.next);
             }
@@ -424,7 +569,15 @@ pub struct ProductState {
     pub gains: Vec<Vec<f32>>,
     /// Per input slot whether it is up in the log.
     pub up: Vec<bool>,
-    /// Committed entries not applied yet: log id, `at_index` and entry.
+    /// Per input slot the flow it reads in the log, its last `Route`'s
+    /// or its configured one.
+    pub flows: Vec<String>,
+    /// Per input slot the strip parameters the log set, as values: each
+    /// one set again at the install, the strip's own state kept.
+    pub strips: Vec<Vec<StripParam>>,
+    /// Committed entries not applied yet: log id, `at_index` and entry;
+    /// the entries of one log entry adjacent, in order, folded as
+    /// [`crate::Engine::append_batch`] folds them.
     pub pending: Vec<(LogId, u64, Entry)>,
     /// The highest log id the state folds in.
     pub last_id: LogId,

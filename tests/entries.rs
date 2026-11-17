@@ -944,3 +944,158 @@ fn a_re_route_crossfades_from_its_index_after_a_silent_block() {
     common::stop(b);
     common::stop(a);
 }
+
+/// A log entry re-routing two inputs of one domain gets one generation
+/// covering both, swapped in at its index: both cross-fade from their
+/// flows to the new ones, which nobody writes, from that index on, sample
+/// for sample, and neither waits for a generation still to come.
+#[test]
+fn a_log_entry_re_routing_two_inputs_builds_one_generation() {
+    let domain = Domain::new();
+    let (src0, src1, next0, next1, out) = (new_id(), new_id(), new_id(), new_id(), new_id());
+    let _p0 = Pilot::start(&domain.0, &src0, 1, B, 0);
+    let _p1 = Pilot::start(&domain.0, &src1, 1, B, 0);
+    let cfg = config(
+        &domain.0,
+        &[(&src0, 1), (&src1, 1)],
+        &[(&out, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    );
+    let (e, rx, _reports) = start_replicated(cfg);
+    running(&e);
+    let r = (now(&rx) + 150) * B;
+    let routes = [
+        Entry::Route {
+            slot: 0,
+            flow_id: next0.clone(),
+        },
+        Entry::Route {
+            slot: 1,
+            flow_id: next1.clone(),
+        },
+    ];
+    e.append_batch(1, r, &routes).unwrap();
+    e.commit(1);
+    let mut seen = Vec::new();
+    let d = r + u64::from(RAMP);
+    wait_past(&rx, d / B + 20, &mut seen);
+    let range = r / B - 20..d / B + 20;
+    let x = common::read_blocks(&domain.0, &out, 2, range.clone());
+    for (i, k) in range.enumerate() {
+        let want = if k * B < r {
+            ramped(0, k, 1.0, 1.0, 0)
+        } else {
+            ramped(0, k, 1.0, 0.0, r)
+        };
+        for c in 0..2 {
+            assert!(block(&x, 2, i, c) == want, "block {k} of input {c}");
+        }
+    }
+    let s = e.status();
+    assert_eq!(
+        (&*s.inputs[0].flow_id, &*s.inputs[1].flow_id),
+        (&*next0, &*next1)
+    );
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+    assert_eq!(s.diverged, None);
+    common::stop(e);
+}
+
+/// One log entry's `InputUp` and `Route` of a slot raise it on the new
+/// flow, and its `Route` and `InputDown` leave it down on the new flow:
+/// the route is kept, whatever the order.
+#[test]
+fn a_slot_routed_in_one_entry_keeps_its_route_and_its_state() {
+    let domain = Domain::new();
+    let (src0, src1, next, out) = (new_id(), new_id(), new_id(), new_id());
+    let _pilots: Vec<Pilot> = [&src0, &src1, &next]
+        .iter()
+        .map(|id| Pilot::start(&domain.0, id, 1, B, 0))
+        .collect();
+    let cfg = config(
+        &domain.0,
+        &[(&src0, 1), (&src1, 1)],
+        &[(&out, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    );
+    let (e, rx, _reports) = start_replicated(cfg);
+    running(&e);
+    let mut seen = Vec::new();
+    let mut at = |e: &Engine, id, entries: &[Entry]| {
+        let at = (now(&rx) + 100) * B;
+        e.append_batch(id, at, entries).unwrap();
+        e.commit(id);
+        wait_past(&rx, (at + u64::from(RAMP)) / B + 20, &mut seen);
+    };
+    let route = |flow_id: &str| Entry::Route {
+        slot: 1,
+        flow_id: flow_id.to_owned(),
+    };
+    at(&e, 1, &[Entry::InputDown { slot: 1 }]);
+    assert!(!e.status().inputs[1].up);
+    at(&e, 2, &[Entry::InputUp { slot: 1 }, route(&next)]);
+    let s = e.status();
+    assert!(s.inputs[1].up, "raised");
+    assert_eq!(s.inputs[1].flow_id, next);
+    at(&e, 3, &[route(&src1), Entry::InputDown { slot: 1 }]);
+    let s = e.status();
+    assert!(!s.inputs[1].up, "down");
+    assert_eq!(s.inputs[1].flow_id, src1, "the route was lost");
+    assert_eq!(s.diverged, None);
+    common::stop(e);
+}
+
+/// A log entry raising or re-routing inputs of two domains is refused
+/// before anything is appended: one generation is built for a log entry,
+/// and a generation is of one domain. Every slot an `InputUp` or `Route`
+/// names counts, also one a later entry cancels, so every subset of an
+/// admitted entry is admitted.
+#[test]
+fn a_log_entry_across_input_domains_is_refused() {
+    let (a, b) = (Domain::new(), Domain::new());
+    let (src0, src1, out) = (new_id(), new_id(), new_id());
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": MARGIN,
+        "libmxl": common::libmxl(),
+        "domains": [{ "name": "a", "path": a.0 }, { "name": "b", "path": b.0 }],
+        "inputs": [
+            { "name": "in0", "domain": "a", "flowId": src0, "channels": 1 },
+            { "name": "in1", "domain": "b", "flowId": src1, "channels": 1 },
+        ],
+        "outputs": [{ "name": "out0", "domain": "a", "flowId": out, "label": "two domains",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0], [1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (e, _rx, _reports) = start_replicated(samplez::Config::parse(&v.to_string()).unwrap());
+    let up = |slot| Entry::InputUp { slot };
+    let refused = e.admits(&[up(0), up(1)]);
+    assert!(
+        matches!(&refused, Err(samplez::EntryError::Invalid(m)) if m.contains("domain")),
+        "{refused:?}"
+    );
+    assert_eq!(e.append_batch(1, 48_000 * B, &[up(0), up(1)]), refused);
+    assert_eq!(e.admits(&[up(0), Entry::InputDown { slot: 1 }]), Ok(()));
+    // Raising input 0 and dropping it again leaves one domain re-routed,
+    // but a restamp keeping only some of the commands may keep the raise:
+    // the entries are refused whole, so no subset of an admitted log
+    // entry is refused after its commit.
+    let route = Entry::Route {
+        slot: 1,
+        flow_id: new_id(),
+    };
+    let down = Entry::InputDown { slot: 0 };
+    assert!(e.admits(&[up(0), route.clone(), down.clone()]).is_err());
+    let admitted = [up(0), down, Entry::InputDown { slot: 1 }, up(0)];
+    for subset in 0..1u32 << admitted.len() {
+        let entries: Vec<Entry> = (0..admitted.len())
+            .filter(|n| subset & 1 << n != 0)
+            .map(|n| admitted[n].clone())
+            .collect();
+        assert_eq!(e.admits(&entries), Ok(()), "{entries:?}");
+    }
+    e.stop();
+}

@@ -198,6 +198,12 @@ pub trait Audio: Send + Sync + 'static {
     /// Entry `index`, given as unresolved, is decided: its blocks are no
     /// longer degraded for it.
     fn resolved(&self, _index: u64) {}
+    /// Whether the engine takes `request` once committed, checked before
+    /// it is ordered: a committed entry the engine refused would stop
+    /// every replica taking writes.
+    fn admits(&self, _request: &Request) -> Result<(), String> {
+        Ok(())
+    }
     /// Drops the running engine's core: its state no longer follows the
     /// log (snapshot install, purge-point verdict).
     fn drop_engine(&self) {}
@@ -237,6 +243,10 @@ pub struct Sample {
     pub generation_ready: bool,
     /// Clock steps the engine detected.
     pub clock_steps: u64,
+    /// Times the engine dropped its core for committed entries its RT
+    /// thread did not take: a rise returns the replica to `starting`,
+    /// rebuilt from product state.
+    pub log_overflows: u64,
 }
 
 /// The voters of the applied membership: one configuration, or two
@@ -595,6 +605,7 @@ struct State {
     own: Own,
     status_changes_lost: u64,
     entries_refused: u64,
+    log_overflows: u64,
     counts: Counts,
 }
 
@@ -821,6 +832,7 @@ impl Contact {
                 own: Own::default(),
                 status_changes_lost: 0,
                 entries_refused: 0,
+                log_overflows: 0,
                 counts: Counts::default(),
             }),
         }
@@ -1064,6 +1076,12 @@ impl Contact {
             st.generation_ready = sample.generation_ready;
             st.clock_steps = sample.clock_steps;
             st.pages.fold(self.id, &st.own.pages);
+            if sample.log_overflows > st.log_overflows {
+                st.log_overflows = sample.log_overflows;
+                // The engine dropped its core and committed entries with
+                // it: rebuilt from the state after them.
+                self.begin_restart(st, applied);
+            }
             if let Some(r) = &st.rollout {
                 st.own.key = Some(r.key());
                 st.own.revision = r.revision();
@@ -2235,6 +2253,12 @@ impl Contact {
         st.scheduled = st.scheduled.split_off(&(lowest + 1));
     }
 
+    /// Whether this replica's engine takes `request` once committed
+    /// ([`Audio::admits`]); the witness has none and takes any.
+    pub fn admits(&self, request: &Request) -> Result<(), String> {
+        self.audio.as_ref().map_or(Ok(()), |a| a.admits(request))
+    }
+
     /// The engine refused an appended entry: the replica's output no
     /// longer follows the log, so it takes no client writes.
     pub fn engine_failed(&self) -> bool {
@@ -2948,6 +2972,7 @@ mod tests {
                 realised: Vec::new(),
                 generation_ready: true,
                 clock_steps: 0,
+                log_overflows: 0,
             }
         }
         fn fence(&self, end: u64) {

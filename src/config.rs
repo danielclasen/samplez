@@ -9,6 +9,17 @@ use serde::Deserialize;
 /// The most inputs and the most outputs an engine takes: per-block
 /// verdicts carry one bit per input and per output.
 pub const MAX_INPUTS: usize = 64;
+
+/// The matrix coefficients a configuration may have per sample of its
+/// block. A log entry's batch sets every coefficient it holds at its
+/// index, in one block, a scene recall the whole matrix, and the block
+/// reads, mixes, runs the strips and meters and writes as well. A set
+/// takes 20 ns in the builder image into a populated, ramping matrix of
+/// 88 by 88 coefficients and 33 ns into one of 384 by 432; at 34 ns a
+/// set, a full matrix of this many coefficients per sample is set within
+/// a quarter of the block period, 20.8 us a sample at 48 kHz. A larger
+/// matrix takes a larger `blockSize`.
+pub const COEFFICIENTS_PER_BLOCK_SAMPLE: usize = 150;
 pub const MAX_OUTPUTS: usize = 64;
 /// The most meters an engine takes.
 pub const MAX_METERS: usize = 64;
@@ -419,6 +430,16 @@ impl Config {
                 samplez_dsp::MAX_COEFFICIENTS
             ));
         }
+        let per_block = self.block_size as usize * COEFFICIENTS_PER_BLOCK_SAMPLE;
+        if coefficients > per_block {
+            let needed = coefficients.div_ceil(COEFFICIENTS_PER_BLOCK_SAMPLE);
+            return fail(format!(
+                "{coefficients} matrix coefficients, at most {COEFFICIENTS_PER_BLOCK_SAMPLE} per \
+                 sample of the block, {per_block} at blockSize {}, so that a batch setting all \
+                 of them applies in one block; a blockSize of at least {needed} takes them",
+                self.block_size
+            ));
+        }
         if self.meters.len() > MAX_METERS {
             return fail(format!(
                 "{} meters, at most {MAX_METERS}",
@@ -589,6 +610,29 @@ mod tests {
         v["outputs"][0]["channels"] = serde_json::json!(512);
         let e = parse(&v).unwrap_err().to_string();
         assert!(e.contains("matrix coefficients"), "{e}");
+    }
+
+    /// A matrix whose every coefficient a batch could not set within a
+    /// quarter of the block period is refused: at blockSize 48 one of
+    /// 7,200 coefficients is taken, one of 8,192 refused, naming the
+    /// blockSize of 55 that takes it, and taken at blockSize 64.
+    #[test]
+    fn a_matrix_a_batch_cannot_set_in_one_block_is_refused() {
+        let mut v = base();
+        v["blockSize"] = serde_json::json!(48);
+        let shape = |v: &mut serde_json::Value, columns: usize| {
+            v["inputs"][0]["channels"] = serde_json::json!(8);
+            v["outputs"][0]["channels"] = serde_json::json!(columns);
+            v["matrix"] = serde_json::json!(vec![vec![0.0; columns]; 8]);
+        };
+        shape(&mut v, 900);
+        parse(&v).unwrap();
+        shape(&mut v, 1024);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("at most 150 per sample of the block"), "{e}");
+        assert!(e.contains("a blockSize of at least 55 takes them"), "{e}");
+        v["blockSize"] = serde_json::json!(64);
+        parse(&v).unwrap();
     }
 
     #[test]

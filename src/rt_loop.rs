@@ -24,6 +24,7 @@ use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outco
 use samplez_mxl::output::{FlowWriter, Write};
 use samplez_mxl::{MxlApi, time};
 
+use crate::batch::Batch;
 use crate::blocks::{
     Cause, Changes, Ctx, Hold, Kind, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
@@ -138,6 +139,12 @@ pub struct Counters {
     /// Entries whose index passed without a core, taken off the pending
     /// list: strip entries applied to their strips, the others not.
     pub entries_without_core: AtomicU64,
+    /// Spent batches neither the return ring nor the RT thread's spent
+    /// list had room for: leaked rather than freed on the RT thread.
+    pub batches_leaked: AtomicU64,
+    /// Times a replicated engine dropped its core because more than
+    /// `WAITING` committed entries waited for room in its entry ring.
+    pub log_overflows: AtomicU64,
     /// Page hashes the supervisor could not pass on: the replicated
     /// state's channel was full.
     pub page_hashes_unsent: AtomicU64,
@@ -305,9 +312,9 @@ pub(crate) enum Telemetry {
 pub(crate) struct Gen {
     pub mxl: Generation,
     pub prune_after: Vec<u64>,
-    /// Built for a `Route` entry that changes the slot's flow: the slot's
+    /// The slots, by bit, a re-route moved to another flow: each one's
     /// reader is on the new flow, its outgoing reader on the old one.
-    pub rerouted: bool,
+    pub rerouted: u64,
 }
 
 pub(crate) enum Command {
@@ -421,11 +428,39 @@ pub(crate) enum Change {
     Route { slot: usize },
     /// Sets one parameter of the slot's strip from the index.
     Strip { slot: usize, param: StripParam },
+    /// The engine entries of one log entry, folded: its gains, strip
+    /// parameters (`strips` says whether it has any) and `InputDown`s in
+    /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
+    /// slots it raises after them and those it re-routes, all of one
+    /// input domain, for which one generation is built.
+    Batch { strips: bool, up: u64, routed: u64 },
+}
+
+/// The bit of input slot `slot` in a slot mask; at most
+/// [`crate::config::MAX_INPUTS`], 64, slots.
+pub(crate) fn bit(slot: usize) -> u64 {
+    1 << slot
+}
+
+/// The slots of slot mask `mask`, ascending.
+pub(crate) fn slots_of(mask: u64) -> impl Iterator<Item = usize> {
+    (0..64).filter(move |&s| mask & bit(s) != 0)
 }
 
 impl Change {
     pub fn needs_generation(&self) -> bool {
-        matches!(self, Change::InputUp { .. } | Change::Route { .. })
+        self.generating() != (0, 0)
+    }
+
+    /// The slots the change raises and those it re-routes, as masks: what
+    /// its generation is built for.
+    pub fn generating(&self) -> (u64, u64) {
+        match *self {
+            Change::InputUp { slot } => (bit(slot), 0),
+            Change::Route { slot } => (0, bit(slot)),
+            Change::Batch { up, routed, .. } => (up, routed),
+            _ => (0, 0),
+        }
     }
 
     /// Whether a core holds what this change did once applied: a gain
@@ -435,10 +470,15 @@ impl Change {
     /// product state, stay with the RT thread, so an entry making them
     /// must still reach it.
     pub fn in_core(&self, strips: bool) -> bool {
-        match self {
+        match *self {
             Change::Gain { .. } | Change::InputDown { .. } => true,
             Change::Strip { .. } => strips,
             Change::InputUp { .. } | Change::Route { .. } => false,
+            Change::Batch {
+                strips: has,
+                up,
+                routed,
+            } => up | routed == 0 && (strips || !has),
         }
     }
 }
@@ -453,13 +493,27 @@ pub(crate) struct RtEntry {
     pub change: Change,
 }
 
-/// Entries the RT thread holds before their index, and the capacity of
-/// the entry ring.
+/// A committed log entry as the entry ring carries it: a
+/// [`Change::Batch`] with its batch, allocated off the RT thread.
+pub(crate) struct RingEntry {
+    pub entry: RtEntry,
+    pub batch: Option<Arc<Batch>>,
+}
+
+/// Log entries the RT thread holds before their index, and the capacity
+/// of the entry ring: one each, however many engine entries it folds, as
+/// the leader stamps at most `FUTURE_LIST` (the same 64) log entries
+/// ahead.
 pub(crate) const PENDING_CHANGES: usize = 64;
+
+/// Spent batches the RT thread keeps while the return ring is full.
+pub(crate) const SPENT: usize = 2 * PENDING_CHANGES;
 
 pub(crate) enum Returned {
     Generation(Box<Gen>),
     Writer(Box<FlowWriter>),
+    /// A batch applied, reported late or known already.
+    Batch(Arc<Batch>),
 }
 
 pub(crate) struct Slot {
@@ -862,6 +916,9 @@ pub(crate) struct Mix {
     /// Pending entries, by `at_index`, in log order within one index.
     /// Capacity [`PENDING_CHANGES`], never exceeded.
     pub pending: Vec<RtEntry>,
+    /// The batch of each [`Change::Batch`] pending or due, by log id.
+    /// Capacity [`PENDING_CHANGES`], never exceeded: one per entry.
+    pub batches: Vec<(LogId, Arc<Batch>)>,
     /// Entries other than gain changes taken off the pending list by the
     /// last [`Mix::to`], in order, each with whether it was late. They
     /// are applied by the loop.
@@ -890,6 +947,7 @@ impl Mix {
             pos: None,
             ramp_end: 0,
             pending: Vec::with_capacity(PENDING_CHANGES),
+            batches: Vec::with_capacity(PENDING_CHANGES),
             due: Vec::with_capacity(PENDING_CHANGES),
             applied: 0,
             last_taken: 0,
@@ -933,6 +991,30 @@ impl Mix {
         true
     }
 
+    /// Queues `entry` with its batch, a [`Change::Batch`]'s. The batch
+    /// back, and nothing queued, when [`PENDING_CHANGES`] are pending:
+    /// the caller hands it off the RT thread.
+    pub fn push_with(
+        &mut self,
+        entry: RtEntry,
+        batch: Option<Arc<Batch>>,
+    ) -> Result<(), Option<Arc<Batch>>> {
+        if !self.push(entry) {
+            return Err(batch);
+        }
+        if let Some(b) = batch {
+            // As many as pending entries: room.
+            self.batches.push((entry.id, b));
+        }
+        Ok(())
+    }
+
+    /// Takes the batch of entry `id` out of the list.
+    pub fn take_batch(&mut self, id: LogId) -> Option<Arc<Batch>> {
+        let n = self.batches.iter().position(|b| b.0 == id)?;
+        Some(self.batches.swap_remove(n).1)
+    }
+
     /// Whether entry `id` is pending.
     pub fn holds(&self, id: LogId) -> bool {
         self.pending.iter().any(|c| c.id == id)
@@ -970,6 +1052,17 @@ impl Mix {
         {
             self.pending.remove(0);
             self.last_taken = self.last_taken.max(c.id);
+            if matches!(c.change, Change::Batch { .. }) {
+                // Its gains apply here, the rest with the other due
+                // entries; a late one is reported there.
+                if c.at_index >= pos {
+                    self.matrix.advance((c.at_index - pos) as usize);
+                    pos = c.at_index;
+                    self.batch_gains(c);
+                }
+                self.due.push((c, c.at_index < pos));
+                continue;
+            }
             let Change::Gain {
                 input,
                 output,
@@ -994,6 +1087,27 @@ impl Mix {
         }
         self.matrix.advance((start - pos) as usize);
         self.pos = Some(start + self.block);
+    }
+
+    /// Sets the gains of batch entry `c` at its index, the matrix there.
+    fn batch_gains(&mut self, c: RtEntry) {
+        let Mix {
+            matrix,
+            batches,
+            ramp,
+            ramp_end,
+            ..
+        } = self;
+        let Some((_, b)) = batches.iter().find(|b| b.0 == c.id) else {
+            return;
+        };
+        let columns = matrix.outputs();
+        b.gains.each(|k, gain| {
+            let (input, output) = (k / columns, k % columns);
+            if matrix.set(input, output, gain, *ramp) && matrix.is_ramping(input, output) {
+                *ramp_end = (*ramp_end).max(c.at_index + u64::from(*ramp));
+            }
+        });
     }
 
     /// Whether a coefficient ramp runs in block `k`.
@@ -1054,7 +1168,10 @@ pub(crate) struct Rt {
     /// hand-over installs one.
     pub core: bool,
     pub cmd: Consumer<Command>,
-    pub entries: Consumer<RtEntry>,
+    pub entries: Consumer<RingEntry>,
+    /// Spent batches the return ring had no room for. Capacity
+    /// [`SPENT`], never exceeded.
+    pub spent: Vec<Arc<Batch>>,
     pub ret: Producer<Returned>,
     pub tel: Producer<Telemetry>,
     pub meters: Producer<MeterRecord>,
@@ -1217,6 +1334,7 @@ fn capture_core(
         d.strip.clone_from(&s.strip);
         d.strip_pos = s.strip_pos;
     }
+    c.put_batches(&m.batches);
     c.awaiting_gen.clear();
     c.awaiting_gen.extend_from_slice(awaiting);
     c.pending_gen = pending_gen;
@@ -1555,42 +1673,111 @@ impl Rt {
     }
 
     /// Moves committed entries from the entry ring to the pending list
-    /// while it has room.
+    /// while it has room; an entry the list holds already needs none.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn take_entries(&mut self) {
-        while self.mix.pending.len() < PENDING_CHANGES
-            && let Ok(entry) = self.entries.pop()
-        {
-            self.taken += 1;
-            self.last_entry = self.last_entry.max(entry.id);
+        self.return_spent();
+        while let Ok(head) = self.entries.peek() {
             // A hand-over brought the entry in already, pending or
             // applied by the replay.
-            if self.mix.holds(entry.id) {
+            let held = self.mix.holds(head.entry.id);
+            if !held && self.mix.pending.len() >= PENDING_CHANGES {
+                return;
+            }
+            let Ok(RingEntry { entry, batch }) = self.entries.pop() else {
+                return;
+            };
+            self.taken += 1;
+            self.last_entry = self.last_entry.max(entry.id);
+            if held {
+                self.retire(batch);
                 continue;
             }
-            let strip = matches!(entry.change, Change::Strip { .. });
-            if strip && entry.id <= self.strips_upto {
-                // In the strips the last replayed core brought, or on
-                // its pending list, applied here at its index; taken
-                // through that core.
-                self.mix.last_taken = self.mix.last_taken.max(entry.id);
-                continue;
-            }
-            if entry.id <= self.skip_upto {
-                // The core knew it. It holds what a gain change or an
-                // InputDown did; any other entry below the install it
-                // applied without what it did reaching this thread, so
-                // that entry is applied as on time. One at or past the
-                // install was on the core's pending list, applied here at
-                // its index.
-                if !entry.change.in_core(false) && entry.at_index < self.install_at {
-                    self.apply(entry);
+            self.take(entry, batch);
+        }
+    }
+
+    /// Takes entry `entry`, with its batch, off the ring: pending, or
+    /// known to the last core installed.
+    fn take(&mut self, mut entry: RtEntry, batch: Option<Arc<Batch>>) {
+        if entry.id <= self.strips_upto {
+            // Its strip parameters are in the strips the last replayed
+            // core brought, or on its pending list, applied here at its
+            // index; taken through that core.
+            match &mut entry.change {
+                Change::Strip { .. } => {
+                    self.mix.last_taken = self.mix.last_taken.max(entry.id);
+                    return;
                 }
-                // Taken through the core, as one on the pending list.
-                self.mix.last_taken = self.mix.last_taken.max(entry.id);
-                continue;
+                // Its batch's strip parameters are left out.
+                Change::Batch { strips, .. } => *strips = false,
+                _ => {}
             }
-            let _ = self.mix.push(entry);
+        }
+        if entry.id <= self.skip_upto {
+            // The core knew it. It holds what gain changes and InputDowns
+            // did; what else an entry below the install did did not reach
+            // this thread, so that is applied as on time. One at or past
+            // the install was on the core's pending list, applied here at
+            // its index.
+            if !entry.change.in_core(false) && entry.at_index < self.install_at {
+                self.apply_known(entry, batch.as_deref(), true, true);
+            }
+            self.retire(batch);
+            // Taken through the core, as one on the pending list.
+            self.mix.last_taken = self.mix.last_taken.max(entry.id);
+            return;
+        }
+        if let Err(b) = self.mix.push_with(entry, batch) {
+            // Unreachable: room was checked.
+            self.retire(b);
+        }
+    }
+
+    /// The return ring's slots spent batches leave free: one per input
+    /// domain and output and one more, for the generations and writers
+    /// this thread hands back.
+    fn reserve(&self) -> usize {
+        self.gens.len() + self.outs.len() + 1
+    }
+
+    /// Hands this thread's handle on spent batch `batch` off it through
+    /// the return ring, leaving the reserve free, or keeps it on the spent
+    /// list until the ring has room: this thread never drops one, so it
+    /// never frees one. One neither has room for is leaked and counted.
+    /// A replay keeps it on the spent list, which it frees between blocks.
+    pub(crate) fn retire(&mut self, batch: Option<Arc<Batch>>) {
+        let Some(b) = batch else { return };
+        let b = if !self.replay && self.ret.slots() > self.reserve() {
+            match self.ret.push(Returned::Batch(b)) {
+                Ok(()) => return,
+                Err(rtrb::PushError::Full(Returned::Batch(b))) => b,
+                Err(rtrb::PushError::Full(other)) => {
+                    std::mem::forget(other);
+                    return;
+                }
+            }
+        } else {
+            b
+        };
+        if self.spent.len() < self.spent.capacity() {
+            self.spent.push(b);
+        } else {
+            add(&self.counters.batches_leaked, 1);
+            std::mem::forget(b);
+        }
+    }
+
+    /// Passes the spent batches kept to the return ring while it has
+    /// more room than the reserve.
+    fn return_spent(&mut self) {
+        if self.replay {
+            return;
+        }
+        while self.ret.slots() > self.reserve()
+            && let Some(b) = self.spent.pop()
+        {
+            let _ = self.ret.push(Returned::Batch(b));
         }
     }
 
@@ -1603,7 +1790,21 @@ impl Rt {
             }
             let Ok(cmd) = self.cmd.pop() else { return };
             match cmd {
-                Command::Generation { domain, generation } => self.install(domain, generation),
+                Command::Generation { domain, generation } => {
+                    // Slots a product state moved to another flow read it
+                    // anew from here, no crossfade.
+                    let rerouted = generation.rerouted;
+                    self.install(domain, generation);
+                    for i in slots_of(rerouted) {
+                        let slot = &mut self.slots[i];
+                        let s = &mut slot.state;
+                        s.last_end = None;
+                        s.head = 0;
+                        s.frozen_late_blocks = 0;
+                        s.invalid = false;
+                        slot.xfade = None;
+                    }
+                }
                 Command::Pending {
                     id,
                     domain,
@@ -1617,10 +1818,14 @@ impl Rt {
                     } else if id > self.last_entry || self.mix.holds(id) {
                         // Its entry is pending, or still in the entry ring
                         // behind a full pending list.
-                        if let Some((old, _, g)) =
-                            self.pending_gen.replace((id, domain, generation))
-                        {
-                            self.gen_unused(old, g);
+                        match self.pending_gen.replace((id, domain, generation)) {
+                            // Built again for the same entry, as after a
+                            // product state: the entry still awaits it.
+                            Some((old, _, g)) if old == id => {
+                                self.give_back(Returned::Generation(g));
+                            }
+                            Some((old, _, g)) => self.gen_unused(old, g),
+                            None => {}
                         }
                     } else {
                         self.gen_unused(id, generation);
@@ -1727,10 +1932,12 @@ impl Rt {
 
     /// Without a core: takes the entries due by block `k` that need no
     /// generation off the pending list, so that a long spell neither
-    /// fills the list nor holds the log's entries back. A strip entry is
-    /// applied to its slot's strip, which stays with the slot; the others
-    /// pass unapplied. A core installed later must know them, as it must
-    /// know every entry taken.
+    /// fills the list nor holds the log's entries back. A strip entry, and
+    /// a batch's strip parameters, are applied to the slots' strips, which
+    /// stay with the slots; the rest passes unapplied. A batch holding a
+    /// generation-needing entry stays pending whole, as that entry does
+    /// alone. A core installed later must know them, as it must know every
+    /// entry taken.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn pass_entries(&mut self, k: u64) {
         let end = (k + 1) * self.block;
@@ -1743,11 +1950,20 @@ impl Rt {
             self.mix.pending.remove(i);
             self.mix.last_taken = self.mix.last_taken.max(e.id);
             add(&self.counters.entries_without_core, 1);
-            if let Change::Strip { slot, param } = e.change
-                && !self.slots[slot].set_strip(e.at_index, param)
-            {
-                add(&self.counters.strip_refused, 1);
-                self.send(Telemetry::StripRefused { entry: e });
+            match e.change {
+                Change::Strip { slot, param } => self.set_strip(e, slot, param),
+                Change::Batch { strips, .. } => {
+                    let b = self.mix.take_batch(e.id);
+                    // Without strips, its strip parameters are in the
+                    // strips the last replayed core brought.
+                    if let Some(b) = b.as_ref().filter(|_| strips) {
+                        for &(slot, param) in &b.strips {
+                            self.set_strip(e, slot as usize, param);
+                        }
+                    }
+                    self.retire(b);
+                }
+                _ => {}
             }
         }
         self.publish_consumed();
@@ -1766,7 +1982,7 @@ impl Rt {
 
     /// Makes `generation` the one of input domain `domain` and hands the
     /// old one back. Slot state stays with the slots.
-    fn install(&mut self, domain: usize, generation: Box<Gen>) {
+    pub(crate) fn install(&mut self, domain: usize, generation: Box<Gen>) {
         let old = self.gens[domain].take();
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.domain != domain {
@@ -1794,40 +2010,44 @@ impl Rt {
         self.send(Telemetry::GenerationDone { id, swapped: false });
     }
 
-    /// Swaps in the generation of entry `e`, an `InputUp` or a `Route`.
-    /// A re-route on time starts its crossfade at the entry's index; one
-    /// whose generation came late starts the new flow from silence.
+    /// Swaps in the generation of entry `e`, which raises or re-routes
+    /// slots. A re-route on time starts its crossfade at the entry's
+    /// index; one whose generation came late starts the new flow from
+    /// silence.
     fn swap_in(&mut self, e: RtEntry, domain: usize, generation: Box<Gen>, on_time: bool) {
         let rerouted = generation.rerouted;
         self.install(domain, generation);
-        let (Change::InputUp { slot: i } | Change::Route { slot: i }) = e.change else {
-            unreachable!("only these entries need a generation")
-        };
-        // Silent while another entry for the slot awaits its generation.
-        let held = self.awaiting_gen.iter().any(
-            |a| matches!(a.change, Change::InputUp { slot } | Change::Route { slot } if slot == i),
-        );
-        let slot = &mut self.slots[i];
-        slot.held = held;
-        if rerouted {
-            slot.prev = slot.state.clone();
-            let s = &mut slot.state;
-            s.last_end = None;
-            s.head = 0;
-            s.frozen_late_blocks = 0;
-            s.invalid = false;
-            // Anchored at the index whatever the slot's last block was:
-            // an outgoing flow that is silent fades the new one in.
-            slot.xfade = on_time.then_some(e.at_index);
-            // Late, it skips that crossfade: its blocks differ from an
-            // on-time engine's until the crossfade's end.
-            if !on_time
-                && matches!(e.change, Change::Route { .. })
-                && let Some(r) = self.replica.as_mut()
-                && !note_late_route(r, e.id, e.at_index.saturating_add(u64::from(self.ramp)))
-            {
-                add(&self.counters.late_routes_lost, 1);
+        let (up, routed) = e.change.generating();
+        for i in slots_of(up | routed) {
+            // Silent while another entry for the slot awaits its
+            // generation.
+            let held = self.awaiting_gen.iter().any(|a| {
+                let (u, r) = a.change.generating();
+                (u | r) & bit(i) != 0
+            });
+            let slot = &mut self.slots[i];
+            slot.held = held;
+            if rerouted & bit(i) != 0 {
+                slot.prev = slot.state.clone();
+                let s = &mut slot.state;
+                s.last_end = None;
+                s.head = 0;
+                s.frozen_late_blocks = 0;
+                s.invalid = false;
+                // Anchored at the index whatever the slot's last block
+                // was: an outgoing flow that is silent fades the new one
+                // in.
+                slot.xfade = on_time.then_some(e.at_index);
             }
+        }
+        // Late, a re-route skips its crossfade: the blocks differ from an
+        // on-time engine's until the crossfade's end.
+        if !on_time
+            && routed & rerouted != 0
+            && let Some(r) = self.replica.as_mut()
+            && !note_late_route(r, e.id, e.at_index.saturating_add(u64::from(self.ramp)))
+        {
+            add(&self.counters.late_routes_lost, 1);
         }
         self.send(Telemetry::GenerationDone {
             id: e.id,
@@ -1835,13 +2055,71 @@ impl Rt {
         });
     }
 
+    /// Sets parameter `param` of slot `slot`'s strip from the index of
+    /// entry `e`, which carries it; a refusal is counted and reported.
+    fn set_strip(&mut self, e: RtEntry, slot: usize, param: StripParam) {
+        // Checked against the configuration that appended it; a slot of
+        // another width here refuses it.
+        if !self.slots[slot].set_strip(e.at_index, param) {
+            add(&self.counters.strip_refused, 1);
+            let entry = RtEntry {
+                change: Change::Strip { slot, param },
+                ..e
+            };
+            self.send(Telemetry::StripRefused { entry });
+        }
+    }
+
     /// Applies entry `e`, other than a gain change, at the start of the
-    /// block at its index. An entry that sets what the slot already has
-    /// starts nothing.
+    /// block at its index: a batch's `InputDown`s, strip parameters and
+    /// generation-needing entry, its gains set by [`Mix::to`]. An entry
+    /// that sets what the slot already has starts nothing.
     fn apply(&mut self, e: RtEntry) {
+        if let Change::Batch { .. } = e.change {
+            let b = self.mix.take_batch(e.id);
+            self.mix.applied_entry(&e);
+            if let Some(b) = &b {
+                for &slot in &b.downs {
+                    self.apply_change(RtEntry {
+                        change: Change::InputDown {
+                            slot: slot as usize,
+                        },
+                        ..e
+                    });
+                }
+            }
+            self.apply_known(e, b.as_deref(), false, true);
+            self.retire(b);
+            return;
+        }
         self.mix.applied_entry(&e);
-        let slot = match e.change {
-            Change::Gain { .. } => return,
+        self.apply_change(e);
+    }
+
+    /// Applies what of entry `e`, with batch `b`, a core does not hold:
+    /// its strip parameters with `strips`, and its generation-needing
+    /// entry; a single entry whole. Counted applied for the fingerprint
+    /// with `count`.
+    fn apply_known(&mut self, e: RtEntry, b: Option<&Batch>, count: bool, strips: bool) {
+        if count {
+            self.mix.applied_entry(&e);
+        }
+        let Change::Batch { strips: has, .. } = e.change else {
+            self.apply_change(e);
+            return;
+        };
+        if let Some(b) = b.filter(|_| strips && has) {
+            for &(slot, param) in &b.strips {
+                self.set_strip(e, slot as usize, param);
+            }
+        }
+        self.apply_generation(e);
+    }
+
+    /// Applies change `e`, a single one other than a gain change.
+    fn apply_change(&mut self, e: RtEntry) {
+        match e.change {
+            Change::Gain { .. } | Change::Batch { .. } => {}
             Change::InputDown { slot } => {
                 let s = &mut self.slots[slot];
                 if s.up {
@@ -1849,34 +2127,40 @@ impl Rt {
                     s.xfade = None;
                     self.send(Telemetry::Input { slot, up: false });
                 }
-                return;
             }
-            Change::Strip { slot, param } => {
-                // Checked against the configuration that appended it; a
-                // slot of another width here refuses it.
-                if !self.slots[slot].set_strip(e.at_index, param) {
-                    add(&self.counters.strip_refused, 1);
-                    self.send(Telemetry::StripRefused { entry: e });
-                }
-                return;
+            Change::Strip { slot, param } => self.set_strip(e, slot, param),
+            Change::InputUp { .. } | Change::Route { .. } => self.apply_generation(e),
+        }
+    }
+
+    /// Applies what of entry `e` its generation is built for: the slots
+    /// it raises fade in from its index, and its generation is swapped in,
+    /// or, not here yet, awaited with those slots and the re-routed ones
+    /// held silent.
+    fn apply_generation(&mut self, e: RtEntry) {
+        let (up, routed) = e.change.generating();
+        if up | routed == 0 {
+            return;
+        }
+        for slot in slots_of(up) {
+            if !self.slots[slot].up {
+                // The fade-in runs from the entry's index, also on an
+                // engine that skipped the blocks around it.
+                let s = &mut self.slots[slot];
+                s.up = true;
+                s.fade_start = Some(e.at_index);
+                s.silenced_last = false;
+                self.send(Telemetry::Input { slot, up: true });
             }
-            Change::InputUp { slot } | Change::Route { slot } => slot,
-        };
-        if matches!(e.change, Change::InputUp { .. }) && !self.slots[slot].up {
-            // The fade-in runs from the entry's index, also on an engine
-            // that skipped the blocks around it.
-            let s = &mut self.slots[slot];
-            s.up = true;
-            s.fade_start = Some(e.at_index);
-            s.silenced_last = false;
-            self.send(Telemetry::Input { slot, up: true });
         }
         match self.pending_gen.take() {
             Some((id, domain, g)) if id == e.id => self.swap_in(e, domain, g, true),
             other => {
                 self.pending_gen = other;
                 add(&self.counters.generation_late, 1);
-                self.slots[slot].held = true;
+                for slot in slots_of(up | routed) {
+                    self.slots[slot].held = true;
+                }
                 if self.awaiting_gen.len() < PENDING_CHANGES {
                     self.awaiting_gen.push(e);
                 } else {
@@ -1903,6 +2187,8 @@ impl Rt {
             if let Some((id, _, g)) = self.pending_gen.take_if(|p| p.0 == e.id) {
                 self.gen_unused(id, g);
             }
+            let b = self.mix.take_batch(e.id);
+            self.retire(b);
         }
         self.mix.due.clear();
     }
@@ -2270,7 +2556,7 @@ impl Rt {
     /// generation is swapped in, a crossfade anchored at its index, or
     /// the strip set from its index.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    pub(crate) fn install_core(&mut self, c: &Core, last_id: LogId, strips: bool) {
+    pub(crate) fn install_core(&mut self, c: &mut Core, last_id: LogId, strips: bool) {
         let m = &mut self.mix;
         let next = c.pos.unwrap_or(0);
         m.due.clear();
@@ -2290,12 +2576,38 @@ impl Rt {
                 m.last_taken = m.last_taken.max(e.id);
             }
         }
-        m.pending.retain(|e| e.id > last_id);
-        for e in &c.pending {
-            if !m.holds(e.id) && !m.push(*e) {
-                add(&self.counters.handover_entries_lost, 1);
+        // The batches of the entries dropped go off the RT thread with the
+        // core; those of the entries applied below once applied.
+        let mut n = 0;
+        while let Some(&(id, _)) = self.mix.batches.get(n) {
+            if id > last_id || self.mix.due.iter().any(|d| d.0.id == id) {
+                n += 1;
+                continue;
+            }
+            let (_, b) = self.mix.batches.swap_remove(n);
+            if let Err(b) = c.keep(b) {
+                self.retire(Some(b));
             }
         }
+        let m = &mut self.mix;
+        m.pending.retain(|e| e.id > last_id);
+        for i in 0..c.pending.len() {
+            let e = c.pending[i];
+            if self.mix.holds(e.id) {
+                continue;
+            }
+            // The core's batch is taken, not copied: nothing allocates.
+            let b = c.take_batch(e.id);
+            if let Err(b) = self.mix.push_with(e, b) {
+                add(&self.counters.handover_entries_lost, 1);
+                if let Some(b) = b
+                    && let Err(b) = c.keep(b)
+                {
+                    self.retire(Some(b));
+                }
+            }
+        }
+        let m = &mut self.mix;
         m.page_entries.clear();
         m.page_entries.extend_from_slice(&c.page_entries);
         m.entries_page = c.entries_page;
@@ -2324,7 +2636,8 @@ impl Rt {
             }
         }
         for a in &self.awaiting_gen {
-            if let Change::InputUp { slot } | Change::Route { slot } = a.change {
+            let (up, routed) = a.change.generating();
+            for slot in slots_of(up | routed) {
                 self.slots[slot].held = true;
             }
         }
@@ -2342,7 +2655,9 @@ impl Rt {
         }
         for n in 0..self.mix.due.len() {
             let (e, _) = self.mix.due[n];
-            self.apply(e);
+            let b = self.mix.take_batch(e.id);
+            self.apply_known(e, b.as_deref(), true, !strips);
+            self.retire(b);
         }
         self.mix.due.clear();
     }
@@ -2380,7 +2695,21 @@ impl Rt {
         };
         let counter = match h.answer {
             Answer::Installed => {
-                self.install_core(&h.core, h.last_id, h.replayed);
+                self.install_core(&mut h.core, h.last_id, h.replayed);
+                // A product state's strip parameters, from the install on.
+                let e = RtEntry {
+                    id: h.last_id,
+                    at_index: first * self.block,
+                    change: Change::Batch {
+                        strips: true,
+                        up: 0,
+                        routed: 0,
+                    },
+                };
+                for n in 0..h.strips.len() {
+                    let (slot, param) = h.strips[n];
+                    self.set_strip(e, slot, param);
+                }
                 // The page holding the boundary mixes both states: no
                 // record.
                 for p in self.outs.iter_mut().filter_map(|o| o.pages.as_mut()) {
@@ -2970,6 +3299,8 @@ mod tests {
             unresolved: vec![(8, 21 * B), (9, 30 * B)],
             late_routes: vec![(10, 25 * B)],
             late_lost_until: 26 * B,
+            batches: Vec::new(),
+            handed: Default::default(),
         };
         assert_eq!(c, want);
         assert_eq!(c.pending.len(), 2);
@@ -3022,6 +3353,49 @@ mod tests {
         assert!(!note_late_route(&mut r, 99, 20 * B));
         assert_ne!(digest(&mut r, &[], 15 * B, 0, 0), Some(HEALTHY));
         assert_eq!(digest(&mut r, &[], 20 * B, 0, 0), Some(HEALTHY));
+    }
+
+    /// A batch's gains apply at its index, all of them, and the batch is
+    /// due once for the rest; one the matrix passed sets no gain and is
+    /// due late, once.
+    #[test]
+    fn a_batch_sets_its_gains_at_its_index() {
+        let mut m = Mix::new(Matrix::new(2, 2), B, 480);
+        let changes = [
+            Change::Gain {
+                input: 0,
+                output: 1,
+                gain: 0.5,
+            },
+            Change::Gain {
+                input: 1,
+                output: 0,
+                gain: 0.25,
+            },
+        ];
+        let (change, batch) = crate::batch::fold(&changes, 2, 4).unwrap().unwrap();
+        let e = RtEntry {
+            id: 7,
+            at_index: 10 * B,
+            change,
+        };
+        assert!(m.push_with(e, batch.clone()).is_ok());
+        to(&mut m, 9);
+        assert_eq!((m.matrix.gain(0, 1), m.matrix.gain(1, 0)), (0.0, 0.0));
+        to(&mut m, 10);
+        assert_eq!(m.due.as_slice(), [(e, false)]);
+        to(&mut m, 30);
+        assert_eq!((m.matrix.gain(0, 1), m.matrix.gain(1, 0)), (0.5, 0.25));
+        assert!(m.take_batch(7).is_some());
+        // Past its index: nothing set, due late.
+        let late = RtEntry { id: 8, ..e };
+        let mut m2 = Mix::new(Matrix::new(2, 2), B, 480);
+        to(&mut m2, 11);
+        assert!(m2.push_with(late, batch).is_ok());
+        to(&mut m2, 12);
+        assert_eq!(m2.due.as_slice(), [(late, true)]);
+        to(&mut m2, 40);
+        assert_eq!((m2.matrix.gain(0, 1), m2.matrix.gain(1, 0)), (0.0, 0.0));
     }
 
     /// Input entries leave the pending list at the block of their index,

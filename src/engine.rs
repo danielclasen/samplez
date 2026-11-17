@@ -24,6 +24,7 @@ use samplez_mxl::input::{
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
 
+use crate::batch::{self, Batch};
 use crate::blocks::{
     BlockStatus, Cause, Hold, PAGE, PageHash, Pages, Ranks, Standing, StatusChange, Statuses,
 };
@@ -32,8 +33,8 @@ use crate::meters::{InputMeters, OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
     BlockVerdict, Change, Command, Control, Counters, Gen, LogId, LoudnessReset, MeterRecord,
-    Metered, Mix, Out, OutMeter, PENDING_CHANGES, Replica, Returned, Rt, RtEntry, SLICE, Shared,
-    Slot, SlotStats, Telemetry, UNRESOLVED,
+    Metered, Mix, Out, OutMeter, PENDING_CHANGES, Replica, Returned, RingEntry, Rt, RtEntry, SLICE,
+    SPENT, Shared, Slot, SlotStats, Telemetry, UNRESOLVED, bit, slots_of,
 };
 use crate::transfer::{
     Answer, CopyError, Core, CoreCopy, Handover, ProductState, Replay, ReplayError, SlotCore,
@@ -176,6 +177,9 @@ pub struct Status {
     /// blocks a replay clone computes per block period, measured at
     /// start-up on silence.
     pub replay_speed: Option<f64>,
+    /// Spent batches the RT thread leaked rather than free them: its
+    /// return ring and spent list were full ([`Counters::batches_leaked`]).
+    pub batches_leaked: u64,
 }
 
 #[derive(Debug)]
@@ -258,7 +262,8 @@ pub enum EntryError {
     /// slot's strip does not take, an index that is not a multiple of the
     /// block size, or an entry the engine's log mode does not take.
     Invalid(String),
-    /// [`PENDING_CHANGES`] entries are outstanding.
+    /// [`PENDING_CHANGES`] entries are outstanding on an engine keeping
+    /// its own log; a replicated log refuses none for room.
     Full,
     /// Log id `id` is not above the last one appended, `last`.
     Order { id: LogId, last: LogId },
@@ -336,6 +341,9 @@ pub struct Progress {
     pub status_changes_lost: u64,
     /// buildLead in samples ([`GenerationStatus::build_lead`]).
     pub build_lead: u64,
+    /// Times the engine dropped its core for committed entries its RT
+    /// thread did not take ([`Engine::commit`]).
+    pub log_overflows: u64,
 }
 
 /// How an engine that follows a replicated log takes part in its set.
@@ -410,7 +418,7 @@ struct Transfer {
     spare: Option<Box<Core>>,
     /// Input and output channels, input slots and the room for one
     /// page's entries: the shape of a core buffer.
-    shape: (usize, usize, usize, usize),
+    shape: Shape,
     slack_blocks: u64,
 }
 
@@ -421,21 +429,34 @@ enum LogMsg {
     Append {
         id: LogId,
         at_index: u64,
-        change: Change,
-        flow: Option<String>,
+        /// The slots the entry raises, by bit.
+        up: u64,
+        /// The slots it re-routes, with their new flows.
+        routes: Vec<(usize, String)>,
     },
     /// Uncommitted entries from `from` on were removed.
     Truncate { from: LogId },
     /// Uncommitted entry `id` was removed.
     Skip { id: LogId },
+    /// Committed entries up to `upto` were dropped before they reached
+    /// the RT thread, and the core with them.
+    Dropped { upto: LogId },
+    /// A core built from product state is about to be installed: per
+    /// slot whether it is up and the flow it reads. The generations
+    /// reading them are handed to the RT thread before `done` is sent.
+    Product {
+        up: Vec<bool>,
+        flows: Vec<String>,
+        done: SyncSender<()>,
+    },
 }
 
 /// Appended entries not yet committed, and the producer of the RT
 /// thread's entry ring. Committed entries go to the RT thread by log id.
 struct Log {
-    ring: rtrb::Producer<RtEntry>,
+    ring: rtrb::Producer<RingEntry>,
     sup: mpsc::Sender<LogMsg>,
-    uncommitted: VecDeque<RtEntry>,
+    uncommitted: VecDeque<RingEntry>,
     last: LogId,
     committed: LogId,
     /// Entries pushed into the ring.
@@ -461,12 +482,18 @@ struct LocalLog {
 static STAMP_LATE: AtomicBool = AtomicBool::new(false);
 
 impl Log {
-    /// Appends `e`; `consumed` is the RT thread's count of entries taken
-    /// off its list, so committed entries never exceed what it holds.
+    /// Appends `e`. The engine's own log refuses it while
+    /// [`PENDING_CHANGES`] entries are outstanding, `consumed` being the RT
+    /// thread's count of entries taken off its list, so its committed
+    /// entries never exceed what the RT thread holds. A replicated log
+    /// refuses no entry for room: its leader refuses one before ordering
+    /// it, and a committed entry the ring has no room for waits here until
+    /// it has ([`Log::flush`]), applied late should its index pass.
     fn append(
         &mut self,
         e: RtEntry,
-        flow: Option<String>,
+        batch: Option<Arc<Batch>>,
+        routes: Vec<(usize, String)>,
         consumed: u64,
     ) -> Result<(), EntryError> {
         if e.id <= self.last {
@@ -476,40 +503,70 @@ impl Log {
             });
         }
         let outstanding = self.submitted - consumed + self.uncommitted.len() as u64;
-        if outstanding >= PENDING_CHANGES as u64 {
+        if self.local.is_some() && outstanding >= PENDING_CHANGES as u64 {
             return Err(EntryError::Full);
         }
+        let (up, _) = e.change.generating();
         if e.change.needs_generation() {
             // The supervisor outlives every caller.
             let _ = self.sup.send(LogMsg::Append {
                 id: e.id,
                 at_index: e.at_index,
-                change: e.change,
-                flow,
+                up,
+                routes,
             });
         }
-        self.uncommitted.push_back(e);
+        self.uncommitted.push_back(RingEntry { entry: e, batch });
         self.last = e.id;
         Ok(())
     }
 
     fn commit(&mut self, up_to: LogId) {
-        while let Some(e) = self.uncommitted.front().filter(|e| e.id <= up_to) {
-            // append keeps the outstanding entries within the ring.
-            if self.ring.push(*e).is_err() {
-                unreachable!("the entry ring holds every outstanding entry");
+        self.committed = self.committed.max(up_to.min(self.last));
+        self.flush();
+    }
+
+    /// Pushes the committed entries waiting to the ring while it has
+    /// room, in log order.
+    fn flush(&mut self) {
+        while let Some(q) = self.uncommitted.pop_front() {
+            if q.entry.id > self.committed {
+                self.uncommitted.push_front(q);
+                return;
+            }
+            if let Err(rtrb::PushError::Full(q)) = self.ring.push(q) {
+                self.uncommitted.push_front(q);
+                return;
             }
             self.submitted += 1;
-            self.uncommitted.pop_front();
         }
-        self.committed = self.committed.max(up_to.min(self.last));
+    }
+
+    /// The committed entries waiting for room in the ring.
+    fn waiting(&self) -> usize {
+        self.uncommitted
+            .iter()
+            .take_while(|q| q.entry.id <= self.committed)
+            .count()
+    }
+
+    /// Drops the committed entries waiting for room in the ring, and the
+    /// generations built for them: the core no longer follows the log.
+    fn drop_waiting(&mut self) {
+        let n = self.waiting();
+        let last = self.uncommitted.drain(..n).next_back().map(|q| q.entry.id);
+        if let Some(upto) = last {
+            let _ = self.sup.send(LogMsg::Dropped { upto });
+        }
     }
 
     /// Removes uncommitted entry `id`, and the generation built for it;
     /// false when no uncommitted entry has that id.
     fn skip(&mut self, id: LogId) -> bool {
         let before = self.uncommitted.len();
-        self.uncommitted.retain(|e| e.id != id);
+        let committed = self.committed;
+        self.uncommitted
+            .retain(|q| q.entry.id != id || q.entry.id <= committed);
         let skipped = self.uncommitted.len() < before;
         if skipped {
             let _ = self.sup.send(LogMsg::Skip { id });
@@ -522,10 +579,23 @@ impl Log {
     /// point removes those above it.
     fn truncate(&mut self, from: LogId) {
         let from = from.max(self.committed + 1);
-        self.uncommitted.retain(|e| e.id < from);
+        self.uncommitted.retain(|q| q.entry.id < from);
         self.last = self.last.min(from - 1);
         let _ = self.sup.send(LogMsg::Truncate { from });
     }
+}
+
+/// A product state's strip parameters, per slot, folded to the last value
+/// per parameter key, off the RT thread: it sets at most one per slot and
+/// key at an install, however long the lists.
+fn product_strips(strips: &[Vec<StripParam>]) -> Vec<(usize, StripParam)> {
+    let mut folded = std::collections::BTreeMap::new();
+    for (slot, params) in strips.iter().enumerate() {
+        for &param in params {
+            folded.insert((slot, batch::strip_key(&param)), param);
+        }
+    }
+    folded.into_iter().map(|((slot, _), p)| (slot, p)).collect()
 }
 
 /// Whether input slot `slot` exists and has a strip that takes `param`:
@@ -612,6 +682,14 @@ fn history_kept(started: &Started, k0: u64, slack: u64) -> Result<(), u64> {
 
 /// The input slots of `config`'s shape, every one up, and the index in
 /// `config.domains` of each input domain they use.
+/// The committed entries a replicated engine keeps waiting for room in
+/// its entry ring at most ([`Engine::commit`]).
+pub const WAITING: usize = 4 * PENDING_CHANGES;
+
+/// A core buffer's shape: input and output channels, input slots and the
+/// room for one page's entries.
+type Shape = (usize, usize, usize, usize);
+
 fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
     let mut in_domains: Vec<usize> = Vec::new();
     let mut slots = Vec::new();
@@ -757,6 +835,7 @@ fn replay_rt(
         core: true,
         cmd: none(),
         entries: none(),
+        spent: Vec::with_capacity(SPENT),
         ret: sink(),
         tel: sink(),
         meters: sink(),
@@ -1085,6 +1164,7 @@ impl Engine {
             core: true,
             cmd: cmd_rx,
             entries: entry_rx,
+            spent: Vec::with_capacity(SPENT),
             ret: ret_tx,
             tel: tel_tx,
             meters: meter_tx,
@@ -1122,6 +1202,7 @@ impl Engine {
             diverged: None,
             rt_panic: None,
             replay_speed,
+            batches_leaked: 0,
             inputs: config
                 .inputs
                 .iter()
@@ -1224,6 +1305,8 @@ impl Engine {
             lead,
             ramp: u64::from(config.ramp_samples),
             dirty: vec![true; in_domains.len()],
+            reroute: vec![0; in_domains.len()],
+            product: None,
             pollers: (0..in_domains.len()).map(|_| None).collect(),
             poll_errors: vec![None; in_domains.len()],
             rebuild_errors: vec![None; in_domains.len()],
@@ -1400,7 +1483,8 @@ impl Engine {
             change,
         };
         let consumed = self.counters.entries_consumed.load(Acquire);
-        log.append(e, None, consumed).map_err(|_| GainError::Full)?;
+        log.append(e, None, Vec::new(), consumed)
+            .map_err(|_| GainError::Full)?;
         log.commit(e.id);
         Ok(())
     }
@@ -1446,7 +1530,7 @@ impl Engine {
             change: Change::Route { slot },
         };
         let consumed = self.counters.entries_consumed.load(Acquire);
-        log.append(e, Some(flow_id.to_owned()), consumed)?;
+        log.append(e, None, vec![(slot, flow_id.to_owned())], consumed)?;
         log.commit(e.id);
         if let Some(l) = &mut log.local {
             l.last_at[slot] = at_index;
@@ -1455,14 +1539,37 @@ impl Engine {
         Ok(at_index)
     }
 
-    /// Appends entry `entry` at log id `id`, above every id appended
-    /// before, to apply at `at_index`, a multiple of the block size. An
-    /// `InputUp` or `Route` has its generation built at once; at most one
-    /// is built at a time, the next once the RT thread swapped in the one
-    /// before. Committed entries go to the RT thread, which applies each
-    /// at its index or, past it, counts it in `command_late` and marks the
-    /// engine diverged. Refused as invalid on an engine with its own log.
+    /// Appends entry `entry` at log id `id`: [`Engine::append_batch`] of
+    /// one entry.
     pub fn append(&self, id: LogId, at_index: u64, entry: Entry) -> Result<(), EntryError> {
+        self.append_batch(id, at_index, std::slice::from_ref(&entry))
+    }
+
+    /// Appends `entries`, the engine entries of log entry `id`, above every
+    /// id appended before, to apply at `at_index`, a multiple of the block
+    /// size. They are folded here, off the RT thread: per matrix
+    /// coefficient, strip parameter and input slot the last value counts
+    /// (an `InputDown`, `InputUp` or `Route` of a slot replaces the one
+    /// before it), so the log entry takes one place on the RT thread's
+    /// pending list and its batch is bounded by the engine's shape,
+    /// however many entries it has. No entries append nothing. Refused
+    /// whole, nothing appended, when any entry is refused alone or more
+    /// than one `InputUp` or `Route` remains: one generation is built at
+    /// a time. An `InputUp` or `Route` has its generation built at once,
+    /// the next once the RT thread swapped in the one before. Committed
+    /// log entries go to the RT thread, which applies each whole at its
+    /// index, its gains first, or, past it, counts it once in
+    /// `command_late` and marks the engine diverged. Refused as invalid on
+    /// an engine with its own log.
+    pub fn append_batch(
+        &self,
+        id: LogId,
+        at_index: u64,
+        entries: &[Entry],
+    ) -> Result<(), EntryError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         let invalid = |m: String| Err(EntryError::Invalid(m));
         if !at_index.is_multiple_of(self.block) {
             return invalid(format!(
@@ -1470,8 +1577,78 @@ impl Engine {
                 self.block
             ));
         }
+        let Some((change, batch, routes)) = self.fold(entries)? else {
+            return Ok(());
+        };
+        let mut log = self.log.lock().expect("log lock");
+        if log.local.is_some() {
+            return invalid("the engine keeps its own log".to_owned());
+        }
+        let consumed = self.counters.entries_consumed.load(Acquire);
+        let e = RtEntry {
+            id,
+            at_index,
+            change,
+        };
+        log.append(e, batch, routes, consumed)
+    }
+
+    /// Whether [`Engine::append_batch`] takes `entries`, at an index it
+    /// takes: what a log entry is checked against before it is ordered,
+    /// so that no committed one is refused.
+    pub fn admits(&self, entries: &[Entry]) -> Result<(), EntryError> {
+        self.fold(entries).map(|_| ())
+    }
+
+    /// `entries` checked and folded, with the flows of the slots the
+    /// fold re-routes: none for no change. Refused when an entry is, and
+    /// when the slots the entries' `InputUp`s and `Route`s name are of
+    /// more than one input domain: one generation is built for a log
+    /// entry.
+    #[allow(clippy::type_complexity)]
+    fn fold(
+        &self,
+        entries: &[Entry],
+    ) -> Result<Option<(Change, Option<Arc<Batch>>, Vec<(usize, String)>)>, EntryError> {
+        let mut changes = Vec::with_capacity(entries.len());
+        let mut flows = HashMap::new();
+        for entry in entries {
+            changes.push(self.change(entry)?);
+            if let Entry::Route { slot, flow_id } = entry {
+                flows.insert(*slot, flow_id);
+            }
+        }
+        // Every slot an `InputUp` or `Route` names, whether the fold keeps
+        // it or not: then every subset of the entries passes as well, as a
+        // restamp keeping some of a log entry's commands must.
+        let named = changes
+            .iter()
+            .fold(0, |m, c| m | (c.generating().0 | c.generating().1));
+        let mut domains = slots_of(named).map(|s| &self.config.inputs[s].domain);
+        if let Some(first) = domains.next()
+            && domains.any(|d| d != first)
+        {
+            return Err(EntryError::Invalid(
+                "a log entry raising or re-routing inputs of more than one domain: one \
+                 generation is built for it"
+                    .to_owned(),
+            ));
+        }
+        let (n, m) = self.shape;
+        let Some((change, batch)) = batch::fold(&changes, m, n * m).map_err(EntryError::Invalid)?
+        else {
+            return Ok(None);
+        };
+        let (_, routed) = change.generating();
+        let routes = slots_of(routed).map(|s| (s, flows[&s].clone())).collect();
+        Ok(Some((change, batch, routes)))
+    }
+
+    /// The change `entry` makes, checked against the configuration.
+    fn change(&self, entry: &Entry) -> Result<Change, EntryError> {
+        let invalid = |m: String| Err(EntryError::Invalid(m));
         let slots = self.config.inputs.len();
-        let (change, flow) = match entry {
+        Ok(match *entry {
             Entry::Gain {
                 input,
                 output,
@@ -1483,57 +1660,55 @@ impl Engine {
                 if !samplez_dsp::valid_gain(gain) {
                     return invalid(format!("gain {gain} is not finite within MAX_GAIN"));
                 }
-                (
-                    Change::Gain {
-                        input,
-                        output,
-                        gain,
-                    },
-                    None,
-                )
+                Change::Gain {
+                    input,
+                    output,
+                    gain,
+                }
             }
             Entry::InputDown { slot } | Entry::InputUp { slot } | Entry::Route { slot, .. }
                 if slot >= slots =>
             {
                 return invalid(format!("no input slot {slot}"));
             }
-            Entry::InputDown { slot } => (Change::InputDown { slot }, None),
-            Entry::InputUp { slot } => (Change::InputUp { slot }, None),
-            Entry::Route { slot, flow_id } => {
+            Entry::InputDown { slot } => Change::InputDown { slot },
+            Entry::InputUp { slot } => Change::InputUp { slot },
+            Entry::Route { slot, ref flow_id } => {
                 self.config
-                    .check_input_flow(slot, &flow_id)
+                    .check_input_flow(slot, flow_id)
                     .map_err(|e| EntryError::Invalid(e.0))?;
-                (Change::Route { slot }, Some(flow_id))
+                Change::Route { slot }
             }
             Entry::Strip { slot, param } => {
                 check_strip(&self.config, slot, &param).map_err(EntryError::Invalid)?;
-                (Change::Strip { slot, param }, None)
+                Change::Strip { slot, param }
             }
-        };
-        let mut log = self.log.lock().expect("log lock");
-        if log.local.is_some() {
-            return invalid("the engine keeps its own log".to_owned());
-        }
-        let consumed = self.counters.entries_consumed.load(Acquire);
-        log.append(
-            RtEntry {
-                id,
-                at_index,
-                change,
-            },
-            flow,
-            consumed,
-        )
+        })
     }
 
     /// Commits the appended entries up to log id `up_to`: they go to the
-    /// RT thread, in log order.
+    /// RT thread, in log order. A replicated engine whose RT thread takes
+    /// none of them for so long that more than [`WAITING`] wait for room
+    /// drops them and its core: it no longer follows the log and is
+    /// rebuilt or resynced, its progress counting the drop in
+    /// `log_overflows`.
     pub fn commit(&self, up_to: LogId) {
-        self.log.lock().expect("log lock").commit(up_to);
+        let mut log = self.log.lock().expect("log lock");
+        log.commit(up_to);
+        if log.local.is_none() && log.waiting() > WAITING {
+            log.drop_waiting();
+            drop(log);
+            self.counters.log_overflows.fetch_add(1, Relaxed);
+            // Refused with one voter, which has no core to drop, and while
+            // the control ring is full: the replica reads the overflow in
+            // its next report period's sample and drops the core then
+            // (`Audio::drop_engine`), before its rebuild replaces it.
+            let _ = self.drop_core();
+        }
     }
 
-    /// Replicated mode: the appended entry `id` is never applied, and its
-    /// generation is dropped: its commit was not known by its apply
+    /// Replicated mode: the appended log entry `id` is never applied, and
+    /// its generation is dropped: its commit was not known by its apply
     /// deadline, so the log decides it. False when no uncommitted entry has
     /// that id: it was committed already, or never appended.
     pub fn skip(&self, id: LogId) -> bool {
@@ -1718,6 +1893,7 @@ impl Engine {
             steps_cleared: shared.steps_cleared.load(Acquire),
             tai_offset_s: (offset != i64::MIN).then_some(offset),
             self_report: shared.self_report.load(Relaxed),
+            log_overflows: c.log_overflows.load(Relaxed),
             status_changes_lost: c.status_changes_dropped.load(Relaxed)
                 + c.status_changes_unsent.load(Relaxed),
             build_lead: self.build_lead.load(Relaxed),
@@ -1750,23 +1926,36 @@ impl Engine {
     /// rings needs; the engine keeps no delay line, so it holds the core
     /// alone. A copy left behind by a timeout is returned by the next
     /// call. Calls serialise: one buffer is with the RT thread at a time.
+    /// The copy holds every control sent before the call, such as an
+    /// entry given as unresolved.
     pub fn copy_core(&self, timeout: Duration) -> Result<CoreCopy, CopyError> {
-        let (Some((shared, _)), Some(transfer)) = (&self.replica, &self.transfer) else {
+        let (Some((shared, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
             return Err(CopyError::NotReplicated);
         };
         let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + timeout;
         if !t.in_flight {
+            // The RT thread takes controls at the start of a wake and copies
+            // after a block: a buffer sent while a control waits could be
+            // filled in the wake before the one that takes the control.
+            // Sent once every control was taken, it is filled after them.
+            while control.lock().expect("control lock").ring.slots() < UNRESOLVED {
+                if Instant::now() >= deadline {
+                    return Err(CopyError::Timeout);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             let (n, m, slots, page) = t.shape;
-            let core = t
+            let mut core = t
                 .spare
                 .take()
                 .unwrap_or_else(|| Box::new(Core::new(n, m, slots, page)));
+            core.prepare();
             if t.cores.push(core).is_err() {
                 unreachable!("one buffer is with the RT thread at most");
             }
             t.in_flight = true;
         }
-        let deadline = Instant::now() + timeout;
         let copy = loop {
             if let Ok(copy) = t.copies.pop() {
                 t.in_flight = false;
@@ -1797,13 +1986,13 @@ impl Engine {
     /// flight (a pending generation, an entry awaiting one, a crossfade
     /// running or an `InputUp` or `Route` pending) is refused: copy again
     /// once it applied.
-    pub fn replay(&self, copy: CoreCopy) -> Result<Replay, ReplayError> {
+    pub fn replay(&self, mut copy: CoreCopy) -> Result<Replay, ReplayError> {
         if self.transfer.is_none() {
             return Err(ReplayError::Invalid(
                 "the engine is not replicated with more than one voter".to_owned(),
             ));
         }
-        let c = &copy.core;
+        let c = &mut copy.core;
         let (n, m, _, page) = self
             .transfer
             .as_ref()
@@ -1857,7 +2046,7 @@ impl Engine {
             gens.push(Some(Box::new(Gen {
                 mxl: g,
                 prune_after: vec![u64::MAX; slots.len()],
-                rerouted: false,
+                rerouted: 0,
             })));
         }
         let (hashes_tx, hashes) = rtrb::RingBuffer::new(4 * self.config.outputs.len().max(1));
@@ -1894,7 +2083,7 @@ impl Engine {
         // Up to the last block the RT thread computed, before the first
         // attempt.
         replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
-        self.offer(timeout, true, |j, core| {
+        self.offer(timeout, true, &[], |j, core| {
             replay.run(j);
             replay.rt.capture(core);
             (replay.next - 1, replay.last_id)
@@ -1936,24 +2125,62 @@ impl Engine {
         if state.gains.len() != n
             || state.gains.iter().any(|row| row.len() != m)
             || state.up.len() != slots
+            || state.flows.len() != slots
+            || state.strips.len() != slots
         {
             return Err(ReplayError::Invalid(format!(
                 "a product state of the shape {n} x {m} with {slots} inputs"
             )));
         }
+        for (slot, (flow, params)) in state.flows.iter().zip(&state.strips).enumerate() {
+            self.config
+                .check_input_flow(slot, flow)
+                .map_err(|e| ReplayError::Invalid(e.0))?;
+            for param in params {
+                check_strip(&self.config, slot, param).map_err(ReplayError::Invalid)?;
+            }
+        }
+        let strips = product_strips(&state.strips);
+        // The entries of one log entry are adjacent and fold into one.
         let mut pending = Vec::with_capacity(state.pending.len());
-        for (id, at_index, entry) in &state.pending {
+        let mut batches = Vec::new();
+        for group in state.pending.chunk_by(|a, b| a.0 == b.0) {
+            let (id, at_index, _) = group[0];
+            let changes: Vec<Change> = group.iter().map(|(_, _, e)| change_of(e)).collect();
+            let folded = batch::fold(&changes, m, n * m).map_err(ReplayError::Invalid)?;
+            let Some((change, b)) = folded else { continue };
             pending.push(RtEntry {
-                id: *id,
-                at_index: *at_index,
-                change: change_of(entry),
+                id,
+                at_index,
+                change,
             });
+            if let Some(b) = b {
+                batches.push((id, b));
+            }
         }
         pending.sort_by_key(|e| (e.at_index, e.id));
         if pending.len() > PENDING_CHANGES {
             return Err(ReplayError::Full);
         }
-        self.offer(timeout, false, |j, core| {
+        let batch = |id: LogId| batches.iter().find(|b| b.0 == id).map(|b| &*b.1);
+        // The supervisor takes the slots' state and flows, and hands the
+        // generations reading them over, before the core: a slot the core
+        // has up reads its flow once installed.
+        let (done, applied) = mpsc::sync_channel(1);
+        let _ = self
+            .log
+            .lock()
+            .expect("log lock")
+            .sup
+            .send(LogMsg::Product {
+                up: state.up.clone(),
+                flows: state.flows.clone(),
+                done,
+            });
+        if applied.recv_timeout(timeout).is_err() {
+            return Err(ReplayError::Timeout { passed: 0 });
+        }
+        self.offer(timeout, false, &strips, |j, core| {
             for (i, row) in state.gains.iter().enumerate() {
                 for (o, &g) in row.iter().enumerate() {
                     let _ = core.matrix.set(i, o, g, 0);
@@ -1980,12 +2207,33 @@ impl Engine {
                     // the RT thread applies a passed re-route or strip
                     // entry itself, taken before the install or after.
                     Change::Route { .. } | Change::Strip { .. } => {}
+                    Change::Batch { up: raised, .. } => {
+                        if let Some(b) = batch(e.id) {
+                            let columns = core.matrix.outputs();
+                            b.gains.each(|c, g| {
+                                let _ = core.matrix.set(c / columns, c % columns, g, 0);
+                            });
+                            for &slot in &b.downs {
+                                up[slot as usize] = false;
+                            }
+                        }
+                        for slot in slots_of(raised) {
+                            up[slot] = true;
+                        }
+                    }
                 }
             }
             core.pos = Some(next);
             core.ramp_end = 0;
             core.pending.clear();
             core.pending.extend_from_slice(&pending[passed..]);
+            // Shared: nothing is allocated in the hand-over's window.
+            core.batches.clear();
+            for e in &pending[passed..] {
+                if let Some(b) = batches.iter().find(|b| b.0 == e.id) {
+                    core.batches.push((e.id, Arc::clone(&b.1)));
+                }
+            }
             core.page_entries.clear();
             core.entries_page = None;
             core.entries_lost = false;
@@ -2021,6 +2269,7 @@ impl Engine {
         &self,
         timeout: Duration,
         replayed: bool,
+        strips: &[(usize, StripParam)],
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
@@ -2090,6 +2339,8 @@ impl Engine {
             // that the RT thread is stalled, and a sixteenth of a period
             // is slept between looks, so the wait does not spend the CPU
             // a stalled RT thread may be waiting for.
+            // Before the wait: the batches it carries are dropped here.
+            core.prepare();
             let p = processed();
             let waiting = Instant::now();
             while processed() == p {
@@ -2111,6 +2362,7 @@ impl Engine {
                 last_id,
                 core,
                 replayed,
+                strips: strips.to_vec(),
                 answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
@@ -2220,11 +2472,21 @@ struct SupSlot {
 struct Job {
     id: LogId,
     at_index: u64,
-    change: Change,
-    /// A `Route`'s flow.
-    flow: Option<String>,
+    /// The slots the entry raises, by bit.
+    up: u64,
+    /// The slots it re-routes, with their new flows.
+    routes: Vec<(usize, String)>,
     domain: usize,
     stage: Stage,
+}
+
+/// What a product state still needs handed to the RT thread before
+/// `done` is sent: per input domain its generation, and the front job's
+/// sent before it.
+struct ProductHandOver {
+    done: SyncSender<()>,
+    domains: Vec<bool>,
+    resend: bool,
 }
 
 enum Stage {
@@ -2258,6 +2520,12 @@ struct Supervisor {
     slots: Vec<SupSlot>,
     /// Input domains whose generation is to be rebuilt.
     dirty: Vec<bool>,
+    /// Per input domain, the slots, by bit, a product state moved to
+    /// another flow: the next generation built starts their readers
+    /// anew.
+    reroute: Vec<u64>,
+    /// A product state's generations not all handed over yet.
+    product: Option<ProductHandOver>,
     pollers: Vec<Option<Pollers>>,
     /// The last failure to create each input domain's poll instance and
     /// generation, logged once per change of its text.
@@ -2328,6 +2596,9 @@ impl Supervisor {
             self.page_hashes();
             self.meters();
             self.log_messages();
+            self.hand_product();
+            // Committed entries the ring had no room for.
+            self.log.lock().expect("log lock").flush();
             self.jobs();
             if last_poll.elapsed() >= POLL_PERIOD {
                 last_poll = Instant::now();
@@ -2357,6 +2628,7 @@ impl Supervisor {
                     self.counters.rt_minor_faults.store(f, Relaxed);
                 }
                 self.clock();
+                self.leaks();
             }
             if rt_thread.as_ref().is_some_and(JoinHandle::is_finished) {
                 self.rt_ended(rt_thread.take());
@@ -2751,7 +3023,7 @@ impl Supervisor {
         };
         if self.cmd.push(command).is_ok() {
             self.dirty[d] = false;
-            self.adopt(d, held, None);
+            self.adopt(d, held, 0);
         }
     }
 
@@ -2780,16 +3052,19 @@ impl Supervisor {
         let produced = self.counters.produced.load(Acquire);
         let mut prune_after = vec![u64::MAX; n];
         let mut held = 0u64;
-        let mut rerouted = false;
+        // The slots a product state moved to another flow, for the
+        // domain's own generation only: a job's crossfades from its index.
+        let mut rerouted = if job.is_none() {
+            std::mem::take(&mut self.reroute[d])
+        } else {
+            0
+        };
         for (slot, limit) in prune_after.iter_mut().enumerate() {
             if self.input_domain(slot) != d {
                 continue;
             }
-            let (target, flow) = match job.map(|j| (j.change, j.flow.as_deref())) {
-                Some((Change::InputUp { slot: s }, _)) if s == slot => (true, None),
-                Some((Change::Route { slot: s }, f)) if s == slot => (true, f),
-                _ => (false, None),
-            };
+            let flow = job.and_then(|j| j.routes.iter().find(|r| r.0 == slot).map(|r| &*r.1));
+            let target = flow.is_some() || job.is_some_and(|j| j.up & bit(slot) != 0);
             let current = self.slots[slot].flow.clone();
             let wanted = !matches!(self.slots[slot].state, SupState::Pruned { .. });
             let cfg = &self.config.inputs[slot];
@@ -2808,7 +3083,9 @@ impl Supervisor {
             {
                 log(format_args!("input {}: flow {old} left: {e}", cfg.name));
             }
-            rerouted |= flow.is_some_and(|f| f != current);
+            if flow.is_some_and(|f| f != current) {
+                rerouted |= bit(slot);
+            }
             if !wanted && !target {
                 continue;
             }
@@ -2866,11 +3143,12 @@ impl Supervisor {
 
     /// Takes the slots of input domain `d` that the generation now live
     /// on the RT thread holds, `held`, as attached, and moves the others
-    /// that were attached or wanted to polling, reported. `target` is the
-    /// slot of an `InputUp` or `Route` entry: reported when not held.
+    /// that were attached or wanted to polling, reported. `targets` are
+    /// the slots, by bit, a log entry raises or re-routes: each reported
+    /// when not held.
     /// A held slot that was pruned meanwhile, or is down in the log, is
     /// left out of the next generation instead.
-    fn adopt(&mut self, d: usize, held: u64, target: Option<usize>) {
+    fn adopt(&mut self, d: usize, held: u64, targets: u64) {
         for slot in 0..self.slots.len() {
             if self.input_domain(slot) != d {
                 continue;
@@ -2879,13 +3157,13 @@ impl Supervisor {
             if held & (1 << slot) == 0 {
                 if !pruned {
                     self.start_polling(slot, true);
-                } else if target == Some(slot) {
+                } else if targets & bit(slot) != 0 {
                     self.slots[slot].reported = false;
                     self.report(Report::InputPruned { slot });
                 }
                 continue;
             }
-            if (pruned && target != Some(slot)) || !self.slots[slot].up {
+            if (pruned && targets & bit(slot) == 0) || !self.slots[slot].up {
                 if !pruned {
                     self.start_polling(slot, false);
                 }
@@ -2913,17 +3191,18 @@ impl Supervisor {
                 LogMsg::Append {
                     id,
                     at_index,
-                    change,
-                    flow,
+                    up,
+                    routes,
                 } => {
-                    let (Change::InputUp { slot } | Change::Route { slot }) = change else {
+                    let targets = up | routes.iter().fold(0, |m, r| m | bit(r.0));
+                    let Some(slot) = slots_of(targets).next() else {
                         continue;
                     };
                     self.jobs.push_back(Job {
                         id,
                         at_index,
-                        change,
-                        flow,
+                        up,
+                        routes,
                         domain: self.input_domain(slot),
                         stage: Stage::Waiting,
                     });
@@ -2934,6 +3213,10 @@ impl Supervisor {
                 LogMsg::Skip { id } => self
                     .jobs
                     .retain(|j| j.id != id || matches!(j.stage, Stage::Sent(_))),
+                // A generation sent for one is handed back unused by the
+                // next one sent.
+                LogMsg::Dropped { upto } => self.jobs.retain(|j| j.id > upto),
+                LogMsg::Product { up, flows, done } => self.product(&up, flows, done),
             }
         }
     }
@@ -2995,28 +3278,142 @@ impl Supervisor {
         if !swapped {
             return;
         }
-        let slot = match j.change {
-            Change::InputUp { slot } => slot,
-            Change::Route { slot } => {
-                let flow = j.flow.expect("a route has a flow");
-                if flow != self.slots[slot].flow {
-                    // A polled slot polls the flow it reads: the hold on
-                    // the old one is released, `poll` takes one on the new.
-                    self.release_poll(slot);
-                    if let SupState::Pruned { recovery, held } = &mut self.slots[slot].state {
-                        *recovery = Recovery::default();
-                        *held = false;
-                    }
-                    self.slots[slot].reported = false;
-                    let old = std::mem::replace(&mut self.slots[slot].flow, flow.clone());
-                    self.slots[slot].routing = Some((j.at_index + self.ramp, old));
-                    self.status().inputs[slot].flow_id = flow;
+        let mut targets = j.up;
+        for (slot, flow) in j.routes {
+            targets |= bit(slot);
+            if flow != self.slots[slot].flow {
+                // A polled slot polls the flow it reads: the hold on the
+                // old one is released, `poll` takes one on the new.
+                self.release_poll(slot);
+                if let SupState::Pruned { recovery, held } = &mut self.slots[slot].state {
+                    *recovery = Recovery::default();
+                    *held = false;
                 }
-                slot
+                self.slots[slot].reported = false;
+                let old = std::mem::replace(&mut self.slots[slot].flow, flow.clone());
+                self.slots[slot].routing = Some((j.at_index + self.ramp, old));
+                self.status().inputs[slot].flow_id = flow;
             }
-            _ => return,
+        }
+        self.adopt(j.domain, held, targets);
+    }
+
+    /// Takes the slots' state and flows of a product state: a slot on
+    /// another flow moves to it at once, no crossfade, its reader state
+    /// started anew in the generation's `rerouted`. Every domain's
+    /// generation is built anew on them and handed to the RT thread, and
+    /// so is the generation a job built or sent before them, which read
+    /// the old flows; `done` is sent once all are handed over
+    /// ([`Supervisor::hand_product`]).
+    fn product(&mut self, up: &[bool], flows: Vec<String>, done: SyncSender<()>) {
+        for (slot, flow) in flows.into_iter().enumerate() {
+            self.slots[slot].up = up[slot];
+            self.status().inputs[slot].up = up[slot];
+            if flow == self.slots[slot].flow {
+                continue;
+            }
+            self.release_poll(slot);
+            if let SupState::Pruned { recovery, held } = &mut self.slots[slot].state {
+                *recovery = Recovery::default();
+                *held = false;
+            }
+            self.slots[slot].reported = false;
+            self.slots[slot].routing = None;
+            self.slots[slot].flow = flow.clone();
+            self.status().inputs[slot].flow_id = flow;
+            let d = self.input_domain(slot);
+            self.reroute[d] |= bit(slot);
+        }
+        // A generation built and not sent is built again when sent.
+        for j in &mut self.jobs {
+            if matches!(j.stage, Stage::Built(..)) {
+                j.stage = Stage::Waiting;
+            }
+        }
+        let resend = self
+            .jobs
+            .front()
+            .is_some_and(|j| matches!(j.stage, Stage::Sent(_)));
+        self.product = Some(ProductHandOver {
+            done,
+            domains: vec![true; self.dirty.len()],
+            resend,
+        });
+        self.hand_product();
+    }
+
+    /// Hands the generations a product state needs to the RT thread while
+    /// the command ring has room, the rest at later ticks: each domain's,
+    /// built on the slots' flows, and the front job's again when it was
+    /// sent before, under its entry's id, which the RT thread takes in
+    /// place of the one it holds. Then sends `done`.
+    fn hand_product(&mut self) {
+        let Some(mut p) = self.product.take() else {
+            return;
         };
-        self.adopt(j.domain, held, Some(slot));
+        for d in 0..p.domains.len() {
+            if !p.domains[d] || self.cmd.slots() == 0 {
+                continue;
+            }
+            let Some((generation, held)) = self.build(d, None) else {
+                continue;
+            };
+            let command = Command::Generation {
+                domain: d,
+                generation,
+            };
+            if self.cmd.push(command).is_ok() {
+                p.domains[d] = false;
+                self.dirty[d] = false;
+                self.adopt(d, held, 0);
+            }
+        }
+        if p.resend
+            && self.cmd.slots() > 0
+            && let Some(j) = self.jobs.pop_front()
+        {
+            if let Stage::Sent(_) = j.stage
+                && let Some((generation, held)) = self.build(j.domain, Some(&j))
+            {
+                let command = Command::Pending {
+                    id: j.id,
+                    domain: j.domain,
+                    generation,
+                };
+                if self.cmd.push(command).is_err() {
+                    unreachable!("a free command slot was checked");
+                }
+                p.resend = false;
+                self.jobs.push_front(Job {
+                    stage: Stage::Sent(held),
+                    ..j
+                });
+            } else {
+                // Done with meanwhile, or not built: at the next tick.
+                p.resend = matches!(j.stage, Stage::Sent(_));
+                self.jobs.push_front(j);
+            }
+        }
+        if p.domains.iter().any(|&d| d) || p.resend {
+            self.product = Some(p);
+        } else {
+            let _ = p.done.try_send(());
+        }
+    }
+
+    /// Puts the spent batches the RT thread leaked in the status, and
+    /// logs a rise: the return ring and its spent list were full, the
+    /// supervisor not taking returns for that long.
+    fn leaks(&mut self) {
+        let leaked = self.counters.batches_leaked.load(Relaxed);
+        let mut st = self.status();
+        if leaked > st.batches_leaked {
+            st.batches_leaked = leaked;
+            drop(st);
+            log(format_args!(
+                "{leaked} spent batches leaked: the return ring and the spent list were full"
+            ));
+        }
     }
 
     /// Sends `r` to the replicated log, or stamps it in the engine's own:
@@ -3069,7 +3466,7 @@ impl Supervisor {
                 at_index,
                 change,
             };
-            if log.append(e, None, consumed).is_err() {
+            if log.append(e, None, Vec::new(), consumed).is_err() {
                 break 'sent false;
             }
             log.commit(e.id);
@@ -3228,6 +3625,7 @@ fn release(r: Returned) {
     match r {
         Returned::Generation(g) => drop(g),
         Returned::Writer(w) => drop(w),
+        Returned::Batch(b) => drop(b),
     }
 }
 
@@ -3322,7 +3720,7 @@ mod tests {
         assert_eq!(build_lead_samples(None, 0, 48), 5040);
     }
 
-    fn log() -> (Log, rtrb::Consumer<RtEntry>, mpsc::Receiver<LogMsg>) {
+    fn log() -> (Log, rtrb::Consumer<RingEntry>, mpsc::Receiver<LogMsg>) {
         let (ring, rx) = rtrb::RingBuffer::new(PENDING_CHANGES);
         let (sup, msgs) = mpsc::channel();
         let log = Log {
@@ -3353,33 +3751,81 @@ mod tests {
         let (mut log, mut rx, msgs) = log();
         let down = Change::InputDown { slot: 0 };
         let up = Change::InputUp { slot: 0 };
-        log.append(e(1, down), None, 0).unwrap();
-        log.append(e(2, up), None, 0).unwrap();
+        log.append(e(1, down), None, Vec::new(), 0).unwrap();
+        log.append(e(2, up), None, Vec::new(), 0).unwrap();
         assert!(matches!(msgs.try_recv(), Ok(LogMsg::Append { id: 2, .. })));
         assert_eq!(
-            log.append(e(2, down), None, 0),
+            log.append(e(2, down), None, Vec::new(), 0),
             Err(EntryError::Order { id: 2, last: 2 })
         );
         assert!(rx.pop().is_err());
         log.commit(1);
-        assert_eq!(rx.pop().unwrap().id, 1);
+        assert_eq!(rx.pop().unwrap().entry.id, 1);
         // A truncation at or below the commit point keeps what is
         // committed, and the generations of its entries.
         log.truncate(1);
         assert!(matches!(msgs.try_recv(), Ok(LogMsg::Truncate { from: 2 })));
         assert_eq!((log.last, log.uncommitted.len()), (1, 0));
-        log.append(e(2, down), None, 0).unwrap();
+        log.append(e(2, down), None, Vec::new(), 0).unwrap();
         log.commit(2);
-        assert_eq!(rx.pop().unwrap().id, 2);
+        assert_eq!(rx.pop().unwrap().entry.id, 2);
+        // The engine's own log refuses what the RT thread has no room for.
+        log.local = Some(LocalLog {
+            up: Vec::new(),
+            last_at: Vec::new(),
+            gen_at: 0,
+        });
         for id in 3..=PENDING_CHANGES as u64 {
-            log.append(e(id, down), None, 0).unwrap();
+            log.append(e(id, down), None, Vec::new(), 0).unwrap();
         }
         assert_eq!(
-            log.append(e(PENDING_CHANGES as u64 + 1, down), None, 0),
+            log.append(e(PENDING_CHANGES as u64 + 1, down), None, Vec::new(), 0),
             Err(EntryError::Full)
         );
-        log.append(e(PENDING_CHANGES as u64 + 1, down), None, 1)
+        log.append(e(PENDING_CHANGES as u64 + 1, down), None, Vec::new(), 1)
             .unwrap();
+    }
+
+    /// A replicated log refuses no entry for room: a replica whose RT
+    /// thread lags keeps the committed entries its ring has no room for
+    /// and passes them on as the ring drains, rather than refuse one,
+    /// which would stop it taking writes while the others apply it.
+    #[test]
+    fn a_replicated_log_keeps_what_its_ring_has_no_room_for() {
+        let (mut log, mut rx, _msgs) = log();
+        let down = Change::InputDown { slot: 0 };
+        let n = PENDING_CHANGES as u64 + 36;
+        for id in 1..=n {
+            log.append(e(id, down), None, Vec::new(), 0).unwrap();
+        }
+        log.commit(n);
+        assert_eq!(rx.slots(), PENDING_CHANGES);
+        assert!(!log.skip(n), "a committed entry skipped");
+        for id in 1..=10 {
+            assert_eq!(rx.pop().unwrap().entry.id, id);
+        }
+        log.flush();
+        assert_eq!(rx.slots(), PENDING_CHANGES);
+        let ids: Vec<LogId> = std::iter::from_fn(|| rx.pop().ok().map(|q| q.entry.id)).collect();
+        assert_eq!(ids, (11..=PENDING_CHANGES as u64 + 10).collect::<Vec<_>>());
+        log.flush();
+        assert_eq!(rx.slots(), 26);
+    }
+
+    /// A product state's strip parameters reach the RT thread folded to
+    /// the last value per slot and key: a list of every value a parameter
+    /// took would otherwise be set one by one in one wake.
+    #[test]
+    fn product_strip_parameters_fold_to_the_last_value_per_key() {
+        let trim = |db| StripParam::Trim { db };
+        let leg = StripParam::LegTrim { leg: 1, db: 2.0 };
+        let mut history: Vec<StripParam> = (0..1000).map(|n| trim(-(n % 20) as f32)).collect();
+        history.push(leg);
+        history.push(trim(-9.0));
+        assert_eq!(
+            product_strips(&[history, vec![trim(-1.0), trim(-2.0)]]),
+            [(0, trim(-9.0)), (0, leg), (1, trim(-2.0))]
+        );
     }
 
     /// A full reset ring says so, not that gain changes are outstanding.
@@ -4490,8 +4936,13 @@ mod tests {
                 param: refused,
             },
         };
-        log.append(entry, None, e.counters.entries_consumed.load(Acquire))
-            .unwrap();
+        log.append(
+            entry,
+            None,
+            Vec::new(),
+            e.counters.entries_consumed.load(Acquire),
+        )
+        .unwrap();
         log.commit(entry.id);
         drop(log);
         e.set_strip(0, StripParam::Trim { db: -3.0 }, entry.at_index)
@@ -4532,6 +4983,7 @@ mod tests {
             last_id: copy.last_id,
             core: copy.core,
             replayed: true,
+            strips: Vec::new(),
             answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
@@ -4667,7 +5119,7 @@ mod tests {
         };
         rt.awaiting_gen.push(route);
         rt.slots[0].held = true;
-        rt.install_core(&core, 5, true);
+        rt.install_core(&mut core, 5, true);
         assert_eq!(rt.awaiting_gen, [route]);
         assert!(rt.slots[0].held);
         e.stop();
@@ -4734,7 +5186,7 @@ mod tests {
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
-        rt.install_core(&core, 4, false);
+        rt.install_core(&mut core, 4, false);
         assert!(rt.mix.pending.is_empty());
         assert_eq!(rt.slots[0].strip_pos, Some(192));
         let mut set = samplez_dsp::Strip::new(1, config.ramp_samples);
@@ -4806,15 +5258,16 @@ mod tests {
         core.pending.clear();
         core.slots[0].strip = Some(replayed.clone());
         core.slots[0].strip_pos = Some(480);
-        rt.install_core(&core, 3, true);
+        rt.install_core(&mut core, 3, true);
         assert_eq!(rt.slots[0].strip.as_ref(), Some(&replayed));
         // A product core that knew entries up to 1 only.
         rt.capture(&mut core);
         core.pos = Some(960);
         core.pending.clear();
-        rt.install_core(&core, 1, false);
+        rt.install_core(&mut core, 1, false);
         // The ring delivers both now.
-        assert!(ring.push(strip).is_ok() && ring.push(gain).is_ok());
+        let one = |entry| RingEntry { entry, batch: None };
+        assert!(ring.push(one(strip)).is_ok() && ring.push(one(gain)).is_ok());
         rt.take_entries();
         assert_eq!(rt.slots[0].strip.as_ref(), Some(&replayed), "applied again");
         assert!(
@@ -4870,11 +5323,17 @@ mod tests {
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
-        rt.install_core(&core, 3, true);
+        rt.install_core(&mut core, 3, true);
         assert!(rt.mix.pending.is_empty());
         assert_eq!(rt.mix.last_taken, 2, "dropped at the install");
         // Delivered between the replayed install and the next one.
-        assert!(ring.push(gain(3, 96)).is_ok());
+        assert!(
+            ring.push(RingEntry {
+                entry: gain(3, 96),
+                batch: None
+            })
+            .is_ok()
+        );
         rt.take_entries();
         assert!(rt.mix.pending.is_empty());
         assert_eq!(rt.mix.last_taken, 3, "skipped as known");
@@ -4915,7 +5374,7 @@ mod tests {
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
-        rt.install_core(&core, 3, true);
+        rt.install_core(&mut core, 3, true);
         // Strip entry 3, applied by the replay, delivered after the install.
         let strip = RtEntry {
             id: 3,
@@ -4925,12 +5384,269 @@ mod tests {
                 param: StripParam::Trim { db: -6.0 },
             },
         };
-        assert!(ring.push(strip).is_ok());
+        assert!(
+            ring.push(RingEntry {
+                entry: strip,
+                batch: None
+            })
+            .is_ok()
+        );
         rt.take_entries();
         assert!(rt.mix.pending.is_empty());
         assert_eq!(rt.mix.last_taken, 3, "skipped as held by the strips");
         // A replayed core that knew entries up to 2 is refused.
         assert!(rt.mix.last_taken > 2);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A replay RT thread of one input of two legs and one mono output,
+    /// on flows named by `tag`, taking entries from the returned ring.
+    fn rt_of(e: &Engine, domain: &std::path::Path, tag: &str) -> (Rt, rtrb::Producer<RingEntry>) {
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": format!("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c{tag}"),
+                         "channels": 2 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": format!("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6d{tag}"),
+                          "label": tag, "group": tag, "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0], [1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (ring, entries) = rtrb::RingBuffer::new(PENDING_CHANGES);
+        rt.entries = entries;
+        (rt, ring)
+    }
+
+    /// A batch of two gains, a trim and an `InputDown` of slot 0, and
+    /// with `up` an `InputUp` of slot 0 after them.
+    fn batch_of(up: bool) -> (Change, Option<Arc<Batch>>) {
+        let mut changes = vec![
+            Change::Gain {
+                input: 0,
+                output: 0,
+                gain: 0.5,
+            },
+            Change::Gain {
+                input: 1,
+                output: 0,
+                gain: 0.25,
+            },
+            Change::InputDown { slot: 0 },
+            Change::Strip {
+                slot: 0,
+                param: StripParam::Trim { db: -6.0 },
+            },
+        ];
+        if up {
+            changes.push(Change::InputUp { slot: 0 });
+        }
+        batch::fold(&changes, 1, 2).unwrap().unwrap()
+    }
+
+    /// An entry the pending list holds already is taken off the ring
+    /// while the list is full: it needs no room, and the entries behind it
+    /// would otherwise wait until the list drains, and turn late.
+    #[test]
+    fn a_held_entry_is_taken_off_a_full_ring() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("held-first", 1);
+        let (mut rt, mut ring) = rt_of(&e, &domain, "1d41");
+        let entry = |id| RtEntry {
+            id,
+            at_index: 1 << 30,
+            change: Change::InputDown { slot: 0 },
+        };
+        for id in 1..=PENDING_CHANGES as u64 {
+            assert!(rt.mix.push(entry(id)));
+        }
+        let (change, batch) = batch_of(false);
+        let held = RingEntry {
+            entry: RtEntry { change, ..entry(3) },
+            batch,
+        };
+        let new = RingEntry {
+            entry: entry(65),
+            batch: None,
+        };
+        assert!(ring.push(held).is_ok() && ring.push(new).is_ok());
+        rt.take_entries();
+        assert_eq!((rt.taken, rt.last_entry), (1, 3), "the held entry waited");
+        assert_eq!(ring.slots(), PENDING_CHANGES - 1, "the new one was taken");
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A copy shares the batches pending, and an install takes the core's
+    /// batch and hands the batch of an entry it drops back in the core: no
+    /// batch is allocated or freed on the RT thread.
+    #[test]
+    fn an_install_moves_batches_without_allocating() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-install", 1);
+        let (mut rt, _ring) = rt_of(&e, &domain, "1d43");
+        let (change, mine) = batch_of(false);
+        let entry = |id| RtEntry {
+            id,
+            at_index: 1440,
+            change,
+        };
+        let mine = mine.unwrap();
+        let theirs = Arc::new((*mine).clone());
+        let (mine_at, theirs_at) = (Arc::as_ptr(&mine), Arc::as_ptr(&theirs));
+        assert!(rt.mix.push_with(entry(3), Some(mine)).is_ok());
+        let mut core = Box::new(Core::new(2, 1, 1, 64));
+        rt.capture(&mut core);
+        assert!(
+            std::ptr::eq(Arc::as_ptr(&core.batches[0].1), mine_at),
+            "copied"
+        );
+        core.pos = Some(480);
+        core.prepare();
+        core.pending.clear();
+        core.pending.push(entry(5));
+        core.batches.push((5, theirs));
+        rt.install_core(&mut core, 5, true);
+        assert_eq!(rt.mix.pending, [entry(5)]);
+        assert_eq!(rt.mix.batches.len(), 1);
+        assert!(std::ptr::eq(Arc::as_ptr(&rt.mix.batches[0].1), theirs_at));
+        assert!(core.batches.is_empty());
+        assert!(
+            core.handed
+                .0
+                .iter()
+                .any(|b| std::ptr::eq(Arc::as_ptr(b), mine_at)),
+            "the dropped batch did not go back with the core"
+        );
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Without a core a batch whose index passed sets its strip
+    /// parameters on the strips the slots keep and passes the rest; one
+    /// holding an `InputUp` stays pending whole, as that entry does
+    /// alone, so its strip parameters wait with it.
+    #[test]
+    fn a_batch_due_without_a_core_passes_whole_or_waits_whole() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-no-core", 1);
+        let (mut rt, _ring) = rt_of(&e, &domain, "1d45");
+        let (plain, plain_batch) = batch_of(false);
+        let (up, up_batch) = batch_of(true);
+        let at = |id, change| RtEntry {
+            id,
+            at_index: 48,
+            change,
+        };
+        assert!(rt.mix.push_with(at(1, up), up_batch).is_ok());
+        rt.pass_entries(2);
+        assert_eq!(rt.mix.pending, [at(1, up)]);
+        assert_eq!(
+            rt.slots[0].strip_pos, None,
+            "a strip parameter of it applied"
+        );
+        assert!(rt.mix.push_with(at(2, plain), plain_batch).is_ok());
+        rt.pass_entries(2);
+        assert_eq!(rt.mix.pending, [at(1, up)]);
+        assert_eq!(rt.mix.batches.len(), 1);
+        assert_eq!(rt.slots[0].strip_pos, Some(48));
+        assert!(rt.slots[0].up, "an InputDown applied without a core");
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Without a core, a batch whose strip parameters the replayed strips
+    /// hold already, marked so when taken, passes without setting them
+    /// again, which would restart their ramps.
+    #[test]
+    fn a_batch_passed_without_a_core_keeps_strips_the_core_brought() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-held-strips", 1);
+        let (mut rt, _ring) = rt_of(&e, &domain, "1d49");
+        let (change, batch) = batch_of(false);
+        let Change::Batch { up, routed, .. } = change else {
+            panic!("{change:?}")
+        };
+        let held = RtEntry {
+            id: 1,
+            at_index: 48,
+            change: Change::Batch {
+                strips: false,
+                up,
+                routed,
+            },
+        };
+        assert!(rt.mix.push_with(held, batch).is_ok());
+        rt.pass_entries(2);
+        assert!(rt.mix.pending.is_empty());
+        assert_eq!(rt.slots[0].strip_pos, None, "a strip parameter set again");
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Spent batches leave the return ring's reserve free, so a
+    /// generation swapped in hands the old one back, not leak it: past the
+    /// reserve they wait on the spent list, beyond it they are leaked and
+    /// counted, and they leave through the ring once it has room.
+    #[test]
+    fn spent_batches_leave_room_for_a_generation_handed_back() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-spent", 1);
+        let (mut rt, _ring) = rt_of(&e, &domain, "1d47");
+        rt.replay = false;
+        let (ret, mut back) = rtrb::RingBuffer::new(8);
+        rt.ret = ret;
+        rt.spent = Vec::with_capacity(2);
+        let generation = || {
+            Box::new(Gen {
+                mxl: Generation::new(&e.api, &domain, 1).unwrap(),
+                prune_after: vec![u64::MAX],
+                rerouted: Default::default(),
+            })
+        };
+        rt.install(0, generation());
+        for _ in 0..10 {
+            rt.retire(batch_of(false).1);
+        }
+        // A reserve of one domain, one output and one more.
+        assert_eq!((rt.ret.slots(), rt.spent.len()), (3, 2));
+        assert_eq!(rt.counters.batches_leaked.load(Relaxed), 3);
+        rt.install(0, generation());
+        let returned: Vec<Returned> = std::iter::from_fn(|| back.pop().ok()).collect();
+        let generations = returned
+            .iter()
+            .filter(|r| matches!(r, Returned::Generation(_)))
+            .count();
+        assert_eq!((returned.len(), generations), (6, 1));
+        rt.take_entries();
+        assert_eq!(rt.spent.len(), 0);
+        assert!(matches!(back.pop(), Ok(Returned::Batch(_))));
+        drop(returned);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// No engine entries append nothing, wherever the index: the log id
+    /// stays free, and an empty translation is refused by no replica.
+    #[test]
+    fn a_log_entry_of_no_engine_entries_appends_nothing() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-empty", 1);
+        assert_eq!(e.append_batch(5, 7, &[]), Ok(()));
+        assert_eq!(e.log.lock().unwrap().last, 0);
+        assert_eq!(
+            e.append_batch(5, 7, &[Entry::InputDown { slot: 0 }]),
+            Err(EntryError::Invalid(
+                "at_index 7 is not a multiple of the block size 48".to_owned()
+            ))
+        );
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }
@@ -4995,6 +5711,7 @@ mod tests {
                 last_id: replay.last_id,
                 core,
                 replayed: true,
+                strips: Vec::new(),
                 answer: Answer::Waiting,
             };
             assert!(t.handovers.push(h).is_ok());
@@ -5041,7 +5758,7 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5), "no stall");
         }
         let mut calls = Vec::new();
-        let _ = e.offer(Duration::from_secs(1), true, |j, _| {
+        let _ = e.offer(Duration::from_secs(1), true, &[], |j, _| {
             calls.push((j, processed()));
             (j, 0)
         });
@@ -5085,7 +5802,7 @@ mod tests {
             Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
         };
         let before = cpu();
-        let err = e.offer(Duration::from_millis(300), true, |j, _| (j, 0));
+        let err = e.offer(Duration::from_millis(300), true, &[], |j, _| (j, 0));
         let spent = cpu() - before;
         assert!(matches!(err, Err(ReplayError::Timeout { .. })), "{err:?}");
         assert!(spent < Duration::from_millis(100), "{spent:?} of CPU");
@@ -5103,7 +5820,7 @@ mod tests {
         let before = e.counters.handovers_passed.load(Relaxed);
         // Each core follows a block two behind the last one computed:
         // every attempt is refused.
-        let err = e.offer(Duration::from_millis(300), true, |j, _| {
+        let err = e.offer(Duration::from_millis(300), true, &[], |j, _| {
             (j.saturating_sub(2), 0)
         });
         let refused = e.counters.handovers_passed.load(Relaxed) - before;

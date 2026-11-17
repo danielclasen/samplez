@@ -80,6 +80,12 @@ pub const MAX_COMMAND_BYTES: usize = 32 << 10;
 /// single command can exceed it, by its id and owner.
 pub const MAX_ENTRY_BYTES: usize = 32 << 10;
 
+/// The commands one entry carries at most. Before a command joins an
+/// entry the engine checks the entry with it ([`contact::Audio::admits`]),
+/// translating and folding its commands again: bounded, the checks of
+/// one entry cost at most this many squared commands' translations.
+pub const MAX_ENTRY_COMMANDS: usize = 64;
+
 /// The entries one AppendEntries carries at most. openraft gives an
 /// AppendEntries the heartbeat interval to complete; at this count and
 /// [`MAX_ENTRY_BYTES`] one carries about 128 KiB of commands, a third
@@ -955,7 +961,9 @@ impl Shared {
                 // A later index asked for is kept, an earlier or absent one
                 // is the earliest.
                 if self.contact.get().is_some() {
-                    command.at_index = Some(command.at_index.unwrap_or(0).max(stamp.earliest));
+                    // A block start, as the engine takes it.
+                    let at = command.at_index.unwrap_or(0).max(stamp.earliest);
+                    command.at_index = Some(at.next_multiple_of(self.settings.block));
                 }
                 batch.push(command)
             })
@@ -1099,11 +1107,28 @@ async fn write(
                 }
             }
             Queued::Command(item) => {
+                if let Err(why) = shared.admits(&[&item.command]) {
+                    let _ = item.reply.send(Err(Refused::Invalid(why)));
+                    continue;
+                }
                 let mut bytes = item.command.size();
                 let mut items = vec![item];
                 while let Ok(queued) = queued.try_recv() {
                     match queued {
-                        Queued::Command(item) if bytes + item.command.size() <= MAX_ENTRY_BYTES => {
+                        // One the engine refuses with the entry's others
+                        // opens an entry of its own.
+                        Queued::Command(item)
+                            if joins(&items[0].command, items.len(), bytes, &item.command)
+                                && shared
+                                    .admits(
+                                        &items
+                                            .iter()
+                                            .map(|i| &i.command)
+                                            .chain([&item.command])
+                                            .collect::<Vec<_>>(),
+                                    )
+                                    .is_ok() =>
+                        {
                             bytes += item.command.size();
                             items.push(item);
                         }
@@ -1117,6 +1142,39 @@ async fn write(
             }
         }
     }
+}
+
+impl Shared {
+    /// Whether this replica's engine takes the entry `commands` make,
+    /// stamped at any index, once committed: checked before the entry is
+    /// ordered, so that no committed entry is refused
+    /// ([`contact::Audio::admits`]).
+    fn admits(&self, commands: &[&Command]) -> Result<(), String> {
+        let Some(contact) = self.contact.get() else {
+            return Ok(());
+        };
+        let commands = commands
+            .iter()
+            .map(|c| Command {
+                at_index: Some(c.at_index.unwrap_or(0)),
+                ..(*c).clone()
+            })
+            .collect();
+        contact.admits(&Request {
+            stamp: 0,
+            body: Body::Commands(commands),
+        })
+    }
+}
+
+/// Whether `next` joins the entry `first` opened, of `commands` commands
+/// and `bytes` command bytes: within [`MAX_ENTRY_COMMANDS`] and
+/// [`MAX_ENTRY_BYTES`], and asking for the index `first` asks for, so
+/// that every command of an entry applies at one index.
+fn joins(first: &Command, commands: usize, bytes: usize, next: &Command) -> bool {
+    commands < MAX_ENTRY_COMMANDS
+        && bytes + next.size() <= MAX_ENTRY_BYTES
+        && next.at_index == first.at_index
 }
 
 fn resolution_of(resolution: entry::Resolution) -> Resolution {
@@ -1363,6 +1421,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
                     Reason::Expired,
                     "first received too long ago",
                 )),
+                Err(Refused::Invalid(detail)) => Err(NotApplied::new(Reason::Invalid, detail)),
                 Err(_) => Err(NotApplied::new(Reason::Unavailable, "no leader")),
             }
         })
@@ -1390,6 +1449,45 @@ mod tests {
     use std::path::PathBuf;
 
     const ID: NodeId = 7;
+
+    /// An entry carries commands asking for one index only: the engine
+    /// applies a log entry at one index, so a command asking for a later
+    /// one is not folded into an entry applied earlier.
+    #[test]
+    fn commands_asking_for_other_indexes_take_entries_of_their_own() {
+        let command = |at_index, bytes: usize| Command {
+            origin: Origin {
+                principal: "p".into(),
+                session: "s".into(),
+                role: samplez_service::Role::Operator,
+                connection: "c".into(),
+            },
+            id: "1".into(),
+            at_index,
+            body: vec![0; bytes],
+        };
+        let first = command(None, 10);
+        assert!(joins(&first, 1, 10, &command(None, 10)));
+        assert!(!joins(&first, 1, 10, &command(Some(4800), 10)));
+        assert!(!joins(&command(Some(4800), 10), 1, 10, &command(None, 10)));
+        assert!(joins(
+            &command(Some(4800), 10),
+            1,
+            10,
+            &command(Some(4800), 10)
+        ));
+        let size = command(None, 0).size();
+        assert!(!joins(&first, 1, MAX_ENTRY_BYTES - size, &command(None, 1)));
+        // At most MAX_ENTRY_COMMANDS: the checks before each joins stay
+        // bounded.
+        assert!(joins(
+            &first,
+            MAX_ENTRY_COMMANDS - 1,
+            10,
+            &command(None, 10)
+        ));
+        assert!(!joins(&first, MAX_ENTRY_COMMANDS, 10, &command(None, 10)));
+    }
 
     /// A network that reaches no one; a set of one voter sends nothing.
     struct Nobody;

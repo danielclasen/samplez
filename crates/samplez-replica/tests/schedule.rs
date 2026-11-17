@@ -385,3 +385,76 @@ async fn a_replica_whose_engine_refused_an_entry_takes_no_writes() {
     assert_eq!(refused.reason, Reason::NotCommitable);
     assert!(set.replica(leader).replica().commitable);
 }
+
+/// A command the engine would refuse once committed is refused to its
+/// client before it is ordered, and commands the engine takes alone but
+/// not in one entry are ordered in entries of their own: no committed
+/// entry is refused, which would stop every replica taking writes.
+#[tokio::test(start_paused = true)]
+async fn a_command_the_engine_refuses_is_refused_before_it_is_ordered() {
+    let set = start(None).await;
+    let leader = set.leader().await;
+    let follower = set.ids().find(|&id| id != leader).unwrap();
+    let before = entries(&set, leader).len();
+    for at in [leader, follower] {
+        let refused = set
+            .replica(at)
+            .submit(&owner("s"), &format!("bad-{at}"), Bytes::from("bad=1@1"))
+            .await
+            .expect_err("refused before it is ordered");
+        assert_eq!(refused.reason, Reason::Invalid);
+    }
+    assert_eq!(entries(&set, leader).len(), before, "ordered");
+    let replica = set.replica(leader);
+    let (a, b) = tokio::join!(
+        replica.submit(&owner("s"), "p1", Bytes::from("pair=1@1")),
+        replica.submit(&owner("s"), "p2", Bytes::from("pair=2@2")),
+    );
+    a.expect("committed");
+    b.expect("committed");
+    let pairs: Vec<usize> = entries(&set, leader)
+        .iter()
+        .filter_map(|r| match &r.body {
+            Body::Commands(c) => Some(c.iter().filter(|c| c.body.starts_with(b"pair")).count()),
+            _ => None,
+        })
+        .filter(|&n| n > 0)
+        .collect();
+    assert_eq!(pairs, [1, 1]);
+    for id in set.ids() {
+        assert_eq!(set.audio(id).lock().entries_refused, 0);
+    }
+}
+
+/// A command asking for an index between block starts is ordered at the
+/// next block start, the only index the engine applies an entry at: at
+/// its own index it would be refused after its commit.
+#[tokio::test(start_paused = true)]
+async fn a_command_asking_for_an_index_off_a_block_start_is_ordered_at_the_next() {
+    let set = start(None).await;
+    let leader = set.leader().await;
+    let asked = e(&set, leader) + 480_000 + 1;
+    let o = owner("s");
+    let request = PeerRequest::Forward {
+        commands: vec![Forwarded {
+            command: Command {
+                origin: Origin::from(&o),
+                id: "off".into(),
+                at_index: Some(asked),
+                body: b"gain=3@3".to_vec(),
+            },
+            received: e(&set, leader),
+            within_ms: 1000,
+        }],
+    };
+    let reply = set.replica(leader).handle(Some(leader), request).await;
+    assert!(
+        matches!(&reply, Ok(PeerResponse::Forwarded(r)) if r[0].is_ok()),
+        "{reply:?}"
+    );
+    let request = entries(&set, leader).pop().unwrap();
+    let Body::Commands(commands) = &request.body else {
+        panic!("{request:?}")
+    };
+    assert_eq!(commands[0].at_index, Some(asked.next_multiple_of(BLOCK)));
+}
