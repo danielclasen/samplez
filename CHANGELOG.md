@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/danielclasen/samplez/compare/v0.2.0...v0.3.0) (2026-11-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** Config gains meters, config::Input gains loudness_channels, Status gains meters and InputStatus gains meters; code building these structs field by field has to set them.
+* **engine:** samplez_mxl::input::Recovery::update takes the prune limit in samples instead of the timing and the input offset, and ON_TIME_NS is RECOVERY_NS.
+
+### Features
+
+* **engine:** meter every input after its strip and meter-only columns ([#42](https://github.com/danielclasen/samplez/issues/42)) ([96c0f28](https://github.com/danielclasen/samplez/commit/96c0f287b6d4a4e57ccb5f741b2872ea6e9bf5d4))
+
+
+### Bug Fixes
+
+* **engine:** re-add a pruned input once its head advances ([#41](https://github.com/danielclasen/samplez/issues/41)) ([f0f31fa](https://github.com/danielclasen/samplez/commit/f0f31fabbe904698600aeec950b53a6f6fab098f))
+
 ## [0.2.0](https://github.com/danielclasen/samplez/compare/v0.1.0...v0.2.0) (2026-11-16)
 
 
