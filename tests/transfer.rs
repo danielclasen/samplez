@@ -1164,3 +1164,37 @@ fn a_core_copied_with_a_log_entry_pending_replays_all_of_it() {
         Ok(())
     });
 }
+
+/// A replay folds a log entry and checks its entries as the engine does:
+/// an `InputUp` followed by an `InputDown` needs no generation, a
+/// `Route` with an `InputDown` keeps its route and needs one, and a
+/// coefficient outside the matrix is refused rather than set elsewhere.
+#[test]
+fn a_replay_folds_and_checks_a_log_entry_as_the_engine_does() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let mut replay = h.e.replay(copy(&h.e)).unwrap();
+    let at = (now_block() + 100) * B;
+    let (up, down) = (Entry::InputUp { slot: 0 }, Entry::InputDown { slot: 0 });
+    assert_eq!(replay.append_batch(1, at, &[up, down.clone()]), Ok(()));
+    let route = Entry::Route {
+        slot: 0,
+        flow_id: new_id(),
+    };
+    assert_eq!(
+        replay.append_batch(2, at, &[route, down]),
+        Err(ReplayError::Generation)
+    );
+    let outside = Entry::Gain {
+        input: 0,
+        output: 2,
+        gain: 0.5,
+    };
+    assert!(matches!(
+        replay.append_batch(3, at, &[outside]),
+        Err(ReplayError::Invalid(_))
+    ));
+    h.e.stop();
+}

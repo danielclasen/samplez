@@ -22,9 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::batch::{self, Batch};
 use crate::blocks::PageHash;
 use crate::engine::Entry;
-use crate::rt_loop::{
-    Change, Control, Generating, LogId, PENDING_CHANGES, Rt, RtEntry, UNRESOLVED,
-};
+use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRESOLVED, slots_of};
 
 /// The engine version a core's encoding carries: a core is replayed only
 /// by the engine that copied it.
@@ -267,16 +265,7 @@ impl Core {
             Some(strip) => strip.legs() == legs && strip.ramp() == ramp,
             None => legs > MAX_LEGS,
         };
-        let entry = |e: &RtEntry| match e.change {
-            Change::Gain { input, output, .. } => input < inputs && output < outputs,
-            Change::InputDown { slot } | Change::InputUp { slot } | Change::Route { slot } => {
-                slot < slots
-            }
-            Change::Strip { slot, param } => slot < slots && param.check(legs[slot]).is_ok(),
-            Change::Batch { generation, .. } => generation.is_none_or(|g| match g {
-                Generating::InputUp { slot } | Generating::Route { slot } => slot < slots,
-            }),
-        };
+        let entry = |e: &RtEntry| fits(&e.change, inputs, outputs, legs);
         let batch = |(_, b): &(LogId, Arc<Batch>)| b.fits(inputs * outputs, legs);
         let shape = (
             self.matrix.inputs(),
@@ -289,6 +278,28 @@ impl Core {
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
             && self.batches.iter().all(batch)
             && self.slots.iter().zip(legs).all(strip)
+    }
+}
+
+/// Whether change `c` is within an engine of `inputs` and `outputs`
+/// channels and input slots of `legs` legs: a coefficient and a gain it
+/// has, a slot, and a strip parameter that slot's strip takes. A batch's
+/// own values are checked by [`Batch::fits`].
+pub(crate) fn fits(c: &Change, inputs: usize, outputs: usize, legs: &[usize]) -> bool {
+    let slots = legs.len();
+    match *c {
+        Change::Gain {
+            input,
+            output,
+            gain,
+        } => input < inputs && output < outputs && samplez_dsp::valid_gain(gain),
+        Change::InputDown { slot } | Change::InputUp { slot } | Change::Route { slot } => {
+            slot < slots
+        }
+        Change::Strip { slot, param } => {
+            slot < slots && legs[slot] <= MAX_LEGS && param.check(legs[slot]).is_ok()
+        }
+        Change::Batch { up, routed, .. } => slots_of(up | routed).all(|s| s < slots),
     }
 }
 
@@ -441,20 +452,30 @@ impl Replay {
         if id <= self.last_id || entries.is_empty() {
             return Ok(());
         }
+        let matrix = &self.rt.mix.matrix;
+        let (inputs, columns) = (matrix.inputs(), matrix.outputs());
+        let legs: Vec<usize> = self.rt.slots.iter().map(|s| s.channels).collect();
         let changes: Vec<Change> = entries.iter().map(change_of).collect();
-        if changes.iter().any(Change::needs_generation) {
+        // The engine's checks: a donor took no entry outside them.
+        if !changes.iter().all(|c| fits(c, inputs, columns, &legs)) {
+            return Err(ReplayError::Invalid(format!(
+                "log entry {id} has an entry outside the engine"
+            )));
+        }
+        // Folded first, as the engine folds it: an `InputUp` followed by
+        // an `InputDown` of the slot needs no generation.
+        let folded =
+            batch::fold(&changes, columns, inputs * columns).map_err(ReplayError::Invalid)?;
+        let Some((change, batch)) = folded else {
+            return Ok(());
+        };
+        if change.needs_generation() {
             return Err(ReplayError::Generation);
         }
         let b = self.rt.block;
         if !at_index.is_multiple_of(b) || at_index < self.next * b {
             return Err(ReplayError::Late { id, at_index });
         }
-        let matrix = &self.rt.mix.matrix;
-        let (columns, coefficients) = (matrix.outputs(), matrix.inputs() * matrix.outputs());
-        let folded = batch::fold(&changes, columns, coefficients).map_err(ReplayError::Invalid)?;
-        let Some((change, batch)) = folded else {
-            return Ok(());
-        };
         let e = RtEntry {
             id,
             at_index,

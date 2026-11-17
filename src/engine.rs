@@ -34,7 +34,7 @@ use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
     BlockVerdict, Change, Command, Control, Counters, Gen, LogId, LoudnessReset, MeterRecord,
     Metered, Mix, Out, OutMeter, PENDING_CHANGES, Replica, Returned, RingEntry, Rt, RtEntry, SLICE,
-    SPENT, Shared, Slot, SlotStats, Telemetry, UNRESOLVED,
+    SPENT, Shared, Slot, SlotStats, Telemetry, UNRESOLVED, bit, slots_of,
 };
 use crate::transfer::{
     Answer, CopyError, Core, CoreCopy, Handover, ProductState, Replay, ReplayError, SlotCore,
@@ -425,8 +425,10 @@ enum LogMsg {
     Append {
         id: LogId,
         at_index: u64,
-        change: Change,
-        flow: Option<String>,
+        /// The slots the entry raises, by bit.
+        up: u64,
+        /// The slots it re-routes, with their new flows.
+        routes: Vec<(usize, String)>,
     },
     /// Uncommitted entries from `from` on were removed.
     Truncate { from: LogId },
@@ -471,7 +473,7 @@ impl Log {
         &mut self,
         e: RtEntry,
         batch: Option<Arc<Batch>>,
-        flow: Option<String>,
+        routes: Vec<(usize, String)>,
         consumed: u64,
     ) -> Result<(), EntryError> {
         if e.id <= self.last {
@@ -484,13 +486,14 @@ impl Log {
         if outstanding >= PENDING_CHANGES as u64 {
             return Err(EntryError::Full);
         }
-        if let Some(change) = e.change.generation() {
+        let (up, _) = e.change.generating();
+        if e.change.needs_generation() {
             // The supervisor outlives every caller.
             let _ = self.sup.send(LogMsg::Append {
                 id: e.id,
                 at_index: e.at_index,
-                change,
-                flow,
+                up,
+                routes,
             });
         }
         self.uncommitted.push_back(RingEntry { entry: e, batch });
@@ -1415,7 +1418,7 @@ impl Engine {
             change,
         };
         let consumed = self.counters.entries_consumed.load(Acquire);
-        log.append(e, None, None, consumed)
+        log.append(e, None, Vec::new(), consumed)
             .map_err(|_| GainError::Full)?;
         log.commit(e.id);
         Ok(())
@@ -1462,7 +1465,7 @@ impl Engine {
             change: Change::Route { slot },
         };
         let consumed = self.counters.entries_consumed.load(Acquire);
-        log.append(e, None, Some(flow_id.to_owned()), consumed)?;
+        log.append(e, None, vec![(slot, flow_id.to_owned())], consumed)?;
         log.commit(e.id);
         if let Some(l) = &mut log.local {
             l.last_at[slot] = at_index;
@@ -1509,22 +1512,8 @@ impl Engine {
                 self.block
             ));
         }
-        let mut changes = Vec::with_capacity(entries.len());
-        let mut flows = HashMap::new();
-        for entry in entries {
-            changes.push(self.change(entry)?);
-            if let Entry::Route { slot, flow_id } = entry {
-                flows.insert(*slot, flow_id);
-            }
-        }
-        let (n, m) = self.shape;
-        let Some((change, batch)) = batch::fold(&changes, m, n * m).map_err(EntryError::Invalid)?
-        else {
+        let Some((change, batch, routes)) = self.fold(entries)? else {
             return Ok(());
-        };
-        let flow = match change.generation() {
-            Some(Change::Route { slot }) => flows.get(&slot).map(|f| (*f).clone()),
-            _ => None,
         };
         let mut log = self.log.lock().expect("log lock");
         if log.local.is_some() {
@@ -1536,7 +1525,51 @@ impl Engine {
             at_index,
             change,
         };
-        log.append(e, batch, flow, consumed)
+        log.append(e, batch, routes, consumed)
+    }
+
+    /// Whether [`Engine::append_batch`] takes `entries`, at an index it
+    /// takes: what a log entry is checked against before it is ordered,
+    /// so that no committed one is refused.
+    pub fn admits(&self, entries: &[Entry]) -> Result<(), EntryError> {
+        self.fold(entries).map(|_| ())
+    }
+
+    /// `entries` checked and folded, with the flows of the slots the
+    /// fold re-routes: none for no change. Refused when an entry is, and
+    /// when the slots the fold raises or re-routes are of more than one
+    /// input domain: one generation is built for a log entry.
+    #[allow(clippy::type_complexity)]
+    fn fold(
+        &self,
+        entries: &[Entry],
+    ) -> Result<Option<(Change, Option<Arc<Batch>>, Vec<(usize, String)>)>, EntryError> {
+        let mut changes = Vec::with_capacity(entries.len());
+        let mut flows = HashMap::new();
+        for entry in entries {
+            changes.push(self.change(entry)?);
+            if let Entry::Route { slot, flow_id } = entry {
+                flows.insert(*slot, flow_id);
+            }
+        }
+        let (n, m) = self.shape;
+        let Some((change, batch)) = batch::fold(&changes, m, n * m).map_err(EntryError::Invalid)?
+        else {
+            return Ok(None);
+        };
+        let (up, routed) = change.generating();
+        let mut domains = slots_of(up | routed).map(|s| &self.config.inputs[s].domain);
+        if let Some(first) = domains.next()
+            && domains.any(|d| d != first)
+        {
+            return Err(EntryError::Invalid(
+                "a log entry raising or re-routing inputs of more than one domain: one \
+                 generation is built for it"
+                    .to_owned(),
+            ));
+        }
+        let routes = slots_of(routed).map(|s| (s, flows[&s].clone())).collect();
+        Ok(Some((change, batch, routes)))
     }
 
     /// The change `entry` makes, checked against the configuration.
@@ -1913,7 +1946,7 @@ impl Engine {
             gens.push(Some(Box::new(Gen {
                 mxl: g,
                 prune_after: vec![u64::MAX; slots.len()],
-                rerouted: false,
+                rerouted: 0,
             })));
         }
         let (hashes_tx, hashes) = rtrb::RingBuffer::new(4 * self.config.outputs.len().max(1));
@@ -2046,7 +2079,7 @@ impl Engine {
                     // the RT thread applies a passed re-route or strip
                     // entry itself, taken before the install or after.
                     Change::Route { .. } | Change::Strip { .. } => {}
-                    Change::Batch { generation, .. } => {
+                    Change::Batch { up: raised, .. } => {
                         if let Some(b) = batch(e.id) {
                             let columns = core.matrix.outputs();
                             b.gains.each(|c, g| {
@@ -2056,7 +2089,7 @@ impl Engine {
                                 up[slot as usize] = false;
                             }
                         }
-                        if let Some(Change::InputUp { slot }) = generation.map(|g| g.change()) {
+                        for slot in slots_of(raised) {
                             up[slot] = true;
                         }
                     }
@@ -2309,9 +2342,10 @@ struct SupSlot {
 struct Job {
     id: LogId,
     at_index: u64,
-    change: Change,
-    /// A `Route`'s flow.
-    flow: Option<String>,
+    /// The slots the entry raises, by bit.
+    up: u64,
+    /// The slots it re-routes, with their new flows.
+    routes: Vec<(usize, String)>,
     domain: usize,
     stage: Stage,
 }
@@ -2841,7 +2875,7 @@ impl Supervisor {
         };
         if self.cmd.push(command).is_ok() {
             self.dirty[d] = false;
-            self.adopt(d, held, None);
+            self.adopt(d, held, 0);
         }
     }
 
@@ -2870,16 +2904,13 @@ impl Supervisor {
         let produced = self.counters.produced.load(Acquire);
         let mut prune_after = vec![u64::MAX; n];
         let mut held = 0u64;
-        let mut rerouted = false;
+        let mut rerouted = 0u64;
         for (slot, limit) in prune_after.iter_mut().enumerate() {
             if self.input_domain(slot) != d {
                 continue;
             }
-            let (target, flow) = match job.map(|j| (j.change, j.flow.as_deref())) {
-                Some((Change::InputUp { slot: s }, _)) if s == slot => (true, None),
-                Some((Change::Route { slot: s }, f)) if s == slot => (true, f),
-                _ => (false, None),
-            };
+            let flow = job.and_then(|j| j.routes.iter().find(|r| r.0 == slot).map(|r| &*r.1));
+            let target = flow.is_some() || job.is_some_and(|j| j.up & bit(slot) != 0);
             let current = self.slots[slot].flow.clone();
             let wanted = !matches!(self.slots[slot].state, SupState::Pruned { .. });
             let cfg = &self.config.inputs[slot];
@@ -2898,7 +2929,9 @@ impl Supervisor {
             {
                 log(format_args!("input {}: flow {old} left: {e}", cfg.name));
             }
-            rerouted |= flow.is_some_and(|f| f != current);
+            if flow.is_some_and(|f| f != current) {
+                rerouted |= bit(slot);
+            }
             if !wanted && !target {
                 continue;
             }
@@ -2956,11 +2989,12 @@ impl Supervisor {
 
     /// Takes the slots of input domain `d` that the generation now live
     /// on the RT thread holds, `held`, as attached, and moves the others
-    /// that were attached or wanted to polling, reported. `target` is the
-    /// slot of an `InputUp` or `Route` entry: reported when not held.
+    /// that were attached or wanted to polling, reported. `targets` are
+    /// the slots, by bit, a log entry raises or re-routes: each reported
+    /// when not held.
     /// A held slot that was pruned meanwhile, or is down in the log, is
     /// left out of the next generation instead.
-    fn adopt(&mut self, d: usize, held: u64, target: Option<usize>) {
+    fn adopt(&mut self, d: usize, held: u64, targets: u64) {
         for slot in 0..self.slots.len() {
             if self.input_domain(slot) != d {
                 continue;
@@ -2969,13 +3003,13 @@ impl Supervisor {
             if held & (1 << slot) == 0 {
                 if !pruned {
                     self.start_polling(slot, true);
-                } else if target == Some(slot) {
+                } else if targets & bit(slot) != 0 {
                     self.slots[slot].reported = false;
                     self.report(Report::InputPruned { slot });
                 }
                 continue;
             }
-            if (pruned && target != Some(slot)) || !self.slots[slot].up {
+            if (pruned && targets & bit(slot) == 0) || !self.slots[slot].up {
                 if !pruned {
                     self.start_polling(slot, false);
                 }
@@ -3003,17 +3037,18 @@ impl Supervisor {
                 LogMsg::Append {
                     id,
                     at_index,
-                    change,
-                    flow,
+                    up,
+                    routes,
                 } => {
-                    let (Change::InputUp { slot } | Change::Route { slot }) = change else {
+                    let targets = up | routes.iter().fold(0, |m, r| m | bit(r.0));
+                    let Some(slot) = slots_of(targets).next() else {
                         continue;
                     };
                     self.jobs.push_back(Job {
                         id,
                         at_index,
-                        change,
-                        flow,
+                        up,
+                        routes,
                         domain: self.input_domain(slot),
                         stage: Stage::Waiting,
                     });
@@ -3085,28 +3120,24 @@ impl Supervisor {
         if !swapped {
             return;
         }
-        let slot = match j.change {
-            Change::InputUp { slot } => slot,
-            Change::Route { slot } => {
-                let flow = j.flow.expect("a route has a flow");
-                if flow != self.slots[slot].flow {
-                    // A polled slot polls the flow it reads: the hold on
-                    // the old one is released, `poll` takes one on the new.
-                    self.release_poll(slot);
-                    if let SupState::Pruned { recovery, held } = &mut self.slots[slot].state {
-                        *recovery = Recovery::default();
-                        *held = false;
-                    }
-                    self.slots[slot].reported = false;
-                    let old = std::mem::replace(&mut self.slots[slot].flow, flow.clone());
-                    self.slots[slot].routing = Some((j.at_index + self.ramp, old));
-                    self.status().inputs[slot].flow_id = flow;
+        let mut targets = j.up;
+        for (slot, flow) in j.routes {
+            targets |= bit(slot);
+            if flow != self.slots[slot].flow {
+                // A polled slot polls the flow it reads: the hold on the
+                // old one is released, `poll` takes one on the new.
+                self.release_poll(slot);
+                if let SupState::Pruned { recovery, held } = &mut self.slots[slot].state {
+                    *recovery = Recovery::default();
+                    *held = false;
                 }
-                slot
+                self.slots[slot].reported = false;
+                let old = std::mem::replace(&mut self.slots[slot].flow, flow.clone());
+                self.slots[slot].routing = Some((j.at_index + self.ramp, old));
+                self.status().inputs[slot].flow_id = flow;
             }
-            _ => return,
-        };
-        self.adopt(j.domain, held, Some(slot));
+        }
+        self.adopt(j.domain, held, targets);
     }
 
     /// Puts the spent batches the RT thread leaked in the status, and
@@ -3174,7 +3205,7 @@ impl Supervisor {
                 at_index,
                 change,
             };
-            if log.append(e, None, None, consumed).is_err() {
+            if log.append(e, None, Vec::new(), consumed).is_err() {
                 break 'sent false;
             }
             log.commit(e.id);
@@ -3459,11 +3490,11 @@ mod tests {
         let (mut log, mut rx, msgs) = log();
         let down = Change::InputDown { slot: 0 };
         let up = Change::InputUp { slot: 0 };
-        log.append(e(1, down), None, None, 0).unwrap();
-        log.append(e(2, up), None, None, 0).unwrap();
+        log.append(e(1, down), None, Vec::new(), 0).unwrap();
+        log.append(e(2, up), None, Vec::new(), 0).unwrap();
         assert!(matches!(msgs.try_recv(), Ok(LogMsg::Append { id: 2, .. })));
         assert_eq!(
-            log.append(e(2, down), None, None, 0),
+            log.append(e(2, down), None, Vec::new(), 0),
             Err(EntryError::Order { id: 2, last: 2 })
         );
         assert!(rx.pop().is_err());
@@ -3474,17 +3505,17 @@ mod tests {
         log.truncate(1);
         assert!(matches!(msgs.try_recv(), Ok(LogMsg::Truncate { from: 2 })));
         assert_eq!((log.last, log.uncommitted.len()), (1, 0));
-        log.append(e(2, down), None, None, 0).unwrap();
+        log.append(e(2, down), None, Vec::new(), 0).unwrap();
         log.commit(2);
         assert_eq!(rx.pop().unwrap().entry.id, 2);
         for id in 3..=PENDING_CHANGES as u64 {
-            log.append(e(id, down), None, None, 0).unwrap();
+            log.append(e(id, down), None, Vec::new(), 0).unwrap();
         }
         assert_eq!(
-            log.append(e(PENDING_CHANGES as u64 + 1, down), None, None, 0),
+            log.append(e(PENDING_CHANGES as u64 + 1, down), None, Vec::new(), 0),
             Err(EntryError::Full)
         );
-        log.append(e(PENDING_CHANGES as u64 + 1, down), None, None, 1)
+        log.append(e(PENDING_CHANGES as u64 + 1, down), None, Vec::new(), 1)
             .unwrap();
     }
 
@@ -4596,8 +4627,13 @@ mod tests {
                 param: refused,
             },
         };
-        log.append(entry, None, None, e.counters.entries_consumed.load(Acquire))
-            .unwrap();
+        log.append(
+            entry,
+            None,
+            Vec::new(),
+            e.counters.entries_consumed.load(Acquire),
+        )
+        .unwrap();
         log.commit(entry.id);
         drop(log);
         e.set_strip(0, StripParam::Trim { db: -3.0 }, entry.at_index)

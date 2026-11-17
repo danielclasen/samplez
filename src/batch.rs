@@ -12,7 +12,7 @@ use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{StripParam, valid_gain};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::rt_loop::{Change, Generating};
+use crate::rt_loop::Change;
 
 /// A log entry's gain targets, by coefficient `input * columns + output`.
 #[derive(Clone, Debug)]
@@ -156,13 +156,26 @@ impl Batch {
     }
 }
 
+/// What one log entry does to one input slot, its entries taken in
+/// order: re-routed to the last flow a `Route` names, down, and up, which
+/// fades in from silence at the index; a later `InputDown` cancels an
+/// `InputUp` before it, a later `InputUp` follows an `InputDown` before
+/// it. Applied in that order.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SlotFold {
+    routed: bool,
+    down: bool,
+    up: bool,
+}
+
 /// What `changes`, the checked engine entries of one log entry in order,
 /// fold into: none for no change, a single change as itself, more as a
-/// [`Change::Batch`] with its batch. Per coefficient, strip parameter key
-/// and slot the last value counts; an `InputDown`, `InputUp` or `Route`
-/// of a slot replaces the one before it. Refused when more than one
-/// `InputUp` or `Route` remains: one generation is built at a time.
-/// `columns` is the matrix's column count, `coefficients` its size.
+/// [`Change::Batch`] with its batch. Per coefficient and strip parameter
+/// key the last value counts. Per input slot a `Route` and its up or down
+/// state are kept apart ([`SlotFold`]): an `InputUp` and a `Route` raise
+/// the slot on the new flow, a `Route` and an `InputDown` leave it down on
+/// the new flow. `columns` is the matrix's column count, `coefficients`
+/// its size.
 #[allow(clippy::type_complexity)]
 pub(crate) fn fold(
     changes: &[Change],
@@ -171,7 +184,7 @@ pub(crate) fn fold(
 ) -> Result<Option<(Change, Option<Arc<Batch>>)>, String> {
     let mut gains = BTreeMap::new();
     let mut strips = BTreeMap::new();
-    let mut slots = BTreeMap::new();
+    let mut slots: BTreeMap<usize, SlotFold> = BTreeMap::new();
     for &c in changes {
         match c {
             Change::Gain {
@@ -184,34 +197,38 @@ pub(crate) fn fold(
             Change::Strip { slot, param } => {
                 strips.insert((slot as u32, strip_key(&param)), param);
             }
-            Change::InputDown { slot } | Change::InputUp { slot } | Change::Route { slot } => {
-                slots.insert(slot, c);
+            Change::Route { slot } => slots.entry(slot).or_default().routed = true,
+            Change::InputDown { slot } => {
+                let s = slots.entry(slot).or_default();
+                s.down = true;
+                s.up = false;
             }
+            Change::InputUp { slot } => slots.entry(slot).or_default().up = true,
             Change::Batch { .. } => return Err("a batch inside a batch".to_owned()),
         }
     }
     let downs: Vec<u32> = slots
         .iter()
-        .filter(|(_, c)| matches!(c, Change::InputDown { .. }))
-        .map(|(&s, _)| s as u32)
+        .filter(|(_, s)| s.down)
+        .map(|(&slot, _)| slot as u32)
         .collect();
-    let mut generating = slots.values().filter_map(|c| match *c {
-        Change::InputUp { slot } => Some(Generating::InputUp { slot }),
-        Change::Route { slot } => Some(Generating::Route { slot }),
-        _ => None,
-    });
-    let generation = generating.next();
-    if generating.next().is_some() {
-        return Err(
-            "a log entry with more than one InputUp or Route: one generation is built at a time"
-                .to_owned(),
-        );
-    }
-    let total = gains.len() + strips.len() + downs.len() + usize::from(generation.is_some());
-    if total == 0 {
+    let mask = |f: fn(&SlotFold) -> bool| {
+        slots
+            .iter()
+            .filter(|(_, s)| f(s))
+            .fold(0u64, |m, (&slot, _)| m | 1 << slot)
+    };
+    let (up, routed) = (mask(|s| s.up), mask(|s| s.routed));
+    let facts = gains.len()
+        + strips.len()
+        + downs.len()
+        + up.count_ones() as usize
+        + routed.count_ones() as usize;
+    if facts == 0 {
         return Ok(None);
     }
-    if total == 1 {
+    if facts == 1 {
+        let slot = (up | routed).trailing_zeros() as usize;
         let single = if let Some((&c, &gain)) = gains.first_key_value() {
             let c = c as usize;
             Change::Gain {
@@ -228,8 +245,10 @@ pub(crate) fn fold(
             Change::InputDown {
                 slot: slot as usize,
             }
+        } else if up != 0 {
+            Change::InputUp { slot }
         } else {
-            generation.expect("one change").change()
+            Change::Route { slot }
         };
         return Ok(Some((single, None)));
     }
@@ -240,7 +259,8 @@ pub(crate) fn fold(
     };
     let change = Change::Batch {
         strips: !batch.strips.is_empty(),
-        generation,
+        up,
+        routed,
     };
     Ok(Some((change, Some(Arc::new(batch)))))
 }
@@ -264,9 +284,9 @@ mod tests {
         }
     }
 
-    /// Per coefficient, strip parameter and slot the last value counts,
-    /// whatever the number of entries: a log entry's batch is bounded by
-    /// the engine's shape.
+    /// Per coefficient and strip parameter the last value counts, whatever
+    /// the number of entries: a log entry's batch is bounded by the
+    /// engine's shape.
     #[test]
     fn a_log_entry_folds_to_the_last_value_per_key() {
         let mut changes = Vec::new();
@@ -274,16 +294,15 @@ mod tests {
             changes.push(gain(n % 2, 1, n as f32 / 1000.0));
             changes.push(trim(0, -(n as f32) / 100.0));
         }
-        changes.push(Change::InputUp { slot: 1 });
         changes.push(Change::InputDown { slot: 1 });
-        changes.push(Change::Route { slot: 0 });
         let (change, batch) = fold(&changes, 3, 6).unwrap().unwrap();
         let batch = batch.unwrap();
         assert_eq!(
             change,
             Change::Batch {
                 strips: true,
-                generation: Some(Generating::Route { slot: 0 })
+                up: 0,
+                routed: 0
             }
         );
         assert_eq!(batch.gains.list(), [(1, 0.998), (4, 0.999)]);
@@ -293,9 +312,41 @@ mod tests {
         assert!(!batch.fits(4, &[1, 1]), "coefficient 4 of 4");
     }
 
-    /// No change folds to none, one change to itself; two generations
-    /// are refused, a generation replaced by a later entry of its slot is
-    /// not one.
+    /// Per slot a re-route and the up or down state are kept apart, in
+    /// the order the command gave them: a route is never lost to an
+    /// `InputDown` after it, an `InputUp` and a `Route` raise the slot on
+    /// the new flow, and an `InputUp` after an `InputDown` fades in from
+    /// silence, its down kept.
+    #[test]
+    fn a_slots_route_and_state_fold_apart() {
+        let (up, down, route) = (
+            Change::InputUp { slot: 1 },
+            Change::InputDown { slot: 1 },
+            Change::Route { slot: 1 },
+        );
+        // (downs, up mask, routed mask) of each sequence on slot 1.
+        let facts = |changes: &[Change]| -> (Vec<u32>, u64, u64) {
+            match fold(changes, 2, 4).unwrap().unwrap() {
+                (Change::Batch { up, routed, .. }, Some(b)) => (b.downs.clone(), up, routed),
+                (Change::InputUp { slot }, None) => (vec![], 1 << slot, 0),
+                (Change::InputDown { slot }, None) => (vec![slot as u32], 0, 0),
+                (Change::Route { slot }, None) => (vec![], 0, 1 << slot),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(facts(&[up, route]), (vec![], 2, 2), "routed and raised");
+        assert_eq!(facts(&[route, up]), (vec![], 2, 2), "routed and raised");
+        assert_eq!(facts(&[route, down]), (vec![1], 0, 2), "routed and down");
+        assert_eq!(facts(&[down, route]), (vec![1], 0, 2), "routed and down");
+        assert_eq!(facts(&[down, up]), (vec![1], 2, 0), "down, then a fade in");
+        assert_eq!(facts(&[up, down]), (vec![1], 0, 0), "down");
+        assert_eq!(facts(&[down, up, down]), (vec![1], 0, 0), "down");
+        assert_eq!(facts(&[up, up]), (vec![], 2, 0));
+        assert_eq!(facts(&[route, down, up]), (vec![1], 2, 2));
+    }
+
+    /// No change folds to none, one change to itself; generation-needing
+    /// entries of several slots fold into one batch.
     #[test]
     fn a_log_entry_of_one_change_or_none_folds_to_itself() {
         assert_eq!(fold(&[], 2, 4).unwrap(), None);
@@ -303,23 +354,24 @@ mod tests {
             gain(1, 1, 0.5),
             trim(1, -3.0),
             Change::InputDown { slot: 1 },
+            Change::InputUp { slot: 1 },
             Change::Route { slot: 1 },
         ] {
             assert_eq!(fold(&[c, c], 2, 4).unwrap(), Some((c, None)));
         }
         let up = |slot| Change::InputUp { slot };
-        assert!(fold(&[up(0), up(1)], 2, 4).is_err());
         assert_eq!(
-            fold(&[up(0), up(1), Change::InputDown { slot: 0 }], 2, 4).unwrap(),
+            fold(&[up(0), Change::Route { slot: 1 }], 2, 4).unwrap(),
             Some((
                 Change::Batch {
                     strips: false,
-                    generation: Some(Generating::InputUp { slot: 1 })
+                    up: 1,
+                    routed: 2
                 },
                 Some(Arc::new(Batch {
                     gains: Gains::Sparse(Vec::new()),
                     strips: Vec::new(),
-                    downs: vec![0],
+                    downs: Vec::new(),
                 }))
             ))
         );

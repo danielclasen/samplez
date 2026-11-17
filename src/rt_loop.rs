@@ -309,9 +309,9 @@ pub(crate) enum Telemetry {
 pub(crate) struct Gen {
     pub mxl: Generation,
     pub prune_after: Vec<u64>,
-    /// Built for a `Route` entry that changes the slot's flow: the slot's
+    /// The slots, by bit, a re-route moved to another flow: each one's
     /// reader is on the new flow, its outgoing reader on the old one.
-    pub rerouted: bool,
+    pub rerouted: u64,
 }
 
 pub(crate) enum Command {
@@ -427,41 +427,36 @@ pub(crate) enum Change {
     Strip { slot: usize, param: StripParam },
     /// The engine entries of one log entry, folded: its gains, strip
     /// parameters (`strips` says whether it has any) and `InputDown`s in
-    /// a [`Batch`] the RT thread holds by log id, and at most one
-    /// generation-needing entry.
-    Batch {
-        strips: bool,
-        generation: Option<Generating>,
-    },
+    /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
+    /// slots it raises after them and those it re-routes, all of one
+    /// input domain, for which one generation is built.
+    Batch { strips: bool, up: u64, routed: u64 },
 }
 
-/// The generation-needing entry of a [`Change::Batch`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum Generating {
-    InputUp { slot: usize },
-    Route { slot: usize },
+/// The bit of input slot `slot` in a slot mask; at most
+/// [`crate::config::MAX_INPUTS`], 64, slots.
+pub(crate) fn bit(slot: usize) -> u64 {
+    1 << slot
 }
 
-impl Generating {
-    pub fn change(self) -> Change {
-        match self {
-            Generating::InputUp { slot } => Change::InputUp { slot },
-            Generating::Route { slot } => Change::Route { slot },
-        }
-    }
+/// The slots of slot mask `mask`, ascending.
+pub(crate) fn slots_of(mask: u64) -> impl Iterator<Item = usize> {
+    (0..64).filter(move |&s| mask & bit(s) != 0)
 }
 
 impl Change {
     pub fn needs_generation(&self) -> bool {
-        self.generation().is_some()
+        self.generating() != (0, 0)
     }
 
-    /// The generation-needing entry the change is or holds.
-    pub fn generation(&self) -> Option<Change> {
+    /// The slots the change raises and those it re-routes, as masks: what
+    /// its generation is built for.
+    pub fn generating(&self) -> (u64, u64) {
         match *self {
-            Change::InputUp { .. } | Change::Route { .. } => Some(*self),
-            Change::Batch { generation, .. } => generation.map(Generating::change),
-            _ => None,
+            Change::InputUp { slot } => (bit(slot), 0),
+            Change::Route { slot } => (0, bit(slot)),
+            Change::Batch { up, routed, .. } => (up, routed),
+            _ => (0, 0),
         }
     }
 
@@ -478,8 +473,9 @@ impl Change {
             Change::InputUp { .. } | Change::Route { .. } => false,
             Change::Batch {
                 strips: has,
-                generation,
-            } => generation.is_none() && (strips || !has),
+                up,
+                routed,
+            } => up | routed == 0 && (strips || !has),
         }
     }
 }
@@ -1991,40 +1987,44 @@ impl Rt {
         self.send(Telemetry::GenerationDone { id, swapped: false });
     }
 
-    /// Swaps in the generation of entry `e`, an `InputUp` or a `Route`.
-    /// A re-route on time starts its crossfade at the entry's index; one
-    /// whose generation came late starts the new flow from silence.
+    /// Swaps in the generation of entry `e`, which raises or re-routes
+    /// slots. A re-route on time starts its crossfade at the entry's
+    /// index; one whose generation came late starts the new flow from
+    /// silence.
     fn swap_in(&mut self, e: RtEntry, domain: usize, generation: Box<Gen>, on_time: bool) {
         let rerouted = generation.rerouted;
         self.install(domain, generation);
-        let (Change::InputUp { slot: i } | Change::Route { slot: i }) = e.change else {
-            unreachable!("only these entries need a generation")
-        };
-        // Silent while another entry for the slot awaits its generation.
-        let held = self.awaiting_gen.iter().any(
-            |a| matches!(a.change, Change::InputUp { slot } | Change::Route { slot } if slot == i),
-        );
-        let slot = &mut self.slots[i];
-        slot.held = held;
-        if rerouted {
-            slot.prev = slot.state.clone();
-            let s = &mut slot.state;
-            s.last_end = None;
-            s.head = 0;
-            s.frozen_late_blocks = 0;
-            s.invalid = false;
-            // Anchored at the index whatever the slot's last block was:
-            // an outgoing flow that is silent fades the new one in.
-            slot.xfade = on_time.then_some(e.at_index);
-            // Late, it skips that crossfade: its blocks differ from an
-            // on-time engine's until the crossfade's end.
-            if !on_time
-                && matches!(e.change, Change::Route { .. })
-                && let Some(r) = self.replica.as_mut()
-                && !note_late_route(r, e.id, e.at_index.saturating_add(u64::from(self.ramp)))
-            {
-                add(&self.counters.late_routes_lost, 1);
+        let (up, routed) = e.change.generating();
+        for i in slots_of(up | routed) {
+            // Silent while another entry for the slot awaits its
+            // generation.
+            let held = self.awaiting_gen.iter().any(|a| {
+                let (u, r) = a.change.generating();
+                (u | r) & bit(i) != 0
+            });
+            let slot = &mut self.slots[i];
+            slot.held = held;
+            if rerouted & bit(i) != 0 {
+                slot.prev = slot.state.clone();
+                let s = &mut slot.state;
+                s.last_end = None;
+                s.head = 0;
+                s.frozen_late_blocks = 0;
+                s.invalid = false;
+                // Anchored at the index whatever the slot's last block
+                // was: an outgoing flow that is silent fades the new one
+                // in.
+                slot.xfade = on_time.then_some(e.at_index);
             }
+        }
+        // Late, a re-route skips its crossfade: the blocks differ from an
+        // on-time engine's until the crossfade's end.
+        if !on_time
+            && routed & rerouted != 0
+            && let Some(r) = self.replica.as_mut()
+            && !note_late_route(r, e.id, e.at_index.saturating_add(u64::from(self.ramp)))
+        {
+            add(&self.counters.late_routes_lost, 1);
         }
         self.send(Telemetry::GenerationDone {
             id: e.id,
@@ -2081,11 +2081,7 @@ impl Rt {
         if count {
             self.mix.applied_entry(&e);
         }
-        let Change::Batch {
-            generation,
-            strips: has,
-        } = e.change
-        else {
+        let Change::Batch { strips: has, .. } = e.change else {
             self.apply_change(e);
             return;
         };
@@ -2094,18 +2090,13 @@ impl Rt {
                 self.set_strip(e, slot as usize, param);
             }
         }
-        if let Some(g) = generation {
-            self.apply_change(RtEntry {
-                change: g.change(),
-                ..e
-            });
-        }
+        self.apply_generation(e);
     }
 
     /// Applies change `e`, a single one other than a gain change.
     fn apply_change(&mut self, e: RtEntry) {
-        let slot = match e.change {
-            Change::Gain { .. } | Change::Batch { .. } => return,
+        match e.change {
+            Change::Gain { .. } | Change::Batch { .. } => {}
             Change::InputDown { slot } => {
                 let s = &mut self.slots[slot];
                 if s.up {
@@ -2113,29 +2104,40 @@ impl Rt {
                     s.xfade = None;
                     self.send(Telemetry::Input { slot, up: false });
                 }
-                return;
             }
-            Change::Strip { slot, param } => {
-                self.set_strip(e, slot, param);
-                return;
+            Change::Strip { slot, param } => self.set_strip(e, slot, param),
+            Change::InputUp { .. } | Change::Route { .. } => self.apply_generation(e),
+        }
+    }
+
+    /// Applies what of entry `e` its generation is built for: the slots
+    /// it raises fade in from its index, and its generation is swapped in,
+    /// or, not here yet, awaited with those slots and the re-routed ones
+    /// held silent.
+    fn apply_generation(&mut self, e: RtEntry) {
+        let (up, routed) = e.change.generating();
+        if up | routed == 0 {
+            return;
+        }
+        for slot in slots_of(up) {
+            if !self.slots[slot].up {
+                // The fade-in runs from the entry's index, also on an
+                // engine that skipped the blocks around it.
+                let s = &mut self.slots[slot];
+                s.up = true;
+                s.fade_start = Some(e.at_index);
+                s.silenced_last = false;
+                self.send(Telemetry::Input { slot, up: true });
             }
-            Change::InputUp { slot } | Change::Route { slot } => slot,
-        };
-        if matches!(e.change, Change::InputUp { .. }) && !self.slots[slot].up {
-            // The fade-in runs from the entry's index, also on an engine
-            // that skipped the blocks around it.
-            let s = &mut self.slots[slot];
-            s.up = true;
-            s.fade_start = Some(e.at_index);
-            s.silenced_last = false;
-            self.send(Telemetry::Input { slot, up: true });
         }
         match self.pending_gen.take() {
             Some((id, domain, g)) if id == e.id => self.swap_in(e, domain, g, true),
             other => {
                 self.pending_gen = other;
                 add(&self.counters.generation_late, 1);
-                self.slots[slot].held = true;
+                for slot in slots_of(up | routed) {
+                    self.slots[slot].held = true;
+                }
                 if self.awaiting_gen.len() < PENDING_CHANGES {
                     self.awaiting_gen.push(e);
                 } else {
@@ -2611,7 +2613,8 @@ impl Rt {
             }
         }
         for a in &self.awaiting_gen {
-            if let Change::InputUp { slot } | Change::Route { slot } = a.change {
+            let (up, routed) = a.change.generating();
+            for slot in slots_of(up | routed) {
                 self.slots[slot].held = true;
             }
         }
