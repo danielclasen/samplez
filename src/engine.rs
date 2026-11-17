@@ -69,7 +69,7 @@ const BUILD_BUCKETS: usize = 256;
 pub enum InputState {
     /// In the RT thread's generation.
     Attached,
-    /// Not in the generation; polled until its head is on time.
+    /// Not in the generation; polled until its head advances again.
     Pruned,
 }
 
@@ -275,7 +275,7 @@ pub enum Report {
     /// The input left the RT thread's generation: pruned, or not
     /// attachable when its generation was built.
     InputPruned { slot: usize },
-    /// The input's head has been on time for a second while it is down.
+    /// The input's head has advanced for a second while it is down.
     InputReadable { slot: usize },
 }
 
@@ -2224,6 +2224,13 @@ struct Supervisor {
     stop: Arc<AtomicBool>,
 }
 
+/// Samples an input's head may stay frozen before the slot is pruned:
+/// `pruneAfterBlocks` blocks, or twice the producer's
+/// `maxCommitBatchSizeHint` plus the margin when that is longer.
+fn prune_limit(config: &Config, timing: &Timing, hint: u64) -> u64 {
+    (u64::from(config.prune_after_blocks) * timing.block).max(2 * hint + timing.margin)
+}
+
 fn log(message: std::fmt::Arguments) {
     eprintln!("samplez: {message}");
 }
@@ -2590,7 +2597,8 @@ impl Supervisor {
             }
         }
         let now = time::now(&self.api);
-        let mut heads: HashMap<(usize, String), Option<u64>> = HashMap::new();
+        // Each flow's head and prune limit.
+        let mut heads: HashMap<(usize, String), Option<(u64, u64)>> = HashMap::new();
         for (d, p) in self.pollers.iter_mut().enumerate() {
             let Some(p) = p else { continue };
             for (id, f) in &mut p.flows {
@@ -2598,29 +2606,35 @@ impl Supervisor {
                     Poll::Head(h) => Some(h),
                     Poll::Invalid | Poll::Absent(_) => None,
                 };
-                heads.insert((d, id.clone()), head);
+                let limit = prune_limit(
+                    &self.config,
+                    &self.timing,
+                    f.commit_batch_hint().unwrap_or(0),
+                );
+                heads.insert((d, id.clone()), head.map(|h| (h, limit)));
             }
         }
         for slot in 0..self.slots.len() {
             let d = self.input_domain(slot);
-            let cfg = &self.config.inputs[slot];
             let s = &mut self.slots[slot];
-            let head = heads.get(&(d, s.flow.clone())).copied().flatten();
+            let polled = heads.get(&(d, s.flow.clone())).copied().flatten();
             let SupState::Pruned { recovery: r, .. } = &mut s.state else {
                 continue;
             };
-            if !r.update(&self.api, head, now, &self.timing, cfg.offset_samples) {
+            let (head, limit) = (polled.map(|p| p.0), polled.map_or(0, |p| p.1));
+            if !r.update(&self.api, head, now, limit) {
                 s.reported = false;
             } else if s.up {
                 // Up in the log, so it is read again at once: the blocks
                 // it was silent in were a degradation of this engine.
-                log(format_args!("input {} on time again, re-adding", cfg.name));
+                let name = &self.config.inputs[slot].name;
+                log(format_args!("input {name} advancing again, re-adding"));
                 self.release_poll(slot);
                 self.slots[slot].state = SupState::Wanted;
                 self.dirty[d] = true;
             } else if !s.reported && self.report(Report::InputReadable { slot }) {
                 let name = &self.config.inputs[slot].name;
-                log(format_args!("input {name} on time again, reported"));
+                log(format_args!("input {name} advancing again, reported"));
                 self.slots[slot].reported = true;
             }
         }
@@ -2722,8 +2736,7 @@ impl Supervisor {
                         .input(slot)
                         .and_then(|i| i.reader().config().ok())
                         .map_or(0, |c| u64::from(c.common.maxCommitBatchSizeHint));
-                    *limit = (u64::from(self.config.prune_after_blocks) * self.timing.block)
-                        .max(2 * hint + self.timing.margin);
+                    *limit = prune_limit(&self.config, &self.timing, hint);
                     if let Some(needed) = short {
                         log(format_args!(
                             "input {}: readerMarginSamples {} is below the {needed} its \

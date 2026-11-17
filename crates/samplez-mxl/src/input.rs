@@ -26,8 +26,9 @@ pub const FROZEN_PROBE_BLOCKS: u32 = 10;
 /// The x86_64 base page size. A larger page is touched more than once.
 const PAGE: usize = 4096;
 
-/// How long a polled head must stay on time before the input is added back.
-pub const ON_TIME_NS: u64 = 1_000_000_000;
+/// How long a polled head must keep advancing before the input is added
+/// back.
+pub const RECOVERY_NS: u64 = 1_000_000_000;
 
 /// The block timeline shared by every input.
 #[derive(Clone, Copy, Debug)]
@@ -790,6 +791,12 @@ impl PolledFlow {
         self.holders
     }
 
+    /// `maxCommitBatchSizeHint` of the flow, when a reader is open.
+    pub fn commit_batch_hint(&self) -> Option<u64> {
+        let info = self.readers.first()?.config().ok()?;
+        Some(u64::from(info.common.maxCommitBatchSizeHint))
+    }
+
     /// Opens one reference per holder.
     fn open(&mut self) -> Result<()> {
         while self.readers.len() < self.holders {
@@ -835,32 +842,42 @@ impl PolledFlow {
     }
 }
 
-/// Supervisor side. Whether a pruned slot's polled head is back on time.
+/// Supervisor side. Whether a pruned slot's polled head advances again.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Recovery {
-    on_time_since: Option<u64>,
+    /// The head of the last poll.
+    head: Option<u64>,
+    /// `mxlTimestampToIndex` of the poll that last saw the head move.
+    moved_at: Option<u64>,
+    /// libmxl's clock at the first move of the current run.
+    since: Option<u64>,
 }
 
 impl Recovery {
-    /// True once `head` has been at or above
-    /// `mxlTimestampToIndex(now) - margin + B + offset` for [`ON_TIME_NS`].
-    /// A head below it, or none, starts the period again.
-    pub fn update(
-        &mut self,
-        api: &MxlApi,
-        head: Option<u64>,
-        now: u64,
-        timing: &Timing,
-        offset: i64,
-    ) -> bool {
-        let threshold = i128::from(timestamp_to_index(api, now)) - i128::from(timing.margin)
-            + i128::from(timing.block)
-            + i128::from(offset);
-        if head.is_none_or(|h| i128::from(h) < threshold) {
-            self.on_time_since = None;
+    /// True once the head has advanced for [`RECOVERY_NS`]: it moved, and
+    /// it never stayed unchanged between two polls for more than `limit`
+    /// samples, the prune limit an attached slot of the flow gets. How far
+    /// the head is from the clock is not checked: an attached input is
+    /// pruned only for a frozen head, so a late head counts as readable
+    /// here as it does there, where its late blocks are silenced and
+    /// raise the margin warning. No head starts the period again.
+    pub fn update(&mut self, api: &MxlApi, head: Option<u64>, now: u64, limit: u64) -> bool {
+        let Some(head) = head else {
+            *self = Recovery::default();
+            return false;
+        };
+        let at = timestamp_to_index(api, now);
+        if self.head.is_some_and(|last| last != head) {
+            self.moved_at = Some(at);
+            self.since.get_or_insert(now);
+        }
+        self.head = Some(head);
+        if self.moved_at.is_none_or(|m| at.saturating_sub(m) > limit) {
+            self.moved_at = None;
+            self.since = None;
             return false;
         }
-        let since = *self.on_time_since.get_or_insert(now);
-        now.saturating_sub(since) >= ON_TIME_NS
+        self.since
+            .is_some_and(|since| now.saturating_sub(since) >= RECOVERY_NS)
     }
 }

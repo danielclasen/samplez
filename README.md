@@ -72,10 +72,11 @@ the engine builds it when the entry is appended, one at a time, and
 swaps it in at the entry's index. The status reports the 99.99th
 percentile of the build times and buildLead, how far ahead such entries
 are stamped. `Engine::start` keeps the log itself, stamping `InputDown`
-when an input is pruned and `InputUp` once it has been on time for a
-second, and each `InputUp` or `Route` at least buildLead after the one
-before; `Engine::start_replicated` takes entries through `append`,
-`commit` and `truncate` and sends those reports out instead.
+when an input is pruned and `InputUp` once its head has advanced for a
+second, wherever it stands against the clock, and each `InputUp` or
+`Route` at least buildLead after the one before;
+`Engine::start_replicated` takes entries through `append`, `commit` and
+`truncate` and sends those reports out instead.
 
 Each input of 1 to 8 channels has a strip: trim, per-leg trim and
 polarity, high-pass, a four-band equaliser, gate and compressor

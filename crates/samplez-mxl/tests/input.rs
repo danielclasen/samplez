@@ -11,7 +11,7 @@ use mxl_sys::{
     MXL_ERR_OUT_OF_RANGE_TOO_EARLY,
 };
 use samplez_mxl::input::{
-    FROZEN_PROBE_BLOCKS, Generation, GroupWait, ON_TIME_NS, Outcome, Poll, PolledFlow, Recovery,
+    FROZEN_PROBE_BLOCKS, Generation, GroupWait, Outcome, Poll, PolledFlow, RECOVERY_NS, Recovery,
     SlotState, Timing,
 };
 use samplez_mxl::{Error, Instance, time};
@@ -515,36 +515,44 @@ fn a_poll_reader_follows_a_replaced_flow_for_every_holder() {
     assert!(matches!(p.poll(), Poll::Head(_)));
 }
 
+/// The prune limit of the recovery tests, 50 ms.
+const LIMIT: u64 = 2_400;
+/// A poll every 10 ms.
+const POLL: u64 = 10_000_000;
+
 #[test]
-fn recovery_needs_a_head_on_time_for_one_second() {
+fn recovery_needs_a_head_advancing_for_one_second() {
     let api = api();
     let now0 = time::index_to_timestamp(&api, K0 * B);
-    let on_time = K0 * B - TIMING.margin + B + 10;
-    let mut r = Recovery::default();
     let at = |ns: u64| now0 + ns;
-    // At the threshold with offset 10.
-    assert!(!r.update(&api, Some(on_time), at(0), &TIMING, 10));
-    assert!(!r.update(
-        &api,
-        Some(on_time + 48_000),
-        at(ON_TIME_NS - 1),
-        &TIMING,
-        10
-    ));
-    assert!(r.update(&api, Some(on_time + 48_000), at(ON_TIME_NS), &TIMING, 10));
-    // One sample short restarts the period, as does no head.
-    let idx = |ns: u64| time::timestamp_to_index(&api, at(ns));
-    let threshold = |ns: u64| idx(ns) - TIMING.margin + B + 10;
-    let t = 2 * ON_TIME_NS;
-    assert!(!r.update(&api, Some(threshold(t) - 1), at(t), &TIMING, 10));
-    assert!(!r.update(&api, Some(threshold(t + 1)), at(t + 1), &TIMING, 10));
-    assert!(!r.update(&api, None, at(t + 2), &TIMING, 10));
-    assert!(!r.update(&api, Some(threshold(t + 3)), at(t + 3), &TIMING, 10));
-    assert!(r.update(
-        &api,
-        Some(threshold(t + 3 + ON_TIME_NS)),
-        at(t + 3 + ON_TIME_NS),
-        &TIMING,
-        10
-    ));
+    // An index a second behind the clock: how far behind does not matter.
+    let behind = |ns: u64| time::timestamp_to_index(&api, at(ns)) - 48_000;
+    let mut r = Recovery::default();
+    let mut poll = |head: Option<u64>, ns: u64| r.update(&api, head, at(ns), LIMIT);
+    // Polls an advancing head from `t` on; true once a second passed.
+    let advance = |poll: &mut dyn FnMut(Option<u64>, u64) -> bool, t: u64| {
+        for i in 0..RECOVERY_NS / POLL {
+            let ns = t + i * POLL;
+            assert!(!poll(Some(behind(ns)), ns), "{i} polls after {t}");
+        }
+        let ns = t + RECOVERY_NS;
+        assert!(poll(Some(behind(ns)), ns));
+        ns
+    };
+    // A head frozen at 0, as on a flow created before its first commit.
+    for i in 0..200 {
+        assert!(!poll(Some(0), i * POLL));
+    }
+    // It jumps to a large index and advances.
+    let t = advance(&mut poll, 200 * POLL);
+    // Unchanged for up to the limit, it still counts as advancing; for
+    // longer, the period starts again.
+    assert!(poll(Some(behind(t)), t + 5 * POLL));
+    assert!(!poll(Some(behind(t)), t + 6 * POLL));
+    let t = advance(&mut poll, t + 7 * POLL);
+    // No head starts it again too, and the first head after it is not a
+    // move.
+    assert!(!poll(None, t + POLL));
+    assert!(!poll(Some(behind(t + 2 * POLL)), t + 2 * POLL));
+    advance(&mut poll, t + 3 * POLL);
 }

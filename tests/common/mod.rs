@@ -130,6 +130,33 @@ pub struct Pilot {
 
 impl Pilot {
     pub fn start(domain: &Path, id: &str, channels: u32, batch: u64, delay: u64) -> Pilot {
+        Pilot::spawn(domain, id, channels, batch, delay, None)
+    }
+
+    /// A pilot whose flow is created at once, its head at 0, and which
+    /// commits nothing until `gate` is set; then it starts at the block
+    /// due, as [`Pilot::start`] does.
+    pub fn gated(
+        domain: &Path,
+        id: &str,
+        channels: u32,
+        batch: u64,
+        delay: u64,
+    ) -> (Pilot, Arc<AtomicBool>) {
+        let gate = Arc::new(AtomicBool::new(false));
+        let pilot = Pilot::spawn(domain, id, channels, batch, delay, Some(Arc::clone(&gate)));
+        (pilot, gate)
+    }
+
+    fn spawn(
+        domain: &Path,
+        id: &str,
+        channels: u32,
+        batch: u64,
+        delay: u64,
+        gate: Option<Arc<AtomicBool>>,
+    ) -> Pilot {
+        let gated = gate.is_some();
         let api = api();
         let instance = Instance::new(&api, domain).unwrap();
         let cfg = OutputConfig {
@@ -152,6 +179,10 @@ impl Pilot {
             let mut data = vec![0.0f32; channels as usize * n];
             let mut next: Option<u64> = None;
             while !flag.load(Ordering::Relaxed) {
+                if gate.as_ref().is_some_and(|g| !g.load(Ordering::Relaxed)) {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 let idx = time::timestamp_to_index(&api, time::now(&api));
                 if let Some(due) = (idx.saturating_sub(delay) / batch).checked_sub(1) {
                     for k in next.unwrap_or(due)..=due {
@@ -174,10 +205,12 @@ impl Pilot {
             drop(writer);
             drop(instance);
         });
-        first_rx
-            .recv()
-            .expect("the pilot thread ended before its first commit");
-        std::thread::sleep(Duration::from_millis(100));
+        if !gated {
+            first_rx
+                .recv()
+                .expect("the pilot thread ended before its first commit");
+            std::thread::sleep(Duration::from_millis(100));
+        }
         Pilot {
             stop,
             thread: Some(thread),
