@@ -1745,7 +1745,7 @@ impl Rt {
     /// Hands spent batch `batch` off the RT thread through the return
     /// ring, or keeps it until the ring has room; one neither has room
     /// for is leaked, never freed here. A replay frees it.
-    fn retire(&mut self, batch: Option<Box<Batch>>) {
+    pub(crate) fn retire(&mut self, batch: Option<Box<Batch>>) {
         let Some(b) = batch else { return };
         if self.replay {
             drop(b);
@@ -3298,6 +3298,49 @@ mod tests {
         assert!(!note_late_route(&mut r, 99, 20 * B));
         assert_ne!(digest(&mut r, &[], 15 * B, 0, 0), Some(HEALTHY));
         assert_eq!(digest(&mut r, &[], 20 * B, 0, 0), Some(HEALTHY));
+    }
+
+    /// A batch's gains apply at its index, all of them, and the batch is
+    /// due once for the rest; one the matrix passed sets no gain and is
+    /// due late, once.
+    #[test]
+    fn a_batch_sets_its_gains_at_its_index() {
+        let mut m = Mix::new(Matrix::new(2, 2), B, 480);
+        let changes = [
+            Change::Gain {
+                input: 0,
+                output: 1,
+                gain: 0.5,
+            },
+            Change::Gain {
+                input: 1,
+                output: 0,
+                gain: 0.25,
+            },
+        ];
+        let (change, batch) = crate::batch::fold(&changes, 2, 4).unwrap().unwrap();
+        let e = RtEntry {
+            id: 7,
+            at_index: 10 * B,
+            change,
+        };
+        assert!(m.push_with(e, batch.clone()).is_ok());
+        to(&mut m, 9);
+        assert_eq!((m.matrix.gain(0, 1), m.matrix.gain(1, 0)), (0.0, 0.0));
+        to(&mut m, 10);
+        assert_eq!(m.due.as_slice(), [(e, false)]);
+        to(&mut m, 30);
+        assert_eq!((m.matrix.gain(0, 1), m.matrix.gain(1, 0)), (0.5, 0.25));
+        assert!(m.take_batch(7).is_some());
+        // Past its index: nothing set, due late.
+        let late = RtEntry { id: 8, ..e };
+        let mut m2 = Mix::new(Matrix::new(2, 2), B, 480);
+        to(&mut m2, 11);
+        assert!(m2.push_with(late, batch).is_ok());
+        to(&mut m2, 12);
+        assert_eq!(m2.due.as_slice(), [(late, true)]);
+        to(&mut m2, 40);
+        assert_eq!((m2.matrix.gain(0, 1), m2.matrix.gain(1, 0)), (0.0, 0.0));
     }
 
     /// Input entries leave the pending list at the block of their index,

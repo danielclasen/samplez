@@ -5038,6 +5038,207 @@ mod tests {
         let _ = std::fs::remove_dir_all(domain);
     }
 
+    /// A replay RT thread of one input of two legs and one mono output,
+    /// on flows named by `tag`, taking entries from the returned ring.
+    fn rt_of(e: &Engine, domain: &std::path::Path, tag: &str) -> (Rt, rtrb::Producer<RingEntry>) {
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": format!("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c{tag}"),
+                         "channels": 2 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": format!("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6d{tag}"),
+                          "label": tag, "group": tag, "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0], [1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (ring, entries) = rtrb::RingBuffer::new(PENDING_CHANGES);
+        rt.entries = entries;
+        (rt, ring)
+    }
+
+    /// A batch of two gains, a trim and an `InputDown` of slot 0, and
+    /// with `up` an `InputUp` of slot 0 after them.
+    fn batch_of(up: bool) -> (Change, Option<Box<Batch>>) {
+        let mut changes = vec![
+            Change::Gain {
+                input: 0,
+                output: 0,
+                gain: 0.5,
+            },
+            Change::Gain {
+                input: 1,
+                output: 0,
+                gain: 0.25,
+            },
+            Change::InputDown { slot: 0 },
+            Change::Strip {
+                slot: 0,
+                param: StripParam::Trim { db: -6.0 },
+            },
+        ];
+        if up {
+            changes.push(Change::InputUp { slot: 0 });
+        }
+        batch::fold(&changes, 1, 2).unwrap().unwrap()
+    }
+
+    /// An entry the pending list holds already is taken off the ring
+    /// while the list is full: it needs no room, and the entries behind it
+    /// would otherwise wait until the list drains, and turn late.
+    #[test]
+    fn a_held_entry_is_taken_off_a_full_ring() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("held-first", 1);
+        let (mut rt, mut ring) = rt_of(&e, &domain, "1d41");
+        let entry = |id| RtEntry {
+            id,
+            at_index: 1 << 30,
+            change: Change::InputDown { slot: 0 },
+        };
+        for id in 1..=PENDING_CHANGES as u64 {
+            assert!(rt.mix.push(entry(id)));
+        }
+        let (change, batch) = batch_of(false);
+        let held = RingEntry {
+            entry: RtEntry { change, ..entry(3) },
+            batch,
+        };
+        let new = RingEntry {
+            entry: entry(65),
+            batch: None,
+        };
+        assert!(ring.push(held).is_ok() && ring.push(new).is_ok());
+        rt.take_entries();
+        assert_eq!((rt.taken, rt.last_entry), (1, 3), "the held entry waited");
+        assert_eq!(ring.slots(), PENDING_CHANGES - 1, "the new one was taken");
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// An install takes the core's batch rather than copying it, and
+    /// hands the batch of an entry it drops back in the core: no batch is
+    /// allocated or freed on the RT thread.
+    #[test]
+    fn an_install_moves_batches_without_allocating() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-install", 1);
+        let (mut rt, _ring) = rt_of(&e, &domain, "1d43");
+        let (change, mine) = batch_of(false);
+        let entry = |id| RtEntry {
+            id,
+            at_index: 1440,
+            change,
+        };
+        let mine = mine.unwrap();
+        let theirs = mine.clone();
+        let (mine_at, theirs_at) = (&*mine as *const Batch, &*theirs as *const Batch);
+        assert!(rt.mix.push_with(entry(3), Some(mine)).is_ok());
+        let mut core = Box::new(Core::new((2, 1, 1, 64, batch::strip_keys(&[2]))));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.clear_batches();
+        core.pending.clear();
+        core.pending.push(entry(5));
+        core.batches.push((5, Some(theirs)));
+        rt.install_core(&mut core, 5, true);
+        assert_eq!(rt.mix.pending, [entry(5)]);
+        assert_eq!(rt.mix.batches.len(), 1);
+        assert!(std::ptr::eq(&*rt.mix.batches[0].1, theirs_at), "copied");
+        assert!(core.batches[0].1.is_none());
+        assert!(
+            core.spare.0.iter().any(|b| std::ptr::eq(&**b, mine_at)),
+            "the dropped batch did not go back with the core"
+        );
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Without a core a batch whose index passed sets its strip
+    /// parameters on the strips the slots keep and passes the rest; one
+    /// holding an `InputUp` stays pending whole, as that entry does
+    /// alone, so its strip parameters wait with it.
+    #[test]
+    fn a_batch_due_without_a_core_passes_whole_or_waits_whole() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-no-core", 1);
+        let (mut rt, _ring) = rt_of(&e, &domain, "1d45");
+        let (plain, plain_batch) = batch_of(false);
+        let (up, up_batch) = batch_of(true);
+        let at = |id, change| RtEntry {
+            id,
+            at_index: 48,
+            change,
+        };
+        assert!(rt.mix.push_with(at(1, up), up_batch).is_ok());
+        rt.pass_entries(2);
+        assert_eq!(rt.mix.pending, [at(1, up)]);
+        assert_eq!(
+            rt.slots[0].strip_pos, None,
+            "a strip parameter of it applied"
+        );
+        assert!(rt.mix.push_with(at(2, plain), plain_batch).is_ok());
+        rt.pass_entries(2);
+        assert_eq!(rt.mix.pending, [at(1, up)]);
+        assert_eq!(rt.mix.batches.len(), 1);
+        assert_eq!(rt.slots[0].strip_pos, Some(48));
+        assert!(rt.slots[0].up, "an InputDown applied without a core");
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A spent batch the return ring has no room for waits on the RT
+    /// thread and leaves through the ring once it has room; beyond the
+    /// spent list's room it is leaked and counted, never freed there.
+    #[test]
+    fn a_spent_batch_leaves_through_the_return_ring() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-spent", 1);
+        let (mut rt, _ring) = rt_of(&e, &domain, "1d47");
+        rt.replay = false;
+        let (ret, mut back) = rtrb::RingBuffer::new(2);
+        rt.ret = ret;
+        rt.spent = Vec::with_capacity(1);
+        let spent = || batch_of(false).1;
+        for _ in 0..4 {
+            rt.retire(spent());
+        }
+        assert_eq!((rt.ret.slots(), rt.spent.len()), (0, 1));
+        assert_eq!(rt.counters.batches_leaked.load(Relaxed), 1);
+        assert!(matches!(back.pop(), Ok(Returned::Batch(_))));
+        assert!(matches!(back.pop(), Ok(Returned::Batch(_))));
+        rt.take_entries();
+        // One slot stays free for a command's return.
+        assert_eq!((rt.spent.len(), rt.ret.slots()), (0, 1));
+        assert!(matches!(back.pop(), Ok(Returned::Batch(_))));
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// No engine entries append nothing, wherever the index: the log id
+    /// stays free, and an empty translation is refused by no replica.
+    #[test]
+    fn a_log_entry_of_no_engine_entries_appends_nothing() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("batch-empty", 1);
+        assert_eq!(e.append_batch(5, 7, &[]), Ok(()));
+        assert_eq!(e.log.lock().unwrap().last, 0);
+        assert_eq!(
+            e.append_batch(5, 7, &[Entry::InputDown { slot: 0 }]),
+            Err(EntryError::Invalid(
+                "at_index 7 is not a multiple of the block size 48".to_owned()
+            ))
+        );
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
     /// A core whose block number leaves the index range at this block
     /// size is refused, not overflowed.
     #[test]

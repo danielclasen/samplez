@@ -998,3 +998,169 @@ fn a_route_the_core_carried_is_not_applied_again() {
     assert!(silenced.is_empty(), "silenced blocks {silenced:?}");
     h.e.stop();
 }
+
+/// One log entry's engine entries: two gain changes and a strip entry.
+fn scene() -> Vec<Entry> {
+    vec![
+        Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.75,
+        },
+        Entry::Gain {
+            input: 1,
+            output: 1,
+            gain: 0.25,
+        },
+        Entry::Strip {
+            slot: 0,
+            param: StripParam::Trim { db: -6.0 },
+        },
+    ]
+}
+
+/// Every engine entry of a log entry applies at its index: an engine
+/// taking them under one log id computes the pages of one taking each
+/// under a log id of its own at that index. The entry fingerprints name
+/// other log ids, so only the samples' hashes compare.
+#[test]
+fn a_log_entrys_entries_all_apply_at_its_index() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        // Past the fade-in from the attach.
+        let at = (now_block() + 200) * B;
+        a.e.append_batch(1, at, &scene()).unwrap();
+        a.e.commit(1);
+        for (id, entry) in (1..).zip(scene()) {
+            b.e.append(id, at, entry).unwrap();
+        }
+        b.e.commit(3);
+        let (from, to) = (at / PAGE, (at + u64::from(RAMP)) / PAGE + 4);
+        let end = (to + 1) * PAGE / B;
+        wait_for(Duration::from_secs(10), "pages compared", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        let (pa, pb) = (a.pages(), b.pages());
+        let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+        for p in from..to {
+            if disturbed.contains(&p) {
+                return Err(format!("page {p} disturbed"));
+            }
+            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+                return Err(format!("page {p} not hashed by both"));
+            };
+            assert_eq!(ha.hash, hb.hash, "page {p}");
+        }
+        for e in [&a.e, &b.e] {
+            assert_eq!(e.counters().command_late.load(Relaxed), 0);
+        }
+        Ok(())
+    });
+}
+
+/// A donor's core copied while a log entry of several engine entries is
+/// pending carries its batch, and a joiner replaying it computes the
+/// donor's pages bit for bit through their ramps and after the
+/// hand-over, the batch handed to its RT thread with the replayed core:
+/// a core without it would leave the joiner's pages apart from the
+/// donor's. A log entry of no engine entries leaves the replay as it is.
+#[test]
+fn a_core_copied_with_a_log_entry_pending_replays_all_of_it() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        // Entry 1 diverges the joiner.
+        let at1 = (now_block() + 20) * B;
+        gain(&a.e, 1, at1, 0, 1.0);
+        gain(&b.e, 1, at1, 0, 0.5);
+        let ramped = (at1 + u64::from(RAMP)) / B + 3 * PAGE / B;
+        wait_for(Duration::from_secs(5), "diverged", || {
+            processed(&a.e) > ramped && processed(&b.e) > ramped
+        });
+        let at2 = (now_block() + 60) * B;
+        for e in [&a.e, &b.e] {
+            e.append_batch(2, at2, &scene()).unwrap();
+            e.commit(2);
+        }
+        let mut copied = None;
+        for _ in 0..20 {
+            let c = copy(&a.e);
+            let held = c.core.pending().filter(|p| p.0 == 2).count();
+            assert!(held <= 1, "log entry 2 pending {held} times");
+            if held == 1 {
+                assert_eq!(c.last_id, 2);
+                copied = Some(c);
+                break;
+            }
+        }
+        let copy = copied.ok_or("log entry 2 never pending in a copy")?;
+        if (copy.k0 + 1) * B > at2 {
+            return Err(format!("copied after block {}, past entry 2", copy.k0));
+        }
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+        let mut replay = b.e.replay(copy).unwrap();
+        // Known to the core: nothing changes.
+        replay.append_batch(2, at2, &scene()).unwrap();
+        assert_eq!(replay.append_batch(3, 7, &[]), Ok(()));
+        let past2 = (at2 + u64::from(RAMP)) / B + PAGE / B;
+        while now_block() <= past2 + MARGIN / B + 2 {
+            std::thread::sleep(Duration::from_millis(5));
+            replay.run_to(now_block().saturating_sub(MARGIN / B + 2));
+        }
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        let end = j + 6 * PAGE / B;
+        wait_for(Duration::from_secs(10), "pages after the hand-over", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        let (pa, pb) = (a.pages(), b.pages());
+        let disturbed: Vec<u64> = a
+            .disturbed()
+            .into_iter()
+            .chain(b.disturbed())
+            .chain(touched(&replay.silenced()))
+            .collect();
+        let clean = |p: &u64| !disturbed.contains(p);
+        let replayed = replay.pages();
+        let mut ramp_pages = 0;
+        for h in replayed.iter().filter(|h| clean(&h.page)) {
+            let Some(d) = pa.get(&h.page) else { continue };
+            assert_eq!(
+                (h.hash, h.fingerprint),
+                (d.hash, d.fingerprint),
+                "replayed page {}",
+                h.page
+            );
+            if (at2 / PAGE..=(at2 + u64::from(RAMP)) / PAGE).contains(&h.page) {
+                ramp_pages += 1;
+            }
+        }
+        if ramp_pages < 2 {
+            return Err(format!("{ramp_pages} replayed pages of entry 2's ramps"));
+        }
+        let mut equal = 0;
+        for (p, hb) in pb.iter().filter(|(p, _)| **p * PAGE >= (j + 1) * B) {
+            let Some(ha) = pa.get(p).filter(|_| clean(p)) else {
+                continue;
+            };
+            assert_eq!(
+                (hb.hash, hb.fingerprint),
+                (ha.hash, ha.fingerprint),
+                "page {p}"
+            );
+            equal += 1;
+        }
+        if equal < 4 {
+            return Err(format!("{equal} pages after the hand-over compared"));
+        }
+        Ok(())
+    });
+}
