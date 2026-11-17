@@ -1701,7 +1701,7 @@ mod tests {
     /// parameter range and between them, shelf slopes through
     /// `shelf_q` included, switched on or off, lies within the box a
     /// decoded section's ramp is held to; the sweep reaches its largest
-    /// value, the low shelf's `m1` at -18 dB and Q 0.1.
+    /// value, the high shelf's `m1` at +18 dB and Q 0.1.
     #[test]
     fn every_filter_target_lies_within_the_coefficient_box() {
         use crate::svf::{COEFFICIENTS_HIGH, COEFFICIENTS_LOW, within_box};
