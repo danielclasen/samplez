@@ -99,6 +99,23 @@ second, wherever it stands against the clock, and each `InputUp` or
 `Engine::start_replicated` takes entries through `append`, `commit` and
 `truncate` and sends those reports out instead.
 
+A replicated log entry may carry any number of engine entries
+(`append_batch`). They are folded off the RT thread, per matrix
+coefficient, strip parameter and input slot the last value (an
+`InputDown`, `InputUp` or `Route` of a slot replaces the one before
+it), so the log entry's batch is bounded by the engine's shape. It
+takes one of the 64 places the RT thread holds for log entries before
+their index, the number of log entries the leader stamps ahead, and
+applies whole at its index, its gains first; a late one counts once in
+`command_late`. One with more than one `InputUp` or `Route` after
+folding, or with an entry refused alone, is refused whole when
+appended; one of no entries appends nothing. Spent batches return to
+the supervisor to be freed. Each core buffer holds 64 batches with room
+for any log entry, `4nm + nm/8 + 40k` bytes each for an `n` by `m`
+matrix and `k` strip parameter keys (10 plus two per leg per strip):
+about 12 KiB at 32 by 22 with 16 stereo strips, 1.1 MiB at the
+coefficient limit.
+
 Each input of 1 to 8 channels has a strip: trim, per-leg trim and
 polarity, high-pass, a four-band equaliser, gate and compressor
 (`samplez_dsp::strip`). It runs on every block computed, after the
@@ -198,7 +215,8 @@ no block and withholds each one, overrun skips included, cause `NoCore`
 (`StatusChange::NoCore` ranges), with the replica withdrawn. Entries
 needing no generation whose index passes meanwhile are taken off the
 pending list, strip entries applied to the strips the slots keep and the
-others not, and the core installed next must know them. A replayed core
+others not, and the core installed next must know them; a batch holding
+an `InputUp` or `Route` stays pending whole. A replayed core
 replaces the strips; one built from product state leaves them.
 `Engine::install_product` builds a core from product state off the RT
 thread (targets at their values, fades and ramps cold, the pending
