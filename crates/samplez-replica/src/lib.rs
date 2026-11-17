@@ -13,6 +13,7 @@
 pub mod baseline;
 pub mod bootstrap;
 pub mod bridge;
+pub mod clock;
 pub mod contact;
 pub mod dedup;
 pub mod entry;

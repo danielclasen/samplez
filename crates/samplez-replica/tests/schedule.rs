@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use harness::{BLOCK, Options, Set, owner};
-use samplez_replica::contact::{FUTURE_LIST, START_LEAD, Timing, index_at};
+use samplez_replica::contact::{FUTURE_LIST, START_LEAD, Timing, index_at, time_of};
 use samplez_replica::entry::{Body, Command, NodeId, Origin, Request};
 use samplez_replica::peer::{Forwarded, PeerRequest, PeerResponse, Refused};
 use samplez_service::ReplicatedState;
@@ -68,11 +68,22 @@ async fn every_voter_estimates_e_alike_and_counts_through_a_relay() {
         let counted = set.replica(id).contact_metrics().unwrap().counted;
         assert_eq!(counted.len(), 3, "{id} counts {counted:?}");
     }
-    // A replica a ClockVerdict judges is counted by nobody.
-    set.replica(leader).append(Body::ClockVerdict {
-        replica: b,
-        judged: true,
-    });
+    // A replica a ClockVerdict judges is counted by nobody: its clock
+    // moved three guards off the others, the leader judges it.
+    set.clock(b)
+        .set_tai_offset(3 * time_of(timing().clock_guard) as i64);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !set.ids().all(|id| {
+        set.replica(id)
+            .store()
+            .with_state(|sm| sm.verdicts.get(&b) == Some(&true))
+    }) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{b} judged within 5 s"
+        );
+        sleep(Duration::from_millis(1)).await;
+    }
     sleep(Duration::from_millis(30)).await;
     for id in set.ids() {
         let counted = set.replica(id).contact_metrics().unwrap().counted;

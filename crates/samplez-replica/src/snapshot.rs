@@ -25,6 +25,10 @@ pub struct Replicated {
     pub baseline: Option<Baseline>,
     /// The latest `ClockVerdict` per replica.
     pub verdicts: BTreeMap<NodeId, bool>,
+    /// The replica the latest `ClockVerdict` judging one named; absent
+    /// from snapshots written before it was kept.
+    #[serde(default)]
+    pub latest_judged: Option<NodeId>,
     pub slot: Option<Disruption>,
     pub dedup: Saved,
     /// Each session's last renewal, in session order: JSON keys are
