@@ -1169,6 +1169,68 @@ pub(crate) mod tests {
         assert!(sm.pending.is_empty() && sm.restamps.is_empty() && sm.terms.is_empty());
     }
 
+    /// The Void the engine is handed in place of a repeat decision on an
+    /// id changes nothing: not once the entry was applied (pruned past,
+    /// so no longer pending), nor once it was restamped (known under the
+    /// restamp's id, which the repeat does not name).
+    #[test]
+    fn the_void_standing_in_for_a_repeat_decision_is_a_no_op() {
+        let mut sm = machine();
+        let down = Body::InputDown {
+            slot: 1,
+            at_index: 960,
+        };
+        sm.apply_at(5, 2, &at(0, down.clone()));
+        let restamp = Body::Restamp {
+            revision: 5,
+            term: 2,
+            at_index: 1920,
+            paths: vec![],
+        };
+        sm.apply_at(6, 3, &at(0, restamp));
+        let (pending, restamps) = (sm.pending.clone(), sm.restamps.clone());
+        sm.apply_at(
+            7,
+            3,
+            &at(
+                0,
+                Body::Void {
+                    revision: 5,
+                    term: 2,
+                },
+            ),
+        );
+        assert_eq!(
+            (&sm.pending, &sm.restamps),
+            (&pending, &restamps),
+            "restamped"
+        );
+        assert_eq!(sm.decided[&(5, 2)].0, 6, "the first decision stays the one");
+        // Applied: its index passed long ago and a later entry on the same
+        // slot leaves only that one pending.
+        let mut sm = machine();
+        sm.apply_at(5, 2, &at(0, down));
+        let up = Body::InputUp {
+            slot: 1,
+            at_index: 2 * PASSED,
+        };
+        sm.apply_at(6, 2, &at(4 * PASSED, up));
+        let pending = sm.pending.clone();
+        assert!(!pending.contains_key(&5));
+        sm.apply_at(
+            7,
+            3,
+            &at(
+                4 * PASSED,
+                Body::Void {
+                    revision: 5,
+                    term: 2,
+                },
+            ),
+        );
+        assert_eq!(sm.pending, pending, "applied");
+    }
+
     /// Pending engine entries stay bounded: once an entry's index lies
     /// [`PASSED`] below the highest stamp applied only the latest per
     /// target is kept, entries ahead all are, and a snapshot carries the
