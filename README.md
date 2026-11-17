@@ -106,9 +106,10 @@ input's copy, fade-in or crossfade and before the matrix, and passes
 its input unchanged until an entry sets it. Its ramps advance over
 skipped samples, as the matrix's do; its filter and envelope state
 follows the samples it processed, so after a skip or a silenced read it
-differs from that of an engine that computed them. Strips are not part
-of a state copy yet, so until then a replica that skipped converges
-with the others only through its strips' time constants. An entry for
+differs from that of an engine that computed them, until a resync
+copies a donor's. A filter state above 1e30 or not finite, which only a
+non-finite or overflowing input leaves, is set to zero after each
+block, so the strip recovers at the next one. An entry for
 an input wider than 8 channels, or one its strip refuses, is refused
 when appended (`append`) or set (`set_strip`); one that a strip on the
 RT thread still refuses is counted in `strip_refused`, not applied, and
@@ -147,7 +148,8 @@ core after the next block k0 into a buffer allocated off it: the matrix
 with its ramps, the pending entries and those applied in the page in
 progress, each input's log state and fades, each strip with its filter
 and dynamics state and position, the entries waiting for a generation
-and the pending generation's entry id, and the unresolved entries. Meters, hold rings, statuses and readers stay with the replica.
+and the pending generation's entry id, and the unresolved entries.
+Meters, hold rings, statuses and readers stay with the replica.
 History rings (`History` in samplez-dsp) hold a delay plus
 `historySlackMs` of slack as relaxed atomic bit patterns; the RT thread
 publishes the block it starts before it stores any history sample, and a
@@ -184,9 +186,10 @@ the engine version; `CoreCopy::decode` refuses a core of another version
 or one holding a value no engine holds (an index beyond 2^62, a gain or
 strip parameter out of range, a ramp past its length, a matrix beyond
 `MAX_COEFFICIENTS`, 2^18, which configurations are held to as well, a
-strip `Strip::is_valid` refuses: a non-finite state, an envelope, pole
-or ramp out of its range, a filter target other than its parameters'),
-and `Engine::replay` one of another shape, with strips of other legs or
+strip `Strip::is_valid` refuses: a parameter, gain, envelope, pole,
+ramp or state beyond any a strip reaches, a filter target other than
+its parameters' or a filter ramp outside the box of every target), and
+`Engine::replay` one of another shape, with strips of other legs or
 ramp length, or with an entry outside the engine.
 
 `Engine::drop_core` drops the RT thread's core while the replica starts:

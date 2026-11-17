@@ -6,10 +6,10 @@
 //! in progress, each input slot's log state, fades and strip with its
 //! position, the entries waiting for their generation and the pending
 //! generation's entry id, and the unresolved entries with the late
-//! re-routes. Meters, hold rings, block
-//! statuses, page hashes in progress and the readers stay with the
-//! replica. The RT thread copies it into a buffer allocated off the RT
-//! thread, of the same shape, so the copy allocates nothing.
+//! re-routes. Meters, hold rings, block statuses, page hashes in progress
+//! and the readers stay with the replica. The RT thread copies it into a
+//! buffer allocated off the RT thread, of the same shape, so the copy
+//! allocates nothing.
 
 use std::sync::atomic::Ordering::Relaxed;
 

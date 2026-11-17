@@ -87,10 +87,11 @@ impl TryFrom<MatrixWire> for Matrix {
     type Error = String;
 
     /// Refuses a matrix of more than [`MAX_COEFFICIENTS`] coefficients,
-    /// before allocating it, and a column with an input out of range, out of order or
-    /// twice, or a ramp a matrix never holds: a gain beyond
-    /// [`crate::MAX_GAIN`] or not finite, a length beyond
-    /// [`crate::MAX_RAMP_LEN`], a position past its length.
+    /// before allocating it, and a column with an input out of range,
+    /// out of order or twice, or a ramp a matrix never holds
+    /// ([`crate::Ramp::is_valid`]): a gain beyond [`crate::MAX_GAIN`] or
+    /// not finite, a length beyond [`crate::MAX_RAMP_LEN`], a position
+    /// past its length.
     fn try_from(w: MatrixWire) -> Result<Matrix, String> {
         let size = w.inputs.checked_mul(w.columns.len());
         if size.is_none_or(|n| n > MAX_COEFFICIENTS) {
