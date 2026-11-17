@@ -702,6 +702,18 @@ mod tests {
         refused("crossfade state beyond any a block leaves", &|s| {
             s["strip"]["alt_eq"][0][0][1] = json!(1e31)
         });
+        refused("leg gain beyond any trim", &|s| {
+            s["strip"]["gain"][0]["c0"] = json!(1.0e5)
+        });
+        refused("compressor gain beyond any reduction", &|s| {
+            s["strip"]["comp"]["y"] = json!(-1.0e38)
+        });
+        refused("release slower than the longest", &|s| {
+            s["strip"]["comp"]["release"]["interval"] = json!(0.999_999_94)
+        });
+        refused("gain step beyond one interval", &|s| {
+            s["strip"]["gate"]["interval"]["step"] = json!(0.5)
+        });
         refused("leg gain of other trims", &|s| {
             s["strip"]["trim_db"] = json!(3.0)
         });

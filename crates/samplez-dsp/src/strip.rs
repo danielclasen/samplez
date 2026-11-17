@@ -55,6 +55,9 @@ pub const MAKEUP_DB: RangeInclusive<f32> = 0.0..=24.0;
 pub const ATTACK_MS: RangeInclusive<f32> = 0.1..=200.0;
 /// Release time constant of the gate and the compressor, ms.
 pub const RELEASE_MS: RangeInclusive<f32> = 5.0..=5000.0;
+/// Largest leg gain magnitude: trim and leg trim at the top of
+/// [`TRIM_DB`], +40 dB.
+const LEG_GAIN_MAX: f32 = 100.0;
 
 /// The response of an equaliser band.
 ///
@@ -338,7 +341,10 @@ impl Strip {
         (1..=MAX_LEGS).contains(&self.legs)
             && trim(&self.trim_db)
             && self.leg_trim_db.iter().all(trim)
-            && self.gain.iter().all(Ramp::is_valid)
+            && self
+                .gain
+                .iter()
+                .all(|g| g.is_within(-LEG_GAIN_MAX..=LEG_GAIN_MAX))
             && (0..self.legs).all(|leg| self.gain[leg].target == self.gain_of(leg))
             && HPF_FREQ.contains(&self.hpf_freq)
             && self.hpf.is_valid(
@@ -1679,6 +1685,28 @@ mod tests {
         assert!(low.iter().zip(&COEFFICIENTS_LOW).all(|(l, b)| l >= b));
     }
 
+    /// The leg gain bound is the gain of trim and leg trim at their
+    /// highest, inverted or not: a strip reaches it and stays valid.
+    #[test]
+    fn the_leg_gain_bound_is_the_highest_trim() {
+        let mut s = Strip::new(2, 0);
+        let top = *TRIM_DB.end();
+        for p in [
+            StripParam::Trim { db: top },
+            StripParam::LegTrim { leg: 0, db: top },
+            StripParam::LegTrim { leg: 1, db: top },
+            StripParam::Polarity {
+                leg: 1,
+                inverted: true,
+            },
+        ] {
+            assert!(s.set(p));
+        }
+        assert_eq!(s.gain[0].target(), LEG_GAIN_MAX);
+        assert_eq!(s.gain[1].target(), -LEG_GAIN_MAX);
+        assert!(s.is_valid());
+    }
+
     /// A strip holding a value none reaches is not valid: a NaN or an
     /// infinity in its state, a ramp out of range, a parameter out of
     /// its range. The dynamics' own are checked with them.
@@ -1710,6 +1738,8 @@ mod tests {
         invalid("filter state beyond a block's", &|s| {
             s.hpf.state[0][1] = 1e31
         });
+        invalid("leg gain beyond any trim", &|s| s.gain[1].c0 = 101.0);
+        invalid("leg gain below any trim", &|s| s.gain[0].c0 = -150.0);
         invalid("crossfade state beyond a block's", &|s| {
             s.alt_eq[0][1][0] = -1e31
         });

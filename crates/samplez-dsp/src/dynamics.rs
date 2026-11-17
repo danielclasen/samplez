@@ -27,6 +27,7 @@
 //! sample index alone, not on how the samples are split into blocks.
 
 use crate::Ramp;
+use crate::strip::{ATTACK_MS, RELEASE_MS};
 use crate::svf::SAMPLE_RATE;
 
 /// Gate hold after the key last reached the threshold: 30 ms, longer
@@ -80,9 +81,12 @@ impl Pole {
         }
     }
 
-    /// Both coefficients in `[0, 1)`, as [`Pole::new`] gives them.
-    fn is_valid(&self) -> bool {
-        (0.0..1.0).contains(&self.sample) && (0.0..1.0).contains(&self.interval)
+    /// Both coefficients at least 0 and at most those of [`Pole::new`]
+    /// at `max_ms`, the longest time constant of the pole's range: a
+    /// pole's coefficients grow with its time constant.
+    fn is_valid(&self, max_ms: f32) -> bool {
+        let max = Pole::new(max_ms);
+        (0.0..=max.sample).contains(&self.sample) && (0.0..=max.interval).contains(&self.interval)
     }
 
     /// The coefficient over a run of `len` samples.
@@ -217,7 +221,8 @@ impl Interval {
 
     /// Whether the interval holds what a unit's does between two samples:
     /// a position within it, runs of 1 or [`GAIN_INTERVAL`] samples, a
-    /// finite key and gains within `[0, 1]`, which both units' gains are.
+    /// finite key, gains within `[0, 1]`, which both units' gains are,
+    /// and a step of at most the distance between two over an interval.
     fn is_valid(&self) -> bool {
         let run = |len: u32| len == 1 || len == GAIN_INTERVAL;
         let gain = |g: f32| (0.0..=1.0).contains(&g);
@@ -228,7 +233,7 @@ impl Interval {
             && self.peak >= 0.0
             && gain(self.from)
             && gain(self.to)
-            && (-1.0..=1.0).contains(&self.step)
+            && self.step.abs() <= 1.0 / GAIN_INTERVAL as f32
     }
 
     /// Sets the samples per run of the gain computer from the next
@@ -557,8 +562,8 @@ impl Gate {
             && unit(self.reopen)
             && range.contains(&self.range_db)
             && unit(self.floor)
-            && self.attack.is_valid()
-            && self.release.is_valid()
+            && self.attack.is_valid(*ATTACK_MS.end())
+            && self.release.is_valid(*RELEASE_MS.end())
             && range.contains(&self.y)
             && self.hold <= GATE_HOLD
             && self.interval.is_valid()
@@ -570,6 +575,13 @@ impl Gate {
         self.wet.is_off() || (self.range_db == 0.0 && self.y == 0.0 && self.interval.from == 1.0)
     }
 }
+
+/// The lowest smoothed gain a compressor reaches, dB: its target is
+/// `slope (key - threshold)`, the key at most `f32::MAX`, 770.6 dBFS, the
+/// threshold at least -60 dBFS and the slope at least `1 / 20 - 1`, so
+/// at most 789.1 dB of reduction, and the smoothed gain moves between
+/// targets.
+pub(crate) const COMP_GAIN_MIN_DB: f32 = -800.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Comp {
@@ -716,8 +728,8 @@ impl Comp {
     /// Whether the compressor holds values a compressor set within the
     /// parameter ranges holds: threshold and knee within theirs, a slope
     /// of a ratio within it, the knee's start gain within `(0, 1]`, a
-    /// makeup ramp within its range, a finite smoothed gain of no more
-    /// than 0 dB, valid poles, switch and interval.
+    /// makeup ramp within its range, a smoothed gain within
+    /// [`COMP_GAIN_MIN_DB`] and 0 dB, valid poles, switch and interval.
     pub(crate) fn is_valid(&self) -> bool {
         use crate::strip::{COMP_KNEE_DB, COMP_RATIO, COMP_THRESHOLD_DB, MAKEUP_DB};
         let slope = 1.0 / *COMP_RATIO.end() - 1.0..=0.0;
@@ -728,11 +740,10 @@ impl Comp {
             && COMP_KNEE_DB.contains(&self.knee_db)
             && self.knee_start > 0.0
             && self.knee_start <= 1.0
-            && self.attack.is_valid()
-            && self.release.is_valid()
+            && self.attack.is_valid(*ATTACK_MS.end())
+            && self.release.is_valid(*RELEASE_MS.end())
             && self.makeup.is_within(makeup)
-            && self.y.is_finite()
-            && self.y <= 0.0
+            && (COMP_GAIN_MIN_DB..=0.0).contains(&self.y)
             && self.interval.is_valid()
     }
 
@@ -1434,7 +1445,59 @@ mod tests {
         comp_invalid("run of neither length", &|u| u.interval.next = 3);
         comp_invalid("interval gain above unity", &|u| u.interval.to = 1.5);
         comp_invalid("pole of no decay", &|u| u.release.sample = 1.0);
+        let slowest = |ms: f32| Pole::new(ms * 1.01);
+        gate_invalid("attack slower than the longest", &|u| {
+            u.attack.interval = slowest(*ATTACK_MS.end()).interval
+        });
+        gate_invalid("release slower than the longest", &|u| {
+            u.release.sample = slowest(*RELEASE_MS.end()).sample
+        });
+        comp_invalid("attack slower than the longest", &|u| {
+            u.attack.sample = slowest(*ATTACK_MS.end()).sample
+        });
+        comp_invalid("release slower than the longest", &|u| {
+            u.release.interval = 0.999_999_94
+        });
+        comp_invalid("gain beyond any reduction", &|u| u.y = -801.0);
+        comp_invalid("step beyond one interval", &|u| u.interval.step = -0.13);
         comp_invalid("slope beyond the ratio", &|u| u.slope = -2.0);
         comp_invalid("makeup beyond its range", &|u| u.makeup.target = 100.0);
+    }
+
+    /// The lowest smoothed gain a compressor reaches is within
+    /// [`COMP_GAIN_MIN_DB`]: at ratio 20 and threshold -60 dBFS, the
+    /// widest of the ranges, a key of `f32::MAX`, 128 octaves or 770.6
+    /// dBFS, is 830.6 dB over and takes `(1 / 20 - 1) 830.6`, -789.1 dB;
+    /// a compressor fed `f32::MAX` and infinities settles there.
+    #[test]
+    fn the_largest_reduction_is_within_its_bound() {
+        let ratio = *crate::strip::COMP_RATIO.end();
+        let threshold = *crate::strip::COMP_THRESHOLD_DB.start();
+        let key_db = log2(f32::MAX) * DB_PER_OCTAVE;
+        let largest = (1.0 / ratio - 1.0) * (key_db - threshold);
+        assert!((-790.0..-789.0).contains(&largest), "{largest}");
+        assert!(largest > COMP_GAIN_MIN_DB);
+        let mut c = Comp::new();
+        c.set(
+            &CompParams {
+                enabled: true,
+                threshold_db: threshold,
+                ratio,
+                attack_ms: *ATTACK_MS.start(),
+                release_ms: 50.0,
+                knee_db: 0.0,
+                makeup_db: 0.0,
+            },
+            0,
+        );
+        let mut lowest = 0.0f32;
+        for n in 0..2000 {
+            let x = if n % 3 == 0 { f32::INFINITY } else { f32::MAX };
+            let mut buf = [x; 48];
+            c.process(&mut buf, 1, 48);
+            lowest = lowest.min(c.y);
+            assert!(c.is_valid(), "{c:?}");
+        }
+        assert!((COMP_GAIN_MIN_DB..-789.0).contains(&lowest), "{lowest}");
     }
 }
