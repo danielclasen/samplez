@@ -177,6 +177,9 @@ pub struct Status {
     /// blocks a replay clone computes per block period, measured at
     /// start-up on silence.
     pub replay_speed: Option<f64>,
+    /// Spent batches the RT thread leaked rather than free them: its
+    /// return ring and spent list were full ([`Counters::batches_leaked`]).
+    pub batches_leaked: u64,
 }
 
 #[derive(Debug)]
@@ -467,7 +470,7 @@ impl Log {
     fn append(
         &mut self,
         e: RtEntry,
-        batch: Option<Box<Batch>>,
+        batch: Option<Arc<Batch>>,
         flow: Option<String>,
         consumed: u64,
     ) -> Result<(), EntryError> {
@@ -617,14 +620,9 @@ fn history_kept(started: &Started, k0: u64, slack: u64) -> Result<(), u64> {
 
 /// The input slots of `config`'s shape, every one up, and the index in
 /// `config.domains` of each input domain they use.
-/// The legs of each input slot.
-fn legs(config: &Config) -> Vec<usize> {
-    config.inputs.iter().map(|i| i.channels as usize).collect()
-}
-
-/// A core buffer's shape: input and output channels, input slots, the
-/// room for one page's entries and for one batch's strip parameters.
-type Shape = (usize, usize, usize, usize, usize);
+/// A core buffer's shape: input and output channels, input slots and the
+/// room for one page's entries.
+type Shape = (usize, usize, usize, usize);
 
 fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
     let mut in_domains: Vec<usize> = Vec::new();
@@ -771,7 +769,7 @@ fn replay_rt(
         core: true,
         cmd: none(),
         entries: none(),
-        spent: Vec::new(),
+        spent: Vec::with_capacity(SPENT),
         ret: sink(),
         tel: sink(),
         meters: sink(),
@@ -1001,7 +999,6 @@ impl Engine {
                         config.columns(),
                         config.inputs.len(),
                         page_entries,
-                        batch::strip_keys(&legs(&config)),
                     ),
                     slack_blocks: config.history_slack_blocks(),
                 })
@@ -1139,6 +1136,7 @@ impl Engine {
             diverged: None,
             rt_panic: None,
             replay_speed,
+            batches_leaked: 0,
             inputs: config
                 .inputs
                 .iter()
@@ -1813,10 +1811,12 @@ impl Engine {
         };
         let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
         if !t.in_flight {
-            let shape = t.shape;
-            let mut core = t.spare.take().unwrap_or_else(|| Box::new(Core::new(shape)));
-            // The RT thread copies the batches into room made here.
-            core.restock(shape);
+            let (n, m, slots, page) = t.shape;
+            let mut core = t
+                .spare
+                .take()
+                .unwrap_or_else(|| Box::new(Core::new(n, m, slots, page)));
+            core.prepare();
             if t.cores.push(core).is_err() {
                 unreachable!("one buffer is with the RT thread at most");
             }
@@ -1860,7 +1860,7 @@ impl Engine {
             ));
         }
         let c = &mut copy.core;
-        let (n, m, _, page, _) = self
+        let (n, m, _, page) = self
             .transfer
             .as_ref()
             .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).shape)
@@ -2066,11 +2066,11 @@ impl Engine {
             core.ramp_end = 0;
             core.pending.clear();
             core.pending.extend_from_slice(&pending[passed..]);
-            // Built here, off the RT thread, which takes them over.
-            core.clear_batches();
+            // Shared: nothing is allocated in the hand-over's window.
+            core.batches.clear();
             for e in &pending[passed..] {
-                if let Some(b) = batch(e.id) {
-                    core.batches.push((e.id, Some(Box::new(b.clone()))));
+                if let Some(b) = batches.iter().find(|b| b.0 == e.id) {
+                    core.batches.push((e.id, Arc::clone(&b.1)));
                 }
             }
             core.page_entries.clear();
@@ -2117,8 +2117,8 @@ impl Engine {
         };
         let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + timeout;
-        let shape = t.shape;
-        let new = || Box::new(Core::new(shape));
+        let (n, m, slots, page) = t.shape;
+        let new = || Box::new(Core::new(n, m, slots, page));
         let mut core = t.spare.take().unwrap_or_else(new);
         // Hand-overs before this one were sent by earlier calls.
         let first = t.seq + 1;
@@ -2177,8 +2177,8 @@ impl Engine {
             // that the RT thread is stalled, and a sixteenth of a period
             // is slept between looks, so the wait does not spend the CPU
             // a stalled RT thread may be waiting for.
-            // Room for the batches `make` copies, made before the wait.
-            core.restock(shape);
+            // Before the wait: the batches it carries are dropped here.
+            core.prepare();
             let p = processed();
             let waiting = Instant::now();
             while processed() == p {
@@ -2446,6 +2446,7 @@ impl Supervisor {
                     self.counters.rt_minor_faults.store(f, Relaxed);
                 }
                 self.clock();
+                self.leaks();
             }
             if rt_thread.as_ref().is_some_and(JoinHandle::is_finished) {
                 self.rt_ended(rt_thread.take());
@@ -3106,6 +3107,21 @@ impl Supervisor {
             _ => return,
         };
         self.adopt(j.domain, held, Some(slot));
+    }
+
+    /// Puts the spent batches the RT thread leaked in the status, and
+    /// logs a rise: the return ring and its spent list were full, the
+    /// supervisor not taking returns for that long.
+    fn leaks(&mut self) {
+        let leaked = self.counters.batches_leaked.load(Relaxed);
+        let mut st = self.status();
+        if leaked > st.batches_leaked {
+            st.batches_leaked = leaked;
+            drop(st);
+            log(format_args!(
+                "{leaked} spent batches leaked: the return ring and the spent list were full"
+            ));
+        }
     }
 
     /// Sends `r` to the replicated log, or stamps it in the engine's own:
@@ -4747,7 +4763,7 @@ mod tests {
         let (_, control) = rtrb::RingBuffer::new(1);
         let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new((inputs, outputs, 1, 64, 0)));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
         rt.capture(&mut core);
         core.pos = Some(480);
         let route = RtEntry {
@@ -4820,7 +4836,7 @@ mod tests {
             }
         )));
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new((inputs, outputs, 1, 64, 0)));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
@@ -4890,7 +4906,7 @@ mod tests {
         assert!(replayed.set(hpf));
         replayed.advance(480 - 48);
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new((inputs, outputs, 1, 64, 0)));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
@@ -4957,7 +4973,7 @@ mod tests {
         // core knew both and applied them.
         assert!(rt.mix.push(gain(2, 48)));
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new((inputs, outputs, 1, 64, 0)));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
@@ -5008,7 +5024,7 @@ mod tests {
         let (mut ring, entries) = rtrb::RingBuffer::new(4);
         rt.entries = entries;
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new((inputs, outputs, 1, 64, 0)));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
@@ -5065,7 +5081,7 @@ mod tests {
 
     /// A batch of two gains, a trim and an `InputDown` of slot 0, and
     /// with `up` an `InputUp` of slot 0 after them.
-    fn batch_of(up: bool) -> (Change, Option<Box<Batch>>) {
+    fn batch_of(up: bool) -> (Change, Option<Arc<Batch>>) {
         let mut changes = vec![
             Change::Gain {
                 input: 0,
@@ -5122,9 +5138,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(domain);
     }
 
-    /// An install takes the core's batch rather than copying it, and
-    /// hands the batch of an entry it drops back in the core: no batch is
-    /// allocated or freed on the RT thread.
+    /// A copy shares the batches pending, and an install takes the core's
+    /// batch and hands the batch of an entry it drops back in the core: no
+    /// batch is allocated or freed on the RT thread.
     #[test]
     fn an_install_moves_batches_without_allocating() {
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
@@ -5137,23 +5153,30 @@ mod tests {
             change,
         };
         let mine = mine.unwrap();
-        let theirs = mine.clone();
-        let (mine_at, theirs_at) = (&*mine as *const Batch, &*theirs as *const Batch);
+        let theirs = Arc::new((*mine).clone());
+        let (mine_at, theirs_at) = (Arc::as_ptr(&mine), Arc::as_ptr(&theirs));
         assert!(rt.mix.push_with(entry(3), Some(mine)).is_ok());
-        let mut core = Box::new(Core::new((2, 1, 1, 64, batch::strip_keys(&[2]))));
+        let mut core = Box::new(Core::new(2, 1, 1, 64));
         rt.capture(&mut core);
+        assert!(
+            std::ptr::eq(Arc::as_ptr(&core.batches[0].1), mine_at),
+            "copied"
+        );
         core.pos = Some(480);
-        core.clear_batches();
+        core.prepare();
         core.pending.clear();
         core.pending.push(entry(5));
-        core.batches.push((5, Some(theirs)));
+        core.batches.push((5, theirs));
         rt.install_core(&mut core, 5, true);
         assert_eq!(rt.mix.pending, [entry(5)]);
         assert_eq!(rt.mix.batches.len(), 1);
-        assert!(std::ptr::eq(&*rt.mix.batches[0].1, theirs_at), "copied");
-        assert!(core.batches[0].1.is_none());
+        assert!(std::ptr::eq(Arc::as_ptr(&rt.mix.batches[0].1), theirs_at));
+        assert!(core.batches.is_empty());
         assert!(
-            core.spare.0.iter().any(|b| std::ptr::eq(&**b, mine_at)),
+            core.handed
+                .0
+                .iter()
+                .any(|b| std::ptr::eq(Arc::as_ptr(b), mine_at)),
             "the dropped batch did not go back with the core"
         );
         e.stop();
@@ -5193,30 +5216,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(domain);
     }
 
-    /// A spent batch the return ring has no room for waits on the RT
-    /// thread and leaves through the ring once it has room; beyond the
-    /// spent list's room it is leaked and counted, never freed there.
+    /// Spent batches leave the return ring's reserve free, so a
+    /// generation swapped in hands the old one back, not leak it: past the
+    /// reserve they wait on the spent list, beyond it they are leaked and
+    /// counted, and they leave through the ring once it has room.
     #[test]
-    fn a_spent_batch_leaves_through_the_return_ring() {
+    fn spent_batches_leave_room_for_a_generation_handed_back() {
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
         let (e, _statuses, _verdicts, domain) = outputs_only("batch-spent", 1);
         let (mut rt, _ring) = rt_of(&e, &domain, "1d47");
         rt.replay = false;
-        let (ret, mut back) = rtrb::RingBuffer::new(2);
+        let (ret, mut back) = rtrb::RingBuffer::new(8);
         rt.ret = ret;
-        rt.spent = Vec::with_capacity(1);
-        let spent = || batch_of(false).1;
-        for _ in 0..4 {
-            rt.retire(spent());
+        rt.spent = Vec::with_capacity(2);
+        let generation = || {
+            Box::new(Gen {
+                mxl: Generation::new(&e.api, &domain, 1).unwrap(),
+                prune_after: vec![u64::MAX],
+                rerouted: Default::default(),
+            })
+        };
+        rt.install(0, generation());
+        for _ in 0..10 {
+            rt.retire(batch_of(false).1);
         }
-        assert_eq!((rt.ret.slots(), rt.spent.len()), (0, 1));
-        assert_eq!(rt.counters.batches_leaked.load(Relaxed), 1);
-        assert!(matches!(back.pop(), Ok(Returned::Batch(_))));
-        assert!(matches!(back.pop(), Ok(Returned::Batch(_))));
+        // A reserve of one domain, one output and one more.
+        assert_eq!((rt.ret.slots(), rt.spent.len()), (3, 2));
+        assert_eq!(rt.counters.batches_leaked.load(Relaxed), 3);
+        rt.install(0, generation());
+        let returned: Vec<Returned> = std::iter::from_fn(|| back.pop().ok()).collect();
+        let generations = returned
+            .iter()
+            .filter(|r| matches!(r, Returned::Generation(_)))
+            .count();
+        assert_eq!((returned.len(), generations), (6, 1));
         rt.take_entries();
-        // One slot stays free for a command's return.
-        assert_eq!((rt.spent.len(), rt.ret.slots()), (0, 1));
+        assert_eq!(rt.spent.len(), 0);
         assert!(matches!(back.pop(), Ok(Returned::Batch(_))));
+        drop(returned);
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }
@@ -5283,7 +5320,8 @@ mod tests {
         while n(&e.counters.handovers_installed) == 0 {
             let mut replay = e.replay(copy()).unwrap();
             let mut t = e.transfer.as_ref().unwrap().lock().unwrap();
-            let mut core = Box::new(Core::new(t.shape));
+            let (inputs, outputs, slots, page) = t.shape;
+            let mut core = Box::new(Core::new(inputs, outputs, slots, page));
             let p = processed();
             while processed() == p {
                 std::thread::sleep(Duration::from_micros(50));

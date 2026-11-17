@@ -6,8 +6,9 @@
 //! entries a command translated to.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use samplez_dsp::strip::{EQ_BANDS, MAX_LEGS};
+use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{StripParam, valid_gain};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -96,7 +97,9 @@ impl<'de> Deserialize<'de> for Gains {
 }
 
 /// What a folded log entry sets besides its generation-needing entry,
-/// which its [`Change::Batch`] names.
+/// which its [`Change::Batch`] names. Never changed once folded: the RT
+/// thread, a core copy and the log share one by [`Arc`], and only off the
+/// RT thread is the last one dropped.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Batch {
     pub gains: Gains,
@@ -123,59 +126,7 @@ pub(crate) fn strip_key(p: &StripParam) -> (u8, usize) {
     }
 }
 
-/// The strip parameter keys of slots of `legs` legs: each slot of at most
-/// [`MAX_LEGS`] legs has a strip, which takes a trim, a trim and a
-/// polarity per leg, the high-pass, the equaliser switch and bands, gate,
-/// compressor and the dynamics order.
-pub(crate) fn strip_keys(legs: &[usize]) -> usize {
-    legs.iter()
-        .filter(|&&l| l <= MAX_LEGS)
-        .map(|&l| 6 + EQ_BANDS + 2 * l)
-        .sum()
-}
-
 impl Batch {
-    /// An empty batch with room for any log entry of an engine with
-    /// `coefficients` coefficients, `strips` strip parameter keys and
-    /// `slots` input slots: the room [`Batch::copy_from`] copies into.
-    pub fn room(coefficients: usize, strips: usize, slots: usize) -> Box<Batch> {
-        Box::new(Batch {
-            gains: Gains::Dense {
-                gains: vec![0.0; coefficients],
-                set: vec![0; coefficients.div_ceil(64)],
-            },
-            strips: Vec::with_capacity(strips),
-            downs: Vec::with_capacity(slots),
-        })
-    }
-
-    /// Whether this batch is one [`Batch::room`] made with these bounds.
-    pub fn has_room(&self, coefficients: usize, strips: usize, slots: usize) -> bool {
-        matches!(&self.gains, Gains::Dense { gains, .. } if gains.len() == coefficients)
-            && self.strips.capacity() >= strips
-            && self.downs.capacity() >= slots
-    }
-
-    /// Makes this batch, one with the room for `src`, a copy of it
-    /// without allocating.
-    pub fn copy_from(&mut self, src: &Batch) {
-        let Gains::Dense { gains, set } = &mut self.gains else {
-            debug_assert!(false, "a copy into a batch without room");
-            return;
-        };
-        set.fill(0);
-        src.gains.each(|c, g| {
-            gains[c] = g;
-            set[c / 64] |= 1 << (c % 64);
-        });
-        debug_assert!(self.strips.capacity() >= src.strips.len());
-        self.strips.clear();
-        self.strips.extend_from_slice(&src.strips);
-        debug_assert!(self.downs.capacity() >= src.downs.len());
-        self.downs.clear();
-        self.downs.extend_from_slice(&src.downs);
-    }
-
     /// Every value is one an engine holds: gains within `MAX_GAIN`, strip
     /// parameters within their ranges, keys strictly ascending.
     pub fn sane(&self) -> bool {
@@ -217,7 +168,7 @@ pub(crate) fn fold(
     changes: &[Change],
     columns: usize,
     coefficients: usize,
-) -> Result<Option<(Change, Option<Box<Batch>>)>, String> {
+) -> Result<Option<(Change, Option<Arc<Batch>>)>, String> {
     let mut gains = BTreeMap::new();
     let mut strips = BTreeMap::new();
     let mut slots = BTreeMap::new();
@@ -291,7 +242,7 @@ pub(crate) fn fold(
         strips: !batch.strips.is_empty(),
         generation,
     };
-    Ok(Some((change, Some(Box::new(batch)))))
+    Ok(Some((change, Some(Arc::new(batch)))))
 }
 
 #[cfg(test)]
@@ -365,7 +316,7 @@ mod tests {
                     strips: false,
                     generation: Some(Generating::InputUp { slot: 1 })
                 },
-                Some(Box::new(Batch {
+                Some(Arc::new(Batch {
                     gains: Gains::Sparse(Vec::new()),
                     strips: Vec::new(),
                     downs: vec![0],
@@ -375,10 +326,9 @@ mod tests {
     }
 
     /// A batch setting most coefficients is held dense, a few as a list;
-    /// both carry the list form in a core, and a copy into a batch with
-    /// room equals its source.
+    /// both carry the list form in a core.
     #[test]
-    fn gains_take_the_smaller_form_and_copy_without_room_lost() {
+    fn gains_take_the_smaller_form() {
         let all: Vec<Change> = (0..64).map(|c| gain(c / 8, c % 8, 0.25)).collect();
         let (_, dense) = fold(&all, 8, 64).unwrap().unwrap();
         let dense = dense.unwrap();
@@ -390,17 +340,5 @@ mod tests {
         let back: Batch = serde_json::from_str(&wire).unwrap();
         assert!(matches!(back.gains, Gains::Sparse(_)));
         assert_eq!(back, *dense);
-        let mut room = Batch::room(64, strip_keys(&[2]), 1);
-        assert!(room.has_room(64, strip_keys(&[2]), 1));
-        let (cap_g, cap_s) = (room.strips.capacity(), room.downs.capacity());
-        room.copy_from(&dense);
-        assert_eq!(*room, *dense);
-        room.copy_from(&sparse);
-        assert_eq!(*room, *sparse);
-        assert_eq!(
-            (room.strips.capacity(), room.downs.capacity()),
-            (cap_g, cap_s)
-        );
-        assert_eq!(strip_keys(&[2, MAX_LEGS + 1]), 6 + EQ_BANDS + 4);
     }
 }

@@ -11,6 +11,7 @@
 //! buffer allocated off the RT thread, of the same shape, so the copy
 //! allocates nothing.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use samplez_dsp::strip::MAX_LEGS;
@@ -65,35 +66,31 @@ pub struct Core {
     pub(crate) unresolved: Vec<(LogId, u64)>,
     pub(crate) late_routes: Vec<(LogId, u64)>,
     pub(crate) late_lost_until: u64,
-    /// The batch of each [`Change::Batch`] pending, by log id; none once
-    /// an install took it.
-    pub(crate) batches: Vec<(LogId, Option<Box<Batch>>)>,
-    /// Batches with room for any log entry, which a copy on the RT thread
-    /// fills, and batches an install handed off the RT thread. Capacity
-    /// twice [`PENDING_CHANGES`].
+    /// The batch of each [`Change::Batch`] pending, by log id.
+    pub(crate) batches: Vec<(LogId, Arc<Batch>)>,
+    /// The batches an install dropped, to leave the RT thread with the
+    /// buffer. Capacity [`PENDING_CHANGES`].
     #[serde(skip)]
-    pub(crate) spare: Spare,
+    pub(crate) handed: Handed,
 }
 
-/// A core buffer's batches not in use; never part of what a core holds.
+/// Batches a core buffer carries off the RT thread; never part of what a
+/// core holds.
 #[derive(Debug, Default)]
-#[allow(clippy::vec_box)]
-pub(crate) struct Spare(pub Vec<Box<Batch>>);
+pub(crate) struct Handed(pub Vec<Arc<Batch>>);
 
-impl PartialEq for Spare {
-    fn eq(&self, _: &Spare) -> bool {
+impl PartialEq for Handed {
+    fn eq(&self, _: &Handed) -> bool {
         true
     }
 }
 
 impl Core {
-    /// A buffer for the core of an engine of `shape`: input and output
-    /// channels, input slots, room for one page's fingerprint entries and
-    /// for one batch's strip parameters. It holds the room for a copy of
-    /// [`PENDING_CHANGES`] batches ([`Core::restock`]).
-    pub(crate) fn new(shape: (usize, usize, usize, usize, usize)) -> Core {
-        let (inputs, outputs, slots, page_entries, _) = shape;
-        let mut core = Core {
+    /// A buffer for the core of an engine with `inputs` and `outputs`
+    /// channels, `slots` input slots and room for `page_entries` entries
+    /// of one page's fingerprint.
+    pub(crate) fn new(inputs: usize, outputs: usize, slots: usize, page_entries: usize) -> Core {
+        Core {
             matrix: Matrix::new(inputs, outputs),
             pos: None,
             ramp_end: 0,
@@ -108,71 +105,57 @@ impl Core {
             late_routes: Vec::with_capacity(PENDING_CHANGES),
             late_lost_until: 0,
             batches: Vec::with_capacity(PENDING_CHANGES),
-            spare: Spare(Vec::with_capacity(2 * PENDING_CHANGES)),
-        };
-        core.restock(shape);
-        core
+            handed: Handed(Vec::with_capacity(PENDING_CHANGES)),
+        }
     }
 
-    /// Off the RT thread: makes the batches room again, [`PENDING_CHANGES`]
-    /// of them with room for any log entry of an engine of `shape`, so
-    /// that a copy on the RT thread allocates nothing, and room for as
-    /// many more that an install hands back. Batches without that room
-    /// are freed.
-    pub(crate) fn restock(&mut self, shape: (usize, usize, usize, usize, usize)) {
-        let (inputs, outputs, slots, _, strips) = shape;
-        let coefficients = inputs * outputs;
-        self.clear_batches();
-        let spare = &mut self.spare.0;
-        spare.retain(|b| b.has_room(coefficients, strips, slots));
-        spare.truncate(PENDING_CHANGES);
-        while spare.len() < PENDING_CHANGES {
-            spare.push(Batch::room(coefficients, strips, slots));
-        }
-        spare.reserve_exact(2 * PENDING_CHANGES - spare.len());
+    /// Off the RT thread, before a buffer goes to it: drops the batches
+    /// it carries, so the RT thread drops none, and makes room for as
+    /// many as it holds pending.
+    pub(crate) fn prepare(&mut self) {
+        self.batches.clear();
         self.batches.reserve_exact(PENDING_CHANGES);
+        self.handed.0.clear();
+        self.handed.0.reserve_exact(PENDING_CHANGES);
     }
 
-    /// Moves the batches to the spare ones, without allocating.
-    pub(crate) fn clear_batches(&mut self) {
+    /// Makes `batches` the core's, sharing them: nothing is allocated or
+    /// freed, the batches the buffer held kept with the handed ones.
+    pub(crate) fn put_batches(&mut self, batches: &[(LogId, Arc<Batch>)]) {
         while let Some((_, b)) = self.batches.pop() {
-            if let Some(b) = b
-                && let Err(b) = self.keep(b)
-            {
-                // Twice PENDING_CHANGES spare ones: unreachable.
-                std::mem::forget(b);
-            }
+            self.keep_or_forget(b);
         }
-    }
-
-    /// Copies `batches` into spare batches with room, without allocating:
-    /// a batch the spare ones have no room for is left out.
-    pub(crate) fn put_batches(&mut self, batches: &[(LogId, Box<Batch>)]) {
-        self.clear_batches();
         for (id, b) in batches {
-            let Some(mut room) = self.spare.0.pop() else {
+            if self.batches.len() == self.batches.capacity() {
                 debug_assert!(false, "a core without room for its batches");
                 return;
-            };
-            room.copy_from(b);
-            self.batches.push((*id, Some(room)));
+            }
+            self.batches.push((*id, Arc::clone(b)));
         }
     }
 
     /// Takes the batch of entry `id` out of the core.
-    pub(crate) fn take_batch(&mut self, id: LogId) -> Option<Box<Batch>> {
-        self.batches.iter_mut().find(|b| b.0 == id)?.1.take()
+    pub(crate) fn take_batch(&mut self, id: LogId) -> Option<Arc<Batch>> {
+        let n = self.batches.iter().position(|b| b.0 == id)?;
+        Some(self.batches.swap_remove(n).1)
     }
 
-    /// Keeps `batch` with the spare ones, to go off the RT thread with
-    /// the core; back when they are at capacity.
-    pub(crate) fn keep(&mut self, batch: Box<Batch>) -> Result<(), Box<Batch>> {
-        let spare = &mut self.spare.0;
-        if spare.len() < spare.capacity() {
-            spare.push(batch);
+    /// Keeps `batch` with the handed ones, to leave the RT thread with
+    /// the buffer; back when they are at capacity.
+    pub(crate) fn keep(&mut self, batch: Arc<Batch>) -> Result<(), Arc<Batch>> {
+        let handed = &mut self.handed.0;
+        if handed.len() < handed.capacity() {
+            handed.push(batch);
             Ok(())
         } else {
             Err(batch)
+        }
+    }
+
+    fn keep_or_forget(&mut self, batch: Arc<Batch>) {
+        if let Err(b) = self.keep(batch) {
+            // A prepared buffer holds none: unreachable.
+            std::mem::forget(b);
         }
     }
 
@@ -251,10 +234,10 @@ impl Core {
             };
             held += 1;
             let mut of = self.batches.iter().filter(|b| b.0 == e.id);
-            let (Some((_, Some(b))), None) = (of.next(), of.next()) else {
+            let (Some((_, b)), None) = (of.next(), of.next()) else {
                 return false;
             };
-            if !b.sane() || strips == b.strips.is_empty() {
+            if !b.sane() || (strips && b.strips.is_empty()) {
                 return false;
             }
         }
@@ -294,9 +277,7 @@ impl Core {
                 Generating::InputUp { slot } | Generating::Route { slot } => slot < slots,
             }),
         };
-        let batch = |(_, b): &(LogId, Option<Box<Batch>>)| {
-            b.as_ref().is_some_and(|b| b.fits(inputs * outputs, legs))
-        };
+        let batch = |(_, b): &(LogId, Arc<Batch>)| b.fits(inputs * outputs, legs);
         let shape = (
             self.matrix.inputs(),
             self.matrix.outputs(),
@@ -515,6 +496,8 @@ impl Replay {
             let before = silenced(&self.rt);
             self.rt.control();
             self.rt.process(self.next, u64::MAX);
+            // The batches it spent, freed here, outside the computation.
+            self.rt.spent.clear();
             if silenced(&self.rt) != before {
                 self.silenced.push(self.next);
             }
@@ -702,7 +685,7 @@ mod tests {
     }
 
     fn copy() -> CoreCopy {
-        let mut core = Core::new((2, 2, 2, 8, 0));
+        let mut core = Core::new(2, 2, 2, 8);
         assert!(core.matrix.set(1, 0, 0.5, 48));
         assert!(core.matrix.set(0, 1, 0.25, 0));
         core.pos = Some(4800);

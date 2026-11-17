@@ -498,7 +498,7 @@ pub(crate) struct RtEntry {
 /// [`Change::Batch`] with its batch, allocated off the RT thread.
 pub(crate) struct RingEntry {
     pub entry: RtEntry,
-    pub batch: Option<Box<Batch>>,
+    pub batch: Option<Arc<Batch>>,
 }
 
 /// Log entries the RT thread holds before their index, and the capacity
@@ -514,7 +514,7 @@ pub(crate) enum Returned {
     Generation(Box<Gen>),
     Writer(Box<FlowWriter>),
     /// A batch applied, reported late or known already.
-    Batch(Box<Batch>),
+    Batch(Arc<Batch>),
 }
 
 pub(crate) struct Slot {
@@ -919,7 +919,7 @@ pub(crate) struct Mix {
     pub pending: Vec<RtEntry>,
     /// The batch of each [`Change::Batch`] pending or due, by log id.
     /// Capacity [`PENDING_CHANGES`], never exceeded: one per entry.
-    pub batches: Vec<(LogId, Box<Batch>)>,
+    pub batches: Vec<(LogId, Arc<Batch>)>,
     /// Entries other than gain changes taken off the pending list by the
     /// last [`Mix::to`], in order, each with whether it was late. They
     /// are applied by the loop.
@@ -998,8 +998,8 @@ impl Mix {
     pub fn push_with(
         &mut self,
         entry: RtEntry,
-        batch: Option<Box<Batch>>,
-    ) -> Result<(), Option<Box<Batch>>> {
+        batch: Option<Arc<Batch>>,
+    ) -> Result<(), Option<Arc<Batch>>> {
         if !self.push(entry) {
             return Err(batch);
         }
@@ -1011,7 +1011,7 @@ impl Mix {
     }
 
     /// Takes the batch of entry `id` out of the list.
-    pub fn take_batch(&mut self, id: LogId) -> Option<Box<Batch>> {
+    pub fn take_batch(&mut self, id: LogId) -> Option<Arc<Batch>> {
         let n = self.batches.iter().position(|b| b.0 == id)?;
         Some(self.batches.swap_remove(n).1)
     }
@@ -1171,10 +1171,8 @@ pub(crate) struct Rt {
     pub cmd: Consumer<Command>,
     pub entries: Consumer<RingEntry>,
     /// Spent batches the return ring had no room for. Capacity
-    /// [`SPENT`], never exceeded. Boxed as everywhere a batch goes: it
-    /// moves by pointer between the ring, this thread and core buffers.
-    #[allow(clippy::vec_box)]
-    pub spent: Vec<Box<Batch>>,
+    /// [`SPENT`], never exceeded.
+    pub spent: Vec<Arc<Batch>>,
     pub ret: Producer<Returned>,
     pub tel: Producer<Telemetry>,
     pub meters: Producer<MeterRecord>,
@@ -1702,7 +1700,7 @@ impl Rt {
 
     /// Takes entry `entry`, with its batch, off the ring: pending, or
     /// known to the last core installed.
-    fn take(&mut self, mut entry: RtEntry, mut batch: Option<Box<Batch>>) {
+    fn take(&mut self, mut entry: RtEntry, batch: Option<Arc<Batch>>) {
         if entry.id <= self.strips_upto {
             // Its strip parameters are in the strips the last replayed
             // core brought, or on its pending list, applied here at its
@@ -1712,13 +1710,8 @@ impl Rt {
                     self.mix.last_taken = self.mix.last_taken.max(entry.id);
                     return;
                 }
-                Change::Batch { strips, .. } => {
-                    *strips = false;
-                    if let Some(b) = batch.as_mut() {
-                        // Copies: nothing is freed.
-                        b.strips.clear();
-                    }
-                }
+                // Its batch's strip parameters are left out.
+                Change::Batch { strips, .. } => *strips = false,
                 _ => {}
             }
         }
@@ -1742,29 +1735,47 @@ impl Rt {
         }
     }
 
-    /// Hands spent batch `batch` off the RT thread through the return
-    /// ring, or keeps it until the ring has room; one neither has room
-    /// for is leaked, never freed here. A replay frees it.
-    pub(crate) fn retire(&mut self, batch: Option<Box<Batch>>) {
+    /// The return ring's slots spent batches leave free: one per input
+    /// domain and output and one more, for the generations and writers
+    /// this thread hands back.
+    fn reserve(&self) -> usize {
+        self.gens.len() + self.outs.len() + 1
+    }
+
+    /// Hands this thread's handle on spent batch `batch` off it through
+    /// the return ring, leaving the reserve free, or keeps it on the spent
+    /// list until the ring has room: this thread never drops one, so it
+    /// never frees one. One neither has room for is leaked and counted.
+    /// A replay keeps it on the spent list, which it frees between blocks.
+    pub(crate) fn retire(&mut self, batch: Option<Arc<Batch>>) {
         let Some(b) = batch else { return };
-        if self.replay {
-            drop(b);
-            return;
-        }
-        if let Err(rtrb::PushError::Full(Returned::Batch(b))) = self.ret.push(Returned::Batch(b)) {
-            if self.spent.len() < self.spent.capacity() {
-                self.spent.push(b);
-            } else {
-                add(&self.counters.batches_leaked, 1);
-                std::mem::forget(b);
+        let b = if !self.replay && self.ret.slots() > self.reserve() {
+            match self.ret.push(Returned::Batch(b)) {
+                Ok(()) => return,
+                Err(rtrb::PushError::Full(Returned::Batch(b))) => b,
+                Err(rtrb::PushError::Full(other)) => {
+                    std::mem::forget(other);
+                    return;
+                }
             }
+        } else {
+            b
+        };
+        if self.spent.len() < self.spent.capacity() {
+            self.spent.push(b);
+        } else {
+            add(&self.counters.batches_leaked, 1);
+            std::mem::forget(b);
         }
     }
 
     /// Passes the spent batches kept to the return ring while it has
-    /// room, leaving one slot for a command's return.
+    /// more room than the reserve.
     fn return_spent(&mut self) {
-        while self.ret.slots() > 1
+        if self.replay {
+            return;
+        }
+        while self.ret.slots() > self.reserve()
             && let Some(b) = self.spent.pop()
         {
             let _ = self.ret.push(Returned::Batch(b));
@@ -1952,7 +1963,7 @@ impl Rt {
 
     /// Makes `generation` the one of input domain `domain` and hands the
     /// old one back. Slot state stays with the slots.
-    fn install(&mut self, domain: usize, generation: Box<Gen>) {
+    pub(crate) fn install(&mut self, domain: usize, generation: Box<Gen>) {
         let old = self.gens[domain].take();
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.domain != domain {
@@ -2070,11 +2081,15 @@ impl Rt {
         if count {
             self.mix.applied_entry(&e);
         }
-        let Change::Batch { generation, .. } = e.change else {
+        let Change::Batch {
+            generation,
+            strips: has,
+        } = e.change
+        else {
             self.apply_change(e);
             return;
         };
-        if let Some(b) = b.filter(|_| strips) {
+        if let Some(b) = b.filter(|_| strips && has) {
             for &(slot, param) in &b.strips {
                 self.set_strip(e, slot as usize, param);
             }
@@ -3209,7 +3224,7 @@ mod tests {
         r.late_routes.push((10, 25 * B));
         r.late_lost_until = 26 * B;
 
-        let mut c = Core::new((1, 1, 2, 4, 0));
+        let mut c = Core::new(1, 1, 2, 4);
         capture_core(&mut c, &m, &slots, &awaiting, Some(11), &r);
         let want = Core {
             matrix: m.matrix.clone(),
@@ -3245,7 +3260,7 @@ mod tests {
             late_routes: vec![(10, 25 * B)],
             late_lost_until: 26 * B,
             batches: Vec::new(),
-            spare: Default::default(),
+            handed: Default::default(),
         };
         assert_eq!(c, want);
         assert_eq!(c.pending.len(), 2);
