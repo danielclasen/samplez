@@ -335,9 +335,6 @@ impl Strip {
     /// with it before it runs.
     pub fn is_valid(&self) -> bool {
         let trim = |db: &f32| TRIM_DB.contains(db);
-        let finite = |states: &[[[f32; 2]; MAX_LEGS]; EQ_BANDS]| {
-            states.iter().flatten().flatten().all(|v| v.is_finite())
-        };
         (1..=MAX_LEGS).contains(&self.legs)
             && trim(&self.trim_db)
             && self.leg_trim_db.iter().all(trim)
@@ -357,7 +354,7 @@ impl Strip {
             && self.comp.is_valid()
             && self.fade.is_within(0.0..=1.0)
             && (self.fade.target == 0.0 || self.fade.target == 1.0)
-            && finite(&self.alt_eq)
+            && self.alt_eq.iter().all(|s| crate::svf::valid_states(s))
             && self.alt_gate.is_valid()
             && self.alt_comp.is_valid()
     }
@@ -1631,6 +1628,57 @@ mod tests {
         }
     }
 
+    /// Every coefficient a section ramps to, over the extremes of every
+    /// parameter range and between them, shelf slopes through
+    /// `shelf_q` included, switched on or off, lies within the box a
+    /// decoded section's ramp is held to; the sweep reaches its largest
+    /// value, the low shelf's `m1` at -18 dB and Q 0.1.
+    #[test]
+    fn every_filter_target_lies_within_the_coefficient_box() {
+        use crate::svf::{COEFFICIENTS_HIGH, COEFFICIENTS_LOW, within_box};
+        let grid = |r: &RangeInclusive<f32>, n: u32| {
+            let (lo, hi) = (*r.start(), *r.end());
+            (0..=n).map(move |i| lo * (hi / lo).powf(i as f32 / n as f32))
+        };
+        let lin = |r: &RangeInclusive<f32>, n: u32| {
+            let (lo, hi) = (*r.start(), *r.end());
+            (0..=n).map(move |i| lo + (hi - lo) * i as f32 / n as f32)
+        };
+        let (mut low, mut high) = ([f32::MAX; 5], [f32::MIN; 5]);
+        let mut check = |shape: Shape| {
+            for on in [false, true] {
+                let mut s = Svf::<1>::new();
+                s.set(shape, on, 0);
+                let c = s.target();
+                assert!(within_box(&c), "{shape:?} on {on}: {c:?}");
+                for i in 0..5 {
+                    low[i] = low[i].min(c[i]);
+                    high[i] = high[i].max(c[i]);
+                }
+            }
+        };
+        for freq in grid(&HPF_FREQ, 40) {
+            check(Shape::HighPass { freq });
+        }
+        for kind in [BandType::LowShelf, BandType::Peak, BandType::HighShelf] {
+            for freq in grid(&EQ_FREQ, 60) {
+                for gain_db in lin(&EQ_GAIN_DB, 24) {
+                    for q in grid(&EQ_Q, 30) {
+                        check(band(kind, freq, gain_db, q).shape());
+                    }
+                }
+            }
+        }
+        assert!(within_box(&Svf::<1>::new().target()), "the neutral section");
+        // The sweep reaches the extremes the box is drawn around.
+        let reached = [(0, 6.2), (1, 28.0), (2, 7.9), (3, 24.6), (4, 6.9)];
+        for (i, v) in reached {
+            assert!(high[i] >= v && high[i] <= COEFFICIENTS_HIGH[i], "{high:?}");
+        }
+        assert!(low[3] <= -64.3 && low[4] <= -6.9, "{low:?}");
+        assert!(low.iter().zip(&COEFFICIENTS_LOW).all(|(l, b)| l >= b));
+    }
+
     /// A strip holding a value none reaches is not valid: a NaN or an
     /// infinity in its state, a ramp out of range, a parameter out of
     /// its range. The dynamics' own are checked with them.
@@ -1658,6 +1706,12 @@ mod tests {
         invalid("NaN filter state", &|s| s.eq[0].state[1][0] = f32::NAN);
         invalid("infinite crossfade state", &|s| {
             s.alt_eq[2][0][1] = f32::INFINITY
+        });
+        invalid("filter state beyond a block's", &|s| {
+            s.hpf.state[0][1] = 1e31
+        });
+        invalid("crossfade state beyond a block's", &|s| {
+            s.alt_eq[0][1][0] = -1e31
         });
         invalid("infinite leg gain", &|s| s.gain[0].c0 = f32::INFINITY);
         invalid("NaN trim", &|s| s.trim_db = f32::NAN);

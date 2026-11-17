@@ -676,6 +676,32 @@ mod tests {
             s["strip"]["hpf"]["len"] = json!(100);
             s["strip"]["hpf"]["step"][0] = json!(-1.0);
         });
+        // Finite and stable, but beyond any coefficient a section ramps
+        // to: 3e38 x + 3e38 v1 + 3e38 v2 overflows on an ordinary sample
+        // for the 2^24 samples of the ramp.
+        refused("filter mix starting beyond any target", &|s| {
+            let hpf = &mut s["strip"]["hpf"];
+            let len = f64::from(samplez_dsp::MAX_RAMP_LEN);
+            let target: Vec<f64> = (0..5).map(|i| hpf["target"][i].as_f64().unwrap()).collect();
+            let c0 = [target[0], target[1], 3e38, 3e38, 3e38];
+            for i in 0..5 {
+                hpf["c0"][i] = json!(c0[i]);
+                hpf["step"][i] = json!((target[i] - c0[i]) / len);
+            }
+            hpf["len"] = json!(samplez_dsp::MAX_RAMP_LEN);
+            hpf["pos"] = json!(0);
+        });
+        refused("filter mix ending beyond any target", &|s| {
+            s["strip"]["eq"][1]["len"] = json!(100);
+            s["strip"]["eq"][1]["step"][3] = json!(10.0);
+        });
+        // Finite, but 2 v1 - s0 overflows within a sample.
+        refused("filter state beyond any a block leaves", &|s| {
+            s["strip"]["hpf"]["state"][0][0] = json!(3e38)
+        });
+        refused("crossfade state beyond any a block leaves", &|s| {
+            s["strip"]["alt_eq"][0][0][1] = json!(1e31)
+        });
         refused("leg gain of other trims", &|s| {
             s["strip"]["trim_db"] = json!(3.0)
         });

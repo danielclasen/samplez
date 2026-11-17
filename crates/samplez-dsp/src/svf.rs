@@ -23,6 +23,27 @@ const FLUSH: f32 = 1.0e-20;
 /// Largest state magnitude kept after a block: +600 dB.
 pub(crate) const STATE_MAX: f32 = 1.0e30;
 
+/// The box every coefficient a section ramps to lies in, `g` and `k`
+/// above their lower bound, which is 0: the largest are `g` 6.3 (a high
+/// shelf at 20 kHz and +18 dB), `k` 28.2, `m0` 7.9, `m1` -64.3 (a low
+/// shelf at -18 dB and Q 0.1) and 24.6, and `m2` +-6.9. A ramp is linear,
+/// so one whose ends lie in it stays in it.
+pub(crate) const COEFFICIENTS_LOW: Coefficients = [0.0, 0.0, 0.0, -72.0, -8.0];
+pub(crate) const COEFFICIENTS_HIGH: Coefficients = [8.0, 32.0, 8.0, 32.0, 8.0];
+
+/// Whether `c` lies within [`COEFFICIENTS_LOW`] and [`COEFFICIENTS_HIGH`],
+/// `g` and `k` above 0, which keeps a section stable.
+pub(crate) fn within_box(c: &Coefficients) -> bool {
+    let low = |i: usize| {
+        if i < 2 {
+            c[i] > COEFFICIENTS_LOW[i]
+        } else {
+            c[i] >= COEFFICIENTS_LOW[i]
+        }
+    };
+    (0..5).all(|i| low(i) && c[i] <= COEFFICIENTS_HIGH[i])
+}
+
 /// `(g, k, m0, m1, m2)`.
 pub(crate) type Coefficients = [f32; 5];
 
@@ -120,6 +141,12 @@ pub(crate) struct Svf<const L: usize> {
     a: [f32; 3],
     /// `(ic1eq, ic2eq)` per leg.
     pub(crate) state: [[f32; 2]; L],
+}
+
+/// Whether every state lies within [`STATE_MAX`], as one after a block
+/// does; a NaN does not.
+pub(crate) fn valid_states(states: &[[f32; 2]]) -> bool {
+    states.iter().flatten().all(|v| v.abs() <= STATE_MAX)
 }
 
 #[inline]
@@ -222,20 +249,19 @@ impl<const L: usize> Svf<L> {
 
     /// Whether the section holds what one last set to `shape`, on or
     /// not, holds: that shape's target, a ramp whose first and last
-    /// values are finite with `g` and `k` positive, so every value of it
-    /// is stable, within [`crate::MAX_RAMP_LEN`] and its position within
-    /// it, and a finite state.
+    /// values lie within the coefficient box ([`within_box`]), so every
+    /// value of it does and is stable, within [`crate::MAX_RAMP_LEN`] and
+    /// its position within it, and states within [`STATE_MAX`].
     pub(crate) fn is_valid(&self, shape: Shape, on: bool) -> bool {
         let target = target_of(shape, on);
-        let stable = |c: Coefficients| c.iter().all(|v| v.is_finite()) && c[0] > 0.0 && c[1] > 0.0;
         self.target == target
             && self.a == a_of(&target)
             && self.c0.iter().chain(&self.step).all(|v| v.is_finite())
-            && stable(self.at(0))
-            && stable(self.at(self.len.saturating_sub(1)))
+            && within_box(&self.at(0))
+            && within_box(&self.at(self.len.saturating_sub(1)))
             && self.len <= crate::MAX_RAMP_LEN
             && self.pos <= self.len
-            && self.state.iter().flatten().all(|v| v.is_finite())
+            && valid_states(&self.state)
     }
 
     /// Moves the coefficient ramp `frames` samples on without processing.
