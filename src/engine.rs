@@ -752,7 +752,7 @@ fn replay_rt(
         taken: 0,
         skip_upto: 0,
         install_at: 0,
-        install_strips: false,
+        strips_upto: 0,
         replay: true,
         core: true,
         cmd: none(),
@@ -1080,7 +1080,7 @@ impl Engine {
             taken: 0,
             skip_upto: 0,
             install_at: 0,
-            install_strips: false,
+            strips_upto: 0,
             replay: false,
             core: true,
             cmd: cmd_rx,
@@ -4742,6 +4742,85 @@ mod tests {
         set.advance(192 - 48);
         assert!(set.set(gain));
         assert_eq!(rt.slots[0].strip.as_ref(), Some(&set));
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A product core that knew less than an earlier replayed one: a
+    /// strip entry the replayed core's strips hold, delivered by the ring
+    /// only after both, is not applied again, which would restart its
+    /// ramp; a gain entry the product core did not know is taken as new,
+    /// not skipped as known, which would lose it.
+    #[test]
+    fn a_product_core_knowing_less_than_a_replayed_one_loses_and_repeats_nothing() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("product-below-replay", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d11", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d12", "label": "below",
+                          "group": "below", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let (mut ring, entries) = rtrb::RingBuffer::new(4);
+        rt.entries = entries;
+        let hpf = StripParam::Hpf {
+            enabled: true,
+            freq: 200.0,
+        };
+        let strip = RtEntry {
+            id: 3,
+            at_index: 48,
+            change: Change::Strip {
+                slot: 0,
+                param: hpf,
+            },
+        };
+        let gain = RtEntry {
+            id: 2,
+            at_index: 1440,
+            change: Change::Gain {
+                input: 0,
+                output: 0,
+                gain: 0.5,
+            },
+        };
+        // The replayed core knew entries up to 3 and applied the strip
+        // entry at 48; its strip, 432 samples into the ramp, is installed.
+        let mut replayed = samplez_dsp::Strip::new(1, config.ramp_samples);
+        assert!(replayed.set(hpf));
+        replayed.advance(480 - 48);
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        core.slots[0].strip = Some(replayed.clone());
+        core.slots[0].strip_pos = Some(480);
+        rt.install_core(&core, 3, true);
+        assert_eq!(rt.slots[0].strip.as_ref(), Some(&replayed));
+        // A product core that knew entries up to 1 only.
+        rt.capture(&mut core);
+        core.pos = Some(960);
+        core.pending.clear();
+        rt.install_core(&core, 1, false);
+        // The ring delivers both now.
+        assert!(ring.push(strip).is_ok() && ring.push(gain).is_ok());
+        rt.take_entries();
+        assert_eq!(rt.slots[0].strip.as_ref(), Some(&replayed), "applied again");
+        assert!(
+            rt.mix.holds(2),
+            "the gain entry the product core missed is lost"
+        );
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

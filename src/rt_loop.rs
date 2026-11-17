@@ -1034,15 +1034,19 @@ pub(crate) struct Rt {
     pub last_entry: LogId,
     /// Entries taken from the entry ring.
     pub taken: u64,
-    /// The highest log id a handed-over core knew: an entry up to it
-    /// taken from the ring later is pending or applied already.
+    /// The highest log id the last handed-over core knew: an entry up to
+    /// it taken from the ring later is pending or applied already. A
+    /// later core that knew less replaces the state of an earlier one, so
+    /// an entry it did not know is taken as new.
     pub skip_upto: LogId,
     /// The first sample index the last handed-over core computed: an
     /// entry the core knew at or past it was on the core's pending list.
     pub install_at: u64,
-    /// The last handed-over core held the strips: a strip entry it knew
-    /// is in them.
-    pub install_strips: bool,
+    /// The highest log id the last replayed core knew: its strips stay
+    /// until the next replayed core, a core built from product state
+    /// leaving them, so a strip entry up to it is in them or was on that
+    /// core's pending list.
+    pub strips_upto: LogId,
     /// A replay clone: computes off the RT thread from past input, writes
     /// nothing and hashes every page it computes whole.
     pub replay: bool,
@@ -1553,7 +1557,7 @@ impl Rt {
     /// Moves committed entries from the entry ring to the pending list
     /// while it has room.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    fn take_entries(&mut self) {
+    pub(crate) fn take_entries(&mut self) {
         while self.mix.pending.len() < PENDING_CHANGES
             && let Ok(entry) = self.entries.pop()
         {
@@ -1564,15 +1568,20 @@ impl Rt {
             if self.mix.holds(entry.id) {
                 continue;
             }
+            let strip = matches!(entry.change, Change::Strip { .. });
+            if strip && entry.id <= self.strips_upto {
+                // In the strips the last replayed core brought, or on
+                // its pending list, applied here at its index.
+                continue;
+            }
             if entry.id <= self.skip_upto {
                 // The core knew it. It holds what a gain change or an
-                // InputDown did, and a replayed core what a strip entry
-                // did; any other entry below the install it applied
-                // without what it did reaching this thread, so
+                // InputDown did; any other entry below the install it
+                // applied without what it did reaching this thread, so
                 // that entry is applied as on time. One at or past the
                 // install was on the core's pending list, applied here at
                 // its index.
-                if !entry.change.in_core(self.install_strips) && entry.at_index < self.install_at {
+                if !entry.change.in_core(false) && entry.at_index < self.install_at {
                     self.apply(entry);
                 }
                 continue;
@@ -2315,9 +2324,11 @@ impl Rt {
             r.late_routes.extend_from_slice(&c.late_routes);
             r.late_lost_until = c.late_lost_until;
         }
-        self.skip_upto = self.skip_upto.max(last_id);
+        self.skip_upto = last_id;
         self.install_at = next;
-        self.install_strips = strips;
+        if strips {
+            self.strips_upto = last_id;
+        }
         for n in 0..self.mix.due.len() {
             let (e, _) = self.mix.due[n];
             self.apply(e);
