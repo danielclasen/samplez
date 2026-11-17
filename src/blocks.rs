@@ -1129,7 +1129,12 @@ impl Hold {
                     if p <= start {
                         self.mode = Mode::Withdrawn;
                         statuses.set_standing(Standing::Withdrawn { since: k });
-                        self.frontier = None;
+                        // A stop at the start of this block, right after
+                        // the block before it, leaves the page whole on
+                        // this member: it fills on from there.
+                        if p != start || self.frontier != Some(start) {
+                            self.frontier = None;
+                        }
                     } else {
                         range = Range::UpTo(p);
                         live.1 = p;
@@ -2118,6 +2123,36 @@ mod tests {
         t.compute(K0 + 3, Some(HEALTHY));
         assert_eq!(t.kind(K0 + 3), Some(Kind::Withheld));
         t.sink.check();
+    }
+
+    /// A stop at the start of a block, right after a block it committed:
+    /// the output is withdrawn from there and fills on contiguously, so a
+    /// stop that falls on a block boundary leaves no block it cannot fill.
+    /// A stop at a block boundary it reaches only later, after a block
+    /// it never computed, still leaves the blocks to the next page
+    /// boundary unfillable.
+    #[test]
+    fn a_stop_at_a_block_boundary_fills_on_from_there() {
+        let mut t = T::committing(false, K0);
+        let p = (K0 + 1) * B;
+        t.compute(K0, Some(HEALTHY));
+        t.hold.stop_at(p);
+        t.compute(K0 + 1, Some(HEALTHY));
+        assert_eq!(t.hold.mode(), Mode::Withdrawn);
+        assert_eq!(t.statuses.standing(), Standing::Withdrawn { since: K0 + 1 });
+        let st = t.statuses.get(K0 + 1).unwrap();
+        assert_eq!(st.range, Range::Whole);
+        assert_ne!(st.kind, Kind::Withheld, "a fill, not unfillable");
+        assert_eq!(st.digest, None, "a fill carries no digest");
+        assert_eq!(t.sink.writes.last(), Some(&(K0 * B, B as usize)));
+
+        let mut t = T::committing(false, K0);
+        t.compute(K0, Some(HEALTHY));
+        t.hold.stop_at((K0 + 2) * B);
+        t.compute(K0 + 2, Some(HEALTHY));
+        if !((K0 + 2) * B).is_multiple_of(PAGE) {
+            assert_eq!(t.kind(K0 + 2), Some(Kind::Withheld));
+        }
     }
 
     /// After a backward clock step every open block of the ring is
