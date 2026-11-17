@@ -178,9 +178,10 @@ jobs:
       - name: Build the clock tests and the kernel's leap-a-day selftest
         run: |
           mkdir -p .cargo-registry vm/timers
-          linux=https://raw.githubusercontent.com/torvalds/linux/v6.12/tools/testing/selftests
-          curl -fsSL -o vm/timers/leap-a-day.c "$linux/timers/leap-a-day.c"
-          curl -fsSL -o vm/kselftest.h "$linux/kselftest.h"
+          linux=https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/tools/testing/selftests
+          get() { curl -fsSL --retry 5 --retry-all-errors -o "$2" "$linux/$1?h=v6.12"; }
+          get timers/leap-a-day.c vm/timers/leap-a-day.c
+          get kselftest.h vm/kselftest.h
           sha256sum -c - <<'SUMS'
           cd486ebfae1003838fd9a88543b0bb19068910c1c031ca7939fcb6398871e49a  vm/timers/leap-a-day.c
           5d5720da5593490c7260d867904531b48230a4868798dcb4b34df8039a7be609  vm/kselftest.h
