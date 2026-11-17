@@ -425,3 +425,36 @@ async fn a_command_the_engine_refuses_is_refused_before_it_is_ordered() {
         assert_eq!(set.audio(id).lock().entries_refused, 0);
     }
 }
+
+/// A command asking for an index between block starts is ordered at the
+/// next block start, the only index the engine applies an entry at: at
+/// its own index it would be refused after its commit.
+#[tokio::test(start_paused = true)]
+async fn a_command_asking_for_an_index_off_a_block_start_is_ordered_at_the_next() {
+    let set = start(None).await;
+    let leader = set.leader().await;
+    let asked = e(&set, leader) + 480_000 + 1;
+    let o = owner("s");
+    let request = PeerRequest::Forward {
+        commands: vec![Forwarded {
+            command: Command {
+                origin: Origin::from(&o),
+                id: "off".into(),
+                at_index: Some(asked),
+                body: b"gain=3@3".to_vec(),
+            },
+            received: e(&set, leader),
+            within_ms: 1000,
+        }],
+    };
+    let reply = set.replica(leader).handle(Some(leader), request).await;
+    assert!(
+        matches!(&reply, Ok(PeerResponse::Forwarded(r)) if r[0].is_ok()),
+        "{reply:?}"
+    );
+    let request = entries(&set, leader).pop().unwrap();
+    let Body::Commands(commands) = &request.body else {
+        panic!("{request:?}")
+    };
+    assert_eq!(commands[0].at_index, Some(asked.next_multiple_of(BLOCK)));
+}

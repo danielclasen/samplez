@@ -31,6 +31,14 @@ use crate::resync::{CoreReply, Resynced, Source};
 /// ([`Request::at_index`]). The engine folds the entries into one batch
 /// bounded by its shape ([`Engine::append_batch`]), so a command of any
 /// number of entries applies whole at its index.
+///
+/// It must be a pure function of the `Request`, the same on every
+/// replica: the leader checks what it orders against its own engine and
+/// translation ([`crate::contact::Audio::admits`]), so a translation that
+/// differed between replicas, or with anything but the request, could
+/// give another replica's engine an entry it refuses after its commit.
+/// The check holds for replicas of the leader's engine version and shape,
+/// which the compatibility key ([`crate::rollout::key`]) tells apart.
 pub type Translate = Box<dyn Fn(&Request) -> Option<Translated> + Send + Sync>;
 
 /// A log entry's index and the engine entries it applies there.
