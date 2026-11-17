@@ -1230,8 +1230,12 @@ impl Set {
         self.replicas.keys().copied()
     }
 
-    /// Starts `id` from what its volume holds.
+    /// Starts `id` from what its volume holds, stopping it first if it
+    /// runs: a second instance would take the same node id and volume
+    /// while the first keeps its timers, calling elections and appending
+    /// to the log beside it.
     pub async fn restart(&mut self, id: NodeId) {
+        self.crash(id).await;
         let base = self.base;
         let clock = self
             .clocks
