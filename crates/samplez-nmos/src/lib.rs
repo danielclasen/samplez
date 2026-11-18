@@ -409,11 +409,11 @@ fn check(model: &NodeModel, cfg: &NmosConfig) -> Result<(), Error> {
     {
         return fail("every asset tag needs a value and the device a function".into());
     }
-    // reqwest is built without TLS: an https registry could never be
-    // reached.
+    // The registration client speaks plain HTTP only, as discovery uses
+    // only registries advertising api_proto=http.
     if let Some(r) = cfg.registries.iter().find(|r| !r.starts_with("http://")) {
         return fail(format!(
-            "registry {r:?}: only http:// is supported, the node has no TLS client"
+            "registry {r:?}: only http:// is supported, the registration client speaks plain HTTP only"
         ));
     }
     // Every sender has the role `Audio out` and every receiver `Audio in`
