@@ -78,7 +78,7 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -e CARGO_INCREMENTAL=0 \
             -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
             -w /w samplez-builder:ci cargo clean --locked \
-            -p samplez -p samplez-dsp -p samplez-mxl -p samplez-replica -p samplez-service
+            -p samplez -p samplez-dsp -p samplez-mxl -p samplez-nmos -p samplez-replica -p samplez-service
           du -sh target .cargo-registry
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -120,6 +120,19 @@ jobs:
             -e SAMPLEZ_REQUIRE_PATHS=avx2 -e CARGO_INCREMENTAL=0 \
             -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
             -w /w samplez-builder:ci cargo test --workspace --locked
+      # The AMWA specification repositories at the commits pinned in
+      # crates/samplez-nmos/tests/specs.txt.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: nmos-specs
+          key: nmos-specs-${{ hashFiles('crates/samplez-nmos/tests/specs.txt') }}
+      - name: NMOS documents against the AMWA schemas
+        run: |
+          crates/samplez-nmos/tests/fetch-specs.sh nmos-specs
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e CARGO_INCREMENTAL=0 -e SAMPLEZ_NMOS_SPECS=/w/nmos-specs \
+            -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
+            -w /w samplez-builder:ci cargo test --locked -p samplez-nmos --test schemas
       - name: End-to-end scenarios with SCHED_FIFO and locked memory
         run: |
           docker run --rm --user "$(id -u):$(id -g)" \
@@ -133,7 +146,7 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -e CARGO_INCREMENTAL=0 \
             -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
             -w /w samplez-builder:ci cargo clean --locked \
-            -p samplez -p samplez-dsp -p samplez-mxl -p samplez-replica -p samplez-service
+            -p samplez -p samplez-dsp -p samplez-mxl -p samplez-nmos -p samplez-replica -p samplez-service
           du -sh target .cargo-registry
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -279,7 +292,7 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -e CARGO_INCREMENTAL=0 \
             -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
             -w /w samplez-builder:ci cargo clean --locked --release \
-            -p samplez -p samplez-dsp -p samplez-mxl -p samplez-replica -p samplez-service
+            -p samplez -p samplez-dsp -p samplez-mxl -p samplez-nmos -p samplez-replica -p samplez-service
           du -sh target .cargo-registry
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -383,7 +396,7 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -e CARGO_INCREMENTAL=0 \
             -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
             -w /w samplez-builder:ci bash -euo pipefail -c '
-              packages="-p samplez -p samplez-dsp -p samplez-mxl -p samplez-replica -p samplez-service"
+              packages="-p samplez -p samplez-dsp -p samplez-mxl -p samplez-nmos -p samplez-replica -p samplez-service"
               cargo clean --locked --release $packages
               cargo "+$SAMPLEZ_NIGHTLY" clean --locked --target x86_64-unknown-linux-gnu $packages
             '
