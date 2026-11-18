@@ -2202,7 +2202,8 @@ impl Engine {
     /// call failing with [`ReplayError::Full`] while the control ring
     /// stays full; on a later failure the core stays dropped. `timeout`
     /// bounds the drop, the supervisor's hand-over and the install
-    /// together.
+    /// together, except that the answer to a core already passed to the
+    /// RT thread is waited for up to 1 s past it.
     pub fn install_product(
         &self,
         state: &ProductState,
@@ -2349,7 +2350,11 @@ impl Engine {
     }
 
     /// Passes the cores `make` fills to the RT thread until one is
-    /// installed or `timeout` passes. The RT thread installs a core only
+    /// installed or `timeout` passes. The answer to a core passed on is
+    /// waited for up to 1 s, past `timeout` too: the RT thread gives it at
+    /// its next wake, so a caller with a short timeout still learns
+    /// whether that core was installed. An answer still missing then is
+    /// taken by the next call. The RT thread installs a core only
     /// before the block after the core's: each attempt waits for it to
     /// compute a block, has `make` fill a core for that block at once and
     /// passes it on before the RT thread's next wake. `make` returns the
