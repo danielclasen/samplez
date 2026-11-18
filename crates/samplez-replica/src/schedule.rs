@@ -158,20 +158,21 @@ impl Lead {
     }
 
     /// Moves to the minute now runs in, falling by B per minute passed
-    /// while ten minutes of slack held 3B or more, unless the entries of
-    /// this minute and the last needed more than the lead: at the cap
-    /// they are stamped with what they needed, so their slack says
-    /// nothing of the lead, and a fall would clear `capped` and stamp the
-    /// next commands with less than they need.
+    /// while ten minutes of slack held 3B or more, unless at the cap the
+    /// entries of the minute just ended needed more than the lead: they
+    /// are stamped with what they needed, so their slack says nothing of
+    /// the lead, and a fall would clear `capped` and stamp the next
+    /// commands with less than they need. Below the cap the slack alone
+    /// decides.
     pub fn roll(&mut self) {
         while self.minute_start.elapsed() >= Duration::from_secs(60) {
             self.minute_start += Duration::from_secs(60);
             self.needed = [self.needed[1], 0];
-            let needed = self.needed[0].max(self.needed[1]);
+            let held = self.capped && self.needed[0].max(self.needed[1]) > self.lead;
             if self.minutes.len() == MINUTES
                 && self.quantile().is_some_and(|q| q >= 3)
                 && self.lead > self.block
-                && needed <= self.lead
+                && !held
             {
                 self.lead -= self.block;
                 self.capped = false;
@@ -276,6 +277,20 @@ mod tests {
         lead.roll();
         assert_eq!(lead.samples(), 49 * B, "a minute needing less, it falls");
         assert!(!lead.capped);
+        // Below the cap the slack's quantile alone decides: one entry
+        // that needed more holds no fall.
+        let mut lead = Lead::new(B, 30 * B, 50 * B);
+        for minute in 0..10 {
+            for _ in 0..100 {
+                lead.add(5 * B as i64, 1, 1);
+            }
+            if minute == 9 {
+                lead.needs(30 * B, B as i64);
+            }
+            tokio::time::advance(Duration::from_secs(60)).await;
+            lead.roll();
+        }
+        assert_eq!(lead.samples(), 29 * B, "below the cap it falls");
     }
 
     /// At the largest block size the lead wanted stays within 64 ms of
