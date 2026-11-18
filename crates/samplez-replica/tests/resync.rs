@@ -32,9 +32,14 @@ fn witness() -> NodeId {
 /// A set whose fakes copy and take cores; `install` lets a test force a
 /// snapshot install.
 async fn start(ids: Vec<NodeId>, install: bool) -> Set {
+    start_timed(ids, install, Timing::defaults(BLOCK)).await
+}
+
+/// [`start`] with the contact timers `timing`.
+async fn start_timed(ids: Vec<NodeId>, install: bool, timing: Timing) -> Set {
     let mut options = Options {
         ids: Some(ids),
-        contact: Some(Timing::defaults(BLOCK)),
+        contact: Some(timing),
         outputs: 1,
         ..Options::default()
     };
@@ -493,4 +498,74 @@ async fn a_decision_across_a_rename_converges() {
         );
     }
     assert_eq!(state(&set, renamed), Some(ReplicaState::Committing));
+}
+
+/// The leader's log entries of each kind: the name of the body's variant.
+fn kinds(set: &Set, id: NodeId) -> std::collections::BTreeMap<String, u64> {
+    let mut kinds = std::collections::BTreeMap::new();
+    set.replica(id).store().entries_after(0, |_, r| {
+        let body = format!("{:?}", r.body);
+        let kind = body
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("");
+        *kinds.entry(kind.to_owned()).or_default() += 1;
+    });
+    kinds
+}
+
+/// Commits that take longer than the capped lead covers: followers
+/// stalled 6 ms per RPC, within the contact window, under a 36 ms cap,
+/// whose 4 ms past the margin and applyGuard no commit makes, the
+/// leader's included. A command is late on every replica, which holds
+/// it unresolved, or resyncs where the baseline applied it; a decision
+/// is stamped with
+/// the lead the entries needed, past the cap, so it applies in time,
+/// where one stamped at the cap was late again and decided in turn,
+/// without end, and a `Baseline` lapsed for its named replica. Every
+/// replica commits again within 5 s and the unresolved entries stay
+/// bounded.
+#[tokio::test(start_paused = true)]
+async fn a_set_whose_commits_outlast_the_capped_lead_commits_with_bounded_unresolved() {
+    let mut timing = Timing::defaults(BLOCK);
+    timing.max_apply_lead = Duration::from_millis(36);
+    let set = start_timed(vec![a(0), a(1), a(2)], false, timing).await;
+    let leader = set.leader().await;
+    let followers: Vec<NodeId> = audio(&set).into_iter().filter(|&id| id != leader).collect();
+    for &id in &followers {
+        set.net.stall(id, Duration::from_millis(6));
+    }
+    let commands = 10;
+    for n in 0..commands {
+        let command = Bytes::from(format!("g=1@{n}"));
+        let _ = (set.replica(leader))
+            .submit(&owner("s"), &n.to_string(), command)
+            .await;
+        sleep(Duration::from_millis(100)).await;
+    }
+    let m = set.replica(leader).contact_metrics().unwrap();
+    assert!(m.apply_lead_capped, "the lead at its cap");
+    let ids = audio(&set);
+    // Past the session's lease expiry, an entry of its own.
+    sleep(Duration::from_secs(2)).await;
+    until("committing under the stall", 5, || {
+        ids.iter()
+            .all(|&id| state(&set, id) == Some(ReplicaState::Committing))
+    })
+    .await;
+    for &id in &ids {
+        let m = set.replica(id).contact_metrics().unwrap();
+        assert!(
+            m.unresolved <= 2 * commands,
+            "{id}: {} unresolved",
+            m.unresolved
+        );
+    }
+    let kinds = kinds(&set, leader);
+    let restamps = kinds.get("Restamp").copied().unwrap_or(0);
+    assert!(restamps <= commands + 2, "one restamp a command: {kinds:?}");
+    assert!(
+        kinds.get("Baseline").copied().unwrap_or(0) <= 2,
+        "{kinds:?}"
+    );
 }

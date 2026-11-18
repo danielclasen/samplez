@@ -735,8 +735,12 @@ pub struct Contact {
 }
 
 /// Adds a counted replica's slack to the lead, naming the replica when
-/// it asked for more, and warning once as the lead reaches its cap.
+/// it asked for more, and warning once as the lead reaches its cap; an
+/// entry still listed counts the lead it needed too ([`Lead::needs`]).
 fn add_slack(st: &mut State, from: NodeId, slack: &Slack, current: u64) {
+    if let Some(&(_, at, stamp, _)) = st.scheduled.get(&slack.index) {
+        st.lead.needs(at.saturating_sub(stamp), slack.samples);
+    }
     let capped = st.lead.capped;
     if st.lead.add(slack.samples, slack.stamp, current) {
         st.lead_raised_by = Some(from);
@@ -2993,6 +2997,15 @@ impl Contact {
             stamp + lead
         };
         Ok(Stamp { stamp, earliest })
+    }
+
+    /// The lead a decision on an unresolved entry is stamped with: what
+    /// the entries applied lately needed, past the cap
+    /// ([`Lead::wanted`]). At the cap an entry is late wherever its
+    /// commit takes longer than the lead covers, and a restamp or void
+    /// stamped with the lead is late again, each decided in turn.
+    pub fn decision_lead(&self) -> u64 {
+        self.lock().lead.wanted()
     }
 
     /// A resync to start: this audio replica is diverged, not

@@ -974,12 +974,23 @@ impl Shared {
                     }
                     Err(refusal) => return Err(stamp_refused(refusal)),
                 };
-                // A later index asked for is kept.
+                // A later index asked for is kept. A decision or a
+                // `Baseline` takes the lead the entries lately needed, past
+                // the cap: stamped with the lead at the cap, it is late
+                // wherever the commit takes longer than the lead covers.
+                let mut earliest = stamp.earliest;
+                if (body.decides().is_some() || matches!(body, Body::Baseline(_)))
+                    && let Some(contact) = self.contact.get()
+                {
+                    let lead = contact.decision_lead();
+                    earliest =
+                        earliest.max((stamp.stamp + lead).next_multiple_of(self.settings.block));
+                }
                 if let Some(at) = body.at_index() {
-                    state_machine::restamp(&mut body, at.max(stamp.earliest));
+                    state_machine::restamp(&mut body, at.max(earliest));
                 }
                 if let Body::Baseline(b) = &mut body {
-                    b.at_index = b.at_index.max(stamp.earliest);
+                    b.at_index = b.at_index.max(earliest);
                     if self.contact.get().is_some_and(|c| c.hands_over(b)) {
                         b.at_index = rollout::hand_over_at(b.at_index, self.settings.block);
                     }
