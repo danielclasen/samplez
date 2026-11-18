@@ -183,7 +183,7 @@ pub(crate) fn senders(inner: &Inner, st: &State) -> Vec<Value> {
             with(
                 core(
                     ids.sender,
-                    s.version,
+                    s.port.version,
                     &d.label,
                     "",
                     grouphint(&d.group, "Audio out"),
@@ -195,8 +195,8 @@ pub(crate) fn senders(inner: &Inner, st: &State) -> Vec<Value> {
                     "manifest_href": null,
                     "interface_bindings": [],
                     "subscription": {
-                        "receiver_id": s.active.peer,
-                        "active": s.active.master_enable,
+                        "receiver_id": s.port.active.peer,
+                        "active": s.port.active.master_enable,
                     },
                 }),
             )

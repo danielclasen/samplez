@@ -1,39 +1,51 @@
-//! NMOS for samplez products: the IS-04 v1.3 Node API for MXL senders and
-//! receivers per AMWA BCP-007-03, with BCP-004-01 receiver caps and
-//! BCP-002-01/02 tags.
+//! NMOS for samplez products: the IS-04 v1.3 Node API and the IS-05 v1.2
+//! Connection API for MXL senders and receivers per AMWA BCP-007-03, with
+//! BCP-004-01 receiver caps and BCP-002-01/02 tags.
 //!
 //! The crate knows NMOS ids, MXL ids and TAI time; it links no libmxl and
 //! runs no real-time code. A product describes its writers and readers in
 //! a [`NodeModel`] and serves [`Nmos::router`] on its NMOS listener.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State as Extract;
-use axum::http::{Method, Uri};
+use axum::http::{HeaderMap, Method, Uri, header};
 use axum::response::Response;
 use axum::routing::any;
 use serde_json::json;
 use uuid::Uuid;
 
+mod connection;
 mod http;
 mod ids;
 mod model;
 mod node_api;
+mod product;
 mod resources;
 mod tai;
 
+pub use connection::RESOLVE_TIMEOUT;
 pub use model::{
     Asset, BIT_DEPTH, ChannelCount, ChannelDesc, MAX_CHANNELS, MEDIA_TYPE, NmosConfig, NodeModel,
     ReceiverDesc, SAMPLE_RATE, SenderDesc,
 };
+pub use product::DEFAULT_APPLY_TIMEOUT;
+pub use product::{
+    Active, Applied, BoxFuture, Connections, Fail, FlowSeen, NmosStatus, NoStore, Port, PortKey,
+    PortStatus, Reject, Store,
+};
 pub use tai::{SystemTai, Tai, TaiClock};
 pub use uuid;
 
+use connection::PortState;
 use ids::Ids;
+
+/// Bucket bounds of `samplez_nmos_activation_late_seconds`.
+const LATE_BUCKETS: [f64; 8] = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 1.0];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -61,19 +73,16 @@ pub(crate) struct Inner {
     cfg: NmosConfig,
     model: NodeModel,
     ids: Ids,
+    conns: Arc<dyn Connections>,
+    clock: Arc<dyn TaiClock>,
     /// The receivers' caps never change, so their version is the start.
     caps_version: Tai,
     state: Mutex<State>,
-}
-
-/// What an IS-05 activation last made active on a port.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Active {
-    pub master_enable: bool,
-    /// `receiver_id` on a sender, `sender_id` on a receiver.
-    pub peer: Option<Uuid>,
-    pub domain: Option<Uuid>,
-    pub flow: Option<Uuid>,
+    /// One per port, senders first; held across a PATCH to the port's
+    /// `/staged`, checks included.
+    patching: Vec<tokio::sync::Mutex<()>>,
+    /// Per port as [`Inner::index`] orders them, once registered.
+    late: std::sync::OnceLock<Vec<samplez_service::Histogram>>,
 }
 
 pub(crate) struct State {
@@ -82,19 +91,13 @@ pub(crate) struct State {
     node_version: Tai,
     device_version: Tai,
     senders: Vec<SenderState>,
-    receivers: Vec<ReceiverState>,
+    receivers: Vec<PortState>,
 }
 
 pub(crate) struct SenderState {
     source_version: Tai,
     flow_version: Tai,
-    version: Tai,
-    active: Active,
-}
-
-pub(crate) struct ReceiverState {
-    version: Tai,
-    active: Active,
+    port: PortState,
 }
 
 impl State {
@@ -105,19 +108,64 @@ impl State {
         self.last_version = v;
         v
     }
+
+    fn port(&self, port: Port) -> &PortState {
+        match port {
+            Port::Sender(i) => &self.senders[i].port,
+            Port::Receiver(i) => &self.receivers[i],
+        }
+    }
+
+    fn port_mut(&mut self, port: Port) -> &mut PortState {
+        match port {
+            Port::Sender(i) => &mut self.senders[i].port,
+            Port::Receiver(i) => &mut self.receivers[i],
+        }
+    }
 }
 
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn key(&self, port: Port) -> PortKey {
+        match port {
+            Port::Sender(i) => PortKey::Sender(self.model.senders[i].key.clone()),
+            Port::Receiver(i) => PortKey::Receiver(self.model.receivers[i].key.clone()),
+        }
+    }
+
+    fn patching(&self, port: Port) -> &tokio::sync::Mutex<()> {
+        &self.patching[self.index(port)]
+    }
+
+    /// The port's place among all ports, senders first.
+    fn index(&self, port: Port) -> usize {
+        match port {
+            Port::Sender(i) => i,
+            Port::Receiver(i) => self.model.senders.len() + i,
+        }
+    }
+
+    fn ports(&self) -> impl Iterator<Item = Port> + use<> {
+        let senders = (0..self.model.senders.len()).map(Port::Sender);
+        senders.chain((0..self.model.receivers.len()).map(Port::Receiver))
+    }
 }
 
 impl Nmos {
     /// Checks the model, derives the ids from `cfg.seed` and sets every
-    /// port's initial state: senders enabled on their flow, receivers
-    /// enabled on their flow when they have one.
-    pub fn new(model: NodeModel, cfg: NmosConfig, clock: impl TaiClock) -> Result<Nmos, Error> {
+    /// port's `/staged` and `/active`: from `store` where it holds the
+    /// port, else senders enabled on their flow and receivers enabled on
+    /// their flow when they have one.
+    pub fn new(
+        model: NodeModel,
+        cfg: NmosConfig,
+        conns: Arc<dyn Connections>,
+        store: &dyn Store,
+        clock: impl TaiClock,
+    ) -> Result<Nmos, Error> {
         check(&model, &cfg)?;
         if let Some(w) = clock.utc_offset().and_then(tai::offset_warning) {
             tracing::warn!("{w}");
@@ -127,6 +175,7 @@ impl Nmos {
             model.senders.iter().map(|s| s.key.as_str()),
             model.receivers.iter().map(|r| r.key.as_str()),
         );
+        let stored = store.load();
         let now = clock.now();
         let mut st = State {
             last_version: Tai::default(),
@@ -139,45 +188,54 @@ impl Nmos {
         st.device_version = st.bump(now);
         let caps_version = st.bump(now);
         for s in &model.senders {
+            let initial = Active {
+                master_enable: true,
+                peer: None,
+                domain: Some(s.domain),
+                flow: Some(s.flow),
+            };
+            let key = PortKey::Sender(s.key.clone());
+            let active = from_store(&stored, &key, s.domain, Some(s.flow)).unwrap_or(initial);
             let state = SenderState {
                 source_version: st.bump(now),
                 flow_version: st.bump(now),
-                version: st.bump(now),
-                active: Active {
-                    master_enable: true,
-                    peer: None,
-                    domain: Some(s.domain),
-                    flow: Some(s.flow),
-                },
+                port: PortState::new(st.bump(now), active),
             };
             st.senders.push(state);
         }
         for r in &model.receivers {
-            let state = ReceiverState {
-                version: st.bump(now),
-                active: Active {
-                    master_enable: r.flow.is_some(),
-                    peer: None,
-                    domain: Some(r.domain),
-                    flow: r.flow,
-                },
+            let initial = Active {
+                master_enable: r.flow.is_some(),
+                peer: None,
+                domain: Some(r.domain),
+                flow: r.flow,
             };
-            st.receivers.push(state);
+            let key = PortKey::Receiver(r.key.clone());
+            let active = from_store(&stored, &key, r.domain, None).unwrap_or(initial);
+            let version = st.bump(now);
+            st.receivers.push(PortState::new(version, active));
         }
+        let ports = model.senders.len() + model.receivers.len();
         Ok(Nmos {
             inner: Arc::new(Inner {
                 cfg,
                 model,
                 ids,
+                conns,
+                clock: Arc::new(clock),
                 caps_version,
                 state: Mutex::new(st),
+                patching: (0..ports).map(|_| tokio::sync::Mutex::new(())).collect(),
+                late: std::sync::OnceLock::new(),
             }),
         })
     }
 
-    /// `/x-nmos/node/v1.3/`, for the product's NMOS listener. Every path
-    /// answers with and without a trailing slash, every response carries
-    /// CORS headers and every `OPTIONS` is a pre-flight.
+    /// `/x-nmos/node/v1.3/` and `/x-nmos/connection/v1.2/`, for the
+    /// product's NMOS listener. Every path answers with and without a
+    /// trailing slash, every response carries CORS headers and every
+    /// `OPTIONS` is a pre-flight. Activations spawn tasks on the runtime
+    /// that serves it.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/", any(handle))
@@ -190,25 +248,114 @@ impl Nmos {
     pub fn node_id(&self) -> Uuid {
         self.inner.ids.node
     }
+
+    /// A change of a port's connection the product made itself, such as a
+    /// switch to another leg: `/active` shows it from now on with a new
+    /// IS-04 version, `/staged` stays as it was, and the activations still
+    /// queued for the port are dropped (a scheduled one still pending
+    /// stays). Returns the change's generation: an apply already running
+    /// carries a lower one, and the product ignores it when it resolves
+    /// after the change; its result no longer changes `/active`.
+    pub fn external_change(&self, port: Port, active: Active) -> u64 {
+        let now = self.inner.clock.now();
+        let mut st = self.inner.lock();
+        let version = st.bump(now);
+        let p = st.port_mut(port);
+        p.active = active;
+        p.version = version;
+        p.applied = Applied::Applied;
+        p.changed_by_product()
+    }
+
+    /// Registers `samplez_nmos_activation_late_seconds{port}`, how long
+    /// after its activation time each scheduled activation was written to
+    /// `/active`, in `metrics`. Once; a second call does nothing.
+    pub fn register_metrics(&self, metrics: &samplez_service::Metrics) {
+        let _ = self.inner.late.set(
+            self.inner
+                .ports()
+                .map(|port| {
+                    let label = match self.inner.key(port) {
+                        PortKey::Sender(k) => format!("sender/{k}"),
+                        PortKey::Receiver(k) => format!("receiver/{k}"),
+                    };
+                    metrics.histogram(
+                        "samplez_nmos_activation_late_seconds",
+                        "How long after its activation time a scheduled IS-05 activation was written to /active.",
+                        &[("port", &label)],
+                        &LATE_BUCKETS,
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    pub fn status(&self) -> NmosStatus {
+        let st = self.inner.lock();
+        NmosStatus {
+            ports: self
+                .inner
+                .ports()
+                .map(|port| {
+                    let p = st.port(port);
+                    PortStatus {
+                        port,
+                        key: self.inner.key(port),
+                        active: p.active.clone(),
+                        pending: p.pending_at(),
+                        applied: p.applied.clone(),
+                        failures: p.failures,
+                        late: p.late,
+                    }
+                })
+                .collect(),
+        }
+    }
 }
 
 async fn handle(
     Extract(inner): Extract<Arc<Inner>>,
     method: Method,
     uri: Uri,
-    _body: Bytes,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     if method == Method::OPTIONS {
-        return http::preflight();
+        return http::preflight(headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS));
     }
     let path = http::segments(uri.path());
     match path.as_slice() {
         [] | ["x-nmos"] if !http::is_get(&method) => http::not_allowed("GET, HEAD"),
         [] => http::ok(&json!(["x-nmos/"])),
-        ["x-nmos"] => http::ok(&json!(["node/"])),
+        ["x-nmos"] => http::ok(&json!(["node/", "connection/"])),
         ["x-nmos", "node", rest @ ..] => node_api::handle(&inner, &method, rest),
+        ["x-nmos", "connection", rest @ ..] => {
+            connection::handle(&inner, &method, rest, &body).await
+        }
         _ => http::not_found(),
     }
+}
+
+/// The stored `/active` of a port when it fits the model: the port's own
+/// domain, a sender's own flow or a receiver's MXL flow, and both where it
+/// is enabled. Anything else is left behind with a warning.
+fn from_store(
+    stored: &BTreeMap<PortKey, Active>,
+    key: &PortKey,
+    domain: Uuid,
+    own_flow: Option<Uuid>,
+) -> Option<Active> {
+    let a = stored.get(key)?;
+    let fits = a.domain.is_none_or(|d| d == domain)
+        && a.flow.is_none_or(|f| match own_flow {
+            Some(own) => f == own,
+            None => ids::is_mxl_uuid(f),
+        })
+        && (!a.master_enable || (a.domain.is_some() && a.flow.is_some()));
+    if !fits {
+        tracing::warn!(?key, stored = ?a, "nmos: the stored connection does not fit the model; the port starts from the model");
+    }
+    fits.then(|| a.clone())
 }
 
 fn check(model: &NodeModel, cfg: &NmosConfig) -> Result<(), Error> {

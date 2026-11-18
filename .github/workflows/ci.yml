@@ -72,6 +72,18 @@ jobs:
                 done
               done
             '
+      # A crates.io release Cargo.lock gains has to be 14 days old, unless
+      # .github/lockfile-age/allow.txt lists it. The base is the PR's base
+      # branch, or main before the push.
+      - name: Lockfile release ages
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 -B .github/lockfile-age/test_check.py
+          git fetch -q --depth 1 origin "$BASE"
+          git show "$BASE:Cargo.lock" > "$RUNNER_TEMP/base.lock"
+          python3 -B .github/lockfile-age/check.py "$RUNNER_TEMP/base.lock" Cargo.lock \
+            .github/lockfile-age/allow.txt
       # deny.toml: the licences every dependency, dev-dependencies
       # included, may carry.
       - name: Dependency licences

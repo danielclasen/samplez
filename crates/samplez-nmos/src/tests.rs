@@ -1,4 +1,7 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
@@ -24,6 +27,114 @@ impl Clock {
 impl TaiClock for Clock {
     fn now(&self) -> Tai {
         *self.0.lock().unwrap()
+    }
+}
+
+/// TAI time on tokio's clock, so a test with paused time drives it: the
+/// base at the tokio instant it was made.
+#[derive(Clone)]
+pub(crate) struct Paused {
+    base: Tai,
+    start: tokio::time::Instant,
+    ahead: Arc<AtomicU64>,
+}
+
+impl Default for Paused {
+    fn default() -> Paused {
+        Paused {
+            base: Tai::new(1_000_000, 0),
+            start: tokio::time::Instant::now(),
+            ahead: Arc::default(),
+        }
+    }
+}
+
+impl TaiClock for Paused {
+    fn now(&self) -> Tai {
+        self.base
+            .after(self.start.elapsed())
+            .after(Duration::from_nanos(self.ahead.load(Ordering::Relaxed)))
+    }
+}
+
+impl Paused {
+    /// Moves the TAI clock ahead of tokio's, as a timer that wakes late
+    /// leaves it.
+    pub fn skip(&self, d: Duration) {
+        self.ahead.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// An apply call: port, target, requested time, the TAI time of the call
+/// and the generation.
+pub(crate) type Call = (Port, Active, Option<Tai>, Tai, u64);
+
+/// A product that records what it is asked to apply and answers from a
+/// queue: each entry is a delay and a result, `Ok` at once when empty.
+/// `done` lists the applies in the order they resolved, with their result.
+#[derive(Default)]
+pub(crate) struct Fake {
+    pub flows: Mutex<HashMap<Uuid, FlowSeen>>,
+    pub lead: Duration,
+    pub apply_timeout: Option<Duration>,
+    pub clock: Paused,
+    pub calls: Mutex<Vec<Call>>,
+    pub results: Mutex<VecDeque<(Duration, Result<(), Fail>)>>,
+    pub done: Arc<Mutex<Vec<(Active, bool)>>>,
+}
+
+impl Fake {
+    /// What a product that takes each successful apply on as it resolves
+    /// ends on.
+    pub fn ends_on(&self) -> Option<Active> {
+        let done = self.done.lock().unwrap();
+        done.iter()
+            .rev()
+            .find(|(_, ok)| *ok)
+            .map(|(a, _)| a.clone())
+    }
+}
+
+impl Connections for Fake {
+    fn resolve(&self, _: Port, flow: Uuid) -> BoxFuture<'_, Result<FlowSeen, Reject>> {
+        let seen = self
+            .flows
+            .lock()
+            .unwrap()
+            .get(&flow)
+            .copied()
+            .unwrap_or(FlowSeen::Absent);
+        Box::pin(async move { Ok(seen) })
+    }
+    fn lead(&self) -> Duration {
+        self.lead
+    }
+    fn apply_timeout(&self) -> Duration {
+        self.apply_timeout.unwrap_or(DEFAULT_APPLY_TIMEOUT)
+    }
+    fn apply(
+        &self,
+        port: Port,
+        active: Active,
+        at: Option<Tai>,
+        generation: u64,
+    ) -> BoxFuture<'_, Result<(), Fail>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((port, active.clone(), at, self.clock.now(), generation));
+        let (delay, result) = self
+            .results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or((Duration::ZERO, Ok(())));
+        let done = self.done.clone();
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            done.lock().unwrap().push((active, result.is_ok()));
+            result
+        })
     }
 }
 
@@ -116,7 +227,14 @@ pub(crate) async fn get(nmos: &Nmos, path: &str) -> Value {
 }
 
 fn node() -> Nmos {
-    Nmos::new(model(), config(), Clock::at(1_000)).unwrap()
+    Nmos::new(
+        model(),
+        config(),
+        Arc::new(Fake::default()),
+        &NoStore,
+        Clock::at(1_000),
+    )
+    .unwrap()
 }
 
 const N: &str = "/x-nmos/node/v1.3";
@@ -125,7 +243,7 @@ const N: &str = "/x-nmos/node/v1.3";
 async fn the_api_roots_list_their_children() {
     let n = node();
     assert_eq!(get(&n, "/").await, json!(["x-nmos/"]));
-    assert_eq!(get(&n, "/x-nmos/").await[0], "node/");
+    assert_eq!(get(&n, "/x-nmos/").await, json!(["node/", "connection/"]));
     assert_eq!(get(&n, "/x-nmos/node/").await, json!(["v1.3/"]));
     let mut base: Vec<String> = serde_json::from_value(get(&n, N).await).unwrap();
     base.sort();
@@ -182,6 +300,23 @@ async fn every_response_carries_cors_and_options_is_a_preflight() {
             .to_str()
             .unwrap()
             .contains("Content-Type")
+    );
+    // A browser controller's pre-flight is allowed the headers it names.
+    let req = Request::builder()
+        .method("OPTIONS")
+        .uri("/x-nmos/connection/v1.2/single/receivers/")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PATCH")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "content-type, x-requested-with",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = n.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "content-type, x-requested-with"
     );
 }
 
@@ -279,7 +414,14 @@ async fn the_node_and_device_advertise_the_apis_and_the_asset_tags() {
 async fn an_ipv6_host_is_bracketed_in_hrefs() {
     let mut cfg = config();
     cfg.advertise_host = "2001:db8::1".into();
-    let n = Nmos::new(model(), cfg, Clock::at(1)).unwrap();
+    let n = Nmos::new(
+        model(),
+        cfg,
+        Arc::new(Fake::default()),
+        &NoStore,
+        Clock::at(1),
+    )
+    .unwrap();
     assert_eq!(
         get(&n, &format!("{N}/self")).await["href"],
         "http://[2001:db8::1]:8081/"
@@ -406,7 +548,7 @@ fn the_model_is_checked() {
     let refuse = |f: &dyn Fn(&mut NodeModel, &mut NmosConfig)| {
         let (mut m, mut c) = (model(), config());
         f(&mut m, &mut c);
-        assert!(Nmos::new(m, c, Clock::at(1)).is_err());
+        assert!(Nmos::new(m, c, Arc::new(Fake::default()), &NoStore, Clock::at(1)).is_err());
     };
     refuse(&|m, _| m.senders.push(m.senders[0].clone()));
     refuse(&|m, _| m.receivers[1].key = "pgm".into());
@@ -438,7 +580,16 @@ fn the_model_is_checked() {
     let mut m = model();
     m.receivers[1].group = "other".into();
     assert_eq!(m.senders[0].group, m.receivers[0].group);
-    assert!(Nmos::new(m, config(), Clock::at(1)).is_ok());
+    assert!(
+        Nmos::new(
+            m,
+            config(),
+            Arc::new(Fake::default()),
+            &NoStore,
+            Clock::at(1)
+        )
+        .is_ok()
+    );
     for ok in ["NSC128", "U64", "LFE", "NSC000"] {
         assert!(symbol_valid(ok), "{ok}");
     }
@@ -495,7 +646,14 @@ fn a_tai_clock_without_the_tai_offset_is_warned_about_at_start() {
     let warnings = |offset| {
         let sub = Arc::new(Warnings(Mutex::new(Vec::new())));
         tracing::subscriber::with_default(sub.clone(), || {
-            Nmos::new(model(), config(), Offset(offset)).unwrap();
+            Nmos::new(
+                model(),
+                config(),
+                Arc::new(Fake::default()),
+                &NoStore,
+                Offset(offset),
+            )
+            .unwrap();
         });
         sub.0.lock().unwrap().clone()
     };
@@ -509,7 +667,14 @@ fn a_tai_clock_without_the_tai_offset_is_warned_about_at_start() {
 #[tokio::test]
 async fn ids_survive_a_restart_with_the_same_seed() {
     let a = node();
-    let b = Nmos::new(model(), config(), Clock::at(2_000)).unwrap();
+    let b = Nmos::new(
+        model(),
+        config(),
+        Arc::new(Fake::default()),
+        &NoStore,
+        Clock::at(2_000),
+    )
+    .unwrap();
     for kind in ["devices", "sources", "flows", "senders", "receivers"] {
         let ids = |v: Value| {
             v.as_array()

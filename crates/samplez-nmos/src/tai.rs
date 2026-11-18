@@ -36,8 +36,16 @@ impl Tai {
         Tai::from_nanos(self.as_nanos() + 1)
     }
 
+    /// `self + d`; panics past the last representable time.
     pub fn after(self, d: Duration) -> Tai {
-        Tai::from_nanos(self.as_nanos() + d.as_nanos())
+        self.checked_after(d)
+            .expect("a TAI time past u64::MAX seconds")
+    }
+
+    /// `self + d`, `None` past the last representable time.
+    pub fn checked_after(self, d: Duration) -> Option<Tai> {
+        let n = self.as_nanos() + d.as_nanos();
+        (n / NANOS as u128 <= u64::MAX as u128).then(|| Tai::from_nanos(n))
     }
 
     /// `self - earlier`, zero when `earlier` is not earlier.
@@ -173,6 +181,13 @@ mod tests {
             Duration::from_millis(200)
         );
         assert_eq!(Tai::new(1, 0).since(Tai::new(2, 0)), Duration::ZERO);
+        let last = Tai::new(u64::MAX, 999_999_999);
+        assert_eq!(last.checked_after(Duration::ZERO), Some(last));
+        assert_eq!(last.checked_after(Duration::from_nanos(1)), None);
+        assert_eq!(
+            Tai::new(1, 0).checked_after(Duration::new(u64::MAX, 0)),
+            None
+        );
     }
 
     #[test]

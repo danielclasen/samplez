@@ -44,8 +44,9 @@ pub(crate) fn not_allowed(allowed: &str) -> Response {
     r
 }
 
-/// The CORS pre-flight answer, the same on every path.
-pub(crate) fn preflight() -> Response {
+/// The CORS pre-flight answer, the same on every path. It allows the
+/// headers the browser asks for, or the usual ones when it names none.
+pub(crate) fn preflight(requested: Option<&HeaderValue>) -> Response {
     let mut r = Response::new(Body::empty());
     let h = r.headers_mut();
     h.insert(
@@ -54,7 +55,9 @@ pub(crate) fn preflight() -> Response {
     );
     h.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static(ALLOW_HEADERS),
+        requested
+            .cloned()
+            .unwrap_or(HeaderValue::from_static(ALLOW_HEADERS)),
     );
     h.insert(
         header::ACCESS_CONTROL_MAX_AGE,
