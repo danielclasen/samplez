@@ -15,7 +15,7 @@ use samplez::blocks::{PAGE, PageHash, StatusChange};
 use samplez::{
     BlockVerdict, CopyError, Engine, Entry, InputState, ProductState, ReplayError, Replication,
 };
-use samplez_dsp::{BandType, CompParams, EqBand, GateParams, StripParam};
+use samplez_dsp::{BandType, CompParams, EqBand, GateParams, Ramp, StripParam};
 
 /// The copy holds the state after block k0: entries due by then applied
 /// with their ramps run out, later ones pending, the input's log state,
@@ -117,6 +117,14 @@ struct Hashed {
 /// Samples of a gain ramp: about two pages, so the pages a ramp runs
 /// over differ from one another.
 const RAMP: u32 = 2048;
+
+/// Waits until the gains of a product core installed after block `j`
+/// have ramped to their targets.
+fn past_fade_in(e: &Engine, j: u64) {
+    wait_for(Duration::from_secs(5), "past the fade-in", || {
+        processed(e) > j + 2 + u64::from(RAMP).div_ceil(B)
+    });
+}
 
 fn hashed(domain: &Domain, src: &str) -> Hashed {
     hashed_with(domain, &[(src, 2)])
@@ -630,12 +638,15 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
         last_id: 0,
     };
     assert_eq!(
-        h.e.install_product(&state, Duration::from_secs(2)),
+        h.e.install_product(&state, 0, Duration::from_secs(2)),
         Err(ReplayError::Missed { id: 65 })
     );
     state.last_id = 65;
-    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
-    // At the targets from the first block on, with no ramp to them.
+    let j =
+        h.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
+    // At the targets once their fade-in ended.
+    past_fade_in(&h.e, j);
     let core = common::copy_core(&h.e).core;
     assert_eq!(
         (core.gain(0, 0), core.gain(1, 1), core.gain(0, 1)),
@@ -691,15 +702,92 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
         pending: Vec::new(),
         last_id: 0,
     };
-    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    let j =
+        h.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
     assert!(
         c.blocks_without_core.load(Relaxed) > 0,
         "the core was held through the product hand-over"
     );
+    past_fade_in(&h.e, j);
     let core = common::copy_core(&h.e).core;
     assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.25, 0.5));
     assert!(processed(&h.e) > j);
     h.e.stop();
+}
+
+/// A product core is installed at the first block at or after the index
+/// its caller names, not before, however soon the RT thread could take
+/// it; and its gains ramp from silence to their targets over the ramp
+/// length from there, as the strips take their parameters, so an output
+/// fades in processed. An index further ahead than the timeout is
+/// refused before the core the RT thread holds is dropped.
+#[test]
+fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let h = hashed(&domain, &src);
+        let c = h.e.counters();
+        let state = ProductState {
+            gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
+            up: vec![true],
+            flows: vec![src.clone()],
+            strips: vec![Vec::new()],
+            pending: Vec::new(),
+            last_id: 0,
+        };
+        let far = processed(&h.e) * B + 10 * 48_000;
+        assert!(matches!(
+            h.e.install_product(&state, far, Duration::from_secs(2)),
+            Err(ReplayError::Invalid(_))
+        ));
+        assert_eq!(
+            c.blocks_without_core.load(Relaxed),
+            0,
+            "the core was dropped"
+        );
+        // 40 blocks ahead, a block start plus a sample: the block after.
+        let at_least = (processed(&h.e) + 40) * B + 1;
+        let passed = c.handovers_passed.load(Relaxed);
+        let j =
+            h.e.install_product(&state, at_least, Duration::from_secs(2))
+                .unwrap();
+        let installed = (j + 1) * B;
+        assert!(
+            installed >= at_least,
+            "installed at {installed}, asked for {at_least}"
+        );
+        // Never more than a second late, whatever the load.
+        assert!(installed < at_least + 48_000, "installed at {installed}");
+        let retries = c.handovers_passed.load(Relaxed) - passed;
+        // The core after block k0 has the matrix at sample (k0 + 1) B: on
+        // the ramp from silence that started at the install.
+        let copy = common::copy_core(&h.e);
+        let at = (copy.k0 + 1) * B - installed;
+        if at >= u64::from(RAMP) {
+            return Err(format!(
+                "copied {at} samples after the install, past the ramp"
+            ));
+        }
+        for (i, target) in [(0, 0.25), (1, 0.5)] {
+            let mut ramp = Ramp::new(0.0);
+            assert!(ramp.set_target(target, RAMP));
+            ramp.advance(at as usize);
+            assert_eq!(
+                copy.core.gain(i, i).to_bits(),
+                ramp.current().to_bits(),
+                "gain {i} -> {i} {at} samples into the fade-in ({retries} retries)"
+            );
+        }
+        assert_eq!(copy.core.gain(0, 1), 0.0);
+        past_fade_in(&h.e, j);
+        let core = common::copy_core(&h.e).core;
+        assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.25, 0.5));
+        h.e.stop();
+        Ok(())
+    });
 }
 
 /// A re-route whose index passes while no core is held is applied once a
@@ -742,7 +830,8 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
         last_id: 1,
     };
     let late = c.command_late.load(Relaxed);
-    h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    h.e.install_product(&state, 0, Duration::from_secs(2))
+        .unwrap();
     wait_for(Duration::from_secs(5), "routed", || {
         let s = h.e.status();
         s.inputs[0].flow_id == other && s.generation.pending.is_none()
@@ -786,11 +875,11 @@ fn a_product_entry_the_install_passed_is_folded_in() {
         last_id: 1,
     };
     let late = c.command_late.load(Relaxed);
-    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    let j =
+        h.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
     assert!(j * B >= at, "installed after block {j}");
-    wait_for(Duration::from_secs(5), "computing", || {
-        processed(&h.e) > j + 5
-    });
+    past_fade_in(&h.e, j);
     let core = common::copy_core(&h.e).core;
     assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.5, 1.0));
     assert_eq!(c.command_late.load(Relaxed), late);
@@ -897,7 +986,9 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
             pending: vec![(1, at, strip)],
             last_id: 1,
         };
-        let j = b.e.install_product(&state, Duration::from_secs(2)).unwrap();
+        let j =
+            b.e.install_product(&state, 0, Duration::from_secs(2))
+                .unwrap();
         b.e.commit(1);
         // After the fade-in from silence the install starts with.
         let from = ((processed(&b.e) + 2) * B).max((j + 1) * B + u64::from(RAMP));
@@ -945,7 +1036,8 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
         pending: Vec::new(),
         last_id: 1,
     };
-    h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    h.e.install_product(&state, 0, Duration::from_secs(2))
+        .unwrap();
     h.e.commit(1);
     wait_for(Duration::from_secs(5), "routed", || {
         let s = h.e.status();
@@ -1032,7 +1124,9 @@ fn a_route_the_core_carried_is_not_applied_again() {
         pending: vec![(1, at, route)],
         last_id: 1,
     };
-    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    let j =
+        h.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
     assert!(
         (j + 1) * B <= at,
         "installed after block {j}, past the route"
@@ -1378,7 +1472,9 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
             pending: Vec::new(),
             last_id: last,
         };
-        let j = b.e.install_product(&state, Duration::from_secs(2)).unwrap();
+        let j =
+            b.e.install_product(&state, 0, Duration::from_secs(2))
+                .unwrap();
         // A slot still on the old flow is silenced from here.
         drop(old);
         let from = ((j + 1) * B + 2 * u64::from(RAMP)).div_ceil(PAGE);
@@ -1493,7 +1589,9 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
         },
         last_id: if sent { 2 } else { 1 },
     };
-    let j = b.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    let j =
+        b.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
     if !sent {
         b.e.commit(2);
     }

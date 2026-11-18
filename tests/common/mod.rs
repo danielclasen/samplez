@@ -824,7 +824,8 @@ pub fn hold_scenario(e: &Engine) {
         // Folds in the entries applied before the drop.
         last_id: id,
     };
-    e.install_product(&state, Duration::from_secs(5)).unwrap();
+    e.install_product(&state, 0, Duration::from_secs(5))
+        .unwrap();
     assert_eq!(e.counters().handovers_installed.load(Ordering::Relaxed), 2);
     through(e);
     wait(processed(e) + 5);

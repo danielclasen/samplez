@@ -388,7 +388,7 @@ impl Audio for EngineAudio {
         let Some(state) = self.rebuild.as_ref().and_then(|r| r()) else {
             return false;
         };
-        match self.engine.install_product(&state, REBUILD_WAIT) {
+        match self.engine.install_product(&state, 0, REBUILD_WAIT) {
             Ok(_) => true,
             Err(e) => {
                 tracing::warn!(error = ?e, "the engine core was not rebuilt");

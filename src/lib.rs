@@ -15,6 +15,7 @@ pub mod engine;
 mod meters;
 pub mod rt;
 mod rt_loop;
+mod targets;
 pub mod transfer;
 
 pub use config::Config;
@@ -25,6 +26,7 @@ pub use engine::{
 pub use meters::{InputMeters, OutputMeters};
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};
 pub use samplez_dsp::MAX_COEFFICIENTS;
+pub use targets::Targets;
 pub use transfer::{
     CopyError, Core, CoreCopy, DecodeError, ENGINE_VERSION, ProductState, Replay, ReplayError,
 };
