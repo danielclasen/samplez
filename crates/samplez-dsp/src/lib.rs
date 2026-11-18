@@ -14,6 +14,7 @@ mod buffer;
 mod dynamics;
 mod history;
 mod kweight;
+mod level;
 mod loudness;
 mod matrix;
 mod meter;
