@@ -1566,9 +1566,11 @@ impl Engine {
     /// before it), so the log entry takes one place on the RT thread's
     /// pending list and its batch is bounded by the engine's shape,
     /// however many entries it has. No entries append nothing. Refused
-    /// whole, nothing appended, when any entry is refused alone or more
-    /// than one `InputUp` or `Route` remains: one generation is built at
-    /// a time. An `InputUp` or `Route` has its generation built at once,
+    /// whole, nothing appended, when any entry is refused alone or the
+    /// slots its `InputUp`s and `Route`s name are of more than one input
+    /// domain: one generation, covering every slot it raises or
+    /// re-routes, is built for a log entry, and one at a time. An
+    /// `InputUp` or `Route` has its generation built at once,
     /// the next once the RT thread swapped in the one before. Committed
     /// log entries go to the RT thread, which applies each whole at its
     /// index, its gains first, or, past it, counts it once in
