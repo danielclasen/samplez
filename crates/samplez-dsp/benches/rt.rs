@@ -2,7 +2,7 @@
 //! by Gungraun (`cargo bench --bench rt`). Each benchmark processes one
 //! block of B = 48 samples at the largest shape measured here, 64 input
 //! channels to 96 output channels, on both dispatch paths, with every
-//! coefficient ramping; the strips, 64 mono ones, the meters of the 64
+//! coefficient ramping, undocked and ducked; the strips, 64 mono ones, the meters of the 64
 //! input channels after them and eight duck detectors keyed by them have
 //! one path. It also
 //! gates the RT parts of a resync at that shape: the matrix copy of the
@@ -18,8 +18,8 @@ use samplez_dsp::duck::MAX_KEYS;
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
     CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams, History,
-    KWeighting, KeyFilter, Matrix, Path, PlanarBuffer, Started, Strip, StripParam, TruePeak,
-    accumulate,
+    KWeighting, KeyFilter, MAX_DUCKS, Matrix, Path, PlanarBuffer, Started, Strip, StripParam,
+    TruePeak, accumulate,
 };
 
 const B: usize = 48;
@@ -67,6 +67,47 @@ fn matrix(
 
 fn setup_matrix(path: Path) -> (Path, (Matrix, PlanarBuffer, PlanarBuffer)) {
     (path, ramping_matrix())
+}
+
+/// The ramping matrix with every coefficient ducked by all eight
+/// detectors, their depths ramping and every mask crossfading, with the
+/// detectors' envelopes moving.
+fn ducked_matrix() -> (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer) {
+    let (mut m, input, output) = ramping_matrix();
+    for i in 0..INPUTS {
+        for g in 0..MAX_DUCKS {
+            assert!(m.set_depth(i, g, 10.0 + g as f32, 0));
+            assert!(m.set_depth(i, g, 20.0, 480));
+        }
+        for j in 0..OUTPUTS {
+            assert!(m.set_mask(i, j, 0x0f, 0));
+            assert!(m.set_mask(i, j, 0xff, 480));
+        }
+    }
+    let mut env = PlanarBuffer::new(MAX_DUCKS, B);
+    for g in 0..MAX_DUCKS {
+        for (n, e) in env.channel_mut(g).iter_mut().enumerate() {
+            *e = (n + g) as f32 / (B + MAX_DUCKS) as f32;
+        }
+    }
+    (m, input, env, output)
+}
+
+#[library_benchmark]
+#[bench::scalar(args = (Path::Scalar,), setup = setup_ducked, config = limit(DUCKED_SCALAR))]
+#[bench::avx2(args = (Path::Avx2,), setup = setup_ducked, config = limit(DUCKED_AVX2))]
+fn matrix_ducked(
+    (path, (mut m, input, env, mut output)): (
+        Path,
+        (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer),
+    ),
+) -> (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer) {
+    m.process_ducked_on(path, black_box(&input), black_box(&env), &mut output, B);
+    (m, input, env, output)
+}
+
+fn setup_ducked(path: Path) -> (Path, (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer)) {
+    (path, ducked_matrix())
 }
 
 // The output meters of one block: true peak and K-weighting over every
@@ -286,6 +327,8 @@ const CORE_COPY: u64 = 26_000;
 const HISTORY_BLOCK: u64 = 45_000;
 const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
+const DUCKED_SCALAR: u64 = 15_184_000;
+const DUCKED_AVX2: u64 = 4_393_000;
 const METERS_SCALAR: u64 = 1_118_000;
 const METERS_AVX2: u64 = 303_000;
 const INPUT_METERS: u64 = 152_623;
@@ -298,7 +341,15 @@ const DUCK_ADVANCE: u64 = 4_065;
 
 library_benchmark_group!(
     name = block,
-    benchmarks = [matrix, meters, input_meters, strip, duck, duck_advance]
+    benchmarks = [
+        matrix,
+        matrix_ducked,
+        meters,
+        input_meters,
+        strip,
+        duck,
+        duck_advance
+    ]
 );
 library_benchmark_group!(name = transfer, benchmarks = [core_copy, history]);
 

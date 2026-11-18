@@ -31,7 +31,7 @@ mod test_util;
 mod true_peak;
 
 pub use buffer::{MAX_FRAMES, PlanarBuffer};
-pub use duck::{Detector, DetectorParams, DuckMode, DuckParam, KeyFilter, duck_gain};
+pub use duck::{Detector, DetectorParams, DuckMode, DuckParam, KeyFilter, MAX_DUCKS, duck_gain};
 pub use history::{History, Started};
 pub use kweight::KWeighting;
 pub use loudness::{Loudness, SLICE, WINDOW, lufs, weight};

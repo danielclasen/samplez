@@ -2,12 +2,17 @@
 //! computes, per sample, the operations of [`mix_scalar`] in the same
 //! order: acc = +0.0, then acc = acc + g * x per term in ascending input
 //! order, with the gain g = c0 + k * step inside a ramp and g = target
-//! outside it.
+//! outside it. The ducked kernel computes those of
+//! [`crate::matrix::mix_ducked_scalar`] over one interval, the gain of a
+//! ducked term times `from + (p + 1) * step` at position `p` of it.
 
 use std::arch::x86_64::*;
 
-use crate::PlanarBuffer;
-use crate::matrix::{Term, mix_scalar};
+use crate::matrix::{Duck, Ducking, Memo, Term, mix_scalar};
+use crate::{PlanarBuffer, Ramp};
+
+// One interval of the duck gain per vector.
+const _: () = assert!(crate::dynamics::GAIN_INTERVAL == 8);
 
 /// Mixes `terms` from `input` into `out` with AVX2.
 #[target_feature(enable = "avx2")]
@@ -63,6 +68,59 @@ fn block_avx2<const U: usize>(terms: &[Term], input: &PlanarBuffer, out: &mut [f
         // SAFETY: `o` holds 8 * U samples.
         unsafe { _mm256_storeu_ps(o.as_mut_ptr().add(8 * u), *a) };
     }
+}
+
+/// The coefficient of `r` at samples `n..n + 8` of the block.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn coefficient(r: &Ramp, n: usize) -> __m256 {
+    if !r.is_active() {
+        return _mm256_set1_ps(r.target);
+    }
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let k = _mm256_add_epi32(_mm256_set1_epi32((r.pos as usize + n) as i32), lane);
+    let step = _mm256_set1_ps(r.step);
+    let ramp = _mm256_add_ps(
+        _mm256_set1_ps(r.c0),
+        _mm256_mul_ps(_mm256_cvtepi32_ps(k), step),
+    );
+    let inside = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(r.len as i32), k));
+    _mm256_blendv_ps(_mm256_set1_ps(r.target), ramp, inside)
+}
+
+/// The interval of samples `n..n + 8` of one output with ducks, `ducks`
+/// the duck of each term `ducked` in order; each duck moves into the next
+/// interval after its last sample.
+#[target_feature(enable = "avx2")]
+pub(crate) fn ducked_interval_avx2(
+    terms: &[Term],
+    ducks: &mut [Duck],
+    memo: &mut [Memo],
+    ducking: &Ducking,
+    input: &PlanarBuffer,
+    out: &mut [f32],
+    n: usize,
+) {
+    let position = _mm256_setr_ps(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0);
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    for t in terms {
+        let mut g = coefficient(&t.ramp, n);
+        if t.ducked {
+            let d = &mut ducks[i];
+            i += 1;
+            let step = _mm256_set1_ps(d.step());
+            let duck = _mm256_add_ps(_mm256_set1_ps(d.from), _mm256_mul_ps(position, step));
+            g = _mm256_mul_ps(g, duck);
+            ducking.retarget(memo, d, t.input, t.mask, n + 7);
+        }
+        let x = &input.channel(t.input)[n..n + 8];
+        // SAFETY: `x` holds 8 samples.
+        let v = unsafe { _mm256_loadu_ps(x.as_ptr()) };
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(g, v));
+    }
+    // SAFETY: `out` holds samples `n..n + 8`.
+    unsafe { _mm256_storeu_ps(out[n..n + 8].as_mut_ptr(), acc) };
 }
 
 /// AVX2 kernel of [`crate::true_peak`]: 8 consecutive outputs of one phase

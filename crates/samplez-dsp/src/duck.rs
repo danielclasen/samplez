@@ -56,6 +56,9 @@ use crate::{MAX_GAIN, MAX_RAMP_LEN};
 
 /// Most trigger inputs a detector keys from.
 pub const MAX_KEYS: usize = 8;
+/// Most detectors a [`Matrix`](crate::Matrix) ducks by: a duck mask has
+/// one bit per detector.
+pub const MAX_DUCKS: usize = 8;
 /// Threshold, dBFS.
 pub const THRESHOLD_DB: RangeInclusive<f32> = -60.0..=0.0;
 /// Hysteresis below the threshold while engaged, dB.

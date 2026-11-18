@@ -8,8 +8,8 @@ use samplez_dsp::duck::MAX_KEYS;
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
     BandType, CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams,
-    KWeighting, KeyFilter, Loudness, Matrix, Meters, Path, PlanarBuffer, Ramp, Strip, StripParam,
-    TruePeak, duck_gain, restore_mxcsr, set_ftz_daz,
+    KWeighting, KeyFilter, Loudness, MAX_DUCKS, Matrix, Meters, Path, PlanarBuffer, Ramp, Strip,
+    StripParam, TruePeak, duck_gain, restore_mxcsr, set_ftz_daz,
 };
 
 #[path = "../src/require.rs"]
@@ -76,6 +76,13 @@ fn process_calls_do_not_allocate() {
         .iter()
         .flat_map(|&p| [(p, Matrix::new(n, m)), (p, sparse.clone())])
         .collect();
+    let mut core = Matrix::new(n, m);
+    let mut envelopes = PlanarBuffer::new(MAX_DUCKS, cap);
+    for g in 0..MAX_DUCKS {
+        for (k, e) in envelopes.channel_mut(g).iter_mut().enumerate() {
+            *e = ((g * 13 + k) % 50) as f32 / 49.0;
+        }
+    }
     let mut scratch = vec![0.0f32; cap];
     let mut strips: Vec<Strip> = [1, 2, 6, 8].map(|legs| Strip::new(legs, 480)).into();
     let mut strip_buf = vec![0.0f32; 8 * cap];
@@ -98,10 +105,19 @@ fn process_calls_do_not_allocate() {
                     };
                     let len = if (i + j) % 3 == 0 { 0 } else { 300 };
                     assert!(matrix.set(i, j, if round == 7 { 0.0 } else { c }, len));
+                    // Masks set, changed and cleared, crossfading while
+                    // ducked.
+                    let mask = ((round * 3 + i + j) % 5) as u8 * 51;
+                    assert!(matrix.set_mask(i, j, mask, len));
                 }
+                assert!(matrix.set_depth(j % n, j % MAX_DUCKS, (round * 5) as f32, 300));
             }
             assert!(matrix.set(0, 1, 1.0, 0));
+            matrix.process_ducked_on(*path, &input, &envelopes, &mut output, frames);
             matrix.process_on(*path, &input, &mut output, frames);
+            matrix.advance(frames);
+            matrix.align(round as u64 * 1000 + 3);
+            core.copy_from(matrix);
             meters.process(&output, frames);
             let mut power = 0.0;
             for ch in 0..m {
