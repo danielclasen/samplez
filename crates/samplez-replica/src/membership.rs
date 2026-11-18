@@ -529,8 +529,8 @@ async fn start(
 
 /// The learners that may be promoted: caught up to `applied`, by the
 /// index `of` gives as matched, and known to hold this replica's product
-/// configuration, which `of` says too: a learner of another one applies
-/// the log into another state.
+/// configuration and to speak its log protocol, which `of` says too
+/// ([`crate::contact::Contact::learner_promotable`]).
 fn promotable(
     learners: &BTreeSet<NodeId>,
     applied: u64,
@@ -579,7 +579,7 @@ pub(crate) async fn reconcile(shared: Arc<Shared>, want: Voters) {
             let holds = shared
                 .contact
                 .get()
-                .is_none_or(|c| c.learner_holds_set_config(id));
+                .is_none_or(|c| c.learner_promotable(id));
             (matched, holds)
         });
         let Some(change) = plan(&voters, &learners, &caught_up, want) else {

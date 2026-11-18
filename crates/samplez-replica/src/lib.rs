@@ -57,7 +57,8 @@ use tokio::time::Instant;
 use crate::bootstrap::Bootstrap;
 use crate::dedup::Limits;
 use crate::entry::{
-    Batch, Body, Command, NodeId, Origin, Outcome, Request, Response, SessionKey, stamping_index,
+    Batch, Body, Command, NodeId, Origin, Outcome, PROTOCOL, Request, Response, SessionKey,
+    stamping_index,
 };
 use crate::log_store::Store;
 use crate::membership::{Slot, Voters, slot_of};
@@ -181,6 +182,15 @@ pub(crate) struct Shared {
     /// it stands ([`Product::reroutes`]), for a product that drives an
     /// engine; read under the store lock.
     reroutes: Box<dyn Fn(&Command) -> bool + Send + Sync>,
+    /// Whether the decidable entry at a log index re-routed an input, or,
+    /// with `pending`, is an engine body that raises or re-routes one: a
+    /// decision on it needs a generation. Read under the store lock.
+    rerouted: Box<dyn Fn(u64, bool) -> bool + Send + Sync>,
+    /// Set while a writer appends [`Body::Protocol`], so it is appended
+    /// once.
+    marking: AtomicBool,
+    /// [`state_machine::StateMachine::protocol`] as applied here.
+    protocol: Box<dyn Fn() -> u32 + Send + Sync>,
     raft: Raft<TypeConfig>,
     peers: Arc<dyn PeerClient>,
     /// The longest a leader goes without a quorum, and a follower without
@@ -356,12 +366,29 @@ impl<P: Product> Replica<P> {
                         })
                 })
             },
+            rerouted: {
+                let store = store.clone();
+                Box::new(move |index, pending| {
+                    store.with_state(|sm| {
+                        sm.derived
+                            .get(&index)
+                            .is_some_and(|slots| !slots.is_empty())
+                            || (pending
+                                && sm.pending.get(&index).is_some_and(Body::needs_generation))
+                    })
+                })
+            },
+            protocol: {
+                let store = store.clone();
+                Box::new(move || store.with_state(|sm| sm.protocol))
+            },
             raft,
             peers,
             lease: Duration::from_millis(raft_config.election_timeout_max),
             heartbeat: Duration::from_millis(raft_config.heartbeat_interval),
             quiescing: AtomicBool::new(false),
             proposing: AtomicUsize::new(0),
+            marking: AtomicBool::new(false),
             revision: {
                 let store = store.clone();
                 Box::new(move || store.with_state(|sm| sm.revision))
@@ -716,6 +743,82 @@ impl Shared {
         }
     }
 
+    /// The generation flag the leader writes for what it classified as
+    /// `generation`: `Some` only while the protocol gate is open
+    /// ([`contact::Contact::protocol_blocker`]) and the state holds
+    /// [`PROTOCOL`], else `None`, which every binary applies alike. The
+    /// first time the gate is open it appends [`Body::Protocol`] at
+    /// `stamp` and flags only once that applied, so the marker precedes
+    /// every flag in the log.
+    async fn flag(&self, generation: bool, stamp: u64) -> Option<bool> {
+        let contact = self.contact.get()?;
+        // The membership as applied now, not as contact's last tick saw it.
+        // A member added after this read and before the entry is written
+        // still receives it. A binary of an older protocol among those
+        // never applies the flag: the marker precedes every flag in the
+        // log and it cannot decode the marker, nor install a snapshot of a
+        // log past it (`snapshot::StoredSnapshot`). From its first report
+        // on it shuts the gate.
+        let members = contact::Members::of(&self.raft.metrics().borrow());
+        if let Some(blocker) = contact.protocol_blocker(&members) {
+            tracing::debug!(?blocker, "protocol gate shut: no generation flag");
+            return None;
+        }
+        if (self.protocol)() < PROTOCOL {
+            // Another writer appending it: unflagged until it applied.
+            if self
+                .marking
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return None;
+            }
+            let marker = Request {
+                stamp,
+                body: Body::Protocol(PROTOCOL),
+            };
+            let written =
+                tokio::time::timeout(self.settings.write_timeout, self.raft.client_write(marker))
+                    .await;
+            self.marking.store(false, Ordering::SeqCst);
+            if !matches!(written, Ok(Ok(_))) {
+                return None;
+            }
+            tracing::info!(protocol = PROTOCOL, "protocol gate opened");
+        }
+        Some(generation)
+    }
+
+    /// Flags a decision on an entry that re-routed or raised an input for
+    /// its generation, from this leader's own state, whatever the body
+    /// carried: it re-asserts that entry on the generation path.
+    async fn classify(&self, body: &mut Body, estimate: &Estimate) {
+        // A restamp moves a pending engine body to its index; a void drops
+        // it, re-asserting only a product entry's effect.
+        let pending = matches!(body, Body::Restamp { .. });
+        if let Body::Restamp {
+            revision,
+            generation,
+            ..
+        }
+        | Body::Void {
+            revision,
+            generation,
+            ..
+        } = body
+        {
+            *generation = None;
+            // No estimate, no stamp for the marker: unflagged.
+            if (self.rerouted)(*revision, pending)
+                && let Some(e) = self.e(estimate)
+            {
+                *generation = self
+                    .flag(true, stamping_index(e, self.settings.block))
+                    .await;
+            }
+        }
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
@@ -856,6 +959,8 @@ impl Shared {
     ) -> Result<(), Refused> {
         loop {
             if let Some(_proposing) = self.propose() {
+                let mut body = body.clone();
+                self.classify(&mut body, estimate).await;
                 let stamped = self.stamp(body.needs_generation(), estimate);
                 let stamp = match stamped {
                     Ok(stamp) => stamp,
@@ -869,7 +974,6 @@ impl Shared {
                     }
                     Err(refusal) => return Err(stamp_refused(refusal)),
                 };
-                let mut body = body;
                 // A later index asked for is kept.
                 if let Some(at) = body.at_index() {
                     state_machine::restamp(&mut body, at.max(stamp.earliest));
@@ -953,7 +1057,7 @@ impl Shared {
                         return;
                     }
                 };
-                let written = self.write_locally(items, stamp, estimate).await;
+                let written = self.write_locally(items, stamp, estimate, generation).await;
                 drop(proposing);
                 match written {
                     Ok(()) => return,
@@ -984,13 +1088,16 @@ impl Shared {
         }
     }
 
-    /// Appends `items` as one entry stamped `stamp` and answers them;
-    /// gives them back when this replica turned out not to lead.
+    /// Appends `items` as one entry stamped `stamp` and answers them,
+    /// each flagged as this leader classified them, `generation`, whatever
+    /// a forwarding replica set; gives them back when this replica turned
+    /// out not to lead.
     async fn write_locally(
         &self,
         items: Vec<Item>,
         stamp: contact::Stamp,
         estimate: &Estimate,
+        generation: bool,
     ) -> Result<(), Vec<Item>> {
         // A member of another configuration would apply them into another
         // product state.
@@ -1027,6 +1134,7 @@ impl Shared {
         if items.is_empty() {
             return Ok(());
         }
+        let flag = self.flag(generation, stamp.stamp).await;
         let mut batch = Batch::default();
         let latest = items
             .iter()
@@ -1037,6 +1145,7 @@ impl Shared {
             .iter()
             .map(|item| {
                 let mut command = item.command.clone();
+                command.generation = flag;
                 // A later index asked for is kept, an earlier or absent one
                 // is the earliest.
                 if self.contact.get().is_some() {
@@ -1159,9 +1268,11 @@ fn answer_all(items: Vec<Item>, refused: Refused) -> Result<(), Vec<Item>> {
 /// that would re-route an input ([`Product::reroutes`]) ends the group
 /// before it and is ordered alone, stamped for its generation. On a
 /// follower the group is forwarded to the leader instead, one group at a
-/// time, so the order holds there too. The generation-needing entries the
-/// replica set decides on have a writer of their own, so one waiting for
-/// the previous generation's index holds no command.
+/// time, so the order holds there too. A re-routing command waiting for
+/// the previous generation's index holds every command queued behind it,
+/// as does a decision that re-asserts a re-route. The `InputUp` and
+/// `Route` entries the replica set decides on have a writer of their own,
+/// so one of those waiting holds no command.
 ///
 /// A first cut: one entry is in flight at a time and the writer waits for
 /// it to commit and apply here before it proposes the next, so the

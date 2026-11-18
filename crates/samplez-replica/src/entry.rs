@@ -167,13 +167,27 @@ pub enum Body {
         term: u64,
         at_index: u64,
         paths: Vec<String>,
+        /// `Some(true)` when the entry it names re-routed or raised an
+        /// input, so it is ordered on the generation path; `None` from a
+        /// leader that did not classify it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<bool>,
     },
-    /// Drops the unresolved entry at log index `revision` of term `term`
-    /// unapplied. One naming an id the log does not hold at that index
-    /// changes no state; it resolves the id where a replica holds it.
+    /// Resolves the unresolved entry at log index `revision` of term
+    /// `term`: an engine body is dropped unapplied, a product entry, whose
+    /// effect the state holds, is re-asserted at `at_index`. One naming an
+    /// id the log does not hold at that index changes no state; it
+    /// resolves the id where a replica holds it.
     Void {
         revision: u64,
         term: u64,
+        /// Stamped by the leader like a restamp's; `None` from an older
+        /// leader, which stamps none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at_index: Option<u64>,
+        /// As [`Body::Restamp`]'s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<bool>,
     },
     ClockVerdict {
         replica: NodeId,
@@ -202,6 +216,10 @@ pub enum Body {
     LeaseExpiry {
         session: SessionKey,
         renewed: u64,
+        /// Stamped by the leader like a command's; `None` from an older
+        /// leader, which stamps none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at_index: Option<u64>,
     },
     InputDown {
         slot: u32,
@@ -221,12 +239,33 @@ pub enum Body {
         enabled: bool,
         at_index: u64,
     },
+    /// The protocol the leader writes from here on, [`PROTOCOL`]: appended
+    /// once, before the first generation flag. A binary of an older
+    /// protocol cannot decode it, so it stops rather than apply such a
+    /// flag as one it does not know.
+    Protocol(u32),
 }
 
+/// The log protocol this binary writes and applies: 2 adds the
+/// generation flags ([`Command::generation`]), which a binary of
+/// protocol 1 ignores.
+pub const PROTOCOL: u32 = 2;
+
 impl Body {
-    /// An entry whose generation every replica builds on receipt.
+    /// An entry whose generation every replica builds on receipt: an
+    /// input raised or re-routed, a decision flagged so, or commands one
+    /// of which the leader ordered on the generation path. A new leader
+    /// learns the pending generation from these; one written while the
+    /// protocol gate was shut carries no flag and is not counted.
     pub fn needs_generation(&self) -> bool {
-        matches!(self, Body::InputUp { .. } | Body::Route { .. })
+        match self {
+            Body::InputUp { .. } | Body::Route { .. } => true,
+            Body::Restamp { generation, .. } | Body::Void { generation, .. } => {
+                *generation == Some(true)
+            }
+            Body::Commands(commands) => commands.iter().any(|c| c.generation == Some(true)),
+            _ => false,
+        }
     }
 
     /// The engine index the entry takes effect at, for the entries the
@@ -238,6 +277,7 @@ impl Body {
             | Body::Route { at_index, .. }
             | Body::MasterEnable { at_index, .. }
             | Body::Restamp { at_index, .. } => Some(*at_index),
+            Body::Void { at_index, .. } | Body::LeaseExpiry { at_index, .. } => *at_index,
             _ => None,
         }
     }
@@ -246,7 +286,7 @@ impl Body {
     /// names.
     pub fn decides(&self) -> Option<(u64, u64)> {
         match self {
-            Body::Restamp { revision, term, .. } | Body::Void { revision, term } => {
+            Body::Restamp { revision, term, .. } | Body::Void { revision, term, .. } => {
                 Some((*revision, *term))
             }
             _ => None,
@@ -340,4 +380,125 @@ pub mod bytes {
 /// `ceil(e / block) * block`: an estimate rounded up to a block boundary.
 pub fn stamping_index(e: u64, block: u64) -> u64 {
     e.div_ceil(block) * block
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`Body`] as a binary of protocol 1 decodes it: no `Protocol`, and
+    /// none of the flags or stamps protocol 2 adds.
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    enum Protocol1 {
+        Commands(Vec<serde_json::Value>),
+        Baseline(Baseline),
+        Restamp {
+            revision: u64,
+            term: u64,
+            at_index: u64,
+            paths: Vec<String>,
+        },
+        Void {
+            revision: u64,
+            term: u64,
+        },
+        ClockVerdict {
+            replica: NodeId,
+            judged: bool,
+        },
+        Diverged {
+            replica: NodeId,
+            page: u64,
+        },
+        PurgePoint {
+            replica: NodeId,
+            index: u64,
+        },
+        Disrupt(Option<Disruption>),
+        LeaseRenew(Vec<SessionKey>),
+        LeaseExpiry {
+            session: SessionKey,
+            renewed: u64,
+        },
+        InputDown {
+            slot: u32,
+            at_index: u64,
+        },
+        InputUp {
+            slot: u32,
+            at_index: u64,
+        },
+        Route {
+            at_index: u64,
+            body: String,
+        },
+        MasterEnable {
+            enabled: bool,
+            at_index: u64,
+        },
+    }
+
+    /// A binary of protocol 1 reads the stamps and flags protocol 2 adds
+    /// as unknown fields, and fails on the marker: it stops at the first
+    /// entry it cannot apply alike instead of applying flags it ignores.
+    #[test]
+    fn a_protocol_1_binary_fails_on_the_marker() {
+        let decode =
+            |body: Body| serde_json::from_slice::<Protocol1>(&serde_json::to_vec(&body).unwrap());
+        let void = Body::Void {
+            revision: 3,
+            term: 1,
+            at_index: Some(960),
+            generation: Some(true),
+        };
+        assert!(matches!(
+            decode(void),
+            Ok(Protocol1::Void { revision: 3, .. })
+        ));
+        let expiry = Body::LeaseExpiry {
+            session: SessionKey::from_parts("p", "s"),
+            renewed: 0,
+            at_index: Some(960),
+        };
+        assert!(decode(expiry).is_ok());
+        assert!(decode(Body::Protocol(PROTOCOL)).is_err());
+    }
+
+    /// The entries the leader flagged for a generation need one, so a
+    /// leader that only appended them learns the pending generation.
+    #[test]
+    fn flagged_entries_need_a_generation() {
+        let command = |generation| Command {
+            origin: Origin {
+                principal: "p".into(),
+                session: "s".into(),
+                role: samplez_service::Role::Operator,
+                connection: "c".into(),
+            },
+            id: "1".into(),
+            at_index: Some(960),
+            body: Vec::new(),
+            generation,
+        };
+        for (generation, needs) in [(None, false), (Some(false), false), (Some(true), true)] {
+            let commands = Body::Commands(vec![command(Some(false)), command(generation)]);
+            assert_eq!(commands.needs_generation(), needs);
+            let restamp = Body::Restamp {
+                revision: 1,
+                term: 1,
+                at_index: 960,
+                paths: Vec::new(),
+                generation,
+            };
+            assert_eq!(restamp.needs_generation(), needs);
+            let void = Body::Void {
+                revision: 1,
+                term: 1,
+                at_index: Some(960),
+                generation,
+            };
+            assert_eq!(void.needs_generation(), needs);
+        }
+    }
 }
