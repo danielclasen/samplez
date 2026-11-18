@@ -85,7 +85,7 @@ impl Connections for Absent {
     fn lead(&self) -> Duration {
         Duration::ZERO
     }
-    fn apply(&self, _: Port, _: Active, _: Option<Tai>) -> BoxFuture<'_, Result<(), Fail>> {
+    fn apply(&self, _: Port, _: Active, _: Option<Tai>, _: u64) -> BoxFuture<'_, Result<(), Fail>> {
         Box::pin(async { Ok(()) })
     }
 }

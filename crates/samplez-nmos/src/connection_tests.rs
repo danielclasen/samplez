@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use axum::http::{StatusCode, header};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::tests::{Clock, DOMAIN, Fake, IN_FLOW, OUT_FLOW, call, config, get, model};
+use crate::tests::{Clock, DOMAIN, Fake, IN_FLOW, OUT_FLOW, Paused, call, config, get, model};
 use crate::*;
 
 const C: &str = "/x-nmos/connection/v1.2";
@@ -17,7 +19,7 @@ fn node_with(fake: Arc<Fake>, store: &dyn Store, clock: impl TaiClock) -> Nmos {
 }
 
 fn node(fake: &Arc<Fake>) -> Nmos {
-    node_with(fake.clone(), &NoStore, SystemTai)
+    node_with(fake.clone(), &NoStore, fake.clock.clone())
 }
 
 fn sender(n: &Nmos) -> String {
@@ -55,12 +57,12 @@ fn leg(v: &Value) -> &Value {
     &v["transport_params"][0]
 }
 
-/// Waits for the spawned apply tasks to settle.
+/// Lets the spawned apply tasks run; time is paused, so nothing waits.
 async fn settle() {
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_connection_api_lists_its_endpoints() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -131,7 +133,7 @@ async fn the_connection_api_lists_its_endpoints() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn constraints_name_the_own_domain_and_never_auto() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -153,7 +155,7 @@ async fn constraints_name_the_own_domain_and_never_auto() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn staged_and_active_start_from_the_model() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -202,7 +204,7 @@ impl Store for Stored {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stored_active_is_where_staged_and_active_start() {
     let stored = Active {
         master_enable: false,
@@ -211,7 +213,7 @@ async fn a_stored_active_is_where_staged_and_active_start() {
         flow: Some(OTHER),
     };
     let store = Stored(BTreeMap::from([(PortKey::Receiver("pgm".into()), stored)]));
-    let n = node_with(Arc::new(Fake::default()), &store, SystemTai);
+    let n = node_with(Arc::new(Fake::default()), &store, Paused::default());
     let r = receiver(&n, 0);
     for v in [
         staged(&n, "receivers", &r).await,
@@ -236,7 +238,7 @@ async fn a_stored_active_is_where_staged_and_active_start() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn staging_refuses_what_the_schemas_and_constraints_refuse() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -326,7 +328,7 @@ async fn staging_refuses_what_the_schemas_and_constraints_refuse() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn staging_accepts_null_auto_and_peers_and_merges_into_staged() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -387,7 +389,7 @@ async fn staging_accepts_null_auto_and_peers_and_merges_into_staged() {
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_immediate_activation_writes_active_resolved_then_applies() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -443,7 +445,7 @@ async fn an_immediate_activation_writes_active_resolved_then_applies() {
     assert_eq!(n.status().ports[0].applied, Applied::Applied);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn activations_re_apply_unchanged_settings() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -461,7 +463,7 @@ async fn activations_re_apply_unchanged_settings() {
     assert_eq!(fake.calls.lock().unwrap().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_activation_that_cannot_be_applied_is_refused_before_active_changes() {
     let fake = Arc::new(Fake::default());
     fake.flows.lock().unwrap().insert(
@@ -470,7 +472,6 @@ async fn an_activation_that_cannot_be_applied_is_refused_before_active_changes()
             channels: 3,
             rate: 48_000,
             float32: true,
-            active: true,
         },
     );
     let n = node(&fake);
@@ -499,14 +500,13 @@ async fn an_activation_that_cannot_be_applied_is_refused_before_active_changes()
     assert_eq!(fake.calls.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_staged_flow_is_checked_against_the_caps() {
     let fake = Arc::new(Fake::default());
     let seen = |channels, rate, float32| FlowSeen::Present {
         channels,
         rate,
         float32,
-        active: false,
     };
     let flows = [
         (
@@ -570,7 +570,7 @@ async fn a_staged_flow_is_checked_against_the_caps() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_failed_apply_turns_master_enable_false_with_a_new_version() {
     let fake = Arc::new(Fake::default());
     fake.results
@@ -596,7 +596,7 @@ async fn a_failed_apply_turns_master_enable_false_with_a_new_version() {
     assert_eq!(status.failures, 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_late_failure_of_a_replaced_activation_changes_nothing() {
     let fake = Arc::new(Fake::default());
     {
@@ -618,9 +618,107 @@ async fn a_late_failure_of_a_replaced_activation_changes_nothing() {
     );
     assert_eq!(n.status().ports[1].applied, Applied::Applied);
     assert_eq!(n.status().ports[1].failures, 0);
+    // The product got the second activation only once the first resolved,
+    // and ends on it.
+    let done: Vec<_> = fake
+        .done
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(a, ok)| (a.flow, *ok))
+        .collect();
+    assert_eq!(done, [(Some(OTHER), false), (Some(IN_FLOW), true)]);
+    assert_eq!(fake.ends_on().and_then(|a| a.flow), Some(IN_FLOW));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn applies_reach_the_product_in_activation_order() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut results = fake.results.lock().unwrap();
+        results.push_back((Duration::from_millis(50), Ok(())));
+        results.push_back((Duration::from_millis(10), Ok(())));
+        results.push_back((Duration::ZERO, Ok(())));
+    }
+    let n = node(&fake);
+    let r = receiver(&n, 0);
+    for flow in [OTHER, IN_FLOW, OTHER] {
+        let body = json!({ "transport_params": [{ "mxl_flow_id": flow }], "activation": { "mode": "activate_immediate" } });
+        assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    }
+    // Only the first is with the product while it takes its time.
+    settle().await;
+    assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let calls = fake.calls.lock().unwrap().clone();
+    let flows: Vec<_> = calls.iter().map(|c| c.1.flow).collect();
+    assert_eq!(flows, [Some(OTHER), Some(IN_FLOW), Some(OTHER)]);
+    assert!(calls.windows(2).all(|w| w[0].4 < w[1].4), "{calls:?}");
+    let done: Vec<_> = fake
+        .done
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(a, _)| a.flow)
+        .collect();
+    assert_eq!(done, flows);
+    assert_eq!(
+        Some(leg(&active(&n, "receivers", &r).await)["mxl_flow_id"].clone()),
+        fake.ends_on().map(|a| json!(a.flow))
+    );
+    assert_eq!(n.status().ports[1].applied, Applied::Applied);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_apply_is_a_failed_one() {
+    struct Panics;
+    impl Connections for Panics {
+        fn resolve(&self, _: Port, _: Uuid) -> BoxFuture<'_, Result<FlowSeen, Reject>> {
+            Box::pin(async { Ok(FlowSeen::Absent) })
+        }
+        fn lead(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn apply(
+            &self,
+            _: Port,
+            _: Active,
+            _: Option<Tai>,
+            _: u64,
+        ) -> BoxFuture<'_, Result<(), Fail>> {
+            Box::pin(async { panic!("the product broke") })
+        }
+    }
+    let n = Nmos::new(
+        model(),
+        config(),
+        Arc::new(Panics),
+        &NoStore,
+        Paused::default(),
+    )
+    .unwrap();
+    let r = receiver(&n, 0);
+    let body = json!({ "transport_params": [{ "mxl_flow_id": OTHER }], "activation": { "mode": "activate_immediate" } });
+    assert_eq!(
+        patch(&n, "receivers", &r, body.clone()).await.0,
+        StatusCode::OK
+    );
+    settle().await;
+    assert_eq!(active(&n, "receivers", &r).await["master_enable"], false);
+    let status = &n.status().ports[1];
+    assert!(
+        matches!(&status.applied, Applied::Failed(m) if m.contains("panic")),
+        "{:?}",
+        status.applied
+    );
+    assert_eq!(status.failures, 1);
+    // The port's queue still works after the panic.
+    assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    settle().await;
+    assert_eq!(n.status().ports[1].failures, 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_pending_activation_locks_staged_until_cancelled() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -629,7 +727,7 @@ async fn a_pending_activation_locks_staged_until_cancelled() {
         "transport_params": [{ "mxl_flow_id": OTHER }],
         "activation": { "mode": "activate_scheduled_relative", "requested_time": "60:0" },
     });
-    let before = SystemTai.now();
+    let before = fake.clock.now();
     let (status, v) = patch(&n, "receivers", &r, body).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{v}");
     assert_eq!(v["activation"]["mode"], "activate_scheduled_relative");
@@ -639,10 +737,7 @@ async fn a_pending_activation_locks_staged_until_cancelled() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!(
-        at >= before.after(Duration::from_secs(60))
-            && at <= SystemTai.now().after(Duration::from_secs(60))
-    );
+    assert_eq!(at, before.after(Duration::from_secs(60)));
     assert_eq!(
         staged(&n, "receivers", &r).await["activation"],
         v["activation"]
@@ -677,7 +772,7 @@ async fn a_pending_activation_locks_staged_until_cancelled() {
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn a_scheduled_activation_applies_lead_early_and_writes_active_on_time() {
     let fake = Arc::new(Fake {
         lead: Duration::from_millis(40),
@@ -696,22 +791,24 @@ async fn a_scheduled_activation_applies_lead_early_and_writes_active_on_time() {
         .unwrap()
         .parse()
         .unwrap();
-    // Polls /active and notes when the flow shows.
-    let shown = loop {
-        let now = SystemTai.now();
-        if leg(&active(&n, "receivers", &r).await)["mxl_flow_id"] == json!(OTHER) {
-            break now;
-        }
-        assert!(now < at.after(Duration::from_secs(1)), "never activated");
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    };
-    let ms = |a: Tai, b: Tai| (a.as_nanos() as i128 - b.as_nanos() as i128) as f64 / 1e6;
-    assert!(
-        (-2.0..10.0).contains(&ms(shown, at)),
-        "/active {:.3} ms after the time",
-        ms(shown, at)
-    );
+    assert_eq!(at, fake.clock.now().after(Duration::from_millis(150)));
+    let shows = |a: &Value| leg(a)["mxl_flow_id"] == json!(OTHER);
+    // Just before the lead: nothing yet.
+    tokio::time::sleep(Duration::from_millis(109)).await;
+    assert!(fake.calls.lock().unwrap().is_empty());
+    // At the lead the product has it, /active not yet.
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2, Some(at));
+    assert_eq!(at.since(calls[0].3), Duration::from_millis(40));
+    assert!(!shows(&active(&n, "receivers", &r).await));
+    // At the time /active shows it.
+    tokio::time::sleep(Duration::from_millis(38)).await;
+    assert!(!shows(&active(&n, "receivers", &r).await));
+    tokio::time::sleep(Duration::from_millis(2)).await;
     let a = active(&n, "receivers", &r).await;
+    assert!(shows(&a));
     assert_eq!(a["activation"]["activation_time"], json!(at.to_string()));
     assert_eq!(a["activation"]["requested_time"], "0:150000000");
     assert_eq!(
@@ -719,18 +816,108 @@ async fn a_scheduled_activation_applies_lead_early_and_writes_active_on_time() {
         Value::Null
     );
     settle().await;
+    assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    assert_eq!(n.status().ports[1].pending, None);
+    assert_eq!(n.status().ports[1].applied, Applied::Applied);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_after_the_lead_hands_the_product_the_active_connection_again() {
+    let fake = Arc::new(Fake {
+        lead: Duration::from_millis(40),
+        ..Fake::default()
+    });
+    let n = node(&fake);
+    let r = receiver(&n, 0);
+    let body = json!({
+        "transport_params": [{ "mxl_flow_id": OTHER }],
+        "activation": { "mode": "activate_scheduled_relative", "requested_time": "0:100000000" },
+    });
+    let (status, v) = patch(&n, "receivers", &r, body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let at: Tai = v["activation"]["activation_time"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Inside the lead: the product has the activation already.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    let (status, _) = patch(
+        &n,
+        "receivers",
+        &r,
+        json!({ "activation": { "mode": null } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // It got the still-active connection for the same time after it, and
+    // ends where /active is.
     let calls = fake.calls.lock().unwrap().clone();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].2, Some(at));
-    let early = ms(at, calls[0].3);
-    assert!(
-        (30.0..50.0).contains(&early),
-        "apply {early:.3} ms before the time"
-    );
+    let got: Vec<_> = calls.iter().map(|c| (c.1.flow, c.2)).collect();
+    assert_eq!(got, [(Some(OTHER), Some(at)), (Some(IN_FLOW), Some(at))]);
+    assert!(calls[0].4 < calls[1].4);
+    let a = active(&n, "receivers", &r).await;
+    assert_eq!(leg(&a)["mxl_flow_id"], json!(IN_FLOW));
+    assert_eq!(a["master_enable"], true);
+    assert_eq!(fake.ends_on().and_then(|a| a.flow), Some(IN_FLOW));
+    assert_eq!(n.status().ports[1].pending, None);
+    assert_eq!(n.status().ports[1].applied, Applied::Applied);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_relative_time_past_the_clock_range_is_refused() {
+    let fake = Arc::new(Fake::default());
+    let n = node(&fake);
+    let r = receiver(&n, 0);
+    let body = json!({
+        "activation": { "mode": "activate_scheduled_relative", "requested_time": format!("{}:0", u64::MAX) },
+    });
+    let (status, v) = patch(&n, "receivers", &r, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], 400);
     assert_eq!(n.status().ports[1].pending, None);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn an_immediate_activation_time_is_read_after_the_check() {
+    struct Slow;
+    impl Connections for Slow {
+        fn resolve(&self, _: Port, _: Uuid) -> BoxFuture<'_, Result<FlowSeen, Reject>> {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(FlowSeen::Absent)
+            })
+        }
+        fn lead(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn apply(
+            &self,
+            _: Port,
+            _: Active,
+            _: Option<Tai>,
+            _: u64,
+        ) -> BoxFuture<'_, Result<(), Fail>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let clock = Paused::default();
+    let n = Nmos::new(model(), config(), Arc::new(Slow), &NoStore, clock.clone()).unwrap();
+    let r = receiver(&n, 0);
+    let start = clock.now();
+    // Staged first, so the activation's own check is the slow one.
+    let body = json!({ "activation": { "mode": "activate_immediate" } });
+    let (status, v) = patch(&n, "receivers", &r, body).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["activation"]["activation_time"],
+        json!(start.after(Duration::from_secs(1)).to_string())
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_absolute_time_in_the_past_fires_at_once() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -746,7 +933,7 @@ async fn an_absolute_time_in_the_past_fires_at_once() {
     assert_eq!(fake.calls.lock().unwrap()[0].2, Some(Tai::new(1, 0)));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_scheduled_activation_rechecked_at_its_time_can_fail() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -766,7 +953,6 @@ async fn a_scheduled_activation_rechecked_at_its_time_can_fail() {
             channels: 6,
             rate: 48_000,
             float32: true,
-            active: true,
         },
     );
     tokio::time::sleep(Duration::from_millis(120)).await;
@@ -779,7 +965,7 @@ async fn a_scheduled_activation_rechecked_at_its_time_can_fail() {
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn bulk_stages_each_item_and_reports_each_code() {
     let fake = Arc::new(Fake::default());
     let n = node(&fake);
@@ -824,7 +1010,7 @@ async fn bulk_stages_each_item_and_reports_each_code() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_external_change_shows_in_active_with_a_new_version() {
     let fake = Arc::new(Fake::default());
     let n = node_with(fake, &NoStore, Clock::at(5_000));
@@ -849,7 +1035,37 @@ async fn an_external_change_shows_in_active_with_a_new_version() {
     assert_eq!(n.status().ports[1].active, switched);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn an_external_change_outlives_the_failure_of_an_apply_in_flight() {
+    let fake = Arc::new(Fake::default());
+    fake.results
+        .lock()
+        .unwrap()
+        .push_back((Duration::from_millis(50), Err(Fail("late".into()))));
+    let n = node(&fake);
+    let r = receiver(&n, 0);
+    let body = json!({ "transport_params": [{ "mxl_flow_id": OTHER }], "activation": { "mode": "activate_immediate" } });
+    assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    settle().await;
+    let switched = Active {
+        master_enable: true,
+        peer: None,
+        domain: Some(DOMAIN),
+        flow: Some(IN_FLOW),
+    };
+    n.external_change(Port::Receiver(0), switched.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let a = active(&n, "receivers", &r).await;
+    assert_eq!(
+        (a["master_enable"].clone(), leg(&a)["mxl_flow_id"].clone()),
+        (json!(true), json!(IN_FLOW))
+    );
+    assert_eq!(n.status().ports[1].active, switched);
+    assert_eq!(n.status().ports[1].applied, Applied::Applied);
+    assert_eq!(n.status().ports[1].failures, 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_slow_check_holds_other_patches_back() {
     struct Slow;
     impl Connections for Slow {
@@ -862,11 +1078,24 @@ async fn a_slow_check_holds_other_patches_back() {
         fn lead(&self) -> Duration {
             Duration::ZERO
         }
-        fn apply(&self, _: Port, _: Active, _: Option<Tai>) -> BoxFuture<'_, Result<(), Fail>> {
+        fn apply(
+            &self,
+            _: Port,
+            _: Active,
+            _: Option<Tai>,
+            _: u64,
+        ) -> BoxFuture<'_, Result<(), Fail>> {
             Box::pin(async { Ok(()) })
         }
     }
-    let n = Nmos::new(model(), config(), Arc::new(Slow), &NoStore, SystemTai).unwrap();
+    let n = Nmos::new(
+        model(),
+        config(),
+        Arc::new(Slow),
+        &NoStore,
+        Paused::default(),
+    )
+    .unwrap();
     let r = receiver(&n, 0);
     let start = Instant::now();
     let slow = patch(
@@ -878,11 +1107,130 @@ async fn a_slow_check_holds_other_patches_back() {
     let quick = patch(&n, "receivers", &r, json!({ "master_enable": false }));
     let ((a, _), (b, _)) = tokio::join!(slow, quick);
     assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
-    assert!(start.elapsed() >= Duration::from_millis(50));
+    assert_eq!(start.elapsed(), Duration::from_millis(50));
     let v = staged(&n, "receivers", &r).await;
     // Both changes landed; neither overwrote the other with a stale copy.
     assert_eq!(
         (v["master_enable"].clone(), leg(&v)["mxl_flow_id"].clone()),
         (json!(false), json!(OTHER))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stuck_check_times_out_and_holds_back_its_port_only() {
+    struct Stuck;
+    impl Connections for Stuck {
+        fn resolve(&self, _: Port, _: Uuid) -> BoxFuture<'_, Result<FlowSeen, Reject>> {
+            Box::pin(std::future::pending())
+        }
+        fn lead(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn apply(
+            &self,
+            _: Port,
+            _: Active,
+            _: Option<Tai>,
+            _: u64,
+        ) -> BoxFuture<'_, Result<(), Fail>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let n = Nmos::new(
+        model(),
+        config(),
+        Arc::new(Stuck),
+        &NoStore,
+        Paused::default(),
+    )
+    .unwrap();
+    let (r0, r1) = (receiver(&n, 0), receiver(&n, 1));
+    let start = Instant::now();
+    let stuck = patch(
+        &n,
+        "receivers",
+        &r0,
+        json!({ "transport_params": [{ "mxl_flow_id": OTHER }] }),
+    );
+    let other = async {
+        let r = patch(&n, "receivers", &r1, json!({ "master_enable": false })).await;
+        (r, start.elapsed())
+    };
+    let both = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(stuck, other)
+    });
+    let ((status, v), ((other, _), quick)) = both.await.expect("a PATCH never answered");
+    assert_eq!(other, StatusCode::OK);
+    assert_eq!(quick, Duration::ZERO);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(v["code"], 500);
+    assert!(
+        v["error"].as_str().unwrap().contains("did not resolve"),
+        "{v}"
+    );
+    assert_eq!(start.elapsed(), RESOLVE_TIMEOUT);
+    assert_eq!(
+        leg(&staged(&n, "receivers", &r0).await)["mxl_flow_id"],
+        json!(IN_FLOW)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stored_active_that_does_not_fit_the_model_is_left_behind() {
+    let foreign = uuid::uuid!("cccccccc-0000-4000-8000-000000000004");
+    let store = Stored(BTreeMap::from([
+        (
+            PortKey::Sender("pgm".into()),
+            Active {
+                master_enable: true,
+                peer: None,
+                domain: Some(foreign),
+                flow: Some(OUT_FLOW),
+            },
+        ),
+        (
+            PortKey::Receiver("pgm".into()),
+            Active {
+                master_enable: true,
+                peer: None,
+                domain: Some(DOMAIN),
+                flow: None,
+            },
+        ),
+        (
+            PortKey::Receiver("spare".into()),
+            Active {
+                master_enable: false,
+                peer: None,
+                domain: Some(DOMAIN),
+                flow: Some(Uuid::nil()),
+            },
+        ),
+    ]));
+    let n = node_with(Arc::new(Fake::default()), &store, Paused::default());
+    let s = sender(&n);
+    assert_eq!(
+        leg(&staged(&n, "senders", &s).await),
+        &json!({ "mxl_domain_id": DOMAIN, "mxl_flow_id": OUT_FLOW })
+    );
+    let r = active(&n, "receivers", &receiver(&n, 0)).await;
+    assert_eq!(
+        (r["master_enable"].clone(), leg(&r)["mxl_flow_id"].clone()),
+        (json!(true), json!(IN_FLOW))
+    );
+    let r = active(&n, "receivers", &receiver(&n, 1)).await;
+    assert_eq!(leg(&r)["mxl_flow_id"], Value::Null);
+    // One that fits is taken as stored.
+    let fits = Stored(BTreeMap::from([(
+        PortKey::Sender("pgm".into()),
+        Active {
+            master_enable: false,
+            peer: None,
+            domain: None,
+            flow: None,
+        },
+    )]));
+    let n = node_with(Arc::new(Fake::default()), &fits, Paused::default());
+    let s = sender(&n);
+    assert_eq!(active(&n, "senders", &s).await["master_enable"], false);
 }

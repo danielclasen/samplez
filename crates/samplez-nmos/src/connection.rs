@@ -2,18 +2,24 @@
 //! BCP-007-03: single and bulk staging, immediate and scheduled
 //! activation.
 //!
-//! `/active` is written when an activation fires; the product's
-//! [`Connections::apply`] runs after that, and a failure turns the port's
+//! `/active` is written when an activation fires. Each port hands its
+//! activations to the product's [`Connections::apply`] one at a time and in
+//! order, an immediate one after `/active` shows it, a scheduled one
+//! [`Connections::lead`] before its time; a failure turns the port's
 //! `master_enable` false in `/active` with a new IS-04 version. A pending
 //! scheduled activation locks `/staged` (423) until it fires or a PATCH
-//! with `mode: null` cancels it; it lives in memory only.
+//! with `mode: null` cancels it; it lives in memory only. A cancel after
+//! the scheduled activation went to the product hands the product the
+//! still-active connection again for the same time.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use serde_json::{Map, Value, json};
+use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
@@ -23,6 +29,10 @@ use crate::product::{Active, Applied, FlowSeen, Port};
 use crate::resources::CONNECTION_VERSION;
 use crate::tai::Tai;
 use crate::{Inner, State};
+
+/// How long the product's [`crate::Connections::resolve`] may take before
+/// the PATCH that asked is refused with 500.
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const DOMAIN: &str = "mxl_domain_id";
 const FLOW: &str = "mxl_flow_id";
@@ -93,6 +103,18 @@ pub(crate) struct Pending {
     id: u64,
     at: Tai,
     task: AbortHandle,
+    /// It went to the product, lead early.
+    applied: bool,
+}
+
+/// An activation queued for the product.
+struct Job {
+    generation: u64,
+    active: Active,
+    at: Option<Tai>,
+    /// Where the result goes instead of [`settle`]: a scheduled activation
+    /// settles once `/active` shows it.
+    reply: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 /// A sender's or receiver's IS-04 version and IS-05 state.
@@ -102,9 +124,13 @@ pub(crate) struct PortState {
     pub active: Active,
     active_activation: Activation,
     pending: Option<Pending>,
-    /// Counts the writes of `/active`; an apply result is for the write
-    /// it was started for only.
+    /// Counts the changes of `/active` and the applies; an apply result
+    /// counts only while nothing came after it.
     generation: u64,
+    /// The applies not handed to the product yet, and whether a task
+    /// works them off.
+    queue: VecDeque<Job>,
+    working: bool,
     /// Counts scheduled activations; a firing one checks it is still the
     /// pending one.
     schedules: u64,
@@ -127,6 +153,8 @@ impl PortState {
             active_activation: Activation::default(),
             pending: None,
             generation: 0,
+            queue: VecDeque::new(),
+            working: false,
             schedules: 0,
             applied: Applied::Initial,
             failures: 0,
@@ -135,6 +163,13 @@ impl PortState {
 
     pub fn pending_at(&self) -> Option<Tai> {
         self.pending.as_ref().map(|p| p.at)
+    }
+
+    /// Marks something that supersedes every apply before it, such as a
+    /// change the product made itself.
+    pub fn supersede(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
     }
 }
 
@@ -454,19 +489,31 @@ fn activation(v: &Value) -> Result<Option<Mode>, (StatusCode, String)> {
     Ok(Some((mode, requested)))
 }
 
+type Refused = (StatusCode, String);
+
 /// Checks a flow the receiver would read against its caps. An absent flow
-/// passes: the receiver reads silence until it appears.
-async fn check_flow(inner: &Inner, port: Port, flow: Uuid) -> Result<(), String> {
+/// passes: the receiver reads silence until it appears. A flow that does
+/// not fit is a 400, a product that does not answer within
+/// [`RESOLVE_TIMEOUT`] a 500.
+async fn check_flow(inner: &Inner, port: Port, flow: Uuid) -> Result<(), Refused> {
     let Port::Receiver(i) = port else {
         return Ok(());
     };
-    match inner.conns.resolve(port, flow).await.map_err(|r| r.0)? {
+    let seen = match tokio::time::timeout(RESOLVE_TIMEOUT, inner.conns.resolve(port, flow)).await {
+        Ok(seen) => seen.or_else(|r| bad(r.0))?,
+        Err(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the product did not resolve flow {flow} within {RESOLVE_TIMEOUT:?}"),
+            ));
+        }
+    };
+    match seen {
         FlowSeen::Absent => Ok(()),
         FlowSeen::Present {
             channels,
             rate,
             float32,
-            ..
         } => {
             let caps = inner.model.receivers[i].channels;
             let fits = match caps {
@@ -474,11 +521,11 @@ async fn check_flow(inner: &Inner, port: Port, flow: Uuid) -> Result<(), String>
                 ChannelCount::AtLeast(n) => (n..=crate::MAX_CHANNELS).contains(&channels),
             };
             if rate != SAMPLE_RATE || !float32 {
-                Err(format!(
+                bad(format!(
                     "flow {flow} is not {BIT_DEPTH}-bit float at {SAMPLE_RATE} Hz"
                 ))
             } else if !fits {
-                Err(format!(
+                bad(format!(
                     "flow {flow} has {channels} channels, the receiver takes {caps:?}"
                 ))
             } else {
@@ -490,7 +537,7 @@ async fn check_flow(inner: &Inner, port: Port, flow: Uuid) -> Result<(), String>
 
 /// What activating `staged` makes active, every `auto` resolved, or why it
 /// cannot be applied.
-async fn target(inner: &Inner, port: Port, staged: &Staged) -> Result<Active, String> {
+async fn target(inner: &Inner, port: Port, staged: &Staged) -> Result<Active, Refused> {
     let (domain, flow) = inner.own(port);
     let active = Active {
         master_enable: staged.master_enable,
@@ -500,7 +547,7 @@ async fn target(inner: &Inner, port: Port, staged: &Staged) -> Result<Active, St
     };
     if active.master_enable {
         let (Some(_), Some(f)) = (active.domain, active.flow) else {
-            return Err("master_enable needs an mxl_domain_id and an mxl_flow_id".into());
+            return bad("master_enable needs an mxl_domain_id and an mxl_flow_id");
         };
         check_flow(inner, port, f).await?;
     }
@@ -509,8 +556,9 @@ async fn target(inner: &Inner, port: Port, staged: &Staged) -> Result<Active, St
 
 pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patched {
     let req = parse(inner, port, &body)?;
-    // One PATCH at a time, so the checks below see the state they change.
-    let _patching = inner.patching.lock().await;
+    // One PATCH per port at a time, so the checks below see the state they
+    // change.
+    let _patching = inner.patching(port).lock().await;
     let mut staged = {
         let st = inner.lock();
         let p = st.port(port);
@@ -534,10 +582,9 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
     if let Some(f) = req.flow {
         staged.flow = f;
         if let Param::Id(id) = f {
-            check_flow(inner, port, id).await.or_else(bad)?;
+            check_flow(inner, port, id).await?;
         }
     }
-    let now = inner.clock.now();
     match req.activation {
         None => {
             inner.lock().port_mut(port).staged = staged.clone();
@@ -547,14 +594,22 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
             staged.activation = Activation::default();
             let mut st = inner.lock();
             let p = st.port_mut(port);
+            p.staged = staged.clone();
             if let Some(pending) = p.pending.take() {
                 pending.task.abort();
+                if pending.applied {
+                    // The product has it already: hand it what stays active,
+                    // for the same time, so it ends where `/active` is.
+                    let active = p.active.clone();
+                    p.applied = Applied::Applying;
+                    enqueue(inner, &mut st, port, active, Some(pending.at), None);
+                }
             }
-            p.staged = staged.clone();
             Ok((StatusCode::OK, staged_json(port, &staged)))
         }
         Some(Some((IMMEDIATE, _))) => {
-            let active = target(inner, port, &staged).await.or_else(bad)?;
+            let active = target(inner, port, &staged).await?;
+            let now = inner.clock.now();
             let activation = Activation {
                 mode: Some(IMMEDIATE),
                 requested: None,
@@ -564,16 +619,14 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
                 activation: activation.clone(),
                 ..staged.clone()
             };
-            let generation = {
-                let mut st = inner.lock();
-                st.port_mut(port).staged = staged;
-                write_active(&mut st, port, active.clone(), activation, now)
-            };
-            spawn_apply(inner, port, active, None, generation);
+            let mut st = inner.lock();
+            st.port_mut(port).staged = staged;
+            write_active(&mut st, port, active.clone(), activation, now);
+            enqueue(inner, &mut st, port, active, None, None);
             Ok((StatusCode::OK, staged_json(port, &response)))
         }
         Some(Some((mode, requested))) => {
-            target(inner, port, &staged).await.or_else(bad)?;
+            target(inner, port, &staged).await?;
             let Some(requested) = requested else {
                 return bad("a scheduled activation needs a requested_time");
             };
@@ -581,7 +634,14 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
                 .parse()
                 .map_err(|_| (StatusCode::BAD_REQUEST, "requested_time".to_string()))?;
             let at = if mode == RELATIVE {
-                now.after(Duration::from_nanos(t.as_nanos() as u64))
+                let after = inner
+                    .clock
+                    .now()
+                    .checked_after(Duration::new(t.sec, t.nsec));
+                match after {
+                    Some(at) => at,
+                    None => return bad(format!("requested_time {requested} is out of range")),
+                }
             } else {
                 t
             };
@@ -595,42 +655,88 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
             p.schedules += 1;
             let id = p.schedules;
             let task = tokio::spawn(scheduled(inner.clone(), port, id, at)).abort_handle();
-            p.pending = Some(Pending { id, at, task });
+            p.pending = Some(Pending {
+                id,
+                at,
+                task,
+                applied: false,
+            });
             p.staged = staged.clone();
             Ok((StatusCode::ACCEPTED, staged_json(port, &staged)))
         }
     }
 }
 
-/// Writes `/active`, bumps the port's IS-04 version and returns the
-/// generation an apply result has to match.
-fn write_active(
-    st: &mut State,
-    port: Port,
-    active: Active,
-    activation: Activation,
-    now: Tai,
-) -> u64 {
+/// Writes `/active` and bumps the port's IS-04 version.
+fn write_active(st: &mut State, port: Port, active: Active, activation: Activation, now: Tai) {
     let version = st.bump(now);
     let p = st.port_mut(port);
     p.active = active;
     p.active_activation = activation;
     p.version = version;
-    p.generation += 1;
     p.applied = Applied::Applying;
-    p.generation
 }
 
-fn spawn_apply(inner: &Arc<Inner>, port: Port, active: Active, at: Option<Tai>, generation: u64) {
-    let inner = inner.clone();
-    tokio::spawn(async move {
-        let result = inner.conns.apply(port, active, at).await;
-        settle(&inner, port, generation, result.map_err(|f| f.0));
+/// Queues an apply behind every earlier one on the port and returns its
+/// generation; the port's task hands them to the product one at a time.
+fn enqueue(
+    inner: &Arc<Inner>,
+    st: &mut State,
+    port: Port,
+    active: Active,
+    at: Option<Tai>,
+    reply: Option<oneshot::Sender<Result<(), String>>>,
+) -> u64 {
+    let p = st.port_mut(port);
+    let generation = p.supersede();
+    p.queue.push_back(Job {
+        generation,
+        active,
+        at,
+        reply,
     });
+    if !p.working {
+        p.working = true;
+        tokio::spawn(work(inner.clone(), port));
+    }
+    generation
+}
+
+/// Hands the port's queued applies to the product, each once the one before
+/// resolved. A panicking apply is a failed one.
+async fn work(inner: Arc<Inner>, port: Port) {
+    loop {
+        let job = {
+            let mut st = inner.lock();
+            let p = st.port_mut(port);
+            match p.queue.pop_front() {
+                Some(job) => job,
+                None => {
+                    p.working = false;
+                    return;
+                }
+            }
+        };
+        let apply = {
+            let inner = inner.clone();
+            let (active, at, generation) = (job.active, job.at, job.generation);
+            tokio::spawn(async move { inner.conns.apply(port, active, at, generation).await })
+        };
+        let result = match apply.await {
+            Ok(r) => r.map_err(|f| f.0),
+            Err(e) => Err(format!("apply did not complete: {e}")),
+        };
+        match job.reply {
+            Some(reply) => {
+                let _ = reply.send(result);
+            }
+            None => settle(&inner, port, job.generation, result),
+        }
+    }
 }
 
 /// Records an apply result; a failure turns `master_enable` false in
-/// `/active` unless a later activation replaced what failed.
+/// `/active` unless something came after what failed.
 fn settle(inner: &Inner, port: Port, generation: u64, result: Result<(), String>) {
     let now = inner.clock.now();
     let mut st = inner.lock();
@@ -657,11 +763,20 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
     let lead = inner.conns.lead();
     sleep_until(&inner, at, lead).await;
     let staged = inner.lock().port(port).staged.clone();
-    let target = target(&inner, port, &staged).await;
-    let apply = target.clone().ok().map(|active| {
-        let inner = inner.clone();
-        tokio::spawn(async move { inner.conns.apply(port, active, Some(at)).await })
-    });
+    let target = target(&inner, port, &staged).await.map_err(|(_, m)| m);
+    let applied = match &target {
+        Ok(active) => {
+            let mut st = inner.lock();
+            match st.port_mut(port).pending.as_mut() {
+                Some(p) if p.id == id => p.applied = true,
+                _ => return,
+            }
+            let (reply, applied) = oneshot::channel();
+            enqueue(&inner, &mut st, port, active.clone(), Some(at), Some(reply));
+            Some(applied)
+        }
+        Err(_) => None,
+    };
     sleep_until(&inner, at, Duration::ZERO).await;
     let generation = {
         let mut st = inner.lock();
@@ -684,14 +799,14 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
             domain: staged.domain.resolve(Some(inner.own(port).0)),
             flow: staged.flow.resolve(inner.own(port).1),
         });
-        write_active(&mut st, port, active, activation, at)
+        write_active(&mut st, port, active, activation, at);
+        st.port_mut(port).supersede()
     };
-    let result = match (target, apply) {
+    let result = match (target, applied) {
         (Err(reason), _) => Err(reason),
-        (Ok(_), Some(task)) => match task.await {
-            Ok(r) => r.map_err(|f| f.0),
-            Err(e) => Err(format!("apply did not complete: {e}")),
-        },
+        (Ok(_), Some(applied)) => applied
+            .await
+            .unwrap_or_else(|_| Err("apply did not complete".into())),
         (Ok(_), None) => Ok(()),
     };
     settle(&inner, port, generation, result);

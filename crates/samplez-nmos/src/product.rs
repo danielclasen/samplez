@@ -51,8 +51,6 @@ pub enum FlowSeen {
         rate: u32,
         /// 32-bit float samples.
         float32: bool,
-        /// A writer is attached.
-        active: bool,
     },
 }
 
@@ -80,19 +78,36 @@ impl fmt::Display for Fail {
 /// router, never on a real-time thread.
 pub trait Connections: Send + Sync + 'static {
     /// What the port's domain holds for `flow`, for the check of a
-    /// receiver's staged flow against its caps.
+    /// receiver's staged flow against its caps. A PATCH that waits longer
+    /// than [`crate::RESOLVE_TIMEOUT`] for it is refused with 500.
     fn resolve(&self, port: Port, flow: Uuid) -> BoxFuture<'_, Result<FlowSeen, Reject>>;
 
     /// How long before a scheduled activation time `apply` has to be
     /// called for the change to land on that time.
     fn lead(&self) -> Duration;
 
-    /// Applies an activation that `/active` already shows: `at` is the
-    /// requested time of a scheduled activation, `None` for an immediate
-    /// one. Resolves once the product has taken it on or failed; a
-    /// failure turns the port's `master_enable` false in `/active`.
-    fn apply(&self, port: Port, active: Active, at: Option<Tai>)
-    -> BoxFuture<'_, Result<(), Fail>>;
+    /// Applies an activation. The calls for one port come one at a time,
+    /// each once the one before resolved, and each supersedes every earlier
+    /// one, also one for the same `at`; `generation` grows with every call
+    /// on the port.
+    ///
+    /// `at` is the activation time of a scheduled activation, `None` for
+    /// an immediate one. An immediate activation shows in `/active` before
+    /// the call; a scheduled one is applied [`Connections::lead`] before
+    /// `at` and shows in `/active` at `at`. A cancel that arrives after
+    /// that call is a second call with the connection `/active` still
+    /// shows and the same `at`.
+    ///
+    /// Resolves once the product has taken the activation on or failed; a
+    /// failure or a panic turns the port's `master_enable` false in
+    /// `/active`.
+    fn apply(
+        &self,
+        port: Port,
+        active: Active,
+        at: Option<Tai>,
+        generation: u64,
+    ) -> BoxFuture<'_, Result<(), Fail>>;
 }
 
 /// The last `/active` of each port as the product persisted it, read once

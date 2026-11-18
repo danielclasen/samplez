@@ -6,14 +6,14 @@
 //! runs no real-time code. A product describes its writers and readers in
 //! a [`NodeModel`] and serves [`Nmos::router`] on its NMOS listener.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State as Extract;
-use axum::http::{Method, Uri};
+use axum::http::{HeaderMap, Method, Uri, header};
 use axum::response::Response;
 use axum::routing::any;
 use serde_json::json;
@@ -28,6 +28,7 @@ mod product;
 mod resources;
 mod tai;
 
+pub use connection::RESOLVE_TIMEOUT;
 pub use model::{
     Asset, BIT_DEPTH, ChannelCount, ChannelDesc, MAX_CHANNELS, MEDIA_TYPE, NmosConfig, NodeModel,
     ReceiverDesc, SAMPLE_RATE, SenderDesc,
@@ -73,8 +74,9 @@ pub(crate) struct Inner {
     /// The receivers' caps never change, so their version is the start.
     caps_version: Tai,
     state: Mutex<State>,
-    /// Held across a PATCH to `/staged`, checks included.
-    patching: tokio::sync::Mutex<()>,
+    /// One per port, senders first; held across a PATCH to the port's
+    /// `/staged`, checks included.
+    patching: Vec<tokio::sync::Mutex<()>>,
 }
 
 pub(crate) struct State {
@@ -128,6 +130,13 @@ impl Inner {
         }
     }
 
+    fn patching(&self, port: Port) -> &tokio::sync::Mutex<()> {
+        match port {
+            Port::Sender(i) => &self.patching[i],
+            Port::Receiver(i) => &self.patching[self.model.senders.len() + i],
+        }
+    }
+
     fn ports(&self) -> impl Iterator<Item = Port> + use<> {
         let senders = (0..self.model.senders.len()).map(Port::Sender);
         senders.chain((0..self.model.receivers.len()).map(Port::Receiver))
@@ -174,10 +183,8 @@ impl Nmos {
                 domain: Some(s.domain),
                 flow: Some(s.flow),
             };
-            let active = stored
-                .get(&PortKey::Sender(s.key.clone()))
-                .cloned()
-                .unwrap_or(initial);
+            let key = PortKey::Sender(s.key.clone());
+            let active = from_store(&stored, &key, s.domain, Some(s.flow)).unwrap_or(initial);
             let state = SenderState {
                 source_version: st.bump(now),
                 flow_version: st.bump(now),
@@ -192,13 +199,12 @@ impl Nmos {
                 domain: Some(r.domain),
                 flow: r.flow,
             };
-            let active = stored
-                .get(&PortKey::Receiver(r.key.clone()))
-                .cloned()
-                .unwrap_or(initial);
+            let key = PortKey::Receiver(r.key.clone());
+            let active = from_store(&stored, &key, r.domain, None).unwrap_or(initial);
             let version = st.bump(now);
             st.receivers.push(PortState::new(version, active));
         }
+        let ports = model.senders.len() + model.receivers.len();
         Ok(Nmos {
             inner: Arc::new(Inner {
                 cfg,
@@ -208,7 +214,7 @@ impl Nmos {
                 clock: Arc::new(clock),
                 caps_version,
                 state: Mutex::new(st),
-                patching: tokio::sync::Mutex::new(()),
+                patching: (0..ports).map(|_| tokio::sync::Mutex::new(())).collect(),
             }),
         })
     }
@@ -233,7 +239,8 @@ impl Nmos {
 
     /// A change of a port's connection the product made itself, such as a
     /// switch to another leg: `/active` shows it from now on with a new
-    /// IS-04 version. `/staged` stays as it was.
+    /// IS-04 version, and the result of an apply still running no longer
+    /// changes it. `/staged` stays as it was.
     pub fn external_change(&self, port: Port, active: Active) {
         let now = self.inner.clock.now();
         let mut st = self.inner.lock();
@@ -241,6 +248,8 @@ impl Nmos {
         let p = st.port_mut(port);
         p.active = active;
         p.version = version;
+        p.supersede();
+        p.applied = Applied::Applied;
     }
 
     pub fn status(&self) -> NmosStatus {
@@ -269,10 +278,11 @@ async fn handle(
     Extract(inner): Extract<Arc<Inner>>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if method == Method::OPTIONS {
-        return http::preflight();
+        return http::preflight(headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS));
     }
     let path = http::segments(uri.path());
     match path.as_slice() {
@@ -285,6 +295,28 @@ async fn handle(
         }
         _ => http::not_found(),
     }
+}
+
+/// The stored `/active` of a port when it fits the model: the port's own
+/// domain, a sender's own flow or a receiver's MXL flow, and both where it
+/// is enabled. Anything else is left behind with a warning.
+fn from_store(
+    stored: &BTreeMap<PortKey, Active>,
+    key: &PortKey,
+    domain: Uuid,
+    own_flow: Option<Uuid>,
+) -> Option<Active> {
+    let a = stored.get(key)?;
+    let fits = a.domain.is_none_or(|d| d == domain)
+        && a.flow.is_none_or(|f| match own_flow {
+            Some(own) => f == own,
+            None => ids::is_mxl_uuid(f),
+        })
+        && (!a.master_enable || (a.domain.is_some() && a.flow.is_some()));
+    if !fits {
+        tracing::warn!(?key, stored = ?a, "nmos: the stored connection does not fit the model; the port starts from the model");
+    }
+    fits.then(|| a.clone())
 }
 
 fn check(model: &NodeModel, cfg: &NmosConfig) -> Result<(), Error> {

@@ -29,18 +29,56 @@ impl TaiClock for Clock {
     }
 }
 
-/// An apply call: port, target, requested time and the TAI time of the
-/// call.
-pub(crate) type Call = (Port, Active, Option<Tai>, Tai);
+/// TAI time on tokio's clock, so a test with paused time drives it: the
+/// base at the tokio instant it was made.
+#[derive(Clone)]
+pub(crate) struct Paused {
+    base: Tai,
+    start: tokio::time::Instant,
+}
+
+impl Default for Paused {
+    fn default() -> Paused {
+        Paused {
+            base: Tai::new(1_000_000, 0),
+            start: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl TaiClock for Paused {
+    fn now(&self) -> Tai {
+        self.base.after(self.start.elapsed())
+    }
+}
+
+/// An apply call: port, target, requested time, the TAI time of the call
+/// and the generation.
+pub(crate) type Call = (Port, Active, Option<Tai>, Tai, u64);
 
 /// A product that records what it is asked to apply and answers from a
 /// queue: each entry is a delay and a result, `Ok` at once when empty.
+/// `done` lists the applies in the order they resolved, with their result.
 #[derive(Default)]
 pub(crate) struct Fake {
     pub flows: Mutex<HashMap<Uuid, FlowSeen>>,
     pub lead: Duration,
+    pub clock: Paused,
     pub calls: Mutex<Vec<Call>>,
     pub results: Mutex<VecDeque<(Duration, Result<(), Fail>)>>,
+    pub done: Arc<Mutex<Vec<(Active, bool)>>>,
+}
+
+impl Fake {
+    /// What a product that takes each successful apply on as it resolves
+    /// ends on.
+    pub fn ends_on(&self) -> Option<Active> {
+        let done = self.done.lock().unwrap();
+        done.iter()
+            .rev()
+            .find(|(_, ok)| *ok)
+            .map(|(a, _)| a.clone())
+    }
 }
 
 impl Connections for Fake {
@@ -62,19 +100,22 @@ impl Connections for Fake {
         port: Port,
         active: Active,
         at: Option<Tai>,
+        generation: u64,
     ) -> BoxFuture<'_, Result<(), Fail>> {
         self.calls
             .lock()
             .unwrap()
-            .push((port, active, at, SystemTai.now()));
+            .push((port, active.clone(), at, self.clock.now(), generation));
         let (delay, result) = self
             .results
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or((Duration::ZERO, Ok(())));
+        let done = self.done.clone();
         Box::pin(async move {
             tokio::time::sleep(delay).await;
+            done.lock().unwrap().push((active, result.is_ok()));
             result
         })
     }
@@ -242,6 +283,23 @@ async fn every_response_carries_cors_and_options_is_a_preflight() {
             .to_str()
             .unwrap()
             .contains("Content-Type")
+    );
+    // A browser controller's pre-flight is allowed the headers it names.
+    let req = Request::builder()
+        .method("OPTIONS")
+        .uri("/x-nmos/connection/v1.2/single/receivers/")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PATCH")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "content-type, x-requested-with",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = n.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "content-type, x-requested-with"
     );
 }
 
