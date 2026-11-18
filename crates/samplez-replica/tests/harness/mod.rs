@@ -69,6 +69,8 @@ pub struct Paths {
     /// (session, path) -> the last touch or release seq applied.
     pub touches: BTreeMap<(String, String), u64>,
     pub conflicts: u64,
+    /// The configuration it was built with; not saved.
+    pub config: u64,
 }
 
 impl Paths {
@@ -161,6 +163,9 @@ impl Product for Paths {
         }
         let values: Vec<String> = values.iter().map(|(p, v)| format!("{p}={v}")).collect();
         format!("{} from {}", values.join(","), origins.join(","))
+    }
+    fn config_hash(&self) -> u64 {
+        self.config
     }
     fn paths(&self, command: &[u8]) -> Vec<String> {
         let text = std::str::from_utf8(command).expect("utf-8");
@@ -1505,6 +1510,8 @@ pub struct Options {
     pub kernel_offsets: Vec<(NodeId, i64)>,
     /// The offsets verify nobody: start waits for readiness only.
     pub unverified: bool,
+    /// Product configuration hashes by node; every other node's is 0.
+    pub configs: Vec<(NodeId, u64)>,
 }
 
 impl Default for Options {
@@ -1522,6 +1529,7 @@ impl Default for Options {
             manual: false,
             kernel_offsets: Vec::new(),
             unverified: false,
+            configs: Vec::new(),
         }
     }
 }
@@ -1650,7 +1658,15 @@ impl Set {
             settings,
             self.options.raft.clone(),
             &self.root.join(id.to_string()),
-            Paths::default(),
+            {
+                let config = (self.options.configs.iter())
+                    .find(|c| c.0 == id)
+                    .map_or(0, |c| c.1);
+                Arc::new(move || Paths {
+                    config,
+                    ..Paths::default()
+                })
+            },
             Factory {
                 from: id,
                 net: self.net.clone(),

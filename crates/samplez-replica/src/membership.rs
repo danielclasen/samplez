@@ -527,6 +527,25 @@ async fn start(
     }
 }
 
+/// The learners that may be promoted: caught up to `applied`, by the
+/// index `of` gives as matched, and known to hold this replica's product
+/// configuration, which `of` says too: a learner of another one applies
+/// the log into another state.
+fn promotable(
+    learners: &BTreeSet<NodeId>,
+    applied: u64,
+    of: impl Fn(NodeId) -> (Option<u64>, bool),
+) -> BTreeSet<NodeId> {
+    learners
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let (matched, holds) = of(id);
+            matched.is_some_and(|m| m >= applied) && holds
+        })
+        .collect()
+}
+
 /// On the leader, makes the voters the wanted ones, a round per
 /// [`PERIOD`] or accepted join.
 pub(crate) async fn reconcile(shared: Arc<Shared>, want: Voters) {
@@ -555,17 +574,14 @@ pub(crate) async fn reconcile(shared: Arc<Shared>, want: Voters) {
         let learners: BTreeSet<NodeId> = membership.learner_ids().collect();
         let applied = metrics.last_applied.map_or(0, |id| id.index);
         let matched = metrics.replication.unwrap_or_default();
-        let caught_up = learners
-            .iter()
-            .copied()
-            .filter(|id| {
-                matched
-                    .get(id)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|m| m.index >= applied)
-            })
-            .collect();
+        let caught_up = promotable(&learners, applied, |id| {
+            let matched = matched.get(&id).copied().flatten().map(|m| m.index);
+            let holds = shared
+                .contact
+                .get()
+                .is_none_or(|c| c.learner_holds_set_config(id));
+            (matched, holds)
+        });
         let Some(change) = plan(&voters, &learners, &caught_up, want) else {
             continue;
         };
@@ -593,6 +609,21 @@ pub(crate) async fn reconcile(shared: Arc<Shared>, want: Voters) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A caught-up learner of another product configuration is not
+    /// promoted; one of the set's is, and one behind is not.
+    #[test]
+    fn a_learner_of_another_configuration_is_not_promoted() {
+        // 4 holds the set's configuration, 5 another, 6 is behind, 7 has
+        // not reported yet.
+        let learners: BTreeSet<NodeId> = [4, 5, 6, 7].into_iter().collect();
+        let of = |id| match id {
+            4 => (Some(10), true),
+            5 | 7 => (Some(10), false),
+            _ => (Some(9), true),
+        };
+        assert_eq!(promotable(&learners, 10, of), [4].into_iter().collect());
+    }
 
     const ME: NodeId = 7;
 

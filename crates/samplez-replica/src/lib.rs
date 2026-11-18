@@ -62,7 +62,7 @@ use crate::entry::{
 use crate::log_store::Store;
 use crate::membership::{Slot, Voters, slot_of};
 use crate::peer::{Forwarded, PeerClient, PeerReply, PeerRequest, PeerResponse, Refused};
-use crate::state_machine::Product;
+use crate::state_machine::{Factory, Product};
 
 openraft::declare_raft_types!(
     /// The openraft types of a samplez replica set.
@@ -284,13 +284,19 @@ pub struct Replica<P> {
 }
 
 impl<P: Product> Replica<P> {
-    /// Opens the storage in `dir` and starts the replica, as
-    /// [`Replica::with_store`].
+    /// Opens the storage in `dir` with the products `factory` builds
+    /// ([`Store::open`]) and starts the replica, as [`Replica::with_store`].
+    /// Every member, learners and the witness included, needs a factory of
+    /// the same configuration ([`Product::config_hash`]): each applies the
+    /// log into its own product state. A snapshot from a replica of another
+    /// configuration ends the process ([`log_store::CONFIG_MISMATCH_EXIT`]);
+    /// open the store with [`Store::on_config_mismatch`] and use
+    /// [`Replica::with_store`] to do otherwise.
     pub async fn start<N>(
         settings: Settings,
         raft: openraft::Config,
         dir: &Path,
-        product: P,
+        factory: Factory<P>,
         network: N,
         peers: Arc<dyn PeerClient>,
         estimate: Estimate,
@@ -298,12 +304,14 @@ impl<P: Product> Replica<P> {
     where
         N: RaftNetworkFactory<TypeConfig>,
     {
-        let store = Store::open(dir, product, settings.limits).map_err(|e| e.to_string())?;
+        let store = Store::open(dir, factory, settings.limits).map_err(|e| e.to_string())?;
         Replica::with_store(settings, raft, store, network, peers, estimate).await
     }
 
     /// Starts the replica on `store`: a restarted one applies its log up to
-    /// the saved committed id before it hears from any peer.
+    /// the saved committed id before it hears from any peer. A snapshot from
+    /// a replica of another product configuration does what `store` was
+    /// opened to do, by default end the process ([`Store::open`]).
     pub async fn with_store<N>(
         settings: Settings,
         raft: openraft::Config,
@@ -935,6 +943,12 @@ impl Shared {
             Ok(stamp) => stamp,
             Err(refusal) => return answer_all(items, stamp_refused(refusal)),
         };
+        // A member of another configuration would apply them into another
+        // product state.
+        if let Some(id) = self.contact.get().and_then(|c| c.config_differs()) {
+            let refused = Refused::Unavailable(format!("config: replica {id} differs"));
+            return answer_all(items, refused);
+        }
         // A command first received longer ago than the set deduplicates
         // is never ordered: E's frame, no TAI clock.
         let e = self.e(estimate).unwrap_or(0);
@@ -1551,7 +1565,7 @@ mod tests {
     }
 
     fn open(dir: &Path) -> Store<Paths> {
-        Store::open(dir, Paths::default(), Limits::defaults(48_000)).expect("opens")
+        Store::open(dir, Arc::new(Paths::default), Limits::defaults(48_000)).expect("opens")
     }
 
     async fn start(store: Store<Paths>) -> Replica<Paths> {
