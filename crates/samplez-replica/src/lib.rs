@@ -934,7 +934,26 @@ impl Shared {
                 return;
             }
             if let Some(proposing) = self.propose() {
-                let written = self.write_locally(items, estimate, generation).await;
+                let stamp = match self.stamp(generation, estimate) {
+                    Ok(stamp) => stamp,
+                    // One pending generation at a time: wait for it
+                    // proposing nothing, so a quiesce goes on meanwhile,
+                    // and check the leadership again.
+                    Err(contact::StampRefusal::GenerationPending)
+                        if items
+                            .iter()
+                            .any(|item| Instant::now() + self.heartbeat < item.deadline) =>
+                    {
+                        drop(proposing);
+                        tokio::time::sleep(self.heartbeat / 10).await;
+                        continue;
+                    }
+                    Err(refusal) => {
+                        let _ = answer_all(items, stamp_refused(refusal));
+                        return;
+                    }
+                };
+                let written = self.write_locally(items, stamp, estimate).await;
                 drop(proposing);
                 match written {
                     Ok(()) => return,
@@ -965,27 +984,14 @@ impl Shared {
         }
     }
 
-    /// Appends `items` as one entry and answers them; gives them back when
-    /// this replica turned out not to lead.
+    /// Appends `items` as one entry stamped `stamp` and answers them;
+    /// gives them back when this replica turned out not to lead.
     async fn write_locally(
         &self,
         items: Vec<Item>,
+        stamp: contact::Stamp,
         estimate: &Estimate,
-        generation: bool,
     ) -> Result<(), Vec<Item>> {
-        let latest = items.iter().map(|item| item.deadline).max();
-        let stamp = loop {
-            match self.stamp(generation, estimate) {
-                Ok(stamp) => break stamp,
-                // One pending generation at a time: wait for it.
-                Err(contact::StampRefusal::GenerationPending)
-                    if latest.is_some_and(|l| Instant::now() + self.heartbeat < l) =>
-                {
-                    tokio::time::sleep(self.heartbeat / 10).await;
-                }
-                Err(refusal) => return answer_all(items, stamp_refused(refusal)),
-            }
-        };
         // A member of another configuration would apply them into another
         // product state.
         if let Some(id) = self.contact.get().and_then(|c| c.config_differs()) {

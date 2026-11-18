@@ -13,7 +13,7 @@ use samplez_replica::contact::Timing;
 use samplez_replica::entry::{Body, Command, NodeId, Origin, Request, SessionKey};
 use samplez_replica::state_machine::{Apply, Changed, Effect, Product};
 use samplez_service::ReplicatedState;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 /// Two input slots into one output: `fader <slot> <gain>` sets a slot's
 /// gain, `route <slot> <flow>` the flow it reads, and re-routes it.
@@ -165,5 +165,42 @@ async fn a_rerouting_command_is_ordered_alone_in_submission_order() {
             .iter()
             .flat_map(|(_, c)| c)
             .all(|c| c.generation.is_none())
+    );
+}
+
+/// A re-routing command waiting for the pending generation proposes
+/// nothing meanwhile: a quiesce does not wait for it, and the leader that
+/// quiesced does not write it.
+#[tokio::test(start_paused = true)]
+async fn a_rerouting_command_waiting_for_a_generation_holds_no_quiesce() {
+    let set = start().await;
+    let leader = set.leader().await;
+    for id in set.ids() {
+        set.audio(id).lock().build_lead = Some(1500 * BLOCK);
+    }
+    sleep(Duration::from_millis(20)).await;
+    set.replica(leader)
+        .append(Body::InputUp {
+            slot: 0,
+            at_index: 0,
+        })
+        .unwrap();
+    sleep(Duration::from_millis(5)).await;
+    let r = set.replica(leader).clone();
+    let route =
+        tokio::spawn(async move { r.submit(&owner("s"), "1", Bytes::from("route 0 c")).await });
+    sleep(Duration::from_millis(20)).await;
+    let t = Instant::now();
+    set.replica(leader).quiesce(Duration::from_secs(5)).await;
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "the quiesce waited {:?} for a command waiting for a generation",
+        t.elapsed()
+    );
+    assert!(route.await.unwrap().is_err());
+    assert!(
+        bodies(&set, leader).is_empty(),
+        "{:?}",
+        bodies(&set, leader)
     );
 }
