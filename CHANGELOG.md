@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.8.0](https://github.com/danielclasen/samplez/compare/v0.7.0...v0.8.0) (2026-11-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** Targets.flows and ProductState.flows are Vec<Option<String>>, None for a detached slot. Entry gains Detach, InputState gains Detached, and the core's encoding gains a slot's detached state and a batch's detached slots.
+* **engine:** Entry, Targets, ProductState and Status gain duck fields, Config gains duckColumns, and the core encoding carries the detectors.
+
+### Features
+
+* **engine:** apply duck groups from log entries ([#79](https://github.com/danielclasen/samplez/issues/79)) ([ea5b164](https://github.com/danielclasen/samplez/commit/ea5b1646cd56ac6f2090116ac722558e4eeab4e3))
+* **engine:** detach inputs and release outputs ([#80](https://github.com/danielclasen/samplez/issues/80)) ([1daf676](https://github.com/danielclasen/samplez/commit/1daf676dff7305c0039c314288ad03db29063e47))
+* **nmos:** add samplez-nmos with the IS-04 v1.3 Node API ([#73](https://github.com/danielclasen/samplez/issues/73)) ([d4566c9](https://github.com/danielclasen/samplez/commit/d4566c9b0f63877320e1b590f8ed408ef6f99c83))
+* **nmos:** register the node with an IS-04 v1.3 registry ([#75](https://github.com/danielclasen/samplez/issues/75)) ([ae1e7dd](https://github.com/danielclasen/samplez/commit/ae1e7dd2d6a5c7a16f0ceef0477d20b7ce04de3e))
+* **nmos:** serve the IS-05 v1.2 Connection API for MXL ports ([#74](https://github.com/danielclasen/samplez/issues/74)) ([6cd273b](https://github.com/danielclasen/samplez/commit/6cd273bbfcf9c1d2630e735e67c000283e06ae58))
+* **replica:** log the index a catch-up waits for and its voter ([#84](https://github.com/danielclasen/samplez/issues/84)) ([25a2246](https://github.com/danielclasen/samplez/commit/25a224668c29e4320b584b224663d28fb72ab295))
+
+
+### Bug Fixes
+
+* **engine:** keep no outgoing flow when detaching a pruned slot ([#82](https://github.com/danielclasen/samplez/issues/82)) ([f9bc735](https://github.com/danielclasen/samplez/commit/f9bc73552f4527f20de630080d61ef087ef742ba))
+* **replica:** align the fallback index with the block, harden two tests ([#78](https://github.com/danielclasen/samplez/issues/78)) ([4245201](https://github.com/danielclasen/samplez/commit/424520157636043053a77f215fceb3f4d9606891))
+* **replica:** count a follower only on an accepted append from its leader ([e67a724](https://github.com/danielclasen/samplez/commit/e67a724f3fe442eacd06084267161b4d0525d818))
+* **replica:** derive a gain an engine refuses as silence everywhere ([#85](https://github.com/danielclasen/samplez/issues/85)) ([0ccedac](https://github.com/danielclasen/samplez/commit/0ccedacec7654391d4c81523b4bff6ccfd9e4056))
+* **replica:** end the membership watch when the replica shuts down ([#86](https://github.com/danielclasen/samplez/issues/86)) ([cbe1bc6](https://github.com/danielclasen/samplez/commit/cbe1bc6b96c21d7c5c9f601f3d449fa8d7620a58))
+* **replica:** hold the lead's fall only at the cap ([03d6745](https://github.com/danielclasen/samplez/commit/03d67458ed3f624f51ffd56911ff3c39c2d4565c))
+* **replica:** hold the lead's fall while entries need more than it ([7423ff1](https://github.com/danielclasen/samplez/commit/7423ff12bedebd8a6b5ef6b5c78f067a3ff821ee))
+* **replica:** keep a generation's earliest index within AHEAD_MAX ([7423ff1](https://github.com/danielclasen/samplez/commit/7423ff12bedebd8a6b5ef6b5c78f067a3ff821ee))
+* **replica:** never count a learner as serving ([7423ff1](https://github.com/danielclasen/samplez/commit/7423ff12bedebd8a6b5ef6b5c78f067a3ff821ee))
+* **replica:** promote learners, settle late entries, rebuild off the tick ([#81](https://github.com/danielclasen/samplez/issues/81)) ([40307f3](https://github.com/danielclasen/samplez/commit/40307f33b027c33ee10a118aa09ca07d5055ed1e))
+* **replica:** resync onto a donor that took entries late ([#83](https://github.com/danielclasen/samplez/issues/83)) ([5b89fee](https://github.com/danielclasen/samplez/commit/5b89fee393a00e7eee753594fbff4e3083c77358))
+* **replica:** wait for the extra lead in an engine rebuild ([7423ff1](https://github.com/danielclasen/samplez/commit/7423ff12bedebd8a6b5ef6b5c78f067a3ff821ee))
+* **replica:** warn when the membership watch ends on a raft fault ([e67a724](https://github.com/danielclasen/samplez/commit/e67a724f3fe442eacd06084267161b4d0525d818))
+
 ## [0.7.0](https://github.com/danielclasen/samplez/compare/v0.6.0...v0.7.0) (2026-11-18)
 
 
