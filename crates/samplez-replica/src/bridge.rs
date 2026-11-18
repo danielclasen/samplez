@@ -273,8 +273,19 @@ impl Audio for EngineAudio {
     }
 
     fn appended(&self, index: u64, at_index: u64, entries: &[Entry]) {
-        let entries = self.filter(index, entries);
-        if let Err(e) = self.engine.append_batch(index, at_index, &entries) {
+        // A lease expiry from an older leader derives off a block start:
+        // the next one keeps the log's order.
+        let at_index = at_index.next_multiple_of(self.block);
+        // Filtered only when refused: the fold runs once for a record the
+        // engine takes.
+        let refused = match self.engine.append_batch(index, at_index, entries) {
+            Err(EntryError::Invalid(_)) => {
+                let kept = self.filter(index, entries);
+                self.engine.append_batch(index, at_index, &kept).err()
+            }
+            appended => appended.err(),
+        };
+        if let Some(e) = refused {
             self.refused(index, &e);
         }
     }
@@ -397,7 +408,7 @@ impl Audio for EngineAudio {
             }
             for (n, (index, record)) in records.into_iter().enumerate() {
                 after = index;
-                let at_index = record.at_index;
+                let at_index = record.at_index.next_multiple_of(self.block);
                 let list = self.filter(index, &record.entries);
                 let mut appended = replay.append_batch(index, at_index, &list);
                 if appended == Err(ReplayError::Full) {

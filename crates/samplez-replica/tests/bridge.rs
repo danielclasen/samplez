@@ -212,8 +212,13 @@ fn an_entry_the_engine_refuses_is_counted_in_every_sample() {
     let domain = Domain::new();
     let (_engine, audio) = bridge(&domain, 1 << 16);
     assert_eq!(audio.sample().entries_refused, 0);
-    // Not a block start: the engine refuses the batch.
+    // Off a block start, as a lease expiry from an older leader derives
+    // under a block size that does not divide the fallback lead: taken
+    // at the next one, which keeps the log's order.
     audio.appended(3, 48_001, &[Entry::InputDown { slot: 0 }]);
+    assert_eq!(audio.sample().entries_refused, 0);
+    // Not above the last log id: the engine refuses the batch.
+    audio.appended(3, 48_048, &[Entry::InputDown { slot: 0 }]);
     assert_eq!(audio.sample().entries_refused, 1);
 }
 
