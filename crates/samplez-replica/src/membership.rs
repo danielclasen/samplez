@@ -367,8 +367,13 @@ pub(crate) async fn watch(shared: Arc<Shared>, bootstrap: Bootstrap) {
     let mut counting = Counting::default();
     let mut asked_at: Option<Instant> = None;
     loop {
-        let Ok(initialized) = shared.raft.is_initialized().await else {
-            return;
+        let initialized = match shared.raft.is_initialized().await {
+            Ok(initialized) => initialized,
+            Err(openraft::error::Fatal::Stopped) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "raft stopped: no longer keeping the replica in its set");
+                return;
+            }
         };
         if initialized {
             let metrics = shared.raft.metrics().borrow().clone();
