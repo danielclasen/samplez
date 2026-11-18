@@ -187,7 +187,7 @@ async fn raft<P: Product + Sync>(
     if to != replica.id() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let raft = replica.raft();
+    let raft = replica.rpcs();
     let bad = || StatusCode::BAD_REQUEST.into_response();
     match rpc.as_str() {
         "append" => {

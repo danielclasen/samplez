@@ -848,8 +848,9 @@ async fn a_set_resumed_from_kept_volumes_recreates_its_marker() {
 /// A set scaled from three audio replicas to one and back, with the
 /// StatefulSet's default PVC retention (the volumes of ordinals 1 and 2
 /// kept), reconciles back to three voters. Ordinal 2 is down while the
-/// leader removes it, so its volume still names it a voter; until a
-/// leader counts the returning replicas again they are not commitable.
+/// leader removes it, so its volume still names it a voter; no leader
+/// counts the returning replicas while ordinal 0 is down, and they are
+/// not commitable meanwhile.
 #[tokio::test]
 async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
     let mut set = Set::new(Voters::new(3, false).unwrap()).await;
@@ -895,12 +896,15 @@ async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
     assert!(removed, "the leader removed the unwanted voters");
     set.crash(Slot::Audio(1)).await;
 
-    // Scale back to three: ordinal 0 restarts with three wanted voters,
-    // ordinals 1 and 2 come back on their kept volumes.
+    // Scale back to three: ordinals 1 and 2 come back on their kept
+    // volumes before ordinal 0, which restarts with three wanted voters.
+    // Without ordinal 0 no leader can count them: the removal's joint
+    // configuration needed ordinal 1, so its log is ahead of ordinal 2's
+    // and it refuses ordinal 2 its vote, and every configuration ordinal
+    // 1 may hold needs ordinal 0 for a majority.
     set.voters = Voters::new(3, false).unwrap();
     set.crash(Slot::Audio(0)).await;
-    set.start_slots(&[Slot::Audio(0), Slot::Audio(1), Slot::Audio(2)])
-        .await;
+    set.start_slots(&[Slot::Audio(1), Slot::Audio(2)]).await;
     let restarted = Instant::now();
     // openraft publishes the membership it loaded once its core runs.
     let named = |slot: Slot| {
@@ -915,14 +919,20 @@ async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
         until(Duration::from_secs(5), || named(Slot::Audio(2))).await,
         "ordinal 2's volume still names it a voter"
     );
-    for slot in [Slot::Audio(1), Slot::Audio(2)] {
-        assert!(
-            !set.replica(slot).replica().commitable,
-            "{slot:?}: no leader counts it yet, {:?} after the start:\n{}",
-            restarted.elapsed(),
-            set.describe()
-        );
-    }
+    // Ten counting checks and more: a slow host makes fewer, never a
+    // leader that counts them.
+    let commitable = || {
+        [Slot::Audio(1), Slot::Audio(2)]
+            .into_iter()
+            .any(|slot| set.replica(slot).replica().commitable)
+    };
+    assert!(
+        !until(Duration::from_secs(1), commitable).await,
+        "commitable though no leader counts it, {:?} after the start:\n{}",
+        restarted.elapsed(),
+        set.describe()
+    );
+    set.start_slots(&[Slot::Audio(0)]).await;
     let all: BTreeSet<NodeId> = ids.values().copied().collect();
     let back = set.voters_become(&all, Duration::from_secs(30)).await;
     assert!(

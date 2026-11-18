@@ -263,11 +263,13 @@ impl Shared {
     }
 
     /// Whether a leader counts this replica as a voter: it leads with a
-    /// quorum's acknowledgement within the lease, or it heard from its
-    /// leader within the lease, since it started, and its membership has
-    /// it as a voter. A vote saved before a restart names a leader the
-    /// replica has not heard since, itself included, and openraft dates it
-    /// to the start.
+    /// quorum's acknowledgement within the lease, or it took an
+    /// AppendEntries or an InstallSnapshot from the leader of its committed
+    /// vote, in that term, within the lease ([`Shared::leader_heard`]), and
+    /// its membership has it as a voter. openraft's vote time does not
+    /// tell: it moves when a saved vote is loaded at a start and when a
+    /// vote is adopted from a peer's refusal, neither of which proves a
+    /// leader alive.
     async fn counted_now(&self) -> bool {
         let metrics = self.raft.metrics().borrow().clone();
         if metrics.state == ServerState::Leader {
@@ -278,19 +280,7 @@ impl Shared {
             .membership()
             .voter_ids()
             .any(|id| id == self.settings.id);
-        let (lease, started) = (self.lease, self.started);
-        voter
-            && metrics.current_leader.is_some()
-            && self
-                .raft
-                .with_raft_state(move |state| {
-                    state.vote_ref().committed
-                        && state
-                            .vote_last_modified()
-                            .is_some_and(|at| at > started && at.elapsed() <= lease)
-                })
-                .await
-                .unwrap_or(false)
+        voter && self.leader_heard(&metrics)
     }
 }
 
