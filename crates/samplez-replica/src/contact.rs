@@ -235,6 +235,8 @@ pub struct Sample {
     pub entries_filtered: u64,
     /// Per output, realised.
     pub realised: Vec<bool>,
+    /// Per output, enabled by the log; an output past the list is.
+    pub enabled: Vec<bool>,
     /// The generation its pending entries need is built, or none is.
     pub generation_ready: bool,
     /// Clock steps the engine detected.
@@ -716,6 +718,9 @@ struct State {
     /// until their commit is known.
     verdicts: Vec<(u64, u64)>,
     realised: Vec<bool>,
+    /// Per output, enabled by the log, as of the last sample; an output
+    /// past the list is.
+    enabled: Vec<bool>,
     generation_ready: bool,
     /// The key, revision and target revision of a rollout, once given.
     rollout: Option<Arc<dyn crate::rollout::Rollout>>,
@@ -996,6 +1001,7 @@ impl Contact {
                 serving: None,
                 verdicts: Vec::new(),
                 realised: Vec::new(),
+                enabled: Vec::new(),
                 generation_ready: true,
                 rollout: None,
                 own: Own::default(),
@@ -1277,6 +1283,7 @@ impl Contact {
             st.entries_refused = sample.entries_refused;
             st.entries_filtered = sample.entries_filtered;
             st.realised = sample.realised;
+            st.enabled = sample.enabled;
             st.generation_ready = sample.generation_ready;
             st.clock_steps = sample.clock_steps;
             st.pages.fold(self.id, &st.own.pages);
@@ -2298,8 +2305,9 @@ impl Contact {
         st.own.ready = ready;
         st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
         // Diverged, resyncing or in `version_mismatch`, or withdrawn once
-        // a `Baseline` applied, with outputs it writes none of what it
-        // computes, in contact or not. Before the first `Baseline` no
+        // a `Baseline` applied, with an output enabled it writes none of
+        // what it computes, in contact or not. A disabled output writes
+        // nothing on any replica, so it counts for none. Before the first `Baseline` no
         // replica of the set committed, as the Named rule starts the
         // first commit, and every one is withdrawn once ready: it keeps
         // the term by its peers, so the first of a set becomes ready. A
@@ -2309,7 +2317,9 @@ impl Contact {
             ReplicaState::Withdrawn => st.own.baseline.is_some(),
             _ => false,
         };
-        let writes_nothing = stopped && !st.own.standing.is_empty();
+        let enabled =
+            (0..st.own.standing.len()).any(|o| st.enabled.get(o).copied().unwrap_or(true));
+        let writes_nothing = stopped && enabled;
         if writes_nothing {
             st.serving = Some(false);
         } else if st.in_contact {
@@ -2424,8 +2434,10 @@ impl Contact {
     /// other audio replica committing within `w + D` by its reports;
     /// judged while in contact, kept out of it, false before the first
     /// contact. False while diverged, resyncing or in `version_mismatch`,
-    /// or withdrawn once a `Baseline` applied, with outputs, in contact or
-    /// not: the replica writes none of what it computes. Always true for
+    /// or withdrawn once a `Baseline` applied, with an output enabled, in
+    /// contact or not: the replica writes none of what it computes. A set
+    /// whose outputs are all disabled writes nothing anywhere, and such a
+    /// replica serves as one without outputs does. Always true for
     /// the witness and for the only voter of its set; never for a learner,
     /// which commits nothing, a set's only voter writing the outputs
     /// alone.
@@ -3663,6 +3675,8 @@ mod tests {
         rebuilt_with: Mutex<Vec<(u64, u64)>>,
         /// Whether it reports one output, withdrawn.
         outputs: std::sync::atomic::AtomicBool,
+        /// Whether that output is disabled.
+        disabled: std::sync::atomic::AtomicBool,
         /// The build time it reports, in samples; none at 0.
         build_time: AtomicU64,
     }
@@ -3689,6 +3703,11 @@ mod tests {
                 entries_refused: 0,
                 entries_filtered: 0,
                 realised: Vec::new(),
+                enabled: if self.outputs.load(Ordering::SeqCst) {
+                    vec![!self.disabled.load(Ordering::SeqCst)]
+                } else {
+                    Vec::new()
+                },
                 generation_ready: true,
                 clock_steps: 0,
                 log_overflows: 0,
@@ -3803,6 +3822,7 @@ mod tests {
             holding: std::sync::atomic::AtomicBool::new(false),
             rebuilt_with: Mutex::new(Vec::new()),
             outputs: std::sync::atomic::AtomicBool::new(false),
+            disabled: std::sync::atomic::AtomicBool::new(false),
             build_time: AtomicU64::new(0),
         });
         let contact = Contact::new(
@@ -4285,6 +4305,20 @@ mod tests {
         }
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
         assert!(!f.contact.serving(), "withdrawn after a baseline");
+        // With every output disabled it writes nothing anywhere, as a set
+        // whose outputs a frontend disabled: it serves as one without
+        // outputs does. Enabled again, it writes nothing it computes.
+        f.engine.disabled.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert!(f.contact.serving(), "withdrawn, every output disabled");
+        f.engine.disabled.store(false, Ordering::SeqCst);
+        f.tick();
+        assert!(!f.contact.serving(), "withdrawn, an output enabled again");
         // A replica whose key differs from the baseline's computes nothing.
         let f = fixture(&[&[1, 2, 3]]);
         f.engine.outputs.store(true, Ordering::SeqCst);

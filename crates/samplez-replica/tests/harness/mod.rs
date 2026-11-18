@@ -900,6 +900,7 @@ impl Audio for FakeAudio {
             entries_refused: st.entries_refused,
             entries_filtered: 0,
             realised: st.outputs.iter().map(|o| o.realised).collect(),
+            enabled: Vec::new(),
             generation_ready: !st.generation_pending,
             clock_steps: self.clock.steps(),
             log_overflows: st.log_overflows,
