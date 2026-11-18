@@ -175,17 +175,32 @@ jobs:
           restore-keys: |
             cargo-debug-${{ hashFiles('Cargo.lock', 'docker/builder/Dockerfile') }}-
             cargo-debug-
+      # Linux v6.12 selftest sources, pinned by .github/vm-selftests.sha256.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vm/selftests
+          key: selftests-${{ hashFiles('.github/vm-selftests.sha256') }}
       - name: Build the clock tests and the kernel's leap-a-day selftest
         run: |
-          mkdir -p .cargo-registry vm/timers
-          linux=https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/tools/testing/selftests
-          get() { curl -fsSL --retry 5 --retry-all-errors -o "$2" "$linux/$1?h=v6.12"; }
-          get timers/leap-a-day.c vm/timers/leap-a-day.c
-          get kselftest.h vm/kselftest.h
-          sha256sum -c - <<'SUMS'
-          cd486ebfae1003838fd9a88543b0bb19068910c1c031ca7939fcb6398871e49a  vm/timers/leap-a-day.c
-          5d5720da5593490c7260d867904531b48230a4868798dcb4b34df8039a7be609  vm/kselftest.h
-          SUMS
+          mkdir -p .cargo-registry vm/selftests/timers vm/timers
+          # A cache hit passes the check and downloads nothing. A miss tries
+          # git.kernel.org, then the GitHub mirror, failing a dead host in seconds.
+          cd vm/selftests
+          while read -r sum path; do
+            echo "$sum  $path" | sha256sum -c --status 2>/dev/null && continue
+            for url in \
+              "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/tools/testing/selftests/$path?h=v6.12" \
+              "https://raw.githubusercontent.com/torvalds/linux/v6.12/tools/testing/selftests/$path"; do
+              curl -fsSL --connect-timeout 5 --max-time 30 --retry 2 --retry-all-errors \
+                -o "$path" "$url" || continue
+              echo "$sum  $path" | sha256sum -c --status && continue 2
+            done
+            echo "no source served $path with the pinned sha256" >&2
+            exit 1
+          done < ../../.github/vm-selftests.sha256
+          cd ../..
+          cp vm/selftests/timers/leap-a-day.c vm/timers/leap-a-day.c
+          cp vm/selftests/kselftest.h vm/kselftest.h
           docker run --rm --user "$(id -u):$(id -g)" -e CARGO_INCREMENTAL=0 \
             -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
             -w /w samplez-builder:ci bash -euo pipefail -c '
