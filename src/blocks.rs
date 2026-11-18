@@ -799,6 +799,31 @@ impl Hold {
         self.mode
     }
 
+    /// The first block in the ring, or block `next` before it is
+    /// computed, that is `withheld` though this output has not seen it
+    /// so, with whether any such block is for a cause
+    /// ([`BlockStatus::for_a_cause`]); none while idle. The replica is
+    /// withdrawn on every output from that block on
+    /// ([`Hold::advance_below`]).
+    pub fn withheld_unseen(&self, statuses: &Statuses, next: Option<u64>) -> Option<(u64, bool)> {
+        if self.mode == Mode::Idle {
+            return None;
+        }
+        let ring = self
+            .pending
+            .iter()
+            .filter(|p| p.status.kind != Kind::Withheld)
+            .map(|p| p.status.k);
+        let mut found: Option<(u64, bool)> = None;
+        for k in ring.chain(next) {
+            if let Some(st) = statuses.get(k).filter(|s| s.kind == Kind::Withheld) {
+                let (first, cause) = found.unwrap_or((k, false));
+                found = Some((first.min(k), cause | st.for_a_cause()));
+            }
+        }
+        found
+    }
+
     /// Blocks in the ring.
     pub fn len(&self) -> usize {
         self.pending.len()
@@ -1287,10 +1312,27 @@ impl Hold {
         changes: &mut Changes,
         sink: &mut impl Sink,
     ) -> Outcome {
+        self.advance_below(ctx, u64::MAX, statuses, changes, sink)
+    }
+
+    /// RT. [`Hold::advance`] for the blocks below block `limit` only: a
+    /// block another output withholds withdraws the replica on this one
+    /// before any block from it on moves.
+    pub fn advance_below(
+        &mut self,
+        ctx: Ctx,
+        limit: u64,
+        statuses: &Statuses,
+        changes: &mut Changes,
+        sink: &mut impl Sink,
+    ) -> Outcome {
         let mut out = Outcome::default();
         let mut prefix = true;
         for n in 0..self.pending.len() {
             let p = self.pending[n];
+            if p.status.k >= limit {
+                break;
+            }
             // The supervisor may have moved it.
             let mut cur = statuses.get(p.status.k).unwrap_or(p.status);
             loop {

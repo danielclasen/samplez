@@ -768,6 +768,28 @@ impl FakeAudio {
             st.computed = Some(k);
         }
         let ctx = st.ctx();
+        // As the engine does: every ring moves up to the first block
+        // withheld on any output that the output has not seen so, then
+        // the replica is withdrawn before any block from it on moves.
+        let found = st
+            .outputs
+            .iter()
+            .filter_map(|out| out.hold.withheld_unseen(&out.statuses, None))
+            .reduce(|(a, x), (b, y)| (a.min(b), x | y));
+        if let Some((first, mut cause)) = found {
+            for (o, out) in st.outputs.iter_mut().enumerate() {
+                let mut changes = Changes {
+                    ring: &mut out.tx,
+                    dropped: &out.dropped,
+                    output: o as u32,
+                };
+                cause |= out
+                    .hold
+                    .advance_below(ctx, first, &out.statuses, &mut changes, &mut out.sink)
+                    .cause;
+            }
+            st.withdraw(cause);
+        }
         for o in 0..st.outputs.len() {
             let out = &mut st.outputs[o];
             let mut changes = Changes {

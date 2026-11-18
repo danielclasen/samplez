@@ -26,7 +26,7 @@ use samplez_mxl::{MxlApi, time};
 
 use crate::batch::Batch;
 use crate::blocks::{
-    Cause, Changes, Ctx, Hold, Kind, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
+    Cause, Changes, Ctx, Hold, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
 use crate::transfer::{Answer, Core, CoreCopy, Handover};
 
@@ -178,29 +178,35 @@ pub(crate) static CLOCK_STEP_NS: std::sync::atomic::AtomicI64 =
 pub(crate) static CLOCK_STEP_LOOP: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Pauses the loop of these counters, by address, once, where
-/// [`HOLD_PASS_PAUSE_K`] says; it sets [`HOLD_PASS_PAUSED`] and resumes
-/// once that is false again.
+/// Pauses the loop of these counters, by address, once, in the step of
+/// the first block from [`HOLD_PASS_PAUSE_K`] on: right after output 0
+/// moved its ring with [`HOLD_PASS_PAUSE_IN_RING`], else after the pass
+/// over the rings and before the outputs decide the block. It sets
+/// [`HOLD_PASS_PAUSED`] and resumes once that is false again.
 #[cfg(test)]
 pub(crate) static HOLD_PASS_PAUSE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Where [`HOLD_PASS_PAUSE`] pauses: 0 in the next pass over the hold
-/// rings, right after output 0 moved its ring; else in the step of this
-/// block, after that pass and before the outputs decide the block.
+/// The block from which [`HOLD_PASS_PAUSE`] pauses.
 #[cfg(test)]
 pub(crate) static HOLD_PASS_PAUSE_K: AtomicU64 = AtomicU64::new(0);
+
+/// Where [`HOLD_PASS_PAUSE`] pauses in the step.
+#[cfg(test)]
+pub(crate) static HOLD_PASS_PAUSE_IN_RING: AtomicBool = AtomicBool::new(false);
 
 /// The loop [`HOLD_PASS_PAUSE`] names is paused.
 #[cfg(test)]
 pub(crate) static HOLD_PASS_PAUSED: AtomicBool = AtomicBool::new(false);
 
-/// Pauses the loop of `counters` at `k` as [`HOLD_PASS_PAUSE`] asks.
+/// Pauses the loop of `counters` in the step of block `k`, `in_ring` or
+/// not, as [`HOLD_PASS_PAUSE`] asks.
 #[cfg(test)]
-fn hold_pass_pause(counters: &Counters, k: u64) {
+fn hold_pass_pause(counters: &Counters, k: Option<u64>, in_ring: bool) {
     let me = std::ptr::from_ref(counters) as usize;
     if HOLD_PASS_PAUSE.load(Acquire) != me
-        || HOLD_PASS_PAUSE_K.load(Relaxed) != k
+        || HOLD_PASS_PAUSE_IN_RING.load(Relaxed) != in_ring
+        || k.is_none_or(|k| k < HOLD_PASS_PAUSE_K.load(Relaxed))
         || HOLD_PASS_PAUSE
             .compare_exchange(me, 0, Relaxed, Relaxed)
             .is_err()
@@ -1380,6 +1386,35 @@ fn capture_core(
     c.late_lost_until = r.late_lost_until;
 }
 
+/// Moves output `o`'s ring below block `limit`
+/// ([`crate::blocks::Hold::advance_below`]); what it did, and whether it
+/// wrote. None without a writer.
+fn advance_ring(
+    out: &mut Out,
+    o: usize,
+    r: &mut Replica,
+    counters: &Counters,
+    ctx: Ctx,
+    limit: u64,
+) -> Option<(crate::blocks::Outcome, bool)> {
+    let writer = out.writer.as_deref_mut()?;
+    let mut changes = Changes {
+        ring: &mut r.changes,
+        dropped: &counters.status_changes_dropped,
+        output: o as u32,
+    };
+    let mut sink = WriterSink {
+        writer,
+        counters,
+        wrote: false,
+    };
+    let statuses = &r.shared.statuses[o];
+    let moved = out
+        .hold
+        .advance_below(ctx, limit, statuses, &mut changes, &mut sink);
+    Some((moved, sink.wrote))
+}
+
 /// The replica is withdrawn on every output, `cause` as
 /// [`crate::blocks::Hold::withdraw`] takes it.
 fn withdraw_all(outs: &mut [Out], r: &mut Replica, counters: &Counters, cause: bool) {
@@ -1630,64 +1665,70 @@ impl Rt {
         }
     }
 
-    /// F and the ranks for one pass over the outputs, read once: the
-    /// supervisor withholds a block before it moves F past it, so a pass
-    /// that reads F past the block finds it withheld on every output, and
-    /// one that does not moves it on none.
+    /// F and the ranks for one pass over the outputs, read once. Every
+    /// withhold the supervisor stored before the F a pass reads is seen
+    /// by every output in that pass: [`Rt::advance_holds`] withdraws the
+    /// replica on every output for it before any block from it on moves
+    /// at that F, and every block the pass decides is decided at that F.
     fn pass_ctx(&self) -> Option<Ctx> {
         self.replica.as_ref().map(|r| ctx(&r.shared, self.step_at))
     }
 
     /// Moves the blocks held in every output's ring and writes those
-    /// committed; one bit per output written. Before block `next` is
-    /// computed, a status the supervisor gave it already withdraws the
-    /// replica as well. `ctx` is [`Rt::pass_ctx`], none without a replica.
+    /// committed; one bit per output written. A block withheld on any
+    /// output, in its ring or block `next` before it is computed,
+    /// withdraws the replica on every output once every ring moved below
+    /// it, so no output commits at `ctx` a block from it on, whichever
+    /// output withholds it. `ctx` is [`Rt::pass_ctx`], none without a
+    /// replica.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn advance_holds(&mut self, next: Option<u64>, ctx: Option<Ctx>) -> u64 {
         let (Some(r), Some(ctx)) = (self.replica.as_mut(), ctx) else {
             return 0;
         };
         let mut written = 0;
+        // The first block withheld on any output that the output has not
+        // seen so: every ring moves up to it, then the replica is
+        // withdrawn on every output before any block from it on moves.
+        let mut found: Option<(u64, bool)> = None;
+        for (o, out) in self.outs.iter().enumerate() {
+            if out.writer.is_some()
+                && let Some((k, c)) = out.hold.withheld_unseen(&r.shared.statuses[o], next)
+            {
+                let (first, cause) = found.unwrap_or((k, false));
+                found = Some((first.min(k), cause | c));
+            }
+        }
+        if let Some((first, mut cause)) = found {
+            for o in 0..self.outs.len() {
+                if let Some((moved, wrote)) =
+                    advance_ring(&mut self.outs[o], o, r, &self.counters, ctx, first)
+                {
+                    cause |= moved.cause;
+                    written |= u64::from(wrote) << o;
+                }
+            }
+            withdraw_all(&mut self.outs, r, &self.counters, cause);
+        }
         for o in 0..self.outs.len() {
             let out = &mut self.outs[o];
-            let Some(writer) = out.writer.as_deref_mut() else {
+            let Some((moved, wrote)) = advance_ring(out, o, r, &self.counters, ctx, u64::MAX)
+            else {
                 continue;
             };
-            let mut changes = Changes {
-                ring: &mut r.changes,
-                dropped: &self.counters.status_changes_dropped,
-                output: o as u32,
-            };
-            let mut sink = WriterSink {
-                writer,
-                counters: &self.counters,
-                wrote: false,
-            };
-            let statuses = &r.shared.statuses[o];
-            let moved = out.hold.advance(ctx, statuses, &mut changes, &mut sink);
-            let (mut withdraw, mut cause) = (moved.withdraw, moved.cause);
             if let Some(p) = out.pages.as_mut() {
+                let statuses = &r.shared.statuses[o];
                 p.settle(statuses, &mut r.hashes, &self.counters.page_hashes_dropped);
             }
-            if let Some(s) = next
-                .filter(|_| out.hold.mode() != crate::blocks::Mode::Idle)
-                .and_then(|k| statuses.get(k))
-                .filter(|s| s.kind == Kind::Withheld)
-            {
-                withdraw = true;
-                cause |= s.for_a_cause();
-            }
-            if sink.wrote {
-                written |= 1 << o;
-            }
+            written |= u64::from(wrote) << o;
             // On every output before the next one advances: none commits a
             // block after this one withheld one.
-            if withdraw {
-                withdraw_all(&mut self.outs, r, &self.counters, cause);
+            if moved.withdraw {
+                withdraw_all(&mut self.outs, r, &self.counters, moved.cause);
             }
             #[cfg(test)]
             if o == 0 {
-                hold_pass_pause(&self.counters, 0);
+                hold_pass_pause(&self.counters, next, true);
             }
         }
         written
@@ -2428,7 +2469,7 @@ impl Rt {
         let pass = self.pass_ctx();
         let mut written = self.advance_holds(Some(k), pass);
         #[cfg(test)]
-        hold_pass_pause(&self.counters, k);
+        hold_pass_pause(&self.counters, Some(k), false);
         for o in 0..self.outs.len() {
             let out = &mut self.outs[o];
             if self.replay {
