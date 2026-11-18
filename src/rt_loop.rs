@@ -178,6 +178,41 @@ pub(crate) static CLOCK_STEP_NS: std::sync::atomic::AtomicI64 =
 pub(crate) static CLOCK_STEP_LOOP: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Pauses the loop of these counters, by address, once, where
+/// [`HOLD_PASS_PAUSE_K`] says; it sets [`HOLD_PASS_PAUSED`] and resumes
+/// once that is false again.
+#[cfg(test)]
+pub(crate) static HOLD_PASS_PAUSE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Where [`HOLD_PASS_PAUSE`] pauses: 0 in the next pass over the hold
+/// rings, right after output 0 moved its ring; else in the step of this
+/// block, after that pass and before the outputs decide the block.
+#[cfg(test)]
+pub(crate) static HOLD_PASS_PAUSE_K: AtomicU64 = AtomicU64::new(0);
+
+/// The loop [`HOLD_PASS_PAUSE`] names is paused.
+#[cfg(test)]
+pub(crate) static HOLD_PASS_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Pauses the loop of `counters` at `k` as [`HOLD_PASS_PAUSE`] asks.
+#[cfg(test)]
+fn hold_pass_pause(counters: &Counters, k: u64) {
+    let me = std::ptr::from_ref(counters) as usize;
+    if HOLD_PASS_PAUSE.load(Acquire) != me
+        || HOLD_PASS_PAUSE_K.load(Relaxed) != k
+        || HOLD_PASS_PAUSE
+            .compare_exchange(me, 0, Relaxed, Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    HOLD_PASS_PAUSED.store(true, Release);
+    while HOLD_PASS_PAUSED.load(Acquire) {
+        std::hint::spin_loop();
+    }
+}
+
 /// The kernel TAI offset, CLOCK_TAI - CLOCK_REALTIME read back to back,
 /// in whole seconds. Each read goes through the vDSO where the kernel has
 /// one for the clock, else it is a `clock_gettime` syscall.
@@ -1495,7 +1530,7 @@ impl Rt {
                 // held blocks still move, nothing is computed.
                 add(&self.counters.heartbeat_blocks, 1);
                 add(&self.counters.clock_behind_wakes, 1);
-                self.advance_holds(None);
+                self.advance_holds(None, self.pass_ctx());
                 self.sleep_until(now + period);
                 continue;
             }
@@ -1525,7 +1560,7 @@ impl Rt {
                 // still move, and the entries whose index passed are
                 // taken off the pending list.
                 add(&self.counters.heartbeat_blocks, 1);
-                self.advance_holds(None);
+                self.advance_holds(None, self.pass_ctx());
                 self.no_core(first, k + 1);
                 self.pass_entries(k);
                 let deadline = time::deadline(&self.api, k, self.block, self.margin);
@@ -1595,13 +1630,21 @@ impl Rt {
         }
     }
 
+    /// F and the ranks for one pass over the outputs, read once: the
+    /// supervisor withholds a block before it moves F past it, so a pass
+    /// that reads F past the block finds it withheld on every output, and
+    /// one that does not moves it on none.
+    fn pass_ctx(&self) -> Option<Ctx> {
+        self.replica.as_ref().map(|r| ctx(&r.shared, self.step_at))
+    }
+
     /// Moves the blocks held in every output's ring and writes those
     /// committed; one bit per output written. Before block `next` is
     /// computed, a status the supervisor gave it already withdraws the
-    /// replica as well.
+    /// replica as well. `ctx` is [`Rt::pass_ctx`], none without a replica.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    fn advance_holds(&mut self, next: Option<u64>) -> u64 {
-        let Some(r) = self.replica.as_mut() else {
+    fn advance_holds(&mut self, next: Option<u64>, ctx: Option<Ctx>) -> u64 {
+        let (Some(r), Some(ctx)) = (self.replica.as_mut(), ctx) else {
             return 0;
         };
         let mut written = 0;
@@ -1620,7 +1663,6 @@ impl Rt {
                 counters: &self.counters,
                 wrote: false,
             };
-            let ctx = ctx(&r.shared, self.step_at);
             let statuses = &r.shared.statuses[o];
             let moved = out.hold.advance(ctx, statuses, &mut changes, &mut sink);
             let (mut withdraw, mut cause) = (moved.withdraw, moved.cause);
@@ -1642,6 +1684,10 @@ impl Rt {
             // block after this one withheld one.
             if withdraw {
                 withdraw_all(&mut self.outs, r, &self.counters, cause);
+            }
+            #[cfg(test)]
+            if o == 0 {
+                hold_pass_pause(&self.counters, 0);
             }
         }
         written
@@ -2377,8 +2423,12 @@ impl Rt {
         };
         // The held blocks move first: one found withheld, or block k
         // withheld before it was computed, withdraws the replica before
-        // block k takes its status.
-        let mut written = self.advance_holds(Some(k));
+        // block k takes its status. Block k takes it at the same F: a ring
+        // that is full moves at block k's decision.
+        let pass = self.pass_ctx();
+        let mut written = self.advance_holds(Some(k), pass);
+        #[cfg(test)]
+        hold_pass_pause(&self.counters, k);
         for o in 0..self.outs.len() {
             let out = &mut self.outs[o];
             if self.replay {
@@ -2403,7 +2453,7 @@ impl Rt {
             for (c, ch) in src.chunks_exact_mut(b).enumerate() {
                 ch.copy_from_slice(&self.outbuf.channel(out.first_channel + c)[..b]);
             }
-            let Some(r) = self.replica.as_mut() else {
+            let (Some(r), Some(ctx)) = (self.replica.as_mut(), pass) else {
                 match writer.write_block(k, src) {
                     Write::Committed => written |= 1 << o,
                     Write::Held => add(&self.counters.output_held_blocks, 1),
@@ -2411,7 +2461,6 @@ impl Rt {
                 }
                 continue;
             };
-            let ctx = ctx(&r.shared, self.step_at);
             let statuses = &r.shared.statuses[o];
             let mut changes = Changes {
                 ring: &mut r.changes,
