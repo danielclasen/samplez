@@ -17,7 +17,9 @@
 //! ramping, replaced by a fade-in from silence (`Matrix::fade_in`), within
 //! the block it has. And on the entries a product's state change derives
 //! (`Targets::diff`), a recall changing every coefficient of the same two
-//! shapes, which a replica computes as each log entry applies.
+//! shapes, which a replica computes as each log entry applies, and a
+//! fader move on 64 stereo slots into 56 columns with every strip
+//! parameter unchanged.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -513,15 +515,76 @@ fn targets_at_block_1024() -> (samplez::Targets, samplez::Targets) {
     targets(384, 400)
 }
 
+/// One stereo slot's strip parameters, every one a strip takes, in key
+/// order: 14 of them.
+fn stereo_strip(slot: usize) -> Vec<StripParam> {
+    let db = slot as f32 / 8.0 - 4.0;
+    let mut p = vec![StripParam::Trim { db }];
+    p.extend((0..2).map(|leg| StripParam::LegTrim { leg, db: -db }));
+    p.extend((0..2).map(|leg| StripParam::Polarity {
+        leg,
+        inverted: leg == 1,
+    }));
+    p.push(StripParam::Hpf {
+        enabled: true,
+        freq: 80.0,
+    });
+    p.push(StripParam::Eq { enabled: true });
+    p.extend(DEFAULT_BANDS.iter().enumerate().map(|(band, b)| {
+        let value = EqBand { gain_db: db, ..*b };
+        StripParam::EqBand { band, value }
+    }));
+    p.push(StripParam::Gate(GateParams {
+        enabled: true,
+        threshold_db: -60.0,
+        range_db: 40.0,
+        attack_ms: 1.0,
+        release_ms: 50.0,
+    }));
+    p.push(StripParam::Comp(CompParams {
+        enabled: true,
+        threshold_db: -20.0,
+        ratio: 4.0,
+        attack_ms: 1.0,
+        release_ms: 50.0,
+        knee_db: 6.0,
+        makeup_db: 3.0,
+    }));
+    p.push(StripParam::DynamicsBeforeEq { enabled: false });
+    p
+}
+
+/// A fader move on a desk of 64 stereo slots into 56 columns: 128 by 56
+/// coefficients and 64 strips of 14 parameters, the strips unchanged and
+/// one slot's two rows of coefficients moved.
+fn targets_at_stereo_64x56() -> (samplez::Targets, samplez::Targets) {
+    let from = samplez::Targets {
+        gains: (0..128)
+            .map(|i| (0..56).map(|o| ((i + o) % 7) as f32 / 7.0).collect())
+            .collect(),
+        flows: (0..64).map(|s| format!("flow-{s}")).collect(),
+        strips: (0..64).map(stereo_strip).collect(),
+    };
+    let mut to = from.clone();
+    for row in &mut to.gains[10..12] {
+        for g in row {
+            *g *= 0.5;
+        }
+    }
+    (from, to)
+}
+
 #[library_benchmark]
 #[bench::block_48(setup = targets_at_block_48, config = limit(DIFF_BLOCK_48))]
 #[bench::block_1024(setup = targets_at_block_1024, config = limit(DIFF_BLOCK_1024))]
+#[bench::stereo_64x56(setup = targets_at_stereo_64x56, config = limit(DIFF_STEREO_64X56))]
 fn targets_diff((from, to): (samplez::Targets, samplez::Targets)) -> Vec<samplez::Entry> {
     black_box(from.diff(&to))
 }
 
 const DIFF_BLOCK_48: u64 = 397_843;
 const DIFF_BLOCK_1024: u64 = 4_030_452;
+const DIFF_STEREO_64X56: u64 = 374_284;
 
 const FILL_BLOCK_48: u64 = 451_896;
 const FILL_BLOCK_1024: u64 = 9_631_507;
