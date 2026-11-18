@@ -1184,6 +1184,16 @@ impl Contact {
         }
         self.learn(st, learned);
         if st.catching_up && st.catch_up_to.is_none() {
+            // The first voter to report sets it, whatever it knows: a
+            // report without a committed id names 0, a lagging voter an
+            // index below the set's.
+            tracing::info!(
+                voter = report.from,
+                catch_up_to = committed_index,
+                committed_known = report.committed.is_some(),
+                told = st.told,
+                "catching up to the committed index a voter reported"
+            );
             st.catch_up_to = Some(committed_index);
         }
         for l in &report.listed {
