@@ -9,6 +9,10 @@
 //! channel dropped (counted) costs nothing: the word says it, and a block
 //! without a word below the processed one was skipped. Only an unwritten
 //! range, which no word records, is lost with its change.
+//!
+//! A sample drains the engine's status-change and page-hash channels into
+//! the unwritten ranges and page records every sample reads, so any
+//! caller may sample beside contact without taking anything from it.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

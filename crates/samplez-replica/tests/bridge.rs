@@ -401,6 +401,34 @@ fn reports_carry_the_latest_page_hashes() {
     }
 }
 
+/// A sample drains the engine's page-hash and status-change channels into
+/// what every sample reads: a second caller, such as a product reading
+/// metrics, takes no page record from contact's next sample.
+#[test]
+fn a_second_caller_takes_no_page_record_from_contacts_sample() {
+    let domain = Domain::new();
+    let (_engine, audio) = bridge(&domain, 1 << 16);
+    let mut checked = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while checked < 3 {
+        assert!(Instant::now() < deadline, "{checked} pages in 10 s");
+        let other = audio.sample().own.pages;
+        let contact = audio.sample().own.pages;
+        for p in &other {
+            // Gone only behind as many newer records of its output.
+            let newer = (contact.iter())
+                .filter(|c| c.output == p.output && c.page > p.page)
+                .count();
+            assert!(
+                contact.contains(p) || newer == PAGES_REPORTED,
+                "{p:?} taken: {contact:?}"
+            );
+        }
+        checked += usize::from(!other.is_empty());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The horizon reads the processed block while the engine is dropped: the
 /// RT thread keeps moving it without a core, so a dropped replica keeps
 /// reporting one, and a rebuild installs a core again.
