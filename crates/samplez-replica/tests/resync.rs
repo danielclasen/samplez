@@ -569,3 +569,42 @@ async fn a_set_whose_commits_outlast_the_capped_lead_commits_with_bounded_unreso
         "{kinds:?}"
     );
 }
+
+/// `/readyz` after the whole set restarts: each replica finds the
+/// set's `Baseline` in its log, becomes ready withdrawn, and its engine
+/// stops computing, so nobody commits again. A replica that writes
+/// nothing is not ready, though it has not committed since it started;
+/// only before the set's first `Baseline` would it be.
+#[tokio::test(start_paused = true)]
+async fn a_restarted_set_withdrawn_while_nobody_commits_is_not_ready() {
+    let mut set = start(vec![a(0), a(1), a(2)], false).await;
+    let ids = audio(&set);
+    for &id in &ids {
+        set.crash(id).await;
+    }
+    for &id in &ids {
+        set.restart(id).await;
+        set.audio(id).lock().resyncs = true;
+    }
+    until("each one ready", 10, || {
+        ids.iter().all(|&id| {
+            set.replica(id)
+                .contact_metrics()
+                .and_then(|m| m.replica)
+                .is_some_and(|r| r.state != Some(ReplicaState::Starting))
+        })
+    })
+    .await;
+    for &id in &ids {
+        let at = due(&set, id);
+        set.audio(id).lock().stalled_at = Some(at);
+    }
+    sleep(Duration::from_millis(500)).await;
+    for &id in &ids {
+        let m = set.replica(id).contact_metrics().unwrap();
+        assert!(m.in_contact, "{id}");
+        assert!(baseline(&set, id).is_some(), "{id}");
+        assert_ne!(state(&set, id), Some(ReplicaState::Committing), "{id}");
+        assert!(!set.replica(id).replica().ready, "{id} writes nothing");
+    }
+}
