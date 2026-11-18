@@ -392,6 +392,8 @@ impl Writes {
 pub struct Fake {
     /// Records handed, by log index, with their at_index and entries.
     pub appended: Vec<(u64, u64, Vec<Entry>)>,
+    /// Records handed once the block of their at_index was due.
+    pub late: u64,
     /// Each commit point handed, with the TAI time it was handed at.
     pub committed: Vec<(u64, u64)>,
     /// F as published, with the TAI time, when it changed.
@@ -917,7 +919,11 @@ impl Audio for FakeAudio {
         })
     }
     fn appended(&self, index: u64, at_index: u64, entries: &[Entry]) {
+        let due = self.due();
         let mut st = self.lock();
+        if due.is_some_and(|k| at_index < (k + 1) * self.timing.block) {
+            st.late += 1;
+        }
         st.appended.push((index, at_index, entries.to_vec()));
     }
     fn committed(&self, up_to: u64) {
@@ -1519,6 +1525,9 @@ pub struct Options {
     pub unverified: bool,
     /// Product configuration hashes by node; every other node's is 0.
     pub configs: Vec<(NodeId, u64)>,
+    /// Nodes each of whose fsynced writes takes this much longer: a slow
+    /// disk.
+    pub sync_delays: Vec<(NodeId, Duration)>,
 }
 
 impl Default for Options {
@@ -1537,6 +1546,7 @@ impl Default for Options {
             kernel_offsets: Vec::new(),
             unverified: false,
             configs: Vec::new(),
+            sync_delays: Vec::new(),
         }
     }
 }
@@ -1696,17 +1706,23 @@ impl<P: Product + Sync> Set<P> {
             peers: self.ids().map(|id| id.to_string()).collect(),
             voters: self.options.wanted,
         };
-        let replica = Replica::start(
+        let factory: samplez_replica::state_machine::Factory<P> = {
+            let config = (self.options.configs.iter())
+                .find(|c| c.0 == id)
+                .map_or(0, |c| c.1);
+            let product = self.product.clone();
+            Arc::new(move || product(config))
+        };
+        let dir = self.root.join(id.to_string());
+        let store = samplez_replica::log_store::Store::open(&dir, factory, self.options.limits)
+            .expect("store opens");
+        let delay = (self.options.sync_delays.iter())
+            .find(|d| d.0 == id)
+            .map_or(Duration::ZERO, |d| d.1);
+        let replica = Replica::with_store(
             settings,
             self.options.raft.clone(),
-            &self.root.join(id.to_string()),
-            {
-                let config = (self.options.configs.iter())
-                    .find(|c| c.0 == id)
-                    .map_or(0, |c| c.1);
-                let product = self.product.clone();
-                Arc::new(move || product(config))
-            },
+            store.with_sync_delay(delay),
             Factory {
                 from: id,
                 net: self.net.clone(),

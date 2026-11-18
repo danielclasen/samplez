@@ -10,9 +10,11 @@ use axum::body::Bytes;
 use harness::{BLOCK, Options, Set, owner};
 use samplez::Targets;
 use samplez_replica::contact::Timing;
+use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{Body, Command, NodeId, Origin, Request, SessionKey};
+use samplez_replica::membership::{Slot, node_id};
 use samplez_replica::peer::{Forwarded, PeerRequest, PeerResponse, Refused};
-use samplez_replica::state_machine::{Apply, Changed, Effect, Product};
+use samplez_replica::state_machine::{Apply, Changed, Effect, Product, StateMachine};
 use samplez_service::ReplicatedState;
 use tokio::time::{Instant, sleep};
 
@@ -606,29 +608,201 @@ fn handed(set: &Set<Desk>, id: NodeId, index: u64) -> Option<(u64, Vec<samplez::
         .map(|a| (a.1, a.2.clone()))
 }
 
-/// Every audio replica's engine is handed the same records, by log
-/// index, at the same index: what each entry derived as it applied.
-#[tokio::test(start_paused = true)]
-async fn every_replica_hands_its_engine_the_same_records() {
-    let set = start().await;
-    let leader = set.leader().await;
-    for n in 0..6 {
+/// Fader moves `from..to`, each written through the leader of the
+/// moment.
+async fn faders(set: &Set<Desk>, from: u64, to: u64) {
+    for n in from..to {
+        let leader = set.leader().await;
         set.replica(leader)
             .submit(
                 &owner("s"),
                 &n.to_string(),
-                Bytes::from(format!("fader {} 0.{n}", n % 2)),
+                Bytes::from(format!("fader {} 0.{}", n % 2, n % 10)),
             )
             .await
             .expect("committed");
     }
+}
+
+/// A set of `options` with contact, whose follower can be made to
+/// install a snapshot ([`Set::force_install`]).
+async fn start_installable(options: Options) -> Set<Desk> {
+    let mut options = Options {
+        contact: Some(Timing::defaults(BLOCK)),
+        ..options
+    };
+    options.raft.snapshot_policy = openraft::SnapshotPolicy::Never;
+    options.raft.max_in_snapshot_log_to_keep = 0;
+    options.raft.purge_batch_size = 1;
+    let set = Set::start_with(options, Arc::new(|_| Desk::new())).await;
+    sleep(Duration::from_millis(50)).await;
+    set
+}
+
+/// The leader cut off until another one leads, then healed.
+async fn change_leader(set: &Set<Desk>) {
+    let old = set.leader().await;
+    set.net.isolate(old, set.ids());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !set.ids().any(|id| {
+        id != old
+            && set.replica(id).raft().metrics().borrow().state == openraft::ServerState::Leader
+    }) {
+        assert!(Instant::now() < deadline, "a new leader within 5 s");
+        sleep(Duration::from_millis(10)).await;
+    }
+    set.net.heal();
+}
+
+/// Every audio replica's engine is handed the same records, by log
+/// index, at the same index: what each entry derived as it applied,
+/// across a leader change and a snapshot install on one replica, which
+/// is handed every record after the snapshot's index and none another
+/// replica was not.
+#[tokio::test(start_paused = true)]
+async fn every_replica_hands_its_engine_the_same_records() {
+    let set = start_installable(Options::default()).await;
+    faders(&set, 0, 4).await;
+    change_leader(&set).await;
+    faders(&set, 4, 8).await;
+    let leader = set.leader().await;
+    let installed = set.ids().find(|&id| id != leader).unwrap();
+    set.force_install(installed).await;
+    let snapshot = set.replica(installed).store().applied_index();
+    faders(&set, 8, 12).await;
     sleep(Duration::from_millis(200)).await;
-    let records: Vec<Vec<(u64, u64, Vec<samplez::Entry>)>> = set
-        .ids()
-        .map(|id| set.audio(id).lock().appended.clone())
-        .collect();
-    assert_eq!(records[0].len(), 6, "{:?}", records[0]);
-    assert!(records.iter().all(|r| *r == records[0]), "{records:?}");
+    let records = |id| set.audio(id).lock().appended.clone();
+    let others: Vec<NodeId> = set.ids().filter(|&id| id != installed).collect();
+    let full = records(others[0]);
+    assert!(full.len() >= 13, "{full:?}");
+    assert_eq!(records(others[1]), full, "the other replicas");
+    let after: Vec<_> = (full.iter()).filter(|r| r.0 > snapshot).cloned().collect();
+    assert!(after.len() >= 4, "{after:?}");
+    let mine = records(installed);
+    assert!(
+        mine.ends_with(&after),
+        "after the install at {snapshot}: {mine:?} against {after:?}"
+    );
+    assert!(mine.iter().all(|r| full.contains(r)), "{mine:?}");
+}
+
+/// The witness's state, which derives records as an audio replica's
+/// does though it hands none, saved as a snapshot carries it and loaded
+/// into a product the factory builds (design test 20): the floor and the
+/// re-routed slots of the audio replicas, and the same record for every
+/// entry after it.
+#[tokio::test(start_paused = true)]
+async fn a_witness_snapshot_loads_to_the_audio_replicas_floor_and_records() {
+    let witness = node_id(Slot::Witness, 7);
+    let audio = |o: u16| node_id(Slot::Audio(o), 1 + u64::from(o));
+    let set = start_installable(Options {
+        ids: Some(vec![audio(0), audio(1), witness]),
+        ..Options::default()
+    })
+    .await;
+    let leader = set.leader().await;
+    set.replica(leader)
+        .submit(&owner("s"), "r", Bytes::from("route 0 c"))
+        .await
+        .expect("committed");
+    faders(&set, 0, 4).await;
+    sleep(Duration::from_millis(100)).await;
+    let saved = set.replica(witness).store().with_state(|sm| sm.save());
+    let n = set.replica(witness).store().applied_index();
+    let mut loaded = StateMachine::new(Desk::new(), Limits::defaults(48_000));
+    loaded.load(saved, Limits::defaults(48_000)).expect("loads");
+    let a = set.replica(audio(0)).store();
+    assert_eq!(a.applied_index(), n, "settled");
+    a.with_state(|sm| {
+        assert_eq!(loaded.floor, sm.floor);
+        assert_eq!(loaded.derived, sm.derived);
+    });
+    faders(&set, 4, 8).await;
+    sleep(Duration::from_millis(100)).await;
+    let mut next = Vec::new();
+    a.entries_after(n, |id, request| next.push((id, request.clone())));
+    assert!(next.len() >= 4, "{next:?}");
+    for (id, request) in &next {
+        loaded.apply_at(id.index, id.term, request);
+    }
+    a.with_state(|sm| {
+        for (id, _) in &next {
+            assert_eq!(
+                loaded.records.get(&id.index),
+                sm.records.get(&id.index),
+                "entry {}",
+                id.index
+            );
+        }
+        assert_eq!(loaded.floor, sm.floor);
+    });
+}
+
+/// Writes for `run` with one follower's every fsync 20 ms slow (design
+/// test 21): it applies each entry later than the others, and the
+/// deadline checked at the apply holds the late ones unresolved there.
+/// No engine refuses a record or is handed one late, and no decision
+/// contradicts a replica. Returns, per replica, the slow follower
+/// first, the records it handed, the entries it held unresolved and its
+/// rebuilds.
+async fn fsync_load(run: Duration) -> Vec<(NodeId, usize, u64, usize)> {
+    let slow = 2;
+    let set = Set::start_with(
+        Options {
+            contact: Some(Timing::defaults(BLOCK)),
+            sync_delays: vec![(slow, Duration::from_millis(20))],
+            ..Options::default()
+        },
+        Arc::new(|_| Desk::new()),
+    )
+    .await;
+    sleep(Duration::from_millis(50)).await;
+    let end = Instant::now() + run;
+    let mut n = 0u64;
+    while Instant::now() < end {
+        let leader = set.leader().await;
+        set.replica(leader)
+            .submit(
+                &owner("s"),
+                &n.to_string(),
+                Bytes::from(format!("fader {} 0.{}", n % 2, n % 10)),
+            )
+            .await
+            .expect("committed");
+        n += 1;
+        sleep(Duration::from_millis(5)).await;
+    }
+    sleep(Duration::from_millis(500)).await;
+    let mut out = Vec::new();
+    for id in std::iter::once(slow).chain(set.ids().filter(|&id| id != slow)) {
+        let m = set.replica(id).contact_metrics().unwrap();
+        let fake = set.audio(id).lock();
+        assert_eq!(m.entries_refused, 0, "{id}");
+        assert_eq!(fake.late, 0, "{id} handed a record late");
+        assert_eq!(m.contradicted, 0, "{id} contradicted");
+        out.push((id, fake.appended.len(), m.unresolved, fake.rebuilds.len()));
+    }
+    let leader = set.replica(set.leader().await).contact_metrics().unwrap();
+    eprintln!(
+        "{n} writes in {run:?}; per replica, the slow one first, records handed, \
+         entries unresolved and rebuilds: {out:?}; the leader's lead {} samples, \
+         capped: {}",
+        leader.lead, leader.apply_lead_capped
+    );
+    out
+}
+
+/// [`fsync_load`] for 3 s of writes.
+#[tokio::test(start_paused = true)]
+async fn a_slow_follower_disk_refuses_and_contradicts_nothing() {
+    fsync_load(Duration::from_secs(3)).await;
+}
+
+/// [`fsync_load`] for the 30 s the design names: run with `--ignored`.
+#[tokio::test(start_paused = true)]
+#[ignore = "30 s of writes; the 3 s variant runs in CI"]
+async fn a_slow_follower_disk_refuses_and_contradicts_nothing_for_30_s() {
+    fsync_load(Duration::from_secs(30)).await;
 }
 
 /// A command applied on no replica by its apply deadline is unresolved

@@ -85,7 +85,6 @@ pub struct Store<P> {
     on_mismatch: Arc<dyn Fn(u64, u64) + Send + Sync>,
     snapshots: Arc<tokio::sync::Mutex<()>>,
     /// Added to every fsynced write, for tests of a slow volume.
-    #[cfg(test)]
     sync_delay: std::time::Duration,
 }
 
@@ -97,7 +96,6 @@ impl<P> Clone for Store<P> {
             config: self.config,
             on_mismatch: self.on_mismatch.clone(),
             snapshots: self.snapshots.clone(),
-            #[cfg(test)]
             sync_delay: self.sync_delay,
         }
     }
@@ -352,21 +350,19 @@ impl<P: Product> Store<P> {
             config,
             on_mismatch: Arc::new(exit_on_mismatch),
             snapshots: Arc::default(),
-            #[cfg(test)]
             sync_delay: std::time::Duration::ZERO,
         })
     }
 
-    /// This store with every fsynced write taking `delay` longer.
-    #[cfg(test)]
-    pub(crate) fn with_sync_delay(mut self, delay: std::time::Duration) -> Store<P> {
+    /// This store with every fsynced write taking `delay` longer: a slow
+    /// disk, for tests.
+    pub fn with_sync_delay(mut self, delay: std::time::Duration) -> Store<P> {
         self.sync_delay = delay;
         self
     }
 
     /// Appends `records` to `log` as one frame, fsynced with `sync`.
     async fn write(&self, records: &[Record], sync: bool) -> io::Result<()> {
-        #[cfg(test)]
         if sync && !self.sync_delay.is_zero() {
             tokio::time::sleep(self.sync_delay).await;
         }
@@ -957,6 +953,14 @@ mod tests {
         let mut records = Vec::new();
         assert!(store.records(0, 3, |i, r| records.push((i, r.at_index))));
         assert_eq!(records, [(1, 4800), (2, 4800), (3, 9600)]);
+        // Read as held, not copied.
+        let mut shared = Vec::new();
+        store.records(0, 3, |i, r| shared.push((i, Arc::clone(r))));
+        store.with_state(|sm| {
+            for (i, r) in &shared {
+                assert!(Arc::ptr_eq(r, &sm.records[i]));
+            }
+        });
     }
 
     #[tokio::test]

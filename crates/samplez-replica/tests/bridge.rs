@@ -8,16 +8,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use samplez::blocks::{HEALTHY, PAGE};
-use samplez::{Config, Engine, Entry, InputState, Replication};
-use samplez_dsp::StripParam;
+use samplez::{Config, Engine, Entry, InputState, Replication, Targets};
+use samplez_dsp::{GateParams, StripParam};
 use samplez_mxl::output::{self, Creation, OutputConfig};
 use samplez_mxl::{Instance, time};
 use samplez_replica::bootstrap::random_id;
 use samplez_replica::bridge::{EngineAudio, PAGES_REPORTED};
 use samplez_replica::contact::{Audio, Timing};
+use samplez_replica::dedup::Limits;
+use samplez_replica::entry::{Body, Command, Origin, Request, SessionKey};
 use samplez_replica::report::{Page, page_digest, status_of};
 use samplez_replica::resync::{Missed, Source};
-use samplez_replica::state_machine::Record;
+use samplez_replica::state_machine::{Apply, Changed, Effect, Product, Record, StateMachine};
 
 const B: u64 = 48;
 
@@ -1193,4 +1195,378 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
     assert!(audio.rebuild_engine(&state, floor), "rebuilt at the floor");
     let installed = engine.progress().unwrap().processed.unwrap();
     assert!(installed * B + B >= floor, "installed at {installed}");
+}
+
+/// Two mono input slots reading one flow into one output, as a product
+/// drives them: `fader <slot> <gain>`, `vca <gain>`, `gate <slot> <dB>`
+/// for the gate threshold, `recall <gain>` setting both faders.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Console {
+    faders: [f32; 2],
+    vca: f32,
+    gates: [f32; 2],
+    flow: String,
+}
+
+impl Console {
+    fn new(flow: &str) -> Console {
+        Console {
+            faders: [1.0, 1.0],
+            vca: 1.0,
+            gates: [-60.0, -60.0],
+            flow: flow.to_owned(),
+        }
+    }
+}
+
+impl Product for Console {
+    type Change = ();
+    const DRIVES_ENGINE: bool = true;
+
+    fn apply(&mut self, _: &Origin, command: &[u8], _: &Apply) -> Effect<()> {
+        let text = std::str::from_utf8(command).expect("utf-8");
+        let number = |s: &str| s.parse::<f32>().unwrap();
+        match text.split(' ').collect::<Vec<_>>()[..] {
+            ["fader", slot, gain] => self.faders[slot.parse::<usize>().unwrap()] = number(gain),
+            ["vca", gain] => self.vca = number(gain),
+            ["gate", slot, db] => self.gates[slot.parse::<usize>().unwrap()] = number(db),
+            ["recall", gain] => self.faders = [number(gain), number(gain) / 2.0],
+            _ => return Effect::Stale,
+        }
+        Effect::Changed(())
+    }
+    fn expire(&mut self, _: &SessionKey) -> Effect<()> {
+        Effect::Unchanged
+    }
+    fn forget(&mut self, _: &SessionKey) {}
+    fn delta(&self, _: u64, _: &[Changed<'_, ()>]) -> String {
+        String::new()
+    }
+    fn text(&self) -> String {
+        String::new()
+    }
+    fn save(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("encodes")
+    }
+    fn load(&mut self, saved: &[u8]) -> Result<(), String> {
+        *self = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    fn config_hash(&self) -> u64 {
+        0
+    }
+    fn targets(&self) -> Option<Targets> {
+        let gate = |slot: usize| {
+            vec![StripParam::Gate(GateParams {
+                enabled: true,
+                threshold_db: self.gates[slot],
+                range_db: 30.0,
+                attack_ms: 1.0,
+                release_ms: 200.0,
+            })]
+        };
+        Some(Targets {
+            gains: (0..2).map(|s| vec![self.faders[s] * self.vca]).collect(),
+            flows: vec![self.flow.clone(); 2],
+            strips: (0..2).map(gate).collect(),
+        })
+    }
+}
+
+/// An engine of [`Console`]'s shape reading `input`, writing `output`.
+fn console(domain: &Domain, input: &str, output: &str) -> (Arc<Engine>, EngineAudio) {
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": (0..2).map(|n| serde_json::json!({
+            "name": format!("in{n}"), "domain": "d", "flowId": input, "channels": 1 }))
+            .collect::<Vec<_>>(),
+        "outputs": [{ "name": "out0", "domain": "d", "flowId": output, "label": "console",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0], [1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    bridge_of(&v, 1 << 12)
+}
+
+/// A machine applying a log of [`Console`] commands, one per entry.
+struct Machine(StateMachine<Console>);
+
+impl Machine {
+    fn new(flow: &str) -> Machine {
+        Machine(StateMachine::new(
+            Console::new(flow),
+            Limits::defaults(48_000),
+        ))
+    }
+
+    /// Applies entry `index`, command `body` stamped `stamp` asking for
+    /// `at`: the record it derived.
+    fn apply(&mut self, index: u64, stamp: u64, at: u64, body: &str) -> Arc<Record> {
+        let command = Command {
+            origin: Origin {
+                principal: "anonymous".into(),
+                session: "s".into(),
+                role: samplez_service::Role::Operator,
+                connection: "r0:n:1".into(),
+            },
+            id: index.to_string(),
+            at_index: Some(at),
+            body: body.as_bytes().to_vec(),
+            generation: None,
+        };
+        let request = Request {
+            stamp,
+            body: Body::Commands(vec![command]),
+        };
+        self.0.apply_at(index, 1, &request);
+        Arc::clone(&self.0.records[&index])
+    }
+}
+
+/// Collects the page records of every engine of `audios` until each has
+/// processed block `end`: per engine, by page.
+fn pages_until(
+    engines: &[(&Engine, &EngineAudio)],
+    end: u64,
+) -> Result<Vec<BTreeMap<u64, Page>>, String> {
+    let mut pages = vec![BTreeMap::new(); engines.len()];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for (n, (_, audio)) in engines.iter().enumerate() {
+            for p in audio.sample().own.pages {
+                pages[n].insert(p.page, p);
+            }
+        }
+        let done = (engines.iter())
+            .all(|(e, _)| e.progress().and_then(|p| p.processed).unwrap_or(0) > end);
+        if done {
+            return Ok(pages);
+        }
+        if Instant::now() > deadline {
+            return Err("pages within 10 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Pages `from..=to` of `a` and `b` equal by hash and fingerprint: the
+/// number compared.
+fn equal_pages(
+    a: &BTreeMap<u64, Page>,
+    b: &BTreeMap<u64, Page>,
+    from: u64,
+    to: u64,
+) -> Result<usize, String> {
+    let mut compared = 0;
+    for p in from..=to {
+        let (Some(x), Some(y)) = (a.get(&p), b.get(&p)) else {
+            continue;
+        };
+        if (x.hash, x.fingerprint) != (y.hash, y.fingerprint) {
+            return Err(format!("page {p} differs"));
+        }
+        compared += 1;
+    }
+    Ok(compared)
+}
+
+const CONSOLE_INPUT: &str = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd6a00";
+
+/// A domain with a second of history and a pilot on [`CONSOLE_INPUT`],
+/// and two console engines reading it, past their fade-in from the
+/// attach.
+fn consoles(domain: &Domain) -> [(Arc<Engine>, EngineAudio); 2] {
+    std::fs::write(
+        domain.0.join("options.json"),
+        r#"{"urn:x-mxl:option:history_duration/v1.0": 1000000000}"#,
+    )
+    .unwrap();
+    let engines = [
+        console(
+            domain,
+            CONSOLE_INPUT,
+            "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f40",
+        ),
+        console(
+            domain,
+            CONSOLE_INPUT,
+            "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f41",
+        ),
+    ];
+    wait_for("both read the input", || {
+        engines.iter().all(|(e, _)| {
+            e.status()
+                .inputs
+                .iter()
+                .all(|i| i.state == InputState::Attached)
+                && e.progress().and_then(|p| p.processed).is_some()
+        })
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    engines
+}
+
+fn processed_of(e: &Engine) -> u64 {
+    e.progress().and_then(|p| p.processed).unwrap_or(0)
+}
+
+/// Two engines each handed the records its own machine derived from one
+/// log (design test 22): a VCA move, a gate change and a recall derive
+/// equal records on both machines, and the engines compute equal pages
+/// from the first entry's index on.
+#[test]
+fn two_engines_fed_two_machines_records_compute_equal_pages() {
+    undisturbed(machines_records_on_two_engines);
+}
+
+fn machines_records_on_two_engines() -> Result<(), String> {
+    let domain = Domain::new();
+    let _pilot = Pilot::start(&domain, CONSOLE_INPUT);
+    let [(ea, aa), (eb, ab)] = consoles(&domain);
+    let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
+    let silenced_before = silenced(&ea) + silenced(&eb);
+    let (mut ma, mut mb) = (Machine::new(CONSOLE_INPUT), Machine::new(CONSOLE_INPUT));
+    let log = ["vca 0.5", "gate 0 -20", "recall 0.8", "fader 1 0.25"];
+    let (mut first, mut last) = (None, 0);
+    for (n, body) in log.iter().enumerate() {
+        let index = n as u64 + 1;
+        let stamp = processed_of(&ea).max(processed_of(&eb)) * B;
+        let at = stamp + 40 * B;
+        let (ra, rb) = (
+            ma.apply(index, stamp, at, body),
+            mb.apply(index, stamp, at, body),
+        );
+        assert_eq!(ra, rb, "entry {index}: equal records");
+        aa.appended(index, ra.at_index, &ra.entries);
+        aa.committed(index);
+        ab.appended(index, rb.at_index, &rb.entries);
+        ab.committed(index);
+        first.get_or_insert(ra.at_index);
+        last = ra.at_index;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let end = (last + 480) / B + 4 * PAGE / B;
+    let pages = pages_until(&[(&ea, &aa), (&eb, &ab)], end + PAGE / B)?;
+    if silenced(&ea) + silenced(&eb) > silenced_before {
+        return Err("an input block silenced".into());
+    }
+    let from = first.unwrap() / PAGE;
+    let compared = equal_pages(&pages[0], &pages[1], from, end * B / PAGE)?;
+    if compared < 4 {
+        return Err(format!("{compared} pages compared"));
+    }
+    for e in [&ea, &eb] {
+        assert_eq!(e.counters().command_late.load(Ordering::Relaxed), 0);
+    }
+    Ok(())
+}
+
+/// How a rebuild meets the floor (design test 25).
+#[derive(Clone, Copy, Debug)]
+enum Floor {
+    /// An entry after the state read takes effect at exactly its floor.
+    At,
+    /// An entry after the state read passes before the install: the
+    /// install is missed, and a fresh read installs.
+    Passed,
+    /// Nothing written for a while: the floor lies in the past.
+    Idle,
+}
+
+/// A core rebuilt from a machine's product state at its floor, with the
+/// records after it handed on top while fader writes go on, computes the
+/// live engine's pages once the ramps of the install and of the last
+/// write ended.
+#[test]
+fn a_core_rebuilt_at_the_floor_computes_the_live_pages() {
+    for case in [Floor::At, Floor::Passed, Floor::Idle] {
+        undisturbed(|| rebuild_at_the_floor(case));
+    }
+}
+
+fn rebuild_at_the_floor(case: Floor) -> Result<(), String> {
+    let domain = Domain::new();
+    let _pilot = Pilot::start(&domain, CONSOLE_INPUT);
+    let [(live, la), (rebuilt, ra)] = consoles(&domain);
+    let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
+    let silenced_before = silenced(&live) + silenced(&rebuilt);
+    let mut m = Machine::new(CONSOLE_INPUT);
+    let index = std::cell::Cell::new(0u64);
+    // Entry `body` asking for `ahead` blocks past the latest block either
+    // engine computed, handed to both as contact hands it.
+    let write = |m: &mut Machine, body: &str, ahead: u64| {
+        index.set(index.get() + 1);
+        let index = index.get();
+        let stamp = processed_of(&live).max(processed_of(&rebuilt)) * B;
+        let r = m.apply(index, stamp, stamp + ahead * B, body);
+        for audio in [&la, &ra] {
+            audio.appended(index, r.at_index, &r.entries);
+            audio.committed(index);
+        }
+        (index, r)
+    };
+    for n in 0..3 {
+        write(&mut m, &format!("fader 0 0.{}", n + 3), 40);
+    }
+    ra.drop_engine();
+    match case {
+        Floor::At => {
+            write(&mut m, "fader 1 0.7", 40);
+            let (n, floor) = (index.get(), m.0.floor);
+            let state = m.0.product_state(n);
+            let (_, r) = write(&mut m, "fader 0 0.2", 5);
+            assert_eq!(r.at_index, floor, "at exactly the floor");
+            if !ra.rebuild_engine(&state, floor) {
+                return Err("not rebuilt".into());
+            }
+        }
+        Floor::Passed => {
+            write(&mut m, "fader 1 0.7", 40);
+            let (n, floor) = (index.get(), m.0.floor);
+            let stale = m.0.product_state(n);
+            write(&mut m, "fader 0 0.2", 5);
+            wait_for("its index passed", || {
+                processed_of(&rebuilt) > m.0.floor / B + 2
+            });
+            assert!(
+                !ra.rebuild_engine(&stale, floor),
+                "an entry it lacks passed"
+            );
+            let fresh = m.0.product_state(index.get());
+            if !ra.rebuild_engine(&fresh, m.0.floor) {
+                return Err("not rebuilt from a fresh read".into());
+            }
+        }
+        Floor::Idle => {
+            wait_for("the floor passed", || {
+                processed_of(&rebuilt) > m.0.floor / B + 20
+            });
+            let state = m.0.product_state(index.get());
+            if !ra.rebuild_engine(&state, m.0.floor) {
+                return Err("not rebuilt".into());
+            }
+        }
+    }
+    let installed = processed_of(&rebuilt);
+    let mut last = 0;
+    for n in 0..10 {
+        let (_, r) = write(&mut m, &format!("fader {} 0.{}", n % 2, n + 1), 40);
+        last = r.at_index;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let from = ((installed + 1) * B + 2 * 480).div_ceil(PAGE) + 2;
+    let end = (last + 480) / B + 4 * PAGE / B;
+    let pages = pages_until(&[(&live, &la), (&rebuilt, &ra)], end + PAGE / B)?;
+    if silenced(&live) + silenced(&rebuilt) > silenced_before {
+        return Err("an input block silenced".into());
+    }
+    let compared = equal_pages(&pages[0], &pages[1], from, end * B / PAGE)?;
+    if compared < 4 {
+        return Err(format!("{case:?}: {compared} pages compared"));
+    }
+    assert_eq!(rebuilt.counters().command_late.load(Ordering::Relaxed), 0);
+    Ok(())
 }
