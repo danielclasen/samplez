@@ -1,6 +1,7 @@
 //! The strip's filters: a state variable filter in the trapezoidal form
 //! of Andrew Simper (Cytomic, "SvfLinearTrapOptimised2"), whose outputs
-//! mix to the high-pass, bell and shelf responses of the RBJ Audio EQ
+//! mix to the high-pass, low-pass, bell and shelf responses of the RBJ
+//! Audio EQ
 //! Cookbook (Robert Bristow-Johnson), with the same bilinear prewarp.
 //!
 //! The coefficients `(g, k, m0, m1, m2)` are computed in f64 with the
@@ -53,6 +54,9 @@ pub(crate) enum Shape {
     /// Second-order Butterworth high-pass, 12 dB per octave, -3.01 dB at
     /// `freq`: the cookbook HPF with Q = 1/sqrt(2).
     HighPass { freq: f32 },
+    /// Second-order Butterworth low-pass, 12 dB per octave, -3.01 dB at
+    /// `freq`: the cookbook LPF with Q = 1/sqrt(2).
+    LowPass { freq: f32 },
     /// The cookbook peakingEQ.
     Bell { freq: f32, gain_db: f32, q: f32 },
     /// The cookbook lowShelf with its Q, `gain_db / 2` at `freq`.
@@ -76,6 +80,7 @@ pub(crate) fn coefficients(shape: Shape) -> Coefficients {
             let k = core::f64::consts::SQRT_2;
             (warp(freq), k, 1.0, -k, -1.0)
         }
+        Shape::LowPass { freq } => (warp(freq), core::f64::consts::SQRT_2, 0.0, 0.0, 1.0),
         Shape::Bell { freq, gain_db, q } => {
             let a = amplitude(gain_db);
             let k = 1.0 / (f64::from(q) * a);
@@ -332,7 +337,9 @@ pub(crate) mod tests {
     /// against.
     pub(crate) fn cookbook(shape: Shape) -> [f64; 6] {
         let (freq, gain_db, q) = match shape {
-            Shape::HighPass { freq } => (freq, 0.0, core::f32::consts::FRAC_1_SQRT_2),
+            Shape::HighPass { freq } | Shape::LowPass { freq } => {
+                (freq, 0.0, core::f32::consts::FRAC_1_SQRT_2)
+            }
             Shape::Bell { freq, gain_db, q }
             | Shape::LowShelf { freq, gain_db, q }
             | Shape::HighShelf { freq, gain_db, q } => (freq, gain_db, q),
@@ -347,6 +354,14 @@ pub(crate) mod tests {
                 (1.0 + cw) / 2.0,
                 -(1.0 + cw),
                 (1.0 + cw) / 2.0,
+                1.0 + alpha,
+                -2.0 * cw,
+                1.0 - alpha,
+            ],
+            Shape::LowPass { .. } => [
+                (1.0 - cw) / 2.0,
+                1.0 - cw,
+                (1.0 - cw) / 2.0,
                 1.0 + alpha,
                 -2.0 * cw,
                 1.0 - alpha,
@@ -427,6 +442,9 @@ pub(crate) mod tests {
             Shape::HighPass { freq: 20.0 },
             Shape::HighPass { freq: 80.0 },
             Shape::HighPass { freq: 500.0 },
+            Shape::LowPass { freq: 1000.0 },
+            Shape::LowPass { freq: 4000.0 },
+            Shape::LowPass { freq: 20000.0 },
         ];
         for &(freq, gain_db, q) in &[
             (20.0, 18.0, 0.1),
@@ -474,9 +492,10 @@ pub(crate) mod tests {
     }
 
     /// Fixed points of the shapes, independent of the cookbook: the
-    /// Butterworth high-pass is 3.01 dB down at its frequency, a bell has
-    /// its gain at its centre, a shelf half its gain at its frequency and
-    /// all of it far into the shelf.
+    /// Butterworth high-pass and low-pass are 3.01 dB down and 90
+    /// degrees off at their frequency and about 12 dB down an octave
+    /// beyond it, a bell has its gain at its centre, a shelf half its
+    /// gain at its frequency and all of it far into the shelf.
     #[test]
     fn responses_hit_their_defining_points() {
         let half_power = -10.0 * 2f64.log10();
@@ -485,6 +504,11 @@ pub(crate) mod tests {
         assert!((deg - 90.0).abs() < 0.5, "{deg}");
         let (db, _) = svf_response(Shape::HighPass { freq: 100.0 }, 50.0);
         assert!((db + 12.3).abs() < 0.1, "one octave below: {db}");
+        let (db, deg) = svf_response(Shape::LowPass { freq: 4000.0 }, 4000.0);
+        assert!((db - half_power).abs() < 0.002, "{db}");
+        assert!((deg + 90.0).abs() < 0.5, "{deg}");
+        let (db, _) = svf_response(Shape::LowPass { freq: 1000.0 }, 2000.0);
+        assert!((db + 12.3).abs() < 0.1, "one octave above: {db}");
         let (db, deg) = svf_response(
             Shape::Bell {
                 freq: 1000.0,

@@ -145,25 +145,33 @@ pub enum StripParam {
     DynamicsBeforeEq { enabled: bool },
 }
 
-/// Why a strip refuses a parameter. Building one does not allocate, so
-/// [`Strip::set`] can refuse on the real-time thread.
-enum Refusal {
+/// Why a strip or a duck detector refuses a parameter. Building one does
+/// not allocate, so [`Strip::set`] can refuse on the real-time thread.
+pub(crate) enum Refusal {
     Outside(&'static str, f32, f32, f32),
     NoLeg(usize, usize),
     NoBand(usize),
+    NoKey(usize),
+    KeyLegs(usize),
 }
 
 impl Refusal {
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         match *self {
             Refusal::Outside(what, v, lo, hi) => format!("{what} {v} is outside {lo}..={hi}"),
             Refusal::NoLeg(leg, legs) => format!("no leg {leg} on a strip of {legs}"),
             Refusal::NoBand(band) => format!("no eq band {band}"),
+            Refusal::NoKey(key) => format!("no key {key}"),
+            Refusal::KeyLegs(legs) => format!("a key of {legs} legs, not 1 to {MAX_LEGS}"),
         }
     }
 }
 
-fn within(what: &'static str, v: f32, range: &RangeInclusive<f32>) -> Result<(), Refusal> {
+pub(crate) fn within(
+    what: &'static str,
+    v: f32,
+    range: &RangeInclusive<f32>,
+) -> Result<(), Refusal> {
     if range.contains(&v) {
         Ok(())
     } else {
