@@ -453,6 +453,10 @@ pub struct Fake {
     pub lapse_late: bool,
     /// Rebuilds refused: a generation the core names was not built.
     pub refused_rebuilds: u64,
+    /// A rebuilt core's samples differ from every other replica's by
+    /// this factor for good: state a rebuild does not carry, as a duck
+    /// group keyed throughout keeps its envelope off 0 and full depth.
+    pub rebuild_glitch: Option<f32>,
     /// Entries the core holds unresolved: a rebuilt core holds none.
     pub core_unresolved: BTreeSet<u64>,
     /// Blocks computed while the core holds an entry unresolved carry a
@@ -1035,6 +1039,9 @@ impl Audio for FakeAudio {
         }
         st.rebuilds.push(at);
         st.rebuilt_with.push((state.last_id, at_least));
+        if let Some(by) = st.rebuild_glitch {
+            st.glitched.push((k, FOR_GOOD, by));
+        }
         st.no_core = false;
         st.core_unresolved.clear();
         let n = st.unresolved.len();
