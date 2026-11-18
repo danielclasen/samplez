@@ -115,10 +115,11 @@ impl Gate {
         }
     }
 
-    /// Whether each of `dirs` was found. Starts a lookup for each that has
-    /// none running, and waits for the answers until `wait` has passed. A
-    /// lookup that answered since an earlier call is started afresh, so an
-    /// answer is never older than the call.
+    /// Whether each of `dirs` was found; a directory named twice is looked
+    /// up once. Starts a lookup for each that has none running, and waits
+    /// for the answers until `wait` has passed. A lookup that answered
+    /// since an earlier call is started afresh, so an answer is never
+    /// older than the call.
     pub fn found(&mut self, dirs: &[PathBuf], wait: Duration) -> Vec<bool> {
         let until = Instant::now() + wait;
         // Answered lookups of directories not asked for now are dropped.
@@ -133,10 +134,13 @@ impl Gate {
                 .or_insert_with(|| Lookup::new(dir.clone(), look));
             l.start();
         }
+        let mut found: HashMap<&PathBuf, bool> = HashMap::new();
         dirs.iter()
             .map(|dir| {
-                let l = self.lookups.get_mut(dir).expect("inserted above");
-                l.answer_by(until) == Some(true)
+                *found.entry(dir).or_insert_with(|| {
+                    let l = self.lookups.get_mut(dir).expect("inserted above");
+                    l.answer_by(until) == Some(true)
+                })
             })
             .collect()
     }
@@ -242,9 +246,13 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(600), "one lookup");
         let mut fast = Gate::new(exists);
         let missing = dir.join("samplez-no-such-directory");
+        // Two slots reading one flow name its directory twice.
         assert_eq!(
-            fast.found(&[dir, missing], Duration::from_secs(5)),
-            [true, false]
+            fast.found(
+                &[dir.clone(), missing.clone(), dir, missing],
+                Duration::from_secs(5)
+            ),
+            [true, false, true, false]
         );
     }
 }
