@@ -234,9 +234,26 @@ struct Set {
     /// Bound for the set's lifetime, so a stopped replica's port is not
     /// taken by another socket before it starts again.
     listeners: BTreeMap<Slot, std::net::TcpListener>,
+    /// Per slot not running, a task that takes each connection to its port
+    /// and drops it, as a stopped pod's address refuses one: a request
+    /// queued on the bound port would reach the replica started next,
+    /// however old.
+    refusers: Mutex<BTreeMap<Slot, JoinHandle<()>>>,
     tls: BTreeMap<Slot, Tls>,
     nodes: BTreeMap<Slot, Node>,
     _panics: PanicGuard,
+}
+
+/// Takes each connection to `tcp` and drops it, until aborted.
+fn refuse(tcp: &std::net::TcpListener) -> JoinHandle<()> {
+    let tcp = TcpListener::from_std(tcp.try_clone().unwrap()).unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((connection, _)) = tcp.accept().await {
+                drop(connection);
+            }
+        }
+    })
 }
 
 fn name(slot: Slot) -> String {
@@ -289,6 +306,9 @@ impl Set {
             addrs.insert(slot, tcp.local_addr().unwrap().to_string());
             listeners.insert(slot, tcp);
         }
+        let refusers = (listeners.iter())
+            .map(|(&slot, tcp)| (slot, refuse(tcp)))
+            .collect();
         Set {
             root,
             api,
@@ -296,6 +316,7 @@ impl Set {
             voters,
             addrs,
             listeners,
+            refusers: Mutex::new(refusers),
             tls,
             nodes: BTreeMap::new(),
             _panics: PanicGuard::new(),
@@ -348,6 +369,11 @@ impl Set {
         .await
         .unwrap();
         let replica = Arc::new(replica);
+        let refuser = self.refusers.lock().unwrap().remove(&slot);
+        if let Some(refuser) = refuser {
+            refuser.abort();
+            let _ = refuser.await;
+        }
         let tcp = TcpListener::from_std(self.listeners[&slot].try_clone().unwrap()).unwrap();
         let (stop, stopped) = oneshot::channel();
         let server = tokio::spawn(peer::serve(tls, tcp, replica.clone(), async {
@@ -385,6 +411,8 @@ impl Set {
         let _ = node.stop.send(());
         node.replica.shutdown().await;
         let _ = node.server.await;
+        let refuser = refuse(&self.listeners[&slot]);
+        self.refusers.lock().unwrap().insert(slot, refuser);
     }
 
     fn replica(&self, slot: Slot) -> &Arc<Replica<Paths>> {
@@ -848,8 +876,9 @@ async fn a_set_resumed_from_kept_volumes_recreates_its_marker() {
 /// A set scaled from three audio replicas to one and back, with the
 /// StatefulSet's default PVC retention (the volumes of ordinals 1 and 2
 /// kept), reconciles back to three voters. Ordinal 2 is down while the
-/// leader removes it, so its volume still names it a voter; until a
-/// leader counts the returning replicas again they are not commitable.
+/// leader removes it, so its volume still names it a voter; no leader
+/// counts the returning replicas while ordinal 0 is down, and they are
+/// not commitable meanwhile.
 #[tokio::test]
 async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
     let mut set = Set::new(Voters::new(3, false).unwrap()).await;
@@ -895,12 +924,15 @@ async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
     assert!(removed, "the leader removed the unwanted voters");
     set.crash(Slot::Audio(1)).await;
 
-    // Scale back to three: ordinal 0 restarts with three wanted voters,
-    // ordinals 1 and 2 come back on their kept volumes.
+    // Scale back to three: ordinals 1 and 2 come back on their kept
+    // volumes before ordinal 0, which restarts with three wanted voters.
+    // Without ordinal 0 no leader can count them: the removal's joint
+    // configuration needed ordinal 1, so its log is ahead of ordinal 2's
+    // and it refuses ordinal 2 its vote, and every configuration ordinal
+    // 1 may hold needs ordinal 0 for a majority.
     set.voters = Voters::new(3, false).unwrap();
     set.crash(Slot::Audio(0)).await;
-    set.start_slots(&[Slot::Audio(0), Slot::Audio(1), Slot::Audio(2)])
-        .await;
+    set.start_slots(&[Slot::Audio(1), Slot::Audio(2)]).await;
     let restarted = Instant::now();
     // openraft publishes the membership it loaded once its core runs.
     let named = |slot: Slot| {
@@ -915,14 +947,20 @@ async fn a_scale_down_and_up_with_retained_volumes_gets_its_voters_back() {
         until(Duration::from_secs(5), || named(Slot::Audio(2))).await,
         "ordinal 2's volume still names it a voter"
     );
-    for slot in [Slot::Audio(1), Slot::Audio(2)] {
-        assert!(
-            !set.replica(slot).replica().commitable,
-            "{slot:?}: no leader counts it yet, {:?} after the start:\n{}",
-            restarted.elapsed(),
-            set.describe()
-        );
-    }
+    // Ten counting checks and more: a slow host makes fewer, never a
+    // leader that counts them.
+    let commitable = || {
+        [Slot::Audio(1), Slot::Audio(2)]
+            .into_iter()
+            .any(|slot| set.replica(slot).replica().commitable)
+    };
+    assert!(
+        !until(Duration::from_secs(1), commitable).await,
+        "commitable though no leader counts it, {:?} after the start:\n{}",
+        restarted.elapsed(),
+        set.describe()
+    );
+    set.start_slots(&[Slot::Audio(0)]).await;
     let all: BTreeSet<NodeId> = ids.values().copied().collect();
     let back = set.voters_become(&all, Duration::from_secs(30)).await;
     assert!(

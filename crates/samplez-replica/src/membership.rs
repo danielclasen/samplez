@@ -263,11 +263,13 @@ impl Shared {
     }
 
     /// Whether a leader counts this replica as a voter: it leads with a
-    /// quorum's acknowledgement within the lease, or it heard from its
-    /// leader within the lease, since it started, and its membership has
-    /// it as a voter. A vote saved before a restart names a leader the
-    /// replica has not heard since, itself included, and openraft dates it
-    /// to the start.
+    /// quorum's acknowledgement within the lease, or it took an
+    /// AppendEntries or an InstallSnapshot from the leader of its committed
+    /// vote, in that term, within the lease ([`Shared::leader_heard`]), and
+    /// its membership has it as a voter. openraft's vote time does not
+    /// tell: it moves when a saved vote is loaded at a start and when a
+    /// vote is adopted from a peer's refusal, neither of which proves a
+    /// leader alive.
     async fn counted_now(&self) -> bool {
         let metrics = self.raft.metrics().borrow().clone();
         if metrics.state == ServerState::Leader {
@@ -278,19 +280,7 @@ impl Shared {
             .membership()
             .voter_ids()
             .any(|id| id == self.settings.id);
-        let (lease, started) = (self.lease, self.started);
-        voter
-            && metrics.current_leader.is_some()
-            && self
-                .raft
-                .with_raft_state(move |state| {
-                    state.vote_ref().committed
-                        && state
-                            .vote_last_modified()
-                            .is_some_and(|at| at > started && at.elapsed() <= lease)
-                })
-                .await
-                .unwrap_or(false)
+        voter && self.leader_heard(&metrics)
     }
 }
 
@@ -377,8 +367,14 @@ pub(crate) async fn watch(shared: Arc<Shared>, bootstrap: Bootstrap) {
     let mut counting = Counting::default();
     let mut asked_at: Option<Instant> = None;
     loop {
-        let Ok(initialized) = shared.raft.is_initialized().await else {
-            return;
+        let initialized = match shared.raft.is_initialized().await {
+            Ok(initialized) => initialized,
+            Err(openraft::error::Fatal::Stopped) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "raft stopped: no longer keeping the replica in its set");
+                shared.counted.store(false, Ordering::SeqCst);
+                return;
+            }
         };
         if initialized {
             let metrics = shared.raft.metrics().borrow().clone();

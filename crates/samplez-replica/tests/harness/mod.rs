@@ -28,7 +28,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, Raft, ServerState};
+use openraft::{BasicNode, ServerState};
 use samplez::blocks::{
     BlockStatus, Cause, Changes, Ctx, HEALTHY, Hold, Kind, PAGE, PageHash, Pages, Ranks, Sink,
     StatusChange, Statuses,
@@ -46,7 +46,7 @@ use samplez_replica::report::{ClockFlags, Own, Page, Report, Run, runs};
 use samplez_replica::resync::{CoreReply, Resynced, Source};
 use samplez_replica::state::ReplicaState;
 use samplez_replica::state_machine::{Apply, Changed, Effect, Product};
-use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
+use samplez_replica::{RaftRpcs, Replica, Settings, TypeConfig, raft_config};
 use samplez_service::{Owner, ReplicatedState, Role};
 use tokio::time::Instant;
 
@@ -1113,7 +1113,9 @@ impl<P: Product + Sync> Handles for Replica<P> {
 
 #[derive(Default)]
 struct Links {
-    rafts: BTreeMap<NodeId, Raft<TypeConfig>>,
+    /// Each replica's raft as the network reaches it, as the peer listener
+    /// hands it RPCs.
+    rafts: BTreeMap<NodeId, RaftRpcs>,
     replicas: BTreeMap<NodeId, Arc<dyn Handles>>,
     /// (from, to): RPCs from `from` to `to` do not arrive.
     cut: BTreeSet<(NodeId, NodeId)>,
@@ -1300,7 +1302,7 @@ impl Net {
         from: NodeId,
         to: NodeId,
         raft_rpc: bool,
-    ) -> Result<Raft<TypeConfig>, RPCError<NodeId, BasicNode, E>> {
+    ) -> Result<RaftRpcs, RPCError<NodeId, BasicNode, E>> {
         let hung = self.links().hung.contains(&(from, to));
         if hung {
             std::future::pending::<()>().await;
@@ -1797,7 +1799,7 @@ impl<P: Product + Sync> Set<P> {
             });
         }
         let mut links = self.net.links();
-        links.rafts.insert(id, replica.raft().clone());
+        links.rafts.insert(id, replica.rpcs());
         links
             .replicas
             .insert(id, replica.clone() as Arc<dyn Handles>);

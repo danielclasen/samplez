@@ -74,6 +74,85 @@ openraft::declare_raft_types!(
         R = Response,
 );
 
+/// The committed vote of the last AppendEntries or InstallSnapshot a
+/// replica accepted, and when.
+#[derive(Clone, Default)]
+struct Heard(Arc<Mutex<Option<Taken>>>);
+
+type Taken = (openraft::Vote<NodeId>, Instant);
+
+impl Heard {
+    fn took(&self, vote: openraft::Vote<NodeId>) {
+        if vote.committed {
+            *self.0.lock().expect("heard lock poisoned") = Some((vote, Instant::now()));
+        }
+    }
+
+    /// Whether the last one accepted carried `vote` and lies within
+    /// `lease`: a record of another leader or term does not count.
+    fn within(&self, vote: &openraft::Vote<NodeId>, lease: Duration) -> bool {
+        self.0
+            .lock()
+            .expect("heard lock poisoned")
+            .as_ref()
+            .is_some_and(|(v, at)| v == vote && at.elapsed() <= lease)
+    }
+}
+
+/// A replica's raft as other replicas' rafts reach it: the network hands
+/// every AppendEntries, heartbeats included, InstallSnapshot and vote
+/// request to these, so the replica records the leader it accepted.
+#[derive(Clone)]
+pub struct RaftRpcs {
+    raft: Raft<TypeConfig>,
+    heard: Heard,
+}
+
+impl RaftRpcs {
+    /// An AppendEntries; one answered with anything but a higher vote
+    /// took the sender's vote.
+    pub async fn append_entries(
+        &self,
+        rpc: openraft::raft::AppendEntriesRequest<TypeConfig>,
+    ) -> Result<openraft::raft::AppendEntriesResponse<NodeId>, RaftError<NodeId>> {
+        let vote = rpc.vote;
+        let reply = self.raft.append_entries(rpc).await;
+        if reply
+            .as_ref()
+            .is_ok_and(|r| !matches!(r, openraft::raft::AppendEntriesResponse::HigherVote(_)))
+        {
+            self.heard.took(vote);
+        }
+        reply
+    }
+
+    /// An InstallSnapshot chunk; one answered with the sender's vote took
+    /// it.
+    pub async fn install_snapshot(
+        &self,
+        rpc: openraft::raft::InstallSnapshotRequest<TypeConfig>,
+    ) -> Result<
+        openraft::raft::InstallSnapshotResponse<NodeId>,
+        RaftError<NodeId, openraft::error::InstallSnapshotError>,
+    > {
+        let vote = rpc.vote;
+        let reply = self.raft.install_snapshot(rpc).await;
+        if reply.as_ref().is_ok_and(|r| r.vote == vote) {
+            self.heard.took(vote);
+        }
+        reply
+    }
+
+    /// A vote request; it records nothing, since a candidate's vote is no
+    /// leader's.
+    pub async fn vote(
+        &self,
+        rpc: openraft::raft::VoteRequest<NodeId>,
+    ) -> Result<openraft::raft::VoteResponse<NodeId>, RaftError<NodeId>> {
+        self.raft.vote(rpc).await
+    }
+}
+
 /// The largest command body a replica orders; a larger one is refused
 /// with [`Reason::TooLarge`].
 pub const MAX_COMMAND_BYTES: usize = 32 << 10;
@@ -216,7 +295,9 @@ pub(crate) struct Shared {
     /// A leader counted this replica as a voter within the last
     /// [`membership::UNCOUNTED`].
     counted: AtomicBool,
-    started: Instant,
+    /// The leader this replica last took an AppendEntries or an
+    /// InstallSnapshot from ([`RaftRpcs`]).
+    heard: Heard,
     status: Mutex<Option<String>>,
     reconcile: Notify,
     /// Side reports and the contact fence, once started.
@@ -401,7 +482,7 @@ impl<P: Product> Replica<P> {
             },
             epoch: AtomicU64::new(settings_epoch),
             counted: AtomicBool::new(false),
-            started: Instant::now(),
+            heard: Heard::default(),
             status: Mutex::default(),
             reconcile: Notify::new(),
             contact: OnceLock::new(),
@@ -434,8 +515,20 @@ impl<P: Product> Replica<P> {
         self.shared.settings.id
     }
 
+    /// The replica's raft. A network delivers other replicas' RPCs through
+    /// [`Replica::rpcs`], not through this: an AppendEntries delivered here
+    /// leaves no record of the leader, so no leader counts the replica.
     pub fn raft(&self) -> &Raft<TypeConfig> {
         &self.shared.raft
+    }
+
+    /// The RPCs other replicas' rafts send this one, as the network
+    /// delivers them.
+    pub fn rpcs(&self) -> RaftRpcs {
+        RaftRpcs {
+            raft: self.shared.raft.clone(),
+            heard: self.shared.heard.clone(),
+        }
     }
 
     pub fn store(&self) -> &Store<P> {
@@ -552,7 +645,8 @@ impl<P: Product> Replica<P> {
     }
 
     /// Whether this replica knows a quorum: as leader, one acknowledged it
-    /// within the lease; else its leader's last append arrived within it.
+    /// within the lease; else it took its leader's last AppendEntries or
+    /// InstallSnapshot within it.
     pub async fn quorum(&self) -> bool {
         self.shared.quorum().await
     }
@@ -879,20 +973,20 @@ impl Shared {
             ServerState::Leader => metrics
                 .millis_since_quorum_ack
                 .is_some_and(|ms| u128::from(ms) <= self.lease.as_millis()),
-            ServerState::Follower | ServerState::Learner if metrics.current_leader.is_some() => {
-                let lease = self.lease;
-                self.raft
-                    .with_raft_state(move |state| {
-                        state.vote_ref().committed
-                            && state
-                                .vote_last_modified()
-                                .is_some_and(|at| at.elapsed() <= lease)
-                    })
-                    .await
-                    .unwrap_or(false)
-            }
+            ServerState::Follower | ServerState::Learner => self.leader_heard(&metrics),
             _ => false,
         }
+    }
+
+    /// Whether this replica took an AppendEntries or an InstallSnapshot
+    /// from the leader its committed vote names, in that vote's term,
+    /// within the lease. openraft's own vote time does not tell: it also
+    /// moves when a vote is adopted from a peer's refusal, which proves no
+    /// leader alive.
+    fn leader_heard(&self, metrics: &openraft::RaftMetrics<NodeId, BasicNode>) -> bool {
+        metrics.vote.committed
+            && metrics.current_leader.is_some()
+            && self.heard.within(&metrics.vote, self.lease)
     }
 
     /// Waits until this replica applied product revision `revision`;
@@ -1995,6 +2089,91 @@ mod tests {
         drop(store);
         let replica = start(open(&dir).with_sync_delay(SLOW)).await;
         leads(&replica, "a reopened set of one voter leads").await;
+        replica.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An accepted request counts for the leader and term of its committed
+    /// vote alone, and only within the lease; a candidate's uncommitted
+    /// vote is no leader's.
+    #[tokio::test(start_paused = true)]
+    async fn a_heard_leader_counts_for_its_own_vote_within_the_lease() {
+        use openraft::Vote;
+        let lease = Duration::from_secs(2);
+        let heard = Heard::default();
+        let leader = Vote::new_committed(3, 1);
+        assert!(!heard.within(&leader, lease), "nothing taken");
+        heard.took(Vote::new(3, 1));
+        assert!(!heard.within(&Vote::new(3, 1), lease), "a candidate's vote");
+        heard.took(leader);
+        assert!(heard.within(&leader, lease));
+        assert!(
+            !heard.within(&Vote::new_committed(4, 1), lease),
+            "a later term"
+        );
+        assert!(
+            !heard.within(&Vote::new_committed(3, 2), lease),
+            "another leader"
+        );
+        tokio::time::advance(lease + Duration::from_millis(1)).await;
+        assert!(!heard.within(&leader, lease), "past the lease");
+    }
+
+    /// The leader a replica took is recorded from what its raft answered:
+    /// an AppendEntries answered Conflict or Success took the sender's vote,
+    /// one answered HigherVote did not, nor an InstallSnapshot answered
+    /// with another vote.
+    #[tokio::test]
+    async fn rpcs_record_only_a_vote_the_raft_accepted() {
+        let dir = dir("rpcs");
+        let replica = start(open(&dir)).await;
+        let rpcs = replica.rpcs();
+        let lease = Duration::from_secs(60);
+        let heard = |vote: &Vote<NodeId>| replica.shared.heard.within(vote, lease);
+        let append = |vote: Vote<NodeId>, prev: Option<LogId<NodeId>>| AppendEntriesRequest {
+            vote,
+            prev_log_id: prev,
+            entries: Vec::new(),
+            leader_commit: None,
+        };
+        let five = Vote::new_committed(5, 1);
+        let behind = LogId::new(CommittedLeaderId::new(5, 1), 10);
+        let reply = rpcs.append_entries(append(five, Some(behind))).await;
+        assert!(
+            matches!(reply, Ok(AppendEntriesResponse::Conflict)),
+            "{reply:?}"
+        );
+        assert!(heard(&five), "a conflict took the vote");
+        let six = Vote::new_committed(6, 2);
+        let reply = rpcs.append_entries(append(six, None)).await;
+        assert!(
+            matches!(reply, Ok(AppendEntriesResponse::Success)),
+            "{reply:?}"
+        );
+        assert!(heard(&six));
+        let four = Vote::new_committed(4, 1);
+        let reply = rpcs.append_entries(append(four, None)).await;
+        assert!(
+            matches!(reply, Ok(AppendEntriesResponse::HigherVote(_))),
+            "{reply:?}"
+        );
+        assert!(
+            !heard(&four) && heard(&six),
+            "a refused append records nothing"
+        );
+        let snapshot = InstallSnapshotRequest {
+            vote: four,
+            meta: openraft::SnapshotMeta::default(),
+            offset: 0,
+            data: Vec::new(),
+            done: true,
+        };
+        let reply = rpcs.install_snapshot(snapshot).await.expect("answers");
+        assert_eq!(reply.vote, six);
+        assert!(
+            !heard(&four) && heard(&six),
+            "a refused snapshot records nothing"
+        );
         replica.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
