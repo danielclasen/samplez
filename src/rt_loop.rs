@@ -475,14 +475,24 @@ pub(crate) enum Change {
     /// The slot crossfades to another flow from the index; needs a
     /// generation holding both readers.
     Route { slot: usize },
+    /// The slot crossfades to silence from the index and reads no flow
+    /// until a `Route`; needs a generation holding the outgoing reader
+    /// and none for the slot.
+    Detach { slot: usize },
     /// Sets one parameter of the slot's strip from the index.
     Strip { slot: usize, param: StripParam },
     /// The engine entries of one log entry, folded: its gains, strip
     /// parameters (`strips` says whether it has any) and `InputDown`s in
     /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
     /// slots it raises after them and those it re-routes, all of one
-    /// input domain, for which one generation is built.
-    Batch { strips: bool, up: u64, routed: u64 },
+    /// input domain, for which one generation is built; of the re-routed
+    /// ones, `detached` are detached instead of moved to another flow.
+    Batch {
+        strips: bool,
+        up: u64,
+        routed: u64,
+        detached: u64,
+    },
 }
 
 /// The bit of input slot `slot` in a slot mask; at most
@@ -501,14 +511,23 @@ impl Change {
         self.generating() != (0, 0)
     }
 
-    /// The slots the change raises and those it re-routes, as masks: what
-    /// its generation is built for.
+    /// The slots the change raises and those it re-routes, a detached
+    /// slot among them, as masks: what its generation is built for.
     pub fn generating(&self) -> (u64, u64) {
         match *self {
             Change::InputUp { slot } => (bit(slot), 0),
-            Change::Route { slot } => (0, bit(slot)),
+            Change::Route { slot } | Change::Detach { slot } => (0, bit(slot)),
             Change::Batch { up, routed, .. } => (up, routed),
             _ => (0, 0),
+        }
+    }
+
+    /// The slots of the re-routed ones the change detaches, as a mask.
+    pub fn detaching(&self) -> u64 {
+        match *self {
+            Change::Detach { slot } => bit(slot),
+            Change::Batch { detached, .. } => detached,
+            _ => 0,
         }
     }
 
@@ -522,11 +541,12 @@ impl Change {
         match *self {
             Change::Gain { .. } | Change::InputDown { .. } => true,
             Change::Strip { .. } => strips,
-            Change::InputUp { .. } | Change::Route { .. } => false,
+            Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => false,
             Change::Batch {
                 strips: has,
                 up,
                 routed,
+                ..
             } => up | routed == 0 && (strips || !has),
         }
     }
@@ -586,6 +606,10 @@ pub(crate) struct Slot {
     pub xfade: Option<u64>,
     /// The read state of the flow a re-route leaves.
     pub prev: SlotState,
+    /// Detached by a `Detach` from its index until a `Route`: the slot
+    /// reads no flow, whatever its generation holds, and its silence is
+    /// neither a failed read nor a silenced block.
+    pub detached: bool,
     pub prune_requested: bool,
     pub stats: SlotStats,
     /// The slot's strip, run on each block computed after the copy and
@@ -619,6 +643,7 @@ impl Slot {
             held: false,
             xfade: None,
             prev: SlotState::default(),
+            detached: false,
             prune_requested: false,
             stats: EMPTY_STATS,
             strip: (channels <= MAX_LEGS).then(|| Strip::new(channels, ramp)),
@@ -1441,6 +1466,7 @@ fn capture_core(
         d.fade_start = s.fade_start;
         d.silenced_last = s.silenced_last;
         d.xfade = s.xfade;
+        d.detached = s.detached;
         // A strip holds no heap memory: the copy allocates nothing.
         d.strip.clone_from(&s.strip);
         d.strip_pos = s.strip_pos;
@@ -2295,18 +2321,25 @@ impl Rt {
                 }
             }
             Change::Strip { slot, param } => self.set_strip(e, slot, param),
-            Change::InputUp { .. } | Change::Route { .. } => self.apply_generation(e),
+            Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => {
+                self.apply_generation(e)
+            }
         }
     }
 
     /// Applies what of entry `e` its generation is built for: the slots
-    /// it raises fade in from its index, and its generation is swapped in,
-    /// or, not here yet, awaited with those slots and the re-routed ones
-    /// held silent.
+    /// it raises fade in from its index, the re-routed ones are detached
+    /// or attached as it says, and its generation is swapped in, or, not
+    /// here yet, awaited with those slots and the re-routed ones held
+    /// silent.
     fn apply_generation(&mut self, e: RtEntry) {
         let (up, routed) = e.change.generating();
         if up | routed == 0 {
             return;
+        }
+        let detached = e.change.detaching();
+        for slot in slots_of(routed) {
+            self.slots[slot].detached = detached & bit(slot) != 0;
         }
         for slot in slots_of(up) {
             if !self.slots[slot].up {
@@ -2401,8 +2434,9 @@ impl Rt {
             if xfade.is_none() {
                 slot.xfade = None;
             }
+            // A detached slot reads no flow, an outgoing one aside.
             let input = generation
-                .filter(|_| readable)
+                .filter(|_| readable && !slot.detached)
                 .and_then(|g| Some((g.mxl.input(i)?, g)));
             let copied = match input {
                 Some((input, g)) => {
@@ -2454,7 +2488,7 @@ impl Rt {
                     false
                 }
             };
-            if slot.up && !copied {
+            if slot.up && !slot.detached && !copied {
                 failed |= 1 << i;
             }
             if let Some(pos) = xfade {
@@ -2514,8 +2548,12 @@ impl Rt {
                     }
                 }
             } else {
-                silenced |= 1 << i;
-                add(&self.counters.input_silenced_blocks, 1);
+                // A detached slot is silent by the log, not for want of
+                // its input.
+                if !slot.detached {
+                    silenced |= 1 << i;
+                    add(&self.counters.input_silenced_blocks, 1);
+                }
                 slot.silenced_last = true;
             }
             // Silenced blocks too: the strip's filters and dynamics ring
@@ -2807,6 +2845,7 @@ impl Rt {
             d.fade_start = s.fade_start;
             d.silenced_last = s.silenced_last;
             d.xfade = s.xfade;
+            d.detached = s.detached;
             if strips {
                 // Of the same legs, `Core::fits` checked: the copy
                 // allocates nothing.
@@ -2893,6 +2932,7 @@ impl Rt {
                         strips: true,
                         up: 0,
                         routed: 0,
+                        detached: 0,
                     },
                 };
                 for n in 0..h.strips.len() {
@@ -3416,6 +3456,7 @@ mod tests {
             held,
             xfade,
             prev: SlotState::default(),
+            detached: false,
             prune_requested: false,
             stats: EMPTY_STATS,
             strip: None,
@@ -3447,6 +3488,7 @@ mod tests {
         strip.process(&mut [0.5; 48], 48);
         slots[0].strip = Some(strip.clone());
         slots[0].strip_pos = Some(20 * B);
+        slots[1].detached = true;
         let awaiting = [entry(Change::InputUp { slot: 0 }, 19 * B)];
         // Detector 5 keyed by slot 1, mid-envelope after a burst.
         let keys = crate::ducks::KeySet::of(&[(1, 2.0)]).unwrap();
@@ -3483,6 +3525,7 @@ mod tests {
                     fade_start: Some(5 * B),
                     silenced_last: false,
                     xfade: Some(18 * B),
+                    detached: false,
                     strip: Some(strip),
                     strip_pos: Some(20 * B),
                 },
@@ -3492,6 +3535,7 @@ mod tests {
                     fade_start: None,
                     silenced_last: true,
                     xfade: None,
+                    detached: true,
                     strip: None,
                     strip_pos: None,
                 },

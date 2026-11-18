@@ -43,6 +43,8 @@ pub(crate) struct SlotCore {
     pub fade_start: Option<u64>,
     pub silenced_last: bool,
     pub xfade: Option<u64>,
+    /// Detached by a `Detach` until a `Route`: it reads no flow.
+    pub detached: bool,
     /// The slot's strip, its filter and dynamics state included, and the
     /// index of the next sample it processes. A core built from product
     /// state holds none and leaves the RT thread's.
@@ -208,8 +210,10 @@ impl Core {
     /// every index at most [`INDEX_MAX`], every gain one a ramp takes,
     /// every strip parameter and duck setting within its range (legs
     /// aside), a slot named for each duck key keyed and none for another,
-    /// the lists within their capacities. A core from another replica is
-    /// checked when decoded; a strip, a detector and the matrix in it are
+    /// the lists within their capacities, a batch detaching only slots it
+    /// re-routes, and a detached slot's last block silenced, as a slot
+    /// reading no flow leaves it after every block. A core from another
+    /// replica is checked when decoded; a strip, a detector and the matrix in it are
     /// checked as they deserialize ([`Strip::is_valid`],
     /// [`samplez_dsp::Detector::is_valid`]).
     fn sane(&self) -> bool {
@@ -219,11 +223,15 @@ impl Core {
                 && match e.change {
                     Change::Gain { gain, .. } => samplez_dsp::valid_gain(gain),
                     Change::Strip { param, .. } => param.check(usize::MAX).is_ok(),
+                    Change::Batch {
+                        routed, detached, ..
+                    } => detached & !routed == 0,
                     _ => true,
                 }
         };
         let slot = |s: &SlotCore| {
-            s.fade_start.is_none_or(index)
+            (!s.detached || s.silenced_last)
+                && s.fade_start.is_none_or(index)
                 && s.xfade.is_none_or(index)
                 && s.strip_pos.is_none_or(index)
         };
@@ -325,9 +333,10 @@ pub(crate) fn fits(c: &Change, inputs: usize, outputs: usize, legs: &[usize]) ->
             output,
             gain,
         } => input < inputs && output < outputs && samplez_dsp::valid_gain(gain),
-        Change::InputDown { slot } | Change::InputUp { slot } | Change::Route { slot } => {
-            slot < slots
-        }
+        Change::InputDown { slot }
+        | Change::InputUp { slot }
+        | Change::Route { slot }
+        | Change::Detach { slot } => slot < slots,
         Change::Strip { slot, param } => {
             slot < slots && legs[slot] <= MAX_LEGS && param.check(legs[slot]).is_ok()
         }
@@ -682,6 +691,7 @@ fn change_of(entry: &Entry) -> Change {
         Entry::InputDown { slot } => Change::InputDown { slot },
         Entry::InputUp { slot } => Change::InputUp { slot },
         Entry::Route { slot, .. } => Change::Route { slot },
+        Entry::Detach { slot } => Change::Detach { slot },
         Entry::Strip { slot, param } => Change::Strip { slot, param },
         Entry::Duck { .. } | Entry::DuckMask { .. } => {
             unreachable!("duck entries are items of their own")
@@ -699,8 +709,9 @@ pub struct ProductState {
     /// Per input slot whether it is up in the log.
     pub up: Vec<bool>,
     /// Per input slot the flow it reads in the log, its last `Route`'s
-    /// or its configured one.
-    pub flows: Vec<String>,
+    /// or its configured one; none for a slot whose last `Route` or
+    /// `Detach` is a `Detach`.
+    pub flows: Vec<Option<String>>,
     /// Per input slot the strip parameters the log set, as values: each
     /// one set again at the install, the strip's own state kept.
     pub strips: Vec<Vec<StripParam>>,
@@ -875,6 +886,7 @@ mod tests {
             fade_start: Some(480),
             silenced_last: true,
             xfade: None,
+            detached: true,
             strip: Some(strip()),
             strip_pos: Some(4800),
         };
@@ -887,8 +899,8 @@ mod tests {
     }
 
     /// The copy another replica decodes is the copy encoded: the matrix
-    /// with its ramps, the entries and the slot state, the strips' filter
-    /// and dynamics state bit for bit.
+    /// with its ramps, the entries and the slot state, a detached slot's
+    /// included, the strips' filter and dynamics state bit for bit.
     #[test]
     fn a_core_decodes_to_the_copy_encoded() {
         let copy = copy();
@@ -1082,6 +1094,23 @@ mod tests {
         refused("pending list", &|c| {
             let e = c.pending[0];
             c.pending.resize(PENDING_CHANGES + 1, e)
+        });
+        // A detached slot reads nothing: no engine copied a block of it.
+        refused("detached slot with a block copied", &|c| {
+            c.slots[1].silenced_last = false
+        });
+        // Awaiting its generation, a batch holds no batch to mismatch.
+        refused("batch detaching a slot it does not re-route", &|c| {
+            c.awaiting_gen.push(RtEntry {
+                id: 8,
+                at_index: 9600,
+                change: Change::Batch {
+                    strips: false,
+                    up: 0,
+                    routed: 1,
+                    detached: 2,
+                },
+            })
         });
         // The first ramp is the one of length 48 at position 0.
         let encoded = copy().encode().replacen("\"pos\":0", "\"pos\":49", 1);

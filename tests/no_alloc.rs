@@ -2,9 +2,10 @@
 //! allocator once it runs, over a run that includes input generation
 //! swaps, a prune and the `InputDown` it brings, an `InputUp` whose
 //! generation is swapped in at its index with a fade-in, a re-route
-//! crossfade, a gain ramp, strip entries switching every strip unit on
-//! across a prune and a re-add, output, meter and input metering and
-//! loudness resets, duck groups keyed, forced and released, ducking a
+//! crossfade, a detach crossfading the input to silence and a re-route
+//! fading it back in, a gain ramp, strip entries switching every strip
+//! unit on across a prune and a re-add, output, meter and input metering
+//! and loudness resets, duck groups keyed, forced and released, ducking a
 //! coefficient whose mask and depth change while it ducks, with their
 //! readings sent, and, for a replicated engine, every path of the hold
 //! ring (see `common::hold_scenario`) with its pages hashed. libmxl's own
@@ -162,16 +163,28 @@ fn rt_thread_allocates_nothing() {
         engine.status().inputs[0].flow_id == next
     });
     std::thread::sleep(Duration::from_millis(500));
+    // A detach: a crossfade to silence and a generation without the
+    // input; then a route back, faded in from silence.
+    let detached = engine.detach(0, 0).unwrap();
+    wait_for(Duration::from_secs(5), "detached", || {
+        engine.status().inputs[0].state == InputState::Detached
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let routed = engine.route(0, &next, 0).unwrap();
+    wait_for(Duration::from_secs(5), "attached again", attached);
+    std::thread::sleep(Duration::from_millis(500));
 
     let c = engine.counters();
     assert!(c.input_silenced_blocks.load(Relaxed) > 0);
     assert!(c.heartbeat_blocks.load(Relaxed) > 1_000);
     let verdicts: Vec<_> = rx.try_iter().collect();
     assert!(verdicts.iter().any(|v| v.fading != 0), "no fade-in seen");
-    assert!(
-        verdicts.iter().any(|v| v.fading != 0 && v.k * B >= at),
-        "no crossfade seen"
-    );
+    for at in [at, detached, routed] {
+        assert!(
+            verdicts.iter().any(|v| v.fading != 0 && v.k * B >= at),
+            "no crossfade from {at} seen"
+        );
+    }
     assert_eq!(engine.status().generation.pending, None);
     assert_eq!(engine.status().diverged, None);
     assert!(verdicts.iter().any(|v| v.ramping), "no gain ramp seen");

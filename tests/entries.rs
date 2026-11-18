@@ -614,6 +614,145 @@ fn a_down_input_re_routed_to_a_live_flow_comes_up() {
     common::stop(e);
 }
 
+/// A detached input crossfades to silence at its index and stays silent
+/// and detached, neither polled nor reported and no silenced block, while
+/// the writer of the flow it read stops and starts again; a `Route` fades
+/// it in on that flow from silence, as from a flow that is not there.
+#[test]
+fn a_detached_input_stays_silent_and_unreported_until_routed() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let cfg = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    );
+    let (e, rx, reports) = start_replicated(cfg);
+    running(&e);
+    assert!(
+        matches!(e.detach(0, 0), Err(samplez::EntryError::Invalid(_))),
+        "a detach outside the replicated log taken"
+    );
+    let startup: Vec<Report> = reports.try_iter().collect();
+    let mut seen = Vec::new();
+    let k0 = now_kept(&rx, &mut seen);
+    let d = (k0 + 150) * B;
+    e.append(1, d, Entry::Detach { slot: 0 }).unwrap();
+    e.commit(1);
+    let end = (d + u64::from(RAMP)) / B + 20;
+    wait_past(&rx, end, &mut seen);
+    let check =
+        |range: std::ops::Range<u64>, seen: &[BlockVerdict], want: &dyn Fn(u64) -> Vec<f32>| {
+            let x = common::read_blocks(&domain.0, &out, 1, range.clone());
+            let mut compared = 0;
+            for (i, k) in range.clone().enumerate() {
+                if computed(seen, k) {
+                    assert!(block(&x, 1, i, 0) == want(k), "block {k}");
+                    compared += 1;
+                }
+            }
+            assert!(
+                compared * 4 > range.count() as u64 * 3,
+                "{compared} blocks compared"
+            );
+        };
+    check(d / B - 20..end, &seen, &|k| {
+        if k * B < d {
+            ramped(0, k, 1.0, 1.0, 0)
+        } else {
+            ramped(0, k, 1.0, 0.0, d)
+        }
+    });
+    assert_eq!(e.status().inputs[0].state, InputState::Detached);
+    // The writer stops, and starts again after more than a poll's
+    // recovery.
+    drop(pilot);
+    std::thread::sleep(2 * SECOND);
+    let pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    std::thread::sleep(3 * SECOND);
+    let s = e.status();
+    assert!(
+        s.inputs[0].up && s.inputs[0].state == InputState::Detached,
+        "{:?}",
+        s.inputs[0]
+    );
+    assert_eq!(s.inputs[0].flow_id, src);
+    let lead = s.generation.build_lead;
+    let u = ((now_kept(&rx, &mut seen) + 20) * B + lead).next_multiple_of(B);
+    let flow_id = src.clone();
+    e.append(2, u, Entry::Route { slot: 0, flow_id }).unwrap();
+    e.commit(2);
+    let end = u / B + 2 * u64::from(RAMP) / B;
+    wait_past(&rx, end, &mut seen);
+    check(u / B - 20..end, &seen, &|k| {
+        if k * B < u {
+            vec![0.0; B as usize]
+        } else {
+            ramped(0, k, 0.0, 1.0, u)
+        }
+    });
+    // Silent by the log from the crossfade's end to the route: no block
+    // counts it silenced.
+    for v in seen.iter().filter(|v| v.k > k0 + 50) {
+        assert_eq!(v.silenced & 1, 0, "{v:?}");
+    }
+    let s = e.status();
+    assert_eq!(s.inputs[0].state, InputState::Attached);
+    assert_eq!(s.diverged, None);
+    let after: Vec<Report> = reports.try_iter().collect();
+    assert_eq!(after, [], "reported after {startup:?}");
+    common::stop(e);
+    drop(pilot);
+}
+
+/// On an engine with its own log a detached input keeps its log state:
+/// the writer of the flow it read stopping stamps no `InputDown`, and it
+/// stays detached until `route` reads the flow again. A detach of no
+/// slot or inside a block is refused.
+#[test]
+fn a_detached_input_on_an_engine_with_its_own_log_keeps_its_state() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let (e, _rx) = common::start(config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    ));
+    running(&e);
+    for (slot, at) in [(1, 0), (0, B + 8)] {
+        assert!(
+            matches!(e.detach(slot, at), Err(samplez::EntryError::Invalid(_))),
+            "a detach of slot {slot} at {at} taken"
+        );
+    }
+    e.detach(0, 0).unwrap();
+    wait_for(10 * SECOND, "input detached", || {
+        e.status().inputs[0].state == InputState::Detached
+    });
+    drop(pilot);
+    std::thread::sleep(3 * SECOND);
+    let s = e.status();
+    assert!(
+        s.inputs[0].up && s.inputs[0].state == InputState::Detached,
+        "{:?}",
+        s.inputs[0]
+    );
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    e.route(0, &src, 0).unwrap();
+    wait_for(10 * SECOND, "input attached on its flow again", || {
+        let s = e.status();
+        s.inputs[0].up && s.inputs[0].state == InputState::Attached
+    });
+    assert_eq!(e.status().diverged, None);
+    common::stop(e);
+}
+
 /// A re-route at an index inside a block is refused, as a gain or strip
 /// change there is: taken at the next block start it would be late, its
 /// generation dropped although the call succeeded.

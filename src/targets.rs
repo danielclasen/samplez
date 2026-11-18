@@ -14,8 +14,8 @@ pub struct Targets {
     /// The gain targets: one row per input channel, one column per output
     /// or meter column.
     pub gains: Vec<Vec<f32>>,
-    /// Per input slot, the flow it reads.
-    pub flows: Vec<String>,
+    /// Per input slot, the flow it reads; none for a detached slot.
+    pub flows: Vec<Option<String>>,
     /// Per input slot, its strip parameters; of two with one key (one
     /// band, one leg, the gate), the later counts.
     pub strips: Vec<Vec<StripParam>>,
@@ -35,7 +35,8 @@ impl Targets {
     /// `DuckMask` for each coefficient whose mask differs, row by row, a
     /// mask `self` does not hold counting as 0, the mask an engine holds
     /// before any entry sets one; a
-    /// `Route` for each slot whose flow differs. A target `next` holds and
+    /// `Route` for each slot whose flow differs, a `Detach` for one
+    /// `next` holds none for. A target `next` holds and
     /// `self` does not counts as different; one `self` holds and `next`
     /// does not gets no entry, so the engine keeps it.
     pub fn diff(&self, next: &Targets) -> Vec<Entry> {
@@ -57,10 +58,7 @@ impl Targets {
         duck_entries(self, next, &mut entries);
         for (slot, flow) in next.flows.iter().enumerate() {
             if self.flows.get(slot) != Some(flow) {
-                entries.push(Entry::Route {
-                    slot,
-                    flow_id: flow.clone(),
-                });
+                entries.push(flow_entry(slot, flow.as_deref()));
             }
         }
         entries
@@ -68,9 +66,10 @@ impl Targets {
 
     /// The entries that set every gain, strip parameter and duck setting
     /// of `self`, whatever an engine holds, in the order of
-    /// [`Targets::diff`], and a `Route` for each of `slots` in ascending
-    /// order. Of the duck masks, every one other than 0, and a 0 for each
-    /// coefficient `masked` holds a mask other than 0 for: an engine holds
+    /// [`Targets::diff`], and a `Route`, or a `Detach` for a slot without
+    /// a flow, for each of `slots` in ascending order. Of the duck masks,
+    /// every one other than 0, and a 0 for each coefficient `masked`
+    /// holds a mask other than 0 for: an engine holds
     /// a mask other than 0 only where an entry set one, so `masked`, every
     /// mask an engine may have been given ORed together, names every
     /// coefficient a 0 has to clear; none for every coefficient.
@@ -102,13 +101,22 @@ impl Targets {
         slots.dedup();
         for slot in slots {
             if let Some(flow) = self.flows.get(slot) {
-                entries.push(Entry::Route {
-                    slot,
-                    flow_id: flow.clone(),
-                });
+                entries.push(flow_entry(slot, flow.as_deref()));
             }
         }
         entries
+    }
+}
+
+/// The entry that has slot `slot` read `flow`: a `Route`, or a `Detach`
+/// for none.
+fn flow_entry(slot: usize, flow: Option<&str>) -> Entry {
+    match flow {
+        Some(flow_id) => Entry::Route {
+            slot,
+            flow_id: flow_id.to_owned(),
+        },
+        None => Entry::Detach { slot },
     }
 }
 
@@ -329,7 +337,7 @@ mod tests {
     fn targets() -> Targets {
         Targets {
             gains: vec![vec![0.5, 0.0], vec![0.25, 1.0]],
-            flows: vec!["a".into(), "b".into()],
+            flows: vec![Some("a".into()), Some("b".into())],
             strips: vec![vec![StripParam::Trim { db: -3.0 }], Vec::new()],
             ..Targets::default()
         }
@@ -348,7 +356,7 @@ mod tests {
         next.gains[1][0] = 0.125;
         next.gains[0][1] = 0.75;
         next.strips[1].push(StripParam::Gate(gate()));
-        next.flows[0] = "c".into();
+        next.flows[0] = Some("c".into());
         assert_eq!(
             targets().diff(&next),
             vec![
@@ -514,6 +522,35 @@ mod tests {
             }]
         );
         assert_eq!(t.assert(&[], None).len(), 5);
+    }
+
+    /// A slot whose flow `next` holds none for is detached, also when
+    /// `self` holds no flow for it; one already detached gets no entry.
+    /// Asserted, a slot without a flow is detached.
+    #[test]
+    fn a_slot_without_a_flow_is_detached() {
+        let mut next = targets();
+        next.flows[1] = None;
+        assert_eq!(targets().diff(&next), vec![Entry::Detach { slot: 1 }]);
+        assert_eq!(next.diff(&next), Vec::new());
+        let unknown = Targets {
+            flows: Vec::new(),
+            ..next.clone()
+        };
+        assert!(unknown.diff(&next).contains(&Entry::Detach { slot: 1 }));
+        let flows: Vec<Entry> = (next.assert(&[1, 0], None).into_iter())
+            .filter(|e| matches!(e, Entry::Route { .. } | Entry::Detach { .. }))
+            .collect();
+        assert_eq!(
+            flows,
+            vec![
+                Entry::Route {
+                    slot: 0,
+                    flow_id: "a".into()
+                },
+                Entry::Detach { slot: 1 },
+            ]
+        );
     }
 
     /// For every parameter, pairs that differ in one field each: an `f32`
@@ -700,9 +737,12 @@ mod tests {
         }
         for (slot, flow) in next.flows.iter().enumerate() {
             if was.flows.get(slot) != Some(flow) {
-                entries.push(Entry::Route {
-                    slot,
-                    flow_id: flow.clone(),
+                entries.push(match flow {
+                    Some(flow_id) => Entry::Route {
+                        slot,
+                        flow_id: flow_id.clone(),
+                    },
+                    None => Entry::Detach { slot },
                 });
             }
         }
@@ -784,7 +824,7 @@ mod tests {
                     .map(|_| (0..self.below(4)).map(|_| self.value()).collect())
                     .collect(),
                 flows: (0..self.below(4))
-                    .map(|_| ["a", "b"][self.below(2)].into())
+                    .map(|_| [Some("a"), Some("b"), None][self.below(3)].map(Into::into))
                     .collect(),
                 strips,
                 ..Targets::default()

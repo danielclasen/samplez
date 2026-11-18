@@ -408,6 +408,7 @@ jobs:
               # The gate tests ran: without the cfg they compile to nothing.
               for t in rtsan_aborts_an_allocation_in_a_real_time_function \
                 the_rt_thread_passes_rtsan the_rt_thread_passes_rtsan_holding_blocks \
+                the_rt_thread_passes_rtsan_through_detach_and_route \
                 the_rt_thread_passes_rtsan_with_strips \
                 the_rt_thread_passes_rtsan_with_ducks \
                 the_rt_thread_passes_rtsan_with_ducks_through_a_resync \

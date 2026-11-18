@@ -84,7 +84,7 @@ impl Product for Desk {
     fn targets(&self) -> Option<Targets> {
         Some(Targets {
             gains: vec![vec![self.gains[0]], vec![self.gains[1]]],
-            flows: self.flows.to_vec(),
+            flows: self.flows.iter().cloned().map(Some).collect(),
             strips: vec![Vec::new(), Vec::new()],
             ..Targets::default()
         })

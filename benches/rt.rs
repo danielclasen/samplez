@@ -656,7 +656,7 @@ fn targets_at_stereo_64x56() -> (samplez::Targets, samplez::Targets) {
         gains: (0..128)
             .map(|i| (0..56).map(|o| ((i + o) % 7) as f32 / 7.0).collect())
             .collect(),
-        flows: (0..64).map(|s| format!("flow-{s}")).collect(),
+        flows: (0..64).map(|s| Some(format!("flow-{s}"))).collect(),
         strips: (0..64).map(stereo_strip).collect(),
         ..Default::default()
     };

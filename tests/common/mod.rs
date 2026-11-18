@@ -817,7 +817,7 @@ pub fn hold_scenario(e: &Engine) {
             .status()
             .inputs
             .iter()
-            .map(|i| i.flow_id.clone())
+            .map(|i| Some(i.flow_id.clone()))
             .collect(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),

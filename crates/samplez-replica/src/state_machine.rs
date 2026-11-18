@@ -437,7 +437,9 @@ impl<P: Product> StateMachine<P> {
                 let routed = entries
                     .iter()
                     .filter_map(|e| match e {
-                        samplez::Entry::Route { slot, .. } => Some(*slot as u32),
+                        samplez::Entry::Route { slot, .. } | samplez::Entry::Detach { slot } => {
+                            Some(*slot as u32)
+                        }
                         _ => None,
                     })
                     .collect();
@@ -451,7 +453,9 @@ impl<P: Product> StateMachine<P> {
         let generation = entries.iter().any(|e| {
             matches!(
                 e,
-                samplez::Entry::InputUp { .. } | samplez::Entry::Route { .. }
+                samplez::Entry::InputUp { .. }
+                    | samplez::Entry::Route { .. }
+                    | samplez::Entry::Detach { .. }
             )
         });
         // A lease expiry is decided like a command once stamped.
@@ -1858,7 +1862,7 @@ mod derive_tests {
             };
             Some(Targets {
                 gains: vec![vec![gain(0)], vec![gain(1)]],
-                flows: self.flows.to_vec(),
+                flows: self.flows.iter().cloned().map(Some).collect(),
                 strips: self
                     .trims
                     .iter()

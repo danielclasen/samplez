@@ -244,13 +244,15 @@ impl Batch {
 }
 
 /// What one log entry does to one input slot, its entries taken in
-/// order: re-routed to the last flow a `Route` names, down, and up, which
-/// fades in from silence at the index; a later `InputDown` cancels an
-/// `InputUp` before it, a later `InputUp` follows an `InputDown` before
-/// it. Applied in that order.
+/// order: re-routed to the last flow a `Route` names, or detached when a
+/// `Detach` came after the last `Route`, down, and up, which fades in
+/// from silence at the index; a later `InputDown` cancels an `InputUp`
+/// before it, a later `InputUp` follows an `InputDown` before it.
+/// Applied in that order.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct SlotFold {
     routed: bool,
+    detached: bool,
     down: bool,
     up: bool,
 }
@@ -262,7 +264,8 @@ struct SlotFold {
 /// and mask the last value counts. Per input slot a `Route` and its up or
 /// down state are kept apart ([`SlotFold`]): an `InputUp` and a `Route`
 /// raise the slot on the new flow, a `Route` and an `InputDown` leave it
-/// down on the new flow. `columns` is the matrix's column count,
+/// down on the new flow. Of a slot's `Route`s and `Detach`es the last
+/// counts. `columns` is the matrix's column count,
 /// `coefficients` its size.
 #[allow(clippy::type_complexity)]
 pub(crate) fn fold(
@@ -307,7 +310,11 @@ pub(crate) fn fold(
             Change::Strip { slot, param } => {
                 strips.insert((slot as u32, strip_key(&param)), param);
             }
-            Change::Route { slot } => slots.entry(slot).or_default().routed = true,
+            Change::Route { slot } | Change::Detach { slot } => {
+                let s = slots.entry(slot).or_default();
+                s.routed = true;
+                s.detached = matches!(c, Change::Detach { .. });
+            }
             Change::InputDown { slot } => {
                 let s = slots.entry(slot).or_default();
                 s.down = true;
@@ -329,6 +336,7 @@ pub(crate) fn fold(
             .fold(0u64, |m, (&slot, _)| m | 1 << slot)
     };
     let (up, routed) = (mask(|s| s.up), mask(|s| s.routed));
+    let detached = mask(|s| s.detached);
     let facts = gains.len()
         + strips.len()
         + downs.len()
@@ -358,6 +366,8 @@ pub(crate) fn fold(
             }
         } else if up != 0 {
             Change::InputUp { slot }
+        } else if detached != 0 {
+            Change::Detach { slot }
         } else {
             Change::Route { slot }
         };
@@ -377,6 +387,7 @@ pub(crate) fn fold(
         strips: !batch.strips.is_empty(),
         up,
         routed,
+        detached,
     };
     Ok(Some((change, Some(Arc::new(batch)))))
 }
@@ -425,7 +436,8 @@ mod tests {
             Change::Batch {
                 strips: true,
                 up: 0,
-                routed: 0
+                routed: 0,
+                detached: 0
             }
         );
         assert_eq!(batch.gains.list(), [(1, 0.998), (4, 0.999)]);
@@ -468,6 +480,33 @@ mod tests {
         assert_eq!(facts(&[route, down, up]), (vec![1], 2, 2));
     }
 
+    /// Of a slot's `Route`s and `Detach`es in one log entry the last
+    /// counts: a `Detach` after a `Route` leaves the slot detached, a
+    /// `Route` after a `Detach` re-routes it, and either is one change.
+    #[test]
+    fn a_slots_route_and_detach_fold_last_wins() {
+        let (route, detach) = (Change::Route { slot: 1 }, Change::Detach { slot: 1 });
+        let one = |changes: &[Change]| fold(&items(changes), 2, 4).unwrap().unwrap().0;
+        assert_eq!(one(&[route, detach]), detach);
+        assert_eq!(one(&[detach, route]), route);
+        assert_eq!(one(&[route, detach, route, detach]), detach);
+        // With another slot raised, a batch: slot 1 re-routed and
+        // detached, slot 0 only raised.
+        let up = Change::InputUp { slot: 0 };
+        for (changes, detached) in [([up, route, detach], 2), ([up, detach, route], 0)] {
+            let Change::Batch {
+                up,
+                routed,
+                detached: d,
+                ..
+            } = one(&changes)
+            else {
+                panic!("{changes:?}");
+            };
+            assert_eq!((up, routed, d), (1, 2, detached), "{changes:?}");
+        }
+    }
+
     /// No change folds to none, one change to itself; generation-needing
     /// entries of several slots fold into one batch.
     #[test]
@@ -479,6 +518,7 @@ mod tests {
             Change::InputDown { slot: 1 },
             Change::InputUp { slot: 1 },
             Change::Route { slot: 1 },
+            Change::Detach { slot: 1 },
         ] {
             assert_eq!(fold(&items(&[c, c]), 2, 4).unwrap(), Some((c, None)));
         }
@@ -489,7 +529,8 @@ mod tests {
                 Change::Batch {
                     strips: false,
                     up: 1,
-                    routed: 2
+                    routed: 2,
+                    detached: 0
                 },
                 Some(Arc::new(Batch {
                     gains: Gains::Sparse(Vec::new()),
@@ -561,7 +602,8 @@ mod tests {
             Change::Batch {
                 strips: false,
                 up: 0,
-                routed: 0
+                routed: 0,
+                detached: 0
             }
         );
         assert_eq!(

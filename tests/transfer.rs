@@ -640,7 +640,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
 
-        flows: vec![src.clone()],
+        flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -715,7 +715,7 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
     let state = ProductState {
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
-        flows: vec![src.clone()],
+        flows: vec![Some(src.clone())],
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -753,7 +753,7 @@ fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
         let state = ProductState {
             gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
             up: vec![true],
-            flows: vec![src.clone()],
+            flows: vec![Some(src.clone())],
             strips: vec![Vec::new()],
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -845,7 +845,7 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
-        flows: vec![src.clone()],
+        flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -884,7 +884,7 @@ fn a_product_entry_the_install_passed_is_folded_in() {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
-        flows: vec![src.clone()],
+        flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -953,6 +953,99 @@ fn a_strip_entry_the_replay_applied_still_reaches_the_strip() {
     });
 }
 
+/// Two replicas given one log with a `Detach` compute the same pages, the
+/// detached input's silence counted as no silenced block, and so does a
+/// replica whose core is built from a product state holding no flow for
+/// the input: it reads none, as the live replicas do.
+#[test]
+fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let (src, other) = (new_id(), new_id());
+        let _p = Pilot::start(&domain.0, &src, 2, B, 0);
+        let _o = Pilot::start(&domain.0, &other, 2, B, 0);
+        let inputs = [(src.as_str(), 2), (other.as_str(), 2)];
+        let hs = [0; 3].map(|_| hashed_with(&domain, &inputs));
+        for h in &hs {
+            wait_for(Duration::from_secs(5), "inputs attached", || {
+                (h.e.status().inputs.iter()).all(|i| i.state == InputState::Attached)
+            });
+        }
+        let [a, b, c] = &hs;
+        let at = (now_block() + 20) * B;
+        for h in [a, b] {
+            h.e.append(1, at, Entry::Detach { slot: 0 }).unwrap();
+            h.e.commit(1);
+        }
+        assert_same_within(a, b, at, at + u64::from(RAMP) + 4 * PAGE)?;
+        c.e.drop_core().unwrap();
+        let identity = (0..4)
+            .map(|i| (0..4).map(|o| if i == o { 1.0 } else { 0.0 }).collect())
+            .collect();
+        let state = ProductState {
+            gains: identity,
+            up: vec![true, true],
+            flows: vec![None, Some(other.clone())],
+            strips: vec![Vec::new(), Vec::new()],
+            ducks: Vec::new(),
+            masks: Vec::new(),
+            pending: Vec::new(),
+            last_id: 1,
+        };
+        let j =
+            c.e.install_product(&state, 0, Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(c.e.status().inputs[0].state, InputState::Detached);
+        // After the fade-in from silence the install starts with.
+        let from = ((processed(&c.e) + 2) * B).max((j + 1) * B + u64::from(RAMP));
+        assert_same_within(a, c, from, from + 4 * PAGE)?;
+        for h in &hs {
+            assert_eq!(h.e.status().diverged, None);
+        }
+        Ok(())
+    });
+}
+
+/// A core copied with a detached input decodes with it and is replayed
+/// and handed over on a replica whose input is detached too. A replica
+/// whose input reads a flow refuses it, and a detached one refuses a core
+/// reading the input: the replay reads the replica's own inputs.
+#[test]
+fn a_core_with_a_detached_input_replays_only_where_it_is_detached() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+    let reading = copy(&b.e).encode();
+    let detach = |h: &Hashed| {
+        let at = (now_block() + 20) * B;
+        h.e.append(1, at, Entry::Detach { slot: 0 }).unwrap();
+        h.e.commit(1);
+        wait_for(Duration::from_secs(5), "past the crossfade", || {
+            h.e.status().inputs[0].state == InputState::Detached
+                && processed(&h.e) > (at + u64::from(RAMP)) / B + 2
+        });
+    };
+    detach(&a);
+    let encoded = copy(&a.e).encode();
+    let wire: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(wire["copy"]["core"]["slots"][0]["detached"], true);
+    let decoded = || samplez::CoreCopy::decode(&encoded).unwrap();
+    assert!(matches!(
+        b.e.replay(decoded()),
+        Err(ReplayError::Invalid(_))
+    ));
+    detach(&b);
+    let reading = samplez::CoreCopy::decode(&reading).unwrap();
+    assert!(matches!(b.e.replay(reading), Err(ReplayError::Invalid(_))));
+    let mut replay = b.e.replay(decoded()).unwrap();
+    b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+    assert_eq!(b.e.counters().handovers_installed.load(Relaxed), 1);
+    assert_eq!(b.e.status().inputs[0].state, InputState::Detached);
+    a.e.stop();
+    b.e.stop();
+}
+
 /// Every page both engines computed whole within `[from, to)` hashes
 /// alike, each of them compared; a run where one is disturbed or
 /// missing runs again.
@@ -1006,7 +1099,7 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
 
-            flows: vec![src.clone()],
+            flows: vec![Some(src.clone())],
 
             strips: vec![Vec::new()],
             ducks: Vec::new(),
@@ -1058,7 +1151,7 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
-        flows: vec![src.clone()],
+        flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -1148,7 +1241,7 @@ fn a_route_the_core_carried_is_not_applied_again() {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
-        flows: vec![src.clone()],
+        flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -1401,7 +1494,7 @@ fn a_core_with_a_batch_awaiting_its_generation_decodes() {
     wire["copy"]["core"]["awaiting_gen"] = serde_json::json!([{
         "id": wire["copy"]["last_id"],
         "at_index": at,
-        "change": { "Batch": { "strips": true, "up": 1, "routed": 0 } },
+        "change": { "Batch": { "strips": true, "up": 1, "routed": 0, "detached": 0 } },
     }]);
     let copy = samplez::CoreCopy::decode(&wire.to_string()).unwrap();
     assert!(matches!(h.e.replay(copy), Err(ReplayError::Generation)));
@@ -1499,7 +1592,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
         let state = ProductState {
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
-            flows: vec![next.clone()],
+            flows: vec![Some(next.clone())],
             strips: vec![vec![trim]],
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -1614,7 +1707,7 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
     let state = ProductState {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true, true],
-        flows: vec![src0.clone(), next1.clone()],
+        flows: vec![Some(src0.clone()), Some(next1.clone())],
         strips: vec![Vec::new(), Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1789,7 +1882,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
         let state = ProductState {
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
-            flows: vec![src.clone()],
+            flows: vec![Some(src.clone())],
             strips: vec![Vec::new()],
             ducks: vec![DuckTargets {
                 keys: vec![(0, 0.5)],

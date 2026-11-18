@@ -20,7 +20,8 @@ use samplez::blocks::{
     BlockStatus, Cause, HEALTHY, Kind, PAGE, PageHash, Range, Ranks, Standing, StatusChange,
 };
 use samplez::{
-    CopyError, CoreCopy, DuckSetting, Engine, Entry, EntryError, ProductState, ReplayError,
+    CopyError, CoreCopy, DuckSetting, Engine, Entry, EntryError, InputState, ProductState,
+    ReplayError,
 };
 
 use crate::contact::{Audio, Sample, Timing};
@@ -162,8 +163,9 @@ impl EngineAudio {
     }
 
     /// Of `entries`, those the engine takes: all of them, or, when it
-    /// refuses them together, those it takes alone, of the `InputUp`s and
-    /// `Route`s only those it takes with the ones of lower slots, so one
+    /// refuses them together, those it takes alone, of the `InputUp`s,
+    /// `Route`s and `Detach`es only those it takes with the ones of lower
+    /// slots, so one
     /// generation's worth stays. The engine's configuration alone decides
     /// it, the same on every replica of a compatibility key, so their
     /// outputs still agree.
@@ -171,7 +173,12 @@ impl EngineAudio {
         if self.engine.admits(entries).is_ok() {
             return entries.to_vec();
         }
-        let built = |e: &Entry| matches!(e, Entry::InputUp { .. } | Entry::Route { .. });
+        let built = |e: &Entry| {
+            matches!(
+                e,
+                Entry::InputUp { .. } | Entry::Route { .. } | Entry::Detach { .. }
+            )
+        };
         let alone: Vec<&Entry> = (entries.iter())
             .filter(|e| self.engine.admits(std::slice::from_ref(*e)).is_ok())
             .collect();
@@ -182,7 +189,7 @@ impl EngineAudio {
             .collect();
         let mut generation: Vec<&Entry> = alone.into_iter().filter(|e| built(e)).collect();
         generation.sort_by_key(|e| match e {
-            Entry::InputUp { slot } | Entry::Route { slot, .. } => *slot,
+            Entry::InputUp { slot } | Entry::Route { slot, .. } | Entry::Detach { slot } => *slot,
             _ => usize::MAX,
         });
         for e in generation {
@@ -195,7 +202,8 @@ impl EngineAudio {
     }
 
     /// `state` as the records the bridge filters leave an engine: a flow
-    /// differing from the one its input reads is a re-route, kept by the
+    /// differing from the one its input reads is a re-route, a detached
+    /// input reading none and a slot without a flow detached, kept by the
     /// rules of [`EngineAudio::kept`] and else left at the one read; a
     /// strip parameter the engine refuses is not set; a gain it refuses
     /// is silenced, not held at its previous value as a live replica
@@ -204,20 +212,23 @@ impl EngineAudio {
     /// live one that read the same flows holds, flows and strips alike.
     fn sanitised(&self, state: &ProductState) -> ProductState {
         let mut state = state.clone();
-        let reading: Vec<String> = (self.engine.status().inputs.into_iter())
-            .map(|i| i.flow_id)
+        let reading: Vec<Option<String>> = (self.engine.status().inputs.into_iter())
+            .map(|i| (i.state != InputState::Detached).then_some(i.flow_id))
             .collect();
         let routes: Vec<Entry> = (state.flows.iter().enumerate())
             .filter(|&(slot, flow)| reading.get(slot).is_some_and(|r| r != flow))
-            .map(|(slot, flow)| Entry::Route {
-                slot,
-                flow_id: flow.clone(),
+            .map(|(slot, flow)| match flow {
+                Some(flow_id) => Entry::Route {
+                    slot,
+                    flow_id: flow_id.clone(),
+                },
+                None => Entry::Detach { slot },
             })
             .collect();
         let kept = self.kept(&routes);
         let mut dropped = routes.len() - kept.len();
         for route in &routes {
-            if let Entry::Route { slot, .. } = *route
+            if let Entry::Route { slot, .. } | Entry::Detach { slot } = *route
                 && !kept.contains(route)
             {
                 state.flows[slot] = reading[slot].clone();
