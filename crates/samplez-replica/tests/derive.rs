@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use harness::{BLOCK, Options, Set, owner};
 use samplez::Targets;
-use samplez_replica::contact::Timing;
+use samplez_replica::contact::{Timing, index_at};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{Body, Command, NodeId, Origin, Request, SessionKey};
 use samplez_replica::membership::{Slot, node_id};
@@ -738,71 +738,164 @@ async fn a_witness_snapshot_loads_to_the_audio_replicas_floor_and_records() {
     });
 }
 
-/// Writes for `run` with one follower's every fsync 20 ms slow (design
-/// test 21): it applies each entry later than the others, and the
-/// deadline checked at the apply holds the late ones unresolved there.
-/// No engine refuses a record or is handed one late, and no decision
-/// contradicts a replica. Returns, per replica, the slow follower
-/// first, the records it handed, the entries it held unresolved and its
-/// rebuilds.
-async fn fsync_load(run: Duration) -> Vec<(NodeId, usize, u64, usize)> {
+/// One replica's part in an [`fsync_load`], counted over the measured
+/// writes.
+#[derive(Debug)]
+struct Handed {
+    id: NodeId,
+    /// Records handed to its engine.
+    records: usize,
+    /// Entries it held unresolved.
+    unresolved: u64,
+}
+
+/// Writes every 5 ms, one follower's every fsync `delay` slow (design
+/// test 21): for 1 s while the lead settles, then for `run` measured.
+/// That follower applies each entry later than the others, and holds
+/// unresolved those it applies past their deadline. No engine refuses a
+/// record or is handed one late, and no decision contradicts a replica.
+/// Returns the writes measured, per replica its part in them, the slow
+/// follower first, and the leader's contact metrics.
+async fn fsync_load(
+    run: Duration,
+    delay: Duration,
+    timing: Timing,
+) -> (u64, Vec<Handed>, samplez_replica::contact::Metrics) {
     let slow = 2;
     let set = Set::start_with(
         Options {
-            contact: Some(Timing::defaults(BLOCK)),
-            sync_delays: vec![(slow, Duration::from_millis(20))],
+            contact: Some(timing),
+            sync_delays: vec![(slow, delay)],
             ..Options::default()
         },
         Arc::new(|_| Desk::new()),
     )
     .await;
     sleep(Duration::from_millis(50)).await;
-    let end = Instant::now() + run;
-    let mut n = 0u64;
-    while Instant::now() < end {
-        let leader = set.leader().await;
-        set.replica(leader)
-            .submit(
-                &owner("s"),
-                &n.to_string(),
-                Bytes::from(format!("fader {} 0.{}", n % 2, n % 10)),
-            )
-            .await
-            .expect("committed");
-        n += 1;
-        sleep(Duration::from_millis(5)).await;
-    }
+    let ids: Vec<NodeId> = std::iter::once(slow)
+        .chain(set.ids().filter(|&id| id != slow))
+        .collect();
+    let counts = || -> Vec<(usize, u64)> {
+        (ids.iter())
+            .map(|&id| {
+                let unresolved = set.replica(id).contact_metrics().unwrap().unresolved;
+                (set.audio(id).lock().appended.len(), unresolved)
+            })
+            .collect()
+    };
+    let n = std::cell::Cell::new(0u64);
+    let write = async |until: Instant| {
+        while Instant::now() < until {
+            let leader = set.leader().await;
+            assert_ne!(leader, slow, "the slow disk is a follower's");
+            set.replica(leader)
+                .submit(
+                    &owner("s"),
+                    &n.get().to_string(),
+                    Bytes::from(format!("fader {} 0.{}", n.get() % 2, n.get() % 10)),
+                )
+                .await
+                .expect("committed");
+            n.set(n.get() + 1);
+            sleep(Duration::from_millis(5)).await;
+        }
+    };
+    write(Instant::now() + Duration::from_secs(1)).await;
+    let (before, n0) = (counts(), n.get());
+    write(Instant::now() + run).await;
     sleep(Duration::from_millis(500)).await;
     let mut out = Vec::new();
-    for id in std::iter::once(slow).chain(set.ids().filter(|&id| id != slow)) {
+    for (&id, (after, before)) in ids.iter().zip(counts().into_iter().zip(before)) {
         let m = set.replica(id).contact_metrics().unwrap();
-        let fake = set.audio(id).lock();
         assert_eq!(m.entries_refused, 0, "{id}");
-        assert_eq!(fake.late, 0, "{id} handed a record late");
+        assert_eq!(set.audio(id).lock().late, 0, "{id} handed a record late");
         assert_eq!(m.contradicted, 0, "{id} contradicted");
-        out.push((id, fake.appended.len(), m.unresolved, fake.rebuilds.len()));
+        out.push(Handed {
+            id,
+            records: after.0 - before.0,
+            unresolved: after.1 - before.1,
+        });
     }
     let leader = set.replica(set.leader().await).contact_metrics().unwrap();
+    let n = n.get() - n0;
     eprintln!(
-        "{n} writes in {run:?}; per replica, the slow one first, records handed, \
-         entries unresolved and rebuilds: {out:?}; the leader's lead {} samples, \
-         capped: {}",
-        leader.lead, leader.apply_lead_capped
+        "{n} writes measured in {run:?}, one follower's fsync {delay:?} slow; per replica, \
+         the slow one first: {out:?}; the leader's lead {} samples, capped: {}, raised by {:?}",
+        leader.lead, leader.apply_lead_capped, leader.apply_lead_raised_by
     );
-    out
+    (n, out, leader)
 }
 
-/// [`fsync_load`] for 3 s of writes.
+/// The timing of the sc sets, on network block storage: `maxApplyLead`
+/// 80 ms (design D3).
+fn sc_timing() -> Timing {
+    Timing {
+        max_apply_lead: Duration::from_millis(80),
+        ..Timing::defaults(BLOCK)
+    }
+}
+
+/// A follower whose fsync takes 20 ms takes every entry written during
+/// one fsync with the next, and learns the commit of the entries it holds
+/// ahead of the next, so it applies each one to two fsyncs after its
+/// append on the leader, 20 to 40 ms. The lead it raises covers that
+/// below the sc cap: the margin E lags TAI by here and applyGuard, 32 ms,
+/// plus 40 ms, the two blocks of slack the lead keeps and the jitter of
+/// E, at most 78 ms. Once it has, the follower hands its engine every
+/// record but a few, as the others do.
+async fn a_slow_follower_disk_is_covered_by_the_lead(run: Duration) {
+    let (n, out, leader) = fsync_load(run, Duration::from_millis(20), sc_timing()).await;
+    let slow = &out[0];
+    assert!(
+        slow.unresolved * 100 < n,
+        "{} of {n} unresolved on the slow follower",
+        slow.unresolved
+    );
+    for other in &out[1..] {
+        assert_eq!(other.unresolved, 0, "{other:?}");
+    }
+    assert!(!leader.apply_lead_capped);
+    assert!(
+        leader.lead <= index_at(78_000_000),
+        "lead {} samples above 78 ms",
+        leader.lead
+    );
+    assert_eq!(leader.apply_lead_raised_by, Some(slow.id));
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_slow_follower_disk_refuses_and_contradicts_nothing() {
-    fsync_load(Duration::from_secs(3)).await;
+    a_slow_follower_disk_is_covered_by_the_lead(Duration::from_secs(3)).await;
 }
 
-/// [`fsync_load`] for the 30 s the design names: run with `--ignored`.
+/// For the 30 s the design names: run with `--ignored`.
 #[tokio::test(start_paused = true)]
 #[ignore = "30 s of writes; the 3 s variant runs in CI"]
 async fn a_slow_follower_disk_refuses_and_contradicts_nothing_for_30_s() {
-    fsync_load(Duration::from_secs(30)).await;
+    a_slow_follower_disk_is_covered_by_the_lead(Duration::from_secs(30)).await;
+}
+
+/// A follower whose fsync takes 100 ms needs a lead past the default cap
+/// of 50 ms: the lead stops there, the leader names that follower as what
+/// holds it there, and it alone holds entries unresolved; the others
+/// hand every record.
+#[tokio::test(start_paused = true)]
+async fn a_follower_too_slow_for_the_cap_is_named_and_alone_degraded() {
+    let (n, out, leader) = fsync_load(
+        Duration::from_secs(3),
+        Duration::from_millis(100),
+        Timing::defaults(BLOCK),
+    )
+    .await;
+    let slow = &out[0];
+    assert!(leader.apply_lead_capped);
+    assert_eq!(leader.lead, index_at(50_000_000));
+    assert_eq!(leader.apply_lead_raised_by, Some(slow.id));
+    assert!(slow.unresolved * 2 > n, "{slow:?} of {n}");
+    for other in &out[1..] {
+        assert_eq!(other.unresolved, 0, "{other:?}");
+        assert!(other.records as u64 * 100 >= n * 99, "{other:?} of {n}");
+    }
 }
 
 /// A command applied on no replica by its apply deadline is unresolved
