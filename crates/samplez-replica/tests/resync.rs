@@ -676,3 +676,28 @@ async fn a_restarted_set_withdrawn_while_nobody_commits_is_not_ready() {
         assert!(!set.replica(id).replica().ready, "{id} writes nothing");
     }
 }
+
+/// A wait bounded in wall time, as [`Set::force_install`]'s, keeps the
+/// paused clock to wall time: waiting about 50 ms of wall time for a thread
+/// outside the runtime moves it by no more, where a runtime sleep per
+/// round would advance the idle clock a millisecond per turn of the loop.
+#[tokio::test(start_paused = true)]
+async fn a_wall_time_wait_keeps_the_paused_clock_to_wall_time() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = done.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        flag.store(true, Ordering::SeqCst);
+    });
+    let (clock, wall) = (Instant::now(), std::time::Instant::now());
+    harness::until_wall(wall + Duration::from_secs(10), "the thread's flag", || {
+        done.load(Ordering::SeqCst)
+    })
+    .await;
+    let (clock, wall) = (clock.elapsed(), wall.elapsed());
+    assert!(
+        clock <= wall,
+        "the paused clock moved {clock:?} in {wall:?} of wall time"
+    );
+}
