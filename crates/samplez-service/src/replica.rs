@@ -353,9 +353,9 @@ pub enum Reason {
     /// The command is larger than the replication orders; it was not
     /// ordered, and a resend is refused alike.
     TooLarge,
-    /// The command is one the engine would refuse once committed, such as
-    /// a value outside its configuration; it was not ordered, and a resend
-    /// is refused alike.
+    /// The command is one the replication does not order, such as one
+    /// asking for an index it does not schedule; it was not ordered, and a
+    /// resend is refused alike.
     Invalid,
 }
 

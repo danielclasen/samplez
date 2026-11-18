@@ -950,7 +950,6 @@ mod tests {
 
     use super::*;
     use crate::contact::Sample;
-    use crate::entry::Request;
     use crate::membership::{Slot, node_id};
     use crate::report::runs;
 
@@ -974,13 +973,11 @@ mod tests {
         fn settled(&self, _: u64) -> bool {
             false
         }
-        fn appended(&self, _: u64, _: &Request) {}
-        fn truncated(&self, _: u64) {}
+        fn appended(&self, _: u64, _: u64, _: &[samplez::Entry]) {}
         fn committed(&self, _: u64) {}
         fn unresolved(&self, _: u64, _: u64) -> bool {
             true
         }
-        fn skip(&self, _: u64) {}
         fn overwhelmed(&self) {}
         fn status(&self, _: usize, _: u64) -> Option<BlockStatus> {
             None
@@ -1010,7 +1007,7 @@ mod tests {
         fn drop_engine(&self) {
             self.0.lock().unwrap().push("drop".into());
         }
-        fn rebuild_engine(&self) -> bool {
+        fn rebuild_engine(&self, _: &samplez::ProductState, _: u64) -> bool {
             self.0.lock().unwrap().push("rebuild".into());
             true
         }
@@ -1052,7 +1049,17 @@ mod tests {
             alone: false,
             baseline,
             key: None,
-            retarget: &|| calls.rebuild_engine(),
+            retarget: &|| {
+                let state = samplez::ProductState {
+                    gains: Vec::new(),
+                    up: Vec::new(),
+                    flows: Vec::new(),
+                    strips: Vec::new(),
+                    pending: Vec::new(),
+                    last_id: 0,
+                };
+                calls.rebuild_engine(&state, 0)
+            },
             excluded: false,
             above: peers.iter().map(|p| p.id).collect(),
             peers,

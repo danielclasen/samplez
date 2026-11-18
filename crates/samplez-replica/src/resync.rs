@@ -11,9 +11,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::entry::{NodeId, Request};
+use crate::entry::NodeId;
 use crate::report::{Own, Page};
 use crate::state::ReplicaState;
+use crate::state_machine::Record;
 
 /// A donor's core after block `k0`, as the joiner takes it: `core` is the
 /// engine's own encoding, which carries the engine version, and
@@ -37,11 +38,18 @@ pub struct Resynced {
     pub unresolved: Vec<(u64, u64)>,
 }
 
+/// The replica no longer holds the record of an entry the replay needs:
+/// one applied after the donor core's last log id. The attempt fails and
+/// another core is fetched, never a gap replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Missed;
+
 /// What a joiner's replay reads from the replica while it runs.
 pub trait Source: Send + Sync {
-    /// The committed log entries after index `after`, in log order, as the
-    /// engine applies them.
-    fn entries(&self, after: u64) -> Vec<(u64, Request)>;
+    /// The records of the entries applied after log index `after`, in
+    /// log order, with their log index; [`Missed`] when one is no longer
+    /// held.
+    fn entries(&self, after: u64) -> Result<Vec<(u64, Record)>, Missed>;
     /// Whether the hand-over may still happen: false once the replica
     /// left `resync` or the attempt was given up.
     fn go(&self) -> bool;

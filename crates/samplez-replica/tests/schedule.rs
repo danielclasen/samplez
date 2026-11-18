@@ -154,7 +154,9 @@ async fn commands_are_stamped_a_lead_past_e_and_later_indices_kept() {
 async fn the_future_list_holds_64_entries() {
     let set = start(None).await;
     let leader = set.leader().await;
-    let far = e(&set, leader) + 4_800_000;
+    // Within a second of each stamp, the furthest an entry is kept
+    // ahead, and still ahead once the last is appended.
+    let far = e(&set, leader) + 47_000;
     for n in 0..FUTURE_LIST as u64 + 6 {
         set.replica(leader)
             .append(Body::InputDown {
@@ -321,7 +323,9 @@ async fn a_late_commit_raises_the_lead_up_to_its_cap() {
 async fn review_the_future_list_counts_committed_entries() {
     let set = start(None).await;
     let leader = set.leader().await;
-    let far = e(&set, leader) + 4_800_000;
+    // Within a second of each stamp, the furthest an entry is kept
+    // ahead, and still ahead once the last is appended.
+    let far = e(&set, leader) + 47_000;
     for n in 0..FUTURE_LIST as u64 + 6 {
         set.replica(leader)
             .append(Body::InputDown {
@@ -333,7 +337,7 @@ async fn review_the_future_list_counts_committed_entries() {
         // next one.
         sleep(Duration::from_millis(10)).await;
     }
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(100)).await;
     let pending = entries(&set, leader)
         .iter()
         .filter(|r| r.at_index().is_some_and(|at| at >= far))
@@ -399,46 +403,6 @@ async fn a_replica_whose_engine_refused_an_entry_takes_no_writes() {
         .expect_err("not commitable");
     assert_eq!(refused.reason, Reason::NotCommitable);
     assert!(set.replica(leader).replica().commitable);
-}
-
-/// A command the engine would refuse once committed is refused to its
-/// client before it is ordered, and commands the engine takes alone but
-/// not in one entry are ordered in entries of their own: no committed
-/// entry is refused, which would stop every replica taking writes.
-#[tokio::test(start_paused = true)]
-async fn a_command_the_engine_refuses_is_refused_before_it_is_ordered() {
-    let set = start(None).await;
-    let leader = set.leader().await;
-    let follower = set.ids().find(|&id| id != leader).unwrap();
-    let before = entries(&set, leader).len();
-    for at in [leader, follower] {
-        let refused = set
-            .replica(at)
-            .submit(&owner("s"), &format!("bad-{at}"), Bytes::from("bad=1@1"))
-            .await
-            .expect_err("refused before it is ordered");
-        assert_eq!(refused.reason, Reason::Invalid);
-    }
-    assert_eq!(entries(&set, leader).len(), before, "ordered");
-    let replica = set.replica(leader);
-    let (a, b) = tokio::join!(
-        replica.submit(&owner("s"), "p1", Bytes::from("pair=1@1")),
-        replica.submit(&owner("s"), "p2", Bytes::from("pair=2@2")),
-    );
-    a.expect("committed");
-    b.expect("committed");
-    let pairs: Vec<usize> = entries(&set, leader)
-        .iter()
-        .filter_map(|r| match &r.body {
-            Body::Commands(c) => Some(c.iter().filter(|c| c.body.starts_with(b"pair")).count()),
-            _ => None,
-        })
-        .filter(|&n| n > 0)
-        .collect();
-    assert_eq!(pairs, [1, 1]);
-    for id in set.ids() {
-        assert_eq!(set.audio(id).lock().entries_refused, 0);
-    }
 }
 
 /// A command asking for an index between block starts is ordered at the

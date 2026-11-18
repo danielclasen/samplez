@@ -14,8 +14,9 @@ use samplez::blocks::PAGE;
 use samplez_replica::contact::{Audio, Timing, index_at};
 use samplez_replica::entry::{Baseline, Body, NodeId, Request};
 use samplez_replica::membership::{Slot, node_id, slot_of};
-use samplez_replica::resync::{CoreReply, Source};
+use samplez_replica::resync::{CoreReply, Missed, Source};
 use samplez_replica::state::ReplicaState;
+use samplez_replica::state_machine::Record;
 use tokio::time::{Instant, sleep};
 
 fn a(o: u16) -> NodeId {
@@ -286,12 +287,12 @@ async fn x_stopped_while_r_starts_after_a_snapshot_install() {
 fn the_fake_replay_reads_its_source_without_its_lock() {
     struct Probe(Arc<FakeAudio>);
     impl Source for Probe {
-        fn entries(&self, _after: u64) -> Vec<(u64, Request)> {
+        fn entries(&self, _after: u64) -> Result<Vec<(u64, Record)>, Missed> {
             assert!(
                 self.0.state.try_lock().is_ok(),
                 "entries read under the lock"
             );
-            Vec::new()
+            Ok(Vec::new())
         }
         fn go(&self) -> bool {
             assert!(self.0.state.try_lock().is_ok(), "go read under the lock");
@@ -351,13 +352,7 @@ async fn a_decision_across_a_rename_converges() {
         .unwrap();
     let mut index = None;
     until("appended", 1, || {
-        index = set
-            .audio(leader)
-            .lock()
-            .appended
-            .iter()
-            .find(|(_, x)| *x == Some(at))
-            .map(|(i, _)| *i);
+        index = set.logged_at(leader, at);
         index.is_some()
     })
     .await;

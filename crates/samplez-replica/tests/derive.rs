@@ -76,9 +76,6 @@ impl Product for Desk {
         self.flows = [w[2].into(), w[3].into()];
         Ok(())
     }
-    fn paths(&self, _: &[u8]) -> Vec<String> {
-        Vec::new()
-    }
     fn config_hash(&self) -> u64 {
         0
     }
@@ -595,4 +592,92 @@ async fn concurrent_writers_append_the_marker_once() {
         "{log:?}"
     );
     assert_eq!(markers(&set, leader).len(), 1, "{log:?}");
+}
+
+/// What each replica's engine was handed for log index `index`.
+fn handed(set: &Set<Desk>, id: NodeId, index: u64) -> Option<(u64, Vec<samplez::Entry>)> {
+    (set.audio(id).lock().appended.iter())
+        .find(|a| a.0 == index)
+        .map(|a| (a.1, a.2.clone()))
+}
+
+/// Every audio replica's engine is handed the same records, by log
+/// index, at the same index: what each entry derived as it applied.
+#[tokio::test(start_paused = true)]
+async fn every_replica_hands_its_engine_the_same_records() {
+    let set = start().await;
+    let leader = set.leader().await;
+    for n in 0..6 {
+        set.replica(leader)
+            .submit(
+                &owner("s"),
+                &n.to_string(),
+                Bytes::from(format!("fader {} 0.{n}", n % 2)),
+            )
+            .await
+            .expect("committed");
+    }
+    sleep(Duration::from_millis(200)).await;
+    let records: Vec<Vec<(u64, u64, Vec<samplez::Entry>)>> = set
+        .ids()
+        .map(|id| set.audio(id).lock().appended.clone())
+        .collect();
+    assert_eq!(records[0].len(), 6, "{:?}", records[0]);
+    assert!(records.iter().all(|r| *r == records[0]), "{records:?}");
+}
+
+/// A command applied on no replica by its apply deadline is unresolved
+/// everywhere. The leader restamps it, never voids it for a later entry,
+/// since the restamp re-asserts the state at its own place; what the
+/// restamp derives reaches every engine at the restamp's index, and the
+/// command's own record never does.
+#[tokio::test(start_paused = true)]
+async fn a_command_late_everywhere_is_restamped_and_reasserted() {
+    let set = start().await;
+    let leader = set.leader().await;
+    let followers: Vec<NodeId> = set.ids().filter(|&id| id != leader).collect();
+    for &id in &followers {
+        set.net.stall(id, Duration::from_millis(60));
+    }
+    let r = set.replica(leader).clone();
+    let submitted = tokio::spawn(async move {
+        r.submit(&owner("s"), "late", Bytes::from("fader 0 0.25"))
+            .await
+    });
+    sleep(Duration::from_millis(150)).await;
+    for &id in &followers {
+        set.net.unstall(id);
+    }
+    submitted.await.unwrap().expect("committed");
+    let mut late = None;
+    let mut restamp = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while restamp.is_none() {
+        assert!(Instant::now() < deadline, "decided within 5 s");
+        set.replica(leader)
+            .store()
+            .entries_after(0, |id, req| match &req.body {
+                Body::Commands(c) if c.iter().any(|c| c.id == "late") => late = Some(id.index),
+                Body::Restamp { revision, .. } if Some(*revision) == late => {
+                    restamp = Some(id.index)
+                }
+                Body::Void { revision, .. } if Some(*revision) == late => {
+                    panic!("a product entry voided")
+                }
+                _ => {}
+            });
+        sleep(Duration::from_millis(5)).await;
+    }
+    let (late, restamp) = (late.unwrap(), restamp.unwrap());
+    sleep(Duration::from_millis(200)).await;
+    let first = handed(&set, leader, restamp).expect("the restamp handed");
+    assert!(first.1.contains(&samplez::Entry::Gain {
+        input: 0,
+        output: 0,
+        gain: 0.25
+    }));
+    for id in set.ids() {
+        assert_eq!(handed(&set, id, late), None, "{id} handed the late entry");
+        assert_eq!(handed(&set, id, restamp).as_ref(), Some(&first), "on {id}");
+    }
 }

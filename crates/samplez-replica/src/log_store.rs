@@ -274,11 +274,6 @@ impl<P: Product> Store<P> {
         self
     }
 
-    /// The product paths `command` sets.
-    pub fn paths(&self, command: &[u8]) -> Vec<String> {
-        self.lock().sm.product.paths(command)
-    }
-
     /// Opens the storage in `dir`, creating it when absent, with an empty
     /// product `factory` builds as the state the snapshot (if any) is
     /// loaded into. Every snapshot installed later loads into one it
@@ -302,6 +297,7 @@ impl<P: Product> Store<P> {
                 sm.load(snapshot.state.clone(), limits)
                     .map_err(io::Error::other)?;
                 last_applied = snapshot.last_applied;
+                sm.records_from = last_applied.map_or(0, |id| id.index);
                 membership = snapshot.membership.clone();
                 Some(snapshot)
             }
@@ -400,6 +396,12 @@ impl<P: Product> Store<P> {
         self.view(|applied, _| applied)
     }
 
+    /// The applied index, the floor there and the engine state of the
+    /// applied log ([`StateMachine::product_state`]), read at once.
+    pub fn product_state(&self) -> (u64, u64, samplez::ProductState) {
+        self.view(|n, sm| (n, sm.floor, sm.product_state(n)))
+    }
+
     /// Whether the volume holds nothing of a set: no vote, entry or
     /// snapshot, as openraft finds a node it may initialise.
     pub fn pristine(&self) -> bool {
@@ -477,6 +479,49 @@ impl<P> Store<P> {
     /// The restamps behind the entry at `index`, as applied.
     pub fn restamps(&self, index: u64) -> u32 {
         self.lock().sm.restamps.get(&index).map_or(0, |&(n, _)| n)
+    }
+
+    /// Calls `f` with the log index and record of every entry after
+    /// `after` up to `up_to` that derived engine entries and is held, in
+    /// log order; false when one is no longer held
+    /// ([`StateMachine::records_from`]).
+    pub fn records(
+        &self,
+        after: u64,
+        up_to: u64,
+        mut f: impl FnMut(u64, &crate::state_machine::Record),
+    ) -> bool {
+        let inner = self.lock();
+        if after < up_to {
+            for (index, record) in inner.sm.records.range(after + 1..=up_to) {
+                f(*index, record);
+            }
+        }
+        after >= inner.sm.records_from
+    }
+
+    /// The log index after which the state machine holds every record
+    /// ([`StateMachine::records_from`]).
+    pub fn records_from(&self) -> u64 {
+        self.lock().sm.records_from
+    }
+
+    /// The floor after every entry below `index`: the applied state's,
+    /// raised over the entries held after it as the apply will raise it.
+    /// At most the applied state's for an `index` at or below the applied
+    /// one.
+    pub fn floor_before(&self, index: u64) -> u64 {
+        let inner = self.lock();
+        let applied = inner.last_applied.map_or(0, |id| id.index);
+        let mut floor = inner.sm.floor;
+        for e in inner.log.range(applied + 1..index).map(|(_, e)| e) {
+            if let StoredPayload::Normal(request) = &e.payload
+                && let Some(at) = crate::state_machine::floored(floor, request)
+            {
+                floor = at;
+            }
+        }
+        floor
     }
 
     /// Calls `f` with the log index and body of every entry the engine
@@ -780,6 +825,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         let mut sm = StateMachine::new((self.factory)(), limits);
         sm.load(stored.state.clone(), limits)
             .map_err(|e| read_error(&e))?;
+        sm.records_from = stored.last_applied.map_or(0, |id| id.index);
         blocking(move || replace(&dir, "snapshot", &bytes))
             .await
             .map_err(|e| {
@@ -847,6 +893,45 @@ mod tests {
 
     fn id(index: u64) -> LogId<NodeId> {
         LogId::new(CommittedLeaderId::new(1, 0), index)
+    }
+
+    /// Contact's floor at append is the one the apply reaches: the
+    /// applied state's, raised over the entries held after it as they
+    /// will apply; and the records the apply derives are read back at
+    /// it.
+    #[tokio::test]
+    async fn the_floor_before_an_entry_is_the_one_its_apply_reaches() {
+        let dir = dir("floor");
+        let mut store = open(&dir);
+        let down = |index, at_index| openraft::Entry {
+            log_id: id(index),
+            payload: EntryPayload::Normal(Request {
+                stamp: 0,
+                body: Body::InputDown { slot: 0, at_index },
+            }),
+        };
+        let entries = vec![down(1, 4800), down(2, 960), down(3, 9600)];
+        store.append_to_log(entries.clone()).await.expect("append");
+        store
+            .apply_to_state_machine(&entries[..1])
+            .await
+            .expect("apply");
+        assert_eq!(
+            [
+                store.floor_before(2),
+                store.floor_before(3),
+                store.floor_before(4)
+            ],
+            [4800, 4800, 9600]
+        );
+        store
+            .apply_to_state_machine(&entries[1..])
+            .await
+            .expect("apply");
+        assert_eq!(store.with_state(|sm| sm.floor), 9600);
+        let mut records = Vec::new();
+        assert!(store.records(0, 3, |i, r| records.push((i, r.at_index))));
+        assert_eq!(records, [(1, 4800), (2, 4800), (3, 9600)]);
     }
 
     #[tokio::test]

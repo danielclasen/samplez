@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use samplez::{Config, Engine, Replication};
 use samplez_replica::bootstrap::random_id;
-use samplez_replica::bridge::{EngineAudio, input_entry};
+use samplez_replica::bridge::EngineAudio;
 use samplez_replica::contact::{Audio, Timing};
 use samplez_replica::verify::Verifier;
 
@@ -66,13 +66,7 @@ fn engine() -> (Domain, Arc<Engine>, EngineAudio) {
         margin: 960,
         ..Timing::defaults(B)
     };
-    let audio = EngineAudio::new(
-        engine.clone(),
-        status_rx,
-        hash_rx,
-        &timing,
-        Box::new(input_entry),
-    );
+    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, &timing);
     wait_for("a block processed", 10, || {
         audio.sample().own.processed.is_some()
     });

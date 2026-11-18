@@ -184,7 +184,7 @@ async fn links_recovering_6_ms_apart_hold_nobody_silent() {
 }
 
 /// Appends an `InputDown` on the leader 40 ms ahead and waits until `on`
-/// appended it; its log index and at_index.
+/// holds it in its log; its log index and at_index.
 async fn append_ahead(set: &Set, leader: NodeId, on: NodeId) -> (u64, u64) {
     let at = (index_at(tai(set)) + 40 * 48).next_multiple_of(BLOCK);
     set.replica(leader)
@@ -194,8 +194,13 @@ async fn append_ahead(set: &Set, leader: NodeId, on: NodeId) -> (u64, u64) {
         })
         .unwrap();
     for _ in 0..20 {
-        let appended = set.audio(on).lock().appended.clone();
-        if let Some(&(index, _)) = appended.iter().find(|(_, a)| *a == Some(at)) {
+        let mut found = None;
+        set.replica(on).store().entries_after(0, |id, request| {
+            if request.body.at_index() == Some(at) {
+                found = Some(id.index);
+            }
+        });
+        if let Some(index) = found {
             return (index, at);
         }
         sleep(Duration::from_millis(1)).await;
@@ -203,21 +208,28 @@ async fn append_ahead(set: &Set, leader: NodeId, on: NodeId) -> (u64, u64) {
     panic!("{on} did not append the entry");
 }
 
-/// `on` handed entry `index` at `at` to its engine as committed before
-/// its apply deadline, though openraft has not applied it there.
-async fn committed_in_time(set: &Set, on: NodeId, index: u64, at: u64) {
+/// `on` learned entry `index` committed from reports before its apply
+/// deadline, but openraft did not apply it there by then: it is
+/// unresolved, and what it derived never reaches the engine, however
+/// soon the commit was known.
+async fn unresolved_though_known_committed(set: &Set, on: NodeId, index: u64, at: u64) {
     let t = timing();
+    let mut known = false;
+    while set.clock(on).tai_ns() < t.apply_deadline(at) {
+        known |= set.replica(on).contact_metrics().unwrap().known_committed >= index;
+        sleep(Duration::from_millis(1)).await;
+    }
+    assert!(known, "{on} never learned entry {index} committed in time");
     sleep(Duration::from_millis(30)).await;
     let audio = set.audio(on);
-    let handed = audio
-        .committed_at(index)
-        .unwrap_or_else(|| panic!("{on} never learned entry {index} committed"));
-    assert!(handed < t.apply_deadline(at), "learned after the deadline");
     let unresolved = audio.lock().unresolved.clone();
     assert!(
-        unresolved.iter().all(|&(i, _)| i != index),
-        "entry {index} at {at} is unresolved: {unresolved:?}, appended {:?}",
-        audio.lock().appended
+        unresolved.iter().any(|&(i, a)| (i, a) == (index, at)),
+        "entry {index} at {at} is not unresolved: {unresolved:?}"
+    );
+    assert!(
+        audio.lock().appended.iter().all(|e| e.0 != index),
+        "entry {index} reached the engine"
     );
     assert!(
         set.replica(on).store().applied_index() < index,
@@ -225,8 +237,11 @@ async fn committed_in_time(set: &Set, on: NodeId, index: u64, at: u64) {
     );
 }
 
+/// A commit a follower learns only from the other follower's reports
+/// does not hand the entry to its engine: only its apply does, so an
+/// entry not applied by its deadline is unresolved there.
 #[tokio::test(start_paused = true)]
-async fn a_commit_learned_only_from_the_other_follower_reaches_the_engine() {
+async fn a_commit_learned_only_from_the_other_follower_leaves_the_entry_unresolved() {
     let set = start().await;
     let leader = set.leader().await;
     let mut others = set.ids().filter(|&id| id != leader);
@@ -238,11 +253,11 @@ async fn a_commit_learned_only_from_the_other_follower_reaches_the_engine() {
     // Nor do the leader's reports reach a: only b's do.
     set.net.cut_one_way(leader, a);
     assert!(set.replica(b).raft().metrics().borrow().state != openraft::ServerState::Leader);
-    committed_in_time(&set, a, index, at).await;
+    unresolved_though_known_committed(&set, a, index, at).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_stalled_append_response_leaves_the_commit_to_the_listing() {
+async fn a_stalled_append_response_leaves_the_entry_unresolved_though_listed() {
     let set = start().await;
     let leader = set.leader().await;
     let mut others = set.ids().filter(|&id| id != leader);
@@ -259,7 +274,7 @@ async fn a_stalled_append_response_leaves_the_commit_to_the_listing() {
             at_index: second.0,
         })
         .unwrap();
-    committed_in_time(&set, a, index, at).await;
+    unresolved_though_known_committed(&set, a, index, at).await;
     assert!(
         set.replica(a).store().log_id_at(second.1).is_none(),
         "a holds only the first entry"

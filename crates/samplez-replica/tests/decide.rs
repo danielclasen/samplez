@@ -68,12 +68,12 @@ fn engine_entries(set: &Set, id: NodeId, from: u64) -> usize {
         .lock()
         .appended
         .iter()
-        .filter(|(i, at)| *i >= from && at.is_some())
+        .filter(|(i, _, _)| *i >= from)
         .count()
 }
 
 /// An entry appended 40 ms ahead while the followers take every Raft
-/// message 60 ms late: its commit is known nowhere by its apply deadline,
+/// message 60 ms late: it is applied nowhere by its apply deadline,
 /// so it is unresolved on every replica. `kill` crashes the leader once
 /// it appended the entry. Returns the entry's log index on the survivors.
 async fn late_everywhere(kill: bool) -> (Set, u64) {
@@ -98,13 +98,7 @@ async fn late_everywhere(kill: bool) -> (Set, u64) {
         .unwrap();
     let mut index = None;
     until("appended on the leader", 1, || {
-        index = set
-            .audio(leader)
-            .lock()
-            .appended
-            .iter()
-            .find(|(_, x)| *x == Some(at))
-            .map(|(i, _)| *i);
+        index = set.logged_at(leader, at);
         index.is_some()
     })
     .await;

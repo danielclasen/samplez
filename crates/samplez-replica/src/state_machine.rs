@@ -90,12 +90,6 @@ pub trait Product: Send + 'static {
     /// Replaces the state with a saved one.
     fn load(&mut self, saved: &[u8]) -> Result<(), String>;
 
-    /// The product paths `command` sets. The leader restamps an
-    /// unresolved entry only for the paths no later committed entry sets,
-    /// and voids it when none is left, so a restamp never undoes a later
-    /// value.
-    fn paths(&self, command: &[u8]) -> Vec<String>;
-
     /// A hash of the configuration the product was built with that
     /// changes how it applies a command or loads a saved state, 0 for a
     /// product without one. Every member of a set must hold equal
@@ -138,6 +132,23 @@ pub const AHEAD_MAX: u64 = 48_000;
 /// them all, and those of every entry within this window and ahead of it
 /// stay held.
 pub const RECORDS_KEPT: u64 = 48_000;
+
+/// The index the entry `request` takes effect at after entries that
+/// left the floor at `floor`, and the floor after it: its own at_index,
+/// or its stamp, a block start, for one further than [`AHEAD_MAX`] past
+/// it or for a lease expiry from an older leader, which stamps none. A
+/// void from an older leader takes effect nowhere, as that leader's
+/// binary applies it: the floor stays alike on both. A function of the
+/// log prefix alone, so contact computes at append the index the apply
+/// derives at.
+pub fn floored(floor: u64, request: &Request) -> Option<u64> {
+    let own = match (request.at_index(), &request.body) {
+        (Some(at), _) if at <= request.stamp.saturating_add(AHEAD_MAX) => at,
+        (Some(_), _) | (None, Body::LeaseExpiry { .. }) => request.stamp,
+        (None, _) => return None,
+    };
+    Some(own.max(floor))
+}
 
 /// The engine entries one log entry derived, and where they apply.
 #[derive(Debug, Clone, PartialEq)]
@@ -278,6 +289,12 @@ pub struct StateMachine<P> {
     /// Not replicated: the records derived since start or load, by log
     /// index, kept [`RECORDS_KEPT`] past their index.
     pub records: BTreeMap<u64, Record>,
+    /// Not replicated: `records` holds the record of every entry after
+    /// this log index that derived one: the index a snapshot was loaded
+    /// at, or the last whose record retention dropped. The floor makes
+    /// the records' indexes rise in log order, so retention drops a
+    /// prefix.
+    pub records_from: u64,
 }
 
 impl<P: Product> StateMachine<P> {
@@ -305,6 +322,7 @@ impl<P: Product> StateMachine<P> {
             protocol: 0,
             image: None,
             records: BTreeMap::new(),
+            records_from: 0,
         }
         .imaged()
     }
@@ -319,26 +337,14 @@ impl<P: Product> StateMachine<P> {
         self
     }
 
-    /// The index entry `request` takes effect at, raised to the floor,
-    /// and the floor after it: its own at_index, or its stamp, a block
-    /// start, for one further than [`AHEAD_MAX`] past it or for a lease
-    /// expiry from an older leader, which stamps none. A void from an
-    /// older leader takes effect nowhere, as that leader's binary applies
-    /// it: the floor stays alike on both.
-    fn floored(&self, request: &Request) -> Option<u64> {
-        let own = match (request.at_index(), &request.body) {
-            (Some(at), _) if at <= request.stamp.saturating_add(AHEAD_MAX) => at,
-            (Some(_), _) | (None, Body::LeaseExpiry { .. }) => request.stamp,
-            (None, _) => return None,
-        };
-        Some(own.max(self.floor))
-    }
-
     /// Derives the engine entries of the entry at log index `revision`,
     /// applied at `at`: the diff of the targets when it `changed` the
     /// product, every target and the routes of the entry it names for a
     /// restamp or void of one that derived some, an input's state for an
     /// `InputDown` or `InputUp` and for a restamp of one.
+    /// The input states derive for every product, since the engine's
+    /// input health writes them whatever drives the rest; the others only
+    /// for one that [`Product::DRIVES_ENGINE`].
     fn derive(
         &mut self,
         revision: u64,
@@ -347,9 +353,6 @@ impl<P: Product> StateMachine<P> {
         changed: bool,
         restamped: Option<Vec<u32>>,
     ) {
-        if !P::DRIVES_ENGINE {
-            return;
-        }
         let (entries, routed) = match (&request.body, restamped) {
             (Body::Restamp { .. } | Body::Void { .. }, Some(slots)) => {
                 let Some(targets) = self.product.targets() else {
@@ -380,7 +383,7 @@ impl<P: Product> StateMachine<P> {
                 }],
                 Vec::new(),
             ),
-            (Body::Commands(_) | Body::LeaseExpiry { .. }, _) if changed => {
+            (Body::Commands(_) | Body::LeaseExpiry { .. }, _) if changed && P::DRIVES_ENGINE => {
                 let Some(next) = self.product.targets() else {
                     return;
                 };
@@ -409,7 +412,10 @@ impl<P: Product> StateMachine<P> {
                 samplez::Entry::InputUp { .. } | samplez::Entry::Route { .. }
             )
         });
-        if matches!(request.body, Body::Commands(_)) && self.terms.contains_key(&revision) {
+        // A lease expiry is decided like a command once stamped.
+        if matches!(request.body, Body::Commands(_) | Body::LeaseExpiry { .. })
+            && self.terms.contains_key(&revision)
+        {
             self.derived.insert(revision, routed);
         }
         self.records.insert(
@@ -433,7 +439,7 @@ impl<P: Product> StateMachine<P> {
     pub fn apply_at(&mut self, revision: u64, term: u64, request: &Request) -> Response {
         let stamp = request.stamp;
         self.forget_ended(stamp);
-        let at = self.floored(request);
+        let at = floored(self.floor, request);
         if let Some(at) = at {
             self.floor = at;
         }
@@ -629,7 +635,13 @@ impl<P: Product> StateMachine<P> {
         let terms = &self.terms;
         self.derived.retain(|index, _| terms.contains_key(index));
         let kept = self.highest_stamp.saturating_sub(RECORDS_KEPT);
-        self.records.retain(|_, r| r.at_index >= kept);
+        while let Some(entry) = self.records.first_entry() {
+            if entry.get().at_index >= kept {
+                break;
+            }
+            self.records_from = self.records_from.max(*entry.key());
+            entry.remove();
+        }
     }
 
     /// Applies every command of an entry, then makes its changes one delta
@@ -745,13 +757,47 @@ impl<P: Product> StateMachine<P> {
         *renewed = (*renewed).max(stamp);
     }
 
-    /// The highest at_index of a decidable entry that re-routed an input:
-    /// the generation it needs, built on every replica that applied it.
+    /// The highest at_index of an applied entry that built a generation
+    /// on every replica: a decidable one that re-routed an input, or an
+    /// `InputUp` held. The one source of the pending generation of the
+    /// applied log, so a command the product refused waits for nothing,
+    /// live or after a restart.
     pub fn pending_generation(&self) -> Option<u64> {
-        (self.derived.iter())
+        let rerouted = (self.derived.iter())
             .filter(|(_, slots)| !slots.is_empty())
-            .filter_map(|(index, _)| self.terms.get(index).map(|&(_, at)| at))
-            .max()
+            .filter_map(|(index, _)| self.terms.get(index).map(|&(_, at)| at));
+        let raised = self.pending.values().filter_map(|body| match body {
+            Body::InputUp { at_index, .. } => Some(*at_index),
+            _ => None,
+        });
+        rerouted.chain(raised).max()
+    }
+
+    /// The engine state of the applied log, the entry at log index `n`
+    /// last, that an engine core is built from: the targets, and each
+    /// slot up as its latest `InputDown` or `InputUp` held says, up where
+    /// none is held. Every record up to `n` takes effect at or before
+    /// [`StateMachine::floor`], every later one at or after it, so a core
+    /// installed with it there and given the records after `n` holds what
+    /// one given every record holds. Empty targets for a product without.
+    pub fn product_state(&self, n: u64) -> samplez::ProductState {
+        let targets = self.product.targets().unwrap_or_default();
+        let mut up = vec![true; targets.flows.len()];
+        for body in self.pending.values() {
+            if let Body::InputDown { slot, .. } | Body::InputUp { slot, .. } = body
+                && let Some(u) = up.get_mut(*slot as usize)
+            {
+                *u = matches!(body, Body::InputUp { .. });
+            }
+        }
+        samplez::ProductState {
+            gains: targets.gains,
+            up,
+            flows: targets.flows,
+            strips: targets.strips,
+            pending: Vec::new(),
+            last_id: n,
+        }
     }
 
     pub fn save(&self) -> Replicated {
@@ -949,9 +995,6 @@ pub(crate) mod tests {
         fn text(&self) -> String {
             serde_json::to_string(&self.values).expect("encodes")
         }
-        fn paths(&self, command: &[u8]) -> Vec<String> {
-            vec![parse(command).0]
-        }
         fn config_hash(&self) -> u64 {
             self.config
         }
@@ -986,6 +1029,30 @@ pub(crate) mod tests {
 
     fn machine() -> StateMachine<Paths> {
         StateMachine::new(Paths::default(), Limits::defaults(48_000))
+    }
+
+    /// An input state derives its engine entry for a product that drives
+    /// no engine too: the engine's input health writes it whatever
+    /// drives the rest.
+    #[test]
+    fn an_input_state_derives_for_a_product_without_targets() {
+        let mut sm = machine();
+        let down = Request {
+            stamp: 0,
+            body: Body::InputDown {
+                slot: 0,
+                at_index: 960,
+            },
+        };
+        sm.apply(1, &down);
+        assert_eq!(
+            sm.records[&1],
+            Record {
+                at_index: 960,
+                entries: vec![samplez::Entry::InputDown { slot: 0 }],
+                generation: false,
+            }
+        );
     }
 
     fn commands(stamp: u64, commands: Vec<Command>) -> Request {
@@ -1728,9 +1795,6 @@ mod derive_tests {
             *self = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
             Ok(())
         }
-        fn paths(&self, _: &[u8]) -> Vec<String> {
-            Vec::new()
-        }
         fn config_hash(&self) -> u64 {
             0
         }
@@ -2424,5 +2488,119 @@ mod derive_tests {
             slot: 0,
             flow_id: "c".into()
         }));
+    }
+
+    /// A stamped lease expiry that derived engine entries is decided like
+    /// a command: a restamp of it re-asserts the state at the restamp's
+    /// index, so a replica that held it unresolved gets its effect.
+    #[test]
+    fn a_restamp_of_a_lease_expiry_reasserts_its_effect() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "solo", 0, 960, None));
+        let expiry = Request {
+            stamp: 96,
+            body: Body::LeaseExpiry {
+                session: origin("s").key(),
+                renewed: 0,
+                at_index: Some(2400),
+            },
+        };
+        sm.apply_at(11, 1, &expiry);
+        assert!(sm.records.contains_key(&11));
+        let restamp = Request {
+            stamp: 192,
+            body: Body::Restamp {
+                revision: 11,
+                term: 1,
+                at_index: 4800,
+                paths: Vec::new(),
+                generation: None,
+            },
+        };
+        sm.apply_at(12, 1, &restamp);
+        let r = &sm.records[&12];
+        assert_eq!(r.at_index, 4800);
+        let reasserted = gains(r);
+        assert!(
+            gains(&sm.records[&11])
+                .iter()
+                .all(|g| reasserted.contains(g)),
+            "the gains after it"
+        );
+    }
+
+    /// The pending generation of the applied log names an `InputUp` the
+    /// state holds, and not a command flagged for its generation that
+    /// the product refused, which built none.
+    #[test]
+    fn the_pending_generation_names_what_built_one() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "pair c d", 0, 960, Some(true)));
+        assert!(!sm.records.contains_key(&1), "refused");
+        assert_eq!(sm.pending_generation(), None);
+        let up = Request {
+            stamp: 0,
+            body: Body::InputUp {
+                slot: 1,
+                at_index: 4800,
+            },
+        };
+        sm.apply(2, &up);
+        assert_eq!(sm.pending_generation(), Some(4800));
+    }
+
+    /// The state a core is rebuilt from: the targets, each slot up as its
+    /// latest input state held says and up where none is, and the last
+    /// log id it folds in.
+    #[test]
+    fn the_product_state_holds_the_targets_and_the_input_states() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "fader 0 0.5", 0, 960, None));
+        let input = |body| Request { stamp: 0, body };
+        sm.apply(
+            2,
+            &input(Body::InputUp {
+                slot: 1,
+                at_index: 960,
+            }),
+        );
+        sm.apply(
+            3,
+            &input(Body::InputDown {
+                slot: 1,
+                at_index: 1920,
+            }),
+        );
+        let state = sm.product_state(3);
+        let targets = sm.product.targets().unwrap();
+        assert_eq!(state.gains, targets.gains);
+        assert_eq!(state.flows, targets.flows);
+        assert_eq!(state.strips, targets.strips);
+        assert_eq!(state.up, [true, false]);
+        assert_eq!(state.last_id, 3);
+        assert!(state.pending.is_empty());
+    }
+
+    /// Records go once retention passes their index, oldest first, and
+    /// `records_from` names the last gone: a resync from before it cannot
+    /// be replayed.
+    #[test]
+    fn records_from_names_the_last_record_retention_dropped() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "fader 0 0.5", 0, 960, None));
+        sm.apply(2, &one("2", "fader 0 0.25", 0, 1920, None));
+        assert_eq!(sm.records_from, 0);
+        sm.apply(
+            3,
+            &one(
+                "3",
+                "fader 0 0.75",
+                1920 + RECORDS_KEPT,
+                1920 + RECORDS_KEPT,
+                None,
+            ),
+        );
+        assert_eq!(sm.records.keys().copied().collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(sm.records_from, 1);
     }
 }

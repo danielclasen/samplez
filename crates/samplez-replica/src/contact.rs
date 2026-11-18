@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use openraft::{BasicNode, RaftMetrics};
 use samplez::blocks::{BlockStatus, Cause, Ranks};
+use samplez::{Entry, ProductState};
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -23,11 +24,11 @@ use crate::log_store::Store;
 use crate::peer::{PeerRequest, PeerResponse};
 use crate::rank::Baselines;
 use crate::report::{Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report, Slack};
-use crate::resync::{CoreReply, Resynced, Source};
+use crate::resync::{CoreReply, Missed, Resynced, Source};
 use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
 use crate::state::{Life, PageBook, ReplicaState, Seen, View};
-use crate::state_machine::{Product, StateMachine};
+use crate::state_machine::{Product, Record, StateMachine};
 use crate::withhold::Withhold;
 
 /// The engine's sample rate (plan 2.3).
@@ -151,21 +152,16 @@ pub trait Audio: Send + Sync + 'static {
     /// Block k is final on every output, or was never computed and never
     /// will be: F may pass it whatever its contact.
     fn settled(&self, k: u64) -> bool;
-    /// Entry `index` was appended to this replica's log.
-    fn appended(&self, index: u64, request: &Request);
-    /// The entries from `from` on were removed from the log.
-    fn truncated(&self, from: u64);
-    /// The entries up to `up_to` are known committed: they go to the RT
-    /// thread.
+    /// Entry `index`, applied, derived `entries`, which take effect at
+    /// `at_index`.
+    fn appended(&self, index: u64, at_index: u64, entries: &[Entry]);
+    /// The entries up to `up_to` are applied: what they derived goes to
+    /// the RT thread.
     fn committed(&self, up_to: u64);
     /// Entry `index` at `at_index` is unresolved: every block from
     /// `at_index` is degraded until the log decides it. False when the
     /// engine had no room for it.
     fn unresolved(&self, index: u64, at_index: u64) -> bool;
-    /// This log's entry `index` is never applied: its commit was not known
-    /// by its apply deadline, so only the log's later decision on it
-    /// counts.
-    fn skip(&self, index: u64);
     /// An unresolved entry found no room: the replica can no longer tell
     /// its degraded blocks, so it stops committing them at once.
     fn overwhelmed(&self);
@@ -198,18 +194,14 @@ pub trait Audio: Send + Sync + 'static {
     /// Entry `index`, given as unresolved, is decided: its blocks are no
     /// longer degraded for it.
     fn resolved(&self, _index: u64) {}
-    /// Whether the engine takes `request` once committed, checked before
-    /// it is ordered: a committed entry the engine refused would stop
-    /// every replica taking writes.
-    fn admits(&self, _request: &Request) -> Result<(), String> {
-        Ok(())
-    }
     /// Drops the running engine's core: its state no longer follows the
     /// log (snapshot install, purge-point verdict).
     fn drop_engine(&self) {}
-    /// Builds the engine's core from the applied product state and
-    /// installs it; false when that failed and is to be retried.
-    fn rebuild_engine(&self) -> bool {
+    /// Builds the engine's core from `state`, the applied product state,
+    /// and installs it at the first block at or after `at_least`, the
+    /// floor of the applied log; false when that failed and is to be
+    /// retried with a fresh read.
+    fn rebuild_engine(&self, _state: &ProductState, _at_least: u64) -> bool {
         true
     }
     /// A donor's side of a resync: the engine's core after the block it
@@ -237,6 +229,10 @@ pub struct Sample {
     /// Appended entries the engine refused: it lacks a committed entry,
     /// so its output no longer follows the log.
     pub entries_refused: u64,
+    /// Derived engine entries left out before the engine saw them, as it
+    /// refuses them: a product whose targets break its contract. The
+    /// same on every replica, so its output still follows the log.
+    pub entries_filtered: u64,
     /// Per output, realised.
     pub realised: Vec<bool>,
     /// The generation its pending entries need is built, or none is.
@@ -328,9 +324,38 @@ pub trait LogView: Send + Sync + 'static {
     fn term_at(&self, index: u64) -> Option<u64> {
         self.log_id_at(index).map(|id| id.term)
     }
-    /// The product paths `command` sets.
-    fn paths(&self, _command: &[u8]) -> Vec<String> {
-        Vec::new()
+    /// Calls `f` with the log index and record of every applied entry
+    /// after `after` up to `up_to` that derived engine entries.
+    /// False when a record after `after` is no longer held.
+    fn records(&self, _after: u64, _up_to: u64, _f: &mut dyn FnMut(u64, &Record)) -> bool {
+        true
+    }
+    /// The log index after which every applied entry's record is held
+    /// ([`crate::state_machine::StateMachine::records_from`]).
+    fn records_from(&self) -> u64 {
+        0
+    }
+    /// The applied index, the floor there and the engine state of the
+    /// applied log, read at once.
+    fn product_state(&self) -> (u64, u64, ProductState) {
+        let n = self.applied();
+        (
+            n,
+            0,
+            ProductState {
+                gains: Vec::new(),
+                up: Vec::new(),
+                flows: Vec::new(),
+                strips: Vec::new(),
+                pending: Vec::new(),
+                last_id: n,
+            },
+        )
+    }
+    /// The floor after every entry below `index`, as the apply raises
+    /// it ([`crate::state_machine::floored`]).
+    fn floor_before(&self, _index: u64) -> u64 {
+        0
     }
     /// The product's configuration hash, none when it is not known.
     fn config_hash(&self) -> Option<u64> {
@@ -383,8 +408,17 @@ impl<P: Product> LogView for Store<P> {
     fn term_at(&self, index: u64) -> Option<u64> {
         Store::term_at(self, index)
     }
-    fn paths(&self, command: &[u8]) -> Vec<String> {
-        Store::paths(self, command)
+    fn records(&self, after: u64, up_to: u64, f: &mut dyn FnMut(u64, &Record)) -> bool {
+        Store::records(self, after, up_to, f)
+    }
+    fn records_from(&self) -> u64 {
+        Store::records_from(self)
+    }
+    fn product_state(&self) -> (u64, u64, ProductState) {
+        Store::product_state(self)
+    }
+    fn floor_before(&self, index: u64) -> u64 {
+        Store::floor_before(self, index)
     }
     fn config_hash(&self) -> Option<u64> {
         Some(Store::config_hash(self))
@@ -548,16 +582,25 @@ struct State {
     peers: BTreeMap<NodeId, Peer>,
     in_contact: bool,
     regained: Instant,
-    /// The last log index handed to the engine as appended.
+    /// The last log index taken from the log as appended.
     told: u64,
-    /// Entries handed as appended whose commit is not known.
+    /// The floor after the entry at `told`, as the apply will raise it
+    /// ([`crate::state_machine::floored`]).
+    floor_told: u64,
+    /// Entries taken as appended whose commit is not known, until then:
+    /// a truncation is found among them.
     uncommitted: BTreeMap<u64, StoredLogId>,
     /// Entries with an at_index, for listings, until every voter reported
     /// them committed: log id, at_index, stamp, and whether it is a
     /// `Baseline`.
     scheduled: BTreeMap<u64, (StoredLogId, u64, u64, bool)>,
-    /// The at_index of the latest generation-needing entry appended.
-    generation_at: Option<u64>,
+    /// The earliest index the last generation stamp reserved, whatever
+    /// entry carries it: the applied log and the appended entries name
+    /// the other pending generations.
+    reserved: Option<u64>,
+    /// The appended entries not applied yet that need a generation, by
+    /// log index, with the index they take effect at.
+    generations: BTreeMap<u64, u64>,
     /// When `own` was sampled.
     own_at: Instant,
     judged: BTreeSet<NodeId>,
@@ -567,6 +610,8 @@ struct State {
     e_spread: Histogram,
     /// Every entry of this replica's log up to here is committed.
     known_committed: u64,
+    /// Every entry up to here is applied: what it derived went to the
+    /// engine, or it went unresolved.
     handed: u64,
     awaiting: BTreeMap<Key, Waiting>,
     /// Entries given to the engine as unresolved, or refused by it, the
@@ -632,6 +677,7 @@ struct State {
     own: Own,
     status_changes_lost: u64,
     entries_refused: u64,
+    entries_filtered: u64,
     log_overflows: u64,
     counts: Counts,
 }
@@ -676,6 +722,9 @@ pub struct Metrics {
     pub status_changes_lost: u64,
     /// Appended entries the engine refused.
     pub entries_refused: u64,
+    /// Derived engine entries left out as the engine refuses them
+    /// ([`Sample::entries_filtered`]).
+    pub entries_filtered: u64,
     /// Entries given to the engine as unresolved, and refusals of it.
     pub unresolved: u64,
     pub unresolved_refused: u64,
@@ -776,21 +825,14 @@ impl Contact {
         first_seq: u64,
     ) -> Contact {
         let applied = log.applied();
+        let floor_told = log.floor_before(applied + 1);
         let installs_seen = log.installs();
         let mut scheduled = BTreeMap::new();
-        // The pending generation is learned from the applied entries that
-        // re-routed an input, the engine bodies the state machine holds
-        // and, in `sync_log`, every entry appended after `applied` that
-        // needs one.
-        let mut generation_at = log.pending_generation();
         // Entries the engine applies later, purged ones included, for
         // listings.
         // Collected first: the log's view is not re-entered from inside it.
         let mut pending = Vec::new();
         log.pending(&mut |index, body| {
-            if body.needs_generation() {
-                generation_at = generation_at.max(body.at_index());
-            }
             if let Some(at) = body.at_index() {
                 pending.push((index, at));
             }
@@ -824,9 +866,11 @@ impl Contact {
                 // The engine is built from the state applied; entries after
                 // it are handed as they come.
                 told: applied,
+                floor_told,
                 uncommitted: BTreeMap::new(),
                 scheduled,
-                generation_at,
+                reserved: None,
+                generations: BTreeMap::new(),
                 own_at: Instant::now(),
                 judged: BTreeSet::new(),
                 learners: BTreeMap::new(),
@@ -874,6 +918,7 @@ impl Contact {
                 own: Own::default(),
                 status_changes_lost: 0,
                 entries_refused: 0,
+                entries_filtered: 0,
                 log_overflows: 0,
                 counts: Counts::default(),
             }),
@@ -1086,8 +1131,9 @@ impl Contact {
         self.fence(st, tai);
     }
 
-    /// The log changed: appends and truncations go to the engine, and an
-    /// entry openraft applied is known committed.
+    /// The log changed: appends and truncations are taken, what the
+    /// entries openraft applied derived goes to the engine, and they are
+    /// known committed.
     pub fn log_changed(&self) {
         let tai = self.clocks.tai_ns();
         let mut st = self.lock();
@@ -1129,6 +1175,7 @@ impl Contact {
             st.own_at = now;
             st.status_changes_lost = sample.status_changes_lost;
             st.entries_refused = sample.entries_refused;
+            st.entries_filtered = sample.entries_filtered;
             st.realised = sample.realised;
             st.generation_ready = sample.generation_ready;
             st.clock_steps = sample.clock_steps;
@@ -1309,13 +1356,7 @@ impl Contact {
             return;
         };
         for (k, at) in expired {
-            let (index, term, node) = k;
-            // This log's own entry is never applied: the log decides it.
-            if index & UNLISTED_BIT == 0
-                && self.log.log_id_at(index) == Some(StoredLogId { term, node, index })
-            {
-                audio.skip(index);
-            }
+            let index = k.0;
             if audio.unresolved(index, at) {
                 st.counts.unresolved += 1;
                 if index & UNLISTED_BIT != 0 {
@@ -1339,7 +1380,10 @@ impl Contact {
         }
     }
 
-    /// Hands new appends and truncations to the engine.
+    /// Takes new appends and truncations from the log: each entry with an
+    /// index it takes effect at is listed and awaited there, the index the
+    /// apply will derive at ([`crate::state_machine::floored`]); then
+    /// hands what the applied entries derived to the engine.
     fn sync_log(&self, st: &mut State, tai: u64) {
         let cut = st
             .uncommitted
@@ -1351,17 +1395,16 @@ impl Contact {
                 st.awaiting.remove(&key(id));
             }
             st.scheduled.split_off(&from);
+            st.generations.split_off(&from);
             st.baselines.truncated(from);
             st.verdicts.retain(|&(index, _)| index < from);
             st.decisions.retain(|&(index, _, _)| index < from);
             st.purge_points.retain(|&(index, _)| index < from);
             st.told = from - 1;
-            if let Some(audio) = &self.audio {
-                audio.truncated(from);
-            }
+            st.floor_told = self.log.floor_before(from);
         }
         // Collected first: the log's view is not re-entered from inside
-        // it, and the engine takes appends in log order.
+        // it.
         let mut appended: Vec<(StoredLogId, Request)> = Vec::new();
         self.log.entries_after(st.told, &mut |id, request| {
             appended.push((id, request.clone()));
@@ -1381,21 +1424,12 @@ impl Contact {
             if id.index <= st.told {
                 continue;
             }
-            if let Some(audio) = &self.audio {
-                match self.engine_request(id.index, &request) {
-                    Some(engine) => audio.appended(id.index, &engine),
-                    None => audio.appended(id.index, &request),
+            let at = crate::state_machine::floored(st.floor_told, &request);
+            if let Some(at) = at {
+                st.floor_told = at;
+                if request.body.needs_generation() {
+                    st.generations.insert(id.index, at);
                 }
-                // Given unresolved from a listing before it arrived here:
-                // never applied.
-                if st.given.contains_key(&key(id)) {
-                    audio.skip(id.index);
-                }
-            }
-            // Never lowered: a re-routing command's stamp may have raised
-            // it past this entry's index.
-            if request.body.needs_generation() {
-                st.generation_at = st.generation_at.max(request.at_index());
             }
             match &request.body {
                 Body::Baseline(b) => st.baselines.appended(id, b),
@@ -1414,12 +1448,6 @@ impl Contact {
             let baseline = match &request.body {
                 Body::Baseline(b) => Some(b.at_index),
                 _ => None,
-            };
-            // A void or lease expiry changes no engine state contact
-            // translates: never awaited, listed or decided.
-            let at = match request.body {
-                Body::Void { .. } | Body::LeaseExpiry { .. } => None,
-                _ => request.at_index(),
             };
             new.push((id, at, baseline, request.stamp));
         }
@@ -1442,49 +1470,6 @@ impl Contact {
             st.counts.scheduled_dropped += 1;
         }
         self.hand(st);
-    }
-
-    /// What the engine applies for a `Restamp`: the entry it names, under
-    /// whatever restamps lie behind that, at the restamp's at_index; none
-    /// for every other entry, which goes to the engine as it is.
-    fn engine_request(&self, index: u64, request: &Request) -> Option<Request> {
-        let Body::Restamp {
-            revision,
-            term,
-            at_index,
-            ref paths,
-            ..
-        } = request.body
-        else {
-            return None;
-        };
-        // Only the first decision on an id moves it: a copy appended by a
-        // stalled or a new leader would apply the entry a second time.
-        if self.first_decision(revision, term) != Some(index) {
-            return Some(Request {
-                stamp: request.stamp,
-                body: Body::Void {
-                    revision,
-                    term,
-                    at_index: None,
-                    generation: None,
-                },
-            });
-        }
-        let (_, original) = self.original(revision)?;
-        let mut body = original.body;
-        crate::state_machine::restamp(&mut body, at_index);
-        // Only the paths the restamp names: a later committed entry set
-        // the rest.
-        if let Body::Commands(commands) = &mut body
-            && !paths.is_empty()
-        {
-            commands.retain(|c| self.log.paths(&c.body).iter().all(|p| paths.contains(p)));
-        }
-        Some(Request {
-            stamp: request.stamp,
-            body,
-        })
     }
 
     /// The entry behind the restamps ending at `index`, with its own log
@@ -1516,40 +1501,20 @@ impl Contact {
         first
     }
 
-    /// The paths of the entry restamped up to `index` that no entry
-    /// committed after it, up to `committed`, sets: none when none is
-    /// left; empty for an engine entry no later one supersedes.
-    fn remaining(&self, index: u64, committed: u64) -> Option<Vec<String>> {
-        let (from, original) = self.original(index)?;
-        let mut later = Vec::new();
+    /// Whether an entry committed after the one restamped up to `index`,
+    /// up to `committed`, sets every engine target it sets: then a
+    /// restamp would undo that entry. Only an engine body can be: a
+    /// product entry's restamp re-asserts the state at its own place,
+    /// which holds every later entry before it.
+    fn superseded(&self, index: u64, committed: u64) -> bool {
+        let Some((from, original)) = self.original(index) else {
+            return true;
+        };
+        let mut superseded = false;
         self.log.entries_after(from, &mut |id, request| {
-            if id.index <= committed {
-                later.push(request.clone());
-            }
+            superseded |= id.index <= committed && crate::decide::supersedes(&original, request);
         });
-        match &original.body {
-            Body::Commands(commands) => {
-                let mut paths: Vec<String> = commands
-                    .iter()
-                    .flat_map(|c| self.log.paths(&c.body))
-                    .collect();
-                paths.sort();
-                paths.dedup();
-                for request in &later {
-                    if let Body::Commands(set) = &request.body {
-                        for c in set {
-                            let set_later = self.log.paths(&c.body);
-                            paths.retain(|p| !set_later.contains(p));
-                        }
-                    }
-                }
-                (!paths.is_empty()).then_some(paths)
-            }
-            _ => (!later
-                .iter()
-                .any(|r| crate::decide::supersedes(&original, r)))
-            .then(Vec::new),
-        }
+        superseded
     }
 
     /// A snapshot replaced the state up to `applied`: the engine is built
@@ -1557,9 +1522,11 @@ impl Contact {
     /// replica held unresolved is resolved by it.
     fn installed(&self, st: &mut State, applied: u64) {
         st.told = applied;
+        st.floor_told = self.log.floor_before(applied + 1);
         st.known_committed = st.known_committed.max(applied);
         st.handed = st.handed.max(applied);
         st.uncommitted.clear();
+        st.generations.clear();
         st.awaiting.clear();
         st.given.clear();
         st.unlisted.clear();
@@ -1583,17 +1550,39 @@ impl Contact {
         }
     }
 
+    /// Builds the engine's core from the applied product state, at the
+    /// floor of the applied log, and gives it the entries still
+    /// unresolved: the log index the state folds in, none when that
+    /// failed.
+    fn rebuild(&self, audio: &dyn Audio, given: &BTreeMap<Key, u64>) -> Option<u64> {
+        let (n, floor, state) = self.log.product_state();
+        if !audio.rebuild_engine(&state, floor) {
+            return None;
+        }
+        // The rebuilt core holds no unresolved entry.
+        for (&(index, _, _), &at) in given {
+            let _ = audio.unresolved(index, at);
+        }
+        Some(n)
+    }
+
+    /// A core was rebuilt from the state the entries up to `n` left: what
+    /// they derived is in it, not handed again.
+    fn rebuilt(&self, st: &mut State, n: u64) {
+        if n > st.handed {
+            st.handed = n;
+            st.awaiting = st.awaiting.split_off(&(n + 1, 0, 0));
+            st.generations = st.generations.split_off(&(n + 1));
+        }
+    }
+
     /// An entry this replica knows of: unresolved at once when its apply
-    /// deadline has passed, else awaited unless its commit is known.
+    /// deadline has passed, else awaited unless it is applied here.
     fn note(&self, st: &mut State, id: StoredLogId, at_index: u64, tai: u64) {
-        // At or below the known commit point an entry is this log's own,
-        // committed and handed when it was appended, or one that can no
-        // longer commit.
+        // At or below the applied index an entry is this log's own,
+        // applied and handed, or one that can no longer commit.
         let k = key(id);
-        if id.index <= st.known_committed
-            || st.awaiting.contains_key(&k)
-            || st.given.contains_key(&k)
-        {
+        if id.index <= st.handed || st.awaiting.contains_key(&k) || st.given.contains_key(&k) {
             return;
         }
         let full = st.awaiting.len() >= AWAITING_MAX;
@@ -1613,9 +1602,9 @@ impl Contact {
         }
     }
 
-    /// Every entry of this replica's log up to `index` is committed.
-    /// Awaited entries at or below it are settled: this replica's own,
-    /// or another at the same index that can no longer commit.
+    /// Every entry of this replica's log up to `index` is committed: for
+    /// F, listings and baselines. Entries are handed and settled as they
+    /// apply ([`Contact::hand`]).
     fn learn(&self, st: &mut State, index: u64) {
         if index <= st.known_committed {
             return;
@@ -1625,44 +1614,82 @@ impl Contact {
         st.baselines
             .learned(index, self.clocks.tai_ns(), |i| log.log_id_at(i));
         st.uncommitted = st.uncommitted.split_off(&(index + 1));
-        // Awaited entries only wait unexpired: expired ones were given.
-        st.awaiting = st.awaiting.split_off(&(index + 1, 0, 0));
-        self.hand(st);
     }
 
+    /// Hands the records of the entries applied since the last call to
+    /// the engine, each at the index it derived. One applied at or past
+    /// its apply deadline, or already given unresolved, is not: it goes
+    /// unresolved, the log deciding it. Awaited entries up to the applied
+    /// index are settled: this replica's own, or another at the same
+    /// index that can no longer commit.
     fn hand(&self, st: &mut State) {
-        let up_to = st.known_committed.min(st.told);
-        if up_to > st.handed && self.audio.is_some() {
-            // Slack against the apply deadline: the first index this
-            // replica could still apply an entry at, learned now.
-            let tai = self.clocks.tai_ns();
-            let first = index_at(tai + self.timing.apply_guard_ns()) as i64;
-            let now = Instant::now();
-            let counted = self.counted(st, now).contains(&self.id);
-            let current = self.current_stamp(st, now);
-            let handed: Vec<Slack> = st
-                .scheduled
-                .range(st.handed + 1..=up_to)
-                .filter(|(_, e)| !e.3)
-                .map(|(&index, &(_, at, stamp, _))| Slack {
-                    index,
-                    samples: at as i64 - first,
-                    stamp,
-                })
-                .collect();
-            for s in handed {
-                if counted {
-                    st.lead.add(s.samples, s.stamp, current);
-                }
-                if st.slack.len() < MAX_LISTED {
-                    st.slack.push(s);
-                }
-            }
+        let up_to = self.log.applied().min(st.told);
+        if up_to <= st.handed {
+            return;
         }
-        if up_to > st.handed {
-            st.handed = up_to;
-            if let Some(audio) = &self.audio {
-                audio.committed(up_to);
+        let from = st.handed;
+        st.handed = up_to;
+        st.awaiting = st.awaiting.split_off(&(up_to + 1, 0, 0));
+        st.generations = st.generations.split_off(&(up_to + 1));
+        let Some(audio) = self.audio.clone() else {
+            return;
+        };
+        let mut records = Vec::new();
+        let whole = self.log.records(from, up_to, &mut |index, record| {
+            records.push((index, record.at_index, record.entries.clone()));
+        });
+        if !whole {
+            // Records this replica derived went before they were handed:
+            // its engine lacks them, so it is built again.
+            tracing::warn!(from, up_to, "derived records gone before they were handed");
+            self.begin_restart(st, up_to);
+            return;
+        }
+        let tai = self.clocks.tai_ns();
+        let first = index_at(tai + self.timing.apply_guard_ns());
+        for (index, at, entries) in records {
+            // Purged from the log since it applied: it is this log's own,
+            // and only this log's own entries at an index are given by
+            // their id.
+            let k = self.log.log_id_at(index).map_or((index, 0, 0), key);
+            if st.given.contains_key(&k) {
+                continue;
+            }
+            if tai >= self.timing.apply_deadline(at) {
+                st.awaiting.insert(
+                    k,
+                    Waiting {
+                        at_index: at,
+                        expired: true,
+                    },
+                );
+                continue;
+            }
+            audio.appended(index, at, &entries);
+        }
+        self.offer_unresolved(st);
+        audio.committed(up_to);
+        // Slack against the apply deadline: the first index this replica
+        // could still apply an entry at, as it applies.
+        let now = Instant::now();
+        let counted = self.counted(st, now).contains(&self.id);
+        let current = self.current_stamp(st, now);
+        let handed: Vec<Slack> = st
+            .scheduled
+            .range(from + 1..=up_to)
+            .filter(|(_, e)| !e.3)
+            .map(|(&index, &(_, at, stamp, _))| Slack {
+                index,
+                samples: at as i64 - first as i64,
+                stamp,
+            })
+            .collect();
+        for s in handed {
+            if counted {
+                st.lead.add(s.samples, s.stamp, current);
+            }
+            if st.slack.len() < MAX_LISTED {
+                st.slack.push(s);
             }
         }
     }
@@ -1826,14 +1853,15 @@ impl Contact {
         }
         st.held = held;
         let rebuilding = match st.restart {
-            Some(after) if !held && self.log.applied() >= after && audio.rebuild_engine() => {
-                st.restart = None;
-                // The rebuilt core holds no unresolved entry: the ones
-                // still unresolved go to it again.
-                for (&(index, _, _), &at) in &st.given {
-                    let _ = audio.unresolved(index, at);
+            Some(after) if !held && self.log.applied() >= after => {
+                match self.rebuild(audio.as_ref(), &st.given) {
+                    Some(n) => {
+                        st.restart = None;
+                        self.rebuilt(st, n);
+                        false
+                    }
+                    None => true,
                 }
-                false
             }
             Some(_) => true,
             None => false,
@@ -1869,15 +1897,11 @@ impl Contact {
             .filter(|&id| id != self.id && st.baselines.rank(k, id, &audio_voters, &t) < mine)
             .collect();
         let given = &st.given;
+        let retargeted = std::cell::Cell::new(None);
         let retarget = || {
-            if !audio.rebuild_engine() {
-                return false;
-            }
-            // The rebuilt core holds no unresolved entry.
-            for (&(index, _, _), &at) in given {
-                let _ = audio.unresolved(index, at);
-            }
-            true
+            let n = self.rebuild(audio.as_ref(), given);
+            retargeted.set(n);
+            n.is_some()
         };
         let life = st.life.as_mut().expect("checked above");
         let view = View {
@@ -1905,6 +1929,9 @@ impl Contact {
         };
         life.step(&view, audio.as_ref());
         let state = life.state();
+        if let Some(n) = retargeted.get() {
+            self.rebuilt(st, n);
+        }
         if state == ReplicaState::Committing {
             st.resync.committing();
         }
@@ -2080,7 +2107,7 @@ impl Contact {
         let log = &self.log;
         let committed = st.known_committed;
         let own_term_committed = log.log_id_at(committed).is_some_and(|id| id.term == term);
-        let remaining = |index: u64| self.remaining(index, committed);
+        let superseded = |index: u64| self.superseded(index, committed);
         let restamps = |index: u64| log.restamps(index);
         let log_id_at = |index: u64| log.log_id_at(index);
         let decided = |index: u64, term: u64| self.first_decision(index, term).is_some();
@@ -2090,7 +2117,7 @@ impl Contact {
             purged: log.purged(),
             own_term_committed,
             restamps: &restamps,
-            remaining: &remaining,
+            superseded: &superseded,
             decided: &decided,
         };
         let mut decided = st
@@ -2326,12 +2353,6 @@ impl Contact {
         st.scheduled = st.scheduled.split_off(&(lowest + 1));
     }
 
-    /// Whether this replica's engine takes `request` once committed
-    /// ([`Audio::admits`]); the witness has none and takes any.
-    pub fn admits(&self, request: &Request) -> Result<(), String> {
-        self.audio.as_ref().map_or(Ok(()), |a| a.admits(request))
-    }
-
     /// A member of the applied membership, learners included, whose
     /// newest report, direct or relayed, names another product
     /// configuration hash than this replica's: it would apply a command
@@ -2492,12 +2513,14 @@ impl Contact {
         self.estimate_in(st, now).map_or(0, |e| e.div_ceil(b) * b)
     }
 
-    /// Engine entries pending above `floor`: those the state machine holds
-    /// and those this log holds unapplied.
+    /// Engine entries pending above `floor`: the records of applied
+    /// entries that take effect above it, which every engine holds until
+    /// then, and the entries this log holds unapplied that may derive
+    /// one.
     fn pending_above(&self, floor: u64) -> usize {
         let mut pending = 0;
-        self.log.pending(&mut |_, body| {
-            if body.at_index().is_some_and(|at| at > floor) {
+        self.log.records(0, u64::MAX, &mut |_, record| {
+            if record.at_index > floor {
                 pending += 1;
             }
         });
@@ -2553,10 +2576,13 @@ impl Contact {
 
     /// Where the leader stamps an entry: none while E counts nobody, or
     /// with [`FUTURE_LIST`] entries pending above `E - applyGuard - S`.
-    /// A generation's earliest index is the pending generation's from
-    /// here on, so the next waits for it to pass whatever entry carries
-    /// it, a command that re-routes an input included; one that is not
-    /// written after all holds the next for at most its lead.
+    /// A generation waits for the pending one's index to pass: the
+    /// latest of what the applied state built
+    /// ([`LogView::pending_generation`]), what the appended entries not
+    /// applied yet need, and the earliest index the last generation stamp
+    /// reserved, whatever entry carries it, a command that re-routes an
+    /// input included; one that is not written after all holds the next
+    /// for at most its lead.
     pub fn stamp(&self, generation: bool) -> Result<Stamp, StampRefusal> {
         let mut st = self.lock();
         let now = Instant::now();
@@ -2579,7 +2605,13 @@ impl Contact {
         let earliest = if generation {
             // The last one's at_index has passed on the baseline, or on E
             // while no baseline is named.
-            if let Some(at) = st.generation_at {
+            // Applied, appended, or reserved by the last generation stamp.
+            let pending = [
+                self.log.pending_generation(),
+                st.generations.values().copied().max(),
+                st.reserved,
+            ];
+            if let Some(at) = pending.into_iter().flatten().max() {
                 let baseline = self.log.baseline().map(|b| b.replica);
                 let passed = self
                     .copies(&st, now)
@@ -2600,7 +2632,7 @@ impl Contact {
                 .max()
                 .unwrap_or(0);
             let earliest = stamp + lead.max(build_lead).next_multiple_of(b);
-            st.generation_at = st.generation_at.max(Some(earliest));
+            st.reserved = st.reserved.max(Some(earliest));
             earliest
         } else {
             stamp + lead
@@ -2725,22 +2757,15 @@ impl Contact {
         }
     }
 
-    /// The committed log entries after index `after`, as the engine
-    /// applies them, for a resync's replay.
-    pub fn replay_entries(&self, after: u64) -> Vec<(u64, Request)> {
-        let committed = self.log.committed().map_or(0, |c| c.index);
+    /// The records of the entries applied after index `after`, for a
+    /// resync's replay; [`Missed`] when one is no longer held.
+    pub fn replay_entries(&self, after: u64) -> Result<Vec<(u64, Record)>, Missed> {
+        let applied = self.log.applied();
         let mut out = Vec::new();
-        self.log.entries_after(after, &mut |id, request| {
-            if id.index <= committed {
-                out.push((id.index, request.clone()));
-            }
+        let whole = self.log.records(after, applied, &mut |index, record| {
+            out.push((index, record.clone()));
         });
-        out.into_iter()
-            .map(|(index, request)| {
-                let engine = self.engine_request(index, &request).unwrap_or(request);
-                (index, engine)
-            })
-            .collect()
+        if whole { Ok(out) } else { Err(Missed) }
     }
 
     /// The donor's side of a resync: the core, while this audio replica
@@ -2797,6 +2822,7 @@ impl Contact {
             status_lag_p9999: c.status_lag.quantile(0.9999).map(Duration::from_nanos),
             status_changes_lost: st.status_changes_lost,
             entries_refused: st.entries_refused,
+            entries_filtered: st.entries_filtered,
             unresolved: c.unresolved,
             unresolved_refused: c.unresolved_refused,
             awaiting_overflow: c.awaiting_overflow,
@@ -2960,7 +2986,7 @@ struct Feed {
 }
 
 impl Source for Feed {
-    fn entries(&self, after: u64) -> Vec<(u64, Request)> {
+    fn entries(&self, after: u64) -> Result<Vec<(u64, Record)>, Missed> {
         self.contact.replay_entries(after)
     }
 
@@ -3034,22 +3060,37 @@ mod tests {
         installs: u64,
         /// [`LogView::pending_generation`].
         generation: Option<u64>,
+        /// Records by log index, read up to the applied index.
+        records: BTreeMap<u64, Record>,
+        records_from: u64,
+        /// The floor of the applied state.
+        floor: u64,
     }
 
     #[derive(Default)]
     struct Log(Mutex<LogInner>);
 
     impl Log {
+        /// An entry, an `InputDown` at `at_index` that derives its
+        /// record once applied.
         fn push(&self, term: u64, index: u64, at_index: Option<u64>) {
             let body = match at_index {
                 Some(at_index) => Body::InputDown { slot: 0, at_index },
                 None => Body::Commands(Vec::new()),
             };
-            self.0
-                .lock()
-                .unwrap()
-                .log
-                .insert(index, (id(term, index), Request { stamp: 0, body }));
+            let mut log = self.0.lock().unwrap();
+            let stamp = at_index.unwrap_or(0);
+            log.log
+                .insert(index, (id(term, index), Request { stamp, body }));
+            if let Some(at_index) = at_index {
+                let entries = vec![Entry::InputDown { slot: 0 }];
+                let record = Record {
+                    at_index,
+                    entries,
+                    generation: false,
+                };
+                log.records.insert(index, record);
+            }
         }
     }
 
@@ -3098,8 +3139,39 @@ mod tests {
         fn pending_generation(&self) -> Option<u64> {
             self.0.lock().unwrap().generation
         }
-        fn paths(&self, command: &[u8]) -> Vec<String> {
-            vec![crate::state_machine::tests::parse(command).0]
+        fn records(&self, after: u64, up_to: u64, f: &mut dyn FnMut(u64, &Record)) -> bool {
+            let log = self.0.lock().unwrap();
+            if after < up_to {
+                for (index, record) in log.records.range(after + 1..=up_to) {
+                    f(*index, record);
+                }
+            }
+            after >= log.records_from
+        }
+        fn records_from(&self) -> u64 {
+            self.0.lock().unwrap().records_from
+        }
+        fn floor_before(&self, index: u64) -> u64 {
+            let log = self.0.lock().unwrap();
+            let mut floor = log.floor;
+            for (_, request) in log.log.range(log.applied + 1..index).map(|(_, e)| e) {
+                if let Some(at) = crate::state_machine::floored(floor, request) {
+                    floor = at;
+                }
+            }
+            floor
+        }
+        fn product_state(&self) -> (u64, u64, ProductState) {
+            let log = self.0.lock().unwrap();
+            let state = ProductState {
+                gains: Vec::new(),
+                up: Vec::new(),
+                flows: Vec::new(),
+                strips: Vec::new(),
+                pending: Vec::new(),
+                last_id: log.applied,
+            };
+            (log.applied, log.floor, state)
         }
         fn config_hash(&self) -> Option<u64> {
             Some(1)
@@ -3116,9 +3188,12 @@ mod tests {
         /// Unresolved entries it takes before it refuses.
         room: AtomicU64,
         /// What each append carried.
-        requests: Mutex<Vec<(u64, Request)>>,
+        requests: Mutex<Vec<(u64, u64, Vec<Entry>)>>,
         /// Whether a rebuild succeeds.
         rebuilds: std::sync::atomic::AtomicBool,
+        /// Each rebuild's state's last log id and the index it installs
+        /// at or after.
+        rebuilt_with: Mutex<Vec<(u64, u64)>>,
     }
 
     impl Audio for Engine {
@@ -3135,6 +3210,7 @@ mod tests {
                 },
                 status_changes_lost: 0,
                 entries_refused: 0,
+                entries_filtered: 0,
                 realised: Vec::new(),
                 generation_ready: true,
                 clock_steps: 0,
@@ -3147,9 +3223,10 @@ mod tests {
         fn settled(&self, _: u64) -> bool {
             false
         }
-        fn appended(&self, index: u64, request: &Request) {
+        fn appended(&self, index: u64, at_index: u64, entries: &[Entry]) {
             self.calls.lock().unwrap().push(format!("appended {index}"));
-            self.requests.lock().unwrap().push((index, request.clone()));
+            let call = (index, at_index, entries.to_vec());
+            self.requests.lock().unwrap().push(call);
         }
         fn resolved(&self, index: u64) {
             self.calls.lock().unwrap().push(format!("resolved {index}"));
@@ -3157,15 +3234,14 @@ mod tests {
         fn drop_engine(&self) {
             self.calls.lock().unwrap().push("drop".into());
         }
-        fn rebuild_engine(&self) -> bool {
+        fn rebuild_engine(&self, state: &ProductState, at_least: u64) -> bool {
             let ok = self.rebuilds.load(Ordering::SeqCst);
             if ok {
                 self.calls.lock().unwrap().push("rebuild".into());
+                let call = (state.last_id, at_least);
+                self.rebuilt_with.lock().unwrap().push(call);
             }
             ok
-        }
-        fn truncated(&self, from: u64) {
-            self.calls.lock().unwrap().push(format!("truncated {from}"));
         }
         fn committed(&self, up_to: u64) {
             self.calls
@@ -3182,9 +3258,6 @@ mod tests {
             let call = format!("unresolved {index} at {at_index}");
             self.calls.lock().unwrap().push(call);
             true
-        }
-        fn skip(&self, index: u64) {
-            self.calls.lock().unwrap().push(format!("skip {index}"));
         }
         fn overwhelmed(&self) {
             self.calls.lock().unwrap().push("overwhelmed".into());
@@ -3243,6 +3316,7 @@ mod tests {
             room: AtomicU64::new(u64::MAX),
             requests: Mutex::new(Vec::new()),
             rebuilds: std::sync::atomic::AtomicBool::new(true),
+            rebuilt_with: Mutex::new(Vec::new()),
         });
         let contact = Contact::new(
             1,
@@ -3487,16 +3561,18 @@ mod tests {
             f.log.push(1, index, None);
         }
         f.contact.log_changed();
-        assert_eq!(f.engine.calls().len(), 5, "five appends");
+        let known = |f: &Fixture| f.contact.metrics().known_committed;
         // Another term at index 5: not this log's entry.
         let mut r = f.report(2, None);
         r.committed = Some(id(2, 5));
         f.contact.receive(r);
-        assert!(f.engine.calls().is_empty());
+        assert_eq!(known(&f), 0);
         let mut r = f.report(3, None);
         r.committed = Some(id(1, 4));
         f.contact.receive(r);
-        assert_eq!(f.engine.calls(), ["committed 4"]);
+        assert_eq!(known(&f), 4);
+        // Known committed, not applied: nothing reaches the engine.
+        assert!(f.engine.calls().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -3522,7 +3598,11 @@ mod tests {
             baseline: false,
         }];
         f.contact.receive(r.clone());
-        assert!(f.engine.calls().is_empty(), "another entry at index 5");
+        assert_eq!(
+            f.contact.metrics().known_committed,
+            0,
+            "another entry at index 5"
+        );
         r.seq += 1;
         r.listed = vec![Listed {
             id: id(1, 5),
@@ -3530,17 +3610,19 @@ mod tests {
             baseline: false,
         }];
         f.contact.receive(r);
-        assert_eq!(f.engine.calls(), ["committed 5"]);
+        assert_eq!(f.contact.metrics().known_committed, 5);
     }
 
     impl Fixture {
+        /// Entry `index` of term 1, stamped at its own index.
         fn insert(&self, index: u64, body: Body) {
+            let stamp = body.at_index().unwrap_or(0);
             self.log
                 .0
                 .lock()
                 .unwrap()
                 .log
-                .insert(index, (id(1, index), Request { stamp: 0, body }));
+                .insert(index, (id(1, index), Request { stamp, body }));
         }
 
         /// Entries up to `index` applied, which makes them known
@@ -3577,17 +3659,13 @@ mod tests {
             generation: None,
         };
         f.insert(2, restamp);
+        let record = Record {
+            at_index: at + 96,
+            entries: vec![Entry::InputDown { slot: 0 }],
+            generation: false,
+        };
+        f.log.0.lock().unwrap().records.insert(2, record.clone());
         f.contact.log_changed();
-        let (index, engine) = f.engine.requests.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(index, 2);
-        assert_eq!(
-            engine.body,
-            Body::InputDown {
-                slot: 0,
-                at_index: at + 96
-            },
-            "the entry the restamp names, at its index"
-        );
         f.engine.calls();
         f.tick();
         assert_eq!(
@@ -3597,6 +3675,12 @@ mod tests {
         );
         f.apply(2);
         f.contact.log_changed();
+        let handed = f.engine.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            handed,
+            (2, record.at_index, record.entries),
+            "what the restamp derived, at its index, once applied"
+        );
         f.tick();
         assert_eq!(f.state(), Some(ReplicaState::Diverged));
         assert_eq!(f.contact.metrics().contradicted, 1);
@@ -3670,10 +3754,119 @@ mod tests {
         f.tick();
         assert_eq!(f.state(), Some(ReplicaState::Starting), "not rebuilt");
         f.engine.rebuilds.store(true, Ordering::SeqCst);
+        f.log.0.lock().unwrap().floor = 4800;
         f.tick();
         assert!(f.engine.calls().contains(&"rebuild".to_owned()));
+        assert_eq!(
+            *f.engine.rebuilt_with.lock().unwrap(),
+            [(10, 4800)],
+            "the applied state, at its floor"
+        );
         f.tick();
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+    }
+
+    /// What an entry derived reaches the engine as it applies, not as it
+    /// is appended or learned committed, at the index it derived; one
+    /// applied at or past its apply deadline does not, and goes
+    /// unresolved, however late the deadline passed.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_is_handed_as_it_applies_unless_past_its_deadline() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let timing = Timing::defaults(B);
+        let at = index_at(T0) + 400 * B;
+        f.log.push(1, 1, Some(at));
+        f.log.push(1, 2, Some(at + B));
+        f.contact.log_changed();
+        let mut r = f.report(2, None);
+        r.committed = Some(id(1, 2));
+        f.contact.receive(r);
+        assert_eq!(f.contact.metrics().known_committed, 2);
+        assert!(f.engine.requests.lock().unwrap().is_empty(), "not applied");
+        f.apply(1);
+        f.contact.log_changed();
+        let handed = f.engine.requests.lock().unwrap().clone();
+        assert_eq!(handed, [(1, at, vec![Entry::InputDown { slot: 0 }])]);
+        assert_eq!(f.engine.calls(), ["appended 1", "committed 1"]);
+        // Still awaited as contact looks, past its deadline as it hands.
+        f.clock.set(timing.apply_deadline(at + B) - 1);
+        f.clock.step.store(1, Ordering::SeqCst);
+        f.apply(2);
+        f.contact.log_changed();
+        assert_eq!(f.engine.requests.lock().unwrap().len(), 1, "entry 2 handed");
+        assert_eq!(
+            f.engine.calls(),
+            [format!("unresolved 2 at {}", at + B), "committed 2".into()]
+        );
+    }
+
+    /// An applied entry's record gone before contact handed it leaves the
+    /// engine without it: the replica drops its core and is rebuilt.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_gone_before_it_was_handed_rebuilds_the_engine() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let at = index_at(T0) + 400 * B;
+        f.log.push(1, 1, Some(at));
+        f.contact.log_changed();
+        f.engine.calls();
+        f.log.0.lock().unwrap().records_from = 1;
+        f.apply(1);
+        f.contact.log_changed();
+        assert!(f.engine.calls().contains(&"drop".to_owned()));
+        assert!(f.engine.requests.lock().unwrap().is_empty());
+        f.tick();
+        assert!(f.engine.calls().contains(&"rebuild".to_owned()));
+        assert_eq!(*f.engine.rebuilt_with.lock().unwrap(), [(1, 0)]);
+    }
+
+    /// A resync's replay reads the records of the entries applied after
+    /// the donor core's last log id, and fails over a gap: a record
+    /// after it this replica no longer holds.
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_from_before_the_records_held_is_missed() {
+        let f = fixture(&[&[1, 2, 3]]);
+        let at = index_at(T0) + 400 * B;
+        for index in 1..=3 {
+            f.log.push(1, index, Some(at + index * B));
+        }
+        f.apply(3);
+        f.log.0.lock().unwrap().records_from = 1;
+        assert_eq!(f.contact.replay_entries(0), Err(Missed));
+        let replayed: Vec<(u64, u64)> = (f.contact.replay_entries(1).expect("held"))
+            .iter()
+            .map(|(i, r)| (*i, r.at_index))
+            .collect();
+        assert_eq!(replayed, [(2, at + 2 * B), (3, at + 3 * B)]);
+    }
+
+    /// The leader stamps nothing while [`FUTURE_LIST`] records of applied
+    /// entries take effect ahead, which every engine holds until then,
+    /// whatever entry derived them.
+    #[tokio::test(start_paused = true)]
+    async fn applied_records_still_ahead_fill_the_future_list() {
+        let f = fixture(&[&[1]]);
+        f.tick();
+        let ahead = f.contact.stamp(false).expect("stamped").stamp + 400 * B;
+        {
+            let mut log = f.log.0.lock().unwrap();
+            for index in 1..=FUTURE_LIST as u64 {
+                let record = Record {
+                    at_index: ahead,
+                    entries: vec![Entry::Gain {
+                        input: 0,
+                        output: 0,
+                        gain: 0.5,
+                    }],
+                    generation: false,
+                };
+                log.records.insert(index, record);
+            }
+        }
+        assert_eq!(f.contact.stamp(false), Err(StampRefusal::FutureListFull));
+        f.log.0.lock().unwrap().records.pop_first();
+        assert!(f.contact.stamp(false).is_ok());
     }
 
     /// A purge-point verdict naming this replica returns it to `starting`
@@ -3726,45 +3919,19 @@ mod tests {
         }
     }
 
-    /// A second decision on one id, appended by a stalled or a new leader
-    /// that did not see the first, never hands the entry to the engine
-    /// again: only the first decision in log order moves it.
-    #[tokio::test(start_paused = true)]
-    async fn a_second_restamp_of_one_entry_never_reaches_the_engine() {
-        let f = fixture(&[&[1, 2, 3]]);
-        f.tick();
-        let at = index_at(T0) + 400 * 48;
-        f.log.push(1, 1, Some(at));
-        f.insert(2, restamp_of(1, at + 96, &[]));
-        f.insert(3, restamp_of(1, at + 192, &[]));
-        f.contact.log_changed();
-        let handed: Vec<(u64, Option<u64>)> = f
-            .engine
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(i, r)| (*i, r.body.at_index().filter(|_| r.body.decides().is_none())))
-            .collect();
-        assert_eq!(
-            handed,
-            [(1, Some(at)), (2, Some(at + 96)), (3, None)],
-            "the copy carries no engine entry"
-        );
-    }
-
     /// A restamp never undoes a later committed value: a restamped slot
-    /// change that a later entry on the same slot overtook is left with
-    /// nothing to restamp, and of a commands entry only the paths no later
-    /// entry sets remain, which is all the engine gets of it.
+    /// change that a later committed entry on the same slot overtook is
+    /// superseded and voided. A product entry never is, whatever a later
+    /// one sets: its restamp re-asserts the state at its own place, which
+    /// holds every entry before it.
     #[tokio::test(start_paused = true)]
-    async fn a_restamp_keeps_only_what_no_later_committed_entry_sets() {
+    async fn only_an_engine_body_a_later_entry_overtook_is_superseded() {
         use crate::state_machine::tests::command;
         let f = fixture(&[&[1, 2, 3]]);
         let at = index_at(T0) + 400 * 48;
         f.log.push(1, 1, Some(at));
         f.insert(2, restamp_of(1, at + 96, &[]));
-        assert_eq!(f.contact.remaining(2, 2), Some(Vec::new()), "nothing later");
+        assert!(!f.contact.superseded(2, 2), "nothing later");
         f.insert(
             3,
             Body::InputUp {
@@ -3772,11 +3939,11 @@ mod tests {
                 at_index: at + 480,
             },
         );
-        assert_eq!(
-            f.contact.remaining(2, 3),
-            None,
+        assert!(
+            f.contact.superseded(2, 3),
             "the restamp's original entry, overtaken on its slot"
         );
+        assert!(!f.contact.superseded(2, 2), "uncommitted");
         let commands = |cs: &[(&str, &str)]| {
             Body::Commands(
                 cs.iter()
@@ -3789,28 +3956,8 @@ mod tests {
             )
         };
         f.insert(10, commands(&[("a", "gain=1@1"), ("b", "pan=1@1")]));
-        f.insert(11, commands(&[("c", "gain=2@2")]));
-        assert_eq!(f.contact.remaining(10, 11), Some(vec!["pan".to_owned()]));
-        f.insert(12, commands(&[("d", "pan=2@2")]));
-        assert_eq!(f.contact.remaining(10, 12), None);
-        assert_eq!(
-            f.contact.remaining(10, 11),
-            Some(vec!["pan".to_owned()]),
-            "uncommitted"
-        );
-        f.insert(13, restamp_of(10, at + 960, &["pan"]));
-        let engine = f
-            .contact
-            .engine_request(13, &f.log.request(13).unwrap())
-            .unwrap();
-        match engine.body {
-            Body::Commands(cs) => {
-                let ids: Vec<&str> = cs.iter().map(|c| c.id.as_str()).collect();
-                assert_eq!(ids, ["b"]);
-                assert_eq!(cs[0].at_index, Some(at + 960));
-            }
-            other => panic!("{other:?}"),
-        }
+        f.insert(11, commands(&[("c", "gain=2@2"), ("d", "pan=2@2")]));
+        assert!(!f.contact.superseded(10, 11), "a product entry");
     }
 
     /// A void naming an id at an index whose term this replica no longer
@@ -3883,48 +4030,44 @@ mod tests {
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
     }
 
+    /// An entry this replica has not applied by its apply deadline is
+    /// unresolved, its commit known from reports or not; one applied in
+    /// time is handed.
     #[tokio::test(start_paused = true)]
-    async fn an_entry_whose_commit_is_unknown_at_its_deadline_is_unresolved() {
+    async fn an_entry_not_applied_by_its_deadline_is_unresolved() {
         let f = fixture(&[&[1, 2, 3]]);
         // Reports from voters count once a period named the voters.
         f.tick();
         let timing = Timing::defaults(B);
-        // Three entries 40 ms ahead: one learned committed in time, one
-        // only after its deadline, one never.
+        // Three entries 40 ms ahead: one applied in time, one learned
+        // committed in time but not applied, one neither.
         let at = index_at(T0) + 40 * 48;
         for index in 1..=3 {
             f.log.push(1, index, Some(at + index * B));
         }
         f.contact.log_changed();
         f.engine.calls();
+        f.apply(1);
+        f.contact.log_changed();
+        assert_eq!(f.engine.calls(), ["appended 1", "committed 1"]);
         let mut r = f.report(2, None);
-        r.committed = Some(id(1, 1));
+        r.committed = Some(id(1, 2));
         f.contact.receive(r);
-        assert_eq!(f.engine.calls(), ["committed 1"]);
         f.clock.set(timing.apply_deadline(at + 2 * B) - 1);
         f.tick();
         assert!(f.engine.calls().is_empty(), "before the deadline");
         f.clock.set(timing.apply_deadline(at + 2 * B));
-        let mut r = f.report(2, None);
-        r.committed = Some(id(1, 2));
-        f.contact.receive(r);
+        f.tick();
         assert_eq!(
             f.engine.calls(),
-            [
-                "skip 2".into(),
-                format!("unresolved 2 at {}", at + 2 * B),
-                "committed 2".into()
-            ],
-            "a commit learned at the deadline is late: entry 2 is never applied"
+            [format!("unresolved 2 at {}", at + 2 * B)],
+            "known committed, not applied: entry 2 is never handed"
         );
         f.clock.set(timing.apply_deadline(at + 3 * B));
         f.tick();
         assert_eq!(
             f.engine.calls(),
-            [
-                "skip 3".to_owned(),
-                format!("unresolved 3 at {}", at + 3 * B)
-            ]
+            [format!("unresolved 3 at {}", at + 3 * B)]
         );
     }
 
@@ -3981,11 +4124,11 @@ mod tests {
         f.tick();
         let now = index_at(T0);
         for index in 1..=80 {
-            // Descending at_index; index 80 lies past the listing horizon.
+            // Index 80 lies past the listing horizon.
             let at = if index == 80 {
                 now + 60 * 48
             } else {
-                now + (90 - index) * 30
+                now + index * 30
             };
             f.log.push(1, index, Some(at));
         }
@@ -3995,9 +4138,9 @@ mod tests {
         f.contact.receive(r);
         let (_, _, report) = f.tick().pop().unwrap();
         let indices: Vec<u64> = report.listed.iter().map(|l| l.id.index).collect();
-        let expected: Vec<u64> = (16..=79).rev().collect();
+        let expected: Vec<u64> = (4..=67).collect();
         assert_eq!(indices, expected, "the earliest at_index first, 64 of them");
-        assert_eq!(report.unlisted, Some(now + (90 - 15) * 30));
+        assert_eq!(report.unlisted, Some(now + 68 * 30));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4028,14 +4171,31 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_truncated_entry_is_taken_back_and_its_successor_handed() {
         let f = fixture(&[&[1, 2, 3]]);
+        let at = index_at(T0) + 400 * B;
         for index in 1..=3 {
-            f.log.push(1, index, None);
+            f.log.push(1, index, Some(at + index * B));
         }
         f.contact.log_changed();
         f.engine.calls();
-        f.log.push(2, 3, None);
+        // Its successor asks for an earlier index: raised to the floor
+        // of the entries before it, not of the entry it replaced.
+        f.log.push(2, 3, Some(at + B));
         f.contact.log_changed();
-        assert_eq!(f.engine.calls(), ["truncated 3", "appended 3"]);
+        assert!(
+            f.engine.calls().is_empty(),
+            "nothing appended reaches the engine"
+        );
+        {
+            let st = f.contact.lock();
+            assert_eq!(st.scheduled[&3].0, id(2, 3));
+            assert_eq!(st.scheduled[&3].1, at + 2 * B);
+            let awaited: Vec<Key> = st.awaiting.keys().copied().collect();
+            assert_eq!(awaited, [(1, 1, 1), (2, 1, 1), (3, 2, 1)]);
+        }
+        f.apply(3);
+        f.contact.log_changed();
+        let handed = f.engine.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(handed.0, 3);
     }
 
     /// A stale listing at an index must not hide the deadline of the
@@ -4137,32 +4297,6 @@ mod tests {
             "the newer report is the one echoed"
         );
         assert_eq!(f.fence(), fence);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_restarted_leader_waits_for_a_pending_generation_it_applied() {
-        let f = fixture(&[&[1]]);
-        // The state machine holds an InputUp whose index lies ahead.
-        let at = index_at(T0) + 400 * B;
-        f.log.0.lock().unwrap().pending.push((
-            3,
-            Body::InputUp {
-                slot: 0,
-                at_index: at,
-            },
-        ));
-        let contact = Contact::new(
-            1,
-            Timing::defaults(B),
-            f.clock.clone(),
-            Some(f.engine.clone()),
-            f.log.clone(),
-            1,
-        );
-        contact.verified_always();
-        contact.tick(f.members.clone());
-        assert!(contact.stamp(false).is_ok());
-        assert_eq!(contact.stamp(true), Err(StampRefusal::GenerationPending));
     }
 
     /// The log's view holds its lock while it walks the pending entries,
@@ -4307,10 +4441,10 @@ mod tests {
         assert_eq!(f.contact.metrics().protocol_blocker, Some(2));
     }
 
-    /// An appended entry that needs a generation never lowers the pending
-    /// generation a re-routing command's stamp raised, and a `Commands`
-    /// entry the leader flagged for its generation counts, so a leader
-    /// that only appended it waits for it too.
+    /// An appended entry that needs a generation never lowers the
+    /// generation a re-routing command's stamp reserved, and a `Commands`
+    /// entry the leader flagged for its generation counts until it
+    /// applies, so a leader that only appended it waits for it too.
     #[tokio::test(start_paused = true)]
     async fn appended_entries_never_lower_the_pending_generation() {
         let f = fixture(&[&[1]]);
@@ -4326,7 +4460,7 @@ mod tests {
         );
         f.contact.log_changed();
         f.tick();
-        assert_eq!(f.contact.lock().generation_at, Some(raised));
+        assert_eq!(f.contact.lock().reserved, Some(raised));
 
         let restarted = Contact::new(
             1,
@@ -4342,8 +4476,30 @@ mod tests {
         command.generation = Some(true);
         f.insert(2, Body::Commands(vec![command]));
         restarted.tick(f.members.clone());
-        assert_eq!(restarted.lock().generation_at, Some(far));
+        assert_eq!(restarted.lock().generations.get(&2), Some(&far));
         assert_eq!(restarted.stamp(true), Err(StampRefusal::GenerationPending));
+    }
+
+    /// A command the leader flagged for its generation that the product
+    /// refused builds none: once it applied, the applied state alone
+    /// names the pending generation, live as after a restart, and the
+    /// next generation is stamped without waiting for its index.
+    #[tokio::test(start_paused = true)]
+    async fn an_applied_flagged_command_that_built_nothing_holds_no_generation() {
+        let f = fixture(&[&[1]]);
+        f.tick();
+        let far = f.contact.stamp(false).expect("stamped").stamp + 400 * B;
+        let mut command = crate::state_machine::tests::command("s", "1", "route");
+        command.at_index = Some(far);
+        command.generation = Some(true);
+        f.insert(1, Body::Commands(vec![command]));
+        f.contact.log_changed();
+        f.tick();
+        assert_eq!(f.contact.stamp(true), Err(StampRefusal::GenerationPending));
+        // Applied, refused by the product: no generation in the state.
+        f.apply(1);
+        f.contact.log_changed();
+        assert!(f.contact.stamp(true).is_ok());
     }
 
     /// A replica restarted after it applied an entry that re-routed an
@@ -4365,38 +4521,39 @@ mod tests {
         );
         restarted.verified_always();
         restarted.tick(f.members.clone());
-        assert_eq!(restarted.lock().generation_at, Some(far));
         assert_eq!(restarted.stamp(true), Err(StampRefusal::GenerationPending));
     }
 
-    /// A stamped void or lease expiry changes no engine state contact
-    /// translates: it is neither listed nor awaited, so never decided.
+    /// A stamped void or lease expiry derives at its index like a
+    /// command: listed and awaited there. A void from an older leader,
+    /// which stamps none, takes effect nowhere and is neither.
     #[tokio::test(start_paused = true)]
-    async fn a_stamped_void_or_expiry_is_never_awaited() {
+    async fn a_stamped_void_or_expiry_is_awaited_where_it_derives() {
         let f = fixture(&[&[1, 2]]);
         f.tick();
-        let at = index_at(T0) + 20 * B;
-        f.insert(
-            5,
-            Body::Void {
-                revision: 1,
-                term: 1,
-                at_index: Some(at),
-                generation: None,
-            },
-        );
+        let at = index_at(T0) + 400 * B;
+        let void = |at_index| Body::Void {
+            revision: 1,
+            term: 1,
+            at_index,
+            generation: None,
+        };
+        f.insert(4, void(None));
+        f.insert(5, void(Some(at)));
         f.insert(
             6,
             Body::LeaseExpiry {
                 session: crate::entry::SessionKey::from_parts("p", "s"),
                 renewed: 0,
-                at_index: Some(at),
+                at_index: Some(at + B),
             },
         );
         f.contact.log_changed();
         f.tick();
         let st = f.contact.lock();
-        assert!(!st.scheduled.contains_key(&5) && !st.scheduled.contains_key(&6));
-        assert!(st.awaiting.is_empty());
+        let scheduled: Vec<(u64, u64)> = st.scheduled.iter().map(|(&i, e)| (i, e.1)).collect();
+        assert_eq!(scheduled, [(5, at), (6, at + B)]);
+        let awaited: Vec<u64> = st.awaiting.keys().map(|k| k.0).collect();
+        assert_eq!(awaited, [5, 6]);
     }
 }

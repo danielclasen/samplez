@@ -33,11 +33,12 @@ use samplez::blocks::{
     BlockStatus, Cause, Changes, Ctx, HEALTHY, Hold, Kind, PAGE, PageHash, Pages, Ranks, Sink,
     StatusChange, Statuses,
 };
+use samplez::{Entry, ProductState};
 use samplez_replica::bootstrap::{Bootstrap, Marker, Markers, Volume, random_id};
 use samplez_replica::bridge::{PAGES_REPORTED, page_of, word_or_skip};
 use samplez_replica::contact::{self, Audio, Clocks, Sample, Timing};
 use samplez_replica::dedup::Limits;
-use samplez_replica::entry::{Body, Request};
+use samplez_replica::entry::Body;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
 use samplez_replica::membership::{Slot, slot_of};
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest, PeerResponse};
@@ -166,17 +167,6 @@ impl Product for Paths {
     }
     fn config_hash(&self) -> u64 {
         self.config
-    }
-    fn paths(&self, command: &[u8]) -> Vec<String> {
-        let text = std::str::from_utf8(command).expect("utf-8");
-        if let Some(rest) = text
-            .strip_prefix("touch ")
-            .or_else(|| text.strip_prefix("release "))
-        {
-            let (path, _) = rest.split_once('@').expect("path@seq");
-            return vec![path.to_owned()];
-        }
-        vec![parse(command).0]
     }
 
     fn text(&self) -> String {
@@ -400,15 +390,13 @@ impl Writes {
 
 #[derive(Default)]
 pub struct Fake {
-    /// Entries appended, with their at_index.
-    pub appended: Vec<(u64, Option<u64>)>,
-    pub truncated: Vec<u64>,
+    /// Records handed, by log index, with their at_index and entries.
+    pub appended: Vec<(u64, u64, Vec<Entry>)>,
     /// Each commit point handed, with the TAI time it was handed at.
     pub committed: Vec<(u64, u64)>,
     /// F as published, with the TAI time, when it changed.
     pub fences: Vec<(u64, u64)>,
     pub unresolved: Vec<(u64, u64)>,
-    pub skipped: Vec<u64>,
     pub overwhelmed: u64,
     /// The processed block stands still from here.
     pub stalled_at: Option<u64>,
@@ -448,6 +436,9 @@ pub struct Fake {
     /// computed.
     pub drops: Vec<Option<u64>>,
     pub rebuilds: Vec<Option<u64>>,
+    /// Each rebuild's product state's last log id, and the index it was
+    /// asked to install at or after.
+    pub rebuilt_with: Vec<(u64, u64)>,
     /// Stops the supervisor named, `(output, at)`.
     pub stops: Vec<(usize, u64)>,
     /// Blocks `[from, to)` skipped and withheld for a cause; for
@@ -889,6 +880,7 @@ impl Audio for FakeAudio {
             },
             status_changes_lost: 0,
             entries_refused: st.entries_refused,
+            entries_filtered: 0,
             realised: st.outputs.iter().map(|o| o.realised).collect(),
             generation_ready: !st.generation_pending,
             clock_steps: self.clock.steps(),
@@ -922,31 +914,9 @@ impl Audio for FakeAudio {
             None => st.computed.is_some_and(|p| k <= p),
         })
     }
-    fn appended(&self, index: u64, request: &Request) {
-        self.lock().appended.push((index, request.at_index()));
-    }
-    /// The engine refuses a command setting path `bad`, and an entry
-    /// holding more than one command setting path `pair`.
-    fn admits(&self, request: &Request) -> Result<(), String> {
-        let Body::Commands(commands) = &request.body else {
-            return Ok(());
-        };
-        let path = |p: &str| {
-            commands
-                .iter()
-                .filter(|c| c.body.starts_with(p.as_bytes()))
-                .count()
-        };
-        if path("bad=") > 0 {
-            return Err("path bad".into());
-        }
-        if path("pair=") > 1 {
-            return Err("two pairs".into());
-        }
-        Ok(())
-    }
-    fn truncated(&self, from: u64) {
-        self.lock().truncated.push(from);
+    fn appended(&self, index: u64, at_index: u64, entries: &[Entry]) {
+        let mut st = self.lock();
+        st.appended.push((index, at_index, entries.to_vec()));
     }
     fn committed(&self, up_to: u64) {
         let tai = self.clock.tai_ns();
@@ -963,9 +933,6 @@ impl Audio for FakeAudio {
         let n = st.unresolved.len();
         st.resolved.push((index, n));
         st.core_unresolved.remove(&index);
-    }
-    fn skip(&self, index: u64) {
-        self.lock().skipped.push(index);
     }
     fn overwhelmed(&self) {
         self.lock().overwhelmed += 1;
@@ -1034,7 +1001,7 @@ impl Audio for FakeAudio {
     /// Rebuilt from product state: whatever state diverged is gone.
     /// Refused while a generation the core names is not built, and
     /// failed while held.
-    fn rebuild_engine(&self) -> bool {
+    fn rebuild_engine(&self, state: &ProductState, at_least: u64) -> bool {
         self.step();
         let mut st = self.lock();
         if st.generation_pending {
@@ -1050,6 +1017,7 @@ impl Audio for FakeAudio {
             g.1 = g.1.min(k);
         }
         st.rebuilds.push(at);
+        st.rebuilt_with.push((state.last_id, at_least));
         st.no_core = false;
         st.core_unresolved.clear();
         let n = st.unresolved.len();
@@ -1681,6 +1649,19 @@ impl<P: Product + Sync> Set<P> {
 
     pub fn audio(&self, id: NodeId) -> &Arc<FakeAudio> {
         self.audios.get(&id).expect("contact running")
+    }
+
+    /// The log index of the entry `id`'s log holds at `at_index`.
+    pub fn logged_at(&self, id: NodeId, at_index: u64) -> Option<u64> {
+        let mut found = None;
+        self.replica(id)
+            .store()
+            .entries_after(0, |log_id, request| {
+                if request.body.at_index() == Some(at_index) {
+                    found = Some(log_id.index);
+                }
+            });
+        found
     }
 
     pub fn replica(&self, id: NodeId) -> &Arc<Replica<P>> {
