@@ -8,10 +8,8 @@
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
-use std::time::Duration;
+use std::time::Instant;
 
 use mxl_sys::{
     MXL_DATA_FORMAT_AUDIO, MXL_ERR_FLOW_INVALID, MXL_ERR_FLOW_NOT_FOUND, MXL_ERR_INVALID_ARG,
@@ -19,6 +17,7 @@ use mxl_sys::{
     WrappedMultiBufferSlice,
 };
 
+use crate::lookup::{Backoff, Look, Lookup, exists, flow_dir};
 use crate::time::{RATE, timestamp_to_index};
 use crate::{Error, Instance, MxlApi, Result, Status, check, id_cstring};
 
@@ -813,74 +812,14 @@ pub enum Poll {
     Head(u64),
 }
 
-/// How long [`PolledFlow`] waits for the lookup of a flow's directory
-/// before it reads the flow as absent and leaves the lookup running.
-const LOOKUP_WAIT: Duration = Duration::from_millis(5);
-
-/// The lookup of one flow's directory in its domain, on a thread of its
-/// own. On a domain where a lookup of a missing name waits for it to
-/// appear, such as a filesystem that has the flow brought to the node on
-/// that lookup, the wait blocks only that thread, and libmxl opens the
-/// flow once the lookup found it.
-struct Lookup {
-    dir: PathBuf,
-    look: fn(&Path) -> bool,
-    running: Option<Receiver<bool>>,
-}
-
-impl Lookup {
-    fn new(domain: &Path, flow_id: &str, look: fn(&Path) -> bool) -> Lookup {
-        Lookup {
-            // libmxl names a flow's directory after its id in lower case.
-            dir: domain.join(format!("{}.mxl-flow", flow_id.to_ascii_lowercase())),
-            look,
-            running: None,
-        }
-    }
-
-    /// Whether the flow's directory is there. Starts a lookup unless the
-    /// one an earlier call started still runs, and waits [`LOOKUP_WAIT`]
-    /// at most for it: `None` while it runs.
-    fn found(&mut self) -> Option<bool> {
-        let running = match self.running.take() {
-            Some(r) => r,
-            None => {
-                let (tx, rx) = sync_channel(1);
-                let (dir, look) = (self.dir.clone(), self.look);
-                let spawned = std::thread::Builder::new()
-                    .name("samplez-lookup".into())
-                    .spawn(move || {
-                        let _ = tx.send(look(&dir));
-                    });
-                if spawned.is_err() {
-                    return Some(false);
-                }
-                rx
-            }
-        };
-        #[allow(clippy::disallowed_methods, reason = "supervisor side")]
-        let answer = running.recv_timeout(LOOKUP_WAIT);
-        match answer {
-            Ok(found) => Some(found),
-            Err(RecvTimeoutError::Timeout) => {
-                self.running = Some(running);
-                None
-            }
-            Err(RecvTimeoutError::Disconnected) => Some(false),
-        }
-    }
-}
-
-fn exists(dir: &Path) -> bool {
-    dir.symlink_metadata().is_ok()
-}
-
 /// Supervisor side. The poll reader of one flow that one or more pruned
 /// slots read, on the supervisor's poll instance: one libmxl reader
 /// reference per holding slot, all to the reader libmxl shares per flow
-/// id. A flow with no reader open is opened only once a [`Lookup`] found
-/// its directory, so a missing flow never blocks the supervisor in
-/// libmxl's own lookup of it.
+/// id. libmxl is called for the flow only once a [`Lookup`] found its
+/// directory, and no call waits for a lookup: a missing flow is looked up
+/// on a thread of its own, at the pace of its [`Backoff`], and a flow
+/// whose head stopped is checked the same way before libmxl's validity
+/// check, which looks up the flow's data file.
 pub struct PolledFlow {
     instance: Arc<Instance>,
     flow_id: String,
@@ -888,11 +827,14 @@ pub struct PolledFlow {
     /// Empty, or one reference per holder.
     readers: Vec<FlowReader>,
     lookup: Lookup,
+    backoff: Backoff,
+    /// The head the last poll read.
+    head: Option<u64>,
 }
 
 impl PolledFlow {
-    /// A poll reader with one holder. A flow that does not exist yet is
-    /// opened by a later [`poll`](Self::poll).
+    /// A poll reader with one holder, wanted from now: its first lookup is
+    /// started, and a later [`poll`](Self::poll) opens the flow once found.
     pub fn new(instance: &Arc<Instance>, flow_id: &str) -> Result<PolledFlow> {
         PolledFlow::looking_up_with(instance, flow_id, exists)
     }
@@ -902,19 +844,21 @@ impl PolledFlow {
     pub fn looking_up_with(
         instance: &Arc<Instance>,
         flow_id: &str,
-        look: fn(&Path) -> bool,
+        look: Look,
     ) -> Result<PolledFlow> {
         crate::validate_id(flow_id)?;
-        let mut p = PolledFlow {
+        let now = Instant::now();
+        let mut lookup = Lookup::new(flow_dir(instance.domain(), flow_id), look);
+        lookup.start();
+        Ok(PolledFlow {
             instance: Arc::clone(instance),
             flow_id: flow_id.to_owned(),
             holders: 1,
             readers: Vec::new(),
-            lookup: Lookup::new(instance.domain(), flow_id, look),
-        };
-        // An absent flow is retried by poll.
-        let _ = p.open_found();
-        Ok(p)
+            lookup,
+            backoff: Backoff::new(now),
+            head: None,
+        })
     }
 
     pub fn flow_id(&self) -> &str {
@@ -933,6 +877,21 @@ impl PolledFlow {
         }
     }
 
+    /// The flow is wanted anew, as by a re-route or raise of a slot that
+    /// reads it: a missing flow is looked up without a gap again.
+    pub fn want(&mut self) {
+        self.want_at(Instant::now());
+    }
+
+    /// [`PolledFlow::want`] at `now`.
+    #[doc(hidden)]
+    pub fn want_at(&mut self, now: Instant) {
+        self.backoff = Backoff::new(now);
+        if self.readers.is_empty() {
+            self.lookup.start();
+        }
+    }
+
     /// Removes a holder and releases its reference. Returns the holders
     /// left; at 0 the poll reader is to be dropped.
     pub fn release(&mut self) -> usize {
@@ -947,15 +906,8 @@ impl PolledFlow {
         Some(u64::from(info.common.maxCommitBatchSizeHint))
     }
 
-    /// Opens one reference per holder once the lookup found the flow's
-    /// directory. A flow not found reads as libmxl reads a missing one.
-    fn open_found(&mut self) -> Result<()> {
-        if self.lookup.found() != Some(true) {
-            return Err(Error::Mxl {
-                call: "mxlCreateFlowReader",
-                status: MXL_ERR_FLOW_NOT_FOUND,
-            });
-        }
+    /// Opens one reference per holder; the lookup found the flow.
+    fn open(&mut self) -> Result<()> {
         while self.readers.len() < self.holders {
             match FlowReader::open(&self.instance, &self.flow_id) {
                 Ok(r) => self.readers.push(r),
@@ -968,20 +920,43 @@ impl PolledFlow {
         Ok(())
     }
 
-    /// Reads the head and calls `mxlFlowReaderGetSamplesNonBlocking(head +
-    /// 1, 1)`, which runs libmxl's validity check. On
-    /// `MXL_ERR_FLOW_INVALID` every reference is released, so that libmxl
-    /// drops its reader object, and new ones are opened, so that a flow
-    /// recreated under the same id is found (upstream mxl-gst sink,
-    /// `handleInvalidFlow`).
+    /// The flow's head, opening the flow once a lookup found it.
+    /// `Absent` until then, with the status libmxl gives a missing flow.
+    ///
+    /// While the head moves, nothing else is checked. A head unchanged
+    /// since the last poll is checked with
+    /// `mxlFlowReaderGetSamplesNonBlocking(head + 1, 1)`, which runs
+    /// libmxl's validity check, once a lookup found the flow's directory
+    /// still there; until it answers the head is reported unchecked. On
+    /// `MXL_ERR_FLOW_INVALID`, or a directory gone, every reference is
+    /// released, so that libmxl drops its reader object, and the flow is
+    /// looked up anew, so that a flow recreated under the same id is found
+    /// (upstream mxl-gst sink, `handleInvalidFlow`).
     pub fn poll(&mut self) -> Poll {
-        if self.readers.is_empty()
-            && let Err(e) = self.open_found()
-        {
-            return Poll::Absent(e);
+        self.poll_at(Instant::now())
+    }
+
+    /// [`PolledFlow::poll`] at `now`, the time the backoff reads.
+    #[doc(hidden)]
+    pub fn poll_at(&mut self, now: Instant) -> Poll {
+        if self.readers.is_empty() {
+            match self.lookup.answer() {
+                Some(true) => {
+                    if let Err(e) = self.open() {
+                        self.backoff.missing(now);
+                        self.restart(now);
+                        return Poll::Absent(e);
+                    }
+                }
+                Some(false) => {
+                    self.backoff.missing(now);
+                    return self.missing(now);
+                }
+                None => return self.missing(now),
+            }
+            self.head = None;
         }
-        let reader = &self.readers[0];
-        let head = match reader.head() {
+        let head = match self.readers[0].head() {
             Ok(head) => head,
             Err(status) => {
                 return Poll::Absent(Error::Mxl {
@@ -990,12 +965,44 @@ impl PolledFlow {
                 });
             }
         };
-        if reader.probe(head) == MXL_ERR_FLOW_INVALID {
+        let moved = self.head != Some(head);
+        self.head = Some(head);
+        if moved {
+            // Not a check pending from an earlier stop.
+            let _ = self.lookup.answer();
+            return Poll::Head(head);
+        }
+        let valid = match self.lookup.answer() {
+            Some(true) => self.readers[0].probe(head) != MXL_ERR_FLOW_INVALID,
+            Some(false) => false,
+            None => {
+                self.lookup.start();
+                return Poll::Head(head);
+            }
+        };
+        if !valid {
             self.readers.clear();
-            let _ = self.open_found();
+            self.head = None;
+            self.backoff = Backoff::new(now);
+            self.lookup.start();
             return Poll::Invalid;
         }
         Poll::Head(head)
+    }
+
+    /// No reader open: starts a lookup when one is due.
+    fn missing(&mut self, now: Instant) -> Poll {
+        self.restart(now);
+        Poll::Absent(Error::Mxl {
+            call: "mxlCreateFlowReader",
+            status: MXL_ERR_FLOW_NOT_FOUND,
+        })
+    }
+
+    fn restart(&mut self, now: Instant) {
+        if !self.lookup.running() && self.backoff.due(now) {
+            self.lookup.start();
+        }
     }
 }
 

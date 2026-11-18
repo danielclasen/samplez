@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub mod input;
+pub mod lookup;
 pub mod output;
 pub mod rtsan;
 pub mod time;

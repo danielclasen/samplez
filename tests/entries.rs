@@ -340,6 +340,42 @@ fn generation_needing_entries_are_built_one_at_a_time() {
     common::stop(e);
 }
 
+/// A generation build that leaves a slot out, its flow not found, is not
+/// timed: buildLead comes from the 99.99th percentile of the build times,
+/// which is the longest one until 10000 builds were timed, so a build that
+/// waited for a missing flow would stamp every later entry that much
+/// further ahead. A build that attaches every slot is timed.
+#[test]
+fn a_build_that_leaves_a_missing_flow_out_is_not_timed() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let (e, rx, _reports) = start_replicated(config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&out, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    ));
+    running(&e);
+    let generation = || e.status().generation;
+    let builds = generation().builds;
+    let built = |flow_id: String| {
+        let at = (now(&rx) + 2000) * B;
+        e.append(1, at, Entry::Route { slot: 0, flow_id }).unwrap();
+        wait_for(5 * SECOND, "the generation built", || generation().ready);
+        let g = generation();
+        e.truncate(1);
+        wait_for(5 * SECOND, "the entry dropped", || {
+            generation().pending.is_none()
+        });
+        g.builds
+    };
+    assert_eq!(built(new_id()), builds, "a missing flow");
+    assert_eq!(built(src.clone()), builds + 1, "a flow that is there");
+    common::stop(e);
+}
+
 /// A re-route to a flow that is not there crossfades the old flow to
 /// silence from the entry's index; the input is reported pruned, and once
 /// the flow appears it is reported readable and an `InputUp` fades it in.

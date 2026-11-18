@@ -3,9 +3,12 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use common::{B, Domain, RawWriter, TIMING, api, expected, input, new_id, poll_found, sample};
+use common::{
+    B, Domain, RawWriter, TIMING, api, expected, input, new_id, poll_checked, poll_found, sample,
+};
 use mxl_sys::{
     MXL_ERR_FLOW_INVALID, MXL_ERR_FLOW_NOT_FOUND, MXL_ERR_INVALID_ARG,
     MXL_ERR_OUT_OF_RANGE_TOO_EARLY,
@@ -586,7 +589,7 @@ fn a_poll_reader_follows_a_replaced_flow_for_every_holder() {
     drop(w);
     let mut w = RawWriter::create(&api, &domain.0, &id, 1);
     w.blocks(K0 + 7..K0 + 8);
-    assert!(matches!(p.poll(), Poll::Invalid));
+    assert!(matches!(poll_checked(&mut p), Poll::Invalid));
     assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 8) * B));
     w.blocks(K0 + 8..K0 + 9);
     assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 9) * B));
@@ -595,18 +598,35 @@ fn a_poll_reader_follows_a_replaced_flow_for_every_holder() {
     assert!(matches!(p.poll(), Poll::Head(_)));
 }
 
-/// A lookup of a missing flow that waits, as one on a domain that waits
-/// for a name to appear does, holds up no poll: the supervisor polls every
-/// pruned input on one thread, which also drains the meters and the status
-/// changes, so a poll that waited for it would stall them all. The poll
-/// reads the flow absent at once and opens it once a lookup finds it.
-#[test]
-fn a_poll_does_not_wait_for_the_lookup_of_a_missing_flow() {
-    const WAIT: Duration = Duration::from_millis(500);
-    fn waiting(dir: &std::path::Path) -> bool {
-        std::thread::sleep(WAIT);
-        dir.exists()
+/// How long the lookups of the poll tests below wait: as a file system
+/// does that waits for a missing name to appear, up to a timeout.
+const WAIT: Duration = Duration::from_millis(500);
+
+/// A lookup that waits [`WAIT`] whatever it finds.
+fn waiting(dir: &std::path::Path) -> bool {
+    std::thread::sleep(WAIT);
+    dir.exists()
+}
+
+/// A lookup that waits for the directory to appear, [`WAIT`] at most.
+fn waiting_for(dir: &std::path::Path) -> bool {
+    let until = Instant::now() + WAIT;
+    while Instant::now() < until {
+        if dir.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
+    false
+}
+
+/// A lookup that waits holds up no poll: the supervisor polls every
+/// pruned input on one thread, which also drains the meters and the status
+/// changes, so a poll that waited would stall them all. libmxl is not
+/// called for the flow until the lookup found it, though the flow is there
+/// meanwhile: libmxl's own open would wait as the lookup does.
+#[test]
+fn a_poll_opens_a_flow_only_once_its_lookup_found_it() {
     let api = api();
     let domain = Domain::new();
     let id = new_id();
@@ -614,26 +634,139 @@ fn a_poll_does_not_wait_for_the_lookup_of_a_missing_flow() {
 
     let started = Instant::now();
     let mut p = PolledFlow::looking_up_with(&poll, &id, waiting).unwrap();
+    let mut w = RawWriter::create(&api, &domain.0, &id, 1);
+    w.blocks(K0..K0 + 5);
     for _ in 0..10 {
         assert!(matches!(p.poll(), Poll::Absent(_)));
     }
     let polled = started.elapsed();
     assert!(polled < WAIT / 2, "a creation and 10 polls took {polled:?}");
 
-    // The lookup that runs finds the flow created meanwhile.
+    std::thread::sleep(WAIT);
+    assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 5) * B));
+}
+
+/// A poll round over many missing flows whose lookups wait costs the
+/// supervisor no wait at all: each poll reads its lookup's answer only
+/// when there is one.
+#[test]
+fn a_poll_round_over_many_missing_flows_does_not_wait() {
+    let api = api();
+    let domain = Domain::new();
+    let poll = Instance::new(&api, &domain.0).unwrap();
+    let mut flows: Vec<PolledFlow> = (0..50)
+        .map(|_| PolledFlow::looking_up_with(&poll, &new_id(), waiting).unwrap())
+        .collect();
+    for _ in 0..3 {
+        let started = Instant::now();
+        for p in &mut flows {
+            assert!(matches!(p.poll(), Poll::Absent(_)));
+        }
+        let round = started.elapsed();
+        assert!(
+            round < Duration::from_millis(10),
+            "a round of 50 took {round:?}"
+        );
+    }
+}
+
+/// A flow wanted anew is looked up all the time, so it is opened by the
+/// first poll after it appears, even when every lookup made before it
+/// appeared waited and gave up.
+#[test]
+fn a_wanted_flow_is_opened_by_the_poll_after_it_appears() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let poll = Instance::new(&api, &domain.0).unwrap();
+    let mut p = PolledFlow::looking_up_with(&poll, &id, waiting_for).unwrap();
+    // Two lookups give up meanwhile.
+    let until = Instant::now() + 2 * WAIT + WAIT / 3;
+    while Instant::now() < until {
+        assert!(matches!(p.poll(), Poll::Absent(_)));
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let mut w = RawWriter::create(&api, &domain.0, &id, 1);
     w.blocks(K0..K0 + 5);
-    let until = Instant::now() + 4 * WAIT;
-    let head = loop {
-        match p.poll() {
-            Poll::Head(h) => break h,
-            Poll::Absent(_) if Instant::now() < until => {
-                std::thread::sleep(Duration::from_millis(5))
-            }
-            other => panic!("{other:?}"),
+    let appeared = Instant::now();
+    // The lookup in flight sees it within a millisecond or so.
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 5) * B));
+    assert!(appeared.elapsed() < Duration::from_millis(100));
+}
+
+static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+
+/// A lookup of a missing flow that answers at once, counted.
+fn counted(_: &std::path::Path) -> bool {
+    LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// A flow missing for longer than the grace is looked up at the backoff's
+/// pace, one lookup every 5 s at most, and a flow wanted anew, as by a
+/// re-route, at every poll again. Polls are 100 ms apart on the clock the
+/// backoff reads.
+#[test]
+fn a_long_missing_flow_is_looked_up_at_the_backoff_pace() {
+    let api = api();
+    let domain = Domain::new();
+    let poll = Instance::new(&api, &domain.0).unwrap();
+    let t0 = Instant::now();
+    let mut p = PolledFlow::looking_up_with(&poll, &new_id(), counted).unwrap();
+    let lookups_until = |p: &mut PolledFlow, from: u64, to: u64| {
+        let before = LOOKUPS.load(Ordering::Relaxed);
+        for k in from..to {
+            assert!(matches!(
+                p.poll_at(t0 + Duration::from_millis(100 * k)),
+                Poll::Absent(_)
+            ));
+            // The answer is in before the next poll.
+            std::thread::sleep(Duration::from_millis(2));
         }
+        LOOKUPS.load(Ordering::Relaxed) - before
     };
-    assert_eq!(head, (K0 + 5) * B);
+    let eager = lookups_until(&mut p, 0, 100);
+    assert!(
+        (90..=101).contains(&eager),
+        "{eager} lookups in the first 10 s"
+    );
+    lookups_until(&mut p, 100, 300);
+    let slow = lookups_until(&mut p, 300, 600);
+    assert!((5..=7).contains(&slow), "{slow} lookups from 30 s to 60 s");
+
+    p.want_at(t0 + Duration::from_millis(60_000));
+    let wanted = lookups_until(&mut p, 600, 700);
+    assert!(
+        (90..=101).contains(&wanted),
+        "{wanted} lookups once wanted anew"
+    );
+}
+
+/// A flow deleted while its poll reader is open is checked with libmxl
+/// only once a lookup found its directory: until a lookup answers, the
+/// stopped head is reported unchecked, without waiting; once the lookup
+/// answers that the directory is gone, the poll reads it invalid.
+#[test]
+fn a_stopped_head_is_checked_only_after_a_lookup() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let poll = Instance::new(&api, &domain.0).unwrap();
+    let mut w = RawWriter::create(&api, &domain.0, &id, 1);
+    w.blocks(K0..K0 + 5);
+    let mut p = PolledFlow::looking_up_with(&poll, &id, waiting).unwrap();
+    std::thread::sleep(WAIT + WAIT / 5);
+    assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 5) * B));
+
+    drop(w);
+    let stopped = Instant::now();
+    for _ in 0..10 {
+        assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 5) * B));
+    }
+    assert!(stopped.elapsed() < WAIT / 2, "{:?}", stopped.elapsed());
+    std::thread::sleep(WAIT + WAIT / 5);
+    assert!(matches!(p.poll(), Poll::Invalid));
 }
 
 /// The prune limit of the recovery tests, 50 ms.
