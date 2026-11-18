@@ -615,11 +615,13 @@ fn two_inputs() {
         a.checked
     );
     // Every block not reported is an overrun skip. With SCHED_FIFO and
-    // locked memory a skip is an RT stall: it fails the scenario, named
-    // with the RT timing recorded around it.
+    // locked memory a skip is an RT stall: in an optimised build it fails
+    // the scenario, named with the RT timing recorded around it. An
+    // unoptimised build's block can take longer than its period, so its
+    // skips are listed rather than failed.
     let skipped = engine.counters().overrun_skipped_samples.load(Relaxed) - skipped;
     assert_eq!(a.skipped * B, skipped, "{:#?}", a.skips);
-    if std::env::var("SAMPLEZ_REQUIRE_RT").as_deref() == Ok("1") {
+    if std::env::var("SAMPLEZ_REQUIRE_RT").as_deref() == Ok("1") && !cfg!(debug_assertions) {
         assert!(a.skips.is_empty(), "overrun skips: {:#?}", a.skips);
     } else if !a.skips.is_empty() {
         println!("two_inputs: overrun skips: {:#?}", a.skips);
