@@ -503,9 +503,7 @@ mod tests {
         assert_eq!(facts(&[route, down, up]), (vec![1], 2, 2));
     }
 
-    /// Of a slot's `Route`s and `Detach`es in one log entry the last
-    /// counts: a `Detach` after a `Route` leaves the slot detached, a
-    /// `Route` after a `Detach` re-routes it, and either is one change.
+    /// An output's enable and disable in one log entry: the last counts.
     #[test]
     fn an_outputs_last_enable_or_disable_wins() {
         let set = |output, enabled| Change::Output { output, enabled };
@@ -534,6 +532,9 @@ mod tests {
         assert!(!unordered.sane());
     }
 
+    /// Of a slot's `Route`s and `Detach`es in one log entry the last
+    /// counts: a `Detach` after a `Route` leaves the slot detached, a
+    /// `Route` after a `Detach` re-routes it, and either is one change.
     #[test]
     fn a_slots_route_and_detach_fold_last_wins() {
         let (route, detach) = (Change::Route { slot: 1 }, Change::Detach { slot: 1 });

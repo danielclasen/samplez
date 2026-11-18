@@ -3057,6 +3057,13 @@ enum SupState {
     Detached,
 }
 
+/// The outgoing flow a detach of a slot in `state` keeps read until its
+/// crossfade to silence ends at `end`. A pruned slot is read by nothing,
+/// so no reader is attached for its flow.
+fn detach_routing(state: &SupState, end: u64, flow: &str) -> Option<(u64, String)> {
+    (!matches!(state, SupState::Pruned { .. })).then(|| (end, flow.to_owned()))
+}
+
 struct SupSlot {
     state: SupState,
     window: VecDeque<SlotStats>,
@@ -3925,14 +3932,13 @@ impl Supervisor {
             let detached = matches!(self.slots[slot].state, SupState::Detached);
             let Some(flow) = flow else {
                 if !detached {
-                    // Its poll reader is released and its flow read
-                    // until the crossfade to silence ends.
+                    let end = j.at_index + self.ramp;
                     self.release_poll(slot);
                     let s = &mut self.slots[slot];
+                    s.routing = detach_routing(&s.state, end, &s.flow);
                     s.state = SupState::Detached;
                     s.reported = false;
                     s.prune_unsent = false;
-                    s.routing = Some((j.at_index + self.ramp, s.flow.clone()));
                     self.status().inputs[slot].state = InputState::Detached;
                 }
                 continue;
@@ -4428,6 +4434,20 @@ mod tests {
         assert_eq!(history_kept(&started, k0, slack), Ok(()));
         started.begin(k0 + slack);
         assert_eq!(history_kept(&started, k0, slack), Err(k0 + slack));
+    }
+
+    /// Detaching a pruned slot leaves no outgoing flow: its flow is not
+    /// readable, so a reader attached for the crossfade would only fail.
+    #[test]
+    fn detaching_a_pruned_slot_keeps_no_outgoing_flow() {
+        let pruned = SupState::Pruned {
+            recovery: Recovery::default(),
+            held: false,
+        };
+        assert_eq!(detach_routing(&pruned, 9, "f"), None);
+        for state in [SupState::Attached, SupState::Wanted] {
+            assert_eq!(detach_routing(&state, 9, "f"), Some((9, "f".to_owned())));
+        }
     }
 
     #[test]
