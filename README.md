@@ -437,6 +437,17 @@ outside the engine.
 
 ### Starting a replica
 
+A replica that joins a set is a learner until the leader promotes it,
+and a learner reads not ready (`/readyz`): it commits nothing. The
+voter count stays odd, so a set starting from its first voter promotes
+no lone learner and grows by two, and its StatefulSet needs
+`podManagementPolicy: Parallel`: under `OrderedReady` the second
+ordinal waits for promotion, never reads ready, and the third is never
+created. Replicas reach each
+other through a headless Service that publishes not-ready addresses
+(`publishNotReadyAddresses: true`), so a replica that reads not ready
+still takes part in the log, contact and resync.
+
 `Engine::drop_core` drops the RT thread's core while the replica starts:
 the RT thread keeps its writers, flows, hold rings and statuses,
 computes no block and withholds each one, overrun skips included, cause
@@ -576,8 +587,12 @@ snapshot it loaded, fails the attempt, which is retried on a newer core.
 A client command that would re-route an input (`Product::reroutes`) is
 ordered alone on the generation path, stamped the lead and the longest
 build time a counted replica reports past its stamp, since its
-generation is built once it applies; one asking for an index beyond the
-earliest is refused. Such a product owns every input's flow:
+generation is built once it applies, but at most `AHEAD_MAX` (one
+second) past its stamp: an entry further ahead would take effect at its
+stamp. A build longer than that leaves the entry applied on time and
+the slots it raises or re-routes silent until the generation is swapped
+in (`generation_late`). One asking for an index beyond the earliest is
+refused. Such a product owns every input's flow:
 `Replica::append` refuses a `Route` or `MasterEnable` for it.
 
 A replica's store builds its empty product with the `Factory` it is

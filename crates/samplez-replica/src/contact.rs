@@ -4210,8 +4210,8 @@ mod tests {
     /// ready by "nobody else commits"; one withdrawn before the set's
     /// first `Baseline` is, so the first replica of a set becomes ready,
     /// and one withdrawn after it or in `version_mismatch` is not. A sole
-    /// voter always serves, a learner beside it never, and one without
-    /// outputs as before.
+    /// voter always serves, a learner never, and one without outputs as
+    /// before.
     #[tokio::test(start_paused = true)]
     async fn a_replica_writing_nothing_is_not_serving_though_nobody_commits() {
         let f = fixture(&[&[1]]);
@@ -4224,6 +4224,19 @@ mod tests {
         f.tick();
         f.tick();
         assert!(!f.contact.serving(), "a learner beside a sole voter");
+        // A learner of a set of three where no voter commits: in contact,
+        // it would read ready by "nobody else commits".
+        let f = fixture(&[&[2, 3, 4]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        for _ in 0..3 {
+            for v in [2, 3, 4] {
+                f.contact.receive(f.report(v, None));
+            }
+            f.tick();
+        }
+        assert!(f.contact.metrics().in_contact);
+        assert!(!f.contact.serving(), "a learner, nobody commits");
         let f = fixture(&[&[1, 2, 3]]);
         f.tick();
         for _ in 0..3 {
