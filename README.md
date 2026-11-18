@@ -254,10 +254,15 @@ A replica set agrees on its cluster id through the marker ConfigMap that
 ordinal 0 creates on an empty volume (`bootstrap::Kube`). Given the audio
 StatefulSet's name, the one `rollout::follow` reads, with
 `Kube::owned_by`, the marker carries an owner reference to that
-StatefulSet and lives as long as it: Kubernetes deletes it with the
-StatefulSet. Reading the StatefulSet's uid takes the same `get` on
-`statefulsets` the rollout's target revision does. Without a name the
-marker has no owner and outlives the StatefulSet.
+StatefulSet, and the garbage collector deletes it after the StatefulSet,
+in the background; `--cascade=orphan` keeps it. Reading the
+StatefulSet's uid takes the same `get` on `statefulsets` the rollout's
+target revision does. Without a name the marker has no owner. The leader
+of a running set recreates a missing marker under the set's cluster id,
+so a StatefulSet created again on kept volumes goes on as the same set.
+With no set running, an empty volume waits for a marker; one created by
+hand with `data.cluster` from a member volume's `cluster` file and
+`data.volume` 0 lets it join.
 
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
 against CLOCK_MONOTONIC at each wake, when it also samples the kernel

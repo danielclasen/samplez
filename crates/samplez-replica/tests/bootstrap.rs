@@ -775,9 +775,10 @@ async fn joiners_follow_a_replaced_marker_and_a_stale_cluster_is_refused() {
 }
 
 /// With the marker gone while the set runs, ordinal 0 on an empty volume
-/// does not start a second set: the other replicas answer as members.
+/// does not start a second set: the set's leader recreates the marker
+/// under the set's cluster id, and ordinal 0 joins the running set.
 #[tokio::test]
-async fn ordinal_0_does_not_start_a_second_set_beside_a_running_one() {
+async fn ordinal_0_joins_the_running_set_after_its_marker_is_gone() {
     let mut set = Set::new(Voters::new(3, false).unwrap()).await;
     set.start_all().await;
     set.settled().await;
@@ -786,23 +787,46 @@ async fn ordinal_0_does_not_start_a_second_set_beside_a_running_one() {
     set.crash(Slot::Audio(0)).await;
     std::fs::remove_dir_all(set.dir(Slot::Audio(0))).unwrap();
     let node = set.start(Slot::Audio(0)).await;
-    let replica = node.replica.clone();
     set.nodes.insert(Slot::Audio(0), node);
-    assert!(
-        until(PERIOD * 4, || replica.status().is_some_and(
-            |status| status.contains("not starting a second one")
-        ))
-        .await,
-        "{:?}",
-        replica.status()
-    );
-    assert_eq!(set.api.marker(), None, "no marker created");
-    assert!(!replica.raft().is_initialized().await.unwrap());
-    for slot in [Slot::Audio(1), Slot::Audio(2)] {
-        assert_eq!(set.replica(slot).epoch(), epoch);
+    set.settled().await;
+    assert_eq!(set.epochs(), BTreeSet::from([epoch]), "one history");
+    assert_eq!(set.api.marker().map(|m| m.0), Some(epoch));
+    let revision = set.write(Slot::Audio(0), "1", "gain=1@1").await;
+    assert!(revision > 0, "the set commits");
+}
+
+/// A StatefulSet deleted with its marker and created again on the volumes
+/// it kept resumes the set from them, and its leader recreates the marker
+/// under the set's cluster id: a replica that then loses its volume joins
+/// the set again rather than waiting for a marker nothing creates.
+#[tokio::test]
+async fn a_set_resumed_from_kept_volumes_recreates_its_marker() {
+    let mut set = Set::new(Voters::new(3, false).unwrap()).await;
+    set.start_all().await;
+    set.settled().await;
+    let epoch = set.replica(Slot::Audio(1)).epoch();
+    let slots: Vec<Slot> = set.nodes.keys().copied().collect();
+    for &slot in &slots {
+        set.crash(slot).await;
     }
-    let revision = set.write(Slot::Audio(1), "1", "gain=1@1").await;
-    assert!(revision > 0, "the running set still commits");
+    set.api.delete();
+    set.start_all().await;
+    set.settled().await;
+    assert!(
+        until(PERIOD * 10, || set
+            .api
+            .marker()
+            .is_some_and(|m| m.0 == epoch))
+        .await,
+        "marker {:?}",
+        set.api.marker()
+    );
+    set.crash(Slot::Audio(2)).await;
+    std::fs::remove_dir_all(set.dir(Slot::Audio(2))).unwrap();
+    let node = set.start(Slot::Audio(2)).await;
+    set.nodes.insert(Slot::Audio(2), node);
+    set.settled().await;
+    assert_eq!(set.epochs(), BTreeSet::from([epoch]), "one history");
 }
 
 /// A set scaled from three audio replicas to one and back, with the

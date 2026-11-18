@@ -14,12 +14,20 @@
 //! volume, so a restart, a snapshot install and a resync keep it.
 //!
 //! Created by a [`Kube`] given the audio StatefulSet ([`Kube::owned_by`]),
-//! the marker names that StatefulSet as its owner and lives as long as
-//! it: Kubernetes deletes it with the StatefulSet, and a StatefulSet
-//! created again under the same name on empty volumes starts a new set
-//! with a new cluster id. Volumes kept past the StatefulSet outlive the
-//! marker; an empty volume beside them waits for a marker that only
-//! ordinal 0 on an empty volume creates.
+//! the marker carries an owner reference to that StatefulSet, and
+//! Kubernetes' garbage collector deletes it after the StatefulSet. That
+//! happens in the background: a StatefulSet created again at once can
+//! read the old marker first, its empty volumes joining the old cluster id
+//! until the marker is gone and ordinal 0 creates a new one. A deletion
+//! with `--cascade=orphan` removes the owner reference and keeps the
+//! marker.
+//!
+//! The leader of a running set recreates a marker it finds missing, under
+//! the set's cluster id (`membership`), so a StatefulSet created again on
+//! the volumes it kept goes on as the same set. With no set running, an
+//! empty volume other than ordinal 0's waits for a marker; one created by
+//! hand with `data.cluster` from a member volume's `cluster` file and
+//! `data.volume` 0 lets it join.
 
 use std::fs;
 use std::io::{self, Write};
@@ -288,8 +296,8 @@ impl Kube {
     }
 
     /// Creates the marker owned by the StatefulSet `statefulset` in its
-    /// namespace, the one [`crate::rollout::follow`] reads, so Kubernetes
-    /// deletes the marker with it. Its uid is read with a GET on the
+    /// namespace, the one [`crate::rollout::follow`] reads, so Kubernetes'
+    /// garbage collector deletes the marker after it. Its uid is read with a GET on the
     /// StatefulSet at the create; the reference is no controller and does
     /// not block the StatefulSet's deletion.
     pub fn owned_by(mut self, statefulset: String) -> Kube {
