@@ -577,10 +577,12 @@ enum Rebuild {
     /// after it started.
     Running {
         n: u64,
-        job: std::thread::JoinHandle<bool>,
+        done: std::sync::mpsc::Receiver<bool>,
         stale: bool,
     },
-    /// Installed, given the entries still unresolved; not yet taken.
+    /// Installed, given the entries still unresolved; not yet taken. A
+    /// retarget's is kept while the replica stays in `version_mismatch`:
+    /// its next retarget takes it.
     Done,
 }
 
@@ -1657,19 +1659,26 @@ impl Contact {
         }
         let (n, floor, state) = self.log.product_state();
         let audio = Arc::clone(audio);
-        let job = std::thread::Builder::new()
+        // Dropped unsent, by a panic or a thread never started: failed.
+        let (sent, done) = std::sync::mpsc::sync_channel(1);
+        let run = move || {
+            let _ = sent.send(audio.rebuild_engine(&state, floor));
+        };
+        // A blocking task in a runtime: a paused clock holds still while
+        // it runs, as it did while the tick waited.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn_blocking(run);
+        } else if let Err(e) = std::thread::Builder::new()
             .name("rebuild".into())
-            .spawn(move || audio.rebuild_engine(&state, floor));
-        match job {
-            Ok(job) => {
-                st.rebuild = Rebuild::Running {
-                    n,
-                    job,
-                    stale: false,
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "no thread for an engine rebuild: retried"),
+            .spawn(run)
+        {
+            tracing::warn!(error = %e, "no thread for an engine rebuild: retried");
         }
+        st.rebuild = Rebuild::Running {
+            n,
+            done,
+            stale: false,
+        };
         false
     }
 
@@ -1677,18 +1686,18 @@ impl Contact {
     /// unresolved entry: it is given those still held. A stale one's core
     /// is dropped again; a failed one is retried.
     fn rebuild_ended(&self, st: &mut State, audio: &dyn Audio) {
-        let Rebuild::Running { job, .. } = &st.rebuild else {
+        let Rebuild::Running { done, .. } = &st.rebuild else {
             return;
         };
-        if !job.is_finished() {
-            return;
-        }
-        let Rebuild::Running { n, job, stale } = std::mem::replace(&mut st.rebuild, Rebuild::Idle)
+        let ok = match done.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            ended => ended.unwrap_or(false),
+        };
+        let Rebuild::Running { n, stale, .. } = std::mem::replace(&mut st.rebuild, Rebuild::Idle)
         else {
             return;
         };
-        // One that panicked failed.
-        if !job.join().unwrap_or(false) {
+        if !ok {
             return;
         }
         if stale {
@@ -1702,9 +1711,19 @@ impl Contact {
         st.rebuild = Rebuild::Done;
     }
 
+    /// Takes the result of a rebuild under way once it ended.
     #[cfg(test)]
     fn await_rebuild(&self) {
-        while matches!(&self.lock().rebuild, Rebuild::Running { job, .. } if !job.is_finished()) {
+        let Some(audio) = self.audio.clone() else {
+            return;
+        };
+        loop {
+            let mut st = self.lock();
+            self.rebuild_ended(&mut st, audio.as_ref());
+            if !matches!(st.rebuild, Rebuild::Running { .. }) {
+                return;
+            }
+            drop(st);
             std::thread::yield_now();
         }
     }
@@ -2148,10 +2167,11 @@ impl Contact {
         if retarget_asked.get() {
             self.rebuild(st, audio);
         }
-        // Done for a replica that no longer wants it: dropped again.
-        if matches!(st.rebuild, Rebuild::Done) {
+        // Done for a replica no longer in `version_mismatch`, which no
+        // retarget takes: the replica left it another way, and its engine
+        // goes on from there.
+        if matches!(st.rebuild, Rebuild::Done) && state != ReplicaState::VersionMismatch {
             st.rebuild = Rebuild::Idle;
-            audio.drop_engine();
         }
         if state == ReplicaState::Committing {
             st.resync.committing();
@@ -2873,7 +2893,9 @@ impl Contact {
         let mut st = self.lock();
         let st = &mut *st;
         let diverged = st.life.as_ref()?.state() == ReplicaState::Diverged;
-        if !diverged || st.own.clock.unverified || st.judged.contains(&self.id) {
+        // A rebuild under way would install its core over the resync's.
+        let rebuilding = matches!(st.rebuild, Rebuild::Running { .. });
+        if !diverged || rebuilding || st.own.clock.unverified || st.judged.contains(&self.id) {
             return None;
         }
         let fresh = self.timing.contact_window + self.timing.hold;
