@@ -11,7 +11,7 @@
 
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub mod input;
@@ -137,6 +137,7 @@ pub fn load(path: &Path) -> Result<Arc<MxlApi>> {
 pub struct Instance {
     api: Arc<MxlApi>,
     raw: mxl_sys::Instance,
+    domain: PathBuf,
     /// Serialises reader and group creation and release on this instance.
     lock: Mutex<()>,
 }
@@ -173,8 +174,14 @@ impl Instance {
         Ok(Arc::new(Instance {
             api: Arc::clone(api),
             raw,
+            domain: domain.to_owned(),
             lock: Mutex::new(()),
         }))
+    }
+
+    /// The domain directory the instance was created on.
+    pub fn domain(&self) -> &Path {
+        &self.domain
     }
 
     /// Held around reader and group creation and release.

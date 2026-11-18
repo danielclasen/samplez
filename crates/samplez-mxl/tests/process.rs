@@ -10,7 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use common::{B, Domain, RawReader, RawWriter, api, new_id, sample};
+use common::{B, Domain, RawReader, RawWriter, api, new_id, poll_found, sample};
 use samplez_mxl::Instance;
 use samplez_mxl::input::{Poll, PolledFlow};
 use samplez_mxl::output::{self, Creation, OutputConfig, Write};
@@ -97,7 +97,7 @@ fn poller_recreates_its_reader_after_the_flow_is_replaced() {
     let poll = Instance::new(&api, &domain.0).unwrap();
     let mut p = PolledFlow::new(&poll, &id).unwrap();
     let head = (K0 + BLOCKS) * B;
-    assert!(matches!(p.poll(), Poll::Head(h) if h == head));
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == head));
 
     kill(child);
     // A dead writer leaves a valid flow whose head stays.
@@ -113,7 +113,7 @@ fn poller_recreates_its_reader_after_the_flow_is_replaced() {
     w.blocks(K0 + BLOCKS..K0 + BLOCKS + 5);
 
     assert!(matches!(p.poll(), Poll::Invalid));
-    assert!(matches!(p.poll(), Poll::Head(h) if h == head + 5 * B));
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == head + 5 * B));
     w.blocks(K0 + BLOCKS + 5..K0 + BLOCKS + 6);
     assert!(matches!(p.poll(), Poll::Head(h) if h == head + 6 * B));
 }

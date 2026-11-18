@@ -15,10 +15,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use samplez_mxl::input::{InputConfig, Timing};
+use samplez_mxl::input::{InputConfig, Poll, PolledFlow, Timing};
 use samplez_mxl::{Instance, MxlApi, Status};
 
 pub const B: u64 = 48;
+
+/// Polls `p` again while it reads the flow absent, for one second at most:
+/// the lookup of a flow's directory runs on a thread of its own, which a
+/// loaded machine may start later than a poll waits for it.
+pub fn poll_found(p: &mut PolledFlow) -> Poll {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match p.poll() {
+            Poll::Absent(_) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            polled => return polled,
+        }
+    }
+}
 
 pub const TIMING: Timing = Timing {
     block: B,

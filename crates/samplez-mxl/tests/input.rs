@@ -5,7 +5,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{B, Domain, RawWriter, TIMING, api, expected, input, new_id, sample};
+use common::{B, Domain, RawWriter, TIMING, api, expected, input, new_id, poll_found, sample};
 use mxl_sys::{
     MXL_ERR_FLOW_INVALID, MXL_ERR_FLOW_NOT_FOUND, MXL_ERR_INVALID_ARG,
     MXL_ERR_OUT_OF_RANGE_TOO_EARLY,
@@ -579,7 +579,7 @@ fn a_poll_reader_follows_a_replaced_flow_for_every_holder() {
 
     let mut w = RawWriter::create(&api, &domain.0, &id, 1);
     w.blocks(K0..K0 + 5);
-    assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 5) * B));
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 5) * B));
 
     // Both holders' references are released, else libmxl would hand the
     // stale reader out again and every poll would report it invalid.
@@ -587,12 +587,53 @@ fn a_poll_reader_follows_a_replaced_flow_for_every_holder() {
     let mut w = RawWriter::create(&api, &domain.0, &id, 1);
     w.blocks(K0 + 7..K0 + 8);
     assert!(matches!(p.poll(), Poll::Invalid));
-    assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 8) * B));
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 8) * B));
     w.blocks(K0 + 8..K0 + 9);
     assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 9) * B));
 
     assert_eq!(p.release(), 1);
     assert!(matches!(p.poll(), Poll::Head(_)));
+}
+
+/// A lookup of a missing flow that waits, as one on a domain that waits
+/// for a name to appear does, holds up no poll: the supervisor polls every
+/// pruned input on one thread, which also drains the meters and the status
+/// changes, so a poll that waited for it would stall them all. The poll
+/// reads the flow absent at once and opens it once a lookup finds it.
+#[test]
+fn a_poll_does_not_wait_for_the_lookup_of_a_missing_flow() {
+    const WAIT: Duration = Duration::from_millis(500);
+    fn waiting(dir: &std::path::Path) -> bool {
+        std::thread::sleep(WAIT);
+        dir.exists()
+    }
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let poll = Instance::new(&api, &domain.0).unwrap();
+
+    let started = Instant::now();
+    let mut p = PolledFlow::looking_up_with(&poll, &id, waiting).unwrap();
+    for _ in 0..10 {
+        assert!(matches!(p.poll(), Poll::Absent(_)));
+    }
+    let polled = started.elapsed();
+    assert!(polled < WAIT / 2, "a creation and 10 polls took {polled:?}");
+
+    // The lookup that runs finds the flow created meanwhile.
+    let mut w = RawWriter::create(&api, &domain.0, &id, 1);
+    w.blocks(K0..K0 + 5);
+    let until = Instant::now() + 4 * WAIT;
+    let head = loop {
+        match p.poll() {
+            Poll::Head(h) => break h,
+            Poll::Absent(_) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(head, (K0 + 5) * B);
 }
 
 /// The prune limit of the recovery tests, 50 ms.

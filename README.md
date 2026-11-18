@@ -681,6 +681,11 @@ neither swapping nor compaction moves the locked pages of the RT
 thread. MXL domains belong on tmpfs: on a disk-backed file system a
 commit into an output's shared mapping can wait for the page's
 writeback, and the loop then skips blocks.
+A pruned input's poll reader opens its flow only once a lookup of the
+flow's directory, on a thread of its own, found it, so a domain whose
+lookup of a missing name waits for the name to appear holds up that
+thread and not the supervisor, which drains the meter records and the
+status changes.
 
 
 ## NMOS
