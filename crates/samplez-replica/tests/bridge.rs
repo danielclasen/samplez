@@ -1138,6 +1138,8 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
         flows(&live),
         "the flows the live one reads"
     );
+    // A live replica keeps the previous gain of a cell it refuses; the
+    // product state holds no previous one, so the rebuild silences it.
     state.gains[1][0] = f32::INFINITY;
     state.last_id = 2;
     assert!(rebuilt_audio.rebuild_engine(&state, 0), "rebuilt again");
