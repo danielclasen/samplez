@@ -40,7 +40,9 @@ pub trait Product: Send + 'static {
     /// The engine targets of the current state: absolute, a function of
     /// the state and the configuration the product was built with alone,
     /// the same bits on every replica. None for a product that drives no
-    /// engine.
+    /// engine. Only a change [`Product::apply`] or [`Product::expire`]
+    /// reports may change them: the state machine derives nothing for
+    /// anything else, [`Product::forget`] included.
     fn targets(&self) -> Option<samplez::Targets> {
         None
     }
@@ -65,7 +67,10 @@ pub trait Product: Send + 'static {
     /// that ended the lifetime plus the dedup retention plus the failover
     /// bound ([`Limits`]), the longest a copy of one of its commands can
     /// apply after the original, unless the session came back meanwhile.
-    /// In apply order, so at the same point on every replica.
+    /// In apply order, so at the same point on every replica. Never
+    /// changes [`Product::targets`]: nothing derives from it, so a replica
+    /// that loads a snapshot after it would derive other entries than one
+    /// that applied the whole log.
     fn forget(&mut self, session: &SessionKey);
 
     /// The one delta clients get for one entry's changes, in the order
@@ -128,6 +133,10 @@ pub const AHEAD_MAX: u64 = 48_000;
 
 /// How long a derived record is kept past its index: a resync replays the
 /// records after a donor's core, copied after the block in progress.
+/// Records are bounded by time, not bytes: each holds the entries of one
+/// diff, up to every coefficient of the shape for one entry that changes
+/// them all, and those of every entry within this window and ahead of it
+/// stay held.
 pub const RECORDS_KEPT: u64 = 48_000;
 
 /// The engine entries one log entry derived, and where they apply.
