@@ -9,9 +9,10 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{
     B, Domain, MARGIN, Pilot, RAMP, config, diagonal, new_id, start_replicated, wait_for,
@@ -338,6 +339,134 @@ fn generation_needing_entries_are_built_one_at_a_time() {
     assert_eq!(generation().builds, builds + 2);
     assert_eq!(e.counters().generation_late.load(Relaxed), 0);
     common::stop(e);
+}
+
+/// A generation build that leaves a slot out, its flow not found, is not
+/// timed: buildLead comes from the 99.99th percentile of the build times,
+/// which is the longest one until 10000 builds were timed, so a build that
+/// waited for a missing flow would stamp every later entry that much
+/// further ahead. A build that attaches every slot is timed.
+#[test]
+fn a_build_that_leaves_a_missing_flow_out_is_not_timed() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let (e, rx, _reports) = start_replicated(config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&out, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    ));
+    running(&e);
+    let generation = || e.status().generation;
+    let builds = generation().builds;
+    let built = |flow_id: String| {
+        let at = (now(&rx) + 2000) * B;
+        e.append(1, at, Entry::Route { slot: 0, flow_id }).unwrap();
+        wait_for(5 * SECOND, "the generation built", || generation().ready);
+        let g = generation();
+        e.truncate(1);
+        wait_for(5 * SECOND, "the entry dropped", || {
+            generation().pending.is_none()
+        });
+        g.builds
+    };
+    assert_eq!(built(new_id()), builds, "a missing flow");
+    assert_eq!(built(src.clone()), builds + 1, "a flow that is there");
+    common::stop(e);
+}
+
+/// Flow ids whose lookup [`slow_look`] makes wait.
+static SLOW: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The engine's lookup of a flow's directory, waiting 500 ms first for a
+/// flow [`SLOW`] names, as a file system does that waits for a name.
+fn slow_look(dir: &std::path::Path) -> bool {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if SLOW
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|id| name.starts_with(id.as_str()))
+    {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    samplez_mxl::lookup::exists(dir)
+}
+
+/// A generation build opens no flow its lookup has not found: a route to
+/// a flow that is there, but whose lookup does not answer within the
+/// build's wait, leaves the slot out at once, saying so, instead of
+/// libmxl's open waiting on a file system that waits for a missing name.
+#[test]
+fn a_build_leaves_out_a_flow_its_lookup_has_not_found() {
+    let domain = Domain::new();
+    let (src, slow, out) = (new_id(), new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let _slow = Pilot::start(&domain.0, &slow, 2, B, 0);
+    SLOW.lock().unwrap().push(slow.clone());
+    let mut cfg = config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&out, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    );
+    cfg.look = slow_look;
+    let (e, rx, _reports) = start_replicated(cfg);
+    running(&e);
+    let generation = || e.status().generation;
+    let started = Instant::now();
+    let at = (now(&rx) + 2000) * B;
+    e.append(
+        1,
+        at,
+        Entry::Route {
+            slot: 0,
+            flow_id: slow,
+        },
+    )
+    .unwrap();
+    wait_for(5 * SECOND, "the generation built", || generation().ready);
+    let built = started.elapsed();
+    let error = e.status().inputs[0].error.clone().unwrap_or_default();
+    assert!(error.contains("did not answer"), "{error:?}");
+    assert!(built < Duration::from_millis(250), "built in {built:?}");
+    e.truncate(1);
+    wait_for(5 * SECOND, "the entry dropped", || {
+        generation().pending.is_none()
+    });
+    common::stop(e);
+}
+
+/// An output flow is created without libmxl's check for a live writer,
+/// which looks the flow's name up, while a lookup has not found its
+/// directory: a live writer's flow is then opened and reported raced,
+/// not waited for.
+#[test]
+fn an_output_is_created_without_waiting_for_its_lookup() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let _live = Pilot::start(&domain.0, &out, 2, B, 0);
+    SLOW.lock().unwrap().push(out.clone());
+    let mut cfg = config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&out, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    );
+    cfg.look = slow_look;
+    let (e, _rx) = common::start(cfg);
+    wait_for(5 * SECOND, "a creation tried", || {
+        e.status().outputs[0].attempts > 0
+    });
+    let o = &e.status().outputs[0];
+    assert!(!o.realised);
+    assert_eq!(o.races, 1, "{:?}", o.reason);
+    e.stop();
 }
 
 /// A re-route to a flow that is not there crossfades the old flow to

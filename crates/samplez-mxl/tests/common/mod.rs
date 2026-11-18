@@ -15,10 +15,35 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use samplez_mxl::input::{InputConfig, Timing};
+use samplez_mxl::input::{InputConfig, Poll, PolledFlow, Timing};
 use samplez_mxl::{Instance, MxlApi, Status};
 
 pub const B: u64 = 48;
+
+/// Polls `p` until `done` holds for what it reads, for one second at
+/// most, and returns that reading, or the last one: a poll reads the
+/// answer of a lookup that runs on a thread of its own, which the poll
+/// does not wait for.
+pub fn poll_until(p: &mut PolledFlow, done: impl Fn(&Poll) -> bool) -> Poll {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let polled = p.poll();
+        if done(&polled) || std::time::Instant::now() >= until {
+            return polled;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// [`poll_until`] the flow is no longer read absent.
+pub fn poll_found(p: &mut PolledFlow) -> Poll {
+    poll_until(p, |r| !matches!(r, Poll::Absent(_)))
+}
+
+/// [`poll_until`] the head is no longer reported, checked or not.
+pub fn poll_checked(p: &mut PolledFlow) -> Poll {
+    poll_until(p, |r| !matches!(r, Poll::Head(_)))
+}
 
 pub const TIMING: Timing = Timing {
     block: B,

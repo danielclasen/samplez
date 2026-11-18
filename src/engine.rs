@@ -22,6 +22,7 @@ use samplez_dsp::{DuckParam, MAX_DUCKS, Matrix, PlanarBuffer, Started, StripPara
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, Recovery, Timing,
 };
+use samplez_mxl::lookup::{self, Found, Gate};
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
 
@@ -58,6 +59,12 @@ const HASHES_PER_OUTPUT: usize = 64;
 const MIN_STATUS_SLOTS: usize = 64;
 const SUPERVISOR_TICK: Duration = Duration::from_millis(5);
 const POLL_PERIOD: Duration = Duration::from_millis(100);
+/// How long a generation build, or a replay, waits for the lookups of the
+/// flows it attaches. One that answers at once does so in microseconds; a
+/// flow not found by then is left out, its lookup kept running, rather
+/// than waited for by libmxl's own open on a file system that waits for a
+/// missing name to appear.
+const GATE_WAIT: Duration = Duration::from_millis(20);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Seconds of slot statistics the margin warning looks at, plus one.
@@ -812,6 +819,15 @@ fn build_time_samples(p9999_ns: Option<u64>) -> u64 {
     (u128::from(ns) * samplez_mxl::SAMPLE_RATE as u128).div_ceil(1_000_000_000) as u64
 }
 
+/// Why flow `flow_id` was not opened: its lookup found no directory, or
+/// gave no answer within [`GATE_WAIT`].
+fn unopened(flow_id: &str, found: Found) -> String {
+    match found {
+        Found::Pending => format!("flow {flow_id}: its lookup did not answer within {GATE_WAIT:?}"),
+        _ => format!("flow {flow_id} not found"),
+    }
+}
+
 /// Generation build times in quarter-octave buckets of nanoseconds.
 struct BuildTimes {
     counts: Vec<u64>,
@@ -1073,6 +1089,8 @@ pub struct Engine {
     replica: Option<(Arc<Shared>, Mutex<ReplicaControl>)>,
     /// Core copies, in replicated mode with more than one voter.
     transfer: Option<Mutex<Transfer>>,
+    /// The lookups of the flows a replay attaches.
+    replay_gate: Mutex<Gate>,
 }
 
 impl Engine {
@@ -1508,6 +1526,8 @@ impl Engine {
             reroute: vec![0; in_domains.len()],
             product: None,
             pollers: (0..in_domains.len()).map(|_| None).collect(),
+            gate: Gate::new(config.look),
+            out_gate: Gate::fresh(config.look),
             poll_errors: vec![None; in_domains.len()],
             rebuild_errors: vec![None; in_domains.len()],
             outs: (0..config.outputs.len())
@@ -1572,6 +1592,7 @@ impl Engine {
                 return Err(Error::Thread(format!("spawning the supervisor: {e}")));
             }
         };
+        let replay_gate = Mutex::new(Gate::new(config.look));
         Ok(Engine {
             stop,
             supervisor: Some(supervisor),
@@ -1589,6 +1610,7 @@ impl Engine {
             config,
             replica,
             transfer,
+            replay_gate,
         })
     }
 
@@ -2464,6 +2486,22 @@ impl Engine {
             resync_budget: self.config.resync_budget_samples(),
         };
         let attach = |e: samplez_mxl::Error| ReplayError::Attach(e.to_string());
+        // libmxl opens only flows a lookup found, so a missing one fails
+        // the replay at once rather than once a waiting lookup gave up.
+        let attached: Vec<(PathBuf, &str)> = (slots.iter().zip(&status.inputs))
+            .filter(|(_, i)| i.state == InputState::Attached)
+            .map(|(s, i)| {
+                let domain = &self.config.domains[in_domains[s.domain]].path;
+                (lookup::flow_dir(domain, &i.flow_id), i.flow_id.as_str())
+            })
+            .collect();
+        let dirs: Vec<PathBuf> = attached.iter().map(|a| a.0.clone()).collect();
+        let found = (self.replay_gate.lock())
+            .unwrap_or_else(|e| e.into_inner())
+            .found(&dirs, GATE_WAIT);
+        if let Some(((_, id), f)) = attached.iter().zip(&found).find(|(_, f)| **f != Found::Yes) {
+            return Err(ReplayError::Attach(unopened(id, *f)));
+        }
         let mut gens = Vec::with_capacity(in_domains.len());
         for (d, &domain) in in_domains.iter().enumerate() {
             let path = &self.config.domains[domain].path;
@@ -3144,6 +3182,10 @@ struct Supervisor {
     /// A product state's generations not all handed over yet.
     product: Option<ProductHandOver>,
     pollers: Vec<Option<Pollers>>,
+    /// The lookups of the flows a generation build attaches.
+    gate: Gate,
+    /// The lookups of the output flows about to be created.
+    out_gate: Gate,
     /// The last failure to create each input domain's poll instance and
     /// generation, logged once per change of its text.
     poll_errors: Vec<Option<String>>,
@@ -3546,8 +3588,9 @@ impl Supervisor {
         };
         if let Some(f) = p.flows.get_mut(&id) {
             f.hold();
+            f.want();
         } else {
-            match PolledFlow::new(&p.instance, &id) {
+            match PolledFlow::looking_up_with(&p.instance, &id, self.config.look) {
                 Ok(f) => {
                     p.flows.insert(id, f);
                 }
@@ -3698,7 +3741,10 @@ impl Supervisor {
         } else {
             0
         };
-        for (slot, limit) in prune_after.iter_mut().enumerate() {
+        // Each slot's outgoing flow and the flow it is to read, looked up
+        // together before libmxl opens any of them.
+        let mut plan: Vec<(usize, Option<String>, Option<String>)> = Vec::new();
+        for slot in 0..n {
             if self.input_domain(slot) != d {
                 continue;
             }
@@ -3711,39 +3757,57 @@ impl Supervisor {
             // The flow the slot reads, none detached.
             let reads = (!matches!(state, SupState::Detached)).then_some(current.as_str());
             let wanted = !matches!(state, SupState::Pruned { .. } | SupState::Detached);
-            let cfg = &self.config.inputs[slot];
             // The flow a re-route leaves is read until its crossfade ends.
             let outgoing = match (route, &self.slots[slot].routing) {
                 (Some(f), _) if f != reads && wanted => Some(current.clone()),
                 (None, Some((end, old))) if produced < *end => Some(old.clone()),
                 _ => None,
             };
-            if let Some(old) = outgoing
-                && let Err(e) = generation.attach_outgoing(
-                    slot,
-                    &self.config.input_config(cfg, &old),
-                    &self.timing,
-                )
-            {
-                log(format_args!("input {}: flow {old} left: {e}", cfg.name));
-            }
             if route.is_some_and(|f| f != reads) {
                 rerouted |= bit(slot);
             }
-            if !wanted && !target {
-                continue;
+            let attach = (wanted || target)
+                .then(|| route.unwrap_or(reads).map(str::to_owned))
+                .flatten();
+            plan.push((slot, outgoing, attach));
+        }
+        let dirs: Vec<PathBuf> = plan
+            .iter()
+            .flat_map(|(_, outgoing, attach)| outgoing.iter().chain(attach))
+            .map(|id| lookup::flow_dir(&path, id))
+            .collect();
+        let mut found = self.gate.found(&dirs, GATE_WAIT).into_iter();
+        let mut complete = true;
+        for (slot, outgoing, attach) in plan {
+            let cfg = &self.config.inputs[slot];
+            if let Some(old) = outgoing {
+                let result = match found.next() {
+                    Some(Found::Yes) => generation
+                        .attach_outgoing(slot, &self.config.input_config(cfg, &old), &self.timing)
+                        .map_err(|e| e.to_string()),
+                    f => Err(unopened(&old, f.unwrap_or(Found::No))),
+                };
+                if let Err(e) = result {
+                    log(format_args!("input {}: flow {old} left: {e}", cfg.name));
+                }
             }
-            let Some(flow_id) = route.unwrap_or(reads) else {
+            let Some(flow_id) = attach else {
                 continue;
             };
-            match generation.attach(slot, &self.config.input_config(cfg, flow_id), &self.timing) {
+            let result = match found.next() {
+                Some(Found::Yes) => generation
+                    .attach(slot, &self.config.input_config(cfg, &flow_id), &self.timing)
+                    .map_err(|e| e.to_string()),
+                f => Err(unopened(&flow_id, f.unwrap_or(Found::No))),
+            };
+            match result {
                 Ok(short) => {
                     held |= 1 << slot;
                     let hint = generation
                         .input(slot)
                         .and_then(|i| i.reader().config().ok())
                         .map_or(0, |c| u64::from(c.common.maxCommitBatchSizeHint));
-                    *limit = prune_limit(&self.config, &self.timing, hint);
+                    prune_after[slot] = prune_limit(&self.config, &self.timing, hint);
                     if let Some(needed) = short {
                         log(format_args!(
                             "input {}: readerMarginSamples {} is below the {needed} its \
@@ -3755,8 +3819,8 @@ impl Supervisor {
                     st.inputs[slot].error = None;
                     st.inputs[slot].margin_short = short;
                 }
-                Err(e) => {
-                    let message = e.to_string();
+                Err(message) => {
+                    complete = false;
                     log(format_args!("input {} not attached: {message}", cfg.name));
                     self.status().inputs[slot].error = Some(message);
                 }
@@ -3770,7 +3834,11 @@ impl Supervisor {
                 path.display()
             ));
         }
-        self.build_times.add(started.elapsed().as_nanos() as u64);
+        // A build that left a slot out waited for a lookup, or failed an
+        // attach: not the time a generation takes to build.
+        if complete {
+            self.build_times.add(started.elapsed().as_nanos() as u64);
+        }
         let p = self.build_times.p9999();
         let lead = build_lead_samples(p, self.lead, self.timing.block);
         self.build_lead.store(lead, Relaxed);
@@ -3809,6 +3877,13 @@ impl Supervisor {
                 } else if targets & bit(slot) != 0 {
                     self.slots[slot].reported = false;
                     self.report(Report::InputPruned { slot });
+                    // Raised or re-routed again: looked up without a gap.
+                    let id = &self.slots[slot].flow;
+                    if let Some(p) = &mut self.pollers[d]
+                        && let Some(f) = p.flows.get_mut(id)
+                    {
+                        f.want();
+                    }
                 }
                 continue;
             }
@@ -4259,7 +4334,21 @@ impl Supervisor {
                 batch: self.batch,
                 ..self.config.output_config(cfg)
             };
-            let result = output::create(instance, &oc);
+            // A flow whose directory is not found, or not yet, is created
+            // without libmxl's check for a live writer, which looks the
+            // missing name up and on a file system that waits for it would
+            // hold the supervisor; a flow there meanwhile is opened, not
+            // created, and reported raced.
+            // After collecting a stale flow, the same lookup decides
+            // whether it is still there.
+            let dir = lookup::flow_dir(&self.config.domains[d].path, oc.flow_id);
+            let gate = &mut self.out_gate;
+            let mut found = || gate.found(std::slice::from_ref(&dir), GATE_WAIT)[0] == Found::Yes;
+            let result = if found() {
+                output::create_looking(instance, &oc, found)
+            } else {
+                output::create_new(instance, &oc)
+            };
             let mut st = self.status.lock().expect("status lock");
             let s = &mut st.outputs[o];
             s.attempts += 1;
@@ -4291,7 +4380,8 @@ impl Supervisor {
                 Ok(Creation::Active) => "another writer is live on the flow".to_owned(),
                 Ok(Creation::Raced) => {
                     s.races += 1;
-                    "another writer created the flow first; libmxl v1.1.0 leaves a \
+                    "another writer created the flow first, or a stale flow its lookup \
+                     had not found yet was opened and removed; libmxl v1.1.0 leaves a \
                      .mxl-tmp-* directory in the domain on this path (upstream #776)"
                         .to_owned()
                 }

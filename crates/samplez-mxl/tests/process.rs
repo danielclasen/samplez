@@ -10,7 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use common::{B, Domain, RawReader, RawWriter, api, new_id, sample};
+use common::{B, Domain, RawReader, RawWriter, api, new_id, poll_checked, poll_found, sample};
 use samplez_mxl::Instance;
 use samplez_mxl::input::{Poll, PolledFlow};
 use samplez_mxl::output::{self, Creation, OutputConfig, Write};
@@ -97,7 +97,7 @@ fn poller_recreates_its_reader_after_the_flow_is_replaced() {
     let poll = Instance::new(&api, &domain.0).unwrap();
     let mut p = PolledFlow::new(&poll, &id).unwrap();
     let head = (K0 + BLOCKS) * B;
-    assert!(matches!(p.poll(), Poll::Head(h) if h == head));
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == head));
 
     kill(child);
     // A dead writer leaves a valid flow whose head stays.
@@ -112,8 +112,8 @@ fn poller_recreates_its_reader_after_the_flow_is_replaced() {
     let mut w = RawWriter::create(&api, &domain.0, &id, 2);
     w.blocks(K0 + BLOCKS..K0 + BLOCKS + 5);
 
-    assert!(matches!(p.poll(), Poll::Invalid));
-    assert!(matches!(p.poll(), Poll::Head(h) if h == head + 5 * B));
+    assert!(matches!(poll_checked(&mut p), Poll::Invalid));
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == head + 5 * B));
     w.blocks(K0 + BLOCKS + 5..K0 + BLOCKS + 6);
     assert!(matches!(p.poll(), Poll::Head(h) if h == head + 6 * B));
 }
@@ -179,13 +179,21 @@ fn output_creation_over_a_live_stale_and_surviving_flow() {
     assert_eq!(active, Some(false));
 
     // Collectable again: removed by mxlGarbageCollectFlows, then created.
+    // Whether it is gone is asked of the caller's lookup, not of
+    // mxlIsFlowActive, which looks the collected name up again.
+    let asked = std::cell::Cell::new(false);
+    let still_there = || {
+        asked.set(true);
+        dir.exists()
+    };
     let Creation::Created {
         writer: mut w,
         collected: true,
-    } = output::create(&instance, &cfg).unwrap()
+    } = output::create_looking(&instance, &cfg, still_there).unwrap()
     else {
         panic!("stale flow not collected and created");
     };
+    assert!(asked.get(), "the lookup was not asked after the collection");
     assert!(domain.tmp_dirs().is_empty(), "{:?}", domain.tmp_dirs());
     let k = K0 + BLOCKS + 3;
     let data: Vec<f32> = (0..2)

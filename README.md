@@ -681,6 +681,23 @@ neither swapping nor compaction moves the locked pages of the RT
 thread. MXL domains belong on tmpfs: on a disk-backed file system a
 commit into an output's shared mapping can wait for the page's
 writeback, and the loop then skips blocks.
+libmxl opens an input flow only once a lookup of the flow's directory,
+on a thread of its own, found it, so a domain whose lookup of a missing
+name waits for the name to appear holds up that thread and not the
+supervisor, which drains the meter records and the status changes. A
+generation build or a replay waits 20 ms at most for the lookups of the
+flows it attaches and leaves out, or fails on, a flow not found by then,
+a lookup's finding a flow counting for a second; a build that left a
+slot out is not counted in the build times. An output flow whose
+directory is not found is created without libmxl's check for a live
+writer, which looks the name up; a flow that is there after all is
+opened and reported raced. A
+pruned input's flow that is missing is looked up again at every poll
+for 10 s after it was wanted (first polled, re-routed to or raised),
+and after that with a gap from 100 ms doubling up to 5 s. A stopped
+head is checked with libmxl's validity check only once a lookup found
+the flow's directory, at once and then at the same doubling gaps while
+it stays.
 
 
 ## NMOS
