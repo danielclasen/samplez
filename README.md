@@ -454,7 +454,11 @@ the replica, and the record's index is the one contact lists and awaits
 the entry at from its append on, the floor being a function of the log
 prefix. An entry not applied by its apply deadline is unresolved and its
 record never handed, however early reports made its commit known; the
-log decides it. One AppendEntries carries up to
+log decides it. The leader stamps entries the lead ahead, which it keeps
+on the slack every counted audio replica reports at its apply-hand, up
+to `maxApplyLead`; a replica that still applies past the deadline at the
+cap holds those entries unresolved alone, and the leader's contact
+metrics name it (`apply_lead_raised_by`). One AppendEntries carries up to
 `MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
 than the gap between entries takes every entry written meanwhile with
 one fsync rather than falling further behind. `EngineAudio` leaves out

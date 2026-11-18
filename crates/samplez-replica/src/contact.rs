@@ -603,6 +603,8 @@ struct State {
     /// Slack of the entries learned committed, for the next reports.
     slack: Vec<Slack>,
     lead: Lead,
+    /// The replica whose slack last asked for a higher lead.
+    lead_raised_by: Option<NodeId>,
     e_spread: Histogram,
     /// Every entry of this replica's log up to here is committed.
     known_committed: u64,
@@ -688,6 +690,23 @@ pub struct Contact {
     state: Mutex<State>,
 }
 
+/// Adds a counted replica's slack to the lead, naming the replica when
+/// it asked for more, and warning once as the lead reaches its cap.
+fn add_slack(st: &mut State, from: NodeId, slack: &Slack, current: u64) {
+    let capped = st.lead.capped;
+    if st.lead.add(slack.samples, slack.stamp, current) {
+        st.lead_raised_by = Some(from);
+        if st.lead.capped && !capped {
+            tracing::warn!(
+                replica = from,
+                lead = st.lead.samples(),
+                "the apply lead is at its cap: this replica applies entries past their \
+                 deadline and holds them unresolved"
+            );
+        }
+    }
+}
+
 /// Contact as status and metrics show it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Metrics {
@@ -740,6 +759,10 @@ pub struct Metrics {
     /// The lead, in samples, and whether it wanted more than the cap.
     pub lead: u64,
     pub apply_lead_capped: bool,
+    /// The counted audio replica whose slack last asked for a higher
+    /// lead: while the lead is capped, the one applying entries past
+    /// their deadline, which holds them unresolved.
+    pub apply_lead_raised_by: Option<NodeId>,
     /// How far the E estimates other voters report lie from this one's at
     /// receipt, 99.99th percentile, in samples.
     pub e_spread_p9999: Option<u64>,
@@ -875,6 +898,7 @@ impl Contact {
                     index_at(START_LEAD.as_nanos() as u64),
                     index_at(timing.max_apply_lead.as_nanos() as u64),
                 ),
+                lead_raised_by: None,
                 e_spread: Histogram::default(),
                 known_committed: applied,
                 handed: applied,
@@ -1073,7 +1097,7 @@ impl Contact {
         if self.counted(st, now).contains(&report.from) {
             let current = self.current_stamp(st, now);
             for slack in &report.slack {
-                st.lead.add(slack.samples, slack.stamp, current);
+                add_slack(st, report.from, slack, current);
             }
         }
         // Commit knowledge: a committed id this log holds, or a listed
@@ -1697,7 +1721,7 @@ impl Contact {
             .collect();
         for s in handed {
             if counted {
-                st.lead.add(s.samples, s.stamp, current);
+                add_slack(st, self.id, &s, current);
             }
             if st.slack.len() < MAX_LISTED {
                 st.slack.push(s);
@@ -2833,6 +2857,7 @@ impl Contact {
             counted: self.counted(&st, Instant::now()).into_iter().collect(),
             lead: st.lead.samples(),
             apply_lead_capped: st.lead.capped,
+            apply_lead_raised_by: st.lead_raised_by,
             e_spread_p9999: st.e_spread.quantile(0.9999),
             withholding: st.withhold.counts,
             floor,
