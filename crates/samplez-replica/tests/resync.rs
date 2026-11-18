@@ -9,7 +9,8 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{BLOCK, Clock, FOR_GOOD, FakeAudio, Options, Set};
+use axum::body::Bytes;
+use harness::{BLOCK, Clock, FOR_GOOD, FakeAudio, Options, Set, owner};
 use samplez::blocks::PAGE;
 use samplez_replica::contact::{Audio, Timing, index_at};
 use samplez_replica::entry::{Baseline, Body, NodeId, Request};
@@ -17,6 +18,7 @@ use samplez_replica::membership::{Slot, node_id, slot_of};
 use samplez_replica::resync::{CoreReply, Missed, Source};
 use samplez_replica::state::ReplicaState;
 use samplez_replica::state_machine::Record;
+use samplez_service::ReplicatedState;
 use tokio::time::{Instant, sleep};
 
 fn a(o: u16) -> NodeId {
@@ -133,6 +135,84 @@ async fn a_diverged_replica_resyncs_from_the_baseline_and_commits_again() {
         Some(ReplicaState::Committing),
         "stays committing"
     );
+}
+
+/// The value of `name`'s sample with `label` in `id`'s `/metrics`
+/// samples.
+fn sample(set: &Set, id: NodeId, name: &str, label: Option<(&str, &str)>) -> f64 {
+    let samples = set.replica(id).replica_metrics();
+    (samples.iter())
+        .find(|m| {
+            m.name == name
+                && label.is_none_or(|(k, v)| m.labels.iter().any(|(mk, mv)| *mk == k && mv == v))
+        })
+        .unwrap_or_else(|| panic!("{name} {label:?} in {samples:?}"))
+        .value
+}
+
+/// The sc pod-kill test: 3 replicas after the apply lead reached its
+/// cap, a follower diverged, then the leader killed. The diverged
+/// follower resyncs from the replica still committing and commits again
+/// within 5 s; `/metrics` shows the hand-over and the replica serving
+/// again, and not serving while it wrote nothing.
+#[tokio::test(start_paused = true)]
+async fn a_follower_diverged_under_a_capped_lead_resyncs_after_the_leader_is_killed() {
+    let mut set = start(vec![a(0), a(1), a(2)], false).await;
+    let leader = set.leader().await;
+    // Commits 50 ms after their stamp: the lead rises to its cap.
+    let followers: Vec<NodeId> = audio(&set).into_iter().filter(|&id| id != leader).collect();
+    for &id in &followers {
+        set.net.stall(id, Duration::from_millis(25));
+    }
+    for n in 0..3 {
+        let command = Bytes::from(format!("g=1@{n}"));
+        let _ = (set.replica(leader))
+            .submit(&owner("s"), &n.to_string(), command)
+            .await;
+    }
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        set.replica(leader)
+            .contact_metrics()
+            .unwrap()
+            .apply_lead_capped
+    );
+    assert_eq!(
+        sample(&set, leader, "samplez_replica_apply_lead_capped", None),
+        1.0
+    );
+    for &id in &followers {
+        set.net.unstall(id);
+    }
+    let ids = audio(&set);
+    until("committing again", 5, || {
+        ids.iter()
+            .all(|&id| state(&set, id) == Some(ReplicaState::Committing))
+    })
+    .await;
+    let named = baseline(&set, leader).unwrap().replica;
+    let odd = (followers.iter().copied()).find(|&id| id != named).unwrap();
+    // Its first two replays fail: it resyncs after the kill.
+    set.audio(odd).lock().failing = 2;
+    let k = due(&set, odd) + 30;
+    set.audio(odd).glitch(k, FOR_GOOD, 0.5);
+    passes(&set, odd, ReplicaState::Diverged, 3).await;
+    assert_eq!(
+        sample(&set, odd, "samplez_replica_serving", None),
+        0.0,
+        "diverged, it writes nothing"
+    );
+    let diverged = Some(("state", "diverged"));
+    assert_eq!(sample(&set, odd, "samplez_replica_state", diverged), 1.0);
+    set.crash(leader).await;
+    let killed = Instant::now();
+    passes(&set, odd, ReplicaState::Committing, 5).await;
+    assert!(killed.elapsed() < Duration::from_secs(5));
+    assert!(resyncs(&set, odd).handovers >= 1);
+    let handovers = sample(&set, odd, "samplez_replica_resync_handovers_total", None);
+    assert!(handovers >= 1.0);
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(sample(&set, odd, "samplez_replica_serving", None), 1.0);
 }
 
 /// A failed replay leaves the replica diverged, and it tries again with a

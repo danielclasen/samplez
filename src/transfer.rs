@@ -487,6 +487,8 @@ pub struct Replay {
     pub(crate) next: u64,
     /// The highest log id it knows.
     pub(crate) last_id: LogId,
+    /// The entries it took below its next block, not applied.
+    pub(crate) late: Vec<(LogId, u64)>,
     /// The engine's duck columns.
     pub(crate) duck_columns: Vec<usize>,
 }
@@ -506,8 +508,12 @@ impl Replay {
     /// Takes the committed log entry `id` at `at_index`, its engine
     /// entries `entries` folded as [`crate::Engine::append_batch`] folds
     /// them; one the core knew already, or of no entries, changes
-    /// nothing. Only entries that need no generation replay; one whose
-    /// index the replay computed is late.
+    /// nothing. Only entries that need no generation replay. One whose
+    /// index is below the replay's next block reached the donor's RT
+    /// thread after the core's block, past its index, which took it late
+    /// and did not apply it: the replay does not apply it either and
+    /// holds it unresolved from the next block on, as the donor holds an
+    /// entry it took late, until the log decides it ([`Replay::late`]).
     pub fn append_batch(
         &mut self,
         id: LogId,
@@ -563,8 +569,14 @@ impl Replay {
             return Err(ReplayError::Generation);
         }
         let b = self.rt.block;
-        if !at_index.is_multiple_of(b) || at_index < self.next * b {
+        if !at_index.is_multiple_of(b) {
             return Err(ReplayError::Late { id, at_index });
+        }
+        if at_index < self.next * b {
+            self.unresolved(id, at_index)?;
+            self.late.push((id, at_index));
+            self.last_id = id;
+            return Ok(());
         }
         let e = RtEntry {
             id,
@@ -576,6 +588,12 @@ impl Replay {
         }
         self.last_id = id;
         Ok(())
+    }
+
+    /// The `(log id, at_index)` of the entries it took below its next
+    /// block, which it did not apply and holds unresolved.
+    pub fn late(&self) -> &[(LogId, u64)] {
+        &self.late
     }
 
     /// Entry `id` at `at_index` is unresolved, from the next block on.
@@ -768,7 +786,7 @@ pub enum ReplayError {
     Generation,
     /// An input's reader could not be attached.
     Attach(String),
-    /// The entry's index is not a block start or was computed already.
+    /// The entry's index is not a block start.
     Late { id: LogId, at_index: u64 },
     /// The pending list or the control ring is full.
     Full,

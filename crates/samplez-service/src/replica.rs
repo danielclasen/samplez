@@ -155,9 +155,33 @@ pub enum ReadIndex {
     CutOff,
 }
 
+/// One sample of a replication metric: `/metrics` renders it with the
+/// replica's id as label `replica`, beside `labels`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicaMetric {
+    pub name: &'static str,
+    pub help: &'static str,
+    pub kind: MetricKind,
+    pub labels: Vec<(&'static str, String)>,
+    pub value: f64,
+}
+
+/// A [`ReplicaMetric`]'s Prometheus type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricKind {
+    Counter,
+    Gauge,
+}
+
 /// Implemented by the product or by the replication mechanism.
 pub trait ReplicatedState: Send + Sync + 'static {
     fn replica(&self) -> ReplicaInfo;
+
+    /// The replication's own metrics, rendered on `/metrics`; the samples
+    /// of one name adjacent. None by default.
+    fn replica_metrics(&self) -> Vec<ReplicaMetric> {
+        Vec::new()
+    }
 
     /// The id of this state's history, so a revision names one state only
     /// together with it. Drawn anew whenever the state is initialised empty

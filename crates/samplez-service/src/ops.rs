@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use tokio::time::Instant;
 
 use crate::metrics::{Metrics, label_set};
-use crate::replica::{ReplicaInfo, ReplicatedState};
+use crate::replica::{MetricKind, ReplicaInfo, ReplicaMetric, ReplicatedState};
 
 /// `/healthz` fails once the heartbeat has not advanced for this long.
 pub const HEARTBEAT_WINDOW: Duration = Duration::from_secs(1);
@@ -119,8 +119,9 @@ impl Ops {
                     let text = format!(
                         "# HELP samplez_replica_info This replica's id and role.\n\
                          # TYPE samplez_replica_info gauge\n\
-                         samplez_replica_info{} 1\n{}",
+                         samplez_replica_info{} 1\n{}{}",
                         label_set(labels),
+                        render_replica(&replica.id, &s3.replica_metrics()),
                         metrics.render()
                     );
                     (
@@ -133,6 +134,31 @@ impl Ops {
                 }),
             )
     }
+}
+
+/// The replication's metrics in the text exposition format, each sample
+/// labelled with replica `id`, a name's help and type before its first
+/// sample.
+fn render_replica(id: &str, samples: &[ReplicaMetric]) -> String {
+    let mut out = String::new();
+    let mut last = None;
+    for m in samples {
+        if last != Some(m.name) {
+            let kind = match m.kind {
+                MetricKind::Counter => "counter",
+                MetricKind::Gauge => "gauge",
+            };
+            out.push_str(&format!(
+                "# HELP {} {}\n# TYPE {} {kind}\n",
+                m.name, m.help, m.name
+            ));
+            last = Some(m.name);
+        }
+        let labels =
+            std::iter::once(("replica", id)).chain(m.labels.iter().map(|(k, v)| (*k, v.as_str())));
+        out.push_str(&format!("{}{} {}\n", m.name, label_set(labels), m.value));
+    }
+    out
 }
 
 fn status(ok: bool, replica: ReplicaInfo) -> impl IntoResponse + use<> {

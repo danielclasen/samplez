@@ -34,8 +34,9 @@ pub struct Resynced {
     pub j: u64,
     /// The pages the replay computed whole, `committed` false.
     pub pages: Vec<Page>,
-    /// The unresolved entries the state holds, the donor's: `(log index,
-    /// at_index)`.
+    /// The unresolved entries the state holds, `(log index, at_index)`:
+    /// the donor's core's, and the entries the replay took below the
+    /// core's next block, which the donor took late.
     pub unresolved: Vec<(u64, u64)>,
 }
 
@@ -76,6 +77,11 @@ pub struct Metrics {
     /// Attempts that ended without a hand-over: no core, a refused one, a
     /// replayed page unequal to the donor's, or none taken in time.
     pub failures: u64,
+    /// Checks that found no donor, no fresh, committing, clock-verified
+    /// audio replica: counted, and logged, at most once per a backoff
+    /// that doubles from [`RETRY`] up to [`RETRY_MAX`] while none is
+    /// found. The check itself runs on every tick.
+    pub no_donor: u64,
     /// Hand-overs reached later than `resyncBudgetMs` after the core was
     /// asked for, and whether the latest one was.
     pub over_budget: u64,
@@ -97,6 +103,9 @@ pub(crate) struct Tracker {
     ended: Option<Instant>,
     /// The backoff after the next attempt ends, none for [`RETRY`].
     wait: Option<Duration>,
+    /// When a missing donor was last counted, and the wait before the
+    /// next is: none while donors are found.
+    no_donor: Option<(Instant, Duration)>,
     pub metrics: Metrics,
 }
 
@@ -109,9 +118,27 @@ impl Tracker {
             return None;
         }
         self.epoch += 1;
+        self.no_donor = None;
         self.running = Some((self.epoch, now));
         self.metrics.attempts += 1;
         Some(self.epoch)
+    }
+
+    /// No donor at `now`: true, and counted, when the no-donor backoff
+    /// passed since the last one counted.
+    pub fn no_donor(&mut self, now: Instant) -> bool {
+        let (last, wait) = self.no_donor.unwrap_or((now, Duration::ZERO));
+        if self.no_donor.is_some() && now < last + wait {
+            return false;
+        }
+        let next = if self.no_donor.is_some() {
+            (wait * 2).min(RETRY_MAX)
+        } else {
+            RETRY
+        };
+        self.no_donor = Some((now, next));
+        self.metrics.no_donor += 1;
+        true
     }
 
     /// Whether `epoch` is the attempt in progress.

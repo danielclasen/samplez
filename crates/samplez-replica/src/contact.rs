@@ -2267,7 +2267,15 @@ impl Contact {
         st.own.state = Some(state);
         st.own.ready = ready;
         st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
-        if st.in_contact {
+        // Withdrawn, diverged or resyncing, it writes none of what it
+        // computes, in contact or not.
+        let writes_nothing = matches!(
+            state,
+            ReplicaState::Withdrawn | ReplicaState::Diverged | ReplicaState::Resync
+        );
+        if writes_nothing {
+            st.serving = Some(false);
+        } else if st.in_contact {
             let other = copies
                 .iter()
                 .any(|(_, age, own)| *age <= fresh && own.state == Some(ReplicaState::Committing));
@@ -2378,7 +2386,9 @@ impl Contact {
     /// The audio `/readyz` term (plan 2.11, Deployment): committing, or no
     /// other audio replica committing within `w + D` by its reports;
     /// judged while in contact, kept out of it, false before the first
-    /// contact. Always true for the witness and for one voter.
+    /// contact. False while withdrawn, diverged or resyncing, in contact
+    /// or not: the replica writes none of what it computes. Always true
+    /// for the witness and for one voter.
     pub fn serving(&self) -> bool {
         let st = self.lock();
         if self.audio.is_none() || st.members.voters().len() == 1 {
@@ -2972,9 +2982,11 @@ impl Contact {
 
     /// A resync to start: this audio replica is diverged, not
     /// clock-unverified or excluded, no attempt runs and the last ended
-    /// [`crate::resync::RETRY`] ago, and a committing donor reported
-    /// within `w + D`. Returns the attempt's epoch, the donor and its
-    /// address.
+    /// the backoff ago, and a committing donor reported within `w + D`,
+    /// one that did within the last report period and tick first.
+    /// Returns the attempt's epoch, the donor and its address. Without a
+    /// donor it is checked for again on the next tick, and counted and
+    /// logged with a backoff ([`crate::resync::Metrics::no_donor`]).
     pub fn resync_due(&self) -> Option<(u64, NodeId, String)> {
         self.audio.as_ref()?;
         let now = Instant::now();
@@ -2986,18 +2998,36 @@ impl Contact {
         if !diverged || rebuilding || st.own.clock.unverified || st.judged.contains(&self.id) {
             return None;
         }
-        let fresh = self.timing.contact_window + self.timing.hold;
         let audio_voters = crate::rank::audio_voters(&st.members);
-        let donor = {
-            let peers: Vec<(NodeId, bool, &Own)> = self
-                .copies(st, now)
-                .into_iter()
-                .filter(|(id, _, _)| {
-                    *id != self.id && audio_voters.contains(id) && !st.judged.contains(id)
-                })
-                .map(|(id, age, own)| (id, age > fresh, own))
+        let baseline = self.log.baseline().map(|b| b.replica);
+        let candidates: Vec<(NodeId, Duration, &Own)> = self
+            .copies(st, now)
+            .into_iter()
+            .filter(|(id, _, _)| {
+                *id != self.id && audio_voters.contains(id) && !st.judged.contains(id)
+            })
+            .collect();
+        // A report up to `w + D` old may name a replica that withdrew
+        // since, which refuses its core: one committing by a report of
+        // the last period and tick comes first.
+        let donor_within = |max_age: Duration| {
+            let peers: Vec<(NodeId, bool, &Own)> = (candidates.iter())
+                .map(|&(id, age, own)| (id, age > max_age, own))
                 .collect();
-            crate::resync::donor(self.log.baseline().map(|b| b.replica), &peers)?
+            crate::resync::donor(baseline, &peers)
+        };
+        let donor = donor_within(2 * self.timing.report_period)
+            .or_else(|| donor_within(self.timing.contact_window + self.timing.hold))
+            .filter(|d| st.members.addrs.contains_key(d));
+        let Some(donor) = donor else {
+            if st.resync.no_donor(now) {
+                let m = &st.resync.metrics;
+                tracing::warn!(
+                    no_donor = m.no_donor,
+                    "diverged with no committing donor: retried every tick"
+                );
+            }
+            return None;
         };
         let addr = st.members.addrs.get(&donor)?.clone();
         let epoch = st.resync.start(now)?;
@@ -4072,6 +4102,120 @@ mod tests {
         f.tick();
         assert_eq!(f.state(), Some(ReplicaState::Diverged));
         assert_eq!(f.contact.metrics().contradicted, 1);
+    }
+
+    /// Diverges the fixture's replica as the restamp of an entry it
+    /// applied at its own index does.
+    fn diverge(f: &Fixture) {
+        f.tick();
+        let at = index_at(T0) + 400 * 48;
+        f.log.push(1, 1, Some(at));
+        f.apply(1);
+        f.contact.log_changed();
+        f.tick();
+        f.insert(
+            2,
+            Body::Restamp {
+                revision: 1,
+                term: 1,
+                at_index: at + 96,
+                paths: Vec::new(),
+                generation: None,
+            },
+        );
+        let record = Record {
+            at_index: at + 96,
+            entries: vec![Entry::InputDown { slot: 0 }],
+            generation: false,
+        };
+        (f.log.0.lock().unwrap().records).insert(2, Arc::new(record));
+        f.apply(2);
+        f.contact.log_changed();
+        f.tick();
+        assert_eq!(f.state(), Some(ReplicaState::Diverged));
+    }
+
+    /// A report from `from` of a replica in `state`, `ago` before now.
+    fn state_report(f: &Fixture, from: NodeId, state: ReplicaState, ago: Duration) -> Report {
+        let mut r = f.report(from, None);
+        r.sent_at = f.clock.get() - ago.as_nanos() as u64;
+        r.own.state = Some(state);
+        r
+    }
+
+    /// `/readyz`: a replica that writes nothing is not serving while no
+    /// other replica commits, in contact or out of it, where it read
+    /// ready by "nobody else commits"; it becomes ready by committing. A
+    /// sole voter always serves.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_writing_nothing_is_not_serving_though_nobody_commits() {
+        let f = fixture(&[&[1]]);
+        f.tick();
+        f.tick();
+        assert!(f.contact.serving(), "a sole voter");
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert!(f.contact.metrics().in_contact);
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert!(!f.contact.serving(), "withdrawn, nobody else commits");
+        let f = fixture(&[&[1, 2, 3]]);
+        diverge(&f);
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert!(f.contact.metrics().in_contact);
+        assert_eq!(f.state(), Some(ReplicaState::Diverged));
+        assert!(!f.contact.serving(), "diverged, in contact");
+        // Out of contact the term follows the state too.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        f.clock.add(Duration::from_millis(50));
+        f.tick();
+        assert!(!f.contact.metrics().in_contact);
+        assert!(!f.contact.serving(), "diverged, out of contact");
+    }
+
+    /// A diverged replica asks a donor committing by a report of the last
+    /// period first, not one whose committing report is older though
+    /// within `w + D`; with no committing donor at all it keeps checking,
+    /// counted and logged with a backoff, rather than going silent.
+    #[tokio::test(start_paused = true)]
+    async fn a_resync_prefers_a_fresh_donor_and_retries_without_one() {
+        let f = fixture(&[&[1, 2, 3]]);
+        diverge(&f);
+        let attempts = |f: &Fixture| f.contact.metrics().resync;
+        assert_eq!(f.contact.resync_due(), None, "nobody commits");
+        let m = attempts(&f);
+        assert_eq!((m.no_donor, m.attempts), (1, 0), "{m:?}");
+        assert_eq!(f.contact.resync_due(), None);
+        assert_eq!(attempts(&f).no_donor, 1, "counted within the backoff once");
+        tokio::time::advance(crate::resync::RETRY).await;
+        assert_eq!(f.contact.resync_due(), None);
+        assert_eq!(attempts(&f).no_donor, 2, "counted again after the backoff");
+        // 2 reported committing 12 ms ago, 3 just now.
+        f.contact.receive(state_report(
+            &f,
+            2,
+            ReplicaState::Committing,
+            Duration::ZERO,
+        ));
+        tokio::time::advance(Duration::from_millis(12)).await;
+        f.clock.add(Duration::from_millis(12));
+        f.contact.receive(state_report(
+            &f,
+            3,
+            ReplicaState::Committing,
+            Duration::ZERO,
+        ));
+        let (_, donor, _) = f.contact.resync_due().expect("an attempt");
+        assert_eq!(donor, 3, "the fresh donor");
+        assert_eq!(attempts(&f).attempts, 1);
     }
 
     /// A void of an entry held unresolved resolves it in the engine and

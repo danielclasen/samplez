@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, Request, StatusCode, header, request};
 use axum::routing::get;
 use axum::{Extension, Router};
 use futures_util::future::BoxFuture;
-use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
+use samplez_service::replica::{Ack, NotApplied, Reason, ReplicaMetric, Resolution};
 use samplez_service::ws::{Delta, Snapshot};
 use samplez_service::{
     Identity, Ops, Owner, Position, ReadIndex, ReplicaInfo, ReplicatedState, Service, ServiceConfig,
@@ -63,6 +63,8 @@ pub struct FakeState {
     pub catch_ups: AtomicUsize,
     /// Woken on every revision applied.
     applied: Notify,
+    /// What `replica_metrics` returns.
+    pub metrics: Mutex<Vec<ReplicaMetric>>,
 }
 
 impl FakeState {
@@ -88,6 +90,7 @@ impl FakeState {
             read_index: Mutex::new(Reads::Applied),
             catch_ups: AtomicUsize::new(0),
             applied: Notify::new(),
+            metrics: Mutex::new(Vec::new()),
         })
     }
 
@@ -177,6 +180,10 @@ fn key(owner: &Owner, id: &str) -> (String, String, String) {
 impl ReplicatedState for FakeState {
     fn replica(&self) -> ReplicaInfo {
         self.replica.lock().unwrap().clone()
+    }
+
+    fn replica_metrics(&self) -> Vec<ReplicaMetric> {
+        self.metrics.lock().unwrap().clone()
     }
 
     fn epoch(&self) -> u64 {

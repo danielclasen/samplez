@@ -302,8 +302,10 @@ impl BlockVerdict {
 pub(crate) struct SlotStats {
     pub late: u32,
     pub on_time: u32,
-    /// Smallest `head - range end` of the late blocks.
-    pub min_slack: i64,
+    /// Smallest `head - range end` of the late blocks read with a head
+    /// above 0; none without one. A head of 0 names no grain: its
+    /// slack would be the negated absolute index.
+    pub min_slack: Option<i64>,
     pub head: Option<u64>,
     /// libmxl's clock when the head was read.
     pub now: u64,
@@ -1366,7 +1368,7 @@ impl Sink for WriterSink<'_> {
 pub(crate) const EMPTY_STATS: SlotStats = SlotStats {
     late: 0,
     on_time: 0,
-    min_slack: 0,
+    min_slack: None,
     head: None,
     now: 0,
     counters: InputCounters {
@@ -2529,12 +2531,11 @@ impl Rt {
                             add(&self.counters.input_late_blocks, 1);
                             s.late += 1;
                             let end = ((k + 1) * self.block).saturating_add_signed(slot.offset);
-                            let slack = slot.state.head as i64 - end as i64;
-                            s.min_slack = if s.late == 1 {
-                                slack
-                            } else {
-                                s.min_slack.min(slack)
-                            };
+                            let head = slot.state.head;
+                            if head > 0 {
+                                let slack = head as i64 - end as i64;
+                                s.min_slack = Some(s.min_slack.map_or(slack, |m| m.min(slack)));
+                            }
                             // The failure path (README): the probe runs
                             // libmxl's flow validity check, a stat() and
                             // path allocations.

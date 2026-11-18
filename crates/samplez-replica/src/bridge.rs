@@ -526,7 +526,7 @@ impl Audio for EngineAudio {
 
     fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, String> {
         let copy = CoreCopy::decode(&core.core).map_err(|e| e.to_string())?;
-        let unresolved = copy.core.unresolved().to_vec();
+        let mut unresolved = copy.core.unresolved().to_vec();
         let mut replay = self.engine.replay(copy).map_err(|e| e.to_string())?;
         let deadline = Instant::now() + REPLAY_WAIT;
         let mut after = core.last_id;
@@ -568,6 +568,13 @@ impl Audio for EngineAudio {
                 Err(e) => return Err(e.to_string()),
             }
         };
+        // Taken late by the donor after its core and held unresolved, as
+        // the donor holds them.
+        for &(id, at) in replay.late() {
+            if !unresolved.iter().any(|u| u.0 == id) {
+                unresolved.push((id, at));
+            }
+        }
         // A page holding a block computed with an input silenced depends
         // on more than the input and the log: not compared.
         let silenced = replay.silenced();
