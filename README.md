@@ -443,10 +443,10 @@ voter count stays odd, so a set starting from its first voter promotes
 no lone learner and grows by two, and its StatefulSet needs
 `podManagementPolicy: Parallel`: under `OrderedReady` the second
 ordinal waits for promotion, never reads ready, and the third is never
-created. Replicas reach each
-other through a headless Service that publishes not-ready addresses
-(`publishNotReadyAddresses: true`), so a replica that reads not ready
-still takes part in the log, contact and resync.
+created. Replicas reach each other through a headless Service that
+publishes not-ready addresses (`publishNotReadyAddresses: true`), so a
+replica that reads not ready still takes part in the log, contact and
+resync.
 
 `Engine::drop_core` drops the RT thread's core while the replica starts:
 the RT thread keeps its writers, flows, hold rings and statuses,
