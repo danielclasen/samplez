@@ -43,16 +43,7 @@ impl Targets {
                 }
             }
         }
-        for (slot, params) in next.strips.iter().enumerate() {
-            let mut was = keyed(self.strips.get(slot).map_or(&[], Vec::as_slice)).peekable();
-            for (key, &param) in keyed(params) {
-                while was.next_if(|&(k, _)| k < key).is_some() {}
-                let held = was.next_if(|&(k, _)| k == key);
-                if held.is_none_or(|(_, w)| !same_bits(w, &param)) {
-                    entries.push(Entry::Strip { slot, param });
-                }
-            }
-        }
+        strip_entries(&self.strips, &next.strips, &mut entries);
         for (slot, flow) in next.flows.iter().enumerate() {
             if self.flows.get(slot) != Some(flow) {
                 entries.push(Entry::Route {
@@ -87,6 +78,23 @@ impl Targets {
             }
         }
         entries
+    }
+}
+
+/// The `Strip` entries of [`Targets::diff`], appended to `entries`. Kept
+/// out of line: inlined into `diff`, it raises the instruction count of
+/// a diff of gains alone.
+#[inline(never)]
+fn strip_entries(was: &[Vec<StripParam>], next: &[Vec<StripParam>], entries: &mut Vec<Entry>) {
+    for (slot, params) in next.iter().enumerate() {
+        let mut held = keyed(was.get(slot).map_or(&[], Vec::as_slice)).peekable();
+        for (key, &param) in keyed(params) {
+            while held.next_if(|&(k, _)| k < key).is_some() {}
+            let w = held.next_if(|&(k, _)| k == key);
+            if w.is_none_or(|(_, w)| !same_bits(w, &param)) {
+                entries.push(Entry::Strip { slot, param });
+            }
+        }
     }
 }
 
@@ -174,7 +182,7 @@ fn same_bits(a: &StripParam, b: &StripParam) -> bool {
 }
 
 /// `params` by ascending key, the later of two with one key counting,
-/// without allocating: in list order when the keys already ascend, as a
+/// and nothing once it has ended, without allocating: in list order when the keys already ascend, as a
 /// product lists them, by selection otherwise.
 fn keyed(params: &[StripParam]) -> impl Iterator<Item = ((u8, usize), &StripParam)> {
     let ascending = params
@@ -195,8 +203,9 @@ fn keyed(params: &[StripParam]) -> impl Iterator<Item = ((u8, usize), &StripPara
                 least = Some((key, p));
             }
         }
-        last = least.map(|(k, _)| k);
-        least
+        let least = least?;
+        last = Some(least.0);
+        Some(least)
     })
 }
 
@@ -704,6 +713,25 @@ mod tests {
                 format!("{:?}", reference_diff(&was, &next)),
                 "{was:?} -> {next:?}"
             );
+        }
+    }
+
+    /// Ended, `keyed` stays ended, in list order and by selection alike.
+    #[test]
+    fn keyed_stays_ended() {
+        let ascending = [
+            StripParam::Trim { db: 1.0 },
+            StripParam::Eq { enabled: true },
+        ];
+        let unordered = [
+            StripParam::Eq { enabled: true },
+            StripParam::Trim { db: 1.0 },
+        ];
+        for params in [&ascending, &unordered] {
+            let mut it = keyed(params);
+            assert_eq!(it.by_ref().count(), 2);
+            assert!(it.next().is_none());
+            assert!(it.next().is_none());
         }
     }
 }
