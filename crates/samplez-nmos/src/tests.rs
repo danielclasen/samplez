@@ -76,6 +76,7 @@ pub(crate) type Call = (Port, Active, Option<Tai>, Tai, u64);
 pub(crate) struct Fake {
     pub flows: Mutex<HashMap<Uuid, FlowSeen>>,
     pub lead: Duration,
+    pub apply_timeout: Option<Duration>,
     pub clock: Paused,
     pub calls: Mutex<Vec<Call>>,
     pub results: Mutex<VecDeque<(Duration, Result<(), Fail>)>>,
@@ -107,6 +108,9 @@ impl Connections for Fake {
     }
     fn lead(&self) -> Duration {
         self.lead
+    }
+    fn apply_timeout(&self) -> Duration {
+        self.apply_timeout.unwrap_or(DEFAULT_APPLY_TIMEOUT)
     }
     fn apply(
         &self,

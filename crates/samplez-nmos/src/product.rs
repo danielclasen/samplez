@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 use crate::tai::Tai;
 
+/// [`Connections::apply_timeout`] unless the product says otherwise.
+pub const DEFAULT_APPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A sender or receiver, by its index in [`crate::NodeModel`].
@@ -86,21 +89,29 @@ pub trait Connections: Send + Sync + 'static {
     /// called for the change to land on that time.
     fn lead(&self) -> Duration;
 
+    /// How long an `apply` may take before it counts as failed: the port
+    /// records the failure and hands the product its next activation.
+    fn apply_timeout(&self) -> Duration {
+        DEFAULT_APPLY_TIMEOUT
+    }
+
     /// Applies an activation. The calls for one port come one at a time,
     /// each once the one before resolved, and each supersedes every earlier
     /// one, also one for the same `at`; `generation` grows with every call
-    /// on the port.
+    /// on the port and with every [`crate::Nmos::external_change`], and a
+    /// call whose generation is below the last one the product saw is
+    /// stale.
     ///
     /// `at` is the activation time of a scheduled activation, `None` for
     /// an immediate one. An immediate activation shows in `/active` before
     /// the call; a scheduled one is applied [`Connections::lead`] before
     /// `at` and shows in `/active` at `at`. A cancel that arrives after
     /// that call is a second call with the connection `/active` still
-    /// shows and the same `at`.
+    /// shows and the same `at`; one that arrives before it means no call.
     ///
     /// Resolves once the product has taken the activation on or failed; a
-    /// failure or a panic turns the port's `master_enable` false in
-    /// `/active`.
+    /// failure, a panic or no answer within [`Connections::apply_timeout`]
+    /// turns the port's `master_enable` false in `/active`.
     fn apply(
         &self,
         port: Port,
@@ -146,6 +157,10 @@ pub struct PortStatus {
     pub applied: Applied,
     /// Activations the product failed to apply since start.
     pub failures: u64,
+    /// How long after its activation time the last scheduled activation
+    /// was written to `/active`; a time already past when it was asked for
+    /// counts.
+    pub late: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

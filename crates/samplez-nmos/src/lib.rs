@@ -33,6 +33,7 @@ pub use model::{
     Asset, BIT_DEPTH, ChannelCount, ChannelDesc, MAX_CHANNELS, MEDIA_TYPE, NmosConfig, NodeModel,
     ReceiverDesc, SAMPLE_RATE, SenderDesc,
 };
+pub use product::DEFAULT_APPLY_TIMEOUT;
 pub use product::{
     Active, Applied, BoxFuture, Connections, Fail, FlowSeen, NmosStatus, NoStore, Port, PortKey,
     PortStatus, Reject, Store,
@@ -42,6 +43,9 @@ pub use uuid;
 
 use connection::PortState;
 use ids::Ids;
+
+/// Bucket bounds of `samplez_nmos_activation_late_seconds`.
+const LATE_BUCKETS: [f64; 8] = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 1.0];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -77,6 +81,8 @@ pub(crate) struct Inner {
     /// One per port, senders first; held across a PATCH to the port's
     /// `/staged`, checks included.
     patching: Vec<tokio::sync::Mutex<()>>,
+    /// Per port as [`Inner::index`] orders them, once registered.
+    late: std::sync::OnceLock<Vec<samplez_service::Histogram>>,
 }
 
 pub(crate) struct State {
@@ -131,9 +137,14 @@ impl Inner {
     }
 
     fn patching(&self, port: Port) -> &tokio::sync::Mutex<()> {
+        &self.patching[self.index(port)]
+    }
+
+    /// The port's place among all ports, senders first.
+    fn index(&self, port: Port) -> usize {
         match port {
-            Port::Sender(i) => &self.patching[i],
-            Port::Receiver(i) => &self.patching[self.model.senders.len() + i],
+            Port::Sender(i) => i,
+            Port::Receiver(i) => self.model.senders.len() + i,
         }
     }
 
@@ -215,6 +226,7 @@ impl Nmos {
                 caps_version,
                 state: Mutex::new(st),
                 patching: (0..ports).map(|_| tokio::sync::Mutex::new(())).collect(),
+                late: std::sync::OnceLock::new(),
             }),
         })
     }
@@ -239,17 +251,43 @@ impl Nmos {
 
     /// A change of a port's connection the product made itself, such as a
     /// switch to another leg: `/active` shows it from now on with a new
-    /// IS-04 version, and the result of an apply still running no longer
-    /// changes it. `/staged` stays as it was.
-    pub fn external_change(&self, port: Port, active: Active) {
+    /// IS-04 version, `/staged` stays as it was, and the activations still
+    /// queued for the port are dropped (a scheduled one still pending
+    /// stays). Returns the change's generation: an apply already running
+    /// carries a lower one, and the product ignores it when it resolves
+    /// after the change; its result no longer changes `/active`.
+    pub fn external_change(&self, port: Port, active: Active) -> u64 {
         let now = self.inner.clock.now();
         let mut st = self.inner.lock();
         let version = st.bump(now);
         let p = st.port_mut(port);
         p.active = active;
         p.version = version;
-        p.supersede();
         p.applied = Applied::Applied;
+        p.changed_by_product()
+    }
+
+    /// Registers `samplez_nmos_activation_late_seconds{port}`, how long
+    /// after its activation time each scheduled activation was written to
+    /// `/active`, in `metrics`. Once; a second call does nothing.
+    pub fn register_metrics(&self, metrics: &samplez_service::Metrics) {
+        let _ = self.inner.late.set(
+            self.inner
+                .ports()
+                .map(|port| {
+                    let label = match self.inner.key(port) {
+                        PortKey::Sender(k) => format!("sender/{k}"),
+                        PortKey::Receiver(k) => format!("receiver/{k}"),
+                    };
+                    metrics.histogram(
+                        "samplez_nmos_activation_late_seconds",
+                        "How long after its activation time a scheduled IS-05 activation was written to /active.",
+                        &[("port", &label)],
+                        &LATE_BUCKETS,
+                    )
+                })
+                .collect(),
+        );
     }
 
     pub fn status(&self) -> NmosStatus {
@@ -267,6 +305,7 @@ impl Nmos {
                         pending: p.pending_at(),
                         applied: p.applied.clone(),
                         failures: p.failures,
+                        late: p.late,
                     }
                 })
                 .collect(),

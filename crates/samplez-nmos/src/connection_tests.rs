@@ -13,6 +13,7 @@ use crate::*;
 
 const C: &str = "/x-nmos/connection/v1.2";
 const OTHER: Uuid = uuid::uuid!("bbbbbbbb-0000-4000-8000-000000000003");
+const THIRD: Uuid = uuid::uuid!("bbbbbbbb-0000-4000-8000-000000000004");
 
 fn node_with(fake: Arc<Fake>, store: &dyn Store, clock: impl TaiClock) -> Nmos {
     Nmos::new(model(), config(), fake, store, clock).unwrap()
@@ -1056,6 +1057,162 @@ async fn an_external_change_shows_in_active_with_a_new_version() {
     );
     assert_ne!(is04(&n, "receivers", &r).await["version"], version);
     assert_eq!(n.status().ports[1].active, switched);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_external_change_drops_the_activations_queued_before_it() {
+    let fake = Arc::new(Fake::default());
+    fake.results
+        .lock()
+        .unwrap()
+        .push_back((Duration::from_millis(50), Ok(())));
+    let n = node(&fake);
+    let r = receiver(&n, 0);
+    for flow in [OTHER, IN_FLOW] {
+        let body = json!({ "transport_params": [{ "mxl_flow_id": flow }], "activation": { "mode": "activate_immediate" } });
+        assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    }
+    settle().await;
+    // The first is with the product, the second still queued.
+    assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    let switched = Active {
+        master_enable: true,
+        peer: None,
+        domain: Some(DOMAIN),
+        flow: Some(THIRD),
+    };
+    let generation = n.external_change(Port::Receiver(0), switched.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The queued one never reached the product; the one in flight carries
+    // a lower generation, so the product knows it is stale.
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].4 < generation);
+    assert_eq!(n.status().ports[1].active, switched);
+    assert_eq!(n.status().ports[1].applied, Applied::Applied);
+    // The next activation carries a higher generation still.
+    let body = json!({ "activation": { "mode": "activate_immediate" } });
+    assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    settle().await;
+    assert!(fake.calls.lock().unwrap()[1].4 > generation);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_apply_that_does_not_resolve_fails_and_the_queue_moves_on() {
+    let fake = Arc::new(Fake {
+        apply_timeout: Some(Duration::from_secs(3)),
+        ..Fake::default()
+    });
+    fake.results
+        .lock()
+        .unwrap()
+        .push_back((Duration::from_secs(3600), Ok(())));
+    let n = node(&fake);
+    let r = receiver(&n, 0);
+    let version = is04(&n, "receivers", &r).await["version"].clone();
+    for flow in [OTHER, IN_FLOW] {
+        let body = json!({ "transport_params": [{ "mxl_flow_id": flow }], "activation": { "mode": "activate_immediate" } });
+        assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    }
+    tokio::time::sleep(Duration::from_millis(2_999)).await;
+    assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    // The stuck one timed out and the next went to the product; it
+    // resolves at once and is the newest, so the port ends applied.
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].1.flow, Some(IN_FLOW));
+    assert_eq!(n.status().ports[1].applied, Applied::Applied);
+    // A stuck newest activation fails the port.
+    fake.results
+        .lock()
+        .unwrap()
+        .push_back((Duration::from_secs(3600), Ok(())));
+    let body = json!({ "activation": { "mode": "activate_immediate" } });
+    assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    let before = is04(&n, "receivers", &r).await["version"].clone();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let a = active(&n, "receivers", &r).await;
+    assert_eq!(a["master_enable"], false);
+    assert_ne!(is04(&n, "receivers", &r).await["version"], before);
+    assert_ne!(before, version);
+    assert!(
+        matches!(&n.status().ports[1].applied, Applied::Failed(m) if m.contains("did not resolve")),
+        "{:?}",
+        n.status().ports[1].applied
+    );
+    assert_eq!(n.status().ports[1].failures, 1);
+    assert_eq!(DEFAULT_APPLY_TIMEOUT, Duration::from_secs(10));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_before_the_product_got_the_activation_hands_it_nothing() {
+    let fake = Arc::new(Fake {
+        lead: Duration::from_millis(40),
+        ..Fake::default()
+    });
+    // An earlier activation keeps the product busy past the lead.
+    fake.results
+        .lock()
+        .unwrap()
+        .push_back((Duration::from_millis(100), Ok(())));
+    let n = node(&fake);
+    let r = receiver(&n, 0);
+    let body = json!({ "master_enable": false, "activation": { "mode": "activate_immediate" } });
+    assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    let body = json!({
+        "master_enable": true,
+        "transport_params": [{ "mxl_flow_id": OTHER }],
+        "activation": { "mode": "activate_scheduled_relative", "requested_time": "0:60000000" },
+    });
+    assert_eq!(
+        patch(&n, "receivers", &r, body).await.0,
+        StatusCode::ACCEPTED
+    );
+    // Past the lead: the scheduled one is queued behind the busy one.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let cancel = json!({ "activation": { "mode": null } });
+    assert_eq!(patch(&n, "receivers", &r, cancel).await.0, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(fake.ends_on().map(|a| a.master_enable), Some(false));
+    assert_eq!(active(&n, "receivers", &r).await["master_enable"], false);
+}
+
+#[tokio::test(start_paused = true)]
+async fn how_late_a_scheduled_activation_fired_is_recorded() {
+    let fake = Arc::new(Fake::default());
+    let n = node(&fake);
+    let metrics = samplez_service::Metrics::default();
+    n.register_metrics(&metrics);
+    let s = sender(&n);
+    assert_eq!(n.status().ports[0].late, None);
+    let body = json!({
+        "master_enable": false,
+        "activation": { "mode": "activate_scheduled_relative", "requested_time": "0:200000000" },
+    });
+    assert_eq!(patch(&n, "senders", &s, body).await.0, StatusCode::ACCEPTED);
+    // Once the task sleeps, the TAI clock steps 3 ms ahead of the timer
+    // that wakes it.
+    settle().await;
+    fake.clock.skip(Duration::from_millis(3));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(n.status().ports[0].late, Some(Duration::from_millis(3)));
+    let text = metrics.render();
+    assert!(
+        text.contains(
+            "samplez_nmos_activation_late_seconds_bucket{port=\"sender/pgm\",le=\"0.005\"} 1"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "samplez_nmos_activation_late_seconds_bucket{port=\"sender/pgm\",le=\"0.002\"} 0"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("samplez_nmos_activation_late_seconds_count{port=\"receiver/spare\"} 0"));
 }
 
 #[tokio::test(start_paused = true)]

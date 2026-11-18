@@ -119,6 +119,8 @@ struct Job {
     /// Where the result goes instead of [`settle`]: a scheduled activation
     /// settles once `/active` shows it.
     reply: Option<oneshot::Sender<Result<(), String>>>,
+    /// The scheduled activation it applies lead early.
+    schedule: Option<u64>,
 }
 
 /// A sender's or receiver's IS-04 version and IS-05 state.
@@ -135,6 +137,9 @@ pub(crate) struct PortState {
     /// works them off.
     queue: VecDeque<Job>,
     working: bool,
+    /// How long after its activation time the last scheduled activation
+    /// was written to `/active`.
+    pub late: Option<Duration>,
     /// Counts scheduled activations; a firing one checks it is still the
     /// pending one.
     schedules: u64,
@@ -159,6 +164,7 @@ impl PortState {
             generation: 0,
             queue: VecDeque::new(),
             working: false,
+            late: None,
             schedules: 0,
             applied: Applied::Initial,
             failures: 0,
@@ -169,11 +175,19 @@ impl PortState {
         self.pending.as_ref().map(|p| p.at)
     }
 
-    /// Marks something that supersedes every apply before it, such as a
-    /// change the product made itself.
+    /// Marks something that supersedes every apply before it.
     pub fn supersede(&mut self) -> u64 {
         self.generation += 1;
         self.generation
+    }
+
+    /// A change the product made itself supersedes every apply before it
+    /// and drops those still queued, so none reaches the product after the
+    /// change. Scheduled activations still pending stay queued: they take
+    /// effect at their time, after the change.
+    pub fn changed_by_product(&mut self) -> u64 {
+        self.queue.retain(|j| j.schedule.is_some());
+        self.supersede()
     }
 }
 
@@ -605,12 +619,14 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
             p.staged = staged.clone();
             if let Some(pending) = p.pending.take() {
                 pending.task.abort();
-                if pending.applied {
+                let queued = p.queue.len();
+                p.queue.retain(|j| j.schedule != Some(pending.id));
+                if pending.applied && p.queue.len() == queued {
                     // The product has it already: hand it what stays active,
                     // for the same time, so it ends where `/active` is.
                     let active = p.active.clone();
                     p.applied = Applied::Applying;
-                    enqueue(inner, &mut st, port, active, Some(pending.at), None);
+                    enqueue(inner, &mut st, port, active, Some(pending.at), None, None);
                 }
             }
             Ok((StatusCode::OK, staged_json(port, &staged)))
@@ -630,7 +646,7 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
             let mut st = inner.lock();
             st.port_mut(port).staged = staged;
             write_active(&mut st, port, active.clone(), activation, now);
-            enqueue(inner, &mut st, port, active, None, None);
+            enqueue(inner, &mut st, port, active, None, None, None);
             Ok((StatusCode::OK, staged_json(port, &response)))
         }
         Some(Some((mode, requested))) => {
@@ -694,6 +710,7 @@ fn enqueue(
     active: Active,
     at: Option<Tai>,
     reply: Option<oneshot::Sender<Result<(), String>>>,
+    schedule: Option<u64>,
 ) -> u64 {
     let p = st.port_mut(port);
     let generation = p.supersede();
@@ -702,6 +719,7 @@ fn enqueue(
         active,
         at,
         reply,
+        schedule,
     });
     if !p.working {
         p.working = true;
@@ -711,7 +729,9 @@ fn enqueue(
 }
 
 /// Hands the port's queued applies to the product, each once the one before
-/// resolved. A panicking apply is a failed one.
+/// resolved. A panicking apply is a failed one, and so is one that has not
+/// resolved within [`Connections::apply_timeout`]: it is dropped and the
+/// queue moves on.
 async fn work(inner: Arc<Inner>, port: Port) {
     loop {
         let job = {
@@ -730,9 +750,15 @@ async fn work(inner: Arc<Inner>, port: Port) {
             let (active, at, generation) = (job.active, job.at, job.generation);
             tokio::spawn(async move { inner.conns.apply(port, active, at, generation).await })
         };
-        let result = match apply.await {
-            Ok(r) => r.map_err(|f| f.0),
-            Err(e) => Err(format!("apply did not complete: {e}")),
+        let limit = inner.conns.apply_timeout();
+        let abort = apply.abort_handle();
+        let result = match tokio::time::timeout(limit, apply).await {
+            Ok(Ok(r)) => r.map_err(|f| f.0),
+            Ok(Err(e)) => Err(format!("apply did not complete: {e}")),
+            Err(_) => {
+                abort.abort();
+                Err(format!("apply did not resolve within {limit:?}"))
+            }
         };
         match job.reply {
             Some(reply) => {
@@ -780,7 +806,16 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
                 _ => return,
             }
             let (reply, applied) = oneshot::channel();
-            enqueue(&inner, &mut st, port, active.clone(), Some(at), Some(reply));
+            let active = active.clone();
+            enqueue(
+                &inner,
+                &mut st,
+                port,
+                active,
+                Some(at),
+                Some(reply),
+                Some(id),
+            );
             Some(applied)
         }
         Err(_) => None,
@@ -808,7 +843,13 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
             flow: staged.flow.resolve(inner.own(port).1),
         });
         write_active(&mut st, port, active, activation, at);
-        st.port_mut(port).supersede()
+        let late = inner.clock.now().since(at);
+        if let Some(h) = inner.late.get() {
+            h[inner.index(port)].observe(late.as_secs_f64());
+        }
+        let p = st.port_mut(port);
+        p.late = Some(late);
+        p.supersede()
     };
     let result = match (target, applied) {
         (Err(reason), _) => Err(reason),

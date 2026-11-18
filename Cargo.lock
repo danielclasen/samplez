@@ -2193,6 +2193,7 @@ dependencies = [
  "axum",
  "jsonschema",
  "libc",
+ "samplez-service",
  "serde_json",
  "tokio",
  "tower",
