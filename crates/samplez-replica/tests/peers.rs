@@ -154,7 +154,7 @@ impl Set {
             settings,
             raft,
             &self.root.join(id.to_string()),
-            Paths::default(),
+            Arc::new(Paths::default),
             Network { pool: pool.clone() },
             pool.clone(),
             Arc::new(|| 0),

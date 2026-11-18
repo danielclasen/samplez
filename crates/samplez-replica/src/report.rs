@@ -140,6 +140,11 @@ pub struct Own {
     /// The pod's revision, its `controller-revision-hash` label.
     #[serde(default)]
     pub revision: Option<String>,
+    /// The product configuration hash it applies the log under
+    /// ([`crate::state_machine::Product::config_hash`]); none from a
+    /// replica that does not report one.
+    #[serde(default)]
+    pub config: Option<u64>,
 }
 
 /// One page of one output as the sender computed it (plan 2.11, page

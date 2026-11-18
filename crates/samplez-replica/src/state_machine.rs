@@ -11,9 +11,9 @@ use crate::entry::{
 use crate::snapshot::Replicated;
 
 /// The product's state, applied in log order on every replica. A
-/// snapshot install loads into a [`Default`] one before it replaces the
-/// state.
-pub trait Product: Default + Send + 'static {
+/// snapshot install loads into an empty one its [`Factory`] builds, with
+/// the replica's configuration, before it replaces the state.
+pub trait Product: Send + 'static {
     /// What one command or expiry changed, as [`Product::delta`] gets it
     /// back.
     type Change;
@@ -62,6 +62,16 @@ pub trait Product: Default + Send + 'static {
     /// value.
     fn paths(&self, command: &[u8]) -> Vec<String>;
 
+    /// A hash of the configuration the product was built with that
+    /// changes how it applies a command or loads a saved state, 0 for a
+    /// product without one. Every member of a set must hold equal
+    /// configuration: product state is shared by every replica, so a
+    /// member that applied a command under another configuration would
+    /// hold another state. A snapshot from a replica with another hash is
+    /// not installed, and the leader orders no client command while a
+    /// member reports another one.
+    fn config_hash(&self) -> u64;
+
     /// The input slot a `Route` body re-routes, so the state machine keeps
     /// only the latest passed route per slot; none keeps every distinct
     /// passed route.
@@ -69,6 +79,10 @@ pub trait Product: Default + Send + 'static {
         None
     }
 }
+
+/// Builds an empty product with the replica's configuration: the state a
+/// store opens into and every snapshot install loads into.
+pub type Factory<P> = std::sync::Arc<dyn Fn() -> P + Send + Sync>;
 
 /// How the product applied a command or an expiry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,6 +566,8 @@ pub(crate) mod tests {
         pub forgotten: Vec<SessionKey>,
         /// Each [`Product::delta`] call's stamp and its changes' at_index.
         pub delta_calls: std::sync::Mutex<Vec<(u64, Vec<Option<u64>>)>>,
+        /// The configuration it was built with; not saved.
+        pub config: u64,
     }
 
     pub fn parse(command: &[u8]) -> (String, String, u64) {
@@ -613,6 +629,9 @@ pub(crate) mod tests {
         }
         fn paths(&self, command: &[u8]) -> Vec<String> {
             vec![parse(command).0]
+        }
+        fn config_hash(&self) -> u64 {
+            self.config
         }
         fn save(&self) -> Vec<u8> {
             serde_json::to_vec(&(&self.values, self.applied)).expect("encodes")

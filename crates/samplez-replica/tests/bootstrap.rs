@@ -312,7 +312,7 @@ impl Set {
         let dir = self.dir(slot);
         let volume = Volume::open(&dir).unwrap();
         let limits = Limits::defaults(RATE);
-        let store = Store::open(&dir, Paths::default(), limits).unwrap();
+        let store = Store::open(&dir, Arc::new(Paths::default), limits).unwrap();
         let prepared = bootstrap::prepare(&volume, slot, store.pristine()).unwrap();
         let tls = Arc::new(PeerTls::new(&self.tls[&slot], &Metrics::default()).unwrap());
         let pool = Pool::new(tls.clone());

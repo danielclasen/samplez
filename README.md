@@ -256,6 +256,17 @@ lag beyond the horizon drops it again. The core is rebuilt only from the
 product state that `EngineAudio::with_rebuild` supplies: a product that
 embeds the replica without one leaves every replica in `starting`.
 
+A replica's store builds its empty product with the `Factory` it is
+given, at open and for every snapshot it installs, so the product keeps
+the replica's configuration. Product state is shared by every replica,
+so every member, the witness included, needs equal configuration as far
+as it changes how a command applies or a saved state loads
+(`Product::config_hash`). Reports and snapshots carry the hash: a
+snapshot from a replica of another hash is not installed, which stops
+the replica's storage, and the leader orders no client command while a
+member reports another hash (`unavailable`, naming it). A configuration
+change of that kind is made with every replica stopped.
+
 A replica set agrees on its cluster id through the marker ConfigMap that
 ordinal 0 creates on an empty volume (`bootstrap::Kube`). Given the audio
 StatefulSet's name, the one `rollout::follow` reads, with

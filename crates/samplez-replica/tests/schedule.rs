@@ -458,3 +458,56 @@ async fn a_command_asking_for_an_index_off_a_block_start_is_ordered_at_the_next(
     };
     assert_eq!(commands[0].at_index, Some(asked.next_multiple_of(BLOCK)));
 }
+
+/// Starts a set whose replica `odd` holds product configuration 5 and
+/// every other replica 0, and submits one command at each replica: all
+/// are refused unavailable, naming `odd`, and none is ordered. Product
+/// state is shared by every replica, so a member of another configuration
+/// would apply the command into another state.
+async fn refused_while_one_configuration_differs(ids: Option<Vec<NodeId>>, odd: NodeId) {
+    let set = Set::start(Options {
+        contact: Some(timing()),
+        ids,
+        configs: vec![(odd, 5)],
+        ..Options::default()
+    })
+    .await;
+    sleep(Duration::from_millis(50)).await;
+    let leader = set.leader().await;
+    let before = entries(&set, leader).len();
+    use samplez_replica::membership::{Slot, slot_of};
+    let audio: Vec<NodeId> = set
+        .ids()
+        .filter(|&id| slot_of(id) != Slot::Witness)
+        .collect();
+    for at in audio {
+        let refused = set
+            .replica(at)
+            .submit(&owner("s"), &format!("c-{at}"), Bytes::from("gain=1@1"))
+            .await
+            .expect_err("refused");
+        assert_eq!(refused.reason, Reason::Unavailable);
+        assert!(
+            refused
+                .detail
+                .contains(&format!("config: replica {odd} differs")),
+            "{}",
+            refused.detail
+        );
+    }
+    assert_eq!(entries(&set, leader).len(), before, "ordered");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_voter_of_another_configuration_stops_client_writes() {
+    refused_while_one_configuration_differs(None, 2).await;
+}
+
+/// The witness applies the log into its own product state like every
+/// voter, so it needs the same configuration.
+#[tokio::test(start_paused = true)]
+async fn a_witness_of_another_configuration_stops_client_writes() {
+    use samplez_replica::membership::{Slot, node_id};
+    let witness = node_id(Slot::Witness, 7);
+    refused_while_one_configuration_differs(Some(vec![0, 1, witness]), witness).await;
+}

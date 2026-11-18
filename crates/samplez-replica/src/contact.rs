@@ -332,6 +332,10 @@ pub trait LogView: Send + Sync + 'static {
     fn paths(&self, _command: &[u8]) -> Vec<String> {
         Vec::new()
     }
+    /// The product's configuration hash, none when it is not known.
+    fn config_hash(&self) -> Option<u64> {
+        None
+    }
     /// The restamps behind the entry at `index`, as applied.
     fn restamps(&self, _index: u64) -> u32 {
         0
@@ -376,6 +380,9 @@ impl<P: Product> LogView for Store<P> {
     }
     fn paths(&self, command: &[u8]) -> Vec<String> {
         Store::paths(self, command)
+    }
+    fn config_hash(&self) -> Option<u64> {
+        Some(Store::config_hash(self))
     }
     fn restamps(&self, index: u64) -> u32 {
         Store::restamps(self, index)
@@ -1089,6 +1096,7 @@ impl Contact {
         } else {
             st.own.clock.tai_offset_s = self.clocks.tai_offset_s();
         }
+        st.own.config = self.log.config_hash();
         st.judged = self.log.judged();
         st.lead.roll();
         self.verify(st, now);
@@ -2257,6 +2265,21 @@ impl Contact {
     /// ([`Audio::admits`]); the witness has none and takes any.
     pub fn admits(&self, request: &Request) -> Result<(), String> {
         self.audio.as_ref().map_or(Ok(()), |a| a.admits(request))
+    }
+
+    /// A member of the applied membership, learners included, whose
+    /// newest report, direct or relayed, names another product
+    /// configuration hash than this replica's: it would apply a command
+    /// into another state, so the leader orders none while one does. A
+    /// report without a hash names none.
+    pub fn config_differs(&self) -> Option<NodeId> {
+        let ours = self.log.config_hash()?;
+        let st = self.lock();
+        let now = Instant::now();
+        self.copies(&st, now).into_iter().find_map(|(id, _, own)| {
+            (st.members.addrs.contains_key(&id) && own.config.is_some_and(|c| c != ours))
+                .then_some(id)
+        })
     }
 
     /// The engine refused an appended entry: the replica's output no

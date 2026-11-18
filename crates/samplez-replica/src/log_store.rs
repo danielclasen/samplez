@@ -34,7 +34,7 @@ use crate::entry::{Body, NodeId, Request, Response};
 use crate::snapshot::{
     StoredEntry, StoredLogId, StoredMembershipConfig, StoredPayload, StoredSnapshot, StoredVote,
 };
-use crate::state_machine::{Product, StateMachine};
+use crate::state_machine::{Factory, Product, StateMachine};
 
 type Error = StorageError<NodeId>;
 
@@ -75,6 +75,10 @@ struct Inner<P> {
 /// with an install.
 pub struct Store<P> {
     inner: Arc<Mutex<Inner<P>>>,
+    /// Builds the empty product a snapshot install loads into.
+    factory: Factory<P>,
+    /// The product's configuration hash, fixed when the store opened.
+    config: u64,
     snapshots: Arc<tokio::sync::Mutex<()>>,
     /// Added to every fsynced write, for tests of a slow volume.
     #[cfg(test)]
@@ -85,6 +89,8 @@ impl<P> Clone for Store<P> {
     fn clone(&self) -> Self {
         Store {
             inner: self.inner.clone(),
+            factory: self.factory.clone(),
+            config: self.config,
             snapshots: self.snapshots.clone(),
             #[cfg(test)]
             sync_delay: self.sync_delay,
@@ -213,16 +219,25 @@ fn replace(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
 }
 
 impl<P: Product> Store<P> {
+    /// The product's configuration hash
+    /// ([`Product::config_hash`]).
+    pub fn config_hash(&self) -> u64 {
+        self.config
+    }
+
     /// The product paths `command` sets.
     pub fn paths(&self, command: &[u8]) -> Vec<String> {
         self.lock().sm.product.paths(command)
     }
 
-    /// Opens the storage in `dir`, creating it when absent, with `product`
-    /// as the empty state the snapshot (if any) is loaded into.
-    pub fn open(dir: &Path, product: P, limits: Limits) -> io::Result<Store<P>> {
+    /// Opens the storage in `dir`, creating it when absent, with an empty
+    /// product `factory` builds as the state the snapshot (if any) is
+    /// loaded into. Every snapshot installed later loads into one it
+    /// builds as well, so the product keeps the replica's configuration.
+    pub fn open(dir: &Path, factory: Factory<P>, limits: Limits) -> io::Result<Store<P>> {
         fs::create_dir_all(dir)?;
-        let mut sm = StateMachine::new(product, limits);
+        let mut sm = StateMachine::new(factory(), limits);
+        let config = sm.product.config_hash();
         let mut last_applied = None;
         let mut membership = StoredMembershipConfig::default();
         let snapshot = match fs::read(dir.join("snapshot")) {
@@ -278,6 +293,8 @@ impl<P: Product> Store<P> {
         sync_dir(dir)?;
         Ok(Store {
             inner: Arc::new(Mutex::new(inner)),
+            factory,
+            config,
             snapshots: Arc::default(),
             #[cfg(test)]
             sync_delay: std::time::Duration::ZERO,
@@ -506,6 +523,7 @@ impl<P: Product> RaftSnapshotBuilder<TypeConfig> for Store<P> {
                 last_applied: last,
                 membership: inner.membership.clone(),
                 state: inner.sm.save(),
+                config: Some(self.config),
             };
             (inner.dir.clone(), snapshot)
         };
@@ -674,6 +692,22 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
             ),
         };
         let stored: StoredSnapshot = serde_json::from_slice(&bytes).map_err(|e| read_error(&e))?;
+        // A state applied under another configuration is another state:
+        // this replica stops rather than load it.
+        if let Some(theirs) = stored.config
+            && theirs != self.config
+        {
+            tracing::error!(
+                ours = self.config,
+                theirs,
+                "a snapshot from a replica of another product configuration"
+            );
+            return Err(read_error(&format!(
+                "the snapshot's product configuration hash {theirs} is not this \
+                 replica's, {}",
+                self.config
+            )));
+        }
         let _installing = self.snapshots.lock().await;
         // Loaded beside the state, then written, then swapped in: a
         // snapshot that does not load or a failed write leaves the state
@@ -682,7 +716,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
             let inner = self.lock();
             (inner.dir.clone(), inner.limits)
         };
-        let mut sm = StateMachine::new(P::default(), limits);
+        let mut sm = StateMachine::new((self.factory)(), limits);
         sm.load(stored.state.clone(), limits)
             .map_err(|e| read_error(&e))?;
         blocking(move || replace(&dir, "snapshot", &bytes))
@@ -703,7 +737,12 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, Error> {
-        let snapshot = self.lock().snapshot.clone();
+        // Sent under this replica's configuration: one changed with every
+        // replica stopped applies to the saved state as its load does.
+        let snapshot = self.lock().snapshot.clone().map(|s| StoredSnapshot {
+            config: Some(self.config),
+            ..s
+        });
         Ok(snapshot.map(|snapshot| Snapshot {
             meta: meta(&snapshot),
             snapshot: Box::new(Cursor::new(
@@ -728,7 +767,7 @@ mod tests {
     }
 
     fn open(dir: &Path) -> Store<Paths> {
-        Store::open(dir, Paths::default(), Limits::defaults(48_000)).expect("opens")
+        Store::open(dir, Arc::new(Paths::default), Limits::defaults(48_000)).expect("opens")
     }
 
     fn entry(index: u64) -> openraft::Entry<TypeConfig> {
@@ -869,7 +908,7 @@ mod tests {
         let len = bytes.len();
         bytes[HEAD + 2] ^= 0x20;
         fs::write(dir.join("log"), &bytes).expect("damage");
-        let Err(e) = Store::open(&dir, Paths::default(), Limits::defaults(48_000)) else {
+        let Err(e) = Store::open(&dir, Arc::new(Paths::default), Limits::defaults(48_000)) else {
             panic!("opened a damaged log");
         };
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
@@ -930,7 +969,7 @@ mod tests {
             + 8;
         bytes[at] = b'5';
         fs::write(dir.join("log"), &bytes).expect("damage");
-        let Err(e) = Store::open(&dir, Paths::default(), Limits::defaults(48_000)) else {
+        let Err(e) = Store::open(&dir, Arc::new(Paths::default), Limits::defaults(48_000)) else {
             panic!("read a damaged frame back");
         };
         assert!(e.to_string().contains("offset 0"), "{e}");
@@ -1052,6 +1091,96 @@ mod tests {
         let second = store.build_snapshot().await.expect("build").meta;
         assert_eq!(first.last_log_id, second.last_log_id);
         assert_ne!(first.snapshot_id, second.snapshot_id);
+    }
+
+    fn open_as(dir: &Path, config: u64) -> Store<Paths> {
+        let factory: Factory<Paths> = Arc::new(move || Paths {
+            config,
+            ..Paths::default()
+        });
+        Store::open(dir, factory, Limits::defaults(48_000)).expect("opens")
+    }
+
+    /// An installed snapshot loads into a product the store's factory
+    /// built, so the replica keeps its configuration: a product built
+    /// empty by its `Default` would hold none.
+    #[tokio::test]
+    async fn an_installed_snapshot_keeps_the_replicas_configuration() {
+        let mut store = open_as(&dir("cfg-from"), 7);
+        let entries: Vec<_> = (1..=3).map(entry).collect();
+        store.append_to_log(entries.clone()).await.expect("append");
+        store.apply_to_state_machine(&entries).await.expect("apply");
+        let snapshot = store.build_snapshot().await.expect("build");
+        let mut other = open_as(&dir("cfg-to"), 7);
+        other
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install");
+        assert_eq!(other.applied_index(), 3);
+        assert_eq!(other.with_state(|sm| sm.product.config), 7);
+        assert_eq!(other.config_hash(), 7);
+    }
+
+    /// A snapshot from a replica of another product configuration is not
+    /// installed: the state stays as it was.
+    #[tokio::test]
+    async fn a_snapshot_of_another_configuration_is_refused() {
+        let mut store = open_as(&dir("cfg-other-from"), 8);
+        let entries: Vec<_> = (1..=3).map(entry).collect();
+        store.append_to_log(entries.clone()).await.expect("append");
+        store.apply_to_state_machine(&entries).await.expect("apply");
+        let snapshot = store.build_snapshot().await.expect("build");
+        let mut other = open_as(&dir("cfg-other-to"), 7);
+        let before = other.with_state(|sm| sm.save());
+        let installed = other
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await;
+        assert!(installed.is_err());
+        assert_eq!(other.applied_index(), 0);
+        assert_eq!(other.with_state(|sm| sm.save()), before);
+        assert_eq!(other.installs(), 0);
+    }
+
+    /// A snapshot is sent under the sender's configuration now: one saved
+    /// before the configuration changed with every replica stopped, and
+    /// one from a replica that recorded none, still install.
+    #[tokio::test]
+    async fn a_snapshot_is_sent_under_the_senders_configuration() {
+        let dir_from = dir("cfg-sent-from");
+        let mut store = open_as(&dir_from, 7);
+        let entries: Vec<_> = (1..=3).map(entry).collect();
+        store.append_to_log(entries.clone()).await.expect("append");
+        store.apply_to_state_machine(&entries).await.expect("apply");
+        store.build_snapshot().await.expect("build");
+        drop(store);
+        let mut store = open_as(&dir_from, 9);
+        let current = store
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("a snapshot");
+        let sent: StoredSnapshot =
+            serde_json::from_slice(current.snapshot.get_ref()).expect("decodes");
+        assert_eq!(sent.config, Some(9));
+        let mut other = open_as(&dir("cfg-sent-to"), 9);
+        other
+            .install_snapshot(&current.meta, current.snapshot)
+            .await
+            .expect("install");
+        let unrecorded = StoredSnapshot {
+            config: None,
+            ..sent
+        };
+        let mut third = open_as(&dir("cfg-sent-none"), 9);
+        third
+            .install_snapshot(
+                &current.meta,
+                Box::new(Cursor::new(
+                    serde_json::to_vec(&unrecorded).expect("encodes"),
+                )),
+            )
+            .await
+            .expect("install");
     }
 
     /// A snapshot that decodes but does not load leaves the state and the

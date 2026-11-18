@@ -195,4 +195,9 @@ pub struct StoredSnapshot {
     pub last_applied: Option<StoredLogId>,
     pub membership: StoredMembershipConfig,
     pub state: Replicated,
+    /// The product configuration hash of the replica that sent it
+    /// ([`crate::state_machine::Product::config_hash`]); none from a
+    /// replica that did not record one.
+    #[serde(default)]
+    pub config: Option<u64>,
 }
