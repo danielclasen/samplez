@@ -24,8 +24,9 @@ matrix, are built on it.
 - Input selection by flow channel (`flowChannels`), re-routing to another
   flow with a crossfade, and fade-in and silencing of inputs at a sample
   index
-- A channel strip per input of 1 to 8 channels: trim, per-leg trim and
-  polarity, high-pass, four-band equaliser, gate and compressor
+- A channel strip per input, set by strip entries for inputs of up to 8
+  channels: trim, per-leg trim and polarity, high-pass, four-band
+  equaliser, gate and compressor
 - A gain matrix with ramped coefficients; in replicated mode the engine
   entries of one log entry are folded and applied whole at its index
 - Meters per output and meter: sample peak, RMS, true peak and EBU R 128
@@ -150,9 +151,13 @@ Table 3; without it every channel weighs 1), and `meters`, each with a
 `name`, `channels` and `loudnessChannels`: matrix columns after the
 outputs' that are computed and metered and written to no flow.
 
-`sampleRate` takes 48000 only, `blockSize` 16 to 1024, `rt.priority` 1
-to 99 and `rt.rtCpu` `auto`, `none`, `first`, `last` or an index into
-the allowed CPUs. Unknown keys are refused. Output flow ids are unique,
+`sampleRate` takes 48000 only, `blockSize` 16 to 1024, `holdMs`,
+`contactWindowMs` and `resyncBudgetMs` 1 to 1000, `historySlackMs` at
+most 1000 and at least two blocks, `rampSamples` at most
+`samplez_dsp::MAX_EXACT_RAMP_LEN` (2^23), every matrix gain finite and
+within `samplez_dsp::MAX_GAIN` (1e6), `rt.priority` 1 to 99 and
+`rt.rtCpu` `auto`, `none`, `first`, `last` or an index into the allowed
+CPUs. Unknown keys are refused. Output flow ids are unique,
 and no input reads a flow an output writes in the same domain.
 
 An input's `channels` are its legs: its matrix rows, meter and strip.
@@ -180,8 +185,8 @@ to start with status 1.
 
 Each output's and each meter's status carries its meters: sample peak,
 RMS and true peak per channel over the last 100 ms, the largest true
-peak, momentary and short-term loudness since the measurement started,
-and momentary, short-term and integrated loudness and loudness
+peak, the largest momentary and the largest short-term loudness since
+the measurement started, and momentary, short-term and integrated loudness and loudness
 range per EBU R 128. Each input's status carries the sample peak and
 RMS per channel and the momentary loudness of the input after its
 strip, read or silenced; it has no true peak.
@@ -235,9 +240,9 @@ asks before it orders a command and refuses it to its client
 slot an `InputUp` or `Route` names, so every subset of an admitted
 entry, which a restamp may keep, is admitted too. One of no entries
 appends nothing. A replicated engine refuses no committed entry for
-room: up to 256 its ring has no room for wait in its log; past that it
-drops them and its core (`log_overflows`) and the replica is rebuilt
-from product state. The RT thread
+room: up to 256 committed entries (`engine::WAITING`) wait in its log
+for room in its entry ring; past that it drops them and its core
+(`log_overflows`), and the replica is rebuilt or resynced. The RT thread
 hands its spent batches to the supervisor to be freed, leaving the
 return ring room for the generations and writers it hands back; one it
 cannot hand off is leaked and counted in the status (`batches_leaked`).
