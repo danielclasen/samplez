@@ -22,8 +22,9 @@ pub mod transfer;
 pub use config::Config;
 pub use ducks::{DuckMeter, DuckSetting, DuckTargets};
 pub use engine::{
-    ClockStatus, ControlError, Engine, Entry, EntryError, GainError, GenerationStatus, InputState,
-    InputStatus, MeterStatus, OutputStatus, Progress, Replication, Report, ResetError, Status,
+    ClockStatus, ControlError, DuckError, Engine, Entry, EntryError, GainError, GenerationStatus,
+    InputState, InputStatus, MeterStatus, OutputStatus, Progress, Replication, Report, ResetError,
+    Status,
 };
 pub use meters::{InputMeters, OutputMeters};
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};

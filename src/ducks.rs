@@ -12,7 +12,7 @@
 
 use samplez_dsp::duck::{DEPTH_DB, KEY_GAIN, MAX_KEYS};
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Detector, DetectorParams, DuckMode, DuckParam, MAX_DUCKS, Matrix, PlanarBuffer};
+use samplez_dsp::{Detector, DetectorParams, DuckMode, DuckParam, MAX_DUCKS, PlanarBuffer};
 use serde::{Deserialize, Serialize};
 
 use crate::rt_loop::SLICE;
@@ -344,6 +344,15 @@ impl DuckCore {
         }
     }
 
+    /// Takes `index` as the next sample, as [`DuckCore::to`] does, with
+    /// no samples passed over.
+    pub fn align(&mut self, index: u64) {
+        for d in &mut self.detectors {
+            d.align(index);
+        }
+        self.pos = Some(index);
+    }
+
     /// Settles detector state built from values at sample index `at`:
     /// key filter ramps ended, a detector its manual controls trigger at
     /// full depth, the others at rest.
@@ -359,36 +368,6 @@ impl DuckCore {
         }
         self.pos = Some(at);
     }
-}
-
-/// Sets `matrix` to a product state's duck masks, by coefficient, and
-/// depths, by input channel and group, and fades its gains in from
-/// silence over `ramp` samples as [`Matrix::fade_in`] does, whatever the
-/// matrix held: the masks and depths at their targets, so a coefficient
-/// with a mask fades in ducked, from the sample index `at` its position
-/// in the interval follows. Whether any gain ramps.
-pub(crate) fn fill_matrix(
-    matrix: &mut Matrix,
-    gains: &[f32],
-    masks: &[u8],
-    depths: &[f32],
-    ramp: u32,
-    at: u64,
-) -> bool {
-    let m = matrix.outputs();
-    // No mask while the gains fade in: no term crossfades from no duck.
-    for c in 0..masks.len() {
-        let _ = matrix.set_mask(c / m, c % m, 0, 0);
-    }
-    for (c, &db) in depths.iter().enumerate() {
-        let _ = matrix.set_depth(c / MAX_DUCKS, c % MAX_DUCKS, db, 0);
-    }
-    let ramping = matrix.fade_in(gains, ramp);
-    for (c, &k) in masks.iter().enumerate().filter(|(_, k)| **k != 0) {
-        let _ = matrix.set_mask(c / m, c % m, k, 0);
-    }
-    matrix.align(at);
-    ramping
 }
 
 /// One duck group's readings over one slice, from the RT thread.

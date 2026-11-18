@@ -7,7 +7,7 @@ mod common;
 use std::time::Duration;
 
 use common::{B, Domain, MARGIN, Pilot, config, new_id, read_blocks, wait_for};
-use samplez::{DuckSetting, Entry, EntryError, GainError, InputState};
+use samplez::{DuckError, DuckSetting, Entry, EntryError, InputState};
 use samplez_dsp::{DetectorParams, DuckMode, duck_gain};
 
 /// Every duck entry an engine cannot hold is refused before anything is
@@ -129,11 +129,11 @@ fn a_duck_group_ducks_its_masked_coefficients_from_its_index() {
     });
     assert!(matches!(
         e.set_duck(0, DuckSetting::Keys(vec![(0, 1.0); 9]), 0),
-        Err(GainError::Invalid(_))
+        Err(DuckError::Invalid(_))
     ));
     assert!(matches!(
         e.set_duck_mask(1, 1, 1, 0),
-        Err(GainError::Invalid(_))
+        Err(DuckError::Invalid(_))
     ));
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap().k;
     let at = (rx.try_iter().last().map_or(first, |v| v.k) + 100) * B;

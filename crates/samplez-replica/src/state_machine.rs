@@ -294,6 +294,12 @@ pub struct StateMachine<P> {
     /// Not replicated: the targets as last derived, a product that drives
     /// an engine only.
     image: Option<samplez::Targets>,
+    /// The duck masks of the state the replica opened or installed a
+    /// snapshot at, which its engine is rebuilt from, and every one
+    /// derived since, ORed together: the coefficients an engine may hold
+    /// a mask other than 0 for, which a re-assertion clears. None for a
+    /// product without targets, every coefficient then counting.
+    masked: Option<Vec<Vec<u8>>>,
     /// Not replicated: the records derived since start or load, by log
     /// index, kept [`RECORDS_KEPT`] past their index; shared, so a reader
     /// under the store lock copies none of a record's entries.
@@ -330,10 +336,29 @@ impl<P: Product> StateMachine<P> {
             derived: BTreeMap::new(),
             protocol: 0,
             image: None,
+            masked: None,
             records: BTreeMap::new(),
             records_from: 0,
         }
         .imaged()
+    }
+
+    /// ORs the duck masks of `targets` into [`StateMachine::masked`].
+    fn mask(&mut self, targets: &samplez::Targets) {
+        let Some(masked) = self.masked.as_mut() else {
+            return;
+        };
+        if masked.len() < targets.masks.len() {
+            masked.resize(targets.masks.len(), Vec::new());
+        }
+        for (held, row) in masked.iter_mut().zip(&targets.masks) {
+            if held.len() < row.len() {
+                held.resize(row.len(), 0);
+            }
+            for (h, &k) in held.iter_mut().zip(row) {
+                *h |= k;
+            }
+        }
     }
 
     /// With [`StateMachine::image`] taken from the product.
@@ -343,6 +368,8 @@ impl<P: Product> StateMachine<P> {
         } else {
             None
         };
+        // An engine is rebuilt from this state: its masks are these.
+        self.masked = self.image.as_ref().map(|t| t.masks.clone());
         self
     }
 
@@ -368,7 +395,8 @@ impl<P: Product> StateMachine<P> {
                     return;
                 };
                 let slots: Vec<usize> = slots.iter().map(|&s| s as usize).collect();
-                let entries = targets.assert(&slots);
+                let entries = targets.assert(&slots, self.masked.as_deref());
+                self.mask(&targets);
                 self.image = Some(targets);
                 (entries, Vec::new())
             }
@@ -400,6 +428,7 @@ impl<P: Product> StateMachine<P> {
                     || samplez::Targets::default().diff(&next),
                     |image| image.diff(&next),
                 );
+                self.mask(&next);
                 self.image = Some(next);
                 let routed = entries
                     .iter()
@@ -875,6 +904,8 @@ impl<P: Product> StateMachine<P> {
         } else {
             None
         };
+        // An engine is rebuilt from this state: its masks are these.
+        self.masked = self.image.as_ref().map(|t| t.masks.clone());
         Ok(())
     }
 }
@@ -1740,6 +1771,9 @@ mod derive_tests {
         trims: [f32; 2],
         flows: [String; 2],
         solo: Option<SessionKey>,
+        /// Slot 1 ducked by group 0 on its coefficient.
+        #[serde(default)]
+        ducked: bool,
     }
 
     impl Desk {
@@ -1750,6 +1784,7 @@ mod derive_tests {
                 trims: [0.0, 0.0],
                 flows: ["a".into(), "b".into()],
                 solo: None,
+                ducked: false,
             }
         }
     }
@@ -1766,6 +1801,7 @@ mod derive_tests {
                     self.faders[slot.parse::<usize>().unwrap()] = gain.parse().unwrap()
                 }
                 ["vca", gain] => self.vca = gain.parse().unwrap(),
+                ["duck", on] => self.ducked = on == "1",
                 ["trim", slot, db] => {
                     self.trims[slot.parse::<usize>().unwrap()] = db.parse().unwrap()
                 }
@@ -1824,6 +1860,7 @@ mod derive_tests {
                     .iter()
                     .map(|&db| vec![StripParam::Trim { db }])
                     .collect(),
+                masks: vec![vec![0], vec![u8::from(self.ducked)]],
                 ..Targets::default()
             })
         }
@@ -1998,6 +2035,39 @@ mod derive_tests {
         assert_eq!(sm.records[&13].at_index, 4000);
         sm.apply_at(14, 1, &restamp(5000));
         assert!(!sm.records.contains_key(&14));
+    }
+
+    /// A restamp clears a duck mask only where one was derived: the
+    /// coefficient a command masked and another cleared gets its 0
+    /// again, one never masked gets none.
+    #[test]
+    fn a_restamp_clears_only_the_masks_derived() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "fader 0 0.2", 0, 3000, None));
+        sm.apply_at(11, 1, &one("2", "duck 1", 0, 3000, None));
+        sm.apply_at(12, 1, &one("3", "duck 0", 0, 3000, None));
+        let restamp = Request {
+            stamp: 96,
+            body: Body::Restamp {
+                revision: 10,
+                term: 1,
+                at_index: 4000,
+                paths: Vec::new(),
+                generation: None,
+            },
+        };
+        sm.apply_at(13, 1, &restamp);
+        let masks: Vec<&Entry> = (sm.records[&13].entries.iter())
+            .filter(|e| matches!(e, Entry::DuckMask { .. }))
+            .collect();
+        assert_eq!(
+            masks,
+            [&Entry::DuckMask {
+                input: 1,
+                output: 0,
+                mask: 0
+            }]
+        );
     }
 
     /// A restamp of an entry that derived nothing derives nothing.

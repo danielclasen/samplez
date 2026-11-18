@@ -270,8 +270,10 @@ impl Core {
     /// channels, input slots of `legs` legs each, strips and duck key
     /// filters ramping over `ramp` samples and room for `page_entries`
     /// entries of one page's fingerprint, every entry and every duck key
-    /// within them: checked before a replay installs it. A slot has a
+    /// within them, and ducks only on the duck columns `ducked`: checked
+    /// before a replay installs it. A slot has a
     /// strip of its legs exactly when it is at most [`MAX_LEGS`] wide.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fits(
         &self,
         inputs: usize,
@@ -279,6 +281,7 @@ impl Core {
         legs: &[usize],
         ramp: u32,
         page_entries: usize,
+        ducked: &[usize],
     ) -> bool {
         let slots = legs.len();
         let strip = |(s, &legs): (&SlotCore, &usize)| match &s.strip {
@@ -286,7 +289,14 @@ impl Core {
             None => legs > MAX_LEGS,
         };
         let entry = |e: &RtEntry| fits(&e.change, inputs, outputs, legs);
-        let batch = |(_, b): &(LogId, Arc<Batch>)| b.fits(inputs, outputs, legs);
+        let batch = |(_, b): &(LogId, Arc<Batch>)| b.fits(inputs, outputs, legs, ducked);
+        // No duck on a column the configuration does not name: a ducked
+        // term costs what Config::check counts only on those.
+        let columns = |m: &Matrix| {
+            (0..outputs)
+                .filter(|o| !ducked.contains(o))
+                .all(|o| !m.is_ducked(o) && (0..inputs).all(|i| m.mask(i, o) == 0))
+        };
         let shape = (
             self.matrix.inputs(),
             self.matrix.outputs(),
@@ -299,6 +309,7 @@ impl Core {
             && self.batches.iter().all(batch)
             && self.slots.iter().zip(legs).all(strip)
             && self.ducks.fits(legs, ramp)
+            && columns(&self.matrix)
     }
 }
 
@@ -448,6 +459,8 @@ pub struct Replay {
     pub(crate) next: u64,
     /// The highest log id it knows.
     pub(crate) last_id: LogId,
+    /// The engine's duck columns.
+    pub(crate) duck_columns: Vec<usize>,
 }
 
 impl Replay {
@@ -491,8 +504,14 @@ impl Replay {
         // The engine's checks: a donor took no entry outside them.
         let fit = |i: &Item| match i {
             Item::Change(c) => fits(c, inputs, columns, &legs),
-            Item::Duck(DuckItem::Mask { input, output, .. }) => {
-                *input < inputs && *output < columns
+            Item::Duck(DuckItem::Mask {
+                input,
+                output,
+                mask,
+            }) => {
+                *input < inputs
+                    && *output < columns
+                    && (*mask == 0 || self.duck_columns.contains(output))
             }
             Item::Duck(_) => true,
         };
@@ -508,7 +527,7 @@ impl Replay {
         };
         if batch
             .as_ref()
-            .is_some_and(|b| !(b.sane() && b.fits(inputs, columns, &legs)))
+            .is_some_and(|b| !(b.sane() && b.fits(inputs, columns, &legs, &self.duck_columns)))
         {
             return Err(outside());
         }
@@ -1107,23 +1126,23 @@ mod tests {
     #[test]
     fn a_core_fits_only_its_own_shape() {
         let mut copy = copy();
-        assert!(copy.core.fits(2, 2, &[1, 1], 48, 8));
-        assert!(!copy.core.fits(2, 3, &[1, 1], 48, 8));
-        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 0));
+        assert!(copy.core.fits(2, 2, &[1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 3, &[1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 0, &[]));
         // Strips of other legs, another ramp, or none on a narrow slot;
         // a slot wider than a strip has none.
-        assert!(!copy.core.fits(2, 2, &[1, 2], 48, 8));
-        assert!(!copy.core.fits(2, 2, &[1, 1], 480, 8));
+        assert!(!copy.core.fits(2, 2, &[1, 2], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 480, 8, &[]));
         copy.core.slots[0].strip = None;
-        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 8));
-        assert!(copy.core.fits(2, 2, &[MAX_LEGS + 1, 1], 48, 8));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 8, &[]));
+        assert!(copy.core.fits(2, 2, &[MAX_LEGS + 1, 1], 48, 8, &[]));
         copy.core.slots[0].strip = Some(Strip::new(1, 48));
         copy.core.pending.push(RtEntry {
             id: 8,
             at_index: 9648,
             change: Change::InputDown { slot: 2 },
         });
-        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 8));
+        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 8, &[]));
     }
 
     /// A copy whose detector 2 is keyed by slot 1, forced on and
@@ -1164,13 +1183,17 @@ mod tests {
         );
         assert_eq!(a.envelope().to_bits(), b.envelope().to_bits());
         assert_eq!(decoded.core.duck_mask(1, 0), 0b100);
-        assert!(decoded.core.fits(2, 2, &[1, 1], 48, 8));
+        assert!(decoded.core.fits(2, 2, &[1, 1], 48, 8, &[0]));
+        // Its mask is on column 0: refused on an engine whose duck
+        // columns leave it out, or that has none.
+        assert!(!decoded.core.fits(2, 2, &[1, 1], 48, 8, &[1]));
+        assert!(!decoded.core.fits(2, 2, &[1, 1], 48, 8, &[]));
         assert!(
-            !decoded.core.fits(2, 2, &[1, 2], 48, 8),
+            !decoded.core.fits(2, 2, &[1, 2], 48, 8, &[0]),
             "key 0 of another width"
         );
         assert!(
-            !decoded.core.fits(2, 2, &[1, 1], 480, 8),
+            !decoded.core.fits(2, 2, &[1, 1], 480, 8, &[0]),
             "another key filter ramp"
         );
     }

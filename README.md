@@ -446,7 +446,14 @@ targets over the ramp length from the install, as the strips take their
 parameters, so an output fades in processed. Its duck groups start cold
 at the state's settings: key filters at rest, no hold, the envelope at 0
 or, for a group its mode On or hold triggers, at full depth; masks and
-depths at their targets, so a coefficient fades in ducked. The product state also
+depths at their targets, so a coefficient fades in ducked. A replica
+that kept computing holds its own key filter, hold and envelope state,
+so their outputs differ after the install until the gains' ramp has run,
+each key filter's state has reached the same bits and each group's
+envelope has reached 0 or full depth in both; on a test desk with an
+Auto group mid-duck, a group releasing after its force ended and a key
+filter ringing they are equal from the ramp, 50 ms and the longest
+attack, hold and release of a group on. The product state also
 names each slot's flow and strip parameters: the supervisor hands over
 generations reading those flows before the core, a slot on another flow
 moving to it with no crossfade, and the strip parameters are set from

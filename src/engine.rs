@@ -233,6 +233,11 @@ impl std::fmt::Display for GainError {
 
 impl std::error::Error for GainError {}
 
+/// Why [`Engine::set_duck`] or [`Engine::set_duck_mask`] refused a
+/// setting: for what a gain change is refused for, and as invalid for a
+/// setting [`Engine::admits`] refuses.
+pub type DuckError = GainError;
+
 /// A log entry for the engine. Each sets an absolute target, so one
 /// applied again once its ramp has ended changes nothing.
 #[derive(Clone, Debug, PartialEq)]
@@ -1638,7 +1643,7 @@ impl Engine {
         group: usize,
         setting: DuckSetting,
         at_index: u64,
-    ) -> Result<(), GainError> {
+    ) -> Result<(), DuckError> {
         self.set_local_entry(&Entry::Duck { group, setting }, at_index, "duck changes")
     }
 
@@ -1652,7 +1657,7 @@ impl Engine {
         output: usize,
         mask: u8,
         at_index: u64,
-    ) -> Result<(), GainError> {
+    ) -> Result<(), DuckError> {
         let entry = Entry::DuckMask {
             input,
             output,
@@ -2284,7 +2289,8 @@ impl Engine {
             .expect("checked above");
         let (slots, in_domains) = new_slots(&self.config);
         let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
-        if !c.fits(n, m, &legs, self.config.ramp_samples, page) {
+        let ducked = &self.config.duck_columns;
+        if !c.fits(n, m, &legs, self.config.ramp_samples, page, ducked) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -2345,6 +2351,7 @@ impl Engine {
             silenced: Vec::new(),
             next: copy.k0 + 1,
             last_id: copy.last_id,
+            duck_columns: self.config.duck_columns.clone(),
         })
     }
 
@@ -2501,7 +2508,8 @@ impl Engine {
             let (id, at_index, _) = group[0];
             let mut items = Vec::with_capacity(group.len());
             for (_, _, e) in group {
-                items_of(e, &rows, &mut items).map_err(ReplayError::Invalid)?;
+                self.items(e, &mut items)
+                    .map_err(|e| ReplayError::Invalid(e.to_string()))?;
             }
             let folded = batch::fold(&items, m, n * m).map_err(ReplayError::Invalid)?;
             let Some((change, b)) = folded else { continue };
@@ -2552,15 +2560,27 @@ impl Engine {
         let targets: Vec<f32> = state.gains.iter().flatten().copied().collect();
         let mut gains = targets.clone();
         let mut up = state.up.clone();
-        let mask_targets: Vec<u8> = if state.masks.is_empty() {
+        // Empty for none, as a fill takes them: a state and pending list
+        // without masks or depths pay nothing for them.
+        let pending_masks = batches.iter().any(|(_, b)| !b.masks.is_empty());
+        let pending_depths = batches.iter().any(|(_, b)| !b.depths.is_empty());
+        let mask_targets: Vec<u8> = if !state.masks.is_empty() {
+            state.masks.iter().flatten().copied().collect()
+        } else if pending_masks {
             vec![0; n * m]
         } else {
-            state.masks.iter().flatten().copied().collect()
+            Vec::new()
         };
         let mut masks = mask_targets.clone();
         // Per input channel and group, as the matrix holds them.
-        let mut depth_targets = vec![0.0f32; n * MAX_DUCKS];
-        for (g, d) in state.ducks.iter().enumerate() {
+        let any_depth = (state.ducks.iter()).any(|d| d.depths.iter().any(|&db| db != 0.0));
+        let mut depth_targets = if any_depth || pending_depths {
+            vec![0.0f32; n * MAX_DUCKS]
+        } else {
+            Vec::new()
+        };
+        let fill_depths = !depth_targets.is_empty();
+        for (g, d) in state.ducks.iter().enumerate().filter(|_| fill_depths) {
             for (slot, &db) in d.depths.iter().enumerate() {
                 let (first, legs) = rows[slot];
                 for row in first..first + legs {
@@ -2570,14 +2590,19 @@ impl Engine {
         }
         let mut depths = depth_targets.clone();
         let legs = |s: usize| self.config.inputs.get(s).map_or(0, |i| i.channels as usize);
+        // Cold detectors at the state's settings, settled, built here: an
+        // attempt copies them.
+        let mut cold = crate::ducks::DuckCore::new(ramp);
+        cold.cold(ramp, &state.ducks, legs);
+        cold.settle(ramp, 0);
         self.offer(left(), at_least, false, &strips, |j, core| {
             gains.copy_from_slice(&targets);
             up.copy_from_slice(&state.up);
             masks.copy_from_slice(&mask_targets);
             depths.copy_from_slice(&depth_targets);
-            // Cold detectors at the state's settings, whatever a spare
-            // core held.
-            core.ducks.cold(ramp, &state.ducks, legs);
+            // Whatever a spare core held.
+            core.ducks.copy_from(&cold);
+            let mut ducks_passed = false;
             // The entries whose index the install passed are folded in
             // like the rest of the state: reported late they would never
             // apply.
@@ -2608,6 +2633,7 @@ impl Engine {
                             }
                             for &(g, change) in &b.ducks {
                                 let _ = core.ducks.apply(usize::from(g), change, legs);
+                                ducks_passed = true;
                             }
                         }
                         for slot in slots_of(raised) {
@@ -2616,11 +2642,15 @@ impl Engine {
                     }
                 }
             }
-            core.ducks.settle(ramp, next);
+            if ducks_passed {
+                core.ducks.settle(ramp, next);
+            } else {
+                core.ducks.align(next);
+            }
             // From silence, whatever a spare core held, ducked as the
             // masks and depths say from the start.
-            let ramping =
-                crate::ducks::fill_matrix(&mut core.matrix, &gains, &masks, &depths, ramp, next);
+            let ramping = core.matrix.fade_in_ducked(&gains, &masks, &depths, ramp);
+            core.matrix.align(next);
             core.pos = Some(next);
             core.ramp_end = if ramping { next + u64::from(ramp) } else { 0 };
             core.pending.clear();

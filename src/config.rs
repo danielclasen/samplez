@@ -21,11 +21,16 @@ pub const MAX_INPUTS: usize = 64;
 /// matrix takes a larger `blockSize`.
 pub const COEFFICIENTS_PER_BLOCK_SAMPLE: usize = 150;
 /// The coefficients a coefficient of a column in `duckColumns` counts as
-/// against [`COEFFICIENTS_PER_BLOCK_SAMPLE`]. A ducked term mixes in 17.7
-/// instructions per sample on the AVX2 path against 3.2 for a plain one
-/// (callgrind, a 64 by 96 matrix at a `blockSize` of 48), 5.5 times; on
-/// the scalar path twice. A configuration taken holds its bound with every
-/// coefficient of those columns ducked.
+/// against [`COEFFICIENTS_PER_BLOCK_SAMPLE`]. That bound is one of set
+/// time: a batch setting every coefficient applies within a quarter of
+/// the block. Setting a mask costs less than setting a gain, so the set
+/// time alone needs no weight; the weight is one of mixing time, laid on
+/// the same bound. A ducked term mixes in 17.7 instructions per sample on
+/// the AVX2 path against 3.2 for a plain one (callgrind, a 64 by 96
+/// matrix at a `blockSize` of 48), 5.5 times; on the scalar path twice.
+/// So a configuration taken mixes, with every coefficient of those
+/// columns ducked, in no more than a configuration of plain coefficients
+/// at the bound.
 pub const DUCKED_TERM_COST: usize = 6;
 pub const MAX_OUTPUTS: usize = 64;
 /// The most meters an engine takes.

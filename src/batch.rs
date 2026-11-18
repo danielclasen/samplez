@@ -210,8 +210,9 @@ impl Batch {
     }
 
     /// Whether every value fits an engine of `inputs` input and `columns`
-    /// matrix channels and input slots of `legs` legs.
-    pub fn fits(&self, inputs: usize, columns: usize, legs: &[usize]) -> bool {
+    /// matrix channels, input slots of `legs` legs and the duck columns
+    /// `ducked`: a mask other than 0 only on those.
+    pub fn fits(&self, inputs: usize, columns: usize, legs: &[usize], ducked: &[usize]) -> bool {
         let coefficients = inputs * columns;
         let mut gains = true;
         self.gains.each(|c, _| gains &= c < coefficients);
@@ -228,6 +229,12 @@ impl Batch {
                 .iter()
                 .all(|&(row, _, _)| (row as usize) < inputs)
             && self.masks.sane(coefficients, |_| true)
+            && {
+                let mut on = true;
+                self.masks
+                    .each(|c, k| on &= k == 0 || ducked.contains(&(c % columns)));
+                on
+            }
     }
 
     /// Whether it sets anything of the matrix's ducks.
@@ -424,8 +431,8 @@ mod tests {
         assert_eq!(batch.gains.list(), [(1, 0.998), (4, 0.999)]);
         assert_eq!(batch.strips, [(0, StripParam::Trim { db: -9.99 })]);
         assert_eq!(batch.downs, [1]);
-        assert!(batch.sane() && batch.fits(2, 3, &[1, 1]));
-        assert!(!batch.fits(1, 4, &[1, 1]), "coefficient 4 of 4");
+        assert!(batch.sane() && batch.fits(2, 3, &[1, 1], &[]));
+        assert!(!batch.fits(1, 4, &[1, 1], &[]), "coefficient 4 of 4");
     }
 
     /// Per slot a re-route and the up or down state are kept apart, in
@@ -574,9 +581,18 @@ mod tests {
         );
         assert_eq!(b.depths, [(0, 3, 9.8), (1, 3, 9.9)]);
         assert_eq!(b.masks.list(), [(3, 99), (4, 97), (5, 98)]);
-        assert!(b.sane() && b.fits(2, 3, &[1, 1, 1, 1]));
-        assert!(!b.fits(2, 3, &[1, 1, 1]), "a key of slot 3 of 3");
-        assert!(!b.fits(1, 3, &[1, 1, 1, 1]), "a depth of channel 1 of 1");
+        let all = [0, 1, 2];
+        assert!(b.sane() && b.fits(2, 3, &[1, 1, 1, 1], &all));
+        assert!(!b.fits(2, 3, &[1, 1, 1], &all), "a key of slot 3 of 3");
+        assert!(
+            !b.fits(1, 3, &[1, 1, 1, 1], &all),
+            "a depth of channel 1 of 1"
+        );
+        // Masks 99, 97 and 98 on columns 0, 1 and 2.
+        assert!(
+            !b.fits(2, 3, &[1, 1, 1, 1], &[0, 2]),
+            "a mask off the duck columns"
+        );
         for item in [
             duck(0, DuckChange::Hold(true)),
             depth(0, 0, 1.0),

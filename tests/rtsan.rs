@@ -198,6 +198,24 @@ fn the_rt_thread_passes_rtsan_with_ducks() {
     common::stop(engine);
 }
 
+/// Ducks through a resync under RealtimeSanitizer: a key unkeyed and
+/// keyed again while its group ducks, the core with its detectors
+/// captured and a replayed one installed.
+#[test]
+fn the_rt_thread_passes_rtsan_with_ducks_through_a_resync() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let extra = serde_json::json!({ "duckColumns": [0] });
+    let (engine, _hashes) = common::start_held_with(&domain.0, &src, &dst, 2, extra);
+    wait_for(Duration::from_secs(5), "input attached", || {
+        engine.status().inputs[0].state == InputState::Attached
+    });
+    common::duck_resync_scenario(&engine);
+    assert_eq!(engine.status().rt_panic, None);
+    engine.stop();
+}
+
 /// Writes block `k`, then block `k - 1`, below the last commit, then block
 /// `k + 1` from too little data, in a real-time function.
 #[sanitize(realtime = "nonblocking")]

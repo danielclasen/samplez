@@ -32,7 +32,9 @@ impl Targets {
     /// pattern, by slot and parameter; a `Duck` for each setting of a
     /// group that differs in any field's bit pattern, by group, its
     /// parameters, keys, mode and hold, then its depths by slot; a
-    /// `DuckMask` for each coefficient whose mask differs, row by row; a
+    /// `DuckMask` for each coefficient whose mask differs, row by row, a
+    /// mask `self` does not hold counting as 0, the mask an engine holds
+    /// before any entry sets one; a
     /// `Route` for each slot whose flow differs. A target `next` holds and
     /// `self` does not counts as different; one `self` holds and `next`
     /// does not gets no entry, so the engine keeps it.
@@ -64,17 +66,37 @@ impl Targets {
         entries
     }
 
-    /// The entries that set every gain, strip parameter, duck setting
-    /// and duck mask of `self`, whatever an engine holds, in the order of
+    /// The entries that set every gain, strip parameter and duck setting
+    /// of `self`, whatever an engine holds, in the order of
     /// [`Targets::diff`], and a `Route` for each of `slots` in ascending
-    /// order.
-    pub fn assert(&self, slots: &[usize]) -> Vec<Entry> {
+    /// order. Of the duck masks, every one other than 0, and a 0 for each
+    /// coefficient `masked` holds a mask other than 0 for: an engine holds
+    /// a mask other than 0 only where an entry set one, so `masked`, every
+    /// mask an engine may have been given ORed together, names every
+    /// coefficient a 0 has to clear; none for every coefficient.
+    pub fn assert(&self, slots: &[usize], masked: Option<&[Vec<u8>]>) -> Vec<Entry> {
         // Against no targets at all: every gain, zeros included, every
-        // strip parameter, duck setting and mask.
+        // strip parameter, duck setting and mask other than 0.
         let mut entries = Targets::default().diff(&Targets {
             flows: Vec::new(),
             ..self.clone()
         });
+        for (input, row) in self.masks.iter().enumerate() {
+            for (output, &mask) in row.iter().enumerate() {
+                let held = masked.is_none_or(|m| {
+                    m.get(input)
+                        .and_then(|r| r.get(output))
+                        .is_some_and(|&k| k != 0)
+                });
+                if mask == 0 && held {
+                    entries.push(Entry::DuckMask {
+                        input,
+                        output,
+                        mask: 0,
+                    });
+                }
+            }
+        }
         let mut slots = slots.to_vec();
         slots.sort_unstable();
         slots.dedup();
@@ -141,7 +163,7 @@ fn duck_entries(was: &Targets, next: &Targets, entries: &mut Vec<Entry>) {
     for (input, row) in next.masks.iter().enumerate() {
         let was = was.masks.get(input);
         for (output, &mask) in row.iter().enumerate() {
-            if was.and_then(|r| r.get(output)) != Some(&mask) {
+            if was.and_then(|r| r.get(output)).copied().unwrap_or(0) != mask {
                 entries.push(Entry::DuckMask {
                     input,
                     output,
@@ -470,7 +492,7 @@ mod tests {
     #[test]
     fn assert_sets_every_gain_and_parameter_and_the_routes_named() {
         let t = targets();
-        let entries = t.assert(&[1, 1]);
+        let entries = t.assert(&[1, 1], None);
         let gains = entries
             .iter()
             .filter(|e| matches!(e, Entry::Gain { .. }))
@@ -491,7 +513,7 @@ mod tests {
                 flow_id: "b".into()
             }]
         );
-        assert_eq!(t.assert(&[]).len(), 5);
+        assert_eq!(t.assert(&[], None).len(), 5);
     }
 
     /// For every parameter, pairs that differ in one field each: an `f32`
@@ -881,23 +903,65 @@ mod tests {
         );
     }
 
-    /// Asserting sets every duck setting and mask, whatever the engine
-    /// holds.
+    /// Asserting sets every duck setting and every mask other than 0,
+    /// and a 0 where an engine may hold another mask: every coefficient
+    /// without `masked`, those it names with it.
     #[test]
-    fn assert_sets_every_duck_setting_and_mask() {
+    fn assert_sets_every_duck_setting_and_clears_only_masks_given() {
         let mut t = targets();
         t.ducks = vec![duck(), duck()];
         t.masks = vec![vec![0, 1], vec![0, 0]];
-        let entries = t.assert(&[]);
+        let masks = |entries: &[Entry]| -> Vec<(usize, usize, u8)> {
+            (entries.iter())
+                .filter_map(|e| match *e {
+                    Entry::DuckMask {
+                        input,
+                        output,
+                        mask,
+                    } => Some((input, output, mask)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let entries = t.assert(&[], None);
         let ducks = entries
             .iter()
             .filter(|e| matches!(e, Entry::Duck { .. }))
             .count();
-        let masks = entries
-            .iter()
-            .filter(|e| matches!(e, Entry::DuckMask { .. }))
-            .count();
         // Parameters, keys, mode, hold and two depths per group.
-        assert_eq!((ducks, masks), (12, 4));
+        assert_eq!(ducks, 12);
+        assert_eq!(
+            masks(&entries),
+            [(0, 1, 1), (0, 0, 0), (1, 0, 0), (1, 1, 0)]
+        );
+        let masked = [vec![0, 4], vec![2, 0]];
+        assert_eq!(masks(&t.assert(&[], Some(&masked))), [(0, 1, 1), (1, 0, 0)]);
+    }
+
+    /// A diff names a mask only where it changes: a row new to the
+    /// targets names only its masks other than 0, as an engine holds 0
+    /// where no entry set one.
+    #[test]
+    fn a_diff_names_only_masks_that_change() {
+        let mut next = targets();
+        next.masks = vec![vec![0, 3], vec![0, 0]];
+        assert_eq!(
+            targets().diff(&next),
+            vec![Entry::DuckMask {
+                input: 0,
+                output: 1,
+                mask: 3
+            }]
+        );
+        let mut cleared = next.clone();
+        cleared.masks[0][1] = 0;
+        assert_eq!(
+            next.diff(&cleared),
+            vec![Entry::DuckMask {
+                input: 0,
+                output: 1,
+                mask: 0
+            }]
+        );
     }
 }

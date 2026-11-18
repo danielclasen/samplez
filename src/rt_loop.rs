@@ -4096,7 +4096,7 @@ mod tests {
     /// coefficients fading in ducked.
     #[test]
     fn a_rebuilt_core_does_not_depend_on_the_buffer_and_ducks_forced_on_at_once() {
-        use crate::ducks::{DuckTargets, fill_matrix};
+        use crate::ducks::DuckTargets;
         use samplez_dsp::DuckMode;
         let targets = [DuckTargets {
             keys: vec![(0, 1.0)],
@@ -4113,7 +4113,8 @@ mod tests {
             let m = &mut d.mix;
             m.ducks.core.cold(480, &targets, |_| 1);
             m.ducks.core.settle(480, at);
-            fill_matrix(&mut m.matrix, &gains, &masks, &depths, 480, at);
+            m.matrix.fade_in_ducked(&gains, &masks, &depths, 480);
+            m.matrix.align(at);
             m.pos = Some(at);
             m.pending.clear();
             m.batches.clear();
@@ -4137,7 +4138,11 @@ mod tests {
         let mut plain = Desk::new(48);
         plain.mix.ducks.core.cold(480, &targets, |_| 1);
         plain.mix.ducks.core.settle(480, at);
-        fill_matrix(&mut plain.mix.matrix, &gains, &[0; 4], &depths, 480, at);
+        plain
+            .mix
+            .matrix
+            .fade_in_ducked(&gains, &[0; 4], &depths, 480);
+        plain.mix.matrix.align(at);
         plain.mix.pos = Some(at);
         let p = plain.run(101..200, desk_input);
         let full = samplez_dsp::duck_gain(20.0, 1.0);
@@ -4151,5 +4156,115 @@ mod tests {
         }
         assert!(compared > 4000, "{compared}");
         assert!(bits(&a[1]) == bits(&p[1]), "the column not ducked");
+    }
+
+    /// A desk rebuilt from its product state while a live one ducks
+    /// converges on it: at the rebuild the live desk has an Auto group
+    /// mid-duck, a group whose force ended two blocks before and that
+    /// releases, and a group keyed through its low-pass with its filters
+    /// ringing; the rebuilt one starts them cold and its gains from
+    /// silence. Their outputs differ from the rebuild on and are equal
+    /// bit for bit from the bound on, for three seconds: the gains' ramp,
+    /// 50 ms for a key filter's state to reach the live one's bits, and
+    /// the longest attack, hold and release of a group, in which each
+    /// envelope reaches 0 or full depth in both.
+    #[test]
+    fn a_desk_rebuilt_mid_duck_converges_on_the_live_one() {
+        use crate::ducks::{DuckSetting, DuckTargets};
+        use crate::engine::Entry;
+        use samplez_dsp::{DetectorParams, DuckMode, KeyFilter};
+        let p0 = DetectorParams {
+            attack_ms: 10.0,
+            hold_ms: 50.0,
+            release_ms: 200.0,
+            ..DetectorParams::DEFAULT
+        };
+        let p1 = DetectorParams {
+            attack_ms: 5.0,
+            hold_ms: 100.0,
+            release_ms: 300.0,
+            ..DetectorParams::DEFAULT
+        };
+        let p2 = DetectorParams {
+            lpf: KeyFilter {
+                enabled: true,
+                freq: 4000.0,
+            },
+            attack_ms: 5.0,
+            hold_ms: 20.0,
+            release_ms: 100.0,
+            ..DetectorParams::DEFAULT
+        };
+        let duck = |group, setting| Entry::Duck { group, setting };
+        let mut live = Desk::new(48);
+        let mut entries = duck_entries();
+        entries.extend([
+            duck(1, DuckSetting::Detector(Box::new(p1))),
+            duck(1, DuckSetting::Mode(DuckMode::On)),
+            duck(1, DuckSetting::Depth { slot: 1, db: 12.0 }),
+            duck(2, DuckSetting::Detector(Box::new(p2))),
+            duck(2, DuckSetting::Keys(vec![(0, 2.0)])),
+            duck(2, DuckSetting::Depth { slot: 1, db: 6.0 }),
+            Entry::DuckMask {
+                input: 1,
+                output: 1,
+                mask: 0b110,
+            },
+        ]);
+        live.entry(1, 0, &entries);
+        let r = 200 * 48;
+        live.entry(2, r - 96, &[duck(1, DuckSetting::Mode(DuckMode::Off))]);
+        live.run(0..r / 48, desk_input);
+        let d = &live.mix.ducks.core.detectors;
+        let e1 = d[1].envelope();
+        assert!(0.0 < e1 && e1 < 1.0, "group 1 releasing: {e1}");
+        let targets = [
+            DuckTargets {
+                params: p0,
+                keys: vec![(0, 1.0)],
+                depths: vec![0.0, 20.0],
+                ..DuckTargets::default()
+            },
+            DuckTargets {
+                params: p1,
+                mode: DuckMode::Off,
+                depths: vec![0.0, 12.0],
+                ..DuckTargets::default()
+            },
+            DuckTargets {
+                params: p2,
+                keys: vec![(0, 2.0)],
+                depths: vec![0.0, 6.0],
+                ..DuckTargets::default()
+            },
+        ];
+        let mut depths = [0.0; 2 * MAX_DUCKS];
+        depths[MAX_DUCKS..MAX_DUCKS + 3].copy_from_slice(&[20.0, 12.0, 6.0]);
+        let mut rebuilt = Desk::new(48);
+        let m = &mut rebuilt.mix;
+        m.ducks.core.cold(480, &targets, |_| 1);
+        m.ducks.core.settle(480, r);
+        m.matrix
+            .fade_in_ducked(&[0.0, 0.5, 1.0, 1.0], &[0, 0, 1, 0b110], &depths, 480);
+        m.matrix.align(r);
+        m.pos = Some(r);
+        let blocks = r / 48..r / 48 + 3000;
+        let (a, b) = (
+            live.run(blocks.clone(), desk_input),
+            rebuilt.run(blocks, desk_input),
+        );
+        let ms = |t: f32| (t * 48.0) as usize;
+        let longest = [p0, p1, p2]
+            .iter()
+            .map(|p| ms(p.attack_ms + p.hold_ms + p.release_ms))
+            .max()
+            .unwrap();
+        let bound = 480 + ms(50.0) + longest;
+        let last = (0..a[0].len())
+            .rev()
+            .find(|&n| (0..2).any(|c| a[c][n].to_bits() != b[c][n].to_bits()));
+        assert!(a[0][..48] != b[0][..48], "the rebuilt desk never differed");
+        let last = last.unwrap();
+        assert!(last < bound, "differed until sample {last}, bound {bound}");
     }
 }

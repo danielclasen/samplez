@@ -252,3 +252,24 @@ fn rt_thread_allocates_nothing_with_ducks() {
     assert_no_rt_calls();
     common::stop(engine);
 }
+
+/// Ducks through a resync on the RT thread: a key unkeyed and keyed
+/// again while its group ducks, the core with its detectors captured and
+/// a replayed one installed ([`common::duck_resync_scenario`]).
+#[test]
+fn rt_thread_allocates_nothing_with_ducks_through_a_resync() {
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let extra = serde_json::json!({ "duckColumns": [0] });
+    let (engine, _hashes) = common::start_held_with(&domain.0, &src, &dst, 2, extra);
+    wait_for(Duration::from_secs(5), "input attached", || {
+        engine.status().inputs[0].state == InputState::Attached
+    });
+    RT_TID.store(engine.status().rt.thread.tid, Relaxed);
+    common::duck_resync_scenario(&engine);
+    RT_TID.store(0, Relaxed);
+    assert_no_rt_calls();
+    engine.stop();
+}

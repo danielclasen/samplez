@@ -922,3 +922,56 @@ pub fn undisturbed(scenario: impl Fn() -> Result<(), String>) {
     }
     panic!("every run was disturbed: {seen:?}");
 }
+
+/// Ducks through a resync on a replicated engine of two voters whose
+/// column 0 ducks: a group keyed, forced on and ducking the input, its
+/// key unkeyed and keyed again while it ducks, then the core copied
+/// mid-duck and replayed and handed back over to the engine, which
+/// installs its detectors. Returns once the hand-over is installed and
+/// a second of blocks ran after it.
+#[allow(dead_code)]
+pub fn duck_resync_scenario(e: &Engine) {
+    use samplez::{DuckSetting, Entry};
+    let api = api();
+    let now = || time::timestamp_to_index(&api, time::now(&api)) / B;
+    let duck = |setting| Entry::Duck { group: 2, setting };
+    let at = (now() + 20) * B;
+    let entries = [
+        duck(DuckSetting::Keys(vec![(0, 1.0)])),
+        duck(DuckSetting::Mode(samplez_dsp::DuckMode::On)),
+        duck(DuckSetting::Depth { slot: 0, db: 20.0 }),
+        Entry::DuckMask {
+            input: 0,
+            output: 0,
+            mask: 1 << 2,
+        },
+    ];
+    e.append_batch(1, at, &entries).unwrap();
+    // The key unkeyed, then keyed again: its filters at rest.
+    e.append(2, at + 100 * B, duck(DuckSetting::Keys(Vec::new())))
+        .unwrap();
+    e.append(3, at + 150 * B, duck(DuckSetting::Keys(vec![(0, 0.5)])))
+        .unwrap();
+    e.commit(3);
+    let past = at / B + 200;
+    wait_for(Duration::from_secs(10), "keys changed", || {
+        e.progress()
+            .and_then(|p| p.processed)
+            .is_some_and(|k| k > past)
+    });
+    let copy = copy_core(e);
+    assert!(copy.core.detector(2).is_some_and(|d| d.key(0).is_some()));
+    let mut replay = e.replay(copy).unwrap();
+    let j = e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+    wait_for(
+        Duration::from_secs(10),
+        "a second after the hand-over",
+        || {
+            e.progress()
+                .and_then(|p| p.processed)
+                .is_some_and(|k| k > j + 1000)
+        },
+    );
+    assert_eq!(e.counters().handovers_installed.load(Ordering::Relaxed), 1);
+    assert_eq!(e.counters().duck_refused.load(Ordering::Relaxed), 0);
+}
