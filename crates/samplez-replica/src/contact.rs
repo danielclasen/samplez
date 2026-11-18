@@ -1358,8 +1358,10 @@ impl Contact {
                     audio.skip(id.index);
                 }
             }
+            // Never lowered: a re-routing command's stamp may have raised
+            // it past this entry's index.
             if request.body.needs_generation() {
-                st.generation_at = request.at_index();
+                st.generation_at = st.generation_at.max(request.at_index());
             }
             match &request.body {
                 Body::Baseline(b) => st.baselines.appended(id, b),
@@ -4124,5 +4126,24 @@ mod tests {
         let calls = f.engine.calls();
         let n = calls.iter().filter(|c| *c == "overwhelmed").count();
         assert_eq!(n, 1, "withdrawn {n} times: {calls:?}");
+    }
+
+    /// An appended entry that needs a generation never lowers the pending
+    /// generation a re-routing command's stamp raised.
+    #[tokio::test(start_paused = true)]
+    async fn appended_entries_never_lower_the_pending_generation() {
+        let f = fixture(&[&[1]]);
+        f.tick();
+        let raised = f.contact.stamp(true).expect("stamped").earliest;
+        f.insert(
+            1,
+            Body::InputUp {
+                slot: 0,
+                at_index: raised - B,
+            },
+        );
+        f.contact.log_changed();
+        f.tick();
+        assert_eq!(f.contact.lock().generation_at, Some(raised));
     }
 }
