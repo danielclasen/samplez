@@ -166,4 +166,6 @@ pub struct PortStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NmosStatus {
     pub ports: Vec<PortStatus>,
+    /// The Registration API the node is registered with.
+    pub registry: Option<String>,
 }

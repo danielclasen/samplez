@@ -191,6 +191,9 @@ pub(crate) fn config() -> NmosConfig {
             instance_id: "test/node".into(),
             functions: vec!["Mixer".into()],
         },
+        heartbeat: Duration::from_secs(5),
+        registries: Vec::new(),
+        dns_sd_domain: None,
     }
 }
 
@@ -534,6 +537,7 @@ fn bump_never_repeats_or_goes_back() {
         device_version: Tai::default(),
         senders: Vec::new(),
         receivers: Vec::new(),
+        changed: Default::default(),
     };
     let a = st.bump(Tai::new(5, 0));
     let b = st.bump(Tai::new(5, 0));

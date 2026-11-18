@@ -10,16 +10,21 @@ publish = false
 
 [dependencies]
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+hickory-resolver = "=0.26.3"
 libc = "=0.2.191"
+mdns-sd = { version = "=0.21.7", default-features = false }
+# Plain HTTP to the registry: registries advertising api_proto=https are
+# not used.
+reqwest = { version = "=0.12.28", default-features = false }
 samplez-service = { path = "../samplez-service", version = "0.7.0" }
 serde_json = "=1.0.154"
-tokio = { version = "=1.54.1", features = ["rt", "sync", "time"] }
+tokio = { version = "=1.54.1", features = ["macros", "rt", "sync", "time"] }
 tracing = "=0.1.44"
 uuid = { version = "=1.29.2", features = ["serde", "v5"] }
 
 [dev-dependencies]
 jsonschema = { version = "=0.60.2", default-features = false }
-tokio = { version = "=1.54.1", features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+tokio = { version = "=1.54.1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 tower = { version = "=0.5.3", features = ["util"] }
 
 # Validates the served documents against the AMWA schemas, which

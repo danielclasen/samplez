@@ -1,6 +1,6 @@
-//! NMOS for samplez products: the IS-04 v1.3 Node API and the IS-05 v1.2
-//! Connection API for MXL senders and receivers per AMWA BCP-007-03, with
-//! BCP-004-01 receiver caps and BCP-002-01/02 tags.
+//! NMOS for samplez products: the IS-04 v1.3 Node API and registration and
+//! the IS-05 v1.2 Connection API for MXL senders and receivers per AMWA
+//! BCP-007-03, with BCP-004-01 receiver caps and BCP-002-01/02 tags.
 //!
 //! The crate knows NMOS ids, MXL ids and TAI time; it links no libmxl and
 //! runs no real-time code. A product describes its writers and readers in
@@ -20,11 +20,13 @@ use serde_json::json;
 use uuid::Uuid;
 
 mod connection;
+mod discovery;
 mod http;
 mod ids;
 mod model;
 mod node_api;
 mod product;
+mod registration;
 mod resources;
 mod tai;
 
@@ -83,6 +85,10 @@ pub(crate) struct Inner {
     patching: Vec<tokio::sync::Mutex<()>>,
     /// Per port as [`Inner::index`] orders them, once registered.
     late: std::sync::OnceLock<Vec<samplez_service::Histogram>>,
+    /// Signalled on every new resource version, for the registration.
+    changed: Arc<tokio::sync::Notify>,
+    /// The Registration API the node is registered with.
+    registry: Mutex<Option<String>>,
 }
 
 pub(crate) struct State {
@@ -92,6 +98,7 @@ pub(crate) struct State {
     device_version: Tai,
     senders: Vec<SenderState>,
     receivers: Vec<PortState>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) struct SenderState {
@@ -106,6 +113,7 @@ impl State {
     fn bump(&mut self, now: Tai) -> Tai {
         let v = now.max(self.last_version.next());
         self.last_version = v;
+        self.changed.notify_one();
         v
     }
 
@@ -177,12 +185,14 @@ impl Nmos {
         );
         let stored = store.load();
         let now = clock.now();
+        let changed = Arc::new(tokio::sync::Notify::new());
         let mut st = State {
             last_version: Tai::default(),
             node_version: Tai::default(),
             device_version: Tai::default(),
             senders: Vec::new(),
             receivers: Vec::new(),
+            changed: changed.clone(),
         };
         st.node_version = st.bump(now);
         st.device_version = st.bump(now);
@@ -227,6 +237,8 @@ impl Nmos {
                 state: Mutex::new(st),
                 patching: (0..ports).map(|_| tokio::sync::Mutex::new(())).collect(),
                 late: std::sync::OnceLock::new(),
+                changed,
+                registry: Mutex::new(None),
             }),
         })
     }
@@ -243,6 +255,22 @@ impl Nmos {
             .route("/x-nmos/", any(handle))
             .route("/x-nmos/{*rest}", any(handle))
             .with_state(self.inner.clone())
+    }
+
+    /// Finds a registry and keeps the node registered with it: posts the
+    /// resources, heartbeats every [`NmosConfig::heartbeat`], posts each
+    /// resource whose version changed, and fails over to another registry
+    /// when one stops answering. Runs until dropped; it never waits on the
+    /// product. No registry found means no registration: the node does
+    /// not fall back to peer-to-peer advertisement.
+    pub fn registration(&self) -> impl Future<Output = ()> + Send + 'static {
+        registration::run(self.inner.clone())
+    }
+
+    /// Deletes the Node from its registry, for a graceful shutdown after
+    /// [`Nmos::registration`] is dropped.
+    pub async fn unregister(&self) {
+        registration::unregister(&self.inner).await
     }
 
     pub fn node_id(&self) -> Uuid {
@@ -309,6 +337,12 @@ impl Nmos {
                     }
                 })
                 .collect(),
+            registry: self
+                .inner
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         }
     }
 }
