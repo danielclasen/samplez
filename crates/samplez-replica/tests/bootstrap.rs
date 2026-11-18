@@ -234,9 +234,26 @@ struct Set {
     /// Bound for the set's lifetime, so a stopped replica's port is not
     /// taken by another socket before it starts again.
     listeners: BTreeMap<Slot, std::net::TcpListener>,
+    /// Per slot not running, a task that takes each connection to its port
+    /// and drops it, as a stopped pod's address refuses one: a request
+    /// queued on the bound port would reach the replica started next,
+    /// however old.
+    refusers: Mutex<BTreeMap<Slot, JoinHandle<()>>>,
     tls: BTreeMap<Slot, Tls>,
     nodes: BTreeMap<Slot, Node>,
     _panics: PanicGuard,
+}
+
+/// Takes each connection to `tcp` and drops it, until aborted.
+fn refuse(tcp: &std::net::TcpListener) -> JoinHandle<()> {
+    let tcp = TcpListener::from_std(tcp.try_clone().unwrap()).unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((connection, _)) = tcp.accept().await {
+                drop(connection);
+            }
+        }
+    })
 }
 
 fn name(slot: Slot) -> String {
@@ -289,6 +306,9 @@ impl Set {
             addrs.insert(slot, tcp.local_addr().unwrap().to_string());
             listeners.insert(slot, tcp);
         }
+        let refusers = (listeners.iter())
+            .map(|(&slot, tcp)| (slot, refuse(tcp)))
+            .collect();
         Set {
             root,
             api,
@@ -296,6 +316,7 @@ impl Set {
             voters,
             addrs,
             listeners,
+            refusers: Mutex::new(refusers),
             tls,
             nodes: BTreeMap::new(),
             _panics: PanicGuard::new(),
@@ -348,6 +369,11 @@ impl Set {
         .await
         .unwrap();
         let replica = Arc::new(replica);
+        let refuser = self.refusers.lock().unwrap().remove(&slot);
+        if let Some(refuser) = refuser {
+            refuser.abort();
+            let _ = refuser.await;
+        }
         let tcp = TcpListener::from_std(self.listeners[&slot].try_clone().unwrap()).unwrap();
         let (stop, stopped) = oneshot::channel();
         let server = tokio::spawn(peer::serve(tls, tcp, replica.clone(), async {
@@ -385,6 +411,8 @@ impl Set {
         let _ = node.stop.send(());
         node.replica.shutdown().await;
         let _ = node.server.await;
+        let refuser = refuse(&self.listeners[&slot]);
+        self.refusers.lock().unwrap().insert(slot, refuser);
     }
 
     fn replica(&self, slot: Slot) -> &Arc<Replica<Paths>> {
