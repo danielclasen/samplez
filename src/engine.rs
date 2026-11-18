@@ -4389,7 +4389,7 @@ fn retry(out: &mut SupOut, now: Instant) {
 /// far behind a head advancing at the nominal rate are no reader margin
 /// to widen.
 fn margin_warning(api: &MxlApi, window: &VecDeque<SlotStats>, timing: &Timing) -> Option<u64> {
-    let (first, last) = (window.front()?, window.back()?);
+    let (first, last) = (first_head(window)?, window.back()?);
     let index = |now| time::timestamp_to_index(api, now);
     margin_needed(
         window,
@@ -4398,13 +4398,18 @@ fn margin_warning(api: &MxlApi, window: &VecDeque<SlotStats>, timing: &Timing) -
     )
 }
 
+/// The first sample with a head above 0: a slot not read yet has none.
+fn first_head(window: &VecDeque<SlotStats>) -> Option<&SlotStats> {
+    window.iter().find(|s| s.head.is_some_and(|h| h > 0))
+}
+
 /// [`margin_warning`] over a window whose clock advanced `nominal`
 /// samples.
 fn margin_needed(window: &VecDeque<SlotStats>, nominal: u64, timing: &Timing) -> Option<u64> {
     if window.len() < MARGIN_WINDOW {
         return None;
     }
-    let (first, last) = (window.front()?, window.back()?);
+    let (first, last) = (first_head(window)?, window.back()?);
     let late: u64 = window.iter().skip(1).map(|s| u64::from(s.late)).sum();
     let on_time: u64 = window.iter().skip(1).map(|s| u64::from(s.on_time)).sum();
     if late == 0 || on_time == 0 {
@@ -4535,6 +4540,13 @@ mod tests {
             None,
             "beyond the window"
         );
+        // The first sample has no head yet: the window starts at the next.
+        let w = margin_window(|n| match n {
+            0 => (None, None),
+            _ => (Some(head(n)), Some(-100)),
+        });
+        let nine = 9 * 48_000;
+        assert_eq!(margin_needed(&w, nine, &timing), Some(724), "no first head");
     }
 
     #[test]

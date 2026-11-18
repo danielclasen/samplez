@@ -3019,7 +3019,10 @@ impl Contact {
             .copies(st, now)
             .into_iter()
             .filter(|(id, _, _)| {
-                *id != self.id && audio_voters.contains(id) && !st.judged.contains(id)
+                *id != self.id
+                    && audio_voters.contains(id)
+                    && !st.judged.contains(id)
+                    && st.members.addrs.contains_key(id)
             })
             .collect();
         // A report up to `w + D` old may name a replica that withdrew
@@ -3032,8 +3035,7 @@ impl Contact {
             crate::resync::donor(baseline, &peers)
         };
         let donor = donor_within(2 * self.timing.report_period)
-            .or_else(|| donor_within(self.timing.contact_window + self.timing.hold))
-            .filter(|d| st.members.addrs.contains_key(d));
+            .or_else(|| donor_within(self.timing.contact_window + self.timing.hold));
         let Some(donor) = donor else {
             if st.resync.no_donor(now) {
                 let m = &st.resync.metrics;
@@ -4246,6 +4248,31 @@ mod tests {
         let (_, donor, _) = f.contact.resync_due().expect("an attempt");
         assert_eq!(donor, 3, "the fresh donor");
         assert_eq!(attempts(&f).attempts, 1);
+    }
+
+    /// A fresh donor without a peer address is no donor: the one
+    /// committing by an older report within `w + D` is asked instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_donor_without_an_address_leaves_the_older_one() {
+        let mut f = fixture(&[&[1, 2, 3]]);
+        f.members.addrs.remove(&3);
+        diverge(&f);
+        f.contact.receive(state_report(
+            &f,
+            2,
+            ReplicaState::Committing,
+            Duration::ZERO,
+        ));
+        tokio::time::advance(Duration::from_millis(12)).await;
+        f.clock.add(Duration::from_millis(12));
+        f.contact.receive(state_report(
+            &f,
+            3,
+            ReplicaState::Committing,
+            Duration::ZERO,
+        ));
+        let (_, donor, _) = f.contact.resync_due().expect("an attempt");
+        assert_eq!(donor, 2);
     }
 
     /// A void of an entry held unresolved resolves it in the engine and
