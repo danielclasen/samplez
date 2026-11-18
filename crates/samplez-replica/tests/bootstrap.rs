@@ -813,14 +813,11 @@ async fn a_set_resumed_from_kept_volumes_recreates_its_marker() {
     set.start_all().await;
     set.settled().await;
     assert!(
-        until(PERIOD * 10, || set
-            .api
-            .marker()
-            .is_some_and(|m| m.0 == epoch))
-        .await,
-        "marker {:?}",
-        set.api.marker()
+        until(PERIOD * 10, || set.api.marker().is_some()).await,
+        "no marker"
     );
+    // Volume 0, which no volume has: no empty volume initialises from it.
+    assert_eq!(set.api.marker(), Some((epoch, 0)));
     set.crash(Slot::Audio(2)).await;
     std::fs::remove_dir_all(set.dir(Slot::Audio(2))).unwrap();
     let node = set.start(Slot::Audio(2)).await;

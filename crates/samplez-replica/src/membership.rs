@@ -413,7 +413,7 @@ pub(crate) async fn watch(shared: Arc<Shared>, bootstrap: Bootstrap) {
 
 /// Recreates the marker a formed set finds missing, each [`PERIOD`] while
 /// this replica leads with a quorum: under the set's cluster id, naming
-/// the volume of ordinal 0 among the voters, or 0 without one. A
+/// volume 0, which no volume has, so every empty volume joins. A
 /// StatefulSet deleted with its marker and created again on the volumes
 /// it kept resumes the set from them, and an empty volume joins it only
 /// through the marker. Ends once the replica is shut down.
@@ -438,13 +438,7 @@ async fn keep_marker(shared: Arc<Shared>, markers: Arc<dyn Markers>) {
                 continue;
             }
         }
-        let volume = metrics
-            .membership_config
-            .membership()
-            .voter_ids()
-            .find(|&id| slot_of(id) == Slot::Audio(0))
-            .map_or(0, |id| id & VOLUME_MASK);
-        match markers.create(Marker { cluster, volume }).await {
+        match markers.create(Marker { cluster, volume: 0 }).await {
             Ok(true) => {
                 tracing::info!(
                     cluster,
