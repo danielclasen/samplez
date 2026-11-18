@@ -1923,4 +1923,150 @@ mod derive_tests {
         legacy.load(saved, Limits::defaults(48_000)).unwrap();
         assert_eq!(legacy.floor, sm.floor);
     }
+
+    /// An `InputDown` or `InputUp` derives the input's state at its index,
+    /// raised to the floor; only the `InputUp` builds a generation.
+    #[test]
+    fn input_down_and_up_derive_the_input_state() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "fader 0 0.5", 0, 3000, None));
+        let input = |body| Request { stamp: 0, body };
+        sm.apply(
+            2,
+            &input(Body::InputDown {
+                slot: 1,
+                at_index: 960,
+            }),
+        );
+        let down = &sm.records[&2];
+        assert_eq!(down.entries, [Entry::InputDown { slot: 1 }]);
+        assert_eq!(down.at_index, 3000);
+        assert!(!down.generation);
+        sm.apply(
+            3,
+            &input(Body::InputUp {
+                slot: 1,
+                at_index: 4800,
+            }),
+        );
+        let up = &sm.records[&3];
+        assert_eq!(up.entries, [Entry::InputUp { slot: 1 }]);
+        assert_eq!(up.at_index, 4800);
+        assert!(up.generation);
+    }
+
+    /// A Void of an entry that derived engine entries drops it from
+    /// `derived`: nothing re-asserts it later.
+    #[test]
+    fn a_void_clears_the_derived_bit() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "route 0 c", 0, 3000, Some(true)));
+        assert_eq!(sm.derived.get(&10), Some(&vec![0]));
+        let void = Request {
+            stamp: 96,
+            body: Body::Void {
+                revision: 10,
+                term: 1,
+            },
+        };
+        sm.apply_at(11, 1, &void);
+        assert!(!sm.derived.contains_key(&10));
+        assert!(!sm.records.contains_key(&11));
+    }
+
+    /// A record is kept until its index lies [`RECORDS_KEPT`] below the
+    /// highest stamp applied, and one still ahead stays.
+    #[test]
+    fn records_are_kept_for_records_kept_past_their_index() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "fader 0 0.5", 0, 960, None));
+        sm.apply(2, &one("2", "fader 1 0.5", 40_000, 88_000, None));
+        let renew = |stamp| Request {
+            stamp,
+            body: Body::LeaseRenew(Vec::new()),
+        };
+        sm.apply(3, &renew(960 + RECORDS_KEPT));
+        assert!(sm.records.contains_key(&1));
+        sm.apply(4, &renew(960 + RECORDS_KEPT + 48));
+        assert!(!sm.records.contains_key(&1));
+        assert!(sm.records.contains_key(&2));
+    }
+
+    /// A lease expiry stamped below the floor derives at the floor, after
+    /// the entry before it.
+    #[test]
+    fn a_lease_expiry_below_the_floor_derives_at_the_floor() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "solo", 0, 9600, None));
+        sm.apply(
+            2,
+            &Request {
+                stamp: 4800,
+                body: Body::LeaseExpiry {
+                    session: origin("s").key(),
+                    renewed: 0,
+                },
+            },
+        );
+        assert_eq!(sm.records[&2].at_index, 9600);
+        assert_eq!(sm.floor, 9600);
+    }
+
+    /// A machine that loads a snapshot taken mid-log holds the targets of
+    /// the one that applied the whole log at that point, and derives the
+    /// same records from every later entry.
+    #[test]
+    fn a_machine_loaded_mid_log_derives_what_the_whole_log_derives() {
+        let log = [
+            one("1", "fader 0 0.5", 0, 960, None),
+            one("2", "route 1 c", 48, 1008, None),
+            one("3", "vca 0.5", 96, 1056, None),
+            one("4", "solo", 144, 1104, None),
+            one("5", "trim 0 -3.5", 192, 1152, None),
+            one("6", "route 0 d", 240, 1200, Some(true)),
+            Request {
+                stamp: 288,
+                body: Body::LeaseExpiry {
+                    session: origin("s").key(),
+                    renewed: 240,
+                },
+            },
+        ];
+        let mut whole = machine();
+        for (n, r) in log.iter().enumerate().take(3) {
+            whole.apply_at(n as u64 + 1, 1, r);
+        }
+        let mut loaded = machine();
+        loaded.load(whole.save(), Limits::defaults(48_000)).unwrap();
+        assert_eq!(loaded.product.targets(), whole.product.targets());
+        for (n, r) in log.iter().enumerate().skip(3) {
+            whole.apply_at(n as u64 + 1, 1, r);
+            loaded.apply_at(n as u64 + 1, 1, r);
+        }
+        let later = |sm: &StateMachine<Desk>| {
+            sm.records
+                .range(4..)
+                .map(|(&i, r)| (i, r.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(later(&loaded).len(), 4);
+        assert_eq!(later(&loaded), later(&whole));
+        assert_eq!(loaded.floor, whole.floor);
+    }
+
+    /// A re-routing command from a writer that did not classify it
+    /// applies and derives its route like one ordered on the generation
+    /// path: two machines, one fed each, agree on the product state.
+    #[test]
+    fn a_rerouting_command_flagged_none_applies_like_one_flagged_true() {
+        let (mut a, mut b) = (machine(), machine());
+        a.apply(1, &one("1", "route 0 c", 0, 960, None));
+        b.apply(1, &one("1", "route 0 c", 0, 960, Some(true)));
+        assert_eq!(a.product.save(), b.product.save());
+        assert_eq!(a.records, b.records);
+        assert!(a.records[&1].entries.contains(&Entry::Route {
+            slot: 0,
+            flow_id: "c".into()
+        }));
+    }
 }

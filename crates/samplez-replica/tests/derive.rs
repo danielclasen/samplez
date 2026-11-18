@@ -11,6 +11,7 @@ use harness::{BLOCK, Options, Set, owner};
 use samplez::Targets;
 use samplez_replica::contact::Timing;
 use samplez_replica::entry::{Body, Command, NodeId, Origin, Request, SessionKey};
+use samplez_replica::peer::{Forwarded, PeerRequest, PeerResponse, Refused};
 use samplez_replica::state_machine::{Apply, Changed, Effect, Product};
 use samplez_service::ReplicatedState;
 use tokio::time::{Instant, sleep};
@@ -233,5 +234,75 @@ async fn a_rerouting_command_waiting_for_a_generation_holds_no_quiesce() {
         bodies(&set, leader).is_empty(),
         "{:?}",
         bodies(&set, leader)
+    );
+}
+
+/// A command asking for an index beyond the earliest is refused before it
+/// is ordered; one asking for none beside it is ordered.
+#[tokio::test(start_paused = true)]
+async fn a_scheduled_command_is_refused() {
+    let set = start().await;
+    let leader = set.leader().await;
+    let e = set
+        .replica(leader)
+        .contact_metrics()
+        .unwrap()
+        .estimate
+        .expect("E counts a replica");
+    let command = |id: &str, at_index| Forwarded {
+        command: Command {
+            generation: None,
+            origin: Origin::from(&owner("s")),
+            id: id.into(),
+            at_index,
+            body: b"fader 0 0.5".to_vec(),
+        },
+        received: e,
+        within_ms: 1000,
+    };
+    let request = PeerRequest::Forward {
+        commands: vec![command("far", Some(e + 10 * 48_000)), command("now", None)],
+    };
+    let Ok(PeerResponse::Forwarded(results)) =
+        set.replica(leader).handle(Some(leader), request).await
+    else {
+        panic!("not forwarded");
+    };
+    assert!(
+        matches!(&results[0], Err(Refused::Invalid(why)) if why.contains("scheduled")),
+        "{:?}",
+        results[0]
+    );
+    assert!(results[1].is_ok(), "{:?}", results[1]);
+    assert_eq!(bodies(&set, leader), [vec!["fader 0 0.5".to_owned()]]);
+}
+
+/// The product owns every input's flow: an entry that routes an input or
+/// enables the master is refused, one that raises an input is ordered.
+#[tokio::test(start_paused = true)]
+async fn a_route_or_master_enable_is_refused() {
+    let set = start().await;
+    let leader = set.leader().await;
+    let r = set.replica(leader);
+    assert!(
+        r.append(Body::Route {
+            at_index: 0,
+            body: Vec::new(),
+        })
+        .is_err()
+    );
+    assert!(
+        r.append(Body::MasterEnable {
+            enabled: true,
+            at_index: 0,
+        })
+        .is_err()
+    );
+    assert!(
+        r.append(Body::InputUp {
+            slot: 0,
+            at_index: 0,
+        })
+        .is_ok()
     );
 }
