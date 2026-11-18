@@ -112,7 +112,12 @@ pub(crate) async fn run(inner: Arc<Inner>) {
         inner.cfg.registries.clone(),
         inner.cfg.dns_sd_domain.clone(),
     );
-    let mut posted: BTreeMap<Uuid, String> = BTreeMap::new();
+    // Per registry the node completed joining, the version of each
+    // resource it took. Any other registry found holding the node is taken
+    // to share the store of the one the node came from, as a registry
+    // cluster does.
+    let mut records: BTreeMap<String, BTreeMap<Uuid, String>> = BTreeMap::new();
+    let mut last: Option<String> = None;
     let mut registered_once = false;
     let mut backoff = BACKOFF_MIN;
     // The registry the node just failed over from, tried last in the next
@@ -153,24 +158,36 @@ pub(crate) async fn run(inner: Arc<Inner>) {
                     continue;
                 }
             };
+            let mut joining = match records.remove(&registry.base) {
+                Some(own) => own,
+                None => last
+                    .as_ref()
+                    .and_then(|l| records.get(l))
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            let posted = &mut joining;
             // A registry that still holds the node gets a heartbeat only,
             // as IS-04 asks, then every resource whose version it has not
-            // seen: the change whose POST failed the last registry, and any
-            // made since.
+            // taken: the change whose POST failed the last registry, any
+            // made since, and on a registry the node left earlier, any made
+            // while it was away.
             let joined = if still_held {
-                post_changed(&inner, &client, &registry.base, &mut posted, false).await
+                post_changed(&inner, &client, &registry.base, posted, false).await
             } else {
-                register_all(&inner, &client, &registry.base, &mut posted).await
+                register_all(&inner, &client, &registry.base, posted).await
             };
             if joined.is_err() {
                 continue;
             }
+            let posted = records.entry(registry.base.clone()).or_insert(joining);
             registered_once = true;
             served = true;
             backoff = BACKOFF_MIN;
             *inner.registry.lock().unwrap_or_else(|e| e.into_inner()) = Some(registry.base.clone());
             tracing::info!(registry = %registry.base, "nmos: registered");
-            let Err(Leave::Failover) = maintain(&inner, &client, &registry.base, &mut posted).await;
+            last = Some(registry.base.clone());
+            let Err(Leave::Failover) = maintain(&inner, &client, &registry.base, posted).await;
             *inner.registry.lock().unwrap_or_else(|e| e.into_inner()) = None;
             tracing::warn!(registry = %registry.base, "nmos: the registry failed; trying another");
             failed = Some(registry.base.clone());

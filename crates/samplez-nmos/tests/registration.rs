@@ -488,6 +488,73 @@ async fn a_change_that_failed_a_registry_reaches_the_next() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registry_the_node_returns_to_gets_what_changed_while_away() {
+    // Two registries that do not share their store.
+    let (a, b) = (
+        Registry::start(Mode::Up).await,
+        Registry::start(Mode::Up).await,
+    );
+    let n = node(&[&a, &b], Duration::ZERO);
+    let task = tokio::spawn(n.registration());
+    until("a heartbeat on a", || {
+        a.seen().iter().any(Seen::is_heartbeat)
+    })
+    .await;
+    a.set(Mode::Down);
+    until("registered on b", || types(&b.seen()).len() == 7).await;
+    let switched = Active {
+        master_enable: true,
+        peer: None,
+        domain: Some(uuid!("11111111-2222-4333-8444-555555555555")),
+        flow: Some(uuid!("cccccccc-0000-4000-8000-000000000001")),
+    };
+    n.external_change(Port::Receiver(0), switched);
+    until("the change on b", || types(&b.seen()).len() == 8).await;
+    // Back to a, which still holds the node at the versions before.
+    a.clear();
+    a.set(Mode::Up);
+    b.set(Mode::Down);
+    until("the change on a", || !types(&a.seen()).is_empty()).await;
+    tokio::time::sleep(HEARTBEAT).await;
+    task.abort();
+    let seen = a.seen();
+    assert!(seen[0].is_heartbeat(), "{seen:?}");
+    assert_eq!(types(&seen), ["receiver"]);
+    let post = seen.iter().find(|s| s.is_post()).unwrap();
+    assert_eq!(post.json()["data"]["subscription"]["active"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registry_that_failed_the_first_registration_gets_a_heartbeat_only_later() {
+    let (a, b) = (
+        Registry::start(Mode::Down).await,
+        Registry::start(Mode::Up).await,
+    );
+    let n = node(&[&a, &b], Duration::ZERO);
+    let task = tokio::spawn(n.registration());
+    until("a heartbeat on b", || {
+        b.seen().iter().any(Seen::is_heartbeat)
+    })
+    .await;
+    // a refused the first registration; it now holds the node, as a
+    // cluster with b would.
+    assert!(!a.seen().is_empty());
+    a.state.lock().unwrap().ids = b.state.lock().unwrap().ids.clone();
+    a.clear();
+    a.set(Mode::Up);
+    b.set(Mode::Down);
+    until("a heartbeat on a", || {
+        a.seen().iter().any(Seen::is_heartbeat)
+    })
+    .await;
+    tokio::time::sleep(HEARTBEAT * 2).await;
+    task.abort();
+    // IS-04-01 test_16: no POST of the node, nothing posted at all.
+    let seen = a.seen();
+    assert!(types(&seen).is_empty(), "{:?}", types(&seen));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_registry_just_failed_is_tried_last() {
     let (a, b) = (
         Registry::start(Mode::Up).await,
