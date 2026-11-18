@@ -18,15 +18,18 @@
 //! not chatter. A trigger restarts the hold; the detector stays engaged
 //! until the hold has run out after the last one. The manual controls
 //! decide in place of the key: a momentary hold triggers, otherwise mode
-//! [`Mode::On`] triggers and [`Mode::Off`] does not, and only
-//! [`Mode::Auto`] follows the key. The hold applies to every cause, so a
-//! manual duck released recovers after the hold.
+//! [`DuckMode::On`] triggers and [`DuckMode::Off`] does not, and only
+//! [`DuckMode::Auto`] follows the key. The hold applies after the key, a
+//! momentary hold or mode On, so a manual duck released recovers after
+//! the hold; mode Off is a bypass and releases at once.
 //!
 //! The envelope is linear in dB. While engaged it rises by one interval
 //! in each run, otherwise it falls by one, counted in whole intervals:
 //! attack and release are the times from no duck to full depth and back,
-//! each rounded to a whole number of intervals. A change of direction
-//! carries the envelope over to the other count within half an interval.
+//! each rounded to a whole number of intervals. A change of direction or
+//! of the time carries the envelope over to the new count, so the time
+//! left is the new time times the distance left, and no run moves it by
+//! more than one run of the new count.
 //! Between two runs the envelope moves linearly to the value computed at
 //! the start of the interval, so the key of a sample acts from the next
 //! interval on.
@@ -37,8 +40,11 @@
 //! how samples are split into blocks. Samples not processed move the key
 //! filters' coefficient ramps on and leave what follows the signal as it
 //! is, as the strip does, except that a detector decided by its manual
-//! controls moves on exactly. The detector holds no heap memory and does
-//! not allocate.
+//! controls moves on exactly, at once whatever the number of samples.
+//! The key filters zero their small states at the multiples of 64 of the
+//! sample index, not at the ends of blocks, so their states do not
+//! depend on the split either. The detector holds no heap memory and
+//! does not allocate.
 
 use core::ops::RangeInclusive;
 
@@ -69,7 +75,9 @@ pub const DEPTH_DB: RangeInclusive<f32> = 0.0..=40.0;
 /// Linear gain of a key.
 pub const KEY_GAIN: RangeInclusive<f32> = 0.0..=MAX_GAIN;
 
-/// Samples of a chunk the keys are filtered in, on the stack.
+/// Samples of a chunk the keys are filtered in, on the stack, at the
+/// multiples of which of the sample index the key filters zero their
+/// small states; a multiple of [`GAIN_INTERVAL`].
 const CHUNK: usize = 64;
 /// `1 / GAIN_INTERVAL`.
 const INV: f32 = 1.0 / GAIN_INTERVAL as f32;
@@ -150,12 +158,13 @@ impl Default for DetectorParams {
 
 /// What decides the detector when no momentary hold is held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Mode {
+pub enum DuckMode {
     /// The key.
     Auto,
     /// Triggered whatever the key.
     On,
-    /// Not triggered whatever the key.
+    /// Not triggered whatever the key, released at once: the hold does
+    /// not apply.
     Off,
 }
 
@@ -175,7 +184,7 @@ pub enum DuckParam {
     Unkey {
         key: usize,
     },
-    Mode(Mode),
+    Mode(DuckMode),
     /// The momentary hold: while held, the detector is triggered whatever
     /// the mode and the key.
     Hold {
@@ -221,6 +230,15 @@ pub fn duck_gain(depth_db: f32, envelope: f32) -> f32 {
     exp2(-(depth_db * envelope) * OCTAVES_PER_DB)
 }
 
+fn samples(ms: f32) -> f64 {
+    f64::from(ms) * SAMPLE_RATE / 1000.0
+}
+
+/// Runs of a transit of `ms`, at least one.
+fn runs(ms: f32) -> u32 {
+    (libm::round(samples(ms) / f64::from(GAIN_INTERVAL)) as u32).max(1)
+}
+
 /// The values a detector computes from its parameters.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Levels {
@@ -237,8 +255,6 @@ struct Levels {
 
 impl Levels {
     fn of(p: &DetectorParams) -> Levels {
-        let samples = |ms: f32| f64::from(ms) * SAMPLE_RATE / 1000.0;
-        let runs = |ms: f32| (libm::round(samples(ms) / f64::from(GAIN_INTERVAL)) as u32).max(1);
         Levels {
             threshold: db_to_gain(p.threshold_db),
             reopen: db_to_gain(p.threshold_db - p.hysteresis_db),
@@ -254,11 +270,17 @@ impl Levels {
     }
 }
 
-/// `pos` runs of a transit of `from` carried over to one of `to`, to the
-/// nearest run.
-fn carry(pos: u32, from: u32, to: u32) -> u32 {
-    let (pos, from, to) = (u64::from(pos), u64::from(from), u64::from(to));
-    ((pos * to + from / 2) / from) as u32
+/// `pos` runs of a transit of `from` runs carried over to one of `to`
+/// runs, down while rising and up while falling, so the next run moves
+/// the envelope on by at most one run of the new transit.
+fn carry(pos: u32, from: u32, to: u32, rising: bool) -> u32 {
+    let (n, d) = (u64::from(pos) * u64::from(to), u64::from(from));
+    (if rising { n / d } else { n.div_ceil(d) }) as u32
+}
+
+/// Runs of the longest transit.
+fn max_span() -> u32 {
+    runs(*ATTACK_MS.end()).max(runs(*RELEASE_MS.end()))
 }
 
 /// One key: its input's width and gain, and its filters.
@@ -297,15 +319,16 @@ impl Key {
 
     /// Takes the key of `out.len()` samples into `out` where it is
     /// larger, leg `l` of them from `leg(l)`.
-    fn key<'a>(&mut self, out: &mut [f32], leg: impl Fn(usize) -> &'a [f32]) {
+    /// The filters zero their small states when `small`.
+    fn key<'a>(&mut self, out: &mut [f32], leg: impl Fn(usize) -> &'a [f32], small: bool) {
         let (n, legs) = (out.len(), self.legs);
         let mut scratch = [0.0f32; MAX_LEGS * CHUNK];
         let x = &mut scratch[..legs * n];
         for (l, x) in x.chunks_exact_mut(n).enumerate() {
             x.copy_from_slice(leg(l));
         }
-        self.hpf.process(x, legs, n);
-        self.lpf.process(x, legs, n);
+        self.hpf.process_flushing(x, legs, n, small);
+        self.lpf.process_flushing(x, legs, n, small);
         for (i, o) in out.iter_mut().enumerate() {
             let mut m = 0.0f32;
             for l in 0..legs {
@@ -341,7 +364,7 @@ impl Key {
 const REST: [[f32; 2]; MAX_LEGS] = [[0.0; 2]; MAX_LEGS];
 
 /// A duck detector. A new one is at [`DetectorParams::DEFAULT`], mode
-/// [`Mode::Auto`], no key and no duck.
+/// [`DuckMode::Auto`], no key and no duck.
 ///
 /// A detector deserializes only as one [`Detector::is_valid`] takes.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -350,19 +373,21 @@ pub struct Detector {
     ramp: u32,
     params: DetectorParams,
     levels: Levels,
-    mode: Mode,
+    mode: DuckMode,
     held: bool,
     keys: [Key; MAX_KEYS],
     /// Triggered in the last run or holding: the envelope rises.
     engaged: bool,
     /// Samples of hold left.
     hold: u32,
-    /// The envelope in runs of the transit `levels.span(engaged)`.
+    /// The envelope in runs of a transit of `span` runs.
     pos: u32,
+    span: u32,
     /// The largest key of the interval so far.
     peak: f32,
-    /// Samples of the interval processed.
-    phase: u32,
+    /// The sample index modulo [`CHUNK`]; modulo [`GAIN_INTERVAL`], the
+    /// samples of the interval processed.
+    at: u32,
     /// The envelope moving by `step` a sample from `from` to `to`.
     from: f32,
     step: f32,
@@ -375,14 +400,15 @@ struct Unchecked {
     ramp: u32,
     params: DetectorParams,
     levels: Levels,
-    mode: Mode,
+    mode: DuckMode,
     held: bool,
     keys: [Key; MAX_KEYS],
     engaged: bool,
     hold: u32,
     pos: u32,
+    span: u32,
     peak: f32,
-    phase: u32,
+    at: u32,
     from: f32,
     step: f32,
     to: f32,
@@ -402,8 +428,9 @@ impl TryFrom<Unchecked> for Detector {
             engaged: u.engaged,
             hold: u.hold,
             pos: u.pos,
+            span: u.span,
             peak: u.peak,
-            phase: u.phase,
+            at: u.at,
             from: u.from,
             step: u.step,
             to: u.to,
@@ -420,18 +447,20 @@ impl Detector {
     /// A detector whose key filter changes ramp over `ramp` samples.
     pub fn new(ramp: u32) -> Detector {
         let params = DetectorParams::DEFAULT;
+        let levels = Levels::of(&params);
         Detector {
             ramp: ramp.min(MAX_RAMP_LEN),
             params,
-            levels: Levels::of(&params),
-            mode: Mode::Auto,
+            levels,
+            mode: DuckMode::Auto,
             held: false,
             keys: [Key::new(&params); MAX_KEYS],
             engaged: false,
             hold: 0,
             pos: 0,
+            span: levels.span(false),
             peak: 0.0,
-            phase: 0,
+            at: 0,
             from: 0.0,
             step: 0.0,
             to: 0.0,
@@ -442,7 +471,7 @@ impl Detector {
         self.params
     }
 
-    pub fn mode(&self) -> Mode {
+    pub fn mode(&self) -> DuckMode {
         self.mode
     }
 
@@ -458,7 +487,7 @@ impl Detector {
 
     /// The envelope of the last sample processed, 0 to 1.
     pub fn envelope(&self) -> f32 {
-        self.from + self.phase as f32 * self.step
+        self.from + (self.at % GAIN_INTERVAL) as f32 * self.step
     }
 
     /// Sets `param` from the next run on: a new threshold, hysteresis,
@@ -473,11 +502,8 @@ impl Detector {
         }
         match param {
             DuckParam::Detector(p) => {
-                let old = self.levels;
                 self.params = p;
                 self.levels = Levels::of(&p);
-                let span = |l: &Levels| l.span(self.engaged);
-                self.pos = carry(self.pos, span(&old), span(&self.levels));
                 self.hold = self.hold.min(self.levels.hold);
                 for k in &mut self.keys {
                     k.retarget(&p, self.ramp);
@@ -519,21 +545,24 @@ impl Detector {
         envelope: &mut [f32],
     ) {
         let envelope = &mut envelope[..frames];
-        let mut at = 0;
-        while at < frames {
-            let n = (frames - at).min(CHUNK);
+        let mut done = 0;
+        while done < frames {
+            // Chunks end at the multiples of CHUNK of the sample index,
+            // where the key filters zero their small states.
+            let n = (frames - done).min(CHUNK - self.at as usize);
+            let small = self.at as usize + n == CHUNK;
             let mut key = [0.0f32; CHUNK];
             for (k, chain) in self.keys.iter_mut().enumerate() {
                 if chain.on {
-                    chain.key(&mut key[..n], |l| &leg(k, l)[at..at + n]);
+                    chain.key(&mut key[..n], |l| &leg(k, l)[done..done + n], small);
                 } else {
                     chain.advance(n);
                 }
             }
-            for (e, &k) in envelope[at..at + n].iter_mut().zip(&key[..n]) {
+            for (e, &k) in envelope[done..done + n].iter_mut().zip(&key[..n]) {
                 *e = self.tick(k);
             }
-            at += n;
+            done += n;
         }
     }
 
@@ -543,9 +572,10 @@ impl Detector {
         if key > self.peak {
             self.peak = key;
         }
-        self.phase += 1;
-        if self.phase < GAIN_INTERVAL {
-            return self.from + self.phase as f32 * self.step;
+        self.at = (self.at + 1) % CHUNK as u32;
+        let phase = self.at % GAIN_INTERVAL;
+        if phase != 0 {
+            return self.from + phase as f32 * self.step;
         }
         let e = self.to;
         self.run();
@@ -554,7 +584,7 @@ impl Detector {
 
     /// Whether the manual controls decide the detector.
     fn forced(&self) -> bool {
-        self.held || self.mode != Mode::Auto
+        self.held || self.mode != DuckMode::Auto
     }
 
     /// The run at the end of an interval: decides whether the interval
@@ -562,48 +592,63 @@ impl Detector {
     /// interval.
     fn run(&mut self) {
         let l = self.levels;
-        let triggered = self.held
-            || match self.mode {
-                Mode::On => true,
-                Mode::Off => false,
-                Mode::Auto => self.peak >= if self.engaged { l.reopen } else { l.threshold },
-            };
-        self.hold = if triggered {
-            l.hold
+        let (triggered, hold) = if self.held {
+            (true, l.hold)
         } else {
-            self.hold.saturating_sub(GAIN_INTERVAL)
+            match self.mode {
+                DuckMode::On => (true, l.hold),
+                DuckMode::Off => (false, 0),
+                DuckMode::Auto => {
+                    let at = if self.engaged { l.reopen } else { l.threshold };
+                    let triggered = self.peak >= at;
+                    let hold = if triggered {
+                        l.hold
+                    } else {
+                        self.hold.saturating_sub(GAIN_INTERVAL)
+                    };
+                    (triggered, hold)
+                }
+            }
         };
-        let engaged = triggered || self.hold > 0;
-        if engaged != self.engaged {
-            self.pos = carry(self.pos, l.span(self.engaged), l.span(engaged));
-            self.engaged = engaged;
-        }
-        let span = l.span(engaged);
-        self.pos = if engaged {
-            (self.pos + 1).min(span)
-        } else {
-            self.pos.saturating_sub(1)
-        };
-        let to = self.pos as f32 / span as f32;
+        self.hold = hold;
+        self.toward(triggered || hold > 0, 1);
+        let to = self.pos as f32 / self.span as f32;
         self.from = self.to;
         self.step = (to - self.to) * INV;
         self.to = to;
         self.peak = 0.0;
-        self.phase = 0;
     }
 
-    /// Whether a run changes nothing but the peak: a forced detector at
-    /// full depth holding, or at rest with no hold left.
-    fn settled(&self) -> bool {
-        let on = self.held || self.mode == Mode::On;
-        let span = self.levels.span(on);
-        self.step == 0.0
-            && self.engaged == on
-            && if on {
-                self.pos == span && self.hold == self.levels.hold
-            } else {
-                self.pos == 0 && self.hold == 0
-            }
+    /// Moves the envelope `runs` runs up while `engaged`, down otherwise,
+    /// in runs of the attack or the release, carried over from the
+    /// transit it was counted in.
+    fn toward(&mut self, engaged: bool, runs: u64) {
+        let span = self.levels.span(engaged);
+        if span != self.span {
+            self.pos = carry(self.pos, self.span, span, engaged);
+            self.span = span;
+        }
+        self.engaged = engaged;
+        let pos = u64::from(self.pos);
+        self.pos = if engaged {
+            (pos + runs).min(u64::from(span))
+        } else {
+            pos.saturating_sub(runs)
+        } as u32;
+    }
+
+    /// `runs` runs of a detector its manual controls decide, the same
+    /// decision in each: all but the last at once, the last as
+    /// [`run`](Self::run) makes it.
+    fn run_forced(&mut self, runs: u64) {
+        if runs > 1 {
+            let on = self.held || self.mode == DuckMode::On;
+            self.hold = if on { self.levels.hold } else { 0 };
+            self.toward(on, runs - 1);
+            self.to = self.pos as f32 / self.span as f32;
+        }
+        self.peak = 0.0;
+        self.run();
     }
 
     /// Into the next interval without a run: the envelope held at the
@@ -617,43 +662,36 @@ impl Detector {
     /// Moves `frames` samples on without their keys: the key filters'
     /// ramps move on, their states, the hold and the envelope stay as
     /// they are, held at the last value computed across the end of the
-    /// interval. A detector decided by its manual controls runs every
-    /// interval it passes, as processing does, the keys not entering.
+    /// interval. A detector decided by its manual controls makes every
+    /// run it passes, as processing does, the keys not entering.
     pub fn advance(&mut self, frames: usize) {
         for k in &mut self.keys {
             k.advance(frames);
         }
-        let end = self.phase as usize + frames;
         let len = GAIN_INTERVAL as usize;
-        if end < len {
-            self.phase = end as u32;
+        let runs = ((self.at as usize % len) + frames) / len;
+        self.at = ((self.at as usize + frames % CHUNK) % CHUNK) as u32;
+        if runs == 0 {
             return;
         }
         if self.forced() {
-            self.peak = 0.0;
-            for _ in 0..end / len {
-                if self.settled() {
-                    break;
-                }
-                self.run();
-            }
+            self.run_forced(runs as u64);
         } else {
             self.wrap();
         }
-        self.phase = (end % len) as u32;
     }
 
     /// Takes the next sample processed to be sample index `index`: the
     /// detector runs at the multiples of [`GAIN_INTERVAL`] samples of the
-    /// index. A position other than the current one holds the envelope as
-    /// [`advance`](Self::advance) does. A detector starts at index 0 and
-    /// counts the samples it processes and advances over.
+    /// index. A position in the interval other than the current one holds
+    /// the envelope as [`advance`](Self::advance) does. A detector starts
+    /// at index 0 and counts the samples it processes and advances over.
     pub fn align(&mut self, index: u64) {
-        let phase = (index % u64::from(GAIN_INTERVAL)) as u32;
-        if phase != self.phase {
+        let at = (index % CHUNK as u64) as u32;
+        if at % GAIN_INTERVAL != self.at % GAIN_INTERVAL {
             self.wrap();
-            self.phase = phase;
         }
+        self.at = at;
     }
 
     /// Whether the detector holds what one built by [`Detector::new`] and
@@ -662,10 +700,10 @@ impl Detector {
     /// a gain within [`KEY_GAIN`], key filters ramping to the shapes of
     /// the parameters with states within the bound a block leaves and at
     /// rest when not keyed, a hold within the hold time and only while
-    /// engaged, an envelope within its transit, a finite key, a position
-    /// within the interval and an envelope within 0 and 1 moving by the
-    /// step of its ends. A detector decoded from a peer is checked with it
-    /// before it runs.
+    /// engaged, an envelope position within a transit no longer than the
+    /// longest, a finite key, a position within the grid and an envelope
+    /// within 0 and 1 moving by the step of its ends to its position. A
+    /// detector decoded from a peer is checked with it before it runs.
     pub fn is_valid(&self) -> bool {
         let unit = |v: f32| (0.0..=1.0).contains(&v);
         self.ramp <= MAX_RAMP_LEN
@@ -674,12 +712,13 @@ impl Detector {
             && self.keys.iter().all(|k| k.is_valid(&self.params))
             && self.hold <= self.levels.hold
             && (self.hold == 0 || self.engaged)
-            && self.pos <= self.levels.span(self.engaged)
+            && (1..=max_span()).contains(&self.span)
+            && self.pos <= self.span
             && self.peak.is_finite()
             && self.peak >= 0.0
-            && self.phase < GAIN_INTERVAL
+            && self.at < CHUNK as u32
             && unit(self.from)
-            && unit(self.to)
+            && self.to == self.pos as f32 / self.span as f32
             && self.step == (self.to - self.from) * INV
     }
 }
@@ -1057,9 +1096,9 @@ mod tests {
         let p = plain(DetectorParams::DEFAULT);
         let len = samples(p.attack_ms) + TOL;
         for held in [false, true] {
-            for mode in [Mode::Auto, Mode::On, Mode::Off] {
+            for mode in [DuckMode::Auto, DuckMode::On, DuckMode::Off] {
                 for loud in [false, true] {
-                    let want = held || mode == Mode::On || (mode == Mode::Auto && loud);
+                    let want = held || mode == DuckMode::On || (mode == DuckMode::Auto && loud);
                     let mut d = detector(p);
                     assert!(d.set(DuckParam::Mode(mode)) && d.set(DuckParam::Hold { held }));
                     let x = vec![
@@ -1079,10 +1118,11 @@ mod tests {
         }
     }
 
-    /// A manual duck takes the attack to full depth and, released, the
-    /// hold and the release back to none, as a keyed one does; mode Off
-    /// set while a key holds the duck releases it after the hold, and
-    /// the momentary hold ducks again through it.
+    /// A manual duck, held or latched, takes the attack to full depth
+    /// and, released, the hold and the release back to none, as a keyed
+    /// one does; mode Off
+    /// set while a key holds the duck releases it at the next run,
+    /// without the hold, and the momentary hold ducks again through it.
     #[test]
     fn a_manual_duck_takes_the_same_times() {
         let p = plain(DetectorParams::DEFAULT);
@@ -1096,39 +1136,52 @@ mod tests {
             (from..e.len()).find(|&n| f(e[n])).unwrap()
         };
         for b in BLOCKS {
-            let press = 480;
-            let lift = press + attack + 960;
-            let silence = vec![vec![vec![0.0f32; lift + span]]];
-            let events = [
-                (press, DuckParam::Hold { held: true }),
-                (lift, DuckParam::Hold { held: false }),
+            // The momentary hold, and a latch set back to auto.
+            let latches = [
+                (
+                    DuckParam::Hold { held: true },
+                    DuckParam::Hold { held: false },
+                ),
+                (
+                    DuckParam::Mode(DuckMode::On),
+                    DuckParam::Mode(DuckMode::Auto),
+                ),
             ];
-            let e = run_with(&mut detector(p), &silence, || b, &events);
-            let full = at(&e, press, &|v| v == 1.0);
-            let falls = at(&e, full, &|v| v < 1.0);
-            let rest = at(&e, falls, &|v| v == 0.0);
-            assert!(e[..=press].iter().all(|&v| v == 0.0), "blocks of {b}");
-            assert!(
-                (full - press).abs_diff(attack) <= TOL,
-                "blocks of {b}: full after {}",
-                full - press
-            );
-            assert!(
-                (hold..=hold + TOL).contains(&(falls - lift)),
-                "blocks of {b}: release after {}",
-                falls - lift
-            );
-            assert!(
-                (rest + 1 - falls).abs_diff(release) <= TOL,
-                "blocks of {b}: none after {}",
-                rest + 1 - falls
-            );
+            for (on, off) in latches {
+                let press = 480;
+                let lift = press + attack + 960;
+                let silence = vec![vec![vec![0.0f32; lift + span]]];
+                let events = [(press, on), (lift, off)];
+                let e = run_with(&mut detector(p), &silence, || b, &events);
+                let full = at(&e, press, &|v| v == 1.0);
+                let falls = at(&e, full, &|v| v < 1.0);
+                let rest = at(&e, falls, &|v| v == 0.0);
+                assert!(
+                    e[..=press].iter().all(|&v| v == 0.0),
+                    "{on:?}, blocks of {b}"
+                );
+                assert!(
+                    (full - press).abs_diff(attack) <= TOL,
+                    "{on:?}, blocks of {b}: full after {}",
+                    full - press
+                );
+                assert!(
+                    (hold..=hold + TOL).contains(&(falls - lift)),
+                    "{on:?}, blocks of {b}: release after {}",
+                    falls - lift
+                );
+                assert!(
+                    (rest + 1 - falls).abs_diff(release) <= TOL,
+                    "{on:?}, blocks of {b}: none after {}",
+                    rest + 1 - falls
+                );
+            }
 
             let bypass = attack + 960;
             let press = bypass + span;
             let loud = vec![vec![vec![db_to_gain(p.threshold_db + 6.0); press + span]]];
             let events = [
-                (bypass, DuckParam::Mode(Mode::Off)),
+                (bypass, DuckParam::Mode(DuckMode::Off)),
                 (press, DuckParam::Hold { held: true }),
             ];
             let e = run_with(&mut detector(p), &loud, || b, &events);
@@ -1136,9 +1189,14 @@ mod tests {
             let falls = at(&e, bypass, &|v| v < 1.0);
             let rest = at(&e, falls, &|v| v == 0.0);
             assert!(
-                (hold..=hold + TOL).contains(&(falls - bypass)),
+                (1..=TOL).contains(&(falls - bypass)),
                 "blocks of {b}: bypass after {}",
                 falls - bypass
+            );
+            assert!(
+                (rest + 1 - falls).abs_diff(release) <= TOL,
+                "blocks of {b}: no duck {} samples after the bypass",
+                rest + 1 - falls
             );
             assert!(e[rest..press].iter().all(|&v| v == 0.0), "blocks of {b}");
             let full = at(&e, press, &|v| v == 1.0);
@@ -1171,7 +1229,11 @@ mod tests {
         );
 
         let tail = vec![0.0f32; samples(p.attack_ms + p.hold_ms + p.release_ms) + TOL];
-        for (mode, held) in [(Mode::On, false), (Mode::Auto, true), (Mode::Off, false)] {
+        for (mode, held) in [
+            (DuckMode::On, false),
+            (DuckMode::Auto, true),
+            (DuckMode::Off, false),
+        ] {
             for skip in [
                 3,
                 8,
@@ -1423,8 +1485,16 @@ mod tests {
         });
         refused("hold beyond its time", &|d| d.hold = d.levels.hold + 1);
         refused("hold while not engaged", &|d| d.engaged = false);
-        refused("envelope beyond its transit", &|d| {
-            d.pos = d.levels.span(d.engaged) + 1
+        refused("envelope beyond its transit", &|d| d.pos = d.span + 1);
+        refused("transit beyond the longest", &|d| {
+            d.pos = 0;
+            d.span = max_span() + 1;
+            d.to = 0.0;
+            d.step = (d.to - d.from) * INV;
+        });
+        refused("envelope off its position", &|d| {
+            d.to = (d.pos + 1) as f32 / d.span as f32;
+            d.step = (d.to - d.from) * INV;
         });
         refused("NaN envelope", &|d| d.to = f32::NAN);
         refused("envelope beyond full depth", &|d| {
@@ -1432,7 +1502,7 @@ mod tests {
             d.step = (d.to - d.from) * INV;
         });
         refused("step not between its ends", &|d| d.step = 0.5);
-        refused("phase beyond the interval", &|d| d.phase = GAIN_INTERVAL);
+        refused("position beyond the grid", &|d| d.at = CHUNK as u32);
         refused("NaN key", &|d| d.peak = f32::NAN);
         refused("negative key", &|d| d.peak = -1.0);
         refused("key of no legs", &|d| d.keys[0].legs = 0);
@@ -1512,7 +1582,7 @@ mod tests {
             2 => DuckParam::Unkey {
                 key: rng.below(MAX_KEYS),
             },
-            3 => DuckParam::Mode([Mode::Auto, Mode::On, Mode::Off][rng.below(3)]),
+            3 => DuckParam::Mode([DuckMode::Auto, DuckMode::On, DuckMode::Off][rng.below(3)]),
             4 => DuckParam::Hold {
                 held: rng.below(3) == 0,
             },
@@ -1620,6 +1690,106 @@ mod tests {
                     "after {bad}, {p:?}"
                 );
             }
+        }
+    }
+
+    /// A reversal mid-transit carries the envelope over: a key returning
+    /// mid-release takes the attack times the distance left to full
+    /// depth, a duck released mid-attack the release times the depth
+    /// reached, within TOL, with attack and release either way round and
+    /// at every block size; no sample moves the envelope by more than one
+    /// run's share of the transit it moves in.
+    #[test]
+    fn a_reversal_takes_the_time_of_the_distance_left() {
+        // Transits of no whole ratio, so a carry rounds.
+        for (attack_ms, release_ms) in [(70.0, 330.0), (330.0, 70.0), (23.0, 1000.0)] {
+            let p = plain(DetectorParams {
+                attack_ms,
+                hold_ms: 0.0,
+                release_ms,
+                ..DetectorParams::DEFAULT
+            });
+            let (attack, release) = (samples(attack_ms), samples(release_ms));
+            let up = INV / runs(attack_ms) as f32 + 1e-6;
+            let down = INV / runs(release_ms) as f32 + 1e-6;
+            let loud = db_to_gain(p.threshold_db + 6.0);
+            // Full depth, released for 0.4 of the release, back again.
+            let first = attack + samples(20.0);
+            let back = first + 2 * release / 5;
+            let returns: Vec<f32> = (0..back + attack + samples(20.0))
+                .map(|n| if n < first || n >= back { loud } else { 0.0 })
+                .collect();
+            // 0.4 of the attack, then released.
+            let burst = 2 * attack / 5;
+            let leaves: Vec<f32> = (0..burst + release + samples(20.0))
+                .map(|n| if n < burst { loud } else { 0.0 })
+                .collect();
+            for b in BLOCKS {
+                let what = format!("attack {attack_ms}, release {release_ms} ms, blocks of {b}");
+                let e = run_mono(&mut detector(p), &returns, b);
+                let rises = (first..e.len()).find(|&n| e[n] > e[n - 1]).unwrap();
+                let e0 = e[rises - 1];
+                assert!(0.3 < e0 && e0 < 0.9, "{what}: {e0}");
+                let full = (rises..e.len()).find(|&n| e[n] == 1.0).unwrap();
+                let want = f64::from(1.0 - e0) * attack as f64;
+                let got = (full + 1 - rises) as f64;
+                assert!(
+                    (got - want).abs() <= TOL as f64,
+                    "{what}: full {got} samples after the return from {e0}, want {want}"
+                );
+                let e1 = run_mono(&mut detector(p), &leaves, b);
+                let falls = (1..e1.len()).find(|&n| e1[n] < e1[n - 1]).unwrap();
+                let top = e1[falls - 1];
+                assert!(0.2 < top && top < 0.6, "{what}: {top}");
+                let rest = (falls..e1.len()).find(|&n| e1[n] == 0.0).unwrap();
+                let want = f64::from(top) * release as f64;
+                let got = (rest + 1 - falls) as f64;
+                assert!(
+                    (got - want).abs() <= TOL as f64,
+                    "{what}: none {got} samples after the release from {top}, want {want}"
+                );
+                for e in [&e, &e1] {
+                    for (n, w) in e.windows(2).enumerate() {
+                        let d = w[1] - w[0];
+                        assert!(
+                            d <= up && -d <= down,
+                            "{what}: sample {n} moves {d}, at most {up} up, {down} down"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The key filters zero their small states on the grid of the sample
+    /// index, not at the ends of blocks: a filtered tone dying into
+    /// silence and returning leaves the same detector, key filter states
+    /// included, at every block size, every 5 ms.
+    #[test]
+    fn key_filter_states_do_not_depend_on_the_split() {
+        let p = DetectorParams {
+            lpf: KeyFilter {
+                enabled: true,
+                freq: 4000.0,
+            },
+            ..DetectorParams::DEFAULT
+        };
+        let burst = tone(1000.0, db_to_gain(-20.0), samples(100.0));
+        let mut x = burst.clone();
+        x.extend(vec![0.0; samples(200.0)]);
+        x.extend(&burst);
+        let states = |b: usize| -> Vec<Detector> {
+            let mut d = detector(p);
+            x.chunks(samples(5.0))
+                .map(|c| {
+                    run_mono(&mut d, c, b);
+                    d
+                })
+                .collect()
+        };
+        let want = states(48);
+        for b in BLOCKS {
+            assert!(states(b) == want, "blocks of {b}");
         }
     }
 }

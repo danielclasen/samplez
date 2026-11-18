@@ -7,8 +7,8 @@ use std::cell::Cell;
 use samplez_dsp::duck::MAX_KEYS;
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
-    BandType, CompParams, Detector, DetectorParams, DuckParam, EqBand, GateParams, KWeighting,
-    KeyFilter, Loudness, Matrix, Meters, Mode, Path, PlanarBuffer, Ramp, Strip, StripParam,
+    BandType, CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams,
+    KWeighting, KeyFilter, Loudness, Matrix, Meters, Path, PlanarBuffer, Ramp, Strip, StripParam,
     TruePeak, duck_gain, restore_mxcsr, set_ftz_daz,
 };
 
@@ -206,7 +206,7 @@ fn process_calls_do_not_allocate() {
             DuckParam::Unkey {
                 key: (round + 1) % MAX_KEYS,
             },
-            DuckParam::Mode(if on { Mode::Auto } else { Mode::Off }),
+            DuckParam::Mode(if on { DuckMode::Auto } else { DuckMode::Off }),
             DuckParam::Hold { held: round == 3 },
         ] {
             assert!(detector.set(p));

@@ -1,8 +1,8 @@
-//! The strip's filters: a state variable filter in the trapezoidal form
-//! of Andrew Simper (Cytomic, "SvfLinearTrapOptimised2"), whose outputs
-//! mix to the high-pass, low-pass, bell and shelf responses of the RBJ
-//! Audio EQ
-//! Cookbook (Robert Bristow-Johnson), with the same bilinear prewarp.
+//! The filters of the strip and of the duck detector's keys: a state
+//! variable filter in the trapezoidal form of Andrew Simper (Cytomic,
+//! "SvfLinearTrapOptimised2"), whose outputs mix to the high-pass,
+//! low-pass, bell and shelf responses of the RBJ Audio EQ Cookbook
+//! (Robert Bristow-Johnson), with the same bilinear prewarp.
 //!
 //! The coefficients `(g, k, m0, m1, m2)` are computed in f64 with the
 //! pure-Rust `libm`, so every replica gets the same bits, and stored as
@@ -14,6 +14,9 @@
 //! below -400 dB is set to zero, so silence decays to exact zeros, and so
 //! is one above +600 dB or not finite, which only a non-finite or
 //! overflowing input leaves, so the section recovers at the next block.
+//! A caller can leave the states below -400 dB for a later block, so
+//! where they are zeroed does not depend on how samples are split into
+//! blocks.
 
 /// Sample rate the coefficients are computed for.
 pub const SAMPLE_RATE: f64 = 48_000.0;
@@ -281,8 +284,20 @@ impl<const L: usize> Svf<L> {
     /// Filters `frames` samples of each of the first `legs` legs of the
     /// planar `buf` in place and moves the ramp on.
     pub(crate) fn process(&mut self, buf: &mut [f32], legs: usize, frames: usize) {
+        self.process_flushing(buf, legs, frames, true);
+    }
+
+    /// Filters as [`Svf::process`] does, setting states below -400 dB to
+    /// zero only when `small`.
+    pub(crate) fn process_flushing(
+        &mut self,
+        buf: &mut [f32],
+        legs: usize,
+        frames: usize,
+        small: bool,
+    ) {
         let mut state = self.state;
-        self.filter(&mut state, buf, legs, frames);
+        self.filter_flushing(&mut state, buf, legs, frames, small);
         self.state = state;
         self.advance(frames);
     }
@@ -296,6 +311,17 @@ impl<const L: usize> Svf<L> {
         buf: &mut [f32],
         legs: usize,
         frames: usize,
+    ) {
+        self.filter_flushing(state, buf, legs, frames, true);
+    }
+
+    fn filter_flushing(
+        &self,
+        state: &mut [[f32; 2]; L],
+        buf: &mut [f32],
+        legs: usize,
+        frames: usize,
+        small: bool,
     ) {
         if self.is_bypassed() {
             *state = [[0.0; 2]; L];
@@ -312,13 +338,14 @@ impl<const L: usize> Svf<L> {
             for v in held {
                 *v = tick(&mut s, &self.target, &self.a, *v);
             }
-            // A state below FLUSH is set to zero: the trapezoidal
-            // integrators can stop on a small value once their increment
-            // underflows, under FTZ/DAZ or rounding, and silence must
-            // reach exact zeros. One above STATE_MAX, or a NaN, which
-            // fails both comparisons, is set to zero too.
+            // A state below FLUSH is set to zero, when `small`: the
+            // trapezoidal integrators can stop on a small value once their
+            // increment underflows, under FTZ/DAZ or rounding, and silence
+            // must reach exact zeros. One above STATE_MAX, or a NaN, which
+            // fails the comparison, is set to zero always.
+            let low = if small { FLUSH } else { 0.0 };
             for v in &mut s {
-                if !(FLUSH..=STATE_MAX).contains(&v.abs()) {
+                if !(low..=STATE_MAX).contains(&v.abs()) {
                     *v = 0.0;
                 }
             }
