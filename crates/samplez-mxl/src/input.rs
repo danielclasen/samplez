@@ -21,8 +21,9 @@ use crate::lookup::{Backoff, Look, Lookup, exists, flow_dir};
 use crate::time::{RATE, timestamp_to_index};
 use crate::{Error, Instance, MxlApi, Result, Status, check, id_cstring};
 
-/// Consecutive late blocks with a frozen head after which an input is
-/// probed for validity.
+/// Consecutive late blocks with a frozen head after which
+/// [`Input::identify`] probes an input for validity.
+#[deprecated(note = "only the deprecated `Input::identify` probes")]
 pub const FROZEN_PROBE_BLOCKS: u32 = 10;
 
 /// The x86_64 base page size. A larger page is touched more than once.
@@ -454,16 +455,19 @@ impl Generation {
             .sum()
     }
 
-    /// RT. Whether every reader's head, the outgoing ones' included, has
-    /// reached `index`: the condition the group wait waits for, read from
-    /// the flows' shared memory alone. A head that cannot be read counts as
-    /// reached; the read reports it.
-    pub fn reached(&self, index: u64) -> bool {
+    /// RT. How many samples the slowest reader's head, the outgoing ones'
+    /// included, is below `index`; 0 once every head reached it, the
+    /// condition the group wait waits for. Read from the flows' shared
+    /// memory alone. A head that cannot be read counts as reached; the
+    /// read reports it.
+    pub fn behind(&self, index: u64) -> u64 {
         self.inputs
             .iter()
             .chain(&self.outgoing)
             .flatten()
-            .all(|i| !matches!(i.reader.head(), Ok(head) if head < index))
+            .map(|i| i.reader.head().map_or(0, |head| index.saturating_sub(head)))
+            .max()
+            .unwrap_or(0)
     }
 
     /// RT. `mxlFlowSynchronizationGroupWaitForDataAt` on the generation's
@@ -810,6 +814,7 @@ impl Input {
     #[deprecated(
         note = "the engine prunes a frozen input and checks its flow on the supervisor side"
     )]
+    #[allow(deprecated, reason = "FROZEN_PROBE_BLOCKS goes with this probe")]
     pub fn identify(&self, state: &mut SlotState, group: &GroupWait, outcome: Outcome) -> bool {
         if state.invalid
             || outcome != Outcome::Late

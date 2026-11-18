@@ -14,8 +14,8 @@ use mxl_sys::{
     MXL_ERR_OUT_OF_RANGE_TOO_EARLY,
 };
 use samplez_mxl::input::{
-    FROZEN_PROBE_BLOCKS, Generation, GroupWait, InputConfig, Outcome, Poll, PolledFlow,
-    RECOVERY_NS, Recovery, SlotState, Timing,
+    Generation, GroupWait, InputConfig, Outcome, Poll, PolledFlow, RECOVERY_NS, Recovery,
+    SlotState, Timing,
 };
 use samplez_mxl::{Error, Instance, time};
 
@@ -157,9 +157,9 @@ fn group_timestamp_includes_the_largest_offset() {
     let index = time::group_index(K0, B, g.max_offset());
     assert_eq!(index, (K0 + 1) * B + 24);
     w.write((K0 + 1) * B + 23, B as usize, sample);
-    assert!(!g.reached(index));
+    assert_eq!(g.behind(index), 1);
     w.write((K0 + 1) * B + 24, 1, sample);
-    assert!(g.reached(index));
+    assert_eq!(g.behind(index), 0);
 }
 
 /// The heads are read from the flows' shared memory: every reader counts,
@@ -167,7 +167,7 @@ fn group_timestamp_includes_the_largest_offset() {
 /// its mapping, the head it had, without libmxl looking the flow's files
 /// up.
 #[test]
-fn reached_reads_every_head_and_a_deleted_flows_too() {
+fn behind_reads_every_head_and_a_deleted_flows_too() {
     let api = api();
     let domain = Domain::new();
     let (a, b) = (new_id(), new_id());
@@ -177,16 +177,16 @@ fn reached_reads_every_head_and_a_deleted_flows_too() {
     wb.blocks(K0..K0 + 5);
     let mut g = Generation::new(&api, &domain.0, 1).unwrap();
     g.attach(0, &input(&a, 1, 0), &TIMING).unwrap();
-    assert!(g.reached((K0 + 10) * B));
-    assert!(!g.reached((K0 + 10) * B + 1));
+    assert_eq!(g.behind((K0 + 10) * B), 0);
+    assert_eq!(g.behind((K0 + 10) * B + 1), 1);
     g.attach_outgoing(0, &input(&b, 1, 0), &TIMING).unwrap();
-    assert!(g.reached((K0 + 5) * B));
-    assert!(!g.reached((K0 + 6) * B), "the outgoing reader is behind");
+    assert_eq!(g.behind((K0 + 5) * B), 0);
+    assert_eq!(g.behind((K0 + 6) * B), B, "the outgoing reader is behind");
 
     drop(wb);
     assert!(!domain.0.join(format!("{b}.mxl-flow")).exists());
-    assert!(g.reached((K0 + 5) * B));
-    assert!(!g.reached((K0 + 6) * B));
+    assert_eq!(g.behind((K0 + 5) * B), 0);
+    assert_eq!(g.behind((K0 + 6) * B), B);
 }
 
 #[test]
@@ -343,12 +343,15 @@ fn identify_probes_and_marks_a_replaced_flow() {
     {
         let r = f.generation.input(0).unwrap();
         // A stalled, valid flow: one probe at the tenth frozen late block.
-        for i in 1..=FROZEN_PROBE_BLOCKS + 2 {
+        for i in 1..=samplez_mxl::input::FROZEN_PROBE_BLOCKS + 2 {
             let o = r.read(&mut s, K0 + 20 + u64::from(i), &timeout, &mut dst);
             assert_eq!(o, Outcome::Late);
             assert_eq!(s.frozen_late_blocks, i);
             assert!(!r.identify(&mut s, &timeout, o));
-            assert_eq!(s.counters.probes, u64::from(i >= FROZEN_PROBE_BLOCKS));
+            assert_eq!(
+                s.counters.probes,
+                u64::from(i >= samplez_mxl::input::FROZEN_PROBE_BLOCKS)
+            );
         }
         // A non-late block is never probed, whatever the group said.
         assert!(!r.identify(
@@ -448,7 +451,10 @@ fn a_new_generation_reads_the_same_samples_and_outlives_the_old_one() {
     drop(old);
     wa.blocks(K0 + 20..K0 + 30);
     wb.blocks(K0 + 20..K0 + 30);
-    assert!(new.reached(time::group_index(K0 + 28, B, new.max_offset())));
+    assert_eq!(
+        0,
+        new.behind(time::group_index(K0 + 28, B, new.max_offset()))
+    );
     for k in K0 + 15..K0 + 29 {
         for slot in 0..2 {
             let mut dst = vec![0.0; channels[slot] * B as usize];

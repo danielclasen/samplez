@@ -6071,7 +6071,6 @@ mod tests {
         until("prune", &|| {
             e.status().inputs[0].state == InputState::Pruned
         });
-        assert_eq!(n(&c.input_probes), 0);
         assert_eq!(e.status().rt_panic, None);
         e.stop();
         std::fs::remove_dir_all(&domain).unwrap();

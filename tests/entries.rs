@@ -445,7 +445,9 @@ fn a_build_leaves_out_a_flow_its_lookup_has_not_found() {
 /// check the flow, which on a file system that waits for a missing name
 /// looks the deleted flow's files up and waits; the input is pruned for
 /// its frozen head, and its flow looked up on the supervisor side, here
-/// with a lookup that waits. The other input is read throughout.
+/// with a lookup that waits. The other input is read throughout, and the
+/// frozen head, ever further behind, costs the wait a few wakes per block,
+/// not one per 100 us.
 #[test]
 fn a_deleted_input_flow_is_pruned_without_a_check_on_the_rt_thread() {
     let domain = Domain::new();
@@ -464,6 +466,9 @@ fn a_deleted_input_flow_is_pruned_without_a_check_on_the_rt_thread() {
     running(&e);
     // From now on the flow's lookup waits.
     SLOW.lock().unwrap().push(gone.clone());
+    let c = e.counters();
+    let sleeps = c.input_wait_sleeps.load(Relaxed);
+    let timeouts = c.input_wait_timeout.load(Relaxed);
     let k0 = now(&rx);
     drop(pilot);
     assert!(!domain.0.join(format!("{gone}.mxl-flow")).exists());
@@ -472,8 +477,13 @@ fn a_deleted_input_flow_is_pruned_without_a_check_on_the_rt_thread() {
     });
     let mut seen = Vec::new();
     wait_past(&rx, now(&rx) + 200, &mut seen);
-    let c = e.counters();
-    assert_eq!(c.input_probes.load(Relaxed), 0);
+    let sleeps = c.input_wait_sleeps.load(Relaxed) - sleeps;
+    let timeouts = c.input_wait_timeout.load(Relaxed) - timeouts;
+    assert!(timeouts > 0);
+    assert!(
+        sleeps <= 3 * timeouts,
+        "{sleeps} sleeps in {timeouts} late blocks"
+    );
     // Every block after the deletion read the other input.
     let read: Vec<_> = seen.iter().filter(|v| v.k > k0).collect();
     assert!(read.len() > 150, "{} blocks", read.len());

@@ -46,11 +46,13 @@ pub struct Counters {
     /// Samples skipped when the loop was more than `maxCatchupBlocks`
     /// behind; libmxl zero-fills them on the next commit.
     pub overrun_skipped_samples: AtomicU64,
-    /// Blocks processed before their deadline after a group wait returned
-    /// OK.
+    /// Blocks processed before their deadline after every input head
+    /// reached the block.
     pub wait_early: AtomicU64,
-    /// Group waits that timed out.
+    /// Input waits that reached the block's deadline with a head behind.
     pub input_wait_timeout: AtomicU64,
+    /// Sleeps of the input waits between two reads of the heads.
+    pub input_wait_sleeps: AtomicU64,
     /// Input blocks not read because the head was below the range end.
     pub input_late_blocks: AtomicU64,
     /// Input blocks silenced for any reason, a pruned input included.
@@ -727,9 +729,8 @@ pub(crate) struct Out {
 }
 
 /// Samples of a meter slice: 10 ms at 48 kHz.
-/// How long the RT thread sleeps between two reads of the input heads
-/// while it waits for a block's input: 100 us, a tenth of a 48-sample
-/// block.
+/// The shortest sleep between two reads of the input heads while the RT
+/// thread waits for a block's input.
 const HEAD_POLL_NS: u64 = 100_000;
 
 pub(crate) const SLICE: u64 = samplez_dsp::SLICE;
@@ -1595,8 +1596,8 @@ impl Rt {
         }
     }
 
-    /// The loop of plan 2.3. Per block k: wait on each input domain's group
-    /// for the group timestamp until `T_k`, read, process and write,
+    /// The loop of plan 2.3. Per block k: wait for each input domain's
+    /// heads to reach the group index until `T_k`, read, process and write,
     /// `mxlSleepUntil(T_k)`. After a wake, an overdue backlog of up to
     /// `maxCatchupBlocks` is processed in order without waiting, beyond
     /// that only the newest block. Returns its state when `stop` is set,
@@ -1613,8 +1614,8 @@ impl Rt {
         (self, message)
     }
 
-    /// The loop body is real-time; the two calls that wait by design, the
-    /// sync-group wait and `mxlSleepUntil`, are allowed by call site.
+    /// The loop body is real-time; the call that waits by design,
+    /// `mxlSleepUntil`, is allowed by call site.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     fn blocks(&mut self) {
         let mut next: Option<u64> = None;
@@ -1864,7 +1865,10 @@ impl Rt {
 
     /// Waits for each input domain's readers to reach block `k`'s group
     /// index, until `deadline`: reads their heads, which are in the flows'
-    /// shared memory, and sleeps [`HEAD_POLL_NS`] between two reads. No
+    /// shared memory, and sleeps until the slowest one can have reached it
+    /// at the sample rate, [`HEAD_POLL_NS`] at least, the deadline at most:
+    /// a producer that lags is read when its samples are due, and a frozen
+    /// head, falling further behind, costs a wake or two per block. No
     /// libmxl call that looks a flow's files up, as the group wait's and the
     /// read's validity checks do once they time out, runs here: on a file
     /// system that waits for a missing name, a deleted flow would hold the
@@ -1879,7 +1883,8 @@ impl Rt {
                     waited = true;
                     let index = time::group_index(k, self.block, g.mxl.max_offset());
                     loop {
-                        if g.mxl.reached(index) {
+                        let behind = g.mxl.behind(index);
+                        if behind == 0 {
                             break GroupWait::Ok;
                         }
                         let now = self.now();
@@ -1887,7 +1892,10 @@ impl Rt {
                             add(&self.counters.input_wait_timeout, 1);
                             break GroupWait::Failed(MXL_ERR_OUT_OF_RANGE_TOO_EARLY);
                         }
-                        self.sleep_until(now.saturating_add(HEAD_POLL_NS).min(deadline));
+                        let due =
+                            behind.saturating_mul(1_000_000_000) / samplez_mxl::SAMPLE_RATE as u64;
+                        add(&self.counters.input_wait_sleeps, 1);
+                        self.sleep_until(now.saturating_add(due.max(HEAD_POLL_NS)).min(deadline));
                     }
                 }
                 _ => GroupWait::Skipped,

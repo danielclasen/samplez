@@ -659,8 +659,9 @@ which aborts on allocations, pthread locks, blocking syscalls and the
 sleeps its runtime intercepts. Allowed by call site are the calls that
 block by design: `mxlSleepUntil` and the `FUTEX_WAKE` of the output
 commit. The RT thread waits for a block's input by reading the readers'
-heads, which are in the flows' shared memory, and sleeping 100 us
-between two reads, not with libmxl's sync-group wait: once that wait
+heads, which are in the flows' shared memory, and sleeping until the
+slowest can have reached the block at the sample rate, 100 us at least
+and the block's deadline at most, not with libmxl's sync-group wait: once that wait
 times out, libmxl checks the flow's validity with a `stat()` of its data
 file, which on a file system that waits for a missing name blocks for
 that wait once the flow is deleted. RealtimeSanitizer does not see an
@@ -677,7 +678,9 @@ input is pruned after `pruneAfterBlocks` blocks of a frozen head, or
 twice the producer's `maxCommitBatchSizeHint` plus `readerMarginSamples`
 when that is longer, with no validity check on the RT thread: the
 supervisor's poll reader checks the pruned input's flow once a lookup
-found it. libmxl's read runs its validity check only when the head moves
+found it. A producer that replaces its flow under the same id therefore
+leaves the input silent for the prune limit before the supervisor reads
+the new flow, as one that stops does. libmxl's read runs its validity check only when the head moves
 back between the head read and the read, which reports the block
 `TooEarly`.
 

@@ -88,13 +88,13 @@ fn rt_functions_do_not_allocate() {
         let t = time::deadline(&api, due, B, TIMING.margin);
         counts[0] +=
             u64::from(time::timestamp_to_index(&api, t) <= time::timestamp_to_index(&api, now));
-        assert!(g.reached(index));
+        assert_eq!(g.behind(index), 0);
         let status = GroupWait::Ok;
         counts[1] += u64::from(r.read(&mut s, k, &status, &mut buf) == Outcome::Copy);
         counts[2] += u64::from(r.read(&mut s, k, &status, &mut buf) == Outcome::BelowLastRead);
         let o = r.read(&mut s, k + 200, &timeout, &mut buf);
         counts[3] += u64::from(o == Outcome::Late);
-        counts[4] += u64::from(!g.reached(index + 200 * B));
+        counts[4] += u64::from(g.behind(index + 200 * B) > 0);
         let mut old = SlotState::default();
         counts[6] += u64::from(r.read(&mut old, k - 250, &timeout, &mut buf) == Outcome::TooLate);
         assert_eq!(out.write_block(k, &buf), Write::Committed);
