@@ -239,6 +239,25 @@ async fn a_lagging_follower_installs_a_snapshot_and_rebuilds_its_engine() {
     }
 }
 
+/// A replica rebuilt from product state whose pages differ from the
+/// set's for good, as a duck group keyed throughout keeps its envelope
+/// off 0 and full depth where the rebuild started it cold: it does not
+/// stay withdrawn waiting for a matching page, but takes a donor's core,
+/// which carries that state, and commits again within a bound.
+#[tokio::test(start_paused = true)]
+async fn a_rebuilt_replica_whose_pages_never_match_resyncs() {
+    let set = start(vec![a(0), a(1), a(2)], true).await;
+    let leader = set.leader().await;
+    let r = audio(&set).into_iter().find(|&id| id != leader).unwrap();
+    let before = set.audio(r).lock().rebuilds.len();
+    set.audio(r).lock().rebuild_glitch = Some(0.5);
+    set.force_install(r).await;
+    until("rebuilt", 2, || set.audio(r).lock().rebuilds.len() > before).await;
+    passes(&set, r, ReplicaState::Committing, 5).await;
+    let m = resyncs(&set, r);
+    assert!(m.handovers >= 1, "resynced: {m:?}");
+}
+
 /// 2 audio replicas plus witness, X stopped while R is in `starting`
 /// after a snapshot install: R's engine is rebuilt from product state, R
 /// is named and commits from its first page boundary once ready; nothing

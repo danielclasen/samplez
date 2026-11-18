@@ -4,12 +4,13 @@
 
 mod harness;
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use harness::{BLOCK, Options, Set};
 use samplez_replica::contact::Timing;
 use samplez_replica::entry::NodeId;
-use samplez_replica::membership::{Slot, node_id, slot_of};
+use samplez_replica::membership::{Slot, Voters, node_id, slot_of};
 use samplez_replica::raft_config;
 use samplez_replica::state::ReplicaState;
 use tokio::time::{Instant, sleep};
@@ -130,4 +131,40 @@ async fn two_audio_and_a_witness_commit_again_after_a_follower_and_a_leader_rest
 #[tokio::test(start_paused = true)]
 async fn three_audio_commit_again_after_a_follower_and_a_leader_restart() {
     follower_then_leader(vec![a(0), a(1), a(2)]).await;
+}
+
+/// A replica that lost its volume rejoins under a new node id as a
+/// learner, which reports its configuration and protocol to the voters:
+/// the leader, running contact, promotes it in the old node's place and it
+/// commits again.
+#[tokio::test(start_paused = true)]
+async fn a_replica_rejoining_on_an_empty_volume_is_promoted_while_contact_runs() {
+    let mut set = Set::start(Options {
+        ids: Some(vec![a(0), a(1), a(2)]),
+        contact: Some(Timing::defaults(BLOCK)),
+        outputs: 1,
+        wanted: Some(Voters::new(3, false).unwrap()),
+        ..Options::default()
+    })
+    .await;
+    all_committing(&set, "started").await;
+    let leader = set.leader().await;
+    let old = follower(&set, leader);
+    set.crash(old).await;
+    set.wipe(old);
+    let Slot::Audio(ordinal) = slot_of(old) else {
+        unreachable!("an audio replica")
+    };
+    let new = node_id(Slot::Audio(ordinal), 10);
+    set.restart(new).await;
+    let voters = |set: &Set| -> BTreeSet<NodeId> {
+        let leader = set.replica(leader);
+        let metrics = leader.raft().metrics().borrow().clone();
+        metrics.membership_config.membership().voter_ids().collect()
+    };
+    until("the new node promoted", Duration::from_secs(30), || {
+        voters(&set).contains(&new) && !voters(&set).contains(&old)
+    })
+    .await;
+    all_committing(&set, "rejoined").await;
 }
