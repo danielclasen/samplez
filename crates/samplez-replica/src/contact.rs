@@ -1407,7 +1407,13 @@ impl Contact {
                 Body::Baseline(b) => Some(b.at_index),
                 _ => None,
             };
-            new.push((id, request.at_index(), baseline, request.stamp));
+            // A void or lease expiry changes no engine state contact
+            // translates: never awaited, listed or decided.
+            let at = match request.body {
+                Body::Void { .. } | Body::LeaseExpiry { .. } => None,
+                _ => request.at_index(),
+            };
+            new.push((id, at, baseline, request.stamp));
         }
         for (id, at, baseline, stamp) in new {
             st.told = id.index;
@@ -4290,5 +4296,36 @@ mod tests {
         restarted.tick(f.members.clone());
         assert_eq!(restarted.lock().generation_at, Some(far));
         assert_eq!(restarted.stamp(true), Err(StampRefusal::GenerationPending));
+    }
+
+    /// A stamped void or lease expiry changes no engine state contact
+    /// translates: it is neither listed nor awaited, so never decided.
+    #[tokio::test(start_paused = true)]
+    async fn a_stamped_void_or_expiry_is_never_awaited() {
+        let f = fixture(&[&[1, 2]]);
+        f.tick();
+        let at = index_at(T0) + 20 * B;
+        f.insert(
+            5,
+            Body::Void {
+                revision: 1,
+                term: 1,
+                at_index: Some(at),
+                generation: None,
+            },
+        );
+        f.insert(
+            6,
+            Body::LeaseExpiry {
+                session: crate::entry::SessionKey::from_parts("p", "s"),
+                renewed: 0,
+                at_index: Some(at),
+            },
+        );
+        f.contact.log_changed();
+        f.tick();
+        let st = f.contact.lock();
+        assert!(!st.scheduled.contains_key(&5) && !st.scheduled.contains_key(&6));
+        assert!(st.awaiting.is_empty());
     }
 }

@@ -511,7 +511,14 @@ impl<P: Product> StateMachine<P> {
                     // effect at its own index: one that goes unresolved is
                     // decided like the entry, known under the void's id,
                     // the restamps behind the entry counting.
-                    if let Some(at) = *at_index {
+                    // A void of an engine body drops it: nothing to
+                    // re-assert, so final. So is one with the most
+                    // restamps behind it already.
+                    let late = behind.map_or(0, |(n, _)| n);
+                    if let Some(at) = *at_index
+                        && derived.is_some()
+                        && late < crate::decide::RESTAMPS_MAX
+                    {
                         self.terms.insert(revision, (term, at));
                         if let Some((behind, _)) = behind {
                             self.restamps.insert(revision, (behind, at));
@@ -2144,6 +2151,28 @@ mod derive_tests {
             flow_id: "c".into()
         }));
         assert_eq!(sm.restamps.get(&12).map(|r| r.0), Some(3));
+    }
+
+    /// A void of a pending engine body drops it: it derives nothing and
+    /// is not decidable. A void with the most restamps behind its entry
+    /// re-asserts and is final.
+    #[test]
+    fn a_void_of_an_engine_body_or_a_late_entry_is_final() {
+        let mut sm = machine();
+        let up = Body::InputUp {
+            slot: 1,
+            at_index: 960,
+        };
+        sm.apply_at(10, 1, &Request { stamp: 0, body: up });
+        sm.apply_at(11, 1, &void(10, 96, Some(4800)));
+        assert!(!sm.terms.contains_key(&11));
+        assert!(!sm.records.contains_key(&11));
+        sm.apply_at(12, 1, &one("1", "route 0 c", 0, 4800, Some(true)));
+        sm.restamps.insert(12, (crate::decide::RESTAMPS_MAX, 4800));
+        sm.apply_at(13, 1, &void(12, 96, Some(6000)));
+        assert_eq!(sm.records[&13].at_index, 6000);
+        assert!(!sm.terms.contains_key(&13));
+        assert!(!sm.restamps.contains_key(&13));
     }
 
     /// A restamp of an `InputUp` or `InputDown` derives it at the

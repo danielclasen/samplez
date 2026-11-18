@@ -449,4 +449,39 @@ async fn the_leader_stamps_and_classifies_a_void_and_an_expiry() {
         assert_eq!(record.at_index, at);
         assert!(record.generation);
     }
+    // A void of a pending InputUp drops it: no generation.
+    r.append(Body::InputUp {
+        slot: 1,
+        at_index: 0,
+    })
+    .unwrap();
+    sleep(Duration::from_millis(500)).await;
+    let mut up = None;
+    r.store().entries_after(0, |id, req| {
+        if matches!(req.body, Body::InputUp { .. }) {
+            up = Some((id.index, id.term));
+        }
+    });
+    let (revision, term) = up.expect("InputUp written");
+    r.append(Body::Void {
+        revision,
+        term,
+        at_index: Some(0),
+        generation: Some(true),
+    })
+    .unwrap();
+    sleep(Duration::from_millis(500)).await;
+    let mut voided = None;
+    r.store().entries_after(revision, |_, req| {
+        if let Body::Void {
+            revision: of,
+            generation,
+            ..
+        } = req.body
+            && of == revision
+        {
+            voided = Some(generation);
+        }
+    });
+    assert_eq!(voided, Some(None), "a void of an InputUp is not flagged");
 }

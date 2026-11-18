@@ -182,10 +182,13 @@ pub(crate) struct Shared {
     /// it stands ([`Product::reroutes`]), for a product that drives an
     /// engine; read under the store lock.
     reroutes: Box<dyn Fn(&Command) -> bool + Send + Sync>,
-    /// Whether the decidable entry at a log index re-routed or raised an
-    /// input, so a decision on it needs a generation; read under the store
-    /// lock.
-    rerouted: Box<dyn Fn(u64) -> bool + Send + Sync>,
+    /// Whether the decidable entry at a log index re-routed an input, or,
+    /// with `pending`, is an engine body that raises or re-routes one: a
+    /// decision on it needs a generation. Read under the store lock.
+    rerouted: Box<dyn Fn(u64, bool) -> bool + Send + Sync>,
+    /// Set while a writer appends [`Body::Protocol`], so it is appended
+    /// once.
+    marking: AtomicBool,
     /// [`state_machine::StateMachine::protocol`] as applied here.
     protocol: Box<dyn Fn() -> u32 + Send + Sync>,
     raft: Raft<TypeConfig>,
@@ -365,12 +368,13 @@ impl<P: Product> Replica<P> {
             },
             rerouted: {
                 let store = store.clone();
-                Box::new(move |index| {
+                Box::new(move |index, pending| {
                     store.with_state(|sm| {
                         sm.derived
                             .get(&index)
                             .is_some_and(|slots| !slots.is_empty())
-                            || sm.pending.get(&index).is_some_and(Body::needs_generation)
+                            || (pending
+                                && sm.pending.get(&index).is_some_and(Body::needs_generation))
                     })
                 })
             },
@@ -384,6 +388,7 @@ impl<P: Product> Replica<P> {
             heartbeat: Duration::from_millis(raft_config.heartbeat_interval),
             quiescing: AtomicBool::new(false),
             proposing: AtomicUsize::new(0),
+            marking: AtomicBool::new(false),
             revision: {
                 let store = store.clone();
                 Box::new(move || store.with_state(|sm| sm.revision))
@@ -752,6 +757,14 @@ impl Shared {
             return None;
         }
         if (self.protocol)() < PROTOCOL {
+            // Another writer appending it: unflagged until it applied.
+            if self
+                .marking
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return None;
+            }
             let marker = Request {
                 stamp,
                 body: Body::Protocol(PROTOCOL),
@@ -759,6 +772,7 @@ impl Shared {
             let written =
                 tokio::time::timeout(self.settings.write_timeout, self.raft.client_write(marker))
                     .await;
+            self.marking.store(false, Ordering::SeqCst);
             if !matches!(written, Ok(Ok(_))) {
                 return None;
             }
@@ -771,6 +785,9 @@ impl Shared {
     /// its generation, from this leader's own state, whatever the body
     /// carried: it re-asserts that entry on the generation path.
     async fn classify(&self, body: &mut Body, estimate: &Estimate) {
+        // A restamp moves a pending engine body to its index; a void drops
+        // it, re-asserting only a product entry's effect.
+        let pending = matches!(body, Body::Restamp { .. });
         if let Body::Restamp {
             revision,
             generation,
@@ -783,8 +800,10 @@ impl Shared {
         } = body
         {
             *generation = None;
-            if (self.rerouted)(*revision) {
-                let e = self.e(estimate).unwrap_or(0);
+            // No estimate, no stamp for the marker: unflagged.
+            if (self.rerouted)(*revision, pending)
+                && let Some(e) = self.e(estimate)
+            {
                 *generation = self
                     .flag(true, stamping_index(e, self.settings.block))
                     .await;
