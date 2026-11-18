@@ -12,11 +12,30 @@
 //! loss included. The cluster id is the epoch: drawn with each new marker,
 //! so a state initialised empty starts a new history, and kept on the
 //! volume, so a restart, a snapshot install and a resync keep it.
+//!
+//! Created by a [`Kube`] given the audio StatefulSet ([`Kube::owned_by`]),
+//! the marker carries an owner reference to that StatefulSet, and
+//! Kubernetes' garbage collector deletes it after the StatefulSet. That
+//! happens in the background: a StatefulSet created again at once can
+//! read the old marker first, its empty volumes joining the old cluster id
+//! until the marker is gone and ordinal 0 creates a new one. A deletion
+//! with `--cascade=orphan` removes the owner reference and keeps the
+//! marker.
+//!
+//! The leader of a running set recreates a marker it finds missing, under
+//! the set's cluster id and volume 0 (`membership`), so a StatefulSet
+//! created again on the volumes it kept goes on as the same set. An owned
+//! marker is created only for the StatefulSet the process first read, and
+//! not while it is being deleted: a leader of a deleted set does not write
+//! its cluster id into the marker of one created again under its name. With no set running, an
+//! empty volume other than ordinal 0's waits for a marker; one created by
+//! hand with `data.cluster` from a member volume's `cluster` file and
+//! `data.volume` 0 lets it join.
 
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::BoxFuture;
@@ -227,6 +246,10 @@ pub struct Kube {
     token: Option<PathBuf>,
     namespace: String,
     name: String,
+    /// The StatefulSet the marker is created owned by.
+    owner: Option<String>,
+    /// That StatefulSet's uid as this process first read it.
+    owner_uid: OnceLock<String>,
 }
 
 const SERVICE_ACCOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
@@ -273,7 +296,24 @@ impl Kube {
             token,
             namespace,
             name,
+            owner: None,
+            owner_uid: OnceLock::new(),
         })
+    }
+
+    /// Creates the marker owned by the StatefulSet `statefulset` in its
+    /// namespace, the one [`crate::rollout::follow`] reads, so Kubernetes'
+    /// garbage collector deletes the marker after it. Its uid is read with
+    /// a GET on the StatefulSet at the create; the reference is no
+    /// controller and does not block the StatefulSet's deletion. The uid of
+    /// this process's first read of it, by a create or
+    /// [`Kube::update_revision`], is kept: a create refuses a StatefulSet
+    /// created again under the name since, or one being deleted, so a
+    /// replica of a deleted set never writes its cluster id into the
+    /// marker of the set that replaces it.
+    pub fn owned_by(mut self, statefulset: String) -> Kube {
+        self.owner = Some(statefulset);
+        self
     }
 
     /// The pod's own API server, service account and namespace, for the
@@ -331,10 +371,8 @@ impl Kube {
         format!("/api/v1/namespaces/{}/configmaps", self.namespace)
     }
 
-    /// `status.updateRevision` of the StatefulSet `name` in the marker's
-    /// namespace: the revision a rollout moves its pods to. None while
-    /// the StatefulSet reports none.
-    pub async fn update_revision(&self, name: &str) -> Result<Option<String>, String> {
+    /// The StatefulSet `name` in the marker's namespace.
+    async fn statefulset(&self, name: &str) -> Result<StatefulSet, String> {
         let path = format!(
             "/apis/apps/v1/namespaces/{}/statefulsets/{name}",
             self.namespace
@@ -343,19 +381,40 @@ impl Kube {
         if status != StatusCode::OK {
             return Err(format!("GET {path}: {status}"));
         }
-        #[derive(Deserialize)]
-        struct StatefulSet {
-            status: Option<SetStatus>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SetStatus {
-            update_revision: Option<String>,
-        }
         let set: StatefulSet =
             serde_json::from_slice(&body).map_err(|e| format!("StatefulSet {name}: {e}"))?;
+        if self.owner.as_deref() == Some(name) {
+            let _ = self.owner_uid.set(set.metadata.uid.clone());
+        }
+        Ok(set)
+    }
+
+    /// `status.updateRevision` of the StatefulSet `name` in the marker's
+    /// namespace: the revision a rollout moves its pods to. None while
+    /// the StatefulSet reports none.
+    pub async fn update_revision(&self, name: &str) -> Result<Option<String>, String> {
+        let set = self.statefulset(name).await?;
         Ok(set.status.and_then(|s| s.update_revision))
     }
+}
+
+#[derive(Deserialize)]
+struct StatefulSet {
+    metadata: SetMetadata,
+    status: Option<SetStatus>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetMetadata {
+    uid: String,
+    deletion_timestamp: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetStatus {
+    update_revision: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -395,10 +454,31 @@ impl Markers for Kube {
 
     fn create(&self, marker: Marker) -> BoxFuture<'_, Result<bool, String>> {
         Box::pin(async move {
+            let mut metadata = serde_json::json!({ "name": self.name });
+            if let Some(owner) = &self.owner {
+                let set = self.statefulset(owner).await?;
+                if set.metadata.deletion_timestamp.is_some() {
+                    return Err(format!("StatefulSet {owner} is being deleted"));
+                }
+                let first = self.owner_uid.get().expect("set by the read");
+                if *first != set.metadata.uid {
+                    return Err(format!(
+                        "StatefulSet {owner} was replaced: uid {}, first read as {first}",
+                        set.metadata.uid
+                    ));
+                }
+                metadata["ownerReferences"] = serde_json::json!([{
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "name": owner,
+                    "uid": set.metadata.uid,
+                    "controller": false,
+                }]);
+            }
             let body = serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "ConfigMap",
-                "metadata": { "name": self.name },
+                "metadata": metadata,
                 "data": Data {
                     cluster: marker.cluster.to_string(),
                     volume: marker.volume.to_string(),

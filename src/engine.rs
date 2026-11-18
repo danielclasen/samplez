@@ -400,6 +400,13 @@ impl std::error::Error for ControlError {}
 struct ReplicaControl {
     ring: rtrb::Producer<Control>,
     unresolved: Vec<LogId>,
+    /// The number of controls pushed to the ring and of hand-overs found
+    /// installed: a copy buffer sent before either is filled again.
+    sent: u64,
+    /// The RT thread holds a core, or will once it takes the controls
+    /// pushed: false from a `DropCore` pushed until a hand-over installs
+    /// one.
+    core: bool,
 }
 
 /// The off-RT side of core copies: at most one buffer is with the RT
@@ -408,6 +415,9 @@ struct Transfer {
     cores: rtrb::Producer<Box<Core>>,
     copies: rtrb::Consumer<CoreCopy>,
     in_flight: bool,
+    /// The number of controls pushed when the buffer in flight was sent,
+    /// all of them taken by the RT thread before it fills that buffer.
+    in_flight_after: u64,
     handovers: rtrb::Producer<Handover>,
     handed: rtrb::Consumer<Handover>,
     /// A hand-over is with the RT thread.
@@ -1055,6 +1065,7 @@ impl Engine {
                     cores: cores_tx,
                     copies: copies_rx,
                     in_flight: false,
+                    in_flight_after: 0,
                     handovers: handovers_tx,
                     handed: handed_rx,
                     handing: false,
@@ -1086,6 +1097,8 @@ impl Engine {
             let control = ReplicaControl {
                 ring: control_tx,
                 unresolved: Vec::with_capacity(UNRESOLVED),
+                sent: 0,
+                core: true,
             };
             (
                 Some((shared, Mutex::new(control))),
@@ -1702,7 +1715,8 @@ impl Engine {
             // Refused with one voter, which has no core to drop, and while
             // the control ring is full: the replica reads the overflow in
             // its next report period's sample and drops the core then
-            // (`Audio::drop_engine`), before its rebuild replaces it.
+            // (`Audio::drop_engine`), and `install_product` drops one
+            // still held before its rebuild replaces it.
             let _ = self.drop_core();
         }
     }
@@ -1759,7 +1773,13 @@ impl Engine {
             }
             _ => {}
         }
-        control.ring.push(c).map_err(|_| ControlError::Full)
+        let dropped = matches!(c, Control::DropCore);
+        control.ring.push(c).map_err(|_| ControlError::Full)?;
+        control.sent += 1;
+        if dropped {
+            control.core = false;
+        }
+        Ok(())
     }
 
     /// Replicated mode: publishes F, the end index of the highest block up
@@ -1925,40 +1945,56 @@ impl Engine {
     /// history after `k0` (`historySlackMs`), which a copy of history
     /// rings needs; the engine keeps no delay line, so it holds the core
     /// alone. A copy left behind by a timeout is returned by the next
-    /// call. Calls serialise: one buffer is with the RT thread at a time.
-    /// The copy holds every control sent before the call, such as an
-    /// entry given as unresolved.
+    /// call unless a control was sent or a hand-over installed after its
+    /// buffer was. Calls serialise:
+    /// one buffer is with the RT thread at a time. The copy holds every
+    /// control sent before the call, such as an entry given as
+    /// unresolved.
     pub fn copy_core(&self, timeout: Duration) -> Result<CoreCopy, CopyError> {
         let (Some((shared, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
             return Err(CopyError::NotReplicated);
         };
         let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + timeout;
-        if !t.in_flight {
-            // The RT thread takes controls at the start of a wake and copies
-            // after a block: a buffer sent while a control waits could be
-            // filled in the wake before the one that takes the control.
-            // Sent once every control was taken, it is filled after them.
-            while control.lock().expect("control lock").ring.slots() < UNRESOLVED {
-                if Instant::now() >= deadline {
-                    return Err(CopyError::Timeout);
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            let (n, m, slots, page) = t.shape;
-            let mut core = t
-                .spare
-                .take()
-                .unwrap_or_else(|| Box::new(Core::new(n, m, slots, page)));
-            core.prepare();
-            if t.cores.push(core).is_err() {
-                unreachable!("one buffer is with the RT thread at most");
-            }
-            t.in_flight = true;
-        }
+        let before = control.lock().expect("control lock").sent;
         let copy = loop {
+            if !t.in_flight {
+                // The RT thread takes controls at the start of a wake and
+                // copies after a block: a buffer sent while a control waits
+                // could be filled in the wake before the one that takes the
+                // control. Sent once every control was taken, it is filled
+                // after them.
+                let sent = loop {
+                    let c = control.lock().expect("control lock");
+                    if c.ring.slots() == UNRESOLVED {
+                        break c.sent;
+                    }
+                    drop(c);
+                    if Instant::now() >= deadline {
+                        return Err(CopyError::Timeout);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let (n, m, slots, page) = t.shape;
+                let mut core = t
+                    .spare
+                    .take()
+                    .unwrap_or_else(|| Box::new(Core::new(n, m, slots, page)));
+                core.prepare();
+                if t.cores.push(core).is_err() {
+                    unreachable!("one buffer is with the RT thread at most");
+                }
+                t.in_flight = true;
+                t.in_flight_after = sent;
+            }
             if let Ok(copy) = t.copies.pop() {
                 t.in_flight = false;
+                // A buffer an earlier call left behind can predate controls
+                // sent since: it is filled again.
+                if t.in_flight_after < before {
+                    t.spare = Some(copy.core);
+                    continue;
+                }
                 break copy;
             }
             if Instant::now() >= deadline {
@@ -2104,6 +2140,54 @@ impl Engine {
         self.control(Control::DropCore)
     }
 
+    /// Drops the RT thread's core, unless a drop was sent since the last
+    /// install known, and waits until `deadline` for the RT thread to take
+    /// it. While a core is held, an entry could swap in a generation built
+    /// on the old flows after the product state's one for its domain.
+    fn drop_core_by(&self, deadline: Instant) -> Result<(), ReplayError> {
+        let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
+            return Err(ReplayError::Invalid(
+                "the engine is not replicated with more than one voter".to_owned(),
+            ));
+        };
+        // A hand-over left unanswered by a timeout may install one: the
+        // drop has to follow its answer.
+        let mut unanswered = loop {
+            let t = transfer.lock().unwrap_or_else(|e| e.into_inner());
+            if !t.handing || t.handed.slots() > 0 {
+                break t.handing;
+            }
+            drop(t);
+            if Instant::now() >= deadline {
+                return Err(ReplayError::Timeout { passed: 0 });
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        loop {
+            let (core, taken) = {
+                let c = control.lock().expect("control lock");
+                (c.core, c.ring.slots() == UNRESOLVED)
+            };
+            if !core && !unanswered && taken {
+                return Ok(());
+            }
+            // A full ring refuses it: the RT thread empties it at its
+            // next wake.
+            let refused = (core || unanswered) && self.drop_core().is_err();
+            if !refused {
+                unanswered = false;
+            }
+            if Instant::now() >= deadline {
+                return Err(if refused {
+                    ReplayError::Full
+                } else {
+                    ReplayError::Timeout { passed: 0 }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Replicated mode with more than one voter: builds a core from
     /// `state` off the RT thread, its targets at their values, its fades
     /// and ramps cold, its pending entries, and installs it at a block
@@ -2114,12 +2198,19 @@ impl Engine {
     /// RT thread takes the entries needing no generation whose index
     /// passed off its pending list, applying only strip entries, to the
     /// strips the slots keep; [`ReplayError::Missed`] when it took one
-    /// above `state.last_id`.
+    /// above `state.last_id`. A core still held is dropped first, the
+    /// call failing with [`ReplayError::Full`] while the control ring
+    /// stays full; on a later failure the core stays dropped. `timeout`
+    /// bounds the drop, the supervisor's hand-over and the install
+    /// together, except that the answer to a core already passed to the
+    /// RT thread is waited for up to 1 s past it.
     pub fn install_product(
         &self,
         state: &ProductState,
         timeout: Duration,
     ) -> Result<u64, ReplayError> {
+        let deadline = Instant::now() + timeout;
+        let left = || deadline.saturating_duration_since(Instant::now());
         let (n, m) = self.shape;
         let slots = self.config.inputs.len();
         if state.gains.len() != n
@@ -2163,6 +2254,7 @@ impl Engine {
             return Err(ReplayError::Full);
         }
         let batch = |id: LogId| batches.iter().find(|b| b.0 == id).map(|b| &*b.1);
+        self.drop_core_by(deadline)?;
         // The supervisor takes the slots' state and flows, and hands the
         // generations reading them over, before the core: a slot the core
         // has up reads its flow once installed.
@@ -2177,10 +2269,10 @@ impl Engine {
                 flows: state.flows.clone(),
                 done,
             });
-        if applied.recv_timeout(timeout).is_err() {
+        if applied.recv_timeout(left()).is_err() {
             return Err(ReplayError::Timeout { passed: 0 });
         }
-        self.offer(timeout, false, &strips, |j, core| {
+        self.offer(left(), false, &strips, |j, core| {
             for (i, row) in state.gains.iter().enumerate() {
                 for (o, &g) in row.iter().enumerate() {
                     let _ = core.matrix.set(i, o, g, 0);
@@ -2258,7 +2350,11 @@ impl Engine {
     }
 
     /// Passes the cores `make` fills to the RT thread until one is
-    /// installed or `timeout` passes. The RT thread installs a core only
+    /// installed or `timeout` passes. The answer to a core passed on is
+    /// waited for up to 1 s, past `timeout` too: the RT thread gives it at
+    /// its next wake, so a caller with a short timeout still learns
+    /// whether that core was installed. An answer still missing then is
+    /// taken by the next call. The RT thread installs a core only
     /// before the block after the core's: each attempt waits for it to
     /// compute a block, has `make` fill a core for that block at once and
     /// passes it on before the RT thread's next wake. `make` returns the
@@ -2307,6 +2403,8 @@ impl Engine {
                 t.handing = false;
                 if h.answer == Answer::Installed {
                     let mut control = control.lock().expect("control lock");
+                    control.core = true;
+                    control.sent += 1;
                     control.unresolved.clear();
                     control
                         .unresolved
@@ -4997,6 +5095,216 @@ mod tests {
         assert_eq!(e.counters.handovers_passed.load(Relaxed), 1);
         assert_eq!(e.counters.handovers_installed.load(Relaxed), 0);
         drop(t);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A copy buffer left with the RT thread by a call that timed out, and
+    /// filled there, `slack` widened so the test thread may stall.
+    fn copy_left_behind(e: &Engine) {
+        let transfer = e.transfer.as_ref().unwrap();
+        transfer.lock().unwrap().slack_blocks = 1000;
+        // No control waits: the buffer is sent, and no copy is back yet.
+        assert_eq!(e.copy_core(Duration::ZERO).err(), Some(CopyError::Timeout));
+        assert!(transfer.lock().unwrap().in_flight, "no buffer sent");
+        wait(&|| transfer.lock().unwrap().copies.slots() == 1);
+    }
+
+    /// The copy a timed-out call left behind was filled before a control
+    /// sent after that call: the next call has a buffer filled again, so
+    /// its copy holds every control sent before it.
+    #[test]
+    fn a_copy_left_behind_holds_the_controls_sent_after_it() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("copy-behind", 1);
+        copy_left_behind(&e);
+        let far = (e.counters.processed.load(Acquire) + 1_000_000) * e.block;
+        e.unresolved(1, far).unwrap();
+        let c = e.copy_core(Duration::from_secs(2)).unwrap();
+        assert_eq!(c.core.unresolved(), &[(1, far)]);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A core fit for a hand-over after block `j`, of an engine with no
+    /// inputs and no log entries taken.
+    fn bare_core(e: &Engine, j: u64, core: &mut Core) -> (u64, LogId) {
+        core.pos = Some((j + 1) * e.block);
+        (j, 0)
+    }
+
+    /// The copy a timed-out call left behind was filled before a core
+    /// handed over since: the next call has a buffer filled again, after
+    /// the install.
+    #[test]
+    fn a_copy_left_behind_is_filled_again_after_a_hand_over() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("copy-handover", 1);
+        copy_left_behind(&e);
+        let j = e
+            .offer(Duration::from_secs(5), false, &[], |j, core| {
+                bare_core(&e, j, core)
+            })
+            .unwrap();
+        let c = e.copy_core(Duration::from_secs(2)).unwrap();
+        assert!(
+            c.k0 > j,
+            "copy after block {} of a core installed after {j}",
+            c.k0
+        );
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A product install that finds the control ring full while a core is
+    /// held retries the drop until its timeout and fails as full, sending
+    /// nothing; once the ring has room it drops the core before the
+    /// install.
+    #[test]
+    fn a_product_install_retries_the_drop_while_the_ring_is_full() {
+        use crate::rt_loop::STALL_MS;
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("drop-full", 1);
+        let c = &e.counters;
+        let state = ProductState {
+            gains: Vec::new(),
+            up: Vec::new(),
+            flows: Vec::new(),
+            strips: Vec::new(),
+            pending: Vec::new(),
+            last_id: 0,
+        };
+        let processed = || c.processed.load(Acquire);
+        // The RT thread stalls with the ring full. A stall another test's
+        // RT thread takes is set again.
+        let t = Instant::now();
+        loop {
+            assert!(t.elapsed() < Duration::from_secs(10), "no stall");
+            STALL_MS.store(500, Relaxed);
+            wait(&|| STALL_MS.load(Relaxed) == 0);
+            let p = processed();
+            std::thread::sleep(Duration::from_millis(20));
+            if processed() == p {
+                break;
+            }
+        }
+        while e.withdraw().is_ok() {}
+        assert_eq!(
+            e.install_product(&state, Duration::from_millis(50)),
+            Err(ReplayError::Full)
+        );
+        assert_eq!(c.blocks_without_core.load(Relaxed), 0, "dropped while full");
+        let j = e.install_product(&state, Duration::from_secs(5)).unwrap();
+        assert!(
+            c.blocks_without_core.load(Relaxed) > 0,
+            "installed over a held core"
+        );
+        assert!(processed() > j);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A product install's drop, hand-over and install share one timeout:
+    /// a drop that waited out most of it leaves the install the rest. The
+    /// RT thread stalls with the control ring full, then computes nothing
+    /// for 3 s, its clock stepped back.
+    #[test]
+    fn a_product_install_keeps_to_one_timeout() {
+        use crate::rt_loop::{CLOCK_SHIFT_NS, CLOCK_STEP_LOOP, CLOCK_STEP_NS, STALL_MS};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        struct Unshift;
+        impl Drop for Unshift {
+            fn drop(&mut self) {
+                STALL_MS.store(0, Relaxed);
+                CLOCK_STEP_NS.store(0, Relaxed);
+                CLOCK_SHIFT_NS.store(0, Relaxed);
+                CLOCK_STEP_LOOP.store(0, Relaxed);
+            }
+        }
+        let _unshift = Unshift;
+        let (e, _statuses, _verdicts, domain) = outputs_only("drop-deadline", 1);
+        let c = &e.counters;
+        CLOCK_STEP_LOOP.store(std::ptr::from_ref(&**c) as usize, Relaxed);
+        let state = ProductState {
+            gains: Vec::new(),
+            up: Vec::new(),
+            flows: Vec::new(),
+            strips: Vec::new(),
+            pending: Vec::new(),
+            last_id: 0,
+        };
+        let processed = || c.processed.load(Acquire);
+        let t = Instant::now();
+        loop {
+            assert!(t.elapsed() < Duration::from_secs(10), "no stall");
+            STALL_MS.store(600, Relaxed);
+            wait(&|| STALL_MS.load(Relaxed) == 0);
+            let p = processed();
+            std::thread::sleep(Duration::from_millis(20));
+            if processed() == p {
+                break;
+            }
+        }
+        // Taken at the end of the stall, in the same wake.
+        CLOCK_STEP_NS.store(-3_000_000_000, Relaxed);
+        while e.withdraw().is_ok() {}
+        let t = Instant::now();
+        let r = e.install_product(&state, Duration::from_secs(1));
+        let took = t.elapsed();
+        assert_eq!(r, Err(ReplayError::Timeout { passed: 0 }));
+        assert!(took < Duration::from_millis(1300), "took {took:?}");
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A hand-over a call gave up on can still be installed. The drop
+    /// before a product install waits for its answer and follows it, so
+    /// no core is held after it returns: the clock steps back as the
+    /// hand-over is sent, and the RT thread computes nothing, answering
+    /// nothing, until the clock is due at its block again.
+    #[test]
+    fn the_drop_follows_a_hand_over_left_unanswered() {
+        use crate::rt_loop::{CLOCK_SHIFT_NS, CLOCK_STEP_LOOP, CLOCK_STEP_NS};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        struct Unshift;
+        impl Drop for Unshift {
+            fn drop(&mut self) {
+                CLOCK_STEP_NS.store(0, Relaxed);
+                CLOCK_SHIFT_NS.store(0, Relaxed);
+                CLOCK_STEP_LOOP.store(0, Relaxed);
+            }
+        }
+        let _unshift = Unshift;
+        let (e, _statuses, _verdicts, domain) = outputs_only("drop-unanswered", 1);
+        let c = &e.counters;
+        CLOCK_STEP_LOOP.store(std::ptr::from_ref(&**c) as usize, Relaxed);
+        let without = || c.blocks_without_core.load(Relaxed);
+        let installed = || c.handovers_installed.load(Relaxed);
+        // A hand-over taken a block late is refused, not installed: tried
+        // again.
+        for attempt in 0.. {
+            assert!(attempt < 5, "no hand-over installed after its call");
+            e.drop_core().unwrap();
+            let w = without();
+            wait(&|| without() > w + 5);
+            let before = installed();
+            let r = e.offer(Duration::from_secs(5), false, &[], |j, core| {
+                CLOCK_STEP_NS.store(-1_500_000_000, Relaxed);
+                bare_core(&e, j, core)
+            });
+            assert_eq!(r, Err(ReplayError::Timeout { passed: 0 }));
+            assert!(e.transfer.as_ref().unwrap().lock().unwrap().handing);
+            e.drop_core_by(Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            let w = without();
+            let p = c.processed.load(Acquire);
+            wait(&|| c.processed.load(Acquire) > p + 20);
+            if installed() == before {
+                continue;
+            }
+            assert!(without() > w, "a core held after the drop");
+            break;
+        }
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

@@ -13,7 +13,7 @@ use openraft::error::{ClientWriteError, RaftError};
 use openraft::{BasicNode, ChangeMembers, RaftMetrics, ServerState};
 
 use crate::Shared;
-use crate::bootstrap::{self, Bootstrap, Marker, Step, Volume};
+use crate::bootstrap::{self, Bootstrap, Marker, Markers, Step, Volume};
 use crate::entry::NodeId;
 use crate::peer::{PeerReply, PeerRequest, PeerResponse, Refused};
 
@@ -370,6 +370,7 @@ impl Counting {
 /// counted for [`UNCOUNTED`] it asks to join again under its own id each
 /// [`PERIOD`], as one removed from the voters while it was down must.
 pub(crate) async fn watch(shared: Arc<Shared>, bootstrap: Bootstrap) {
+    tokio::spawn(keep_marker(shared.clone(), bootstrap.markers.clone()));
     let mut empty_rounds = 0;
     let mut counting = Counting::default();
     let mut asked_at: Option<Instant> = None;
@@ -410,6 +411,47 @@ pub(crate) async fn watch(shared: Arc<Shared>, bootstrap: Bootstrap) {
     }
 }
 
+/// Recreates the marker a formed set finds missing, each [`PERIOD`] while
+/// this replica leads with a quorum: under the set's cluster id, naming
+/// volume 0, which no volume has, so every empty volume joins. A
+/// StatefulSet deleted with its marker and created again on the volumes
+/// it kept resumes the set from them, and an empty volume joins it only
+/// through the marker. Ends once the replica is shut down.
+async fn keep_marker(shared: Arc<Shared>, markers: Arc<dyn Markers>) {
+    loop {
+        tokio::time::sleep(PERIOD).await;
+        match shared.raft.is_initialized().await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(_) => return,
+        }
+        let metrics = shared.raft.metrics().borrow().clone();
+        let cluster = shared.epoch();
+        if metrics.state != ServerState::Leader || cluster == 0 || !shared.quorum().await {
+            continue;
+        }
+        match markers.get().await {
+            Ok(None) => {}
+            Ok(Some(_)) => continue,
+            Err(e) => {
+                tracing::debug!(error = %e, marker = markers.name(), "reading the marker");
+                continue;
+            }
+        }
+        match markers.create(Marker { cluster, volume: 0 }).await {
+            Ok(true) => {
+                tracing::info!(
+                    cluster,
+                    marker = markers.name(),
+                    "recreated the missing marker"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, marker = markers.name(), "recreating the marker"),
+        }
+    }
+}
+
 /// One round of an empty volume: [`bootstrap::step`] on the marker.
 async fn start(
     shared: &Shared,
@@ -425,13 +467,17 @@ async fn start(
     let refuse = || {
         format!(
             "another replica answers as a member of a set, though ConfigMap {} names none \
-             to join; not starting a second one",
+             to join; not starting a second one. The set's leader recreates the ConfigMap; \
+             with no leader, create it with data.cluster from a member volume's cluster file \
+             and data.volume 0",
             markers.name()
         )
     };
     match bootstrap::step(bootstrap.slot, bootstrap.volume.id, marker) {
         Step::Wait => Err(format!(
-            "waiting for ordinal 0 to create ConfigMap {}",
+            "waiting for ordinal 0 to create ConfigMap {}, or a running set's leader to \
+             recreate it; with neither, create it with data.cluster from a member volume's \
+             cluster file and data.volume 0",
             markers.name()
         )),
         Step::Create => {

@@ -43,6 +43,9 @@ use tokio_rustls::server::TlsStream;
 const TOKEN: &str = "t0k3n";
 const NAMESPACE: &str = "replicas";
 const MARKER: &str = "set-replica-cluster";
+/// The one StatefulSet the fake API server serves, and its uid.
+const STATEFULSET: &str = "set-audio";
+const STATEFULSET_UID: &str = "0d6a3c1e-5b2f-4f7a-9c11-2e8b7d4a6f90";
 
 /// A CA, as PEM, and a certificate for 127.0.0.1 it issued.
 fn authority_for_loopback() -> (
@@ -89,9 +92,11 @@ impl axum::serve::Listener for Tlsd {
 }
 
 /// ConfigMaps by name in one namespace, over TLS: create (409 when it
-/// exists), get (404 when absent); every request needs the bearer token.
+/// exists), get (404 when absent); and get on the StatefulSet
+/// [`STATEFULSET`], its metadata [`STATEFULSET_UID`] and what the second
+/// field sets over it. Every request needs the bearer token.
 #[derive(Clone, Default)]
-struct Api(Arc<Mutex<BTreeMap<String, Value>>>);
+struct Api(Arc<Mutex<BTreeMap<String, Value>>>, Arc<Mutex<Value>>);
 
 impl Api {
     /// Serves the API; returns its address and the PEM of the CA its
@@ -130,7 +135,36 @@ impl Api {
                 None => (StatusCode::NOT_FOUND, Vec::new()),
             }
         };
+        let statefulset = move |State(api): State<Api>,
+                                Path((namespace, name)): Path<(String, String)>,
+                                headers: HeaderMap| async move {
+            if !authorized(&headers) {
+                return (StatusCode::UNAUTHORIZED, Vec::new());
+            }
+            assert_eq!(namespace, NAMESPACE);
+            if name != STATEFULSET {
+                return (StatusCode::NOT_FOUND, Vec::new());
+            }
+            let mut metadata =
+                serde_json::json!({ "name": name, "namespace": namespace, "uid": STATEFULSET_UID });
+            if let Value::Object(set) = &*api.1.lock().unwrap() {
+                for (k, v) in set {
+                    metadata[k] = v.clone();
+                }
+            }
+            let set = serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "metadata": metadata,
+                "status": { "updateRevision": "set-audio-1" },
+            });
+            (StatusCode::OK, serde_json::to_vec(&set).unwrap())
+        };
         let router = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{namespace}/statefulsets/{name}",
+                get(statefulset),
+            )
             .route("/api/v1/namespaces/{namespace}/configmaps", post(create))
             .route(
                 "/api/v1/namespaces/{namespace}/configmaps/{name}",
@@ -750,9 +784,10 @@ async fn joiners_follow_a_replaced_marker_and_a_stale_cluster_is_refused() {
 }
 
 /// With the marker gone while the set runs, ordinal 0 on an empty volume
-/// does not start a second set: the other replicas answer as members.
+/// does not start a second set: the set's leader recreates the marker
+/// under the set's cluster id, and ordinal 0 joins the running set.
 #[tokio::test]
-async fn ordinal_0_does_not_start_a_second_set_beside_a_running_one() {
+async fn ordinal_0_joins_the_running_set_after_its_marker_is_gone() {
     let mut set = Set::new(Voters::new(3, false).unwrap()).await;
     set.start_all().await;
     set.settled().await;
@@ -761,23 +796,43 @@ async fn ordinal_0_does_not_start_a_second_set_beside_a_running_one() {
     set.crash(Slot::Audio(0)).await;
     std::fs::remove_dir_all(set.dir(Slot::Audio(0))).unwrap();
     let node = set.start(Slot::Audio(0)).await;
-    let replica = node.replica.clone();
     set.nodes.insert(Slot::Audio(0), node);
-    assert!(
-        until(PERIOD * 4, || replica.status().is_some_and(
-            |status| status.contains("not starting a second one")
-        ))
-        .await,
-        "{:?}",
-        replica.status()
-    );
-    assert_eq!(set.api.marker(), None, "no marker created");
-    assert!(!replica.raft().is_initialized().await.unwrap());
-    for slot in [Slot::Audio(1), Slot::Audio(2)] {
-        assert_eq!(set.replica(slot).epoch(), epoch);
+    set.settled().await;
+    assert_eq!(set.epochs(), BTreeSet::from([epoch]), "one history");
+    assert_eq!(set.api.marker().map(|m| m.0), Some(epoch));
+    let revision = set.write(Slot::Audio(0), "1", "gain=1@1").await;
+    assert!(revision > 0, "the set commits");
+}
+
+/// A StatefulSet deleted with its marker and created again on the volumes
+/// it kept resumes the set from them, and its leader recreates the marker
+/// under the set's cluster id: a replica that then loses its volume joins
+/// the set again rather than waiting for a marker nothing creates.
+#[tokio::test]
+async fn a_set_resumed_from_kept_volumes_recreates_its_marker() {
+    let mut set = Set::new(Voters::new(3, false).unwrap()).await;
+    set.start_all().await;
+    set.settled().await;
+    let epoch = set.replica(Slot::Audio(1)).epoch();
+    let slots: Vec<Slot> = set.nodes.keys().copied().collect();
+    for &slot in &slots {
+        set.crash(slot).await;
     }
-    let revision = set.write(Slot::Audio(1), "1", "gain=1@1").await;
-    assert!(revision > 0, "the running set still commits");
+    set.api.delete();
+    set.start_all().await;
+    set.settled().await;
+    assert!(
+        until(PERIOD * 10, || set.api.marker().is_some()).await,
+        "no marker"
+    );
+    // Volume 0, which no volume has: no empty volume initialises from it.
+    assert_eq!(set.api.marker(), Some((epoch, 0)));
+    set.crash(Slot::Audio(2)).await;
+    std::fs::remove_dir_all(set.dir(Slot::Audio(2))).unwrap();
+    let node = set.start(Slot::Audio(2)).await;
+    set.nodes.insert(Slot::Audio(2), node);
+    set.settled().await;
+    assert_eq!(set.epochs(), BTreeSet::from([epoch]), "one history");
 }
 
 /// A set scaled from three audio replicas to one and back, with the
@@ -895,4 +950,81 @@ async fn ordinal_0_does_not_start_a_set_while_its_peers_are_unreachable() {
         !replica.raft().is_initialized().await.unwrap(),
         "a second set was initialised"
     );
+}
+
+/// A marker created for the StatefulSet names it as its owner, with the
+/// uid the StatefulSet has, so Kubernetes deletes the marker with it and
+/// a StatefulSet created again under the same name starts a new set. A
+/// StatefulSet that cannot be read creates no marker; without one named,
+/// the marker has no owner.
+#[tokio::test]
+async fn the_marker_is_owned_by_the_statefulset_named() {
+    let root = harness::root("bootstrap-owner");
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = Marker {
+        cluster: 7,
+        volume: 9,
+    };
+    let metadata = |api: &Api| api.0.lock().unwrap()[MARKER]["metadata"].clone();
+
+    let api = Api::default();
+    let owned = kube(&api, &root).await.owned_by(STATEFULSET.into());
+    assert!(owned.create(marker).await.unwrap());
+    assert_eq!(
+        metadata(&api)["ownerReferences"],
+        serde_json::json!([{
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "name": STATEFULSET,
+            "uid": STATEFULSET_UID,
+            "controller": false,
+        }])
+    );
+    assert_eq!(api.marker(), Some((7, 9)));
+    assert_eq!(
+        owned.update_revision(STATEFULSET).await.unwrap().as_deref(),
+        Some("set-audio-1")
+    );
+
+    let api = Api::default();
+    let unknown = kube(&api, &root).await.owned_by("other".into());
+    assert!(unknown.create(marker).await.is_err());
+    assert_eq!(api.marker(), None);
+
+    let api = Api::default();
+    assert!(kube(&api, &root).await.create(marker).await.unwrap());
+    assert_eq!(metadata(&api).get("ownerReferences"), None);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The owned marker is created only for the StatefulSet this process first
+/// read: one created again under the name since, or one being deleted, is
+/// refused, so a replica of a deleted set that still leads never writes
+/// its cluster id into the marker of the set that replaces it.
+#[tokio::test]
+async fn the_owned_marker_is_refused_for_a_replaced_or_deleting_statefulset() {
+    let root = harness::root("bootstrap-replaced");
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = Marker {
+        cluster: 7,
+        volume: 0,
+    };
+    let api = Api::default();
+    let owned = kube(&api, &root).await.owned_by(STATEFULSET.into());
+    // The rollout's first read takes the uid.
+    owned.update_revision(STATEFULSET).await.unwrap();
+    *api.1.lock().unwrap() = serde_json::json!({ "uid": "5c0e9a7d-1f22-4b36-8e51-a3d0c4b7e912" });
+    let refused = owned.create(marker).await.unwrap_err();
+    assert!(refused.contains("was replaced"), "{refused}");
+    assert_eq!(api.marker(), None);
+
+    *api.1.lock().unwrap() = serde_json::json!({ "deletionTimestamp": "2026-01-01T00:00:00Z" });
+    let refused = owned.create(marker).await.unwrap_err();
+    assert!(refused.contains("being deleted"), "{refused}");
+    assert_eq!(api.marker(), None);
+
+    *api.1.lock().unwrap() = Value::Null;
+    assert!(owned.create(marker).await.unwrap());
+    assert_eq!(api.marker(), Some((7, 0)));
+    let _ = std::fs::remove_dir_all(&root);
 }
