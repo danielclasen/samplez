@@ -742,9 +742,12 @@ const DIFF_BLOCK_48: u64 = 397_843;
 const DIFF_BLOCK_1024: u64 = 4_536_590;
 const DIFF_STEREO_64X56: u64 = 374_284;
 
-// Raised from 451,896 by the duck_copy limit of samplez-dsp, 22,310: the
-// fill now copies the eight cold detectors into the core as well
-// (453,474 measured).
+// Raised from 451,896 by the duck_copy limit of samplez-dsp, 22,310, not
+// to measured plus 10 %: 453,474 measured, 4.6 % below the limit. That
+// is about 42,600 over the 410,800 measured before, twice duck_copy's
+// 20,300: the fill now copies the eight cold detectors into the core,
+// aligns them and fades in through the ducked path. Callgrind counts are
+// deterministic, so the smaller margin holds.
 const FILL_BLOCK_48: u64 = 474_206;
 const FILL_BLOCK_1024: u64 = 9_631_507;
 

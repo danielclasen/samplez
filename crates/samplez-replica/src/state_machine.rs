@@ -302,7 +302,12 @@ pub struct StateMachine<P> {
     /// snapshot at, which its engine is rebuilt from, and every one
     /// derived since, ORed together: the coefficients an engine may hold
     /// a mask other than 0 for, which a re-assertion clears. None for a
-    /// product without targets, every coefficient then counting.
+    /// product without targets, every coefficient then counting. Per
+    /// replica, re-seeded from the image at open and at snapshot load:
+    /// the restamp records of two replicas may differ by mask 0 entries
+    /// one derives and the other does not. Mask 0 is always admitted and
+    /// leaves a coefficient at 0 as it is, so their outputs agree; their
+    /// records need not.
     masked: Option<Vec<Vec<u8>>>,
     /// Not replicated: the records derived since start or load, by log
     /// index, kept [`RECORDS_KEPT`] past their index; shared, so a reader
