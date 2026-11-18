@@ -115,6 +115,11 @@ pub struct Own {
     /// buildLead: samples a generation-needing entry is stamped ahead of
     /// the earliest index, covering this replica's generation builds.
     pub build_lead: Option<u64>,
+    /// How long a generation takes once its entry reaches the engine,
+    /// in samples: buildLead without the engine's lead
+    /// ([`samplez::Progress::build_time`]).
+    #[serde(default)]
+    pub build_time: Option<u64>,
     /// The replica's state (plan 2.11, Replica states); none for the
     /// witness.
     #[serde(default)]

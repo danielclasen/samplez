@@ -201,7 +201,13 @@ async fn generation_needing_entries_wait_for_the_last_one_and_buildlead() {
         .collect();
     assert_eq!(ups.len(), 2, "{ups:?}");
     let first = ups[0].at_index().unwrap();
-    assert_eq!(first, ups[0].stamp + build_lead, "buildLead past the lead");
+    // A replica that reports no build time counts its build lead.
+    let lead = set.replica(leader).contact_metrics().unwrap().lead;
+    assert_eq!(
+        first,
+        ups[0].stamp + lead + build_lead,
+        "buildLead past the lead"
+    );
     // The second was stamped once the first's index had passed.
     assert!(
         ups[1].stamp >= first,

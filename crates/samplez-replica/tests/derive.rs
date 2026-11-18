@@ -241,15 +241,19 @@ async fn the_leader_flags_a_forwarded_command_itself() {
 }
 
 /// Two re-routing commands hold one generation in flight: the second is
-/// stamped once the first's index passed, which lies the build lead past
-/// its stamp.
+/// stamped once the first's index passed. That index lies the lead and
+/// the build time past its stamp, since the build starts once the entry
+/// applies; the build lead, which holds the engine's own lead again, is
+/// not counted.
 #[tokio::test(start_paused = true)]
 async fn rerouting_commands_hold_one_generation_in_flight() {
     let set = start().await;
     let leader = set.leader().await;
-    let build_lead = 100 * BLOCK;
+    let build_time = 100 * BLOCK;
     for id in set.ids() {
-        set.audio(id).lock().build_lead = Some(build_lead);
+        let mut fake = set.audio(id).lock();
+        fake.build_time = Some(build_time);
+        fake.build_lead = Some(1000 * BLOCK);
     }
     sleep(Duration::from_millis(20)).await;
     let r = set.replica(leader);
@@ -263,7 +267,8 @@ async fn rerouting_commands_hold_one_generation_in_flight() {
     let routes: Vec<Request> = commands(&set, leader).into_iter().map(|(r, _)| r).collect();
     assert_eq!(routes.len(), 2, "{routes:?}");
     let first = routes[0].at_index().unwrap();
-    assert_eq!(first, routes[0].stamp + build_lead);
+    let lead = set.replica(leader).contact_metrics().unwrap().lead;
+    assert_eq!(first, routes[0].stamp + lead + build_time);
     assert!(
         routes[1].stamp >= first,
         "the second stamped at {} before the first's index {first} passed",

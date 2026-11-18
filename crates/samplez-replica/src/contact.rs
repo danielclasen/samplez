@@ -2623,15 +2623,19 @@ impl Contact {
                     return Err(StampRefusal::GenerationPending);
                 }
             }
+            // The build starts once the entry applies, which the lead
+            // covers, and takes the build time on the slowest counted
+            // replica. One that reports none counts its build lead, which
+            // holds its engine's lead as well.
             let counted = self.counted(&st, now);
-            let build_lead = self
+            let build = self
                 .copies(&st, now)
                 .into_iter()
                 .filter(|(id, _, _)| counted.contains(id))
-                .filter_map(|(_, _, own)| own.build_lead)
+                .filter_map(|(_, _, own)| own.build_time.or(own.build_lead))
                 .max()
                 .unwrap_or(0);
-            let earliest = stamp + lead.max(build_lead).next_multiple_of(b);
+            let earliest = (stamp + lead + build).next_multiple_of(b);
             st.reserved = st.reserved.max(Some(earliest));
             earliest
         } else {

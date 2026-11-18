@@ -402,6 +402,7 @@ pub struct Fake {
     pub stalled_at: Option<u64>,
     pub flags: ClockFlags,
     pub build_lead: Option<u64>,
+    pub build_time: Option<u64>,
     pub entries_refused: u64,
     pub outputs: Vec<Output>,
     /// The last block computed.
@@ -871,6 +872,7 @@ impl Audio for FakeAudio {
                 standing: st.outputs.iter().map(|o| o.statuses.standing()).collect(),
                 unwritten: Vec::new(),
                 build_lead: st.build_lead,
+                build_time: st.build_time,
                 pages: st
                     .outputs
                     .iter()

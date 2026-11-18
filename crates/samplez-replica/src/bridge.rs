@@ -231,6 +231,7 @@ impl Audio for EngineAudio {
                 .collect(),
             unwritten: Vec::new(),
             build_lead: Some(progress.build_lead),
+            build_time: Some(progress.build_time),
             pages: unwritten.pages.iter().flatten().copied().collect(),
             ..Own::default()
         };
