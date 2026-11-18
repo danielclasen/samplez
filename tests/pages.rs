@@ -399,3 +399,119 @@ fn one_voter_hashes_no_page_and_a_full_channel_is_counted() {
     );
     assert_eq!(c.page_hashes_dropped.load(Relaxed), 0);
 }
+
+/// A replicated engine of three voters over a two-channel input on `src`
+/// and a second, one-channel input on its channel 0, both into output 0,
+/// the second also into output 1; `started` starts the second input
+/// without a flow and output 1 disabled.
+fn start_shaped(domain: &Domain, src: &str, started: bool) -> Replica {
+    let (out0, out1) = (new_id(), new_id());
+    let mut config = config(
+        &domain.0,
+        &[(src, 2), (src, 1)],
+        &[(&out0, 2), (&out1, 1)],
+        vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.5, 0.0, 1.0],
+        ],
+        MARGIN,
+    );
+    config.ramp_samples = RAMP;
+    config.inputs[1].flow_channels = Some(vec![0]);
+    if started {
+        config.inputs[1].flow_id = None;
+        config.outputs[1].enabled = false;
+    }
+    let (report_tx, _reports) = std::sync::mpsc::sync_channel(64);
+    let (hash_tx, hashes) = std::sync::mpsc::sync_channel(1 << 16);
+    let (verdict_tx, verdicts) = std::sync::mpsc::sync_channel(1 << 16);
+    let process = samplez::rt::setup_process(&config.rt);
+    let replication = Replication {
+        voters: 3,
+        reports: report_tx,
+        statuses: None,
+        hashes: Some(hash_tx),
+    };
+    let e = Engine::start_replicated(config, process, Some(verdict_tx), replication).unwrap();
+    wait_for(Duration::from_secs(5), "started", || {
+        let s = e.status();
+        s.outputs[0].realised
+            && (s.inputs.iter())
+                .all(|i| matches!(i.state, InputState::Attached | InputState::Detached))
+    });
+    Replica {
+        e,
+        hashes,
+        verdicts,
+    }
+}
+
+/// An engine started with an output disabled and an input without a flow
+/// hashes the pages after a `Detach` and an `Output` that disable them on
+/// another engine alike: the start state computes what the log leaves.
+/// Neither hashes the disabled output past the entries.
+#[test]
+fn a_start_state_hashes_as_the_entries_that_leave_it() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let started = start_shaped(&domain, &src, true);
+        let logged = start_shaped(&domain, &src, false);
+        let k = processed(&started.e).max(processed(&logged.e));
+        let at = (k + 100) * B;
+        logged
+            .e
+            .append_batch(
+                1,
+                at,
+                &[
+                    Entry::Detach { slot: 1 },
+                    Entry::Output {
+                        slot: 1,
+                        enabled: false,
+                    },
+                ],
+            )
+            .unwrap();
+        logged.e.commit(1);
+        // Past the detach's crossfade to silence.
+        let from = (at + u64::from(RAMP)).div_ceil(PAGE) + 1;
+        wait_all(&[&started, &logged], (from + 20) * PAGE / B);
+        let keyed = |r: &Replica| -> BTreeMap<(u32, u64), PageHash> {
+            r.hashes
+                .try_iter()
+                .map(|h| ((h.output, h.page), h))
+                .collect()
+        };
+        let (a, b) = (keyed(&started), keyed(&logged));
+        let disturbed: Vec<(u64, u64)> = (started.disturbed().into_iter())
+            .chain(logged.disturbed())
+            .collect();
+        assert!(
+            !(a.keys().chain(b.keys())).any(|&(o, p)| o == 1 && p >= from),
+            "a disabled output hashed"
+        );
+        let pairs: Vec<(PageHash, PageHash)> = (a.iter())
+            .filter(|((o, p), _)| *o == 0 && *p >= from)
+            .filter(|((_, p), _)| !disturbed.iter().any(|&(f, t)| (f..t).contains(p)))
+            .filter_map(|(key, ha)| Some((*ha, *b.get(key)?)))
+            .collect();
+        if pairs.len() < 10 {
+            let count = |m: &BTreeMap<(u32, u64), PageHash>| {
+                m.keys().filter(|&&(o, p)| o == 0 && p >= from).count()
+            };
+            return Err(format!(
+                "{} pages compared of {} and {} from page {from}, disturbed {disturbed:?}",
+                pairs.len(),
+                count(&a),
+                count(&b)
+            ));
+        }
+        for (ha, hb) in &pairs {
+            assert_eq!(ha.hash, hb.hash, "page {}", ha.page);
+        }
+        Ok(())
+    });
+}

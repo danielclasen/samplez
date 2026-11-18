@@ -117,7 +117,13 @@ pub struct Domain {
 pub struct Input {
     pub name: String,
     pub domain: String,
-    pub flow_id: String,
+    /// The flow the input reads from the start; none starts it detached,
+    /// as a `Detach` leaves it: no reader is opened until a `Route`. In
+    /// replicated mode the product's targets set the flow from their
+    /// first record and every rebuild on: this is the start until then,
+    /// and has to match the product's initial targets.
+    #[serde(default)]
+    pub flow_id: Option<String>,
     /// The input's legs: its matrix rows, meter and strip width.
     pub channels: u32,
     /// The 0-based flow channel each leg reads, `channels` long, each
@@ -180,6 +186,14 @@ pub struct Output {
     pub group: String,
     pub role: String,
     pub channels: u32,
+    /// Whether the output starts enabled, true by default; one started
+    /// disabled creates no flow until an `Output` entry enables it. In
+    /// replicated mode the product's targets set it only by an `Output`
+    /// entry, which their diff emits when the output's enabled state
+    /// changes, or by a rebuild, so it has to match the product's initial
+    /// targets.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// The loudness role of each channel: `L`, `R`, `C`, `Ls`, `Rs` or
     /// `LFE`, weighted per ITU-R BS.1770-5 Table 3 (the LFE channel is not
     /// measured). Without it every channel is weighted 1.
@@ -501,7 +515,7 @@ impl Config {
             if i.channels == 0 {
                 return fail(format!("input {}: channels must be at least 1", i.name));
             }
-            samplez_mxl::input::legs(&self.input_config(i, &i.flow_id))
+            samplez_mxl::input::legs(&self.input_config(i, i.flow_id.as_deref().unwrap_or("none")))
                 .map_err(|e| Error(format!("input {}: {e}", i.name)))?;
             i.loudness_weights()?;
         }
@@ -520,7 +534,9 @@ impl Config {
             o.loudness_weights()?;
         }
         for (slot, i) in self.inputs.iter().enumerate() {
-            self.check_input_flow(slot, &i.flow_id)?;
+            if let Some(flow_id) = &i.flow_id {
+                self.check_input_flow(slot, flow_id)?;
+            }
         }
         let (n, m) = (self.input_channels(), self.columns());
         if self.matrix.len() != n || self.matrix.iter().any(|row| row.len() != m) {
@@ -639,6 +655,37 @@ mod tests {
         assert_eq!(c.resync_budget_samples(), 2400);
         // D + w + 2B: 864 + 96 samples.
         assert_eq!(c.hold_blocks() as u64 * 48, 960);
+    }
+
+    /// An input's flow is optional: absent or null starts it without one,
+    /// an empty id is refused as any invalid id is, and an input without
+    /// a flow skips the check against the outputs' flows. An output
+    /// starts enabled unless `enabled` is false.
+    #[test]
+    fn an_input_flow_is_optional_and_an_output_starts_enabled_by_default() {
+        let c = parse(&base()).unwrap();
+        assert_eq!(c.inputs[0].flow_id.as_deref(), Some(IN));
+        assert!(c.outputs[0].enabled);
+        let mut v = base();
+        v["inputs"][0].as_object_mut().unwrap().remove("flowId");
+        v["outputs"][0]["enabled"] = serde_json::json!(false);
+        let c = parse(&v).unwrap();
+        assert_eq!(c.inputs[0].flow_id, None);
+        assert!(!c.outputs[0].enabled);
+        v["inputs"][0]["flowId"] = serde_json::Value::Null;
+        assert_eq!(parse(&v).unwrap().inputs[0].flow_id, None);
+        v["inputs"][0]["flowId"] = serde_json::json!("");
+        assert!(parse(&v).is_err(), "an empty flow id taken");
+        // Reading the output's flow is refused only for an input with one.
+        v["inputs"][0]["flowId"] = serde_json::json!(OUT);
+        assert!(
+            parse(&v).is_err(),
+            "an input reading the output's flow taken"
+        );
+        v["inputs"][0].as_object_mut().unwrap().remove("flowId");
+        v["inputs"][0]["flowChannels"] = serde_json::json!([0]);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("flow none"), "{e}");
     }
 
     /// A matrix beyond `MAX_COEFFICIENTS` is refused with the

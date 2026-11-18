@@ -935,6 +935,54 @@ fn a_detached_input_on_an_engine_with_its_own_log_keeps_its_state() {
     common::stop(e);
 }
 
+/// An engine starts with an output configured disabled and an input
+/// configured without a flow as a disabled `Output` and a `Detach` leave
+/// them: the output creates no flow and the input opens no reader, is
+/// not polled and is not reported, while the engine computes. Enabled,
+/// the output's flow is created; routed, the input reads its flow.
+#[test]
+fn an_engine_starts_with_an_output_disabled_and_an_input_detached() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let mut c = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    );
+    c.inputs[0].flow_id = None;
+    c.outputs[0].enabled = false;
+    let (e, rx) = common::start(c);
+    now(&rx);
+    std::thread::sleep(SECOND);
+    let s = e.status();
+    let (input, output) = (&s.inputs[0], &s.outputs[0]);
+    assert_eq!(input.state, InputState::Detached, "{input:?}");
+    assert!(
+        input.error.is_none() && input.flow_id.is_empty(),
+        "{input:?}"
+    );
+    assert!(
+        !output.enabled && !output.realised && output.reason.as_deref() == Some("disabled"),
+        "{output:?}"
+    );
+    assert!(!domain.has_flow(&out), "a disabled output's flow created");
+    e.set_output_enabled(0, true, 0).unwrap();
+    wait_for(10 * SECOND, "output realised", || {
+        let o = e.status().outputs[0].clone();
+        o.enabled && o.realised && domain.has_flow(&out)
+    });
+    e.route(0, &src, 0).unwrap();
+    wait_for(10 * SECOND, "input attached on its flow", || {
+        let s = e.status();
+        s.inputs[0].state == InputState::Attached && s.inputs[0].flow_id == src
+    });
+    assert_eq!(e.status().diverged, None);
+    common::stop(e);
+}
+
 /// A disabled output's flow is gone from the domain while the engine runs
 /// on; enabled again, a writer another process holds on the flow is
 /// reported and the output realised once that writer is gone, written
