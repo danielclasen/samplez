@@ -541,6 +541,16 @@ impl Audio for EngineAudio {
             for (n, (_, r)) in records.iter().enumerate().rev() {
                 lowest[n] = lowest[n + 1].min(r.at_index);
             }
+            // An entry at or after the replay's next block is applied,
+            // though the donor may have taken it late and held it
+            // unresolved: the records carry no decision, and one in the
+            // log names the entry only once the leader saw it held
+            // unresolved, which an entry the baseline applied in time
+            // never draws. The pages after it then differ, the hand-over
+            // waits for a matched page and the attempt fails; the next
+            // copies a newer core, whose next block is past the entry, and
+            // holds it unresolved as below. Decisions are stamped with the
+            // lead the entries needed, so late entries do not keep coming.
             for (n, (index, record)) in records.into_iter().enumerate() {
                 after = index;
                 let at_index = record.at_index.next_multiple_of(self.block);
