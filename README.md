@@ -259,13 +259,27 @@ embeds the replica without one leaves every replica in `starting`.
 A replica's store builds its empty product with the `Factory` it is
 given, at open and for every snapshot it installs, so the product keeps
 the replica's configuration. Product state is shared by every replica,
-so every member, the witness included, needs equal configuration as far
-as it changes how a command applies or a saved state loads
-(`Product::config_hash`). Reports and snapshots carry the hash: a
-snapshot from a replica of another hash is not installed, which stops
-the replica's storage, and the leader orders no client command while a
-member reports another hash (`unavailable`, naming it). A configuration
-change of that kind is made with every replica stopped.
+so every member, learners and the witness included, needs equal
+configuration as far as it changes how a command applies or a saved
+state loads (`Product::config_hash`). The checks detect a difference;
+they do not undo it. Reports carry the hash: the leader orders no
+client command while a voter or a learner reports another one
+(`unavailable`, naming it), until that member reports the set's hash or
+leaves the membership, and promotes no learner of another hash. A
+report without a hash, from a replica that records none, names none. A
+snapshot carries its sender's hash: a replica of another hash refuses
+it before anything is written and exits with status 78, so it restarts
+visibly; restarted under the set's configuration it installs the
+snapshot; an embedder chooses otherwise with
+`Store::on_config_mismatch`. The replica whose hash differs from the
+others' is the one to fix, and it may be the sender: a lagging replica
+of the set's configuration exits on a snapshot from one that is not.
+Each replica's hash is in its contact metrics (`config_hash`). A store
+warns at open when its snapshot was built under another hash: expected
+once after a change made with every replica stopped; otherwise the
+replica ran under another configuration than the set's, holds another
+state and is rebuilt from an empty volume. A configuration change of that kind is made with every
+replica stopped.
 
 A replica set agrees on its cluster id through the marker ConfigMap that
 ordinal 0 creates on an empty volume (`bootstrap::Kube`). Given the audio

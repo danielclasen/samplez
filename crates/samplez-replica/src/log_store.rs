@@ -79,6 +79,10 @@ pub struct Store<P> {
     factory: Factory<P>,
     /// The product's configuration hash, fixed when the store opened.
     config: u64,
+    /// Called with this replica's hash and a refused snapshot's before
+    /// the install fails: by default ends the process
+    /// ([`Store::on_config_mismatch`]).
+    on_mismatch: Arc<dyn Fn(u64, u64) + Send + Sync>,
     snapshots: Arc<tokio::sync::Mutex<()>>,
     /// Added to every fsynced write, for tests of a slow volume.
     #[cfg(test)]
@@ -91,11 +95,40 @@ impl<P> Clone for Store<P> {
             inner: self.inner.clone(),
             factory: self.factory.clone(),
             config: self.config,
+            on_mismatch: self.on_mismatch.clone(),
             snapshots: self.snapshots.clone(),
             #[cfg(test)]
             sync_delay: self.sync_delay,
         }
     }
+}
+
+/// Exit status of a replica that refused a snapshot of another product
+/// configuration: `EX_CONFIG`.
+pub const CONFIG_MISMATCH_EXIT: i32 = 78;
+
+/// Ends the process on a snapshot refused for its configuration, so the
+/// refusal shows as a restarting replica rather than a raft core that
+/// stopped behind a process still running. Its storage is untouched: a
+/// restart under the set's configuration installs the snapshot.
+fn exit_on_mismatch(ours: u64, theirs: u64) {
+    eprintln!(
+        "samplez-replica: a snapshot from a replica of product configuration {theirs} \
+         is not this replica's, {ours}: exiting"
+    );
+    std::process::exit(CONFIG_MISMATCH_EXIT);
+}
+
+/// What a store opening under configuration `ours` warns of when its
+/// snapshot was built under another one, `built_under`.
+fn open_warning(ours: u64, built_under: Option<u64>) -> Option<String> {
+    let theirs = built_under.filter(|&t| t != ours)?;
+    Some(format!(
+        "the stored snapshot was built under product configuration {theirs}, this replica \
+         runs {ours}: expected once after a configuration change made with every replica \
+         stopped; otherwise this replica ran under another configuration than the set's, \
+         holds another state and is rebuilt from an empty volume"
+    ))
 }
 
 /// Runs file work on tokio's blocking pool.
@@ -225,6 +258,22 @@ impl<P: Product> Store<P> {
         self.config
     }
 
+    /// The configuration hash the stored snapshot was built under, as
+    /// last built, installed or read at open; none without one or from a
+    /// replica that recorded none.
+    pub fn snapshot_config(&self) -> Option<u64> {
+        self.lock().snapshot.as_ref().and_then(|s| s.config)
+    }
+
+    /// This store calling `f` with its own hash and the snapshot's when it
+    /// refuses a snapshot of another product configuration, in place of
+    /// ending the process with [`CONFIG_MISMATCH_EXIT`]; the install fails
+    /// after it either way.
+    pub fn on_config_mismatch(mut self, f: impl Fn(u64, u64) + Send + Sync + 'static) -> Store<P> {
+        self.on_mismatch = Arc::new(f);
+        self
+    }
+
     /// The product paths `command` sets.
     pub fn paths(&self, command: &[u8]) -> Vec<String> {
         self.lock().sm.product.paths(command)
@@ -234,6 +283,12 @@ impl<P: Product> Store<P> {
     /// product `factory` builds as the state the snapshot (if any) is
     /// loaded into. Every snapshot installed later loads into one it
     /// builds as well, so the product keeps the replica's configuration.
+    ///
+    /// A snapshot sent by a replica of another product configuration
+    /// ([`Product::config_hash`]) is refused, and the process exits with
+    /// [`CONFIG_MISMATCH_EXIT`] unless [`Store::on_config_mismatch`] says
+    /// otherwise: a learner catching up, or any member lagging, may receive
+    /// one.
     pub fn open(dir: &Path, factory: Factory<P>, limits: Limits) -> io::Result<Store<P>> {
         fs::create_dir_all(dir)?;
         let mut sm = StateMachine::new(factory(), limits);
@@ -291,10 +346,15 @@ impl<P: Product> Store<P> {
             inner.replay(record);
         }
         sync_dir(dir)?;
+        if let Some(warning) = open_warning(config, inner.snapshot.as_ref().and_then(|s| s.config))
+        {
+            tracing::warn!("{warning}");
+        }
         Ok(Store {
             inner: Arc::new(Mutex::new(inner)),
             factory,
             config,
+            on_mismatch: Arc::new(exit_on_mismatch),
             snapshots: Arc::default(),
             #[cfg(test)]
             sync_delay: std::time::Duration::ZERO,
@@ -702,6 +762,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
                 theirs,
                 "a snapshot from a replica of another product configuration"
             );
+            (self.on_mismatch)(self.config, theirs);
             return Err(read_error(&format!(
                 "the snapshot's product configuration hash {theirs} is not this \
                  replica's, {}",
@@ -1122,7 +1183,9 @@ mod tests {
     }
 
     /// A snapshot from a replica of another product configuration is not
-    /// installed: the state stays as it was.
+    /// installed: the process would end, the state and the volume stay as
+    /// they were, and the replica restarted under the set's configuration
+    /// installs it.
     #[tokio::test]
     async fn a_snapshot_of_another_configuration_is_refused() {
         let mut store = open_as(&dir("cfg-other-from"), 8);
@@ -1130,15 +1193,66 @@ mod tests {
         store.append_to_log(entries.clone()).await.expect("append");
         store.apply_to_state_machine(&entries).await.expect("apply");
         let snapshot = store.build_snapshot().await.expect("build");
-        let mut other = open_as(&dir("cfg-other-to"), 7);
+        let to = dir("cfg-other-to");
+        let ended = Arc::new(Mutex::new(Vec::new()));
+        let seen = ended.clone();
+        let mut other = open_as(&to, 7).on_config_mismatch(move |ours, theirs| {
+            seen.lock().unwrap().push((ours, theirs));
+        });
         let before = other.with_state(|sm| sm.save());
+        let bytes = snapshot.snapshot.into_inner();
         let installed = other
-            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .install_snapshot(&snapshot.meta, Box::new(Cursor::new(bytes.clone())))
             .await;
         assert!(installed.is_err());
+        assert_eq!(*ended.lock().unwrap(), [(7, 8)], "the process ends");
         assert_eq!(other.applied_index(), 0);
         assert_eq!(other.with_state(|sm| sm.save()), before);
         assert_eq!(other.installs(), 0);
+        drop(other);
+        let mut restarted = open_as(&to, 8);
+        restarted
+            .install_snapshot(&snapshot.meta, Box::new(Cursor::new(bytes)))
+            .await
+            .expect("installs under the set's configuration");
+        assert_eq!(restarted.applied_index(), 3);
+    }
+
+    /// The open warning names both hashes and both cases: expected after
+    /// a change made with every replica stopped, else a rebuild.
+    #[test]
+    fn a_snapshot_built_under_another_configuration_warns_at_open() {
+        assert_eq!(open_warning(7, None), None);
+        assert_eq!(open_warning(7, Some(7)), None);
+        let w = open_warning(9, Some(7)).expect("a warning");
+        assert!(w.contains("configuration 7, this replica runs 9"), "{w}");
+        assert!(w.contains("every replica stopped"), "{w}");
+        assert!(w.contains("empty volume"), "{w}");
+    }
+
+    /// A snapshot or a report from a replica that records no
+    /// configuration, its JSON without the field, decodes as none.
+    #[test]
+    fn a_snapshot_and_a_report_without_a_configuration_decode() {
+        let snapshot = StoredSnapshot {
+            id: "s".into(),
+            last_applied: None,
+            membership: StoredMembershipConfig::default(),
+            state: StateMachine::new(Paths::default(), Limits::defaults(48_000)).save(),
+            config: Some(1),
+        };
+        let mut json = serde_json::to_value(&snapshot).expect("encodes");
+        json.as_object_mut().expect("an object").remove("config");
+        let decoded: StoredSnapshot = serde_json::from_value(json).expect("decodes");
+        assert_eq!(decoded.config, None);
+        let own = crate::report::Own {
+            config: Some(1),
+            ..Default::default()
+        };
+        let mut json = serde_json::to_value(&own).expect("encodes");
+        json.as_object_mut().expect("an object").remove("config");
+        let decoded: crate::report::Own = serde_json::from_value(json).expect("decodes");
+        assert_eq!(decoded.config, None);
     }
 
     /// A snapshot is sent under the sender's configuration now: one saved
@@ -1154,6 +1268,11 @@ mod tests {
         store.build_snapshot().await.expect("build");
         drop(store);
         let mut store = open_as(&dir_from, 9);
+        assert_eq!(
+            store.snapshot_config(),
+            Some(7),
+            "built under 7, read at open"
+        );
         let current = store
             .get_current_snapshot()
             .await

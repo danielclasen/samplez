@@ -523,6 +523,9 @@ struct Counts {
 
 struct State {
     members: Members,
+    /// The product configuration hash of each learner's newest report:
+    /// the only part of a learner's report taken.
+    learner_configs: BTreeMap<NodeId, Option<u64>>,
     seq: u64,
     sent: VecDeque<(u64, u64)>,
     peers: BTreeMap<NodeId, Peer>,
@@ -629,6 +632,10 @@ pub struct Contact {
 /// Contact as status and metrics show it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Metrics {
+    /// This replica's product configuration hash
+    /// ([`crate::state_machine::Product::config_hash`]), to compare with
+    /// the other replicas'.
+    pub config_hash: Option<u64>,
     /// F, none before it is first computed.
     pub fence: Option<u64>,
     pub in_contact: bool,
@@ -795,6 +802,7 @@ impl Contact {
                 generation_at,
                 own_at: Instant::now(),
                 judged: BTreeSet::new(),
+                learner_configs: BTreeMap::new(),
                 slack: Vec::new(),
                 lead: Lead::new(
                     timing.block,
@@ -875,7 +883,14 @@ impl Contact {
         let mut st = self.lock();
         let st = &mut *st;
         let voters = st.members.voters();
-        if report.from == self.id || !voters.contains(&report.from) {
+        if report.from == self.id {
+            return;
+        }
+        if !voters.contains(&report.from) {
+            // A learner applies the log too: its configuration counts.
+            if st.members.addrs.contains_key(&report.from) {
+                st.learner_configs.insert(report.from, report.own.config);
+            }
             return;
         }
         self.expire(st, tai);
@@ -1061,6 +1076,8 @@ impl Contact {
         let st = &mut *st;
         let voters = members.voters();
         st.peers.retain(|id, _| voters.contains(id));
+        st.learner_configs
+            .retain(|id, _| members.addrs.contains_key(id) && !voters.contains(id));
         st.members = members;
         self.expire(st, tai);
         self.sync_log(st, tai);
@@ -2276,10 +2293,27 @@ impl Contact {
         let ours = self.log.config_hash()?;
         let st = self.lock();
         let now = Instant::now();
-        self.copies(&st, now).into_iter().find_map(|(id, _, own)| {
+        let voter = self.copies(&st, now).into_iter().find_map(|(id, _, own)| {
             (st.members.addrs.contains_key(&id) && own.config.is_some_and(|c| c != ours))
                 .then_some(id)
+        });
+        voter.or_else(|| {
+            (st.learner_configs.iter())
+                .find(|(_, c)| c.is_some_and(|c| c != ours))
+                .map(|(&id, _)| id)
         })
+    }
+
+    /// Whether learner `id` reported and its newest report names this
+    /// replica's product configuration hash, or none, as a replica that
+    /// records none does: only then is it promoted. One not heard from yet
+    /// is not.
+    pub fn learner_holds_set_config(&self, id: NodeId) -> bool {
+        let ours = self.log.config_hash();
+        self.lock()
+            .learner_configs
+            .get(&id)
+            .is_some_and(|c| c.is_none_or(|c| ours.is_none_or(|o| o == c)))
     }
 
     /// The engine refused an appended entry: the replica's output no
@@ -2640,6 +2674,7 @@ impl Contact {
             .map(|(d, th)| 2 * self.timing.report_period + Duration::from_nanos(2 * d + th));
         let status_lag = q(&c.status_lag).map(Duration::from_nanos);
         Metrics {
+            config_hash: self.log.config_hash(),
             fence: st.fence,
             in_contact: st.in_contact,
             known_committed: st.known_committed,
@@ -2961,6 +2996,9 @@ mod tests {
         fn paths(&self, command: &[u8]) -> Vec<String> {
             vec![crate::state_machine::tests::parse(command).0]
         }
+        fn config_hash(&self) -> Option<u64> {
+            Some(1)
+        }
     }
 
     /// Records what contact hands the engine. Its step flag shows once
@@ -3158,6 +3196,15 @@ mod tests {
             self.engine.fence.load(Ordering::SeqCst)
         }
 
+        /// A report from `from` naming product configuration `config`.
+        fn config_report(&self, from: NodeId, config: Option<u64>) -> Report {
+            // A later report than the one before.
+            self.clock.add(Duration::from_millis(1));
+            let mut r = self.report(from, None);
+            r.own.config = config;
+            r
+        }
+
         fn silent(&self, node: NodeId) -> bool {
             let m = self.contact.metrics();
             m.peers.iter().any(|p| p.node == node && p.silent)
@@ -3168,6 +3215,45 @@ mod tests {
 
     fn w_ns() -> u64 {
         W.as_nanos() as u64
+    }
+
+    /// Writes stop while a voter or a learner reports another product
+    /// configuration, and resume once it reports the set's or leaves the
+    /// membership; a report without one names none. A learner of another
+    /// configuration is not promoted.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_of_another_configuration_stops_writes_until_it_matches_or_leaves() {
+        let mut f = fixture(&[&[1, 2, 3]]);
+        f.members.addrs.insert(9, "9".into());
+        f.tick();
+        assert_eq!(f.contact.config_differs(), None);
+        assert!(!f.contact.learner_holds_set_config(9), "not heard from yet");
+        f.contact.receive(f.config_report(2, None));
+        assert_eq!(f.contact.config_differs(), None, "no hash names none");
+        f.contact.receive(f.config_report(2, Some(5)));
+        assert_eq!(f.contact.config_differs(), Some(2));
+        f.contact.receive(f.config_report(2, Some(1)));
+        assert_eq!(
+            f.contact.config_differs(),
+            None,
+            "restarted under the set's"
+        );
+        f.contact.receive(f.config_report(9, Some(5)));
+        assert_eq!(f.contact.config_differs(), Some(9), "a learner");
+        assert!(!f.contact.learner_holds_set_config(9));
+        assert!(!f.contact.learner_holds_set_config(2), "not a learner");
+        f.contact.receive(f.config_report(9, Some(1)));
+        assert!(f.contact.learner_holds_set_config(9));
+        f.contact.receive(f.config_report(9, None));
+        assert!(f.contact.learner_holds_set_config(9), "one recording none");
+        f.contact.receive(f.config_report(9, Some(5)));
+        f.contact.receive(f.config_report(3, Some(6)));
+        f.members.addrs.remove(&9);
+        f.members.configs = vec![[1, 2].into_iter().collect()];
+        f.members.addrs.remove(&3);
+        f.tick();
+        assert_eq!(f.contact.config_differs(), None, "both left the membership");
+        assert!(!f.contact.learner_holds_set_config(9));
     }
 
     #[tokio::test(start_paused = true)]
