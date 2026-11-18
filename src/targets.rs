@@ -25,7 +25,8 @@ pub struct Targets {
 impl Targets {
     /// The entries that move an engine holding `self` to `next`: a `Gain`
     /// for each coefficient whose bit pattern differs, row by row; a
-    /// `Strip` for each parameter that differs, by slot and parameter; a
+    /// `Strip` for each parameter that differs in any field's bit
+    /// pattern, by slot and parameter; a
     /// `Route` for each slot whose flow differs. A target `next` holds and
     /// `self` does not counts as different; one `self` holds and `next`
     /// does not gets no entry, so the engine keeps it.
@@ -47,7 +48,7 @@ impl Targets {
         for (slot, params) in next.strips.iter().enumerate() {
             let was = self.strips.get(slot).map(|p| keyed(p)).unwrap_or_default();
             for (key, param) in keyed(params) {
-                if was.get(&key) != Some(&param) {
+                if was.get(&key).is_none_or(|w| !same_bits(w, &param)) {
                     entries.push(Entry::Strip { slot, param });
                 }
             }
@@ -67,12 +68,13 @@ impl Targets {
     /// whatever an engine holds, in the order of [`Targets::diff`], and a
     /// `Route` for each of `slots` in ascending order.
     pub fn assert(&self, slots: &[usize]) -> Vec<Entry> {
+        // Against no targets at all: every gain, zeros included, and every
+        // strip parameter.
         let mut entries = Targets::default().diff(&Targets {
             gains: self.gains.clone(),
             flows: Vec::new(),
             strips: self.strips.clone(),
         });
-        // A gain of +0.0 is the default's missing coefficient too.
         let mut slots = slots.to_vec();
         slots.sort_unstable();
         slots.dedup();
@@ -86,6 +88,14 @@ impl Targets {
         }
         entries
     }
+}
+
+/// Whether `a` and `b` hold the same bit pattern in every field. Their
+/// `Debug` forms tell every pair of `f32` bit patterns apart but NaNs,
+/// which no parameter an engine takes holds: -0.0 and 0.0 differ there as
+/// they do in a core copy.
+fn same_bits(a: &StripParam, b: &StripParam) -> bool {
+    a == b && format!("{a:?}") == format!("{b:?}")
 }
 
 /// `params` by key, the later of two with one key counting.
@@ -168,6 +178,23 @@ mod tests {
                 input: 0,
                 output: 1,
                 gain: -0.0
+            }]
+        );
+    }
+
+    /// A strip field that moves from 0.0 to -0.0 is another bit pattern:
+    /// every replica names it, as it names such a gain.
+    #[test]
+    fn strip_parameters_compare_by_bit_pattern() {
+        let mut next = targets();
+        next.strips[0] = vec![StripParam::Trim { db: -0.0 }];
+        let mut base = targets();
+        base.strips[0] = vec![StripParam::Trim { db: 0.0 }];
+        assert_eq!(
+            base.diff(&next),
+            vec![Entry::Strip {
+                slot: 0,
+                param: StripParam::Trim { db: -0.0 }
             }]
         );
     }
