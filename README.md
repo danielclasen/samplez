@@ -210,11 +210,20 @@ Every change to what the engine computes is a log entry applied at a
 sample index: a gain change, `InputDown` (the input is silent from the
 index on, whatever is readable), `InputUp` (it fades in from the index),
 `Route` (it crossfades to another flow over the ramp length from the
-index) and `Strip` (one parameter of an input's channel strip, a
+index), `Detach` (it crossfades to silence over the ramp length from the
+index and reads no flow, is not polled and is not reported until a
+`Route` fades it in from silence; its up or down state is kept),
+`Output` (an output disabled: nothing is written to it from the index
+on and its writer is released, which deletes its flow unless another
+writer holds it; or enabled: its flow is created as at start-up and
+written from the first block due once the writer is in, another writer
+live on the flow reported in the output's status and the creation
+retried) and `Strip` (one parameter of an input's channel strip, a
 `samplez_dsp::StripParam`, ramping over the ramp length). Each sets an
 absolute target, so an entry applied again once its ramp has ended
 changes nothing; applied again while it ramps, it starts the ramp over
-from where it is. `InputUp` and `Route` need a new input generation:
+from where it is. `InputUp`, `Route` and `Detach` need a new input
+generation:
 the engine builds it when the entry is appended, one at a time, and
 swaps it in at the entry's index. The status reports the 99.99th
 percentile of the build times and buildLead, how far ahead such entries
@@ -222,18 +231,21 @@ are stamped; `Engine::progress` reports buildLead and the build time,
 the percentile and a supervisor tick without the engine's lead.
 `Engine::start` keeps the log itself, stamping `InputDown`
 when an input is pruned and `InputUp` once its head has advanced for a
-second, wherever it stands against the clock, and each `InputUp` or
-`Route` at least buildLead after the one before;
+second, wherever it stands against the clock, each `InputUp`,
+`Route` (`Engine::route`) or `Detach` (`Engine::detach`) at least
+buildLead after the one before, and an `Output`
+(`Engine::set_output_enabled`) as a gain change;
 `Engine::start_replicated` takes entries through `append`, `commit` and
 `truncate` and sends those reports out instead.
 
 A replicated log entry may carry any number of engine entries
 (`append_batch`). They are folded off the RT thread: per matrix
-coefficient and strip parameter the last value; per input slot
-whether it is re-routed, goes down and comes up, an `InputUp` after an
-`InputDown` fading in from silence and a route kept whatever the
-state. The log entry's batch is bounded by the engine's shape, shared
-by reference and never changed once folded. It takes one of the 64
+coefficient, strip parameter and output the last value; per input slot
+whether it is re-routed or detached, the last `Route` or `Detach`
+counting, goes down and comes up, an `InputUp` after an `InputDown`
+fading in from silence and a route kept whatever the state. The log
+entry's batch is bounded by the engine's shape, shared by reference
+and never changed once folded. It takes one of the 64
 places the RT thread holds for log entries before their index, the
 number the leader stamps ahead, and applies whole at its index, its
 gains first; one generation covers every slot it raises or re-routes,
@@ -392,8 +404,9 @@ block computation off the RT thread, its readers on a new instance per
 input domain reading the blocks after k0 from the flows' history, its
 entries and unresolved-entry decisions after the core's last log id
 taken from the caller, and every page it computes whole hashed. A core
-with a generation-needing entry in flight (`InputUp`, `Route`, a pending
-generation or a crossfade) is not replayed. `Replay::run_to` stops at the
+with a generation-needing entry in flight (`InputUp`, `Route`, `Detach`,
+a pending generation or a crossfade) is not replayed, nor one whose
+detached inputs are not the engine's. `Replay::run_to` stops at the
 newest block due, and `Replay::silenced` names the blocks computed with
 an input silenced. `Engine::hand_over` waits for the RT thread to
 compute a block, runs the clone up to it and passes its state to the RT

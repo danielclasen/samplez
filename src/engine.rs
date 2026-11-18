@@ -73,6 +73,9 @@ pub enum InputState {
     Attached,
     /// Not in the generation; polled until its head advances again.
     Pruned,
+    /// Detached by a `Detach` entry: reads no flow, is not polled and
+    /// not reported until a `Route` attaches it again.
+    Detached,
 }
 
 #[derive(Clone, Debug)]
@@ -82,7 +85,8 @@ pub struct InputStatus {
     /// The input's state in the log: up from an `InputUp`, down from an
     /// `InputDown` entry, applied by the RT thread.
     pub up: bool,
-    /// The flow the input reads, changed by `Route` entries.
+    /// The flow the input reads, changed by `Route` entries; for a
+    /// detached input, the flow it read last.
     pub flow_id: String,
     /// Why the last attach failed.
     pub error: Option<String>,
@@ -101,6 +105,8 @@ pub struct InputStatus {
 #[derive(Clone, Debug)]
 pub struct OutputStatus {
     pub name: String,
+    /// Enabled by the log: a disabled output has no writer and no flow.
+    pub enabled: bool,
     pub realised: bool,
     /// Why the output is not realised.
     pub reason: Option<String>,
@@ -123,9 +129,9 @@ pub struct MeterStatus {
     pub meters: OutputMeters,
 }
 
-/// The generation-needing entry (`InputUp`, `Route`) the engine builds or
-/// holds, and the build times that set how far ahead such entries are
-/// stamped.
+/// The generation-needing entry (`InputUp`, `Route`, `Detach`) the
+/// engine builds or holds, and the build times that set how far ahead
+/// such entries are stamped.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GenerationStatus {
     /// The log id of the entry; at most one generation is pending.
@@ -257,8 +263,21 @@ pub enum Entry {
     /// recreated in a new generation.
     InputUp { slot: usize },
     /// Input slot `slot` crossfades to flow `flow_id` over the ramp
-    /// length from the entry's index.
+    /// length from the entry's index; a detached slot fades in from
+    /// silence.
     Route { slot: usize, flow_id: String },
+    /// Input slot `slot` crossfades to silence over the ramp length from
+    /// the entry's index and reads no flow until a `Route`: its reader
+    /// is dropped, the flow is not polled and no `InputPruned` or
+    /// `InputReadable` is reported for it. Its up or down state is kept.
+    Detach { slot: usize },
+    /// Output `slot` is written from the entry's index on, or disabled:
+    /// nothing is written to it from the index on, its writer is
+    /// released and its flow deleted, unless another writer holds the
+    /// flow. Enabled again, its flow is created as at start-up, and an
+    /// output another writer holds the flow of is not realised. Every
+    /// output starts enabled.
+    Output { slot: usize, enabled: bool },
     /// Sets parameter `param` of input slot `slot`'s strip from the
     /// entry's index, ramping over the ramp length.
     Strip { slot: usize, param: StripParam },
@@ -463,14 +482,15 @@ struct Transfer {
 /// What the supervisor learns of the log besides committed entries.
 enum LogMsg {
     /// A generation-needing entry was appended: its generation is built
-    /// on receipt. `flow` is a `Route`'s flow.
+    /// on receipt.
     Append {
         id: LogId,
         at_index: u64,
         /// The slots the entry raises, by bit.
         up: u64,
-        /// The slots it re-routes, with their new flows.
-        routes: Vec<(usize, String)>,
+        /// The slots it re-routes, with their new flows, none for one it
+        /// detaches.
+        routes: Vec<(usize, Option<String>)>,
     },
     /// Uncommitted entries from `from` on were removed.
     Truncate { from: LogId },
@@ -480,11 +500,12 @@ enum LogMsg {
     /// the RT thread, and the core with them.
     Dropped { upto: LogId },
     /// A core built from product state is about to be installed: per
-    /// slot whether it is up and the flow it reads. The generations
-    /// reading them are handed to the RT thread before `done` is sent.
+    /// slot whether it is up and the flow it reads, none when detached.
+    /// The generations reading them are handed to the RT thread before
+    /// `done` is sent.
     Product {
         up: Vec<bool>,
-        flows: Vec<String>,
+        flows: Vec<Option<String>>,
         done: SyncSender<()>,
     },
 }
@@ -531,7 +552,7 @@ impl Log {
         &mut self,
         e: RtEntry,
         batch: Option<Arc<Batch>>,
-        routes: Vec<(usize, String)>,
+        routes: Vec<(usize, Option<String>)>,
         consumed: u64,
     ) -> Result<(), EntryError> {
         if e.id <= self.last {
@@ -914,6 +935,7 @@ fn replay_rt(
                 first_channel: channel - ch,
                 channels: ch,
                 writer: None,
+                enabled: true,
                 first_k: 0,
                 meter: OutMeter::new(ch),
                 hold: Hold::new(ch, b, 0, true),
@@ -1277,6 +1299,7 @@ impl Engine {
                 first_channel: channel,
                 channels: o.channels as usize,
                 writer: None,
+                enabled: true,
                 first_k: 0,
                 meter: OutMeter::new(o.channels as usize),
                 hold: if replica.is_some() {
@@ -1397,6 +1420,7 @@ impl Engine {
                 .iter()
                 .map(|o| OutputStatus {
                     name: o.name.clone(),
+                    enabled: true,
                     realised: false,
                     reason: Some("not created yet".to_owned()),
                     attempts: 0,
@@ -1488,6 +1512,7 @@ impl Engine {
             rebuild_errors: vec![None; in_domains.len()],
             outs: (0..config.outputs.len())
                 .map(|_| SupOut {
+                    enabled: true,
                     realised: false,
                     next_try: now,
                     backoff: BACKOFF_FIRST,
@@ -1767,13 +1792,105 @@ impl Engine {
             change: Change::Route { slot },
         };
         let consumed = self.counters.entries_consumed.load(Acquire);
-        log.append(e, None, vec![(slot, flow_id.to_owned())], consumed)?;
+        log.append(e, None, vec![(slot, Some(flow_id.to_owned()))], consumed)?;
         log.commit(e.id);
         if let Some(l) = &mut log.local {
             l.last_at[slot] = at_index;
             l.gen_at = at_index;
         }
         Ok(at_index)
+    }
+
+    /// Detaches input slot `slot`: a new generation holding no reader for
+    /// it is built, and the slot crossfades from its flow to silence over
+    /// the ramp length from the returned index, stamped as
+    /// [`Engine::route`] stamps. A detached slot reads no flow, is not
+    /// polled and is not reported, so its up or down state stays as it
+    /// is, until a `Route` fades it in on a flow. Detaching a detached
+    /// slot changes nothing audible. Refused as invalid on an engine that
+    /// follows a replicated log, for no such slot, and for an `at_index`
+    /// that is not a multiple of the block size.
+    pub fn detach(&self, slot: usize, at_index: u64) -> Result<u64, EntryError> {
+        if !at_index.is_multiple_of(self.block) {
+            return Err(EntryError::Invalid(format!(
+                "at_index {at_index} is not a multiple of the block size {}",
+                self.block
+            )));
+        }
+        if slot >= self.config.inputs.len() {
+            return Err(EntryError::Invalid(format!("no input slot {slot}")));
+        }
+        let mut log = self.log.lock().expect("log lock");
+        let (last_at, gen_at) = match &log.local {
+            Some(l) => (l.last_at[slot], l.gen_at),
+            None => {
+                return Err(EntryError::Invalid(
+                    "detaches come from the replicated log".to_owned(),
+                ));
+            }
+        };
+        let build_lead = self.build_lead.load(Relaxed);
+        let earliest = (earliest(&self.api, &self.counters, self.margin, self.lead) - self.lead
+            + build_lead)
+            .max(gen_at + build_lead);
+        let ramp = u64::from(self.config.ramp_samples);
+        let at_index = at_index.max(stamp(earliest, last_at, ramp, self.block));
+        let e = RtEntry {
+            id: log.last + 1,
+            at_index,
+            change: Change::Detach { slot },
+        };
+        let consumed = self.counters.entries_consumed.load(Acquire);
+        log.append(e, None, vec![(slot, None)], consumed)?;
+        log.commit(e.id);
+        if let Some(l) = &mut log.local {
+            l.last_at[slot] = at_index;
+            l.gen_at = at_index;
+        }
+        Ok(at_index)
+    }
+
+    /// Enables output `slot` or disables it from the returned index,
+    /// `at_index` or, when that is nearer, the earliest index a gain
+    /// change is stamped at. Disabled, nothing is written to it from that
+    /// index on and the supervisor releases its writer, which deletes its
+    /// flow unless another writer holds it; enabled, the supervisor
+    /// creates its flow as at start-up and it is written from the first
+    /// block due once the writer is in. [`OutputStatus`] reports both, and
+    /// why a flow is not created. Refused as invalid on an engine that
+    /// follows a replicated log, for no such output, and for an
+    /// `at_index` that is not a multiple of the block size; as full while
+    /// [`PENDING_CHANGES`] entries are outstanding.
+    pub fn set_output_enabled(
+        &self,
+        slot: usize,
+        enabled: bool,
+        at_index: u64,
+    ) -> Result<u64, EntryError> {
+        if !at_index.is_multiple_of(self.block) {
+            return Err(EntryError::Invalid(format!(
+                "at_index {at_index} is not a multiple of the block size {}",
+                self.block
+            )));
+        }
+        let change = self.change(&Entry::Output { slot, enabled })?;
+        let mut log = self.log.lock().expect("log lock");
+        if log.local.is_none() {
+            return Err(EntryError::Invalid(
+                "output changes come from the replicated log".to_owned(),
+            ));
+        }
+        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead)
+            .next_multiple_of(self.block);
+        let e = RtEntry {
+            id: log.last + 1,
+            at_index: at_index.max(earliest),
+            change,
+        };
+        let consumed = self.counters.entries_consumed.load(Acquire);
+        log.append(e, None, Vec::new(), consumed)?;
+        log.commit(e.id);
+        Ok(e.at_index)
     }
 
     /// Appends entry `entry` at log id `id`: [`Engine::append_batch`] of
@@ -1786,15 +1903,16 @@ impl Engine {
     /// id appended before, to apply at `at_index`, a multiple of the block
     /// size. They are folded here, off the RT thread: per matrix
     /// coefficient, strip parameter and input slot the last value counts
-    /// (an `InputDown`, `InputUp` or `Route` of a slot replaces the one
-    /// before it), so the log entry takes one place on the RT thread's
-    /// pending list and its batch is bounded by the engine's shape,
-    /// however many entries it has. No entries append nothing. Refused
-    /// whole, nothing appended, when any entry is refused alone or the
-    /// slots its `InputUp`s and `Route`s name are of more than one input
-    /// domain: one generation, covering every slot it raises or
-    /// re-routes, is built for a log entry, and one at a time. An
-    /// `InputUp` or `Route` has its generation built at once,
+    /// (an `InputDown` or `InputUp` of a slot replaces the one before it,
+    /// a `Route` or `Detach` the one before it), so the log entry takes
+    /// one place on the RT thread's pending list and its batch is bounded
+    /// by the engine's shape, however many entries it has. No entries
+    /// append nothing. Refused whole, nothing appended, when any entry is
+    /// refused alone or the slots its `InputUp`s, `Route`s and `Detach`es
+    /// name are of more than one input domain: one generation, covering
+    /// every slot it raises, re-routes or detaches, is built for a log
+    /// entry, and one at a time. An `InputUp`, `Route` or `Detach` has
+    /// its generation built at once,
     /// the next once the RT thread swapped in the one before. Committed
     /// log entries go to the RT thread, which applies each whole at its
     /// index, its gains first, or, past it, counts it once in
@@ -1840,24 +1958,31 @@ impl Engine {
     }
 
     /// `entries` checked and folded, with the flows of the slots the
-    /// fold re-routes: none for no change. Refused when an entry is, and
-    /// when the slots the entries' `InputUp`s and `Route`s name are of
-    /// more than one input domain: one generation is built for a log
-    /// entry.
+    /// fold re-routes, none for a slot it detaches: none for no change.
+    /// Refused when an entry is, and when the slots the entries'
+    /// `InputUp`s, `Route`s and `Detach`es name are of more than one input
+    /// domain: one generation is built for a log entry.
     #[allow(clippy::type_complexity)]
     fn fold(
         &self,
         entries: &[Entry],
-    ) -> Result<Option<(Change, Option<Arc<Batch>>, Vec<(usize, String)>)>, EntryError> {
+    ) -> Result<Option<(Change, Option<Arc<Batch>>, Vec<(usize, Option<String>)>)>, EntryError>
+    {
         let mut items = Vec::with_capacity(entries.len());
         let mut flows = HashMap::new();
         for entry in entries {
             self.items(entry, &mut items)?;
-            if let Entry::Route { slot, flow_id } = entry {
-                flows.insert(*slot, flow_id);
+            match entry {
+                Entry::Route { slot, flow_id } => {
+                    flows.insert(*slot, Some(flow_id));
+                }
+                Entry::Detach { slot } => {
+                    flows.insert(*slot, None);
+                }
+                _ => {}
             }
         }
-        // Every slot an `InputUp` or `Route` names, whether the fold keeps
+        // Every slot an `InputUp`, `Route` or `Detach` names, whether the fold keeps
         // it or not: then every subset of the entries passes as well, as a
         // restamp keeping some of a log entry's commands must.
         let named = items.iter().fold(0, |m, i| match i {
@@ -1880,7 +2005,7 @@ impl Engine {
             return Ok(None);
         };
         let (_, routed) = change.generating();
-        let routes = slots_of(routed).map(|s| (s, flows[&s].clone())).collect();
+        let routes = slots_of(routed).map(|s| (s, flows[&s].cloned())).collect();
         Ok(Some((change, batch, routes)))
     }
 
@@ -1928,11 +2053,22 @@ impl Engine {
                     gain,
                 }
             }
-            Entry::InputDown { slot } | Entry::InputUp { slot } | Entry::Route { slot, .. }
+            Entry::InputDown { slot }
+            | Entry::InputUp { slot }
+            | Entry::Route { slot, .. }
+            | Entry::Detach { slot }
                 if slot >= slots =>
             {
                 return invalid(format!("no input slot {slot}"));
             }
+            Entry::Detach { slot } => Change::Detach { slot },
+            Entry::Output { slot, .. } if slot >= self.config.outputs.len() => {
+                return invalid(format!("no output {slot}"));
+            }
+            Entry::Output { slot, enabled } => Change::Output {
+                output: slot,
+                enabled,
+            },
             Entry::InputDown { slot } => Change::InputDown { slot },
             Entry::InputUp { slot } => Change::InputUp { slot },
             Entry::Route { slot, ref flow_id } => {
@@ -2273,8 +2409,10 @@ impl Engine {
     /// a new instance per input domain, on the flows this engine's
     /// attached inputs read. A core with a generation-needing entry in
     /// flight (a pending generation, an entry awaiting one, a crossfade
-    /// running or an `InputUp` or `Route` pending) is refused: copy again
-    /// once it applied.
+    /// running or an `InputUp`, `Route` or `Detach` pending) is refused:
+    /// copy again once it applied. So is a core whose detached slots are
+    /// not the ones detached here: the replay reads the flows of this
+    /// engine's inputs.
     pub fn replay(&self, mut copy: CoreCopy) -> Result<Replay, ReplayError> {
         if self.transfer.is_none() {
             return Err(ReplayError::Invalid(
@@ -2290,7 +2428,8 @@ impl Engine {
         let (slots, in_domains) = new_slots(&self.config);
         let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
         let ducked = &self.config.duck_columns;
-        if !c.fits(n, m, &legs, self.config.ramp_samples, page, ducked) {
+        let outputs = self.config.outputs.len();
+        if !c.fits(n, m, outputs, &legs, self.config.ramp_samples, page, ducked) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -2312,6 +2451,12 @@ impl Engine {
             return Err(ReplayError::Generation);
         }
         let status = self.status();
+        let detached = |i: &InputStatus| i.state == InputState::Detached;
+        if (c.slots.iter().zip(&status.inputs)).any(|(s, i)| s.detached != detached(i)) {
+            return Err(ReplayError::Invalid(
+                "the core's detached inputs are not this engine's".to_owned(),
+            ));
+        }
         let timing = Timing {
             block: self.block,
             margin: self.margin,
@@ -2453,7 +2598,8 @@ impl Engine {
     /// output fades in processed. Returns the block the core followed.
     /// An `at_least` further ahead than `timeout` is refused as invalid
     /// before anything changes, as is a state holding a gain, flow or
-    /// strip parameter an entry could not set. The core holds no
+    /// strip parameter an entry could not set. A slot whose flow is none
+    /// is detached: no reader is built for it. The core holds no
     /// unresolved entry: the caller adds the ones still unresolved with
     /// [`Engine::unresolved`] after the install. While no core is held the
     /// RT thread takes the entries needing no generation whose index
@@ -2480,15 +2626,20 @@ impl Engine {
             || state.up.len() != slots
             || state.flows.len() != slots
             || state.strips.len() != slots
+            || state.outputs.len() > self.config.outputs.len()
         {
             return Err(ReplayError::Invalid(format!(
-                "a product state of the shape {n} x {m} with {slots} inputs"
+                "a product state of the shape {n} x {m} with {slots} inputs and at most {} \
+                 outputs",
+                self.config.outputs.len()
             )));
         }
         for (slot, (flow, params)) in state.flows.iter().zip(&state.strips).enumerate() {
-            self.config
-                .check_input_flow(slot, flow)
-                .map_err(|e| ReplayError::Invalid(e.0))?;
+            if let Some(flow) = flow {
+                self.config
+                    .check_input_flow(slot, flow)
+                    .map_err(|e| ReplayError::Invalid(e.0))?;
+            }
             for param in params {
                 check_strip(&self.config, slot, param).map_err(ReplayError::Invalid)?;
             }
@@ -2560,6 +2711,10 @@ impl Engine {
         let targets: Vec<f32> = state.gains.iter().flatten().copied().collect();
         let mut gains = targets.clone();
         let mut up = state.up.clone();
+        // A bit per output disabled; one past the list is enabled.
+        let disabled_targets = (state.outputs.iter().enumerate())
+            .filter(|(_, e)| !**e)
+            .fold(0, |d, (o, _)| d | bit(o));
         // Empty for none, as a fill takes them: a state and pending list
         // without masks or depths pay nothing for them.
         let pending_masks = batches.iter().any(|(_, b)| !b.masks.is_empty());
@@ -2598,6 +2753,7 @@ impl Engine {
         self.offer(left(), at_least, false, &strips, |j, core| {
             gains.copy_from_slice(&targets);
             up.copy_from_slice(&state.up);
+            let mut disabled = disabled_targets;
             masks.copy_from_slice(&mask_targets);
             depths.copy_from_slice(&depth_targets);
             // Whatever a spare core held.
@@ -2617,15 +2773,22 @@ impl Engine {
                     } => gains[input * m + output] = gain,
                     Change::InputDown { slot } => up[slot] = false,
                     Change::InputUp { slot } => up[slot] = true,
+                    Change::Output { output, enabled } => {
+                        disabled = output_disabled(disabled, output, enabled);
+                    }
                     // The core holds neither a generation nor a strip:
-                    // the RT thread applies a passed re-route or strip
-                    // entry itself, taken before the install or after.
-                    Change::Route { .. } | Change::Strip { .. } => {}
+                    // the RT thread applies a passed re-route, detach or
+                    // strip entry itself, taken before the install or
+                    // after.
+                    Change::Route { .. } | Change::Detach { .. } | Change::Strip { .. } => {}
                     Change::Batch { up: raised, .. } => {
                         if let Some(b) = batch(e.id) {
                             b.gains.each(|c, g| gains[c] = g);
                             for &slot in &b.downs {
                                 up[slot as usize] = false;
+                            }
+                            for &(o, enabled) in &b.outputs {
+                                disabled = output_disabled(disabled, o as usize, enabled);
                             }
                             b.masks.each(|c, k| masks[c] = k);
                             for &(row, g, db) in &b.depths {
@@ -2665,11 +2828,13 @@ impl Engine {
             core.page_entries.clear();
             core.entries_page = None;
             core.entries_lost = false;
+            core.outputs_disabled = disabled;
             // The RT thread keeps its strips.
-            for (c, &up) in core.slots.iter_mut().zip(&up) {
+            for ((c, &up), flow) in core.slots.iter_mut().zip(&up).zip(&state.flows) {
                 *c = SlotCore {
                     up,
                     silenced_last: true,
+                    detached: flow.is_none(),
                     ..SlotCore::default()
                 };
             }
@@ -2887,12 +3052,15 @@ enum SupState {
         /// Holds one reference to its flow's poll reader.
         held: bool,
     },
+    /// Detached by a `Detach`: in no generation, not polled, reported
+    /// nothing.
+    Detached,
 }
 
 struct SupSlot {
     state: SupState,
     window: VecDeque<SlotStats>,
-    /// The flow the slot reads.
+    /// The flow the slot reads; detached, the one it read last.
     flow: String,
     /// The slot's state in the log, as the RT thread applied it.
     up: bool,
@@ -2912,8 +3080,9 @@ struct Job {
     at_index: u64,
     /// The slots the entry raises, by bit.
     up: u64,
-    /// The slots it re-routes, with their new flows.
-    routes: Vec<(usize, String)>,
+    /// The slots it re-routes, with their new flows, none for one it
+    /// detaches.
+    routes: Vec<(usize, Option<String>)>,
     domain: usize,
     stage: Stage,
 }
@@ -2936,6 +3105,8 @@ enum Stage {
 }
 
 struct SupOut {
+    /// Enabled as the supervisor last read it.
+    enabled: bool,
     realised: bool,
     next_try: Instant,
     backoff: Duration,
@@ -3260,7 +3431,8 @@ impl Supervisor {
                 Telemetry::Input { slot, up } => {
                     self.slots[slot].up = up;
                     self.status().inputs[slot].up = up;
-                    if !up && !matches!(self.slots[slot].state, SupState::Pruned { .. }) {
+                    let state = &self.slots[slot].state;
+                    if !up && !matches!(state, SupState::Pruned { .. } | SupState::Detached) {
                         self.start_polling(slot, false);
                         let d = self.input_domain(slot);
                         self.dirty[d] = true;
@@ -3486,8 +3658,10 @@ impl Supervisor {
 
     /// A generation of input domain `d`, with the slots it holds: every
     /// attached and wanted slot of `d`, the outgoing flow of a re-route
-    /// until its crossfade ended, and the change of `job`. A slot that
-    /// cannot be attached is left out and its error put in its status.
+    /// or detach until its crossfade ended, and the change of `job`. A
+    /// detached slot gets no reader, raised or not, until a re-route; a
+    /// slot that cannot be attached is left out and its error put in its
+    /// status.
     fn build(&mut self, d: usize, job: Option<&Job>) -> Option<(Box<Gen>, u64)> {
         let started = Instant::now();
         let path: PathBuf = self.config.domains[self.in_domains[d]].path.clone();
@@ -3520,14 +3694,19 @@ impl Supervisor {
             if self.input_domain(slot) != d {
                 continue;
             }
-            let flow = job.and_then(|j| j.routes.iter().find(|r| r.0 == slot).map(|r| &*r.1));
-            let target = flow.is_some() || job.is_some_and(|j| j.up & bit(slot) != 0);
+            // The job's re-route of the slot: to a flow, or none to detach.
+            let route =
+                (job.and_then(|j| j.routes.iter().find(|r| r.0 == slot))).map(|r| r.1.as_deref());
+            let target = route.is_some() || job.is_some_and(|j| j.up & bit(slot) != 0);
             let current = self.slots[slot].flow.clone();
-            let wanted = !matches!(self.slots[slot].state, SupState::Pruned { .. });
+            let state = &self.slots[slot].state;
+            // The flow the slot reads, none detached.
+            let reads = (!matches!(state, SupState::Detached)).then_some(current.as_str());
+            let wanted = !matches!(state, SupState::Pruned { .. } | SupState::Detached);
             let cfg = &self.config.inputs[slot];
             // The flow a re-route leaves is read until its crossfade ends.
-            let outgoing = match (flow, &self.slots[slot].routing) {
-                (Some(f), _) if f != current && wanted => Some(current.clone()),
+            let outgoing = match (route, &self.slots[slot].routing) {
+                (Some(f), _) if f != reads && wanted => Some(current.clone()),
                 (None, Some((end, old))) if produced < *end => Some(old.clone()),
                 _ => None,
             };
@@ -3540,13 +3719,15 @@ impl Supervisor {
             {
                 log(format_args!("input {}: flow {old} left: {e}", cfg.name));
             }
-            if flow.is_some_and(|f| f != current) {
+            if route.is_some_and(|f| f != reads) {
                 rerouted |= bit(slot);
             }
             if !wanted && !target {
                 continue;
             }
-            let flow_id = flow.unwrap_or(&current);
+            let Some(flow_id) = route.unwrap_or(reads) else {
+                continue;
+            };
             match generation.attach(slot, &self.config.input_config(cfg, flow_id), &self.timing) {
                 Ok(short) => {
                     held |= 1 << slot;
@@ -3605,10 +3786,12 @@ impl Supervisor {
     /// the slots, by bit, a log entry raises or re-routes: each reported
     /// when not held.
     /// A held slot that was pruned meanwhile, or is down in the log, is
-    /// left out of the next generation instead.
+    /// left out of the next generation instead. A detached slot stays as
+    /// it is.
     fn adopt(&mut self, d: usize, held: u64, targets: u64) {
         for slot in 0..self.slots.len() {
-            if self.input_domain(slot) != d {
+            if self.input_domain(slot) != d || matches!(self.slots[slot].state, SupState::Detached)
+            {
                 continue;
             }
             let pruned = matches!(self.slots[slot].state, SupState::Pruned { .. });
@@ -3739,6 +3922,26 @@ impl Supervisor {
         let mut targets = j.up;
         for (slot, flow) in j.routes {
             targets |= bit(slot);
+            let detached = matches!(self.slots[slot].state, SupState::Detached);
+            let Some(flow) = flow else {
+                if !detached {
+                    // Its poll reader is released and its flow read
+                    // until the crossfade to silence ends.
+                    self.release_poll(slot);
+                    let s = &mut self.slots[slot];
+                    s.state = SupState::Detached;
+                    s.reported = false;
+                    s.prune_unsent = false;
+                    s.routing = Some((j.at_index + self.ramp, s.flow.clone()));
+                    self.status().inputs[slot].state = InputState::Detached;
+                }
+                continue;
+            };
+            if detached {
+                // From silence: no flow is left.
+                self.slots[slot].state = SupState::Wanted;
+                self.slots[slot].routing = None;
+            }
             if flow != self.slots[slot].flow {
                 // A polled slot polls the flow it reads: the hold on the
                 // old one is released, `poll` takes one on the new.
@@ -3749,7 +3952,9 @@ impl Supervisor {
                 }
                 self.slots[slot].reported = false;
                 let old = std::mem::replace(&mut self.slots[slot].flow, flow.clone());
-                self.slots[slot].routing = Some((j.at_index + self.ramp, old));
+                if !detached {
+                    self.slots[slot].routing = Some((j.at_index + self.ramp, old));
+                }
                 self.status().inputs[slot].flow_id = flow;
             }
         }
@@ -3757,17 +3962,21 @@ impl Supervisor {
     }
 
     /// Takes the slots' state and flows of a product state: a slot on
-    /// another flow moves to it at once, no crossfade, its reader state
-    /// started anew in the generation's `rerouted`. Every domain's
+    /// another flow, or attached again, moves to it at once, no
+    /// crossfade, its reader state started anew in the generation's
+    /// `rerouted`; a slot without a flow is detached at once. Every domain's
     /// generation is built anew on them and handed to the RT thread, and
     /// so is the generation a job built or sent before them, which read
     /// the old flows; `done` is sent once all are handed over
     /// ([`Supervisor::hand_product`]).
-    fn product(&mut self, up: &[bool], flows: Vec<String>, done: SyncSender<()>) {
+    fn product(&mut self, up: &[bool], flows: Vec<Option<String>>, done: SyncSender<()>) {
         for (slot, flow) in flows.into_iter().enumerate() {
             self.slots[slot].up = up[slot];
             self.status().inputs[slot].up = up[slot];
-            if flow == self.slots[slot].flow {
+            let detached = matches!(self.slots[slot].state, SupState::Detached);
+            if flow.as_ref().is_some_and(|f| *f == self.slots[slot].flow) && !detached
+                || flow.is_none() && detached
+            {
                 continue;
             }
             self.release_poll(slot);
@@ -3777,6 +3986,15 @@ impl Supervisor {
             }
             self.slots[slot].reported = false;
             self.slots[slot].routing = None;
+            let Some(flow) = flow else {
+                self.slots[slot].state = SupState::Detached;
+                self.slots[slot].prune_unsent = false;
+                self.status().inputs[slot].state = InputState::Detached;
+                continue;
+            };
+            if detached {
+                self.slots[slot].state = SupState::Wanted;
+            }
             self.slots[slot].flow = flow.clone();
             self.status().inputs[slot].flow_id = flow;
             let d = self.input_domain(slot);
@@ -3881,12 +4099,16 @@ impl Supervisor {
     /// and its ramp, and an `InputUp` buildLead after the log's last
     /// generation-needing entry. False when it did not go out: the channel
     /// was full or the log refused it. An `InputPruned` that did not go
-    /// out is sent again by `poll` while it holds.
+    /// out is sent again by `poll` while it holds. Nothing goes out for a
+    /// detached slot, counted as sent: the flow it read is not its input.
     fn report(&mut self, r: Report) -> bool {
         let (slot, up) = match r {
             Report::InputPruned { slot } => (slot, false),
             Report::InputReadable { slot } => (slot, true),
         };
+        if matches!(self.slots[slot].state, SupState::Detached) {
+            return true;
+        }
         let sent = 'sent: {
             if let Some(tx) = &self.reports {
                 if tx.try_send(r).is_err() {
@@ -3964,11 +4186,51 @@ impl Supervisor {
         }
     }
 
+    /// Takes the outputs the RT thread released and the ones the log
+    /// disabled or enabled into the status, and creates a writer for each
+    /// enabled output without one, retried with a backoff while that
+    /// fails.
     fn outputs(&mut self) {
+        let released = self.counters.outputs_released.swap(0, Acquire);
+        if released != 0 {
+            // Their writers are in the return ring: dropped, deleting
+            // their flows, before a flow is created anew, so an output
+            // enabled again does not find its own writer live on it.
+            while let Ok(r) = self.ret.pop() {
+                release(r);
+            }
+        }
+        let disabled = self.counters.outputs_disabled.load(Acquire);
         let now = Instant::now();
         for o in 0..self.outs.len() {
             let out = &mut self.outs[o];
-            if out.realised || now < out.next_try || self.cmd.slots() == 0 {
+            let enabled = disabled & bit(o) == 0;
+            if released & bit(o) != 0 || enabled != out.enabled {
+                let name = &self.config.outputs[o].name;
+                let mut st = self.status.lock().expect("status lock");
+                let s = &mut st.outputs[o];
+                if released & bit(o) != 0 && out.realised {
+                    out.realised = false;
+                    s.realised = false;
+                    log(format_args!("output {name} released"));
+                }
+                if enabled != out.enabled {
+                    out.enabled = enabled;
+                    out.next_try = now;
+                    out.backoff = BACKOFF_FIRST;
+                    s.enabled = enabled;
+                    log(format_args!(
+                        "output {name} {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    ));
+                }
+                if !enabled {
+                    s.reason = Some("disabled".to_owned());
+                } else if !out.realised {
+                    s.reason = Some("not created yet".to_owned());
+                }
+            }
+            if !enabled || out.realised || now < out.next_try || self.cmd.slots() == 0 {
                 continue;
             }
             let cfg = &self.config.outputs[o];
@@ -4075,6 +4337,16 @@ fn unsynchronised() -> Option<bool> {
     // SAFETY: `t` is writable.
     let state = unsafe { libc::adjtimex(&mut t) };
     (state >= 0).then_some(state == libc::TIME_ERROR || t.status & libc::STA_UNSYNC != 0)
+}
+
+/// The outputs disabled, a bit per output, `disabled` with output
+/// `output` enabled or disabled.
+fn output_disabled(disabled: u64, output: usize, enabled: bool) -> u64 {
+    if enabled {
+        disabled & !bit(output)
+    } else {
+        disabled | bit(output)
+    }
 }
 
 /// Releases what the RT thread handed back: a generation's readers,
@@ -5724,6 +5996,7 @@ mod tests {
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
+            outputs: Vec::new(),
             strips: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -5787,6 +6060,7 @@ mod tests {
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
+            outputs: Vec::new(),
             strips: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -6450,6 +6724,7 @@ mod tests {
                 strips: false,
                 up,
                 routed,
+                detached: 0,
             },
         };
         assert!(rt.mix.push_with(held, batch).is_ok());

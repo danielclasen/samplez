@@ -411,7 +411,8 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
     let state = samplez::ProductState {
         gains: vec![vec![1.0]],
         up: vec![true],
-        flows: vec!["5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned()],
+        flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
+        outputs: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1004,7 +1005,8 @@ fn rebuild_after_a_route() -> Result<(), String> {
     let state = samplez::ProductState {
         gains: vec![vec![1.0]],
         up: vec![true],
-        flows: vec![ROUTED.to_owned()],
+        flows: vec![Some(ROUTED.to_owned())],
+        outputs: Vec::new(),
         strips: vec![vec![StripParam::Trim { db: -6.0 }]],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1130,7 +1132,8 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
     let mut state = samplez::ProductState {
         gains: vec![vec![1.0], vec![1.0]],
         up: vec![true, true],
-        flows: routed.map(str::to_owned).to_vec(),
+        flows: routed.map(|f| Some(f.to_owned())).to_vec(),
+        outputs: Vec::new(),
         strips: vec![Vec::new(), Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1216,7 +1219,8 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
     let state = samplez::ProductState {
         gains: vec![vec![0.5]],
         up: vec![true],
-        flows: vec!["5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned()],
+        flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
+        outputs: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1302,7 +1306,7 @@ impl Product for Console {
         };
         Some(Targets {
             gains: (0..2).map(|s| vec![self.faders[s] * self.vca]).collect(),
-            flows: vec![self.flow.clone(); 2],
+            flows: vec![Some(self.flow.clone()); 2],
             strips: (0..2).map(gate).collect(),
             ..Targets::default()
         })
