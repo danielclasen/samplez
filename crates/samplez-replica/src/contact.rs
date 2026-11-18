@@ -643,6 +643,12 @@ struct State {
     /// Slack of the entries learned committed, for the next reports.
     slack: Vec<Slack>,
     lead: Lead,
+    /// The lead each entry with an at_index was stamped with, by log
+    /// index, the lowest forgotten past [`SCHEDULED_MAX`]: kept after
+    /// `scheduled` drops an entry every voter reported committed, since a
+    /// replica that reported the commit may apply the entry, and report
+    /// its slack, only later.
+    leads: BTreeMap<u64, u64>,
     /// The replica whose slack last asked for a higher lead.
     lead_raised_by: Option<NodeId>,
     e_spread: Histogram,
@@ -732,8 +738,13 @@ pub struct Contact {
 }
 
 /// Adds a counted replica's slack to the lead, naming the replica when
-/// it asked for more, and warning once as the lead reaches its cap.
+/// it asked for more, and warning once as the lead reaches its cap; an
+/// entry whose stamp it knows counts the lead it needed too
+/// ([`Lead::needs`]).
 fn add_slack(st: &mut State, from: NodeId, slack: &Slack, current: u64) {
+    if let Some(&lead) = st.leads.get(&slack.index) {
+        st.lead.needs(lead, slack.samples);
+    }
     let capped = st.lead.capped;
     if st.lead.add(slack.samples, slack.stamp, current) {
         st.lead_raised_by = Some(from);
@@ -802,6 +813,9 @@ pub struct Metrics {
     /// The lead, in samples, and whether it wanted more than the cap.
     pub lead: u64,
     pub apply_lead_capped: bool,
+    /// The lead decisions and `Baseline`s are stamped with, and commands
+    /// at the cap ([`Contact::decision_lead`]), in samples.
+    pub decision_lead: u64,
     /// The counted audio replica whose slack last asked for a higher
     /// lead: while the lead is capped, the one applying entries past
     /// their deadline, which holds them unresolved.
@@ -946,6 +960,7 @@ impl Contact {
                     index_at(START_LEAD.as_nanos() as u64),
                     index_at(timing.max_apply_lead.as_nanos() as u64),
                 ),
+                leads: BTreeMap::new(),
                 lead_raised_by: None,
                 e_spread: Histogram::default(),
                 known_committed: applied,
@@ -1494,6 +1509,7 @@ impl Contact {
                 st.awaiting.remove(&key(id));
             }
             st.scheduled.split_off(&from);
+            st.leads.split_off(&from);
             st.generations.split_off(&from);
             st.taken_late.split_off(&from);
             st.baselines.truncated(from);
@@ -1566,6 +1582,10 @@ impl Contact {
             }
             if let Some(at) = at {
                 st.scheduled.insert(id.index, (id, at, stamp, false));
+                st.leads.insert(id.index, at.saturating_sub(stamp));
+                while st.leads.len() > SCHEDULED_MAX {
+                    st.leads.pop_first();
+                }
                 let late = tai >= self.timing.apply_deadline(at);
                 // Caught up once an entry past the commit named when
                 // catching up began is taken in time; one before it may
@@ -2267,7 +2287,22 @@ impl Contact {
         st.own.state = Some(state);
         st.own.ready = ready;
         st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
-        if st.in_contact {
+        // Diverged, resyncing or in `version_mismatch`, or withdrawn once
+        // a `Baseline` applied, with outputs it writes none of what it
+        // computes, in contact or not. Before the first `Baseline` no
+        // replica of the set committed, as the Named rule starts the
+        // first commit, and every one is withdrawn once ready: it keeps
+        // the term by its peers, so the first of a set becomes ready. A
+        // restarted replica finds the baseline in its log.
+        let stopped = match state {
+            ReplicaState::Diverged | ReplicaState::Resync | ReplicaState::VersionMismatch => true,
+            ReplicaState::Withdrawn => st.own.baseline.is_some(),
+            _ => false,
+        };
+        let writes_nothing = stopped && !st.own.standing.is_empty();
+        if writes_nothing {
+            st.serving = Some(false);
+        } else if st.in_contact {
             let other = copies
                 .iter()
                 .any(|(_, age, own)| *age <= fresh && own.state == Some(ReplicaState::Committing));
@@ -2378,7 +2413,10 @@ impl Contact {
     /// The audio `/readyz` term (plan 2.11, Deployment): committing, or no
     /// other audio replica committing within `w + D` by its reports;
     /// judged while in contact, kept out of it, false before the first
-    /// contact. Always true for the witness and for one voter.
+    /// contact. False while diverged, resyncing or in `version_mismatch`,
+    /// or withdrawn once a `Baseline` applied, with outputs, in contact or
+    /// not: the replica writes none of what it computes. Always true for
+    /// the witness and for one voter.
     pub fn serving(&self) -> bool {
         let st = self.lock();
         if self.audio.is_none() || st.members.voters().len() == 1 {
@@ -2927,7 +2965,11 @@ impl Contact {
         if self.log.pending_above(floor) >= FUTURE_LIST {
             return Err(StampRefusal::FutureListFull);
         }
-        let lead = st.lead.samples();
+        // At the cap a command takes the lead the entries needed too:
+        // stamped with the capped lead it would be late on every replica
+        // whose commit takes longer, as long as that lasts, and each one a
+        // degraded block.
+        let lead = st.lead.stamping();
         let earliest = if generation {
             // The last one's at_index has passed on the baseline, or on E
             // while no baseline is named.
@@ -2970,11 +3012,23 @@ impl Contact {
         Ok(Stamp { stamp, earliest })
     }
 
+    /// The lead a decision on an unresolved entry or a `Baseline` is
+    /// stamped with: what the entries applied lately needed, up to
+    /// [`crate::schedule::EXTRA_LEAD`] past the cap ([`Lead::wanted`]).
+    /// Stamped with a lead the commit outlasts, a restamp or void is late
+    /// again and decided in turn, and a `Baseline` lapses for the replica
+    /// it names.
+    pub fn decision_lead(&self) -> u64 {
+        self.lock().lead.wanted()
+    }
+
     /// A resync to start: this audio replica is diverged, not
     /// clock-unverified or excluded, no attempt runs and the last ended
-    /// [`crate::resync::RETRY`] ago, and a committing donor reported
-    /// within `w + D`. Returns the attempt's epoch, the donor and its
-    /// address.
+    /// the backoff ago, and a committing donor reported within `w + D`,
+    /// one that did within the last report period and tick first.
+    /// Returns the attempt's epoch, the donor and its address. Without a
+    /// donor it is checked for again on the next tick, and counted and
+    /// logged with a backoff ([`crate::resync::Metrics::no_donor`]).
     pub fn resync_due(&self) -> Option<(u64, NodeId, String)> {
         self.audio.as_ref()?;
         let now = Instant::now();
@@ -2986,18 +3040,38 @@ impl Contact {
         if !diverged || rebuilding || st.own.clock.unverified || st.judged.contains(&self.id) {
             return None;
         }
-        let fresh = self.timing.contact_window + self.timing.hold;
         let audio_voters = crate::rank::audio_voters(&st.members);
-        let donor = {
-            let peers: Vec<(NodeId, bool, &Own)> = self
-                .copies(st, now)
-                .into_iter()
-                .filter(|(id, _, _)| {
-                    *id != self.id && audio_voters.contains(id) && !st.judged.contains(id)
-                })
-                .map(|(id, age, own)| (id, age > fresh, own))
+        let baseline = self.log.baseline().map(|b| b.replica);
+        let candidates: Vec<(NodeId, Duration, &Own)> = self
+            .copies(st, now)
+            .into_iter()
+            .filter(|(id, _, _)| {
+                *id != self.id
+                    && audio_voters.contains(id)
+                    && !st.judged.contains(id)
+                    && st.members.addrs.contains_key(id)
+            })
+            .collect();
+        // A report up to `w + D` old may name a replica that withdrew
+        // since, which refuses its core: one committing by a report of
+        // the last period and tick comes first.
+        let donor_within = |max_age: Duration| {
+            let peers: Vec<(NodeId, bool, &Own)> = (candidates.iter())
+                .map(|&(id, age, own)| (id, age > max_age, own))
                 .collect();
-            crate::resync::donor(self.log.baseline().map(|b| b.replica), &peers)?
+            crate::resync::donor(baseline, &peers)
+        };
+        let donor = donor_within(2 * self.timing.report_period)
+            .or_else(|| donor_within(self.timing.contact_window + self.timing.hold));
+        let Some(donor) = donor else {
+            if st.resync.no_donor(now) {
+                let m = &st.resync.metrics;
+                tracing::warn!(
+                    no_donor = m.no_donor,
+                    "diverged with no committing donor: retried every tick"
+                );
+            }
+            return None;
         };
         let addr = st.members.addrs.get(&donor)?.clone();
         let epoch = st.resync.start(now)?;
@@ -3166,6 +3240,7 @@ impl Contact {
             estimate: self.estimate_in(&st, Instant::now()),
             counted: self.counted(&st, Instant::now()).into_iter().collect(),
             lead: st.lead.samples(),
+            decision_lead: st.lead.wanted(),
             apply_lead_capped: st.lead.capped,
             apply_lead_raised_by: st.lead_raised_by,
             e_spread_p9999: st.e_spread.quantile(0.9999),
@@ -3402,6 +3477,8 @@ mod tests {
         /// The applied index and floor an apply sets right after the next
         /// read of the applied index.
         apply_after_read: Option<(u64, u64)>,
+        /// [`LogView::baseline`].
+        baseline: Option<Baseline>,
     }
 
     #[derive(Default)]
@@ -3470,7 +3547,7 @@ mod tests {
             BTreeSet::new()
         }
         fn baseline(&self) -> Option<Baseline> {
-            None
+            self.0.lock().unwrap().baseline.clone()
         }
         fn disrupting(&self) -> Option<NodeId> {
             None
@@ -4072,6 +4149,194 @@ mod tests {
         f.tick();
         assert_eq!(f.state(), Some(ReplicaState::Diverged));
         assert_eq!(f.contact.metrics().contradicted, 1);
+    }
+
+    /// Diverges the fixture's replica as the restamp of an entry it
+    /// applied at its own index does.
+    fn diverge(f: &Fixture) {
+        f.tick();
+        let at = index_at(T0) + 400 * 48;
+        f.log.push(1, 1, Some(at));
+        f.apply(1);
+        f.contact.log_changed();
+        f.tick();
+        f.insert(
+            2,
+            Body::Restamp {
+                revision: 1,
+                term: 1,
+                at_index: at + 96,
+                paths: Vec::new(),
+                generation: None,
+            },
+        );
+        let record = Record {
+            at_index: at + 96,
+            entries: vec![Entry::InputDown { slot: 0 }],
+            generation: false,
+        };
+        (f.log.0.lock().unwrap().records).insert(2, Arc::new(record));
+        f.apply(2);
+        f.contact.log_changed();
+        f.tick();
+        assert_eq!(f.state(), Some(ReplicaState::Diverged));
+    }
+
+    /// A report from `from` of a replica in `state`, `ago` before now.
+    fn state_report(f: &Fixture, from: NodeId, state: ReplicaState, ago: Duration) -> Report {
+        let mut r = f.report(from, None);
+        r.sent_at = f.clock.get() - ago.as_nanos() as u64;
+        r.own.state = Some(state);
+        r
+    }
+
+    /// `/readyz`: a replica that writes nothing is not serving while no
+    /// other replica commits, in contact or out of it, where it read
+    /// ready by "nobody else commits"; one withdrawn before the set's
+    /// first `Baseline` is, so the first replica of a set becomes ready,
+    /// and one withdrawn after it or in `version_mismatch` is not. A sole
+    /// voter always serves, and one without outputs as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_writing_nothing_is_not_serving_though_nobody_commits() {
+        let f = fixture(&[&[1]]);
+        f.tick();
+        f.tick();
+        assert!(f.contact.serving(), "a sole voter");
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert!(f.contact.serving(), "withdrawn without outputs");
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert!(f.contact.metrics().in_contact);
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert!(
+            f.contact.serving(),
+            "withdrawn before its first commit, nobody else commits"
+        );
+        // Once a `Baseline` applied the set committed: a replica withdrawn
+        // since, restarted or not, writes nothing.
+        f.log.0.lock().unwrap().baseline = Some(Baseline {
+            replica: 2,
+            order: vec![2, 1, 3],
+            at_index: index_at(T0),
+            key: None,
+        });
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert!(!f.contact.serving(), "withdrawn after a baseline");
+        // A replica whose key differs from the baseline's computes nothing.
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.contact.set_rollout(crate::rollout::Fixed::new(1, None));
+        f.log.0.lock().unwrap().baseline = Some(Baseline {
+            replica: 2,
+            order: vec![2, 1, 3],
+            at_index: index_at(T0),
+            key: Some(2),
+        });
+        f.tick();
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert_eq!(f.state(), Some(ReplicaState::VersionMismatch));
+        assert!(!f.contact.serving(), "version mismatch");
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        diverge(&f);
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert!(f.contact.metrics().in_contact);
+        assert_eq!(f.state(), Some(ReplicaState::Diverged));
+        assert!(!f.contact.serving(), "diverged, in contact");
+        // Out of contact the term follows the state too.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        f.clock.add(Duration::from_millis(50));
+        f.tick();
+        assert!(!f.contact.metrics().in_contact);
+        assert!(!f.contact.serving(), "diverged, out of contact");
+    }
+
+    /// A diverged replica asks a donor committing by a report of the last
+    /// period first, not one whose committing report is older though
+    /// within `w + D`; with no committing donor at all it keeps checking,
+    /// counted and logged with a backoff, rather than going silent.
+    #[tokio::test(start_paused = true)]
+    async fn a_resync_prefers_a_fresh_donor_and_retries_without_one() {
+        let f = fixture(&[&[1, 2, 3]]);
+        diverge(&f);
+        let attempts = |f: &Fixture| f.contact.metrics().resync;
+        assert_eq!(f.contact.resync_due(), None, "nobody commits");
+        let m = attempts(&f);
+        assert_eq!((m.no_donor, m.attempts), (1, 0), "{m:?}");
+        assert_eq!(f.contact.resync_due(), None);
+        assert_eq!(attempts(&f).no_donor, 1, "counted within the backoff once");
+        tokio::time::advance(crate::resync::RETRY).await;
+        assert_eq!(f.contact.resync_due(), None);
+        assert_eq!(attempts(&f).no_donor, 2, "counted again after the backoff");
+        // 2 reported committing 12 ms ago, 3 just now.
+        f.contact.receive(state_report(
+            &f,
+            2,
+            ReplicaState::Committing,
+            Duration::ZERO,
+        ));
+        tokio::time::advance(Duration::from_millis(12)).await;
+        f.clock.add(Duration::from_millis(12));
+        f.contact.receive(state_report(
+            &f,
+            3,
+            ReplicaState::Committing,
+            Duration::ZERO,
+        ));
+        let (_, donor, _) = f.contact.resync_due().expect("an attempt");
+        assert_eq!(donor, 3, "the fresh donor");
+        assert_eq!(attempts(&f).attempts, 1);
+    }
+
+    /// A fresh donor without a peer address is no donor: the one
+    /// committing by an older report within `w + D` is asked instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_donor_without_an_address_leaves_the_older_one() {
+        let mut f = fixture(&[&[1, 2, 3]]);
+        f.members.addrs.remove(&3);
+        diverge(&f);
+        f.contact.receive(state_report(
+            &f,
+            2,
+            ReplicaState::Committing,
+            Duration::ZERO,
+        ));
+        tokio::time::advance(Duration::from_millis(12)).await;
+        f.clock.add(Duration::from_millis(12));
+        f.contact.receive(state_report(
+            &f,
+            3,
+            ReplicaState::Committing,
+            Duration::ZERO,
+        ));
+        let (_, donor, _) = f.contact.resync_due().expect("an attempt");
+        assert_eq!(donor, 2);
     }
 
     /// A void of an entry held unresolved resolves it in the engine and

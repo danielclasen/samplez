@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::contact::index_at;
+use crate::state_machine::AHEAD_MAX;
+
 /// The lead an entry is stamped ahead of `ceil(E / B) * B` with, kept on
 /// the slack the counted audio replicas report: it rises at once to keep
 /// the 0.01 % slack quantile at or above 2B, and falls by B a minute while
@@ -20,6 +23,9 @@ pub struct Lead {
     minute_start: Instant,
     /// The lead wanted more than the cap since the last fall.
     pub capped: bool,
+    /// The most lead an entry needed, by the slack of this minute and of
+    /// the last ([`Lead::needs`]).
+    needed: [u64; 2],
     /// The stamping index at the last raise: entries stamped below it
     /// carry the lead from before it.
     raised_at: u64,
@@ -27,6 +33,9 @@ pub struct Lead {
 
 /// Minutes of slack the lead falls on.
 const MINUTES: usize = 10;
+
+/// How far past the cap [`Lead::wanted`] goes at most.
+pub const EXTRA_LEAD: Duration = Duration::from_millis(64);
 
 /// Slack in blocks, from [`Slacks::LOW`] blocks below 0, one bucket a
 /// block; the outer buckets take everything beyond them.
@@ -61,12 +70,44 @@ impl Lead {
             minutes: VecDeque::from([Slacks::new()]),
             minute_start: Instant::now(),
             capped: false,
+            needed: [0; 2],
             raised_at: 0,
         }
     }
 
     pub fn samples(&self) -> u64 {
         self.lead
+    }
+
+    /// The lead a command is stamped with: [`Lead::wanted`] at the cap,
+    /// the lead below it.
+    pub fn stamping(&self) -> u64 {
+        if self.capped {
+            self.wanted()
+        } else {
+            self.lead
+        }
+    }
+
+    /// One entry stamped `lead` ahead applied with `slack`: it needed
+    /// `lead - slack + 2B` to keep the slack the lead keeps.
+    pub fn needs(&mut self, lead: u64, slack: i64) {
+        self.roll();
+        let needed = (lead as i64 - slack + 2 * self.block as i64).max(0) as u64;
+        self.needed[1] = self.needed[1].max(needed);
+    }
+
+    /// The lead the entries applied this minute and the last needed, at
+    /// least the lead and at most [`EXTRA_LEAD`] past the cap, in whole
+    /// blocks below [`AHEAD_MAX`]: past the cap, what an entry needs to
+    /// apply in time. Further past its stamp than `AHEAD_MAX` an entry
+    /// would take effect at its stamp instead, already passed.
+    pub fn wanted(&self) -> u64 {
+        let b = self.block;
+        let extra = index_at(EXTRA_LEAD.as_nanos() as u64);
+        let most = ((self.max + extra) / b * b).min(AHEAD_MAX / b * b - b);
+        let needed = self.needed[0].max(self.needed[1]);
+        needed.next_multiple_of(b).min(most).max(self.lead)
     }
 
     /// The 0.01 % quantile of the slack over the minutes kept, in whole
@@ -121,6 +162,7 @@ impl Lead {
     pub fn roll(&mut self) {
         while self.minute_start.elapsed() >= Duration::from_secs(60) {
             self.minute_start += Duration::from_secs(60);
+            self.needed = [self.needed[1], 0];
             if self.minutes.len() == MINUTES
                 && self.quantile().is_some_and(|q| q >= 3)
                 && self.lead > self.block
@@ -175,6 +217,47 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         lead.roll();
         assert_eq!(lead.samples(), 1440 - B, "and a block a minute after");
+    }
+
+    /// Past the cap the lead wanted is what the entries applied needed,
+    /// at most 64 ms past it, forgotten after two minutes.
+    #[tokio::test(start_paused = true)]
+    async fn the_lead_wanted_covers_what_entries_needed_past_the_cap() {
+        let mut lead = Lead::new(B, 30 * B, 50 * B);
+        assert_eq!(lead.wanted(), 30 * B);
+        lead.add(-(40 * B as i64), 0, 0);
+        assert!(lead.capped);
+        lead.needs(50 * B, -(20 * B as i64));
+        assert_eq!(lead.wanted(), 72 * B, "20 blocks late and 2B of slack");
+        lead.needs(50 * B, -(200 * B as i64));
+        assert_eq!(lead.wanted(), 50 * B + 3072, "64 ms past the cap");
+        tokio::time::advance(Duration::from_secs(60)).await;
+        lead.roll();
+        assert_eq!(lead.wanted(), 50 * B + 3072, "the last minute counts");
+        tokio::time::advance(Duration::from_secs(60)).await;
+        lead.roll();
+        assert_eq!(lead.wanted(), 50 * B, "the lead itself");
+    }
+
+    /// At the largest block size the lead wanted stays within 64 ms of
+    /// the cap and below `AHEAD_MAX`, however late an entry was.
+    #[tokio::test(start_paused = true)]
+    async fn the_lead_wanted_stays_within_its_time_bound_at_block_1024() {
+        let b = 1024;
+        let mut lead = Lead::new(b, 1440, 3840);
+        lead.add(-(400 * b as i64), 0, 0);
+        assert_eq!(lead.samples(), 3 * b);
+        lead.needs(3 * b, -(1000 * b as i64));
+        assert_eq!(
+            lead.wanted(),
+            6 * b,
+            "3072 samples past the cap, whole blocks"
+        );
+        assert!(lead.wanted() < AHEAD_MAX);
+        let mut lead = Lead::new(b, 1440, 46_000);
+        lead.add(-(400 * b as i64), 0, 0);
+        lead.needs(lead.samples(), -(1000 * b as i64));
+        assert_eq!(lead.wanted(), AHEAD_MAX / b * b - b, "below AHEAD_MAX");
     }
 
     #[tokio::test(start_paused = true)]

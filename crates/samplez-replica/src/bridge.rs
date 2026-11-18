@@ -526,7 +526,7 @@ impl Audio for EngineAudio {
 
     fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, String> {
         let copy = CoreCopy::decode(&core.core).map_err(|e| e.to_string())?;
-        let unresolved = copy.core.unresolved().to_vec();
+        let mut unresolved = copy.core.unresolved().to_vec();
         let mut replay = self.engine.replay(copy).map_err(|e| e.to_string())?;
         let deadline = Instant::now() + REPLAY_WAIT;
         let mut after = core.last_id;
@@ -541,6 +541,16 @@ impl Audio for EngineAudio {
             for (n, (_, r)) in records.iter().enumerate().rev() {
                 lowest[n] = lowest[n + 1].min(r.at_index);
             }
+            // An entry at or after the replay's next block is applied,
+            // though the donor may have taken it late and held it
+            // unresolved: the records carry no decision, and one in the
+            // log names the entry only once the leader saw it held
+            // unresolved, which an entry the baseline applied in time
+            // never draws. The pages after it then differ, the hand-over
+            // waits for a matched page and the attempt fails; the next
+            // copies a newer core, whose next block is past the entry, and
+            // holds it unresolved as below. Decisions are stamped with the
+            // lead the entries needed, so a decision is not late again.
             for (n, (index, record)) in records.into_iter().enumerate() {
                 after = index;
                 let at_index = record.at_index.next_multiple_of(self.block);
@@ -568,6 +578,13 @@ impl Audio for EngineAudio {
                 Err(e) => return Err(e.to_string()),
             }
         };
+        // Taken late by the donor after its core and held unresolved, as
+        // the donor holds them.
+        for &(id, at) in replay.late() {
+            if !unresolved.iter().any(|u| u.0 == id) {
+                unresolved.push((id, at));
+            }
+        }
         // A page holding a block computed with an input silenced depends
         // on more than the input and the log: not compared.
         let silenced = replay.silenced();

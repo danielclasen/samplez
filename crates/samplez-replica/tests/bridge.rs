@@ -621,6 +621,26 @@ fn a_resync_takes_more_entries_than_it_holds_pending() {
     undisturbed(|| resync_after(100));
 }
 
+/// A resync onto a donor whose apply lead is at its cap: half the
+/// entries after the donor's core reach the donor's engine after their
+/// index, which it reports late and does not apply. The replay takes
+/// them as the donor did, so the joiner hands over and computes the
+/// donor's pages instead of failing every attempt on the first late
+/// entry.
+#[test]
+fn a_resync_takes_entries_the_donor_applied_late() {
+    undisturbed(|| resync_with(20, |id| id % 2 == 1));
+}
+
+/// More entries taken late after the core than the engine's control
+/// ring holds before the replay computes a block: the replay holds them
+/// unresolved without the ring, which only a computed block drains, so
+/// a burst of them does not fail the attempt.
+#[test]
+fn a_resync_takes_more_late_entries_than_the_control_ring_holds() {
+    undisturbed(|| resync_with(72, |_| true));
+}
+
 /// Runs `scenario` until a run is not disturbed, four times at most.
 fn undisturbed(scenario: impl Fn() -> Result<(), String>) {
     let mut seen = Vec::new();
@@ -654,6 +674,13 @@ impl Source for Log {
 /// to the donor, each 40 blocks ahead as it applies, which a joiner
 /// learns only from its replica's records in its resync.
 fn resync_after(n: u64) -> Result<(), String> {
+    resync_with(n, |_| false)
+}
+
+/// [`resync_after`], the commands `late` names handed to the donor two
+/// blocks after their index: its engine reports them late and applies
+/// none of them. The last command is handed in time.
+fn resync_with(n: u64, late: fn(u64) -> bool) -> Result<(), String> {
     let domain = Domain::new();
     // A second of history: the replay reads from the donor's core on.
     std::fs::write(
@@ -684,19 +711,43 @@ fn resync_after(n: u64) -> Result<(), String> {
     let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
     let silenced_before = silenced(&donor) + silenced(&joiner);
     let core = donor_audio.copy_core().ok_or("no core copied")?;
+    let late_before = donor.counters().command_late.load(Ordering::Relaxed);
     let mut log = Vec::new();
     let mut at = 0;
+    let mut behind = 0;
     for id in 1..=n {
         let processed = donor.progress().and_then(|p| p.processed).unwrap();
-        at = (processed + 40) * B;
-        let record = mixer(at, 0.5 + (id % 4) as f32 / 10.0, -((id % 7) as f32));
-        donor_audio.appended(id, at, &record.entries);
+        let index = if late(id) && id < n {
+            // Below the core's block: the donor's engine takes it after
+            // the core, late.
+            behind += 1;
+            (core.k0 - 2) * B
+        } else {
+            at = (processed + 40) * B;
+            at
+        };
+        let record = mixer(index, 0.5 + (id % 4) as f32 / 10.0, -((id % 7) as f32));
+        donor_audio.appended(id, index, &record.entries);
         donor_audio.committed(id);
         log.push((id, record));
         std::thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(donor_audio.sample().entries_refused, 0);
-    let r = joiner_audio.resync(&core, &Log(log))?;
+    if behind > 0 {
+        wait_for("the donor took the late entries", || {
+            donor.counters().command_late.load(Ordering::Relaxed) - late_before >= behind
+        });
+    }
+    let r = joiner_audio.resync(&core, &Log(log.clone()))?;
+    // Held unresolved, as the donor holds an entry it took late.
+    let taken_late: Vec<u64> = (log.iter())
+        .filter(|(_, r)| r.at_index <= core.k0 * B)
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(taken_late.len() as u64, behind);
+    for id in taken_late {
+        assert!(r.unresolved.iter().any(|u| u.0 == id), "{id} unresolved");
+    }
     // Past both ramps, by four pages.
     let ramp = 480;
     let end = (at + ramp) / B + 4 * PAGE / B;

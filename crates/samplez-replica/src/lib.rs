@@ -50,7 +50,9 @@ use openraft::storage::Adaptor;
 use openraft::{BasicNode, Raft, ServerState};
 use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::ws::{Delta, Snapshot};
-use samplez_service::{Owner, Position, ReadIndex, ReplicaInfo, ReplicatedState};
+use samplez_service::{
+    MetricKind, Owner, Position, ReadIndex, ReplicaInfo, ReplicaMetric, ReplicatedState,
+};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
@@ -972,12 +974,23 @@ impl Shared {
                     }
                     Err(refusal) => return Err(stamp_refused(refusal)),
                 };
-                // A later index asked for is kept.
+                // A later index asked for is kept. A decision or a
+                // `Baseline` takes the lead the entries lately needed, past
+                // the cap: stamped with the lead at the cap, it is late
+                // wherever the commit takes longer than the lead covers.
+                let mut earliest = stamp.earliest;
+                if (body.decides().is_some() || matches!(body, Body::Baseline(_)))
+                    && let Some(contact) = self.contact.get()
+                {
+                    let lead = contact.decision_lead();
+                    earliest =
+                        earliest.max((stamp.stamp + lead).next_multiple_of(self.settings.block));
+                }
                 if let Some(at) = body.at_index() {
-                    state_machine::restamp(&mut body, at.max(stamp.earliest));
+                    state_machine::restamp(&mut body, at.max(earliest));
                 }
                 if let Body::Baseline(b) = &mut body {
-                    b.at_index = b.at_index.max(stamp.earliest);
+                    b.at_index = b.at_index.max(earliest);
                     if self.contact.get().is_some_and(|c| c.hands_over(b)) {
                         b.at_index = rollout::hand_over_at(b.at_index, self.settings.block);
                     }
@@ -1430,6 +1443,15 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         }
     }
 
+    /// Contact's view of this audio replica, once contact runs: none for
+    /// a single replica.
+    fn replica_metrics(&self) -> Vec<ReplicaMetric> {
+        self.shared
+            .contact
+            .get()
+            .map_or_else(Vec::new, |c| contact_samples(c.serving(), &c.metrics()))
+    }
+
     fn epoch(&self) -> u64 {
         self.shared.epoch()
     }
@@ -1622,6 +1644,132 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             live.iter().map(SessionKey::from).collect(),
         ));
     }
+}
+
+/// The `/metrics` samples of contact metrics `m`, `serving` the `/readyz`
+/// term ([`contact::Contact::serving`]).
+fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
+    use MetricKind::{Counter, Gauge};
+    let one = |name, help, kind, value: f64| ReplicaMetric {
+        name,
+        help,
+        kind,
+        labels: Vec::new(),
+        value,
+    };
+    let flag = |b: bool| if b { 1.0 } else { 0.0 };
+    let r = &m.resync;
+    let mut out = vec![
+        one(
+            "samplez_replica_serving",
+            "The replicated state's /readyz term.",
+            Gauge,
+            flag(serving),
+        ),
+        one(
+            "samplez_replica_in_contact",
+            "Whether contact holds a majority within the contact window.",
+            Gauge,
+            flag(m.in_contact),
+        ),
+    ];
+    use state::ReplicaState as S;
+    let now = m.replica.and_then(|l| l.state);
+    for (state, name) in [
+        (S::Starting, "starting"),
+        (S::Committing, "committing"),
+        (S::Withdrawn, "withdrawn"),
+        (S::Diverged, "diverged"),
+        (S::VersionMismatch, "version_mismatch"),
+        (S::Resync, "resync"),
+    ] {
+        out.push(ReplicaMetric {
+            name: "samplez_replica_state",
+            help: "1 for the audio replica's state.",
+            kind: Gauge,
+            labels: vec![("state", name.to_owned())],
+            value: flag(now == Some(state)),
+        });
+    }
+    let divergences = m.replica.map_or(0, |l| l.divergences);
+    out.extend([
+        one(
+            "samplez_replica_divergences_total",
+            "Times the replica diverged.",
+            Counter,
+            divergences as f64,
+        ),
+        one(
+            "samplez_replica_resync_attempts_total",
+            "Resyncs started: a donor asked for its core.",
+            Counter,
+            r.attempts as f64,
+        ),
+        one(
+            "samplez_replica_resync_handovers_total",
+            "Replayed states the RT thread took.",
+            Counter,
+            r.handovers as f64,
+        ),
+        one(
+            "samplez_replica_resync_failures_total",
+            "Resyncs that ended without a hand-over.",
+            Counter,
+            r.failures as f64,
+        ),
+        one(
+            "samplez_replica_resync_no_donor_total",
+            "Resyncs not started for want of a committing donor.",
+            Counter,
+            r.no_donor as f64,
+        ),
+        one(
+            "samplez_replica_resync_backoff_seconds",
+            "How long the next resync waits after the last one ended.",
+            Gauge,
+            r.backoff.as_secs_f64(),
+        ),
+        one(
+            "samplez_replica_late_rebuilds_total",
+            "Engine rebuilds past entries taken late while catching up.",
+            Counter,
+            m.late_rebuilds as f64,
+        ),
+        one(
+            "samplez_replica_unresolved_total",
+            "Entries handed to the engine unresolved.",
+            Counter,
+            m.unresolved as f64,
+        ),
+        one(
+            "samplez_replica_apply_lead_samples",
+            "The apply lead entries are stamped with.",
+            Gauge,
+            m.lead as f64,
+        ),
+        one(
+            "samplez_replica_apply_lead_capped",
+            "Whether the apply lead is at maxApplyLeadMs.",
+            Gauge,
+            flag(m.apply_lead_capped),
+        ),
+        one(
+            "samplez_replica_decision_lead_samples",
+            "The lead decisions and baselines are stamped with, and commands at the cap.",
+            Gauge,
+            m.decision_lead as f64,
+        ),
+    ]);
+    if let Some(node) = m.apply_lead_raised_by {
+        out.push(ReplicaMetric {
+            name: "samplez_replica_apply_lead_raised_by",
+            help: "The replica whose slack raised the apply lead last.",
+            kind: Gauge,
+            labels: vec![("node", node.to_string())],
+            value: 1.0,
+        });
+    }
+    out
 }
 
 #[cfg(test)]

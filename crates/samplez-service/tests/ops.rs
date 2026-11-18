@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use axum::http::{StatusCode, header};
 use common::*;
-use samplez_service::{Metrics, Ops};
+use samplez_service::{MetricKind, Metrics, Ops, ReplicaMetric};
 
 #[tokio::test(start_paused = true)]
 async fn healthz_follows_the_heartbeat_within_one_second() {
@@ -167,6 +167,59 @@ samplez_wake_seconds_bucket{thread=\"rt\",le=\"1\"} 3
 samplez_wake_seconds_bucket{thread=\"rt\",le=\"+Inf\"} 4
 samplez_wake_seconds_sum{thread=\"rt\"} 2.875
 samplez_wake_seconds_count{thread=\"rt\"} 4
+";
+    assert_eq!(body, expected);
+}
+
+/// The replication's metrics reach `/metrics` labelled with the replica,
+/// a name's help and type once before its samples.
+#[tokio::test]
+async fn metrics_carry_the_replications_own_with_the_replica_label() {
+    let state = FakeState::new("r1", "follower");
+    let sample = |name, kind, labels: Vec<(&'static str, String)>, value| ReplicaMetric {
+        name,
+        help: "Help.",
+        kind,
+        labels,
+        value,
+    };
+    *state.metrics.lock().unwrap() = vec![
+        sample("samplez_replica_serving", MetricKind::Gauge, vec![], 0.0),
+        sample(
+            "samplez_replica_state",
+            MetricKind::Gauge,
+            vec![("state", "committing".into())],
+            0.0,
+        ),
+        sample(
+            "samplez_replica_state",
+            MetricKind::Gauge,
+            vec![("state", "diverged".into())],
+            1.0,
+        ),
+        sample(
+            "samplez_replica_resync_failures_total",
+            MetricKind::Counter,
+            vec![],
+            3.0,
+        ),
+    ];
+    let (code, _, body) = send(&Ops::default().router(state), get_req("/metrics")).await;
+    assert_eq!(code, StatusCode::OK);
+    let expected = "\
+# HELP samplez_replica_info This replica's id and role.
+# TYPE samplez_replica_info gauge
+samplez_replica_info{replica=\"r1\",role=\"follower\"} 1
+# HELP samplez_replica_serving Help.
+# TYPE samplez_replica_serving gauge
+samplez_replica_serving{replica=\"r1\"} 0
+# HELP samplez_replica_state Help.
+# TYPE samplez_replica_state gauge
+samplez_replica_state{replica=\"r1\",state=\"committing\"} 0
+samplez_replica_state{replica=\"r1\",state=\"diverged\"} 1
+# HELP samplez_replica_resync_failures_total Help.
+# TYPE samplez_replica_resync_failures_total counter
+samplez_replica_resync_failures_total{replica=\"r1\"} 3
 ";
     assert_eq!(body, expected);
 }

@@ -2496,6 +2496,7 @@ impl Engine {
             silenced: Vec::new(),
             next: copy.k0 + 1,
             last_id: copy.last_id,
+            late: Vec::new(),
             duck_columns: self.config.duck_columns.clone(),
         })
     }
@@ -4382,30 +4383,52 @@ fn retry(out: &mut SupOut, now: Instant) {
 
 /// The margin the slot's late blocks need, `margin - min_slack + B`, once
 /// the window spans 10 s with late blocks, on-time blocks and a head that
-/// advanced at the nominal rate within 1 %.
+/// advanced at the nominal rate within 1 %. Only samples whose head is
+/// known, above 0 and not behind the window's first head count, and a
+/// margin beyond the samples the window spans is none: late blocks that
+/// far behind a head advancing at the nominal rate are no reader margin
+/// to widen.
 fn margin_warning(api: &MxlApi, window: &VecDeque<SlotStats>, timing: &Timing) -> Option<u64> {
+    let (first, last) = (first_head(window)?, window.back()?);
+    let index = |now| time::timestamp_to_index(api, now);
+    margin_needed(
+        window,
+        index(last.now).checked_sub(index(first.now))?,
+        timing,
+    )
+}
+
+/// The first sample with a head above 0: a slot not read yet has none.
+fn first_head(window: &VecDeque<SlotStats>) -> Option<&SlotStats> {
+    window.iter().find(|s| s.head.is_some_and(|h| h > 0))
+}
+
+/// [`margin_warning`] over a window whose clock advanced `nominal`
+/// samples.
+fn margin_needed(window: &VecDeque<SlotStats>, nominal: u64, timing: &Timing) -> Option<u64> {
     if window.len() < MARGIN_WINDOW {
         return None;
     }
-    let (first, last) = (window.front()?, window.back()?);
+    let (first, last) = (first_head(window)?, window.back()?);
     let late: u64 = window.iter().skip(1).map(|s| u64::from(s.late)).sum();
     let on_time: u64 = window.iter().skip(1).map(|s| u64::from(s.on_time)).sum();
     if late == 0 || on_time == 0 {
         return None;
     }
     let advanced = last.head?.checked_sub(first.head?)?;
-    let nominal =
-        time::timestamp_to_index(api, last.now) - time::timestamp_to_index(api, first.now);
     if advanced.abs_diff(nominal) * 100 > nominal {
         return None;
     }
+    let start = first.head?;
     let min_slack = window
         .iter()
         .skip(1)
-        .filter(|s| s.late > 0)
-        .map(|s| s.min_slack)
+        .filter(|s| s.late > 0 && s.head.is_some_and(|h| h > 0 && h >= start))
+        .filter_map(|s| s.min_slack)
         .min()?;
-    Some((timing.margin as i64 - min_slack) as u64 + timing.block)
+    let required = (timing.margin as i64).checked_sub(min_slack)?;
+    let required = u64::try_from(required).ok()? + timing.block;
+    (required <= nominal).then_some(required)
 }
 
 /// Minor page faults of thread `tid`, from `/proc/self/task/<tid>/stat`.
@@ -4448,6 +4471,82 @@ mod tests {
         for state in [SupState::Attached, SupState::Wanted] {
             assert_eq!(detach_routing(&state, 9, "f"), Some((9, "f".to_owned())));
         }
+    }
+
+    /// A 10 s window of stats, each sample 1 s of 48 kHz with a head
+    /// advancing at the nominal rate, late blocks with `slack` in every
+    /// sample after the first.
+    fn margin_window(slack: impl Fn(usize) -> (Option<u64>, Option<i64>)) -> VecDeque<SlotStats> {
+        (0..MARGIN_WINDOW)
+            .map(|n| {
+                let (head, min_slack) = slack(n);
+                SlotStats {
+                    late: u32::from(n > 0),
+                    on_time: 100,
+                    min_slack,
+                    head,
+                    now: n as u64,
+                    ..crate::rt_loop::EMPTY_STATS
+                }
+            })
+            .collect()
+    }
+
+    /// The margin warning names what the late blocks need, never an
+    /// absolute index: a sample whose head was 0 or that fell behind the
+    /// window's first head is left out, and a requirement beyond the
+    /// samples the window spans is none.
+    #[test]
+    fn a_margin_warning_never_names_an_absolute_index() {
+        let timing = Timing {
+            block: 48,
+            margin: 576,
+            max_catchup_blocks: 4,
+            resync_budget: 0,
+        };
+        let head0: u64 = 86_160_902_160_000;
+        let head = |n: usize| head0 + n as u64 * 48_000;
+        let nominal = 10 * 48_000;
+        let w = margin_window(|n| (Some(head(n)), Some(-100)));
+        assert_eq!(margin_needed(&w, nominal, &timing), Some(576 + 100 + 48));
+        // One sample read its late blocks against a head of 0: its slack
+        // is the negated absolute index.
+        let w = margin_window(|n| match n {
+            5 => (Some(head(n)), None),
+            _ => (Some(head(n)), Some(-100)),
+        });
+        assert_eq!(margin_needed(&w, nominal, &timing), Some(724));
+        let w = margin_window(|n| match n {
+            5 => (Some(0), Some(-(head0 as i64))),
+            _ => (Some(head(n)), Some(-100)),
+        });
+        assert_eq!(
+            margin_needed(&w, nominal, &timing),
+            Some(724),
+            "a head of 0 left out"
+        );
+        let w = margin_window(|n| match n {
+            5 => (Some(head0 - 1), Some(-(head0 as i64))),
+            _ => (Some(head(n)), Some(-100)),
+        });
+        assert_eq!(
+            margin_needed(&w, nominal, &timing),
+            Some(724),
+            "behind the start"
+        );
+        let w = margin_window(|n| (Some(head(n)), Some(-(head0 as i64))));
+        assert_eq!(
+            margin_needed(&w, nominal, &timing),
+            None,
+            "beyond the window"
+        );
+        // The first sample has no head yet: the window starts at the next.
+        let w = margin_window(|n| match n {
+            0 => (None, None),
+            _ => (Some(head(n)), Some(-100)),
+        });
+        let nine = 9 * 48_000;
+        assert_eq!(margin_needed(&w, nine, &timing), Some(724), "no first head");
     }
 
     #[test]

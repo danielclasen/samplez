@@ -9,7 +9,8 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{BLOCK, Clock, FOR_GOOD, FakeAudio, Options, Set};
+use axum::body::Bytes;
+use harness::{BLOCK, Clock, FOR_GOOD, FakeAudio, Options, Set, owner};
 use samplez::blocks::PAGE;
 use samplez_replica::contact::{Audio, Timing, index_at};
 use samplez_replica::entry::{Baseline, Body, NodeId, Request};
@@ -17,6 +18,7 @@ use samplez_replica::membership::{Slot, node_id, slot_of};
 use samplez_replica::resync::{CoreReply, Missed, Source};
 use samplez_replica::state::ReplicaState;
 use samplez_replica::state_machine::Record;
+use samplez_service::ReplicatedState;
 use tokio::time::{Instant, sleep};
 
 fn a(o: u16) -> NodeId {
@@ -30,9 +32,14 @@ fn witness() -> NodeId {
 /// A set whose fakes copy and take cores; `install` lets a test force a
 /// snapshot install.
 async fn start(ids: Vec<NodeId>, install: bool) -> Set {
+    start_timed(ids, install, Timing::defaults(BLOCK)).await
+}
+
+/// [`start`] with the contact timers `timing`.
+async fn start_timed(ids: Vec<NodeId>, install: bool, timing: Timing) -> Set {
     let mut options = Options {
         ids: Some(ids),
-        contact: Some(Timing::defaults(BLOCK)),
+        contact: Some(timing),
         outputs: 1,
         ..Options::default()
     };
@@ -133,6 +140,84 @@ async fn a_diverged_replica_resyncs_from_the_baseline_and_commits_again() {
         Some(ReplicaState::Committing),
         "stays committing"
     );
+}
+
+/// The value of `name`'s sample with `label` in `id`'s `/metrics`
+/// samples.
+fn sample(set: &Set, id: NodeId, name: &str, label: Option<(&str, &str)>) -> f64 {
+    let samples = set.replica(id).replica_metrics();
+    (samples.iter())
+        .find(|m| {
+            m.name == name
+                && label.is_none_or(|(k, v)| m.labels.iter().any(|(mk, mv)| *mk == k && mv == v))
+        })
+        .unwrap_or_else(|| panic!("{name} {label:?} in {samples:?}"))
+        .value
+}
+
+/// A pod-kill test: 3 replicas after the apply lead reached its
+/// cap, a follower diverged, then the leader killed. The diverged
+/// follower resyncs from the replica still committing and commits again
+/// within 5 s; `/metrics` shows the hand-over and the replica serving
+/// again, and not serving while it wrote nothing.
+#[tokio::test(start_paused = true)]
+async fn a_follower_diverged_under_a_capped_lead_resyncs_after_the_leader_is_killed() {
+    let mut set = start(vec![a(0), a(1), a(2)], false).await;
+    let leader = set.leader().await;
+    // Commits 50 ms after their stamp: the lead rises to its cap.
+    let followers: Vec<NodeId> = audio(&set).into_iter().filter(|&id| id != leader).collect();
+    for &id in &followers {
+        set.net.stall(id, Duration::from_millis(25));
+    }
+    for n in 0..3 {
+        let command = Bytes::from(format!("g=1@{n}"));
+        let _ = (set.replica(leader))
+            .submit(&owner("s"), &n.to_string(), command)
+            .await;
+    }
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        set.replica(leader)
+            .contact_metrics()
+            .unwrap()
+            .apply_lead_capped
+    );
+    assert_eq!(
+        sample(&set, leader, "samplez_replica_apply_lead_capped", None),
+        1.0
+    );
+    for &id in &followers {
+        set.net.unstall(id);
+    }
+    let ids = audio(&set);
+    until("committing again", 5, || {
+        ids.iter()
+            .all(|&id| state(&set, id) == Some(ReplicaState::Committing))
+    })
+    .await;
+    let named = baseline(&set, leader).unwrap().replica;
+    let odd = (followers.iter().copied()).find(|&id| id != named).unwrap();
+    // Its first two replays fail: it resyncs after the kill.
+    set.audio(odd).lock().failing = 2;
+    let k = due(&set, odd) + 30;
+    set.audio(odd).glitch(k, FOR_GOOD, 0.5);
+    passes(&set, odd, ReplicaState::Diverged, 3).await;
+    assert_eq!(
+        sample(&set, odd, "samplez_replica_serving", None),
+        0.0,
+        "diverged, it writes nothing"
+    );
+    let diverged = Some(("state", "diverged"));
+    assert_eq!(sample(&set, odd, "samplez_replica_state", diverged), 1.0);
+    set.crash(leader).await;
+    let killed = Instant::now();
+    passes(&set, odd, ReplicaState::Committing, 5).await;
+    assert!(killed.elapsed() < Duration::from_secs(5));
+    assert!(resyncs(&set, odd).handovers >= 1);
+    let handovers = sample(&set, odd, "samplez_replica_resync_handovers_total", None);
+    assert!(handovers >= 1.0);
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(sample(&set, odd, "samplez_replica_serving", None), 1.0);
 }
 
 /// A failed replay leaves the replica diverged, and it tries again with a
@@ -413,4 +498,181 @@ async fn a_decision_across_a_rename_converges() {
         );
     }
     assert_eq!(state(&set, renamed), Some(ReplicaState::Committing));
+}
+
+/// The leader's log entries of each kind: the name of the body's variant.
+fn kinds(set: &Set, id: NodeId) -> std::collections::BTreeMap<String, u64> {
+    let mut kinds = std::collections::BTreeMap::new();
+    set.replica(id).store().entries_after(0, |_, r| {
+        let body = format!("{:?}", r.body);
+        let kind = body
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("");
+        *kinds.entry(kind.to_owned()).or_default() += 1;
+    });
+    kinds
+}
+
+/// Commits that take longer than the capped lead covers: followers
+/// stalled 6 ms per RPC, within the contact window, under a 36 ms cap,
+/// whose 4 ms past the margin and applyGuard no commit makes, the
+/// leader's included. A command is late on every replica, which holds
+/// it unresolved, or resyncs where the baseline applied it; a decision
+/// is stamped with
+/// the lead the entries needed, past the cap, so it applies in time,
+/// where one stamped at the cap was late again and decided in turn,
+/// without end, and a `Baseline` lapsed for its named replica. Every
+/// replica commits again within 5 s and the unresolved entries stay
+/// bounded.
+#[tokio::test(start_paused = true)]
+async fn a_set_whose_commits_outlast_the_capped_lead_commits_with_bounded_unresolved() {
+    let mut timing = Timing::defaults(BLOCK);
+    timing.max_apply_lead = Duration::from_millis(36);
+    let set = start_timed(vec![a(0), a(1), a(2)], false, timing).await;
+    let leader = set.leader().await;
+    let followers: Vec<NodeId> = audio(&set).into_iter().filter(|&id| id != leader).collect();
+    for &id in &followers {
+        set.net.stall(id, Duration::from_millis(6));
+    }
+    let commands = 10;
+    for n in 0..commands {
+        let command = Bytes::from(format!("g=1@{n}"));
+        let _ = (set.replica(leader))
+            .submit(&owner("s"), &n.to_string(), command)
+            .await;
+        sleep(Duration::from_millis(100)).await;
+    }
+    let m = set.replica(leader).contact_metrics().unwrap();
+    assert!(m.apply_lead_capped, "the lead at its cap");
+    let ids = audio(&set);
+    // Past the session's lease expiry, an entry of its own.
+    sleep(Duration::from_secs(2)).await;
+    until("committing under the stall", 5, || {
+        ids.iter()
+            .all(|&id| state(&set, id) == Some(ReplicaState::Committing))
+    })
+    .await;
+    for &id in &ids {
+        let m = set.replica(id).contact_metrics().unwrap();
+        assert!(
+            m.unresolved <= 2 * commands,
+            "{id}: {} unresolved",
+            m.unresolved
+        );
+    }
+    let kinds = kinds(&set, leader);
+    let restamps = kinds.get("Restamp").copied().unwrap_or(0);
+    assert!(restamps <= commands + 2, "one restamp a command: {kinds:?}");
+    assert!(
+        kinds.get("Baseline").copied().unwrap_or(0) <= 2,
+        "{kinds:?}"
+    );
+}
+
+/// Submits command `n` to `leader`, then waits 50 ms.
+async fn submit(set: &Set, leader: NodeId, n: &mut u64) {
+    let command = Bytes::from(format!("g=1@{}", *n % 8));
+    let _ = (set.replica(leader))
+        .submit(&owner("s"), &n.to_string(), command)
+        .await;
+    *n += 1;
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// What `id` withheld for a cause and held unresolved so far.
+fn degraded(set: &Set, id: NodeId) -> (u64, u64) {
+    let m = set.replica(id).contact_metrics().unwrap();
+    let w = m.withholding;
+    let withheld = w.fence_deadline + w.hold_cap + w.other_digest + w.silence;
+    (withheld, m.unresolved)
+}
+
+/// Commands that keep coming while commits outlast the capped lead, as
+/// a fader drag does: followers stalled 6 ms per RPC under a 36 ms cap.
+/// Once the lead adapts, a command is stamped with the lead the entries
+/// needed, past the cap, so it applies in time on every replica: for
+/// two seconds of commands every 50 ms each replica keeps committing,
+/// withholds no block and holds nothing unresolved. Stamped with the
+/// capped lead, each command was late on every replica, each one a
+/// degraded block.
+#[tokio::test(start_paused = true)]
+async fn commands_during_commits_past_the_capped_lead_commit_without_gaps() {
+    let mut timing = Timing::defaults(BLOCK);
+    timing.max_apply_lead = Duration::from_millis(36);
+    let set = start_timed(vec![a(0), a(1), a(2)], false, timing).await;
+    let leader = set.leader().await;
+    let ids = audio(&set);
+    for &id in ids.iter().filter(|&&id| id != leader) {
+        set.net.stall(id, Duration::from_millis(6));
+    }
+    let mut n = 0u64;
+    // The lead reaches its cap and adapts past it; the replicas commit.
+    let adapt = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < adapt {
+        submit(&set, leader, &mut n).await;
+    }
+    let m = set.replica(leader).contact_metrics().unwrap();
+    assert!(m.apply_lead_capped, "the lead at its cap");
+    assert!(
+        m.decision_lead > m.lead,
+        "{} past {}",
+        m.decision_lead,
+        m.lead
+    );
+    until("committing under the stall", 5, || {
+        ids.iter()
+            .all(|&id| state(&set, id) == Some(ReplicaState::Committing))
+    })
+    .await;
+    let before: Vec<(u64, u64)> = ids.iter().map(|&id| degraded(&set, id)).collect();
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        submit(&set, leader, &mut n).await;
+        for &id in &ids {
+            assert_eq!(state(&set, id), Some(ReplicaState::Committing), "{id}");
+        }
+    }
+    for (&id, before) in ids.iter().zip(before) {
+        assert_eq!(degraded(&set, id), before, "{id}: withheld, unresolved");
+    }
+}
+
+/// `/readyz` after the whole set restarts: each replica finds the
+/// set's `Baseline` in its log, becomes ready withdrawn, and its engine
+/// stops computing, so nobody commits again. A replica that writes
+/// nothing is not ready, though it has not committed since it started;
+/// only before the set's first `Baseline` would it be.
+#[tokio::test(start_paused = true)]
+async fn a_restarted_set_withdrawn_while_nobody_commits_is_not_ready() {
+    let mut set = start(vec![a(0), a(1), a(2)], false).await;
+    let ids = audio(&set);
+    for &id in &ids {
+        set.crash(id).await;
+    }
+    for &id in &ids {
+        set.restart(id).await;
+        set.audio(id).lock().resyncs = true;
+    }
+    until("each one out of starting", 10, || {
+        ids.iter().all(|&id| {
+            set.replica(id)
+                .contact_metrics()
+                .and_then(|m| m.replica)
+                .is_some_and(|r| r.state != Some(ReplicaState::Starting))
+        })
+    })
+    .await;
+    for &id in &ids {
+        let at = due(&set, id);
+        set.audio(id).lock().stalled_at = Some(at);
+    }
+    sleep(Duration::from_millis(500)).await;
+    for &id in &ids {
+        let m = set.replica(id).contact_metrics().unwrap();
+        assert!(m.in_contact, "{id}");
+        assert!(baseline(&set, id).is_some(), "{id}");
+        assert_ne!(state(&set, id), Some(ReplicaState::Committing), "{id}");
+        assert!(!set.replica(id).replica().ready, "{id} writes nothing");
+    }
 }

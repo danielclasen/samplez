@@ -44,6 +44,7 @@ use samplez_replica::membership::{Slot, slot_of};
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest, PeerResponse};
 use samplez_replica::report::{ClockFlags, Own, Page, Report, Run, runs};
 use samplez_replica::resync::{CoreReply, Resynced, Source};
+use samplez_replica::state::ReplicaState;
 use samplez_replica::state_machine::{Apply, Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
 use samplez_service::{Owner, ReplicatedState, Role};
@@ -1648,10 +1649,18 @@ impl<P: Product + Sync> Set<P> {
             .await
             .expect("initializes");
         set.leader().await;
+        // Ready, or committing or withdrawn: a replica withdrawn once the
+        // set's first `Baseline` applied writes nothing and reads not
+        // ready until it commits, which in a set whose digests differ it
+        // may never do. Diverged or resyncing is not started.
         let deadline = Instant::now() + Duration::from_secs(30);
         while !set.replicas.iter().all(|(&id, r)| {
             let info = r.replica();
-            info.ready
+            let started = (r.contact_metrics())
+                .and_then(|m| m.replica)
+                .and_then(|l| l.state)
+                .is_some_and(|s| matches!(s, ReplicaState::Committing | ReplicaState::Withdrawn));
+            (info.ready || started)
                 && (slot_of(id) == Slot::Witness || info.commitable || set.options.unverified)
         }) {
             assert!(
