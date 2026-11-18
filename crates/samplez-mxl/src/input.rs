@@ -989,7 +989,7 @@ impl PolledFlow {
         };
         if valid {
             // Checked again after a gap, while the head stays.
-            self.check.missing(now);
+            self.check.checked(now);
         } else {
             self.readers.clear();
             self.head = None;

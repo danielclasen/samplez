@@ -35,7 +35,8 @@ pub fn flow_dir(domain: &Path, flow_id: &str) -> PathBuf {
 pub struct Lookup {
     dir: PathBuf,
     look: Look,
-    running: Option<Receiver<bool>>,
+    /// The answer and when the lookup thread had it.
+    running: Option<Receiver<(bool, Instant)>>,
 }
 
 impl Lookup {
@@ -64,7 +65,8 @@ impl Lookup {
             .name("samplez-lookup".into())
             .stack_size(STACK)
             .spawn(move || {
-                let _ = tx.send(look(&dir));
+                let found = look(&dir);
+                let _ = tx.send((found, Instant::now()));
             });
         if spawned.is_ok() {
             self.running = Some(rx);
@@ -75,24 +77,29 @@ impl Lookup {
     /// The answer of the running lookup once it has one, without waiting.
     /// A lookup thread that ended without one answers false.
     pub fn answer(&mut self) -> Option<bool> {
+        self.answer_at().map(|a| a.0)
+    }
+
+    /// [`Lookup::answer`] and when the lookup had it.
+    pub fn answer_at(&mut self) -> Option<(bool, Instant)> {
         let answer = match self.running.as_ref()?.try_recv() {
-            Ok(found) => found,
+            Ok(answer) => answer,
             Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => false,
+            Err(TryRecvError::Disconnected) => (false, Instant::now()),
         };
         self.running = None;
         Some(answer)
     }
 
-    /// [`Lookup::answer`], waiting for it until `until`.
-    pub fn answer_by(&mut self, until: Instant) -> Option<bool> {
+    /// [`Lookup::answer_at`], waiting for it until `until`.
+    pub fn answer_by(&mut self, until: Instant) -> Option<(bool, Instant)> {
         let wait = until.saturating_duration_since(Instant::now());
         #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let answer = self.running.as_ref()?.recv_timeout(wait);
         let answer = match answer {
-            Ok(found) => found,
+            Ok(answer) => answer,
             Err(RecvTimeoutError::Timeout) => return None,
-            Err(RecvTimeoutError::Disconnected) => false,
+            Err(RecvTimeoutError::Disconnected) => (false, Instant::now()),
         };
         self.running = None;
         Some(answer)
@@ -108,8 +115,8 @@ pub enum Found {
     Pending,
 }
 
-/// How long a [`Gate`] keeps a lookup's finding a directory, with no
-/// lookup since finding it missing.
+/// How long a [`Gate::new`] keeps a lookup's finding a directory, from
+/// when the lookup found it, with no lookup since finding it missing.
 pub const KEEP_FOUND: Duration = Duration::from_secs(1);
 
 /// The directories one caller is about to open, looked up together: what
@@ -117,37 +124,55 @@ pub const KEEP_FOUND: Duration = Duration::from_secs(1);
 /// keeps running for its next call.
 pub struct Gate {
     look: Look,
+    keep: Duration,
     lookups: HashMap<PathBuf, (Lookup, Option<Instant>)>,
 }
 
 impl Gate {
+    /// A gate that keeps a finding for [`KEEP_FOUND`].
     pub fn new(look: Look) -> Gate {
         Gate {
             look,
+            keep: KEEP_FOUND,
             lookups: HashMap::new(),
         }
     }
 
+    /// A gate that keeps no finding: every call waits for a lookup that
+    /// answers within it.
+    pub fn fresh(look: Look) -> Gate {
+        Gate {
+            keep: Duration::ZERO,
+            ..Gate::new(look)
+        }
+    }
+
     /// What is known of each of `dirs`; a directory named twice is looked
-    /// up and answered once. A directory a lookup found within
-    /// [`KEEP_FOUND`], and no lookup found missing since, is found at once;
+    /// up and answered once. A directory a lookup found less than the
+    /// gate's keep ago, by when the lookup found it, and no lookup found
+    /// missing since, is found at once;
     /// a lookup is started for it all the same, so the next call has a
     /// fresh answer. For any other, a lookup is started unless one runs,
     /// and waited for until `wait` has passed.
     pub fn found(&mut self, dirs: &[PathBuf], wait: Duration) -> Vec<Found> {
         let now = Instant::now();
         let until = now + wait;
-        let read = |entry: &mut (Lookup, Option<Instant>), answer: Option<bool>, at| match answer {
-            Some(true) => entry.1 = Some(at),
-            Some(false) => entry.1 = None,
-            None => {}
+        let keep = self.keep;
+        let kept = move |at: Option<Instant>| {
+            at.is_some_and(|at| now.saturating_duration_since(at) < keep)
         };
+        let read =
+            |entry: &mut (Lookup, Option<Instant>), answer: Option<(bool, Instant)>| match answer {
+                Some((true, at)) => entry.1 = Some(at),
+                Some((false, _)) => entry.1 = None,
+                None => {}
+            };
         // Directories not asked for now are dropped once their lookup ended
         // and what it found is no longer kept.
         self.lookups.retain(|_, e| {
-            let answer = e.0.answer();
-            read(e, answer, now);
-            e.0.running() || e.1.is_some_and(|at| now.duration_since(at) < KEEP_FOUND)
+            let answer = e.0.answer_at();
+            read(e, answer);
+            e.0.running() || kept(e.1)
         });
         let mut found: HashMap<&PathBuf, Found> = HashMap::new();
         for dir in dirs {
@@ -156,7 +181,7 @@ impl Gate {
                 .entry(dir.clone())
                 .or_insert_with(|| (Lookup::new(dir.clone(), look), None));
             e.0.start();
-            if e.1.is_some_and(|at| now.duration_since(at) < KEEP_FOUND) {
+            if kept(e.1) {
                 found.insert(dir, Found::Yes);
             }
         }
@@ -165,10 +190,10 @@ impl Gate {
                 *found.entry(dir).or_insert_with(|| {
                     let e = self.lookups.get_mut(dir).expect("inserted above");
                     let answer = e.0.answer_by(until);
-                    read(e, answer, Instant::now());
+                    read(e, answer);
                     match answer {
-                        Some(true) => Found::Yes,
-                        Some(false) => Found::No,
+                        Some((true, _)) => Found::Yes,
+                        Some((false, _)) => Found::No,
                         None => Found::Pending,
                     }
                 })
@@ -187,7 +212,8 @@ impl Gate {
 /// [`MAX_GAP`].
 #[derive(Clone, Copy, Debug)]
 pub struct Backoff {
-    since: Instant,
+    /// When the grace started; none for no grace.
+    since: Option<Instant>,
     gap: Duration,
     next: Instant,
 }
@@ -203,7 +229,7 @@ impl Backoff {
     /// Wanted anew at `now`.
     pub fn new(now: Instant) -> Backoff {
         Backoff {
-            since: now,
+            since: Some(now),
             gap: Duration::ZERO,
             next: now,
         }
@@ -212,7 +238,7 @@ impl Backoff {
     /// Wanted at `now` with no grace: due at once, then with the gaps.
     pub fn paced(now: Instant) -> Backoff {
         Backoff {
-            since: now.checked_sub(GRACE).unwrap_or(now),
+            since: None,
             gap: Duration::ZERO,
             next: now,
         }
@@ -220,7 +246,20 @@ impl Backoff {
 
     /// A lookup answered at `now` that the flow is missing.
     pub fn missing(&mut self, now: Instant) {
-        if now.saturating_duration_since(self.since) < GRACE {
+        self.answered(now);
+    }
+
+    /// A check made at `now` found the flow as it should be: the next one
+    /// is due after the next gap.
+    pub fn checked(&mut self, now: Instant) {
+        self.answered(now);
+    }
+
+    fn answered(&mut self, now: Instant) {
+        if self
+            .since
+            .is_some_and(|s| now.saturating_duration_since(s) < GRACE)
+        {
             self.next = now;
             return;
         }
@@ -260,6 +299,11 @@ mod tests {
         let mut b = Backoff::new(at(t));
         b.missing(at(t + 1));
         assert!(b.due(at(t + 1)));
+        // Paced, the gaps start at once, however long the host has run.
+        let mut b = Backoff::paced(t0);
+        b.checked(t0);
+        assert!(!b.due(at(99)));
+        assert!(b.due(at(100)));
     }
 
     /// An answer the gate waited for counts; one not given within the wait
@@ -285,6 +329,18 @@ mod tests {
         assert!(again.elapsed() < Duration::from_millis(10));
         std::thread::sleep(KEEP_FOUND);
         assert_eq!(gate.found(one, Duration::from_millis(20)), [Found::Yes]);
+        // A finding is as old as when its lookup had it: a lookup a call
+        // started and did not wait for, read by a call a second later,
+        // is not kept.
+        let mut gate = Gate::new(slow);
+        assert_eq!(gate.found(one, Duration::from_secs(5)), [Found::Yes]);
+        assert_eq!(gate.found(one, Duration::ZERO), [Found::Yes]);
+        std::thread::sleep(KEEP_FOUND + Duration::from_millis(400));
+        assert_eq!(gate.found(one, Duration::from_millis(20)), [Found::Pending]);
+        // A gate that keeps nothing waits for every answer.
+        let mut gate = Gate::fresh(slow);
+        assert_eq!(gate.found(one, Duration::from_secs(5)), [Found::Yes]);
+        assert_eq!(gate.found(one, Duration::from_millis(20)), [Found::Pending]);
         // A finding as old as KEEP_FOUND is not kept.
         let mut gate = Gate::new(slow);
         assert_eq!(gate.found(one, Duration::from_secs(5)), [Found::Yes]);

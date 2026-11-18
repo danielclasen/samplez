@@ -179,13 +179,21 @@ fn output_creation_over_a_live_stale_and_surviving_flow() {
     assert_eq!(active, Some(false));
 
     // Collectable again: removed by mxlGarbageCollectFlows, then created.
+    // Whether it is gone is asked of the caller's lookup, not of
+    // mxlIsFlowActive, which looks the collected name up again.
+    let asked = std::cell::Cell::new(false);
+    let still_there = || {
+        asked.set(true);
+        dir.exists()
+    };
     let Creation::Created {
         writer: mut w,
         collected: true,
-    } = output::create(&instance, &cfg).unwrap()
+    } = output::create_looking(&instance, &cfg, still_there).unwrap()
     else {
         panic!("stale flow not collected and created");
     };
+    assert!(asked.get(), "the lookup was not asked after the collection");
     assert!(domain.tmp_dirs().is_empty(), "{:?}", domain.tmp_dirs());
     let k = K0 + BLOCKS + 3;
     let data: Vec<f32> = (0..2)

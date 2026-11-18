@@ -1527,7 +1527,7 @@ impl Engine {
             product: None,
             pollers: (0..in_domains.len()).map(|_| None).collect(),
             gate: Gate::new(config.look),
-            out_gate: Gate::new(config.look),
+            out_gate: Gate::fresh(config.look),
             poll_errors: vec![None; in_domains.len()],
             rebuild_errors: vec![None; in_domains.len()],
             outs: (0..config.outputs.len())
@@ -4339,10 +4339,15 @@ impl Supervisor {
             // missing name up and on a file system that waits for it would
             // hold the supervisor; a flow there meanwhile is opened, not
             // created, and reported raced.
+            // After collecting a stale flow, the same lookup decides
+            // whether it is still there.
             let dir = lookup::flow_dir(&self.config.domains[d].path, oc.flow_id);
-            let result = match self.out_gate.found(std::slice::from_ref(&dir), GATE_WAIT)[..] {
-                [Found::Yes] => output::create(instance, &oc),
-                _ => output::create_new(instance, &oc),
+            let gate = &mut self.out_gate;
+            let mut found = || gate.found(std::slice::from_ref(&dir), GATE_WAIT)[0] == Found::Yes;
+            let result = if found() {
+                output::create_looking(instance, &oc, found)
+            } else {
+                output::create_new(instance, &oc)
             };
             let mut st = self.status.lock().expect("status lock");
             let s = &mut st.outputs[o];
@@ -4375,7 +4380,8 @@ impl Supervisor {
                 Ok(Creation::Active) => "another writer is live on the flow".to_owned(),
                 Ok(Creation::Raced) => {
                     s.races += 1;
-                    "another writer created the flow first; libmxl v1.1.0 leaves a \
+                    "another writer created the flow first, or a stale flow its lookup \
+                     had not found yet was opened and removed; libmxl v1.1.0 leaves a \
                      .mxl-tmp-* directory in the domain on this path (upstream #776)"
                         .to_owned()
                 }

@@ -90,6 +90,20 @@ pub enum Creation {
 /// fails on it: `Err(Error::Mxl { call: "mxlCreateFlowWriter", .. })`,
 /// which the caller counts as a create failure.
 pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
+    create_looking(instance, c, || true)
+}
+
+/// Supervisor side. [`create`], where whether a stale flow is still there
+/// after `mxlGarbageCollectFlows` is asked of `still_there` before
+/// `mxlIsFlowActive`, which looks the name up again and, the flow
+/// collected, on a file system that waits for a missing name waits: false
+/// creates the flow at once, as for no flow. A flow that survived though
+/// is opened, not created: [`Creation::Raced`].
+pub fn create_looking(
+    instance: &Arc<Instance>,
+    c: &OutputConfig,
+    still_there: impl FnOnce() -> bool,
+) -> Result<Creation> {
     let def = flow_definition(c)?;
     if c.block == 0 || c.batch < c.block {
         return Err(Error::Format(format!(
@@ -103,6 +117,9 @@ pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
         Some(true) => return Ok(Creation::Active),
         Some(false) => {
             let gc = instance.garbage_collect();
+            if !still_there() {
+                return create_writer(instance, c, def, true);
+            }
             match instance.is_flow_active(c.flow_id)? {
                 None => collected = true,
                 Some(true) => return Ok(Creation::Active),
@@ -115,8 +132,9 @@ pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
 
 /// Supervisor side. [`create`] for a flow whose directory a lookup did not
 /// find: `mxlCreateFlowWriter` without `mxlIsFlowActive` first, which
-/// would look the missing name up again. A flow created meanwhile is
-/// opened, not created: [`Creation::Raced`].
+/// would look the missing name up again. A flow there after all is
+/// opened, not created: [`Creation::Raced`]. A stale one is then removed
+/// when that writer is released, if this process may.
 pub fn create_new(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
     let def = flow_definition(c)?;
     if c.block == 0 || c.batch < c.block {
