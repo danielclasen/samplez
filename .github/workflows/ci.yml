@@ -72,6 +72,22 @@ jobs:
                 done
               done
             '
+      # deny.toml: the licences every dependency, dev-dependencies
+      # included, may carry.
+      - name: Dependency licences
+        env:
+          DENY: https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+        run: |
+          mkdir -p "$RUNNER_TEMP/deny"
+          curl -sSfL -o "$RUNNER_TEMP/deny.tgz" "$DENY"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $RUNNER_TEMP/deny.tgz" \
+            | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/deny.tgz" -C "$RUNNER_TEMP/deny" --strip-components=1
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
+            -v "$RUNNER_TEMP/deny/cargo-deny:/usr/local/bin/cargo-deny:ro" \
+            -w /w samplez-builder:ci \
+            cargo-deny --locked --workspace --all-features check licenses
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         name: Clean the workspace crates out of the cache
         run: |
