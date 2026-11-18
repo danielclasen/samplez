@@ -1690,17 +1690,19 @@ fn rebuild_at_the_floor(case: Floor) -> Result<(), String> {
     Ok(())
 }
 
-/// A command giving a gain the engine refuses leaves a live engine handed
-/// the records and one rebuilt from the product state past it computing
-/// the same pages: both silence the cell, where the live one would hold
-/// its previous gain and the rebuilt one, from a state holding no previous
-/// gain, silence it.
+/// A command giving a gain the engine refuses, NaN, an infinity or one
+/// past `MAX_GAIN`, leaves a live engine handed the records and one rebuilt
+/// from the product state past it computing the same pages: both silence
+/// the cell, where the live one would hold its previous gain and the
+/// rebuilt one, from a state holding no previous gain, silence it.
 #[test]
 fn a_refused_gain_leaves_a_live_and_a_rebuilt_engine_alike() {
-    undisturbed(refused_gain_live_and_rebuilt);
+    for gain in ["NaN", "inf", "2e6"] {
+        undisturbed(|| refused_gain_live_and_rebuilt(gain));
+    }
 }
 
-fn refused_gain_live_and_rebuilt() -> Result<(), String> {
+fn refused_gain_live_and_rebuilt(gain: &str) -> Result<(), String> {
     let domain = Domain::new();
     let _pilot = Pilot::start(&domain, CONSOLE_INPUT);
     let [(live, la), (rebuilt, ra)] = consoles(&domain);
@@ -1721,7 +1723,7 @@ fn refused_gain_live_and_rebuilt() -> Result<(), String> {
     };
     write(&mut m, "fader 0 0.5");
     ra.drop_engine();
-    write(&mut m, "fader 0 inf");
+    write(&mut m, &format!("fader 0 {gain}"));
     wait_for("the floor passed", || {
         processed_of(&rebuilt) > m.0.floor / B + 20
     });
@@ -1742,9 +1744,9 @@ fn refused_gain_live_and_rebuilt() -> Result<(), String> {
         return Err("an input block silenced".into());
     }
     let compared = equal_pages(&pages[0], &pages[1], from, end * B / PAGE)
-        .map_err(|e| format!("{e}: the live engine holds another gain"))?;
+        .map_err(|e| format!("{gain}: {e}: the live engine holds another gain"))?;
     if compared < 4 {
-        return Err(format!("{compared} pages compared"));
+        return Err(format!("{gain}: {compared} pages compared"));
     }
     Ok(())
 }

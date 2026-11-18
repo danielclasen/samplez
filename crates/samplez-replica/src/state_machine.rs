@@ -309,6 +309,9 @@ pub struct StateMachine<P> {
     /// leaves a coefficient at 0 as it is, so their outputs agree; their
     /// records need not.
     masked: Option<Vec<Vec<u8>>>,
+    /// How many target gains the last derived diff silenced
+    /// ([`StateMachine::targets`]), for the log alone.
+    silenced: usize,
     /// Not replicated: the records derived since start or load, by log
     /// index, kept [`RECORDS_KEPT`] past their index; shared, so a reader
     /// under the store lock copies none of a record's entries.
@@ -346,6 +349,7 @@ impl<P: Product> StateMachine<P> {
             protocol: 0,
             image: None,
             masked: None,
+            silenced: 0,
             records: BTreeMap::new(),
             records_from: 0,
         }
@@ -453,12 +457,17 @@ impl<P: Product> StateMachine<P> {
                 let Some((next, silenced)) = self.targets() else {
                     return;
                 };
-                if silenced > 0 {
-                    tracing::warn!(
-                        revision,
-                        silenced,
-                        "the product's targets hold gains an engine refuses: derived as silence"
-                    );
+                // Once per change of the count, not per entry while the
+                // product keeps such a gain.
+                if silenced != self.silenced {
+                    self.silenced = silenced;
+                    if silenced > 0 {
+                        tracing::warn!(
+                            revision,
+                            silenced,
+                            "the product's targets hold gains an engine refuses: derived as silence"
+                        );
+                    }
                 }
                 let entries = self.image.as_ref().map_or_else(
                     || samplez::Targets::default().diff(&next),
@@ -1962,6 +1971,10 @@ mod derive_tests {
         assert_eq!(sm.product_state(3).gains[0][0].to_bits(), 0.0f32.to_bits());
         sm.apply_at(4, 1, &one("4", "fader 0 0.25", 144, 1104, None));
         assert_eq!(gains(&sm.records[&4]), [(0, 0, 0.25f32.to_bits())]);
+        // Past MAX_GAIN, finite.
+        sm.apply_at(5, 1, &one("5", "fader 0 2e6", 192, 1152, None));
+        assert_eq!(gains(&sm.records[&5]), [(0, 0, 0.0f32.to_bits())]);
+        assert_eq!(sm.product_state(5).gains[0][0].to_bits(), 0.0f32.to_bits());
     }
 
     /// A VCA move derives every member coefficient as fader times VCA,
