@@ -28,13 +28,13 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::TypeConfig;
 use crate::dedup::Limits;
 use crate::entry::{Body, NodeId, Request, Response};
 use crate::snapshot::{
     StoredEntry, StoredLogId, StoredMembershipConfig, StoredPayload, StoredSnapshot, StoredVote,
 };
 use crate::state_machine::{Factory, Product, StateMachine};
+use crate::{MAX_APPEND_BYTES, TypeConfig};
 
 type Error = StorageError<NodeId>;
 
@@ -622,6 +622,40 @@ impl<P: Product> RaftLogReader<TypeConfig> for Store<P> {
             .map(|(_, e)| e.into())
             .collect())
     }
+
+    /// The entries of `[start, end)` up to [`MAX_APPEND_BYTES`] of
+    /// commands beside the first, which is always taken: what one
+    /// AppendEntries carries.
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<openraft::Entry<TypeConfig>>, Error> {
+        let inner = self.lock();
+        let mut bytes = 0;
+        Ok(inner
+            .log
+            .range(start..end)
+            .enumerate()
+            .take_while(|(i, (_, e))| {
+                bytes += command_bytes(e);
+                *i == 0 || bytes <= MAX_APPEND_BYTES
+            })
+            .map(|(_, (_, e))| e.into())
+            .collect())
+    }
+}
+
+/// The command bytes ([`crate::entry::Command::size`]) an entry carries;
+/// 0 for an entry without commands.
+fn command_bytes(entry: &StoredEntry) -> usize {
+    match &entry.payload {
+        StoredPayload::Normal(Request {
+            body: Body::Commands(commands),
+            ..
+        }) => commands.iter().map(|c| c.size()).sum(),
+        _ => 0,
+    }
 }
 
 impl<P: Product> RaftSnapshotBuilder<TypeConfig> for Store<P> {
@@ -961,6 +995,46 @@ mod tests {
                 assert!(Arc::ptr_eq(r, &sm.records[i]));
             }
         });
+    }
+
+    /// One AppendEntries takes every entry written since the last up to
+    /// [`MAX_APPEND_BYTES`] of commands, so a follower whose fsync takes
+    /// longer than the gap between small entries catches up in one; and
+    /// at least the first entry, whatever its size.
+    #[tokio::test]
+    async fn an_append_carries_entries_up_to_its_byte_bound() {
+        let dir = dir("limited");
+        let mut store = open(&dir);
+        // An entry of one command of `size` bytes.
+        let sized = |index: u64, size: usize| {
+            let mut c = command("s", &index.to_string(), "");
+            c.body = vec![b'x'; size - c.size()];
+            assert_eq!(c.size(), size);
+            openraft::Entry {
+                log_id: id(index),
+                payload: EntryPayload::Normal(Request {
+                    stamp: 0,
+                    body: Body::Commands(vec![c]),
+                }),
+            }
+        };
+        let quarter = MAX_APPEND_BYTES / 4;
+        let entries = (1..=64)
+            .map(|i| sized(i, 100))
+            .chain((65..=70).map(|i| sized(i, quarter)))
+            .chain([sized(71, MAX_APPEND_BYTES + 1), sized(72, 100)]);
+        store.append_to_log(entries).await.expect("append");
+        let taken = async |store: &mut Store<Paths>, start, end| {
+            let entries = store.limited_get_log_entries(start, end).await;
+            (entries.expect("entries").iter())
+                .map(|e| e.log_id.index)
+                .collect::<Vec<u64>>()
+        };
+        assert_eq!(taken(&mut store, 1, 65).await, (1..=64).collect::<Vec<_>>());
+        assert_eq!(taken(&mut store, 65, 73).await, [65, 66, 67, 68]);
+        assert_eq!(taken(&mut store, 64, 73).await, [64, 65, 66, 67]);
+        assert_eq!(taken(&mut store, 71, 73).await, [71]);
+        assert_eq!(taken(&mut store, 72, 73).await, [72]);
     }
 
     #[tokio::test]

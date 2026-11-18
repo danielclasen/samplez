@@ -84,15 +84,22 @@ pub const MAX_ENTRY_BYTES: usize = 32 << 10;
 /// The commands one entry carries at most.
 pub const MAX_ENTRY_COMMANDS: usize = 64;
 
-/// The entries one AppendEntries carries at most. openraft gives an
-/// AppendEntries the heartbeat interval to complete; at this count and
-/// [`MAX_ENTRY_BYTES`] one carries about 128 KiB of commands, a third
-/// more encoded.
-pub const MAX_PAYLOAD_ENTRIES: u64 = 4;
+/// The entries one AppendEntries carries at most.
+pub const MAX_PAYLOAD_ENTRIES: u64 = 64;
+
+/// The command bytes ([`Command::size`]) one AppendEntries carries at
+/// most beside its first entry, about 128 KiB, a third more encoded:
+/// openraft gives an AppendEntries the heartbeat interval to complete.
+/// Counting bytes rather than entries lets one AppendEntries, and so one
+/// fsync on a follower, take every small entry written since the last
+/// one, so a follower whose fsync takes longer than the gap between
+/// entries does not fall further behind with each of them.
+pub const MAX_APPEND_BYTES: usize = 4 * MAX_ENTRY_BYTES;
 
 /// openraft's timers as the chart pins them (`replica.raft`): its 0.9.21
 /// defaults, so the election figures do not move with a dependency
-/// update; and [`MAX_PAYLOAD_ENTRIES`].
+/// update; and [`MAX_PAYLOAD_ENTRIES`], which [`MAX_APPEND_BYTES`]
+/// bounds further.
 pub fn raft_config(cluster: &str) -> openraft::Config {
     openraft::Config {
         cluster_name: cluster.to_owned(),

@@ -454,9 +454,13 @@ the replica, and the record's index is the one contact lists and awaits
 the entry at from its append on, the floor being a function of the log
 prefix. An entry not applied by its apply deadline is unresolved and its
 record never handed, however early reports made its commit known; the
-log decides it. `EngineAudio` leaves out of a record the entries its
-engine refuses, and of the `InputUp`s and `Route`s of several input
-domains those not of the lowest slot's, before it appends it: the
+log decides it. One AppendEntries carries up to
+`MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
+than the gap between entries takes every entry written meanwhile with
+one fsync rather than falling further behind. `EngineAudio` leaves out
+of a record the entries its engine refuses, and of the `InputUp`s and
+`Route`s of several input domains those not of the lowest slot's,
+before it appends it: the
 engine's configuration decides that alike on every replica of a key, so
 the outputs still agree, and it is counted in `entries_filtered` and
 logged as the product's fault. A resync's joiner replays the records of

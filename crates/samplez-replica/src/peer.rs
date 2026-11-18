@@ -28,8 +28,8 @@ use crate::state_machine::Product;
 use crate::{Replica, net};
 
 /// The largest request the peer listener takes: above openraft's 3 MiB
-/// snapshot chunks and an AppendEntries of [`crate::MAX_PAYLOAD_ENTRIES`]
-/// entries of [`crate::MAX_ENTRY_BYTES`].
+/// snapshot chunks and an AppendEntries of [`crate::MAX_APPEND_BYTES`]
+/// of commands beside one entry of [`crate::MAX_ENTRY_BYTES`].
 pub const MAX_BODY: usize = 8 << 20;
 
 /// The largest answer a replica reads: [`MAX_BODY`] beside the largest
