@@ -330,7 +330,24 @@ fn the_supervisor_moves_the_engines_blocks_through_the_bridge() {
         (p.saturating_sub(4)..=p)
             .find(|&k| audio.status(0, k).is_some_and(|s| s.kind == Kind::Held))
     };
-    wait_for("a held block", || held(&audio).is_some());
+    // A failure names what the engine computed instead: one seen on CI
+    // could not be reproduced.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while held(&audio).is_none() {
+        if Instant::now() >= deadline {
+            let p = engine.progress().unwrap().processed.unwrap_or(0);
+            let kinds: Vec<_> = (p.saturating_sub(8)..=p)
+                .map(|k| (k, audio.status(0, k).map(|s| (s.kind, s.cause, s.rank))))
+                .collect();
+            let s = engine.status();
+            panic!(
+                "no held block within 10 s: statuses {kinds:?}, input {:?}, standing {:?}",
+                s.inputs[0],
+                audio.sample().own.standing
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let k = held(&audio).unwrap();
     assert_eq!(audio.status(0, k).unwrap().rank, 3);
     assert!(matches!(
