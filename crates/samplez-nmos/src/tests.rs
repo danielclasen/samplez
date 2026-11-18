@@ -565,6 +565,8 @@ fn the_model_is_checked() {
     refuse(&|_, c| c.seed.clear());
     refuse(&|_, c| c.asset.functions.clear());
     refuse(&|_, c| c.asset.manufacturer.clear());
+    refuse(&|_, c| c.registries = vec!["https://192.0.2.1:8443".into()]);
+    refuse(&|_, c| c.registries = vec!["http://192.0.2.1".into(), "192.0.2.2:80".into()]);
     // One resource per role in a BCP-002-01 group, and no colon in it.
     refuse(&|m, _| {
         let mut s = m.senders[0].clone();

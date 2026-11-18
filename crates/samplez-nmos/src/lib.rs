@@ -409,6 +409,13 @@ fn check(model: &NodeModel, cfg: &NmosConfig) -> Result<(), Error> {
     {
         return fail("every asset tag needs a value and the device a function".into());
     }
+    // reqwest is built without TLS: an https registry could never be
+    // reached.
+    if let Some(r) = cfg.registries.iter().find(|r| !r.starts_with("http://")) {
+        return fail(format!(
+            "registry {r:?}: only http:// is supported, the node has no TLS client"
+        ));
+    }
     // Every sender has the role `Audio out` and every receiver `Audio in`
     // in its group, and BCP-002-01 allows one resource per role in a
     // group; the colon separates the group from the role.

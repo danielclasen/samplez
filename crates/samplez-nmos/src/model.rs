@@ -93,7 +93,8 @@ pub struct NmosConfig {
     /// each request to it.
     pub heartbeat: Duration,
     /// Registration APIs to use, `http://host:port`, tried in this order;
-    /// none browses DNS-SD.
+    /// none browses DNS-SD. The node has no TLS client, so `https://` is
+    /// refused.
     pub registries: Vec<String>,
     /// The unicast DNS-SD domain to browse; `None` browses each search
     /// domain of the system resolver.

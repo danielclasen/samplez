@@ -115,8 +115,15 @@ pub(crate) async fn run(inner: Arc<Inner>) {
     let mut posted: BTreeMap<Uuid, String> = BTreeMap::new();
     let mut registered_once = false;
     let mut backoff = BACKOFF_MIN;
+    // The registry the node just failed over from, tried last in the next
+    // round.
+    let mut failed: Option<String> = None;
     loop {
-        let found = discovery.find().await;
+        let mut found = discovery.find().await;
+        if let Some(f) = failed.take() {
+            let (rest, last): (Vec<_>, Vec<_>) = found.into_iter().partition(|r| r.base != f);
+            found = rest.into_iter().chain(last).collect();
+        }
         if found.is_empty() {
             tracing::debug!("nmos: no registry found");
             sleep(RE_BROWSE).await;
@@ -146,12 +153,16 @@ pub(crate) async fn run(inner: Arc<Inner>) {
                     continue;
                 }
             };
-            if still_held {
-                posted.clear();
-            } else if register_all(&inner, &client, &registry.base, &mut posted)
-                .await
-                .is_err()
-            {
+            // A registry that still holds the node gets a heartbeat only,
+            // as IS-04 asks, then every resource whose version it has not
+            // seen: the change whose POST failed the last registry, and any
+            // made since.
+            let joined = if still_held {
+                post_changed(&inner, &client, &registry.base, &mut posted, false).await
+            } else {
+                register_all(&inner, &client, &registry.base, &mut posted).await
+            };
+            if joined.is_err() {
                 continue;
             }
             registered_once = true;
@@ -162,6 +173,7 @@ pub(crate) async fn run(inner: Arc<Inner>) {
             let Err(Leave::Failover) = maintain(&inner, &client, &registry.base, &mut posted).await;
             *inner.registry.lock().unwrap_or_else(|e| e.into_inner()) = None;
             tracing::warn!(registry = %registry.base, "nmos: the registry failed; trying another");
+            failed = Some(registry.base.clone());
             break;
         }
         if !served {

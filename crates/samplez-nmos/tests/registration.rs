@@ -47,6 +47,8 @@ enum Mode {
     Down,
     /// Every resource POST 200, as for a node still registered.
     FirstRegistration,
+    /// No request is ever answered.
+    Hang,
 }
 
 #[derive(Default)]
@@ -56,6 +58,10 @@ struct Mock {
     mode: Option<Mode>,
     /// Answers for the next heartbeats, before the mode applies.
     next_heartbeats: Vec<(StatusCode, Option<String>)>,
+    /// Answers for the next resource POSTs, before the mode applies.
+    next_posts: Vec<(StatusCode, Option<String>)>,
+    /// Resources of this type are refused with 400.
+    refuse: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -95,6 +101,14 @@ impl Registry {
             .push((status, location));
     }
 
+    fn next_post(&self, status: StatusCode, location: Option<String>) {
+        self.state
+            .lock()
+            .unwrap()
+            .next_posts
+            .push((status, location));
+    }
+
     fn seen(&self) -> Vec<Seen> {
         self.state.lock().unwrap().seen.clone()
     }
@@ -111,26 +125,36 @@ async fn answer(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut m = state.lock().unwrap();
     let path = uri.path().to_owned();
-    m.seen.push(Seen {
-        at: Instant::now(),
-        method: method.clone(),
-        path: path.clone(),
-        headers,
-        body: body.clone(),
-    });
+    let hang = {
+        let mut m = state.lock().unwrap();
+        m.seen.push(Seen {
+            at: Instant::now(),
+            method: method.clone(),
+            path: path.clone(),
+            headers,
+            body: body.clone(),
+        });
+        m.mode == Some(Mode::Hang)
+    };
+    if hang {
+        std::future::pending::<()>().await;
+    }
+    let mut m = state.lock().unwrap();
+    let reply = |status: StatusCode, location: Option<String>| {
+        let mut r = status.into_response();
+        if let Some(l) = location {
+            r.headers_mut().insert(header::LOCATION, l.parse().unwrap());
+        }
+        r
+    };
     if m.mode == Some(Mode::Down) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     if path.contains("/health/nodes/") {
         if !m.next_heartbeats.is_empty() {
             let (status, location) = m.next_heartbeats.remove(0);
-            let mut r = status.into_response();
-            if let Some(l) = location {
-                r.headers_mut().insert(header::LOCATION, l.parse().unwrap());
-            }
-            return r;
+            return reply(status, location);
         }
         let id = path.rsplit('/').next().unwrap();
         return if m.ids.contains(id) {
@@ -143,7 +167,14 @@ async fn answer(
         m.ids.clear();
         return StatusCode::NO_CONTENT.into_response();
     }
+    if !m.next_posts.is_empty() {
+        let (status, location) = m.next_posts.remove(0);
+        return reply(status, location);
+    }
     let v: Value = serde_json::from_slice(&body).unwrap();
+    if m.refuse == v["type"].as_str() {
+        return reply(StatusCode::BAD_REQUEST, None);
+    }
     let id = v["data"]["id"].as_str().unwrap().to_owned();
     let known = !m.ids.insert(id) || m.mode == Some(Mode::FirstRegistration);
     let status = if known {
@@ -412,13 +443,76 @@ async fn a_failing_registry_hands_over_to_the_next_with_a_heartbeat_first() {
     tokio::time::sleep(HEARTBEAT * 2).await;
     task.abort();
     let seen = b.seen();
-    // b held the node, so nothing is posted to it.
+    // b held the node and nothing changed, so nothing is posted to it
+    // (IS-04-01 test_16).
     assert!(seen[0].is_heartbeat());
     assert!(types(&seen).is_empty());
     assert_eq!(
         n.status().registry,
         Some(format!("{}/x-nmos/registration/v1.3", b.url))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_that_failed_a_registry_reaches_the_next() {
+    let (a, b) = (
+        Registry::start(Mode::Up).await,
+        Registry::start(Mode::Up).await,
+    );
+    let n = node(&[&a, &b], Duration::ZERO);
+    let task = tokio::spawn(n.registration());
+    until("a heartbeat on a", || {
+        a.seen().iter().any(Seen::is_heartbeat)
+    })
+    .await;
+    b.state.lock().unwrap().ids = a.state.lock().unwrap().ids.clone();
+    a.set(Mode::Down);
+    let switched = Active {
+        master_enable: true,
+        peer: None,
+        domain: Some(uuid!("11111111-2222-4333-8444-555555555555")),
+        flow: Some(uuid!("cccccccc-0000-4000-8000-000000000001")),
+    };
+    // The POST of this change is what finds a down.
+    n.external_change(Port::Receiver(0), switched);
+    until("the receiver on b", || !types(&b.seen()).is_empty()).await;
+    tokio::time::sleep(HEARTBEAT).await;
+    task.abort();
+    // Right after the heartbeat that showed b holds the node, and only the
+    // resource that changed.
+    let seen = b.seen();
+    assert!(seen[0].is_heartbeat(), "{seen:?}");
+    assert!(seen[1].is_post(), "{seen:?}");
+    assert_eq!(types(&seen), ["receiver"]);
+    assert_eq!(seen[1].json()["data"]["subscription"]["active"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_registry_just_failed_is_tried_last() {
+    let (a, b) = (
+        Registry::start(Mode::Up).await,
+        Registry::start(Mode::Up).await,
+    );
+    let n = node(&[&a, &b], Duration::ZERO);
+    let task = tokio::spawn(n.registration());
+    until("a heartbeat on a", || {
+        a.seen().iter().any(Seen::is_heartbeat)
+    })
+    .await;
+    b.state.lock().unwrap().ids = a.state.lock().unwrap().ids.clone();
+    a.clear();
+    a.set(Mode::Down);
+    until("a heartbeat on b", || {
+        b.seen().iter().any(Seen::is_heartbeat)
+    })
+    .await;
+    tokio::time::sleep(HEARTBEAT).await;
+    task.abort();
+    // The heartbeat that failed, and nothing after it: the next round went
+    // to b first.
+    let seen = a.seen();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(seen[0].is_heartbeat());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -539,4 +633,100 @@ async fn unregister_deletes_the_node() {
         )
     );
     assert_eq!(n.status().registry, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_409_on_a_post_unregisters_at_the_other_version_and_posts_again() {
+    let r = Registry::start(Mode::Up).await;
+    let n = node(&[&r], Duration::ZERO);
+    let id = n.node_id();
+    r.next_post(
+        StatusCode::CONFLICT,
+        Some(format!("/x-nmos/registration/v1.2/resource/nodes/{id}")),
+    );
+    let task = tokio::spawn(n.registration());
+    until("a heartbeat", || r.seen().iter().any(Seen::is_heartbeat)).await;
+    task.abort();
+    let seen = r.seen();
+    let calls: Vec<(String, String)> = seen
+        .iter()
+        .take(3)
+        .map(|s| (s.method.to_string(), s.path.clone()))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("POST".into(), "/x-nmos/registration/v1.3/resource".into()),
+            (
+                "DELETE".into(),
+                format!("/x-nmos/registration/v1.2/resource/nodes/{id}")
+            ),
+            ("POST".into(), "/x-nmos/registration/v1.3/resource".into()),
+        ]
+    );
+    assert_eq!(
+        types(&seen),
+        [
+            "node", "node", "device", "source", "flow", "sender", "receiver", "receiver"
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_resource_is_not_sent_again_unchanged() {
+    let r = Registry::start(Mode::Up).await;
+    r.state.lock().unwrap().refuse = Some("device");
+    let n = node(&[&r], Duration::ZERO);
+    let task = tokio::spawn(n.registration());
+    until("two heartbeats", || {
+        r.seen().iter().filter(|s| s.is_heartbeat()).count() >= 2
+    })
+    .await;
+    // The registration went on past the refusal and stayed on r.
+    assert_eq!(
+        types(&r.seen()),
+        [
+            "node", "device", "source", "flow", "sender", "receiver", "receiver"
+        ]
+    );
+    r.clear();
+    let switched = Active {
+        master_enable: true,
+        peer: None,
+        domain: Some(uuid!("11111111-2222-4333-8444-555555555555")),
+        flow: Some(uuid!("cccccccc-0000-4000-8000-000000000001")),
+    };
+    n.external_change(Port::Receiver(0), switched);
+    until("the receiver", || !types(&r.seen()).is_empty()).await;
+    tokio::time::sleep(HEARTBEAT).await;
+    task.abort();
+    assert_eq!(types(&r.seen()), ["receiver"]);
+    assert_eq!(
+        n.status().registry,
+        Some(format!("{}/x-nmos/registration/v1.3", r.url))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_registry_fails_over_after_the_timeout_a_503_at_once() {
+    for (mode, waited) in [(Mode::Hang, true), (Mode::Down, false)] {
+        let (a, b) = (Registry::start(mode).await, Registry::start(Mode::Up).await);
+        let n = node(&[&a, &b], Duration::ZERO);
+        let task = tokio::spawn(n.registration());
+        until("registered on b", || types(&b.seen()).len() == 7).await;
+        task.abort();
+        let asked = a.seen()[0].at;
+        let gap = b.seen()[0].at - asked;
+        // The request timeout is the heartbeat period; it starts as the
+        // request leaves, a little before the registry sees it.
+        if waited {
+            assert!(
+                gap >= HEARTBEAT * 3 / 4 && gap < HEARTBEAT * 2,
+                "{mode:?}: {gap:?}"
+            );
+        } else {
+            assert!(gap < HEARTBEAT / 2, "{mode:?}: {gap:?}");
+        }
+        assert_eq!(a.seen().len(), 1, "{mode:?}");
+    }
 }
