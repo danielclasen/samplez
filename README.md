@@ -534,32 +534,33 @@ on the slack every counted audio replica reports at its apply-hand, up
 to `maxApplyLead`; a replica that still applies past the deadline at the
 cap holds those entries unresolved alone, and the leader's contact
 metrics name it (`apply_lead_raised_by`). A replica catching up, its log
-having taken no entry before the entry's deadline since it started or
-installed a snapshot, as one restarted takes those written meanwhile,
-holds none of those it took past the deadline unresolved while it is in
-`starting`, or `withdrawn` with outputs none of which commits: its
-engine is rebuilt from the state applied past them, as after a snapshot
-install, one rebuild at a time, the entries taken late while one runs
-going into the next (`late_rebuilds` in the contact metrics). A replica
-with no outputs or with one committing, and one taking entries late
-after it took one in time, holds them unresolved. One AppendEntries
-carries up to `MAX_APPEND_BYTES` of commands, so a follower whose fsync
-takes longer than the gap between entries takes every entry written
-meanwhile with one fsync rather than falling further behind.
-`EngineAudio` leaves out of a record the entries its engine refuses, and
-of the `InputUp`s and `Route`s of several input domains those not of the
-lowest slot's, before it appends it: the engine's configuration decides
-that alike on every replica of a key, so the outputs still agree, and it
-is counted in `entries_filtered` and logged as the product's fault. A
-resync's joiner replays the records of the entries applied after the
-donor core's last log id; one it no longer holds, past the second kept
-or before a snapshot it loaded, fails the attempt, which is retried on a
-newer core. A client command that would re-route an input
-(`Product::reroutes`) is ordered alone on the generation path, stamped
-the lead and the longest build time a counted replica reports past its
-stamp, since its generation is built once it applies; one asking for an
-index beyond the earliest is refused. Such a product owns every input's
-flow: `Replica::append` refuses a `Route` or `MasterEnable` for it.
+having taken no entry past the commit index the first voter report named
+before that entry's deadline since it started or installed a snapshot,
+as one restarted takes the entries written meanwhile, holds none of
+those it took past the deadline unresolved while it is in `starting`, or
+`withdrawn` with outputs none of which commits: its engine is rebuilt
+from the state applied past them, as after a snapshot install, one
+rebuild at a time, the entries taken late while one runs going into the
+next (`late_rebuilds` in the contact metrics). A replica with no outputs
+or with one committing, and one taking entries late after it caught up,
+holds them unresolved. One AppendEntries carries up to
+`MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
+than the gap between entries takes every entry written meanwhile with
+one fsync rather than falling further behind. `EngineAudio` leaves out
+of a record the entries its engine refuses, and of the `InputUp`s and
+`Route`s of several input domains those not of the lowest slot's, before
+it appends it: the engine's configuration decides that alike on every
+replica of a key, so the outputs still agree, and it is counted in
+`entries_filtered` and logged as the product's fault. A resync's joiner
+replays the records of the entries applied after the donor core's last
+log id; one it no longer holds, past the second kept or before a
+snapshot it loaded, fails the attempt, which is retried on a newer core.
+A client command that would re-route an input (`Product::reroutes`) is
+ordered alone on the generation path, stamped the lead and the longest
+build time a counted replica reports past its stamp, since its
+generation is built once it applies; one asking for an index beyond the
+earliest is refused. Such a product owns every input's flow:
+`Replica::append` refuses a `Route` or `MasterEnable` for it.
 
 A replica's store builds its empty product with the `Factory` it is
 given, at open and for every snapshot it installs, so the product keeps
@@ -568,24 +569,23 @@ so every member, learners and the witness included, needs equal
 configuration as far as it changes how a command applies or a saved
 state loads (`Product::config_hash`). The checks detect a difference;
 they do not undo it. Reports carry the hash, a learner's too, sent to
-every voter, which takes its hash and protocol alone: the leader orders no
-client command while a voter or a learner reports another one
+every voter, which takes its hash and protocol alone: the leader orders
+no client command while a voter or a learner reports another one
 (`unavailable`, naming it), until that member reports the set's hash or
-leaves the membership, and promotes no learner of another hash. A
-report without a hash, from a replica that records none, names none. A
-snapshot carries its sender's hash: a replica of another hash refuses
-it before anything is written and exits with status 78, so it restarts
-visibly; restarted under the set's configuration it installs the
-snapshot; an embedder chooses otherwise with
-`Store::on_config_mismatch`. The replica whose hash differs from the
-others' is the one to fix, and it may be the sender: a lagging replica
-of the set's configuration exits on a snapshot from one that is not.
-Each replica's hash is in its contact metrics (`config_hash`). A store
-warns at open when its snapshot was built under another hash: expected
-once after a change made with every replica stopped; otherwise the
-replica ran under another configuration than the set's, holds another
-state and is rebuilt from an empty volume. A configuration change of that kind is made with every
-replica stopped.
+leaves the membership, and promotes no learner of another hash. A report
+without a hash, from a replica that records none, names none. A snapshot
+carries its sender's hash: a replica of another hash refuses it before
+anything is written and exits with status 78, so it restarts visibly;
+restarted under the set's configuration it installs the snapshot; an
+embedder chooses otherwise with `Store::on_config_mismatch`. The replica
+whose hash differs from the others' is the one to fix, and it may be the
+sender: a lagging replica of the set's configuration exits on a snapshot
+from one that is not. Each replica's hash is in its contact metrics
+(`config_hash`). A store warns at open when its snapshot was built under
+another hash: expected once after a change made with every replica
+stopped; otherwise the replica ran under another configuration than the
+set's, holds another state and is rebuilt from an empty volume. A
+configuration change of that kind is made with every replica stopped.
 
 A replica set agrees on its cluster id through the marker ConfigMap that
 ordinal 0 creates on an empty volume (`bootstrap::Kube`). Given the audio

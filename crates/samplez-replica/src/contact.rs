@@ -616,9 +616,14 @@ struct State {
     /// The appended entries not applied yet that need a generation, by
     /// log index, with the index they take effect at.
     generations: BTreeMap<u64, u64>,
-    /// Since the start or the last snapshot install this log appended no
-    /// entry before its apply deadline: the replica is catching up.
+    /// Since the start or the last snapshot install this log has taken no
+    /// entry past `catch_up_to` before the entry's apply deadline: the
+    /// replica is catching up.
     catching_up: bool,
+    /// The committed index the first voter report named while catching
+    /// up: the entries up to it were written before the replica could take
+    /// them, whatever lead each was stamped with.
+    catch_up_to: Option<u64>,
     /// The entries not applied yet that this log took past their apply
     /// deadline while catching up, by log index.
     taken_late: BTreeSet<u64>,
@@ -928,6 +933,7 @@ impl Contact {
                 reserved: None,
                 generations: BTreeMap::new(),
                 catching_up: true,
+                catch_up_to: None,
                 taken_late: BTreeSet::new(),
                 late_given: BTreeSet::new(),
                 rebuilt_past: BTreeSet::new(),
@@ -1162,6 +1168,9 @@ impl Contact {
             }
         }
         self.learn(st, learned);
+        if st.catching_up && st.catch_up_to.is_none() {
+            st.catch_up_to = Some(committed_index);
+        }
         for l in &report.listed {
             if l.baseline {
                 st.baselines.listed(l.id, l.at_index);
@@ -1222,6 +1231,10 @@ impl Contact {
         st.members = members;
         self.expire(st, tai);
         self.sync_log(st, tai);
+        // Alone, no voter names a commit to catch up to.
+        if voters.len() == 1 && voters.contains(&self.id) {
+            st.catching_up = false;
+        }
         let applied = self.log.applied();
         self.learn(st, applied);
 
@@ -1553,9 +1566,14 @@ impl Contact {
             }
             if let Some(at) = at {
                 st.scheduled.insert(id.index, (id, at, stamp, false));
-                if tai < self.timing.apply_deadline(at) {
+                let late = tai >= self.timing.apply_deadline(at);
+                // Caught up once an entry past the commit named when
+                // catching up began is taken in time; one before it may
+                // be in time on a longer lead, a generation's, alone.
+                if !late && st.catch_up_to.is_some_and(|to| id.index > to) {
                     st.catching_up = false;
-                } else if st.catching_up {
+                }
+                if st.catching_up && late {
                     st.taken_late.insert(id.index);
                 }
                 self.note(st, id, at, tai);
@@ -1629,6 +1647,7 @@ impl Contact {
         st.uncommitted.clear();
         st.generations.clear();
         st.catching_up = true;
+        st.catch_up_to = None;
         st.taken_late.clear();
         st.late_given.clear();
         st.rebuilt_past.clear();
@@ -4184,21 +4203,33 @@ mod tests {
         f.contact.tick(f.members.clone());
     }
 
-    /// A replica that took an entry in time and then takes every entry
-    /// past its deadline, as a log at the lead cap with a slow disk does,
-    /// is not catching up: it holds them unresolved and keeps its core. A
-    /// rebuild past each would leave it without a core while the lateness
-    /// lasts. Once entries come in time again they are handed.
+    /// A report from voter 2 naming `index` committed.
+    fn committed_at(f: &Fixture, index: u64) {
+        f.clock.add(Duration::from_millis(1));
+        let mut r = f.report(2, None);
+        r.committed = Some(id(1, index));
+        f.contact.receive(r);
+    }
+
+    /// A replica that took an entry in time past the commit the voters
+    /// named and then takes every entry past its deadline, as a log at the lead cap with
+    /// a slow disk does, is not catching up: it holds them unresolved and
+    /// keeps its core. A rebuild past each would leave it without a core
+    /// while the lateness lasts. Once entries come in time again they are
+    /// handed.
     #[tokio::test(start_paused = true)]
     async fn a_replica_late_after_catching_up_keeps_its_core() {
         let f = fixture(&[&[1, 2, 3]]);
         f.engine.outputs.store(true, Ordering::SeqCst);
         f.tick();
         take(&f, 1, false);
+        committed_at(&f, 1);
+        take(&f, 2, false);
         f.tick();
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert!(!f.contact.lock().catching_up);
         f.engine.calls();
-        for index in 2..=20 {
+        for index in 3..=21 {
             take(&f, index, true);
             f.tick();
             assert_eq!(f.state(), Some(ReplicaState::Withdrawn), "entry {index}");
@@ -4210,9 +4241,9 @@ mod tests {
         );
         assert_eq!(f.contact.metrics().late_rebuilds, 0);
         assert_eq!(f.contact.lock().given.len(), 19, "held unresolved");
-        take(&f, 21, false);
+        take(&f, 22, false);
         f.tick();
-        assert!(f.engine.calls().contains(&"appended 21".to_owned()));
+        assert!(f.engine.calls().contains(&"appended 22".to_owned()));
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
     }
 
@@ -4238,6 +4269,7 @@ mod tests {
         f.tick();
         assert_eq!(f.contact.metrics().late_rebuilds, 2, "folded once it ended");
         assert!(f.contact.lock().given.is_empty());
+        committed_at(&f, 10);
         take(&f, 11, false);
         f.tick();
         f.tick();
@@ -4245,6 +4277,53 @@ mod tests {
         assert_eq!(f.contact.metrics().late_rebuilds, 2);
         let st = f.contact.lock();
         assert!(st.given.is_empty() && st.late_given.is_empty() && !st.catching_up);
+    }
+
+    /// An entry taken in time while catching up, as one stamped with a
+    /// generation's build lead on top of the lead can be, does not end the
+    /// catch-up: the entries after it up to the commit the voters named
+    /// were written before the replica could take them, and those it
+    /// takes past their deadlines are rebuilt past, not held unresolved.
+    /// One in time past that commit ends it.
+    #[tokio::test(start_paused = true)]
+    async fn an_entry_in_time_ends_no_catch_up_before_the_named_commit() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        committed_at(&f, 5);
+        take(&f, 1, false);
+        for index in 2..=5 {
+            take(&f, index, true);
+        }
+        f.contact.await_rebuild();
+        f.tick();
+        f.tick();
+        let rebuilds = f.contact.metrics().late_rebuilds;
+        assert!(rebuilds >= 1, "rebuilt past 2..=5");
+        let st = f.contact.lock();
+        assert!(
+            st.given.is_empty() && st.late_given.is_empty(),
+            "{:?}",
+            st.given
+        );
+        drop(st);
+        for _ in 0..3 {
+            f.tick();
+        }
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        take(&f, 6, false);
+        assert!(
+            !f.contact.lock().catching_up,
+            "in time past the named commit"
+        );
+        take(&f, 7, true);
+        f.tick();
+        assert_eq!(
+            f.contact.metrics().late_rebuilds,
+            rebuilds,
+            "7 held unresolved"
+        );
+        assert_eq!(f.contact.lock().given.len(), 1);
     }
 
     /// What an entry derived reaches the engine as it applies, not as it
