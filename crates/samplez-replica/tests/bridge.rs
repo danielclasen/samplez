@@ -1689,3 +1689,64 @@ fn rebuild_at_the_floor(case: Floor) -> Result<(), String> {
     assert_eq!(rebuilt.counters().command_late.load(Ordering::Relaxed), 0);
     Ok(())
 }
+
+/// A command giving a gain the engine refuses, NaN, an infinity or one
+/// past `MAX_GAIN`, leaves a live engine handed the records and one rebuilt
+/// from the product state past it computing the same pages: both silence
+/// the cell, where the live one would hold its previous gain and the
+/// rebuilt one, from a state holding no previous gain, silence it.
+#[test]
+fn a_refused_gain_leaves_a_live_and_a_rebuilt_engine_alike() {
+    for gain in ["NaN", "inf", "2e6"] {
+        undisturbed(|| refused_gain_live_and_rebuilt(gain));
+    }
+}
+
+fn refused_gain_live_and_rebuilt(gain: &str) -> Result<(), String> {
+    let domain = Domain::new();
+    let _pilot = Pilot::start(&domain, CONSOLE_INPUT);
+    let [(live, la), (rebuilt, ra)] = consoles(&domain);
+    let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
+    let silenced_before = silenced(&live) + silenced(&rebuilt);
+    let mut m = Machine::new(CONSOLE_INPUT);
+    let index = std::cell::Cell::new(0u64);
+    let write = |m: &mut Machine, body: &str| {
+        index.set(index.get() + 1);
+        let index = index.get();
+        let stamp = processed_of(&live).max(processed_of(&rebuilt)) * B;
+        let r = m.apply(index, stamp, stamp + 40 * B, body);
+        for audio in [&la, &ra] {
+            audio.appended(index, r.at_index, &r.entries);
+            audio.committed(index);
+        }
+        r
+    };
+    write(&mut m, "fader 0 0.5");
+    ra.drop_engine();
+    write(&mut m, &format!("fader 0 {gain}"));
+    wait_for("the floor passed", || {
+        processed_of(&rebuilt) > m.0.floor / B + 20
+    });
+    let state = m.0.product_state(index.get());
+    if !ra.rebuild_engine(&state, m.0.floor) {
+        return Err("not rebuilt".into());
+    }
+    let installed = processed_of(&rebuilt);
+    let mut last = 0;
+    for n in 0..4 {
+        last = write(&mut m, &format!("fader 1 0.{}", n + 2)).at_index;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let from = ((installed + 1) * B + 2 * 480).div_ceil(PAGE) + 2;
+    let end = (last + 480) / B + 4 * PAGE / B;
+    let pages = pages_until(&[(&live, &la), (&rebuilt, &ra)], end + PAGE / B)?;
+    if silenced(&live) + silenced(&rebuilt) > silenced_before {
+        return Err("an input block silenced".into());
+    }
+    let compared = equal_pages(&pages[0], &pages[1], from, end * B / PAGE)
+        .map_err(|e| format!("{gain}: {e}: the live engine holds another gain"))?;
+    if compared < 4 {
+        return Err(format!("{gain}: {compared} pages compared"));
+    }
+    Ok(())
+}
