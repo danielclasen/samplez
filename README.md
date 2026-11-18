@@ -114,6 +114,7 @@ it deletes its output flow on the way out.
 | `samplez` | the engine: configuration, supervisor, RT loop, block statuses and hold rings, state transfer, and `samplez-hop` |
 | `samplez-dsp` | planar buffers, gain ramps, the mixing matrix, the channel strip, the duck detector, meters, true peak and loudness, history rings |
 | `samplez-mxl` | MXL flow input and output on libmxl v1.1.0, loaded with `mxl::load_api` |
+| `samplez-nmos` | NMOS for products: the IS-04 v1.3 Node API with MXL senders and receivers per BCP-007-03, BCP-004-01 receiver caps and BCP-002-01/02 tags |
 | `samplez-replica` | a product's state replicated over openraft: the log and snapshots on the replica's volume, the applied command ids, the bridge to a replicated engine, clock checks, resync and rollouts |
 | `samplez-service` | the non-RT service layer of products: listeners, TLS, auth, ops endpoints, the OpenAPI document and WebSocket fan-out |
 
@@ -589,9 +590,22 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w \
     cargo bench --locked -p samplez -p samplez-dsp -p samplez-mxl --bench rt'
 ```
 
+The NMOS schema test validates every document `samplez-nmos` serves
+against the AMWA schemas at the commits pinned in
+`crates/samplez-nmos/tests/specs.txt`, so it needs them checked out
+first; `cargo test --workspace` leaves it out:
+
+```sh
+crates/samplez-nmos/tests/fetch-specs.sh
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w \
+  samplez-builder cargo test --locked -p samplez-nmos --test schemas
+```
+
 CI also sets `SAMPLEZ_REQUIRE_PATHS=avx2`, so a matrix test fails rather
 than skips the AVX2 path on a CPU without it, lints with `cargo fmt --all --check` and `cargo
-clippy --workspace --all-targets --locked -- -D warnings`, and runs the
+clippy --workspace --all-targets --locked -- -D warnings`, checks every
+dependency's licence against `deny.toml` with `cargo deny check licenses`,
+and runs the
 kernel clock tests of `samplez-replica` (`--test vm_clock`, a TAI offset
 step and a leap second) in a VM, since they step the clock.
 

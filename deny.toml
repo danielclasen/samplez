@@ -1,0 +1,9 @@
+# Licences every dependency, dev-dependencies included, must carry;
+# CI runs `cargo deny check licenses` against it.
+[licenses]
+allow = ["Apache-2.0", "BSD-3-Clause", "BSL-1.0", "ISC", "MIT", "Unicode-3.0"]
+# Reached only through samplez-nmos's jsonschema dev-dependency.
+exceptions = [
+  { crate = "borrow-or-share", allow = ["MIT-0"] },
+  { crate = "foldhash", allow = ["Zlib"] },
+]

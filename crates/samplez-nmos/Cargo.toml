@@ -1,0 +1,34 @@
+[package]
+name = "samplez-nmos"
+version = "0.6.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/danielclasen/samplez"
+description = "NMOS IS-04 and IS-05 for samplez products, with MXL transport per BCP-007-03"
+publish = false
+
+[dependencies]
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+libc = "=0.2.191"
+serde_json = "=1.0.154"
+tracing = "=0.1.44"
+uuid = { version = "=1.29.2", features = ["serde", "v5"] }
+
+[dev-dependencies]
+jsonschema = { version = "=0.60.2", default-features = false }
+tokio = { version = "=1.54.1", features = ["macros", "rt"] }
+tower = { version = "=0.5.3", features = ["util"] }
+
+# Validates the served documents against the AMWA schemas, which
+# tests/fetch-specs.sh checks out first: `cargo test --workspace` leaves
+# it out, CI runs it with `--test schemas`.
+[[test]]
+name = "schemas"
+test = false
+
+# clippy.toml's blocking primitives: allowed here, denied in the RT
+# modules.
+[lints.clippy]
+disallowed_methods = "allow"
+disallowed_types = "allow"
