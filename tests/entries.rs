@@ -35,6 +35,13 @@ fn now(rx: &Receiver<BlockVerdict>) -> u64 {
     rx.try_iter().last().unwrap_or(first).k
 }
 
+/// [`now`], the verdicts read kept in `seen`.
+fn now_kept(rx: &Receiver<BlockVerdict>, seen: &mut Vec<BlockVerdict>) -> u64 {
+    seen.push(rx.recv_timeout(5 * SECOND).unwrap());
+    seen.extend(rx.try_iter());
+    seen.last().unwrap().k
+}
+
 /// Waits until block `k` has been written and is past the margin.
 fn wait_past(rx: &Receiver<BlockVerdict>, k: u64, seen: &mut Vec<BlockVerdict>) {
     wait_for(10 * SECOND, "block written", || {
@@ -360,44 +367,59 @@ fn re_route_crossfades_at_its_index_and_leaves_other_inputs_exact() {
     let mut seen = Vec::new();
     let d = r + u64::from(RAMP);
     wait_past(&rx, d / B + 20, &mut seen);
-    let range = r / B - 20..d / B + 20;
-    let x = common::read_blocks(&domain.0, &out, 2, range.clone());
-    for (i, k) in range.enumerate() {
-        assert!(block(&x, 2, i, 0) == ramped(0, k, 1.0, 1.0, 0), "block {k}");
-        let want = if k * B < r {
+    // Against the expected values on the blocks the engine computed: one
+    // it skipped after an overrun is zero-filled by libmxl.
+    let check =
+        |range: std::ops::Range<u64>, seen: &[BlockVerdict], want: &dyn Fn(u64) -> Vec<f32>| {
+            let x = common::read_blocks(&domain.0, &out, 2, range.clone());
+            let mut compared = 0;
+            for (i, k) in range.clone().enumerate() {
+                if !computed(seen, k) {
+                    continue;
+                }
+                assert!(block(&x, 2, i, 0) == ramped(0, k, 1.0, 1.0, 0), "block {k}");
+                assert!(
+                    block(&x, 2, i, 1) == want(k),
+                    "block {k} of the re-routed input"
+                );
+                compared += 1;
+            }
+            assert!(
+                compared * 4 > range.count() as u64 * 3,
+                "{compared} blocks compared"
+            );
+        };
+    check(r / B - 20..d / B + 20, &seen, &|k| {
+        if k * B < r {
             ramped(0, k, 1.0, 1.0, 0)
         } else {
             ramped(0, k, 1.0, 0.0, r)
-        };
-        assert!(
-            block(&x, 2, i, 1) == want,
-            "block {k} of the re-routed input"
-        );
-    }
+        }
+    });
     report(&reports, Report::InputPruned { slot: 1 });
-    e.append(2, (now(&rx) + 20) * B, Entry::InputDown { slot: 1 })
-        .unwrap();
+    e.append(
+        2,
+        (now_kept(&rx, &mut seen) + 20) * B,
+        Entry::InputDown { slot: 1 },
+    )
+    .unwrap();
     e.commit(2);
     let _p2 = Pilot::start(&domain.0, &next, 1, B, 0);
     report(&reports, Report::InputReadable { slot: 1 });
     let lead = e.status().generation.build_lead;
-    let u = (now(&rx) * B + lead).next_multiple_of(B);
+    let u = (now_kept(&rx, &mut seen) * B + lead).next_multiple_of(B);
     e.append(3, u, Entry::InputUp { slot: 1 }).unwrap();
     e.commit(3);
     let end = u / B + 2 * u64::from(RAMP) / B;
     wait_past(&rx, end, &mut seen);
 
-    let range = u / B - 20..end;
-    let x = common::read_blocks(&domain.0, &out, 2, range.clone());
-    for (i, k) in range.enumerate() {
-        assert!(block(&x, 2, i, 0) == ramped(0, k, 1.0, 1.0, 0), "block {k}");
-        let want = if k * B < u {
+    check(u / B - 20..end, &seen, &|k| {
+        if k * B < u {
             vec![0.0; B as usize]
         } else {
             ramped(0, k, 0.0, 1.0, u)
-        };
-        assert!(block(&x, 2, i, 1) == want, "block {k} after InputUp");
-    }
+        }
+    });
     for v in seen.iter().filter(|v| v.k > k0 + 50) {
         assert_eq!(v.silenced & 1, 0, "{v:?}");
     }
