@@ -1149,6 +1149,9 @@ struct Links {
     /// Side reports from this node arrive this much later, each on its
     /// own, as through a slow link that still carries every report.
     delayed: BTreeMap<NodeId, Duration>,
+    /// The log protocol every report says this node speaks, its own and
+    /// as relayed, as from a binary of that protocol.
+    protocols: BTreeMap<NodeId, u32>,
 }
 
 /// The links between the replicas of one set.
@@ -1257,6 +1260,17 @@ impl Net {
     /// Side reports from `from` arrive `by` late, every one of them.
     pub fn delay_reports(&self, from: NodeId, by: Duration) {
         self.links().delayed.insert(from, by);
+    }
+
+    /// From now on, every report delivered says `node` speaks log
+    /// protocol `protocol`, in what it says of itself and in what others
+    /// relay of it; `None` delivers them as sent again.
+    pub fn report_protocol(&self, node: NodeId, protocol: Option<u32>) {
+        let mut links = self.links();
+        match protocol {
+            Some(p) => links.protocols.insert(node, p),
+            None => links.protocols.remove(&node),
+        };
     }
 
     /// Records every side report delivered from now on.
@@ -1368,7 +1382,7 @@ impl Peers {
         &self,
         to: Option<NodeId>,
         target: NodeId,
-        request: PeerRequest,
+        mut request: PeerRequest,
     ) -> Result<PeerReply, String> {
         if self.net.links().cut_peer.contains(&(self.from, target)) {
             return Err(format!("{} -> {target} down", self.from));
@@ -1379,6 +1393,18 @@ impl Peers {
             .map_err(|e| e.to_string())?;
         let replica = {
             let mut links = self.net.links();
+            if let PeerRequest::Report(report) = &mut request {
+                if let Some(&p) = links.protocols.get(&report.from) {
+                    report.own.protocol = p;
+                }
+                for heard in &mut report.heard {
+                    if let (Some(&p), Some(own)) =
+                        (links.protocols.get(&heard.node), &mut heard.own)
+                    {
+                        own.protocol = p;
+                    }
+                }
+            }
             if let (Some(tap), PeerRequest::Report(report)) = (links.reports.as_mut(), &request) {
                 tap.push((target, (**report).clone()));
             }

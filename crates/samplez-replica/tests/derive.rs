@@ -485,3 +485,114 @@ async fn the_leader_stamps_and_classifies_a_void_and_an_expiry() {
     });
     assert_eq!(voided, Some(None), "a void of an InputUp is not flagged");
 }
+
+/// Every generation flag `id`'s log holds, in order.
+fn flags(set: &Set<Desk>, id: NodeId) -> Vec<Option<bool>> {
+    commands(set, id)
+        .iter()
+        .flat_map(|(_, c)| c)
+        .map(|c| c.generation)
+        .collect()
+}
+
+/// The log positions of `id`'s protocol markers.
+fn markers(set: &Set<Desk>, id: NodeId) -> Vec<usize> {
+    (entries(set, id).iter().enumerate())
+        .filter(|(_, b)| matches!(b, Body::Protocol(_)))
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// One member whose binary speaks protocol 1 shuts the gate: the leader
+/// writes a re-routing command unflagged and appends no marker, and the
+/// metric names that member. Once it speaks protocol 2 the leader appends
+/// the marker, then flags the next one.
+#[tokio::test(start_paused = true)]
+async fn a_member_at_protocol_1_keeps_flags_off_the_log() {
+    let set = start().await;
+    let leader = set.leader().await;
+    let old = set.ids().find(|&id| id != leader).unwrap();
+    set.net.report_protocol(old, Some(1));
+    sleep(Duration::from_millis(50)).await;
+    let r = set.replica(leader);
+    let m = r.contact_metrics().unwrap();
+    assert!(!m.protocol_gate_open);
+    assert_eq!(m.protocol_blocker, Some(old));
+    r.submit(&owner("s"), "1", Bytes::from("route 0 c"))
+        .await
+        .expect("committed");
+    assert_eq!(flags(&set, leader), [None]);
+    assert!(markers(&set, leader).is_empty());
+
+    set.net.report_protocol(old, None);
+    sleep(Duration::from_millis(50)).await;
+    assert!(r.contact_metrics().unwrap().protocol_gate_open);
+    r.submit(&owner("s"), "2", Bytes::from("route 1 d"))
+        .await
+        .expect("committed");
+    assert_eq!(flags(&set, leader), [None, Some(true)]);
+    let log = entries(&set, leader);
+    let flagged = log
+        .iter()
+        .rposition(|b| matches!(b, Body::Commands(_)))
+        .unwrap();
+    assert_eq!(markers(&set, leader).len(), 1, "{log:?}");
+    assert!(markers(&set, leader)[0] < flagged, "{log:?}");
+}
+
+/// The command writer and the generation writer, each flagging the first
+/// entry it writes while the marker is not applied yet, append one marker
+/// between them: the followers are stalled, so the first marker is still
+/// being committed when the second writer flags.
+#[tokio::test(start_paused = true)]
+async fn concurrent_writers_append_the_marker_once() {
+    let set = start().await;
+    let leader = set.leader().await;
+    let r = set.replica(leader);
+    // Written unflagged: no marker yet.
+    r.append(Body::InputUp {
+        slot: 0,
+        at_index: 0,
+    })
+    .unwrap();
+    sleep(Duration::from_millis(20)).await;
+    let mut up = None;
+    r.store().entries_after(0, |id, req| {
+        if matches!(req.body, Body::InputUp { .. }) {
+            up = Some((id.index, id.term));
+        }
+    });
+    let (revision, term) = up.expect("InputUp written");
+    assert!(
+        r.store()
+            .with_state(|sm| sm.pending.contains_key(&revision))
+    );
+    assert!(markers(&set, leader).is_empty());
+
+    for id in set.ids().filter(|&id| id != leader) {
+        // Below the heartbeat interval, openraft's timeout for an append.
+        set.net.stall(id, Duration::from_millis(30));
+    }
+    // A restamp of the InputUp, which needs a generation, goes to the
+    // generation writer, the fader move to the command writer.
+    r.append(Body::Restamp {
+        revision,
+        term,
+        at_index: 0,
+        paths: Vec::new(),
+        generation: Some(true),
+    })
+    .unwrap();
+    let fader = r.submit(&owner("s"), "1", Bytes::from("fader 0 0.5"));
+    fader.await.expect("committed");
+    for id in set.ids() {
+        set.net.unstall(id);
+    }
+    sleep(Duration::from_millis(500)).await;
+    let log = entries(&set, leader);
+    assert!(
+        log.iter().any(|b| matches!(b, Body::Restamp { .. })),
+        "{log:?}"
+    );
+    assert_eq!(markers(&set, leader).len(), 1, "{log:?}");
+}
