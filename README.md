@@ -234,15 +234,21 @@ others not, and the core installed next must know them; a batch holding
 an `InputUp` or `Route` stays pending whole. A replayed core
 replaces the strips; one built from product state leaves them.
 `Engine::install_product` builds a core from product state off the RT
-thread (targets at their values, fades and ramps cold, the pending
-entries, no unresolved entry; the RT thread keeps its pending generation)
-and installs it through the same block-boundary hand-over as a replay;
-the first block committed after it follows the withdrawn rules. The
-product state also names each slot's flow and strip parameters: the
-supervisor hands over generations reading those flows before the core,
-a slot on another flow moving to it with no crossfade, and the strip
-parameters are set from the install's index, each strip keeping its own
-state.
+thread (fades cold, the pending entries, no unresolved entry; the RT
+thread keeps its pending generation) and installs it through the same
+block-boundary hand-over as a replay, at the first block starting at or
+after the index its caller names; the first block committed after it
+follows the withdrawn rules. Its gains ramp from silence to their
+targets over the ramp length from the install, as the strips take their
+parameters, so an output fades in processed. The product state also
+names each slot's flow and strip parameters: the supervisor hands over
+generations reading those flows before the core, a slot on another flow
+moving to it with no crossfade, and the strip parameters are set from
+the install's index, each strip keeping its own state. `Targets` holds
+every gain, flow and strip parameter as values; `Targets::diff` gives
+the entries that move an engine from one set of targets to another,
+comparing gains by bit pattern, and `Targets::assert` the entries that
+set all of them.
 
 In `samplez-replica` every audio replica starts clock-unverified, which
 drops its engine's core until it verifies, and a snapshot install or a

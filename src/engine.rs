@@ -2121,7 +2121,7 @@ impl Engine {
         // Up to the last block the RT thread computed, before the first
         // attempt.
         replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
-        self.offer(timeout, true, &[], |j, core| {
+        self.offer(timeout, 0, true, &[], |j, core| {
             replay.run(j);
             replay.rt.capture(core);
             (replay.next - 1, replay.last_id)
@@ -2191,10 +2191,14 @@ impl Engine {
     }
 
     /// Replicated mode with more than one voter: builds a core from
-    /// `state` off the RT thread, its targets at their values, its fades
-    /// and ramps cold, its pending entries, and installs it at a block
-    /// boundary as a replay is handed over, the RT thread keeping the
-    /// generation it holds pending. Returns the block the core followed. The core holds no
+    /// `state` off the RT thread, its fades cold, its pending entries, and
+    /// installs it as a replay is handed over, at the first block
+    /// boundary at or after sample index `at_least` the RT thread has not
+    /// started, the RT thread keeping the generation it holds pending.
+    /// Its gains ramp from silence to their targets over the ramp length
+    /// from the install, as the strips take their parameters, so an
+    /// output fades in processed. Returns the block the core followed.
+    /// The core holds no
     /// unresolved entry: the caller adds the ones still unresolved with
     /// [`Engine::unresolved`] after the install. While no core is held the
     /// RT thread takes the entries needing no generation whose index
@@ -2209,6 +2213,7 @@ impl Engine {
     pub fn install_product(
         &self,
         state: &ProductState,
+        at_least: u64,
         timeout: Duration,
     ) -> Result<u64, ReplayError> {
         let deadline = Instant::now() + timeout;
@@ -2274,12 +2279,9 @@ impl Engine {
         if applied.recv_timeout(left()).is_err() {
             return Err(ReplayError::Timeout { passed: 0 });
         }
-        self.offer(left(), false, &strips, |j, core| {
-            for (i, row) in state.gains.iter().enumerate() {
-                for (o, &g) in row.iter().enumerate() {
-                    let _ = core.matrix.set(i, o, g, 0);
-                }
-            }
+        let ramp = self.config.ramp_samples;
+        self.offer(left(), at_least, false, &strips, |j, core| {
+            let mut gains = state.gains.clone();
             // The entries whose index the install passed are folded in
             // like the rest of the state: reported late they would never
             // apply.
@@ -2292,9 +2294,7 @@ impl Engine {
                         input,
                         output,
                         gain,
-                    } => {
-                        let _ = core.matrix.set(input, output, gain, 0);
-                    }
+                    } => gains[input][output] = gain,
                     Change::InputDown { slot } => up[slot] = false,
                     Change::InputUp { slot } => up[slot] = true,
                     // The core holds neither a generation nor a strip:
@@ -2303,10 +2303,7 @@ impl Engine {
                     Change::Route { .. } | Change::Strip { .. } => {}
                     Change::Batch { up: raised, .. } => {
                         if let Some(b) = batch(e.id) {
-                            let columns = core.matrix.outputs();
-                            b.gains.each(|c, g| {
-                                let _ = core.matrix.set(c / columns, c % columns, g, 0);
-                            });
+                            b.gains.each(|c, g| gains[c / m][c % m] = g);
                             for &slot in &b.downs {
                                 up[slot as usize] = false;
                             }
@@ -2317,8 +2314,19 @@ impl Engine {
                     }
                 }
             }
+            // From silence: whatever a spare core held is set first.
+            let mut ramping = false;
+            for (i, row) in gains.iter().enumerate() {
+                for (o, &g) in row.iter().enumerate() {
+                    let _ = core.matrix.set(i, o, 0.0, 0);
+                    if g != 0.0 {
+                        let _ = core.matrix.set(i, o, g, ramp);
+                        ramping = true;
+                    }
+                }
+            }
             core.pos = Some(next);
-            core.ramp_end = 0;
+            core.ramp_end = if ramping { next + u64::from(ramp) } else { 0 };
             core.pending.clear();
             core.pending.extend_from_slice(&pending[passed..]);
             // Shared: nothing is allocated in the hand-over's window.
@@ -2363,9 +2371,12 @@ impl Engine {
     /// block the core follows and the highest log id it knew. A
     /// `replayed` core must name the pending generation the RT thread
     /// holds, and its strips are installed.
+    /// No core is installed before the first block starting at or after
+    /// sample index `at_least`.
     fn offer(
         &self,
         timeout: Duration,
+        at_least: u64,
         replayed: bool,
         strips: &[(usize, StripParam)],
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
@@ -2443,7 +2454,8 @@ impl Engine {
             core.prepare();
             let p = processed();
             let waiting = Instant::now();
-            while processed() == p {
+            // The core is installed before block `processed()`.
+            while processed() == p || processed() * self.block < at_least {
                 if Instant::now() >= deadline {
                     t.spare = Some(core);
                     return Err(ReplayError::Timeout { passed });
@@ -5144,7 +5156,7 @@ mod tests {
         let (e, _statuses, _verdicts, domain) = outputs_only("copy-handover", 1);
         copy_left_behind(&e);
         let j = e
-            .offer(Duration::from_secs(5), false, &[], |j, core| {
+            .offer(Duration::from_secs(5), 0, false, &[], |j, core| {
                 bare_core(&e, j, core)
             })
             .unwrap();
@@ -5192,11 +5204,13 @@ mod tests {
         }
         while e.withdraw().is_ok() {}
         assert_eq!(
-            e.install_product(&state, Duration::from_millis(50)),
+            e.install_product(&state, 0, Duration::from_millis(50)),
             Err(ReplayError::Full)
         );
         assert_eq!(c.blocks_without_core.load(Relaxed), 0, "dropped while full");
-        let j = e.install_product(&state, Duration::from_secs(5)).unwrap();
+        let j = e
+            .install_product(&state, 0, Duration::from_secs(5))
+            .unwrap();
         assert!(
             c.blocks_without_core.load(Relaxed) > 0,
             "installed over a held core"
@@ -5251,7 +5265,7 @@ mod tests {
         CLOCK_STEP_NS.store(-3_000_000_000, Relaxed);
         while e.withdraw().is_ok() {}
         let t = Instant::now();
-        let r = e.install_product(&state, Duration::from_secs(1));
+        let r = e.install_product(&state, 0, Duration::from_secs(1));
         let took = t.elapsed();
         assert_eq!(r, Err(ReplayError::Timeout { passed: 0 }));
         assert!(took < Duration::from_millis(1300), "took {took:?}");
@@ -5290,7 +5304,7 @@ mod tests {
             let w = without();
             wait(&|| without() > w + 5);
             let before = installed();
-            let r = e.offer(Duration::from_secs(5), false, &[], |j, core| {
+            let r = e.offer(Duration::from_secs(5), 0, false, &[], |j, core| {
                 CLOCK_STEP_NS.store(-1_500_000_000, Relaxed);
                 bare_core(&e, j, core)
             });
@@ -6068,7 +6082,7 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5), "no stall");
         }
         let mut calls = Vec::new();
-        let _ = e.offer(Duration::from_secs(1), true, &[], |j, _| {
+        let _ = e.offer(Duration::from_secs(1), 0, true, &[], |j, _| {
             calls.push((j, processed()));
             (j, 0)
         });
@@ -6112,7 +6126,7 @@ mod tests {
             Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
         };
         let before = cpu();
-        let err = e.offer(Duration::from_millis(300), true, &[], |j, _| (j, 0));
+        let err = e.offer(Duration::from_millis(300), 0, true, &[], |j, _| (j, 0));
         let spent = cpu() - before;
         assert!(matches!(err, Err(ReplayError::Timeout { .. })), "{err:?}");
         assert!(spent < Duration::from_millis(100), "{spent:?} of CPU");
@@ -6130,7 +6144,7 @@ mod tests {
         let before = e.counters.handovers_passed.load(Relaxed);
         // Each core follows a block two behind the last one computed:
         // every attempt is refused.
-        let err = e.offer(Duration::from_millis(300), true, &[], |j, _| {
+        let err = e.offer(Duration::from_millis(300), 0, true, &[], |j, _| {
             (j.saturating_sub(2), 0)
         });
         let refused = e.counters.handovers_passed.load(Relaxed) - before;
