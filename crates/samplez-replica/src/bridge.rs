@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use samplez::blocks::{
     BlockStatus, Cause, HEALTHY, Kind, PAGE, PageHash, Range, Ranks, Standing, StatusChange,
 };
-use samplez::{CopyError, CoreCopy, Engine, Entry, EntryError, ProductState, ReplayError};
+use samplez::{
+    CopyError, CoreCopy, DuckSetting, Engine, Entry, EntryError, ProductState, ReplayError,
+};
 
 use crate::contact::{Audio, Sample, Timing};
 use crate::report::{ClockFlags, Own, Page, Unwritten, page_digest, runs};
@@ -228,6 +230,46 @@ impl EngineAudio {
             if !samplez_dsp::valid_gain(*gain) {
                 *gain = 0.0;
                 dropped += 1;
+            }
+        }
+        // A duck setting the engine refuses is left at what no entry set,
+        // as a refused entry leaves it; a group beyond the engine's is
+        // left out.
+        let admits = |group: usize, setting: DuckSetting| {
+            self.engine
+                .admits(&[Entry::Duck { group, setting }])
+                .is_ok()
+        };
+        dropped += state.ducks.len().saturating_sub(samplez_dsp::MAX_DUCKS);
+        state.ducks.truncate(samplez_dsp::MAX_DUCKS);
+        for (group, d) in state.ducks.iter_mut().enumerate() {
+            let default = samplez::DuckTargets::default();
+            if !admits(group, DuckSetting::Detector(Box::new(d.params))) {
+                d.params = default.params;
+                dropped += 1;
+            }
+            if !admits(group, DuckSetting::Keys(d.keys.clone())) {
+                d.keys = default.keys;
+                dropped += 1;
+            }
+            for (slot, db) in d.depths.iter_mut().enumerate() {
+                if !admits(group, DuckSetting::Depth { slot, db: *db }) {
+                    *db = 0.0;
+                    dropped += 1;
+                }
+            }
+        }
+        for (input, row) in state.masks.iter_mut().enumerate() {
+            for (output, mask) in row.iter_mut().enumerate() {
+                let entry = Entry::DuckMask {
+                    input,
+                    output,
+                    mask: *mask,
+                };
+                if *mask != 0 && self.engine.admits(&[entry]).is_err() {
+                    *mask = 0;
+                    dropped += 1;
+                }
             }
         }
         if dropped > 0 {

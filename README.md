@@ -32,7 +32,9 @@ matrix, are built on it.
 - Meters per output and meter: sample peak, RMS, true peak and EBU R 128
   loudness (momentary, short-term, integrated, loudness range); per
   input: sample peak, RMS and momentary loudness
-- A duck detector in `samplez-dsp`
+- Duck groups: up to 8 detectors keyed by inputs after their strips,
+  ducking the matrix coefficients their masks name by each input's
+  depth, set by entries like every other target
 - A real-time thread that does not allocate once its loop runs, checked
   by a test, RealtimeSanitizer and instruction-count limits; it runs
   `SCHED_FIFO` with locked memory, and degraded with a report when the
@@ -112,7 +114,7 @@ it deletes its output flow on the way out.
 | Crate | |
 |---|---|
 | `samplez` | the engine: configuration, supervisor, RT loop, block statuses and hold rings, state transfer, and `samplez-hop` |
-| `samplez-dsp` | planar buffers, gain ramps, the mixing matrix, the channel strip, the duck detector, meters, true peak and loudness, history rings |
+| `samplez-dsp` | planar buffers, gain ramps, the mixing matrix with duck masks and depths, the channel strip, the duck detector, meters, true peak and loudness, history rings |
 | `samplez-mxl` | MXL flow input and output on libmxl v1.1.0, loaded with `mxl::load_api` |
 | `samplez-replica` | a product's state replicated over openraft: the log and snapshots on the replica's volume, the applied command ids, the bridge to a replicated engine, clock checks, resync and rollouts |
 | `samplez-service` | the non-RT service layer of products: listeners, TLS, auth, ops endpoints, the OpenAPI document and WebSocket fan-out |
@@ -143,7 +145,8 @@ releases its writers, which deletes the output flows.
 ```
 
 Further keys and their defaults: `maxCatchupBlocks` 2, `pruneAfterBlocks`
-50, `rampSamples` 480, `holdMs` 10, `contactWindowMs` 8,
+50, `rampSamples` 480, `holdMs` 10, `contactWindowMs` 8, `duckColumns`
+none (below),
 `historySlackMs` 50, `resyncBudgetMs` 50, per input
 `offsetSamples` 0 and `flowChannels` (below), per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
@@ -270,6 +273,41 @@ when appended (`append`) or set (`set_strip`); one that a strip on the
 RT thread still refuses is counted in `strip_refused`, not applied, and
 marks the engine diverged.
 
+### Duck groups
+
+An engine has 8 duck groups (`samplez_dsp::MAX_DUCKS`), each a detector
+(`samplez_dsp::duck`) whose envelope, between 0 and 1, ducks every
+matrix coefficient whose duck mask names the group by its input
+channel's depth under the group times the envelope, in dB; of several
+groups on one coefficient the deepest counts. `Entry::Duck` sets one
+setting of a group (`DuckSetting`): the detector's parameters, its keys
+(up to 8 input slots after their strips, each at a linear gain), its
+mode (`Auto`, `On`, `Off`), its momentary hold, and the depth of an input
+slot's rows, 0 to 40 dB. `Entry::DuckMask` sets the mask of one
+coefficient, bit `g` for group `g`; a mask other than 0 is taken only on
+a column `duckColumns` names. Each sets an absolute target from the
+entry's index: a depth ramps and a mask crossfades from the old mask's
+gain to the new one's over the ramp length, a parameter or mode change
+moves only the detector's decision, so no change steps. A key whose slot
+changes, or that is newly keyed, starts with its filters at rest.
+`Engine::set_duck` and `Engine::set_duck_mask` set them on an engine
+keeping its own log; a replicated log takes them in `append_batch`,
+folded per group and kind of setting, per depth and per mask, and
+`admits` refuses what a group cannot hold: a ninth key, a slot keyed
+twice, beyond the inputs or wider than 8 channels, a value out of range.
+
+The detectors run on every block computed, after the strips, on the grid
+of the sample index, and the matrix is aligned to the index before it
+mixes, so the output depends on neither the block size nor where a core
+was copied. A group with no key, not on and at rest is advanced rather
+than run, which computes the same envelope, 0. A coefficient of a column
+in `duckColumns` counts 6 times against the 150 coefficients per sample
+of the block (`DUCKED_TERM_COST`): a ducked term mixes at 5.5 times the
+instructions of a plain one on the AVX2 path. Each group's readings over
+each meter slice of 10 ms it is in use in, its largest key, its largest
+envelope and whether it was engaged, are in the status (`Status::ducks`);
+they stay with the replica.
+
 ### Clock
 
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
@@ -331,10 +369,12 @@ log entries applied in it and whether the page was committed whole.
 
 For a resync, `Engine::copy_core` has the RT thread copy the engine's
 core after the next block k0 into a buffer allocated off it: the matrix
-with its ramps, the pending entries and those applied in the page in
-progress, each input's log state and fades, each strip with its filter
-and dynamics state and position, the entries waiting for a generation
-and the pending generation's entry id, and the unresolved entries.
+with its ramps, duck masks, depths and mask crossfades, the duck
+detectors with their keys, filter, hold and envelope state, the pending
+entries and those applied in the page in progress, each input's log
+state and fades, each strip with its filter and dynamics state and
+position, the entries waiting for a generation and the pending
+generation's entry id, and the unresolved entries.
 Meters, hold rings, statuses and readers stay with the replica.
 History rings (`History` in samplez-dsp) hold a delay plus
 `historySlackMs` of slack as relaxed atomic bit patterns; the RT thread
@@ -374,9 +414,12 @@ strip parameter out of range, a ramp past its length, a matrix beyond
 `MAX_COEFFICIENTS`, 2^18, which configurations are held to as well, a
 strip `Strip::is_valid` refuses: a parameter, gain, envelope, pole,
 ramp or state beyond any a strip reaches, a filter target other than
-its parameters' or a filter ramp outside the box of every target), and
-`Engine::replay` one of another shape, with strips of other legs or
-ramp length, or with an entry outside the engine.
+its parameters' or a filter ramp outside the box of every target, a
+detector `Detector::is_valid` refuses, a duck key without its slot or a
+slot without its key, a mask, depth or mask crossfade out of range, or a
+duck setting no group takes), and `Engine::replay` one of another shape,
+with strips or duck keys of other legs or ramp length, or with an entry
+outside the engine.
 
 ### Starting a replica
 
@@ -386,7 +429,8 @@ no block and withholds each one, overrun skips included, cause `NoCore`
 (`StatusChange::NoCore` ranges), with the replica withdrawn. Entries
 needing no generation whose index passes meanwhile are taken off the
 pending list, strip entries applied to the strips the slots keep and the
-others not, and the core installed next must know them; a batch holding
+others, duck entries included, not, and the core installed next must
+know them; a batch holding
 an `InputUp` or `Route` stays pending whole. A replayed core
 replaces the strips; one built from product state leaves them.
 `Engine::install_product` builds a core from product state off the RT
@@ -394,19 +438,23 @@ thread (fades cold, the pending entries, no unresolved entry; the RT
 thread keeps its pending generation) and installs it through the same
 block-boundary hand-over as a replay, at the first block starting at or
 after the index its caller names; the first block committed after it
-follows the withdrawn rules. A state holding a gain, flow or strip
-parameter no entry could set is refused before anything changes. Its
+follows the withdrawn rules. A state holding a gain, flow, strip
+parameter or duck value no entry could set is refused before anything
+changes. Its
 gains ramp from silence to their
 targets over the ramp length from the install, as the strips take their
-parameters, so an output fades in processed. The product state also
+parameters, so an output fades in processed. Its duck groups start cold
+at the state's settings: key filters at rest, no hold, the envelope at 0
+or, for a group its mode On or hold triggers, at full depth; masks and
+depths at their targets, so a coefficient fades in ducked. The product state also
 names each slot's flow and strip parameters: the supervisor hands over
 generations reading those flows before the core, a slot on another flow
 moving to it with no crossfade, and the strip parameters are set from
 the install's index, each strip keeping its own state. `Targets` holds
-every gain, flow and strip parameter as values; `Targets::diff` gives
-the entries that move an engine from one set of targets to another,
-comparing gains by bit pattern, and `Targets::assert` the entries that
-set all of them.
+every gain, flow, strip parameter, duck group setting and duck mask as
+values; `Targets::diff` gives the entries that move an engine from one
+set of targets to another, comparing every value by bit pattern, and
+`Targets::assert` the entries that set all of them.
 
 In `samplez-replica` every audio replica starts clock-unverified, which
 drops its engine's core until it verifies, and a snapshot install, a
@@ -424,7 +472,9 @@ to `maxApplyLead` and a generation's build ahead, and the rebuild waits
 that long. `EngineAudio` installs the state as the records it filters
 leave an engine (below): a flow other than the one an input reads is a
 re-route kept by the same rules and else left as read, a strip parameter
-the engine refuses is not set, and a gain it refuses is silent. A
+the engine refuses is not set, a gain it refuses is silent, a duck
+setting it refuses is left at what no entry sets and a mask it refuses
+is 0. A
 product without targets gives an empty
 state, which an engine refuses: its replicas stay in `starting`.
 
@@ -532,8 +582,9 @@ uncontended std lock, which makes no libc call, nor
 and the other blocking std primitives listed in `clippy.toml` in the RT
 modules. `cargo bench --bench rt` in samplez, samplez-dsp and
 samplez-mxl fails when the instruction count of the hold ring's paths,
-the page hashes, the strip calls of the RT loop, a block's DSP and
-input meters, the matrix copy of the core, a block's history stores or an output commit,
+the page hashes, the strip calls of the RT loop, a block's DSP, duck
+detectors and input meters, the matrix and detector copies of the core,
+a duck batch, a block's history stores or an output commit,
 gap zero-fill included, exceeds the limit in the benchmark. One failure
 path is
 excepted from the no-allocation rule, and its probe is allowed by call

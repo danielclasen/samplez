@@ -20,6 +20,13 @@ pub const MAX_INPUTS: usize = 64;
 /// a quarter of the block period, 20.8 us a sample at 48 kHz. A larger
 /// matrix takes a larger `blockSize`.
 pub const COEFFICIENTS_PER_BLOCK_SAMPLE: usize = 150;
+/// The coefficients a coefficient of a column in `duckColumns` counts as
+/// against [`COEFFICIENTS_PER_BLOCK_SAMPLE`]. A ducked term mixes in 17.7
+/// instructions per sample on the AVX2 path against 3.2 for a plain one
+/// (callgrind, a 64 by 96 matrix at a `blockSize` of 48), 5.5 times; on
+/// the scalar path twice. A configuration taken holds its bound with every
+/// coefficient of those columns ducked.
+pub const DUCKED_TERM_COST: usize = 6;
 pub const MAX_OUTPUTS: usize = 64;
 /// The most meters an engine takes.
 pub const MAX_METERS: usize = 64;
@@ -76,6 +83,10 @@ pub struct Config {
     /// each meter channel (column), channels numbered across inputs,
     /// outputs and meters in configuration order.
     pub matrix: Vec<Vec<f32>>,
+    /// The matrix columns whose coefficients a duck mask may duck, each
+    /// once; none by default.
+    #[serde(default)]
+    pub duck_columns: Vec<usize>,
     #[serde(default)]
     pub rt: Rt,
 }
@@ -430,13 +441,28 @@ impl Config {
                 samplez_dsp::MAX_COEFFICIENTS
             ));
         }
+        if let Some(&c) = self.duck_columns.iter().find(|&&c| c >= self.columns()) {
+            return fail(format!(
+                "duckColumns names column {c}, of {} columns",
+                self.columns()
+            ));
+        }
+        let mut seen = HashSet::new();
+        if let Some(c) = self.duck_columns.iter().find(|&&c| !seen.insert(c)) {
+            return fail(format!("duckColumns names column {c} twice"));
+        }
+        // Of every column in duckColumns, every coefficient counts at a
+        // ducked term's cost.
+        let coefficients =
+            coefficients + (DUCKED_TERM_COST - 1) * self.input_channels() * self.duck_columns.len();
         let per_block = self.block_size as usize * COEFFICIENTS_PER_BLOCK_SAMPLE;
         if coefficients > per_block {
             let needed = coefficients.div_ceil(COEFFICIENTS_PER_BLOCK_SAMPLE);
             return fail(format!(
-                "{coefficients} matrix coefficients, at most {COEFFICIENTS_PER_BLOCK_SAMPLE} per \
-                 sample of the block, {per_block} at blockSize {}, so that a batch setting all \
-                 of them applies in one block; a blockSize of at least {needed} takes them",
+                "{coefficients} matrix coefficients, those of duckColumns {DUCKED_TERM_COST} \
+                 times, at most {COEFFICIENTS_PER_BLOCK_SAMPLE} per sample of the block, \
+                 {per_block} at blockSize {}, so that a batch setting all of them applies in \
+                 one block; a blockSize of at least {needed} takes them",
                 self.block_size
             ));
         }
@@ -633,6 +659,31 @@ mod tests {
         assert!(e.contains("a blockSize of at least 55 takes them"), "{e}");
         v["blockSize"] = serde_json::json!(64);
         parse(&v).unwrap();
+    }
+
+    /// A coefficient of a duck column counts six times against the
+    /// limit: 8 rows by 900 columns, 7,200 coefficients, are taken at
+    /// blockSize 48 with no duck column and refused with one, which adds
+    /// 40; a column out of range or named twice is refused.
+    #[test]
+    fn duck_columns_count_at_a_ducked_terms_cost() {
+        let mut v = base();
+        v["inputs"][0]["channels"] = serde_json::json!(8);
+        v["outputs"][0]["channels"] = serde_json::json!(895);
+        v["matrix"] = serde_json::json!(vec![vec![0.0; 895]; 8]);
+        // 7,160 coefficients and 5 x 8 for a duck column: 7,200.
+        v["duckColumns"] = serde_json::json!([3]);
+        assert_eq!(parse(&v).unwrap().duck_columns, [3]);
+        v["duckColumns"] = serde_json::json!([3, 4]);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("7240 matrix coefficients"), "{e}");
+        v["duckColumns"] = serde_json::json!([895]);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("duckColumns names column 895"), "{e}");
+        v["duckColumns"] = serde_json::json!([2, 2]);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("twice"), "{e}");
+        assert!(parse(&base()).unwrap().duck_columns.is_empty());
     }
 
     #[test]

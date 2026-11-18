@@ -86,6 +86,7 @@ impl Product for Desk {
             gains: vec![vec![self.gains[0]], vec![self.gains[1]]],
             flows: self.flows.to_vec(),
             strips: vec![Vec::new(), Vec::new()],
+            ..Targets::default()
         })
     }
     fn reroutes(&self, _: &Origin, command: &[u8]) -> Vec<u32> {

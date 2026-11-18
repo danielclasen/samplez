@@ -148,6 +148,56 @@ fn the_rt_thread_passes_rtsan_with_strips() {
     common::stop(engine);
 }
 
+/// The duck groups under RealtimeSanitizer: a group keyed by a stereo
+/// input, one forced on, masks and depths set and changed while ducking,
+/// a release, and the readings of every slice sent.
+#[test]
+fn the_rt_thread_passes_rtsan_with_ducks() {
+    use samplez::DuckSetting;
+    use samplez_dsp::DuckMode;
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let mut cfg = config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&dst, 2)],
+        common::diagonal(2, 1.0),
+        MARGIN,
+    );
+    cfg.duck_columns = vec![0, 1];
+    let (engine, rx) = start(cfg);
+    wait_for(Duration::from_secs(5), "input attached", || {
+        engine.status().inputs[0].state == InputState::Attached
+    });
+    let api = common::api();
+    let index = samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
+    let at = (index / B + 20) * B;
+    let set = |group, setting, at| engine.set_duck(group, setting, at).unwrap();
+    set(0, DuckSetting::Keys(vec![(0, 1.0)]), at);
+    set(0, DuckSetting::Depth { slot: 0, db: 12.0 }, at);
+    set(4, DuckSetting::Mode(DuckMode::On), at);
+    set(4, DuckSetting::Depth { slot: 0, db: 20.0 }, at);
+    engine.set_duck_mask(0, 0, 1, at).unwrap();
+    engine.set_duck_mask(1, 1, 1 << 4, at).unwrap();
+    let later = at + 400 * B;
+    engine.set_duck_mask(0, 0, 1 | 1 << 4, later).unwrap();
+    set(4, DuckSetting::Depth { slot: 0, db: 6.0 }, later);
+    set(4, DuckSetting::Mode(DuckMode::Off), later + 200 * B);
+    std::thread::sleep(Duration::from_millis(1500));
+    let verdicts: Vec<_> = rx.try_iter().collect();
+    assert!(verdicts.iter().filter(|v| v.k * B > later).count() > 500);
+    let s = engine.status();
+    assert!(
+        s.ducks[0].engaged && s.ducks[4].slice.is_some(),
+        "{:?}",
+        s.ducks
+    );
+    assert_eq!(s.diverged, None);
+    assert_eq!(s.rt_panic, None);
+    common::stop(engine);
+}
+
 /// Writes block `k`, then block `k - 1`, below the last commit, then block
 /// `k + 1` from too little data, in a real-time function.
 #[sanitize(realtime = "nonblocking")]

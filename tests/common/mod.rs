@@ -820,6 +820,8 @@ pub fn hold_scenario(e: &Engine) {
             .map(|i| i.flow_id.clone())
             .collect(),
         strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: Vec::new(),
         // Folds in the entries applied before the drop.
         last_id: id,

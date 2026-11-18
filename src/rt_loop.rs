@@ -18,7 +18,8 @@ use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
 use rtrb::{Consumer, Producer};
 use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{
-    KWeighting, Matrix, PlanarBuffer, Ramp, Started, Strip, StripParam, TruePeak, accumulate,
+    KWeighting, MAX_DUCKS, Matrix, PlanarBuffer, Ramp, Started, Strip, StripParam, TruePeak,
+    accumulate,
 };
 use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{FlowWriter, Write};
@@ -28,6 +29,7 @@ use crate::batch::Batch;
 use crate::blocks::{
     Cause, Changes, Ctx, Hold, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
+use crate::ducks::{DuckRecord, Ducks};
 use crate::transfer::{Answer, Core, CoreCopy, Handover};
 
 /// Engine counters, written by the RT thread and the supervisor.
@@ -79,6 +81,12 @@ pub struct Counters {
     /// Strip entries the slot's strip refused, or for a slot without a
     /// strip: not applied, and each one marks the engine diverged.
     pub strip_refused: AtomicU64,
+    /// Duck settings a detector refused: not applied. The engine checks
+    /// them against its configuration when they are appended, so none is
+    /// expected.
+    pub duck_refused: AtomicU64,
+    /// Duck group readings not sent because their ring was full.
+    pub duck_records_dropped: AtomicU64,
     /// The index of the next sample the matrix produces, published after
     /// each block.
     pub produced: AtomicU64,
@@ -947,6 +955,10 @@ pub(crate) fn plan(next: Option<u64>, newest: Option<u64>, max_catchup: u64, blo
 /// waiting for their index.
 pub(crate) struct Mix {
     pub matrix: Matrix,
+    /// The duck detectors, which the matrix's ducked terms follow.
+    pub ducks: Ducks,
+    /// Per detector, the envelope of each sample of the block: scratch.
+    pub envelopes: PlanarBuffer,
     pub block: u64,
     /// Length of every coefficient ramp in samples.
     pub ramp: u32,
@@ -983,6 +995,8 @@ impl Mix {
     pub fn new(matrix: Matrix, block: u64, ramp: u32) -> Mix {
         Mix {
             matrix,
+            ducks: Ducks::new(ramp),
+            envelopes: PlanarBuffer::new(MAX_DUCKS, block as usize),
             block,
             ramp,
             pos: None,
@@ -1130,7 +1144,8 @@ impl Mix {
         self.pos = Some(start + self.block);
     }
 
-    /// Sets the gains of batch entry `c` at its index, the matrix there.
+    /// Sets the gains, duck masks and depths of batch entry `c` at its
+    /// index, the matrix there, in that order.
     fn batch_gains(&mut self, c: RtEntry) {
         let Mix {
             matrix,
@@ -1149,11 +1164,63 @@ impl Mix {
                 *ramp_end = (*ramp_end).max(c.at_index + u64::from(*ramp));
             }
         });
+        if !b.ducks_matrix() {
+            return;
+        }
+        // A mask crossfades and a depth ramps over the ramp length.
+        let mut moved = false;
+        b.masks.each(|k, mask| {
+            moved |= matrix.mask(k / columns, k % columns) != mask;
+            let _ = matrix.set_mask(k / columns, k % columns, mask, *ramp);
+        });
+        for &(row, group, db) in &b.depths {
+            let (row, group) = (row as usize, usize::from(group));
+            moved |= matrix.depth(row, group) != db;
+            let _ = matrix.set_depth(row, group, db, *ramp);
+        }
+        if moved {
+            *ramp_end = (*ramp_end).max(c.at_index + u64::from(*ramp));
+        }
     }
 
     /// Whether a coefficient ramp runs in block `k`.
     pub fn ramping(&self, k: u64) -> bool {
         k * self.block < self.ramp_end
+    }
+
+    /// Applies the duck settings of batch `b` at sample index `at_index`,
+    /// the keys of slots of `legs(slot)` legs; the number a detector
+    /// refused.
+    pub fn apply_ducks(&mut self, at_index: u64, b: &Batch, legs: impl Fn(usize) -> usize) -> u64 {
+        let mut refused = 0;
+        for &(group, change) in &b.ducks {
+            if !(self.ducks.core).set(at_index, usize::from(group), change, &legs) {
+                refused += 1;
+            }
+        }
+        refused
+    }
+
+    /// Mixes the block of `frames` samples from sample index `start` in
+    /// `inbuf`, the inputs after their strips, into `outbuf`: the
+    /// detectors key from `inbuf`, input slot `s` from its channel
+    /// `first(s)` on, and the matrix ducks by their envelopes on the grid
+    /// of the sample index. Each group's readings go to `sink`.
+    pub fn block(
+        &mut self,
+        start: u64,
+        frames: usize,
+        first: impl Fn(usize) -> usize,
+        inbuf: &PlanarBuffer,
+        outbuf: &mut PlanarBuffer,
+        sink: Option<&mut dyn FnMut(DuckRecord) -> bool>,
+    ) {
+        (self.ducks).process(start, frames, first, inbuf, &mut self.envelopes, sink);
+        // The duck gains move on at the multiples of the interval of the
+        // index, wherever the matrix started: a matrix copied without
+        // ducks carries no position in the interval.
+        self.matrix.align(start);
+        (self.matrix).process_ducked(inbuf, &self.envelopes, outbuf, frames);
     }
 }
 
@@ -1216,6 +1283,8 @@ pub(crate) struct Rt {
     pub ret: Producer<Returned>,
     pub tel: Producer<Telemetry>,
     pub meters: Producer<MeterRecord>,
+    /// Each duck group's readings per meter slice.
+    pub duck_meters: Producer<DuckRecord>,
     pub resets: Consumer<LoudnessReset>,
     /// The sequence number of the next meter record.
     pub meter_seq: u64,
@@ -1357,6 +1426,7 @@ fn capture_core(
     r: &Replica,
 ) {
     c.matrix.copy_from(&m.matrix);
+    c.ducks.copy_from(&m.ducks.core);
     c.pos = m.pos;
     c.ramp_end = m.ramp_end;
     c.pending.clear();
@@ -2162,9 +2232,10 @@ impl Rt {
     }
 
     /// Applies entry `e`, other than a gain change, at the start of the
-    /// block at its index: a batch's `InputDown`s, strip parameters and
-    /// generation-needing entry, its gains set by [`Mix::to`]. An entry
-    /// that sets what the slot already has starts nothing.
+    /// block at its index: a batch's `InputDown`s, duck settings, strip
+    /// parameters and generation-needing entry, its gains, duck masks and
+    /// depths set by [`Mix::to`]. An entry that sets what the slot already
+    /// has starts nothing.
     fn apply(&mut self, e: RtEntry) {
         if let Change::Batch { .. } = e.change {
             let b = self.mix.take_batch(e.id);
@@ -2178,6 +2249,10 @@ impl Rt {
                         ..e
                     });
                 }
+                let slots = &self.slots;
+                let legs = |s: usize| slots.get(s).map_or(0, |s| s.channels);
+                let refused = self.mix.apply_ducks(e.at_index, b, legs);
+                add(&self.counters.duck_refused, refused);
             }
             self.apply_known(e, b.as_deref(), false, true);
             self.retire(b);
@@ -2452,7 +2527,25 @@ impl Rt {
         }
 
         let ramping = self.mix.ramping(k);
-        self.mix.matrix.process(&self.inbuf, &mut self.outbuf, b);
+        let slots = &self.slots;
+        let (counters, duck_meters) = (&self.counters, &mut self.duck_meters);
+        let mut send = |r: DuckRecord| {
+            let sent = duck_meters.push(r).is_ok();
+            if !sent {
+                add(&counters.duck_records_dropped, 1);
+            }
+            sent
+        };
+        let sink: Option<&mut dyn FnMut(DuckRecord) -> bool> =
+            if self.replay { None } else { Some(&mut send) };
+        self.mix.block(
+            start,
+            b,
+            |s| slots[s].first_channel,
+            &self.inbuf,
+            &mut self.outbuf,
+            sink,
+        );
 
         let digest = self
             .replica
@@ -2661,6 +2754,8 @@ impl Rt {
             }
         }
         m.matrix.copy_from(&c.matrix);
+        // Both kinds of core carry the detectors.
+        m.ducks.core.copy_from(&c.ducks);
         m.pos = c.pos;
         m.ramp_end = c.ramp_end;
         // An entry dropped here as known is taken through the core: a
@@ -3353,6 +3448,18 @@ mod tests {
         slots[0].strip = Some(strip.clone());
         slots[0].strip_pos = Some(20 * B);
         let awaiting = [entry(Change::InputUp { slot: 0 }, 19 * B)];
+        // Detector 5 keyed by slot 1, mid-envelope after a burst.
+        let keys = crate::ducks::KeySet::of(&[(1, 2.0)]).unwrap();
+        let keyed = crate::ducks::DuckChange::Keys(keys);
+        assert!(m.ducks.core.set(19 * B, 5, keyed, |_| 1));
+        let mut burst = PlanarBuffer::new(1, B as usize);
+        burst.channel_mut(0).fill(0.5);
+        let mut envelopes = PlanarBuffer::new(MAX_DUCKS, B as usize);
+        m.ducks
+            .process(19 * B, B as usize, |_| 0, &burst, &mut envelopes, None);
+        assert!(m.ducks.core.detectors[5].is_engaged());
+        let ducks = m.ducks.core.clone();
+        assert_ne!(ducks, crate::ducks::DuckCore::new(480));
         let mut r = replica();
         r.unresolved.extend([(8, 21 * B), (9, 30 * B)]);
         r.late_routes.push((10, 25 * B));
@@ -3362,6 +3469,7 @@ mod tests {
         capture_core(&mut c, &m, &slots, &awaiting, Some(11), &r);
         let want = Core {
             matrix: m.matrix.clone(),
+            ducks,
             pos: Some(20 * B),
             ramp_end: 19 * B + 380,
             pending: m.pending.clone(),
@@ -3467,7 +3575,8 @@ mod tests {
                 gain: 0.25,
             },
         ];
-        let (change, batch) = crate::batch::fold(&changes, 2, 4).unwrap().unwrap();
+        let items = changes.map(crate::batch::Item::Change);
+        let (change, batch) = crate::batch::fold(&items, 2, 4).unwrap().unwrap();
         let e = RtEntry {
             id: 7,
             at_index: 10 * B,
@@ -3675,5 +3784,372 @@ mod tests {
         let mut wide = Slot::new(0, 0, MAX_LEGS + 1, 0, 480);
         assert!(wide.strip.is_none());
         assert!(!wide.set_strip(0, StripParam::Trim { db: 0.0 }));
+    }
+
+    /// The duck rows of the desk below: a mono key on slot 0 and a mono
+    /// target on slot 1.
+    const DESK_ROWS: [(usize, usize); 2] = [(0, 1), (1, 1)];
+
+    /// A desk computed off the RT thread as the RT loop computes it: the
+    /// entries due at each block's start applied, the inputs read from a
+    /// function of the sample index, then the detectors and the matrix.
+    /// Two inputs, two outputs: output 0 carries the target ducked by
+    /// group 0, output 1 the target and the key undocked.
+    struct Desk {
+        mix: Mix,
+        inbuf: PlanarBuffer,
+        outbuf: PlanarBuffer,
+        b: u64,
+    }
+
+    impl Desk {
+        fn new(b: u64) -> Desk {
+            Desk {
+                mix: Mix::new(Matrix::new(2, 2), b, 480),
+                inbuf: PlanarBuffer::new(2, b as usize),
+                outbuf: PlanarBuffer::new(2, b as usize),
+                b,
+            }
+        }
+
+        /// Queues log entry `id`, its entries folded, at `at`.
+        fn entry(&mut self, id: LogId, at: u64, entries: &[crate::engine::Entry]) {
+            let mut items = Vec::new();
+            for e in entries {
+                crate::transfer::items_of(e, &DESK_ROWS, &mut items).unwrap();
+            }
+            let (change, batch) = crate::batch::fold(&items, 2, 4).unwrap().unwrap();
+            let e = RtEntry {
+                id,
+                at_index: at,
+                change,
+            };
+            assert!(self.mix.push_with(e, batch).is_ok());
+        }
+
+        /// Computes blocks `ks`, input channel `c` at index `n` being
+        /// `input(c, n)`; the output channels' samples.
+        fn run(&mut self, ks: Range<u64>, input: impl Fn(usize, u64) -> f32) -> [Vec<f32>; 2] {
+            let b = self.b as usize;
+            let mut out = [Vec::new(), Vec::new()];
+            for k in ks {
+                let start = k * self.b;
+                self.mix.to(k, |e, _| panic!("late {e:?}"));
+                for n in 0..self.mix.due.len() {
+                    let (e, late) = self.mix.due[n];
+                    assert!(!late);
+                    if let Some(batch) = self.mix.take_batch(e.id) {
+                        assert_eq!(self.mix.apply_ducks(e.at_index, &batch, |_| 1), 0);
+                    }
+                }
+                self.mix.due.clear();
+                for c in 0..2 {
+                    for (i, x) in self.inbuf.channel_mut(c)[..b].iter_mut().enumerate() {
+                        *x = input(c, start + i as u64);
+                    }
+                }
+                let rows = |s: usize| DESK_ROWS[s].0;
+                self.mix
+                    .block(start, b, rows, &self.inbuf, &mut self.outbuf, None);
+                for (c, o) in out.iter_mut().enumerate() {
+                    o.extend_from_slice(&self.outbuf.channel(c)[..b]);
+                }
+            }
+            out
+        }
+
+        /// The core of the desk after its last block, encoded and decoded
+        /// as a joiner takes it from a donor.
+        fn copy(&self, k0: u64) -> Core {
+            let slots = [
+                slot(true, false, None, false, None),
+                slot(true, false, None, false, None),
+            ];
+            let mut c = Core::new(2, 2, 2, 0);
+            capture_core(&mut c, &self.mix, &slots, &[], None, &replica());
+            let copy = CoreCopy {
+                k0,
+                last_id: 0,
+                core: Box::new(c),
+            };
+            *CoreCopy::decode(&copy.encode()).unwrap().core
+        }
+
+        /// Takes core `c` as the RT thread installs one: its matrix,
+        /// detectors, position and pending entries.
+        fn install(&mut self, c: &mut Core) {
+            self.mix.matrix.copy_from(&c.matrix);
+            self.mix.ducks.core.copy_from(&c.ducks);
+            self.mix.pos = c.pos;
+            self.mix.ramp_end = c.ramp_end;
+            self.mix.pending.clear();
+            for i in 0..c.pending.len() {
+                let e = c.pending[i];
+                let b = c.take_batch(e.id);
+                assert!(self.mix.push_with(e, b).is_ok());
+            }
+        }
+    }
+
+    /// A key like speech on input 0, levels in 30 ms segments around the
+    /// default threshold, and a tone on input 1; exact per index.
+    fn desk_input(c: usize, n: u64) -> f32 {
+        if c == 1 {
+            return 0.25 * (n as f32 * 0.07).sin();
+        }
+        let mut x = (n / 1440).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xd1b5_4a32_d192_ed03;
+        x ^= x >> 29;
+        let db = -42.0 + (x % 24) as f32;
+        let level = 10f32.powf(db / 20.0);
+        let mut y = n.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        y ^= y >> 31;
+        level * ((y % 2001) as f32 / 1000.0 - 1.0)
+    }
+
+    /// The entries of a ducked desk at index 0: the gains, group 0 keyed
+    /// by slot 0 with short times, slot 1 ducked 20 dB on output 0.
+    fn duck_entries() -> Vec<crate::engine::Entry> {
+        use crate::ducks::DuckSetting;
+        use crate::engine::Entry;
+        let gain = |input, output, gain| Entry::Gain {
+            input,
+            output,
+            gain,
+        };
+        let duck = |setting| Entry::Duck { group: 0, setting };
+        vec![
+            gain(1, 0, 1.0),
+            gain(1, 1, 1.0),
+            gain(0, 1, 0.5),
+            duck(DuckSetting::Detector(Box::new(
+                samplez_dsp::DetectorParams {
+                    attack_ms: 10.0,
+                    hold_ms: 50.0,
+                    release_ms: 200.0,
+                    ..samplez_dsp::DetectorParams::DEFAULT
+                },
+            ))),
+            duck(DuckSetting::Keys(vec![(0, 1.0)])),
+            duck(DuckSetting::Depth { slot: 1, db: 20.0 }),
+            Entry::DuckMask {
+                input: 1,
+                output: 0,
+                mask: 1,
+            },
+        ]
+    }
+
+    fn bits(x: &[f32]) -> Vec<u32> {
+        x.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Indices both block sizes below start blocks at: 48 x 55.
+    const BOTH: u64 = 2640;
+
+    /// Two desks of block sizes 48 and 55 given the same input and
+    /// entries compute the same bits while ducking, by the key and by the
+    /// manual controls; the column the mask leaves out carries what a
+    /// desk without ducks carries.
+    #[test]
+    fn ducking_does_not_depend_on_the_block_size() {
+        use crate::ducks::DuckSetting;
+        use crate::engine::Entry;
+        use samplez_dsp::DuckMode;
+        let duck = |setting| Entry::Duck { group: 0, setting };
+        let scripted = |b: u64| {
+            let mut d = Desk::new(b);
+            d.entry(1, 0, &duck_entries());
+            d.entry(2, 10 * BOTH, &[duck(DuckSetting::Mode(DuckMode::On))]);
+            d.entry(3, 20 * BOTH, &[duck(DuckSetting::Mode(DuckMode::Off))]);
+            d.entry(4, 25 * BOTH, &[duck(DuckSetting::Hold { held: true })]);
+            d.entry(5, 27 * BOTH, &[duck(DuckSetting::Hold { held: false })]);
+            d.entry(6, 28 * BOTH, &[duck(DuckSetting::Mode(DuckMode::Auto))]);
+            d.run(0..40 * BOTH / b, desk_input)
+        };
+        let (a, b) = (scripted(48), scripted(55));
+        assert!(bits(&a[0]) == bits(&b[0]), "the ducked output");
+        assert!(bits(&a[1]) == bits(&b[1]), "the undocked output");
+        // It ducked, by the key and by hand, and recovered.
+        let ratio = |n: usize| a[0][n] / desk_input(1, n as u64);
+        let full = samplez_dsp::duck_gain(20.0, 1.0);
+        let at = |i: u64| (i * BOTH) as usize;
+        assert!(
+            (0..at(10)).any(|n| ratio(n).abs() < 0.5),
+            "no automatic duck"
+        );
+        assert!(((at(10) + 9600)..at(20)).all(|n| (ratio(n) - full).abs() < 1e-3));
+        // Released: 200 ms and two intervals after mode Off.
+        assert!(((at(20) + 9616)..at(25)).all(|n| (ratio(n) - 1.0).abs() < 1e-6));
+        assert!(((at(25) + 2400)..at(27)).all(|n| (ratio(n) - full).abs() < 1e-3));
+        let mut plain = Desk::new(48);
+        plain.entry(1, 0, &duck_entries()[..3]);
+        let plain = plain.run(0..40 * BOTH / 48, desk_input);
+        assert!(bits(&a[1]) == bits(&plain[1]), "the column not ducked");
+        assert!(bits(&a[0]) != bits(&plain[0]));
+    }
+
+    /// A joiner taking a donor's core mid-duck, the envelope between 0
+    /// and 1 and the key filters ringing, computes the donor's bits from
+    /// there on; one keeping its own detectors does not.
+    #[test]
+    fn a_core_copied_mid_duck_continues_alike() {
+        use crate::ducks::DuckSetting;
+        use crate::engine::Entry;
+        use samplez_dsp::DuckMode;
+        let mut donor = Desk::new(55);
+        donor.entry(1, 0, &duck_entries());
+        let slow = samplez_dsp::DetectorParams {
+            attack_ms: 500.0,
+            release_ms: 2000.0,
+            ..samplez_dsp::DetectorParams::DEFAULT
+        };
+        let group1 = |setting| Entry::Duck { group: 1, setting };
+        donor.entry(
+            2,
+            BOTH,
+            &[
+                group1(DuckSetting::Detector(Box::new(slow))),
+                group1(DuckSetting::Mode(DuckMode::On)),
+                group1(DuckSetting::Depth { slot: 1, db: 30.0 }),
+                Entry::DuckMask {
+                    input: 1,
+                    output: 0,
+                    mask: 0b11,
+                },
+            ],
+        );
+        let mut joiner = Desk::new(55);
+        joiner.entry(1, 0, &duck_entries());
+        let k0 = 3 * BOTH / 55;
+        donor.run(0..k0 + 1, desk_input);
+        joiner.run(0..k0 + 1, |c, n| desk_input(c, n) * 0.5);
+        let e = donor.mix.ducks.core.detectors[1].envelope();
+        assert!(0.0 < e && e < 1.0, "envelope {e}");
+        let mut core = donor.copy(k0);
+        let mut stale = Desk::new(55);
+        stale.entry(1, 0, &duck_entries());
+        stale.run(0..k0 + 1, |c, n| desk_input(c, n) * 0.5);
+        joiner.install(&mut core);
+        // The stale joiner takes the matrix but keeps its detectors.
+        let keep = stale.mix.ducks.core.clone();
+        stale.install(&mut donor.copy(k0));
+        stale.mix.ducks.core = keep;
+        let ks = k0 + 1..k0 + 1 + 4 * BOTH / 55;
+        let (a, b, c) = (
+            donor.run(ks.clone(), desk_input),
+            joiner.run(ks.clone(), desk_input),
+            stale.run(ks, desk_input),
+        );
+        assert!(bits(&a[0]) == bits(&b[0]) && bits(&a[1]) == bits(&b[1]));
+        assert!(
+            bits(&a[0]) != bits(&c[0]),
+            "the detectors made no difference"
+        );
+    }
+
+    /// A core copied with no duck set carries no position in the interval:
+    /// the joiner starts from 0 where the donor is at the index's. Given
+    /// a mask, depth and manual duck on both sides at a block start off
+    /// the interval grid, both compute the same bits: the matrix is
+    /// aligned to the sample index before it mixes.
+    #[test]
+    fn a_core_copied_without_ducks_ducks_alike_once_given_a_mask() {
+        use crate::ducks::DuckSetting;
+        use crate::engine::Entry;
+        use samplez_dsp::DuckMode;
+        let gains = &duck_entries()[..3];
+        let mut donor = Desk::new(55);
+        donor.entry(1, 0, gains);
+        let k0 = 20;
+        donor.run(0..k0 + 1, desk_input);
+        let core = donor.copy(k0);
+        assert!(!core.matrix.has_ducks());
+        let mut joiner = Desk::new(55);
+        joiner.install(&mut donor.copy(k0));
+        // Index 55 x 30 lies 2 off the interval grid.
+        let at = 30 * 55;
+        assert_ne!(at % u64::from(samplez_dsp::strip::GAIN_INTERVAL), 0);
+        let duck = |setting| Entry::Duck { group: 3, setting };
+        let set = [
+            duck(DuckSetting::Mode(DuckMode::On)),
+            duck(DuckSetting::Depth { slot: 1, db: 12.0 }),
+            Entry::DuckMask {
+                input: 1,
+                output: 0,
+                mask: 1 << 3,
+            },
+        ];
+        donor.entry(2, at, &set);
+        joiner.entry(2, at, &set);
+        let ks = k0 + 1..k0 + 200;
+        let (a, b) = (
+            donor.run(ks.clone(), desk_input),
+            joiner.run(ks, desk_input),
+        );
+        assert!(bits(&a[0]) == bits(&b[0]));
+        assert!(bits(&a[0]) != bits(&a[1]), "nothing ducked");
+    }
+
+    /// Cores built from one product state at one index compute the same
+    /// bits whatever the buffer held before, and a group its manual
+    /// controls trigger ducks at full depth from the install on, its
+    /// coefficients fading in ducked.
+    #[test]
+    fn a_rebuilt_core_does_not_depend_on_the_buffer_and_ducks_forced_on_at_once() {
+        use crate::ducks::{DuckTargets, fill_matrix};
+        use samplez_dsp::DuckMode;
+        let targets = [DuckTargets {
+            keys: vec![(0, 1.0)],
+            mode: DuckMode::On,
+            depths: vec![0.0, 20.0],
+            ..DuckTargets::default()
+        }];
+        let gains = [0.0, 0.5, 1.0, 1.0];
+        let masks = [0, 0, 1, 0];
+        let mut depths = [0.0; 2 * MAX_DUCKS];
+        depths[MAX_DUCKS] = 20.0;
+        let at = 101 * 48;
+        let build = |d: &mut Desk| {
+            let m = &mut d.mix;
+            m.ducks.core.cold(480, &targets, |_| 1);
+            m.ducks.core.settle(480, at);
+            fill_matrix(&mut m.matrix, &gains, &masks, &depths, 480, at);
+            m.pos = Some(at);
+            m.pending.clear();
+            m.batches.clear();
+        };
+        // One desk ran ducks of its own before, another is new.
+        let mut used = Desk::new(48);
+        used.entry(1, 0, &duck_entries());
+        used.run(0..100, desk_input);
+        let mut fresh = Desk::new(48);
+        build(&mut used);
+        build(&mut fresh);
+        assert_eq!(used.mix.ducks.core, fresh.mix.ducks.core);
+        assert_eq!(fresh.mix.ducks.core.detectors[0].envelope(), 1.0);
+        let (a, b) = (
+            used.run(101..200, desk_input),
+            fresh.run(101..200, desk_input),
+        );
+        assert!(bits(&a[0]) == bits(&b[0]) && bits(&a[1]) == bits(&b[1]));
+        // Output 0 is the target fading in, ducked 20 dB from the end of
+        // the first two intervals, against a desk built without masks.
+        let mut plain = Desk::new(48);
+        plain.mix.ducks.core.cold(480, &targets, |_| 1);
+        plain.mix.ducks.core.settle(480, at);
+        fill_matrix(&mut plain.mix.matrix, &gains, &[0; 4], &depths, 480, at);
+        plain.mix.pos = Some(at);
+        let p = plain.run(101..200, desk_input);
+        let full = samplez_dsp::duck_gain(20.0, 1.0);
+        let mut compared = 0;
+        for n in 16..a[0].len() {
+            if p[0][n].abs() > 1e-4 {
+                let r = a[0][n] / p[0][n];
+                assert!((r - full).abs() < 1e-4, "sample {n}: {r}");
+                compared += 1;
+            }
+        }
+        assert!(compared > 4000, "{compared}");
+        assert!(bits(&a[1]) == bits(&p[1]), "the column not ducked");
     }
 }

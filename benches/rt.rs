@@ -12,7 +12,9 @@
 //! every coefficient of a populated, ramping matrix: of the largest
 //! matrix a configuration of B = 48 takes and of the largest any takes,
 //! at B = 1024 (`COEFFICIENTS_PER_BLOCK_SAMPLE`), set within a quarter of
-//! the block. And on the fill of a product core between two blocks of the
+//! the block; and when it holds the duck mask of every coefficient of the
+//! duck columns and every depth of the largest matrix B = 48 takes with
+//! ten duck columns. And on the fill of a product core between two blocks of the
 //! RT thread: every coefficient of the same two matrices, populated and
 //! ramping, replaced by a fade-in from silence (`Matrix::fade_in`), within
 //! the block it has. And on the entries a product's state change derives
@@ -503,6 +505,7 @@ fn targets(inputs: usize, outputs: usize) -> (samplez::Targets, samplez::Targets
             .collect(),
         flows: Vec::new(),
         strips: Vec::new(),
+        ..Default::default()
     };
     (of(|_, _| 0.5), of(|i, o| ((i + o) % 7) as f32 / 7.0 + 0.1))
 }
@@ -564,6 +567,7 @@ fn targets_at_stereo_64x56() -> (samplez::Targets, samplez::Targets) {
             .collect(),
         flows: (0..64).map(|s| format!("flow-{s}")).collect(),
         strips: (0..64).map(stereo_strip).collect(),
+        ..Default::default()
     };
     let mut to = from.clone();
     for row in &mut to.gains[10..12] {
@@ -582,8 +586,48 @@ fn targets_diff((from, to): (samplez::Targets, samplez::Targets)) -> Vec<samplez
     black_box(from.diff(&to))
 }
 
+/// A desk at the largest matrix B = 48 takes with ten duck columns: 64
+/// by 60 coefficients, 3,840, and five more for each of the 640 of the
+/// duck columns, 7,040 of 7,200. Every coefficient set and ramping, and
+/// the batch of a recall setting the mask of every coefficient of the
+/// duck columns and the depth of every row under every group.
+fn duck_recall() -> (samplez_dsp::Matrix, Vec<(usize, usize, u8)>) {
+    let (mut matrix, _) = recall(64, 60);
+    for i in 0..64 {
+        for o in 0..10 {
+            assert!(matrix.set_mask(i, o, 1, 480));
+        }
+    }
+    let sets = (0..64)
+        .flat_map(|i| (0..10).map(move |o| (i, o, 1u8 << ((i + o) % 8))))
+        .collect();
+    (matrix, sets)
+}
+
+#[library_benchmark]
+#[bench::block_48(setup = duck_recall, config = limit(DUCK_RECALL_BLOCK_48))]
+fn duck_batch(
+    (mut matrix, sets): (samplez_dsp::Matrix, Vec<(usize, usize, u8)>),
+) -> samplez_dsp::Matrix {
+    for &(i, o, mask) in &sets {
+        black_box(matrix.set_mask(i, o, mask, 480));
+    }
+    for i in 0..64 {
+        for g in 0..samplez_dsp::MAX_DUCKS {
+            black_box(matrix.set_depth(i, g, (i + g) as f32 / 4.0, 480));
+        }
+    }
+    matrix
+}
+
+const DUCK_RECALL_BLOCK_48: u64 = 231_239;
+
 const DIFF_BLOCK_48: u64 = 397_843;
-const DIFF_BLOCK_1024: u64 = 4_030_452;
+// Raised from 4,030,452 with the duck entries: an entry list now holds
+// two more variants with heap data, a duck group's keys and parameters,
+// and dropping the 153,600 entries of this diff checks them, 3
+// instructions an entry (4,124,172 measured).
+const DIFF_BLOCK_1024: u64 = 4_536_590;
 const DIFF_STEREO_64X56: u64 = 374_284;
 
 const FILL_BLOCK_48: u64 = 451_896;
@@ -594,7 +638,7 @@ const RECALL_BLOCK_1024: u64 = 31_257_737;
 
 library_benchmark_group!(
     name = batches,
-    benchmarks = [batch_recall, product_fill, targets_diff]
+    benchmarks = [batch_recall, duck_batch, product_fill, targets_diff]
 );
 
 main!(library_benchmark_groups = hold, pages, strips, batches);

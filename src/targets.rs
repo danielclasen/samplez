@@ -2,9 +2,10 @@
 //! that holds its engine's targets as values gives the engine only the
 //! entries that move it from one set of targets to the next.
 
-use samplez_dsp::{CompParams, EqBand, GateParams, StripParam};
+use samplez_dsp::{CompParams, DetectorParams, EqBand, GateParams, KeyFilter, StripParam};
 
 use crate::batch::strip_key;
+use crate::ducks::{DuckSetting, DuckTargets};
 use crate::engine::Entry;
 
 /// Every target an engine's log sets, as values.
@@ -18,13 +19,20 @@ pub struct Targets {
     /// Per input slot, its strip parameters; of two with one key (one
     /// band, one leg, the gate), the later counts.
     pub strips: Vec<Vec<StripParam>>,
+    /// Per duck group, its settings.
+    pub ducks: Vec<DuckTargets>,
+    /// The duck mask of each coefficient, shaped as `gains`.
+    pub masks: Vec<Vec<u8>>,
 }
 
 impl Targets {
     /// The entries that move an engine holding `self` to `next`: a `Gain`
     /// for each coefficient whose bit pattern differs, row by row; a
     /// `Strip` for each parameter that differs in any field's bit
-    /// pattern, by slot and parameter; a
+    /// pattern, by slot and parameter; a `Duck` for each setting of a
+    /// group that differs in any field's bit pattern, by group, its
+    /// parameters, keys, mode and hold, then its depths by slot; a
+    /// `DuckMask` for each coefficient whose mask differs, row by row; a
     /// `Route` for each slot whose flow differs. A target `next` holds and
     /// `self` does not counts as different; one `self` holds and `next`
     /// does not gets no entry, so the engine keeps it.
@@ -44,6 +52,7 @@ impl Targets {
             }
         }
         strip_entries(&self.strips, &next.strips, &mut entries);
+        duck_entries(self, next, &mut entries);
         for (slot, flow) in next.flows.iter().enumerate() {
             if self.flows.get(slot) != Some(flow) {
                 entries.push(Entry::Route {
@@ -55,16 +64,16 @@ impl Targets {
         entries
     }
 
-    /// The entries that set every gain and strip parameter of `self`,
-    /// whatever an engine holds, in the order of [`Targets::diff`], and a
-    /// `Route` for each of `slots` in ascending order.
+    /// The entries that set every gain, strip parameter, duck setting
+    /// and duck mask of `self`, whatever an engine holds, in the order of
+    /// [`Targets::diff`], and a `Route` for each of `slots` in ascending
+    /// order.
     pub fn assert(&self, slots: &[usize]) -> Vec<Entry> {
-        // Against no targets at all: every gain, zeros included, and every
-        // strip parameter.
+        // Against no targets at all: every gain, zeros included, every
+        // strip parameter, duck setting and mask.
         let mut entries = Targets::default().diff(&Targets {
-            gains: self.gains.clone(),
             flows: Vec::new(),
-            strips: self.strips.clone(),
+            ..self.clone()
         });
         let mut slots = slots.to_vec();
         slots.sort_unstable();
@@ -96,6 +105,74 @@ fn strip_entries(was: &[Vec<StripParam>], next: &[Vec<StripParam>], entries: &mu
             }
         }
     }
+}
+
+/// The `Duck` and `DuckMask` entries of [`Targets::diff`], appended to
+/// `entries`. Kept out of line, as the strips' are.
+#[inline(never)]
+fn duck_entries(was: &Targets, next: &Targets, entries: &mut Vec<Entry>) {
+    let f = |x: f32, y: f32| x.to_bits() == y.to_bits() && x == y;
+    for (group, d) in next.ducks.iter().enumerate() {
+        let held = was.ducks.get(group);
+        let mut push = |setting| entries.push(Entry::Duck { group, setting });
+        if held.is_none_or(|h| !same_params(&h.params, &d.params)) {
+            push(DuckSetting::Detector(Box::new(d.params)));
+        }
+        let same_keys = |h: &DuckTargets| {
+            h.keys.len() == d.keys.len()
+                && (h.keys.iter().zip(&d.keys)).all(|(a, b)| a.0 == b.0 && f(a.1, b.1))
+        };
+        if held.is_none_or(|h| !same_keys(h)) {
+            push(DuckSetting::Keys(d.keys.clone()));
+        }
+        if held.is_none_or(|h| h.mode != d.mode) {
+            push(DuckSetting::Mode(d.mode));
+        }
+        if held.is_none_or(|h| h.held != d.held) {
+            push(DuckSetting::Hold { held: d.held });
+        }
+        for (slot, &db) in d.depths.iter().enumerate() {
+            let was = held.and_then(|h| h.depths.get(slot));
+            if was.is_none_or(|&w| !f(w, db)) {
+                push(DuckSetting::Depth { slot, db });
+            }
+        }
+    }
+    for (input, row) in next.masks.iter().enumerate() {
+        let was = was.masks.get(input);
+        for (output, &mask) in row.iter().enumerate() {
+            if was.and_then(|r| r.get(output)) != Some(&mask) {
+                entries.push(Entry::DuckMask {
+                    input,
+                    output,
+                    mask,
+                });
+            }
+        }
+    }
+}
+
+/// Whether two detector parameter sets hold the same bit pattern in
+/// every field, as [`same_bits`] compares strip parameters.
+fn same_params(a: &DetectorParams, b: &DetectorParams) -> bool {
+    let f = |x: f32, y: f32| x.to_bits() == y.to_bits() && x == y;
+    let filter = |x: &KeyFilter, y: &KeyFilter| x.enabled == y.enabled && f(x.freq, y.freq);
+    let DetectorParams {
+        threshold_db,
+        hysteresis_db,
+        hpf,
+        lpf,
+        attack_ms,
+        hold_ms,
+        release_ms,
+    } = a;
+    f(*threshold_db, b.threshold_db)
+        && f(*hysteresis_db, b.hysteresis_db)
+        && filter(hpf, &b.hpf)
+        && filter(lpf, &b.lpf)
+        && f(*attack_ms, b.attack_ms)
+        && f(*hold_ms, b.hold_ms)
+        && f(*release_ms, b.release_ms)
 }
 
 /// Whether `a` and `b` hold the same bit pattern in every field: `f32`
@@ -232,6 +309,7 @@ mod tests {
             gains: vec![vec![0.5, 0.0], vec![0.25, 1.0]],
             flows: vec!["a".into(), "b".into()],
             strips: vec![vec![StripParam::Trim { db: -3.0 }], Vec::new()],
+            ..Targets::default()
         }
     }
 
@@ -382,8 +460,7 @@ mod tests {
     fn a_target_left_out_gets_no_entry() {
         let next = Targets {
             gains: vec![vec![0.5]],
-            flows: Vec::new(),
-            strips: Vec::new(),
+            ..Targets::default()
         };
         assert_eq!(targets().diff(&next), Vec::new());
     }
@@ -688,6 +765,7 @@ mod tests {
                     .map(|_| ["a", "b"][self.below(2)].into())
                     .collect(),
                 strips,
+                ..Targets::default()
             }
         }
     }
@@ -733,5 +811,93 @@ mod tests {
             assert!(it.next().is_none());
             assert!(it.next().is_none());
         }
+    }
+
+    fn duck() -> DuckTargets {
+        DuckTargets {
+            keys: vec![(0, 1.0)],
+            depths: vec![0.0, 12.0],
+            ..DuckTargets::default()
+        }
+    }
+
+    /// Duck settings are compared field by field by bit pattern, each
+    /// setting its own entry, depths by slot, masks by coefficient; a
+    /// group or mask row new to the targets is named whole.
+    #[test]
+    fn duck_settings_and_masks_compare_by_bit_pattern() {
+        use samplez_dsp::DuckMode;
+        let mut base = targets();
+        base.ducks = vec![duck()];
+        base.masks = vec![vec![0, 1], vec![0, 0]];
+        assert_eq!(base.diff(&base.clone()), Vec::new());
+        let mut next = base.clone();
+        next.ducks[0].params.attack_ms = 10.0;
+        next.ducks[0].keys[0].1 = 0.5;
+        next.ducks[0].mode = DuckMode::On;
+        next.ducks[0].held = true;
+        next.ducks[0].depths[0] = -0.0;
+        next.masks[1][0] = 3;
+        let group = |setting| Entry::Duck { group: 0, setting };
+        assert_eq!(
+            base.diff(&next),
+            vec![
+                group(DuckSetting::Detector(Box::new(next.ducks[0].params))),
+                group(DuckSetting::Keys(vec![(0, 0.5)])),
+                group(DuckSetting::Mode(DuckMode::On)),
+                group(DuckSetting::Hold { held: true }),
+                group(DuckSetting::Depth { slot: 0, db: -0.0 }),
+                Entry::DuckMask {
+                    input: 1,
+                    output: 0,
+                    mask: 3
+                },
+            ]
+        );
+        // Every field of the parameters takes part.
+        for field in 0..9 {
+            let mut p = DetectorParams::DEFAULT;
+            match field {
+                0 => p.threshold_db = -29.0,
+                1 => p.hysteresis_db = 3.0,
+                2 => p.hpf.enabled = false,
+                3 => p.hpf.freq = 121.0,
+                4 => p.lpf.enabled = true,
+                5 => p.lpf.freq = 4001.0,
+                6 => p.attack_ms = 21.0,
+                7 => p.hold_ms = 501.0,
+                _ => p.release_ms = 1001.0,
+            }
+            assert!(!same_params(&DetectorParams::DEFAULT, &p), "field {field}");
+        }
+        let mut grown = base.clone();
+        grown.ducks.push(DuckTargets::default());
+        assert_eq!(base.diff(&grown).len(), 4, "a new group: every setting");
+        let mut keyed = base.clone();
+        keyed.ducks[0].keys.push((1, 1.0));
+        assert_eq!(
+            base.diff(&keyed),
+            vec![group(DuckSetting::Keys(vec![(0, 1.0), (1, 1.0)]))]
+        );
+    }
+
+    /// Asserting sets every duck setting and mask, whatever the engine
+    /// holds.
+    #[test]
+    fn assert_sets_every_duck_setting_and_mask() {
+        let mut t = targets();
+        t.ducks = vec![duck(), duck()];
+        t.masks = vec![vec![0, 1], vec![0, 0]];
+        let entries = t.assert(&[]);
+        let ducks = entries
+            .iter()
+            .filter(|e| matches!(e, Entry::Duck { .. }))
+            .count();
+        let masks = entries
+            .iter()
+            .filter(|e| matches!(e, Entry::DuckMask { .. }))
+            .count();
+        // Parameters, keys, mode, hold and two depths per group.
+        assert_eq!((ducks, masks), (12, 4));
     }
 }

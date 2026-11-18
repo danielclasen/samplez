@@ -1,45 +1,50 @@
 //! The engine entries of one log entry, folded into one change the RT
 //! thread applies at the log entry's index: per matrix coefficient, strip
-//! parameter and input slot the last value the log entry sets. A folded
-//! log entry holds at most one value per coefficient, per strip parameter
-//! and per slot, so the engine's shape bounds it, whatever the number of
+//! parameter, input slot, duck setting, depth and duck mask the last
+//! value the log entry sets. A folded log entry holds at most one value
+//! of each, so the engine's shape bounds it, whatever the number of
 //! entries a command translated to.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{StripParam, valid_gain};
+use samplez_dsp::{MAX_DUCKS, StripParam, valid_gain};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::ducks::{DuckChange, valid_depth};
 use crate::rt_loop::Change;
 
-/// A log entry's gain targets, by coefficient `input * columns + output`.
+/// A log entry's values per matrix coefficient `input * columns +
+/// output`: its gain targets ([`Gains`]) or its duck masks.
 #[derive(Clone, Debug)]
-pub(crate) enum Gains {
+pub(crate) enum Coefs<T> {
     /// Ascending by coefficient.
-    Sparse(Vec<(u32, f32)>),
-    /// The target of every coefficient, read only where its bit in `set`
+    Sparse(Vec<(u32, T)>),
+    /// The value of every coefficient, read only where its bit in `set`
     /// is set: smaller than the list once about half the coefficients
     /// change.
-    Dense { gains: Vec<f32>, set: Vec<u64> },
+    Dense { values: Vec<T>, set: Vec<u64> },
 }
 
-impl Gains {
-    /// Calls `f` with each coefficient set and its target, ascending.
-    pub fn each(&self, mut f: impl FnMut(usize, f32)) {
+/// A log entry's gain targets.
+pub(crate) type Gains = Coefs<f32>;
+
+impl<T: Copy + Default> Coefs<T> {
+    /// Calls `f` with each coefficient set and its value, ascending.
+    pub fn each(&self, mut f: impl FnMut(usize, T)) {
         match self {
-            Gains::Sparse(list) => {
+            Coefs::Sparse(list) => {
                 for &(c, g) in list {
                     f(c as usize, g);
                 }
             }
-            Gains::Dense { gains, set } => {
+            Coefs::Dense { values, set } => {
                 for (w, &word) in set.iter().enumerate() {
                     let mut bits = word;
                     while bits != 0 {
                         let c = w * 64 + bits.trailing_zeros() as usize;
-                        f(c, gains[c]);
+                        f(c, values[c]);
                         bits &= bits - 1;
                     }
                 }
@@ -49,12 +54,16 @@ impl Gains {
 
     pub fn len(&self) -> usize {
         match self {
-            Gains::Sparse(list) => list.len(),
-            Gains::Dense { set, .. } => set.iter().map(|w| w.count_ones() as usize).sum(),
+            Coefs::Sparse(list) => list.len(),
+            Coefs::Dense { set, .. } => set.iter().map(|w| w.count_ones() as usize).sum(),
         }
     }
 
-    fn list(&self) -> Vec<(u32, f32)> {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn list(&self) -> Vec<(u32, T)> {
         let mut list = Vec::with_capacity(self.len());
         self.each(|c, g| list.push((c as u32, g)));
         list
@@ -62,38 +71,75 @@ impl Gains {
 
     /// `list`, ascending and unique, in the smaller of the two forms for
     /// `coefficients` coefficients.
-    fn of(list: Vec<(u32, f32)>, coefficients: usize) -> Gains {
+    fn of(list: Vec<(u32, T)>, coefficients: usize) -> Coefs<T> {
         let words = coefficients.div_ceil(64);
-        if list.len() * 8 <= coefficients * 4 + words * 8 {
-            return Gains::Sparse(list);
+        let item = std::mem::size_of::<(u32, T)>();
+        if list.len() * item <= coefficients * std::mem::size_of::<T>() + words * 8 {
+            return Coefs::Sparse(list);
         }
-        let mut gains = vec![0.0; coefficients];
+        let mut values = vec![T::default(); coefficients];
         let mut set = vec![0u64; words];
         for (c, g) in list {
-            gains[c as usize] = g;
+            values[c as usize] = g;
             set[c as usize / 64] |= 1 << (c % 64);
         }
-        Gains::Dense { gains, set }
+        Coefs::Dense { values, set }
+    }
+
+    /// Whether the coefficients ascend strictly, each below `end`, each
+    /// value taken by `ok`.
+    fn sane(&self, end: usize, ok: impl Fn(T) -> bool) -> bool {
+        let list = self.list();
+        list.windows(2).all(|w| w[0].0 < w[1].0)
+            && list.iter().all(|&(c, v)| (c as usize) < end && ok(v))
     }
 }
 
-impl PartialEq for Gains {
-    fn eq(&self, other: &Gains) -> bool {
+impl<T: Copy + Default + PartialEq> PartialEq for Coefs<T> {
+    fn eq(&self, other: &Coefs<T>) -> bool {
         self.list() == other.list()
     }
 }
 
+impl<T: Copy + Default> Default for Coefs<T> {
+    fn default() -> Self {
+        Coefs::Sparse(Vec::new())
+    }
+}
+
 /// A core carries the list form, whatever the form held.
-impl Serialize for Gains {
+impl<T: Copy + Default + Serialize> Serialize for Coefs<T> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         self.list().serialize(s)
     }
 }
 
-impl<'de> Deserialize<'de> for Gains {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Gains, D::Error> {
-        Ok(Gains::Sparse(Vec::deserialize(d)?))
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Coefs<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Coefs<T>, D::Error> {
+        Ok(Coefs::Sparse(Vec::deserialize(d)?))
     }
+}
+
+/// What a log entry sets of its duck groups, besides its [`Change`]s.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DuckItem {
+    /// A setting of detector `group`.
+    Set { group: u8, change: DuckChange },
+    /// The depth of input channel `row` under detector `group`.
+    Depth { row: u32, group: u8, db: f32 },
+    /// The duck mask of a coefficient.
+    Mask {
+        input: usize,
+        output: usize,
+        mask: u8,
+    },
+}
+
+/// One thing a log entry's engine entry sets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Item {
+    Change(Change),
+    Duck(DuckItem),
 }
 
 /// What a folded log entry sets besides its generation-needing entry,
@@ -108,6 +154,13 @@ pub(crate) struct Batch {
     pub strips: Vec<(u32, StripParam)>,
     /// The slots going down, ascending.
     pub downs: Vec<u32>,
+    /// Duck settings by group, one per kind ([`DuckChange::kind`]),
+    /// ascending by group and kind.
+    pub ducks: Vec<(u8, DuckChange)>,
+    /// Duck depths by input channel and group, ascending.
+    pub depths: Vec<(u32, u8, f32)>,
+    /// Duck masks by coefficient.
+    pub masks: Coefs<u8>,
 }
 
 /// Distinguishes the strip parameters a log entry folds: one value per
@@ -128,7 +181,8 @@ pub(crate) fn strip_key(p: &StripParam) -> (u8, usize) {
 
 impl Batch {
     /// Every value is one an engine holds: gains within `MAX_GAIN`, strip
-    /// parameters within their ranges, keys strictly ascending.
+    /// parameters, duck settings and depths within their ranges, groups
+    /// below [`MAX_DUCKS`], keys strictly ascending.
     pub fn sane(&self) -> bool {
         let gains = self.gains.list();
         gains.windows(2).all(|w| w[0].0 < w[1].0)
@@ -139,11 +193,26 @@ impl Batch {
                 .windows(2)
                 .all(|w| (w[0].0, strip_key(&w[0].1)) < (w[1].0, strip_key(&w[1].1)))
             && self.downs.windows(2).all(|w| w[0] < w[1])
+            && self
+                .ducks
+                .iter()
+                .all(|(g, c)| usize::from(*g) < MAX_DUCKS && c.sane())
+            && self
+                .ducks
+                .windows(2)
+                .all(|w| (w[0].0, w[0].1.kind()) < (w[1].0, w[1].1.kind()))
+            && (self.depths.iter()).all(|&(_, g, db)| usize::from(g) < MAX_DUCKS && valid_depth(db))
+            && self
+                .depths
+                .windows(2)
+                .all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1))
+            && self.masks.sane(usize::MAX, |_| true)
     }
 
-    /// Whether every value fits an engine of `coefficients` coefficients
-    /// and input slots of `legs` legs.
-    pub fn fits(&self, coefficients: usize, legs: &[usize]) -> bool {
+    /// Whether every value fits an engine of `inputs` input and `columns`
+    /// matrix channels and input slots of `legs` legs.
+    pub fn fits(&self, inputs: usize, columns: usize, legs: &[usize]) -> bool {
+        let coefficients = inputs * columns;
         let mut gains = true;
         self.gains.each(|c, _| gains &= c < coefficients);
         let strip = |&(s, p): &(u32, StripParam)| {
@@ -153,6 +222,17 @@ impl Batch {
         gains
             && self.strips.iter().all(strip)
             && self.downs.iter().all(|&s| (s as usize) < legs.len())
+            && self.ducks.iter().all(|(_, c)| c.fits(legs))
+            && self
+                .depths
+                .iter()
+                .all(|&(row, _, _)| (row as usize) < inputs)
+            && self.masks.sane(coefficients, |_| true)
+    }
+
+    /// Whether it sets anything of the matrix's ducks.
+    pub fn ducks_matrix(&self) -> bool {
+        !self.depths.is_empty() || !self.masks.is_empty()
     }
 }
 
@@ -168,24 +248,47 @@ struct SlotFold {
     up: bool,
 }
 
-/// What `changes`, the checked engine entries of one log entry in order,
-/// fold into: none for no change, a single change as itself, more as a
-/// [`Change::Batch`] with its batch. Per coefficient and strip parameter
-/// key the last value counts. Per input slot a `Route` and its up or down
-/// state are kept apart ([`SlotFold`]): an `InputUp` and a `Route` raise
-/// the slot on the new flow, a `Route` and an `InputDown` leave it down on
-/// the new flow. `columns` is the matrix's column count, `coefficients`
-/// its size.
+/// What `items`, the checked engine entries of one log entry in order,
+/// fold into: none for no change, a single change as itself, more, or
+/// any duck setting, depth or mask, as a [`Change::Batch`] with its
+/// batch. Per coefficient, strip parameter key, duck setting kind, depth
+/// and mask the last value counts. Per input slot a `Route` and its up or
+/// down state are kept apart ([`SlotFold`]): an `InputUp` and a `Route`
+/// raise the slot on the new flow, a `Route` and an `InputDown` leave it
+/// down on the new flow. `columns` is the matrix's column count,
+/// `coefficients` its size.
 #[allow(clippy::type_complexity)]
 pub(crate) fn fold(
-    changes: &[Change],
+    items: &[Item],
     columns: usize,
     coefficients: usize,
 ) -> Result<Option<(Change, Option<Arc<Batch>>)>, String> {
     let mut gains = BTreeMap::new();
     let mut strips = BTreeMap::new();
     let mut slots: BTreeMap<usize, SlotFold> = BTreeMap::new();
-    for &c in changes {
+    let mut ducks = BTreeMap::new();
+    let mut depths = BTreeMap::new();
+    let mut masks = BTreeMap::new();
+    for &item in items {
+        let c = match item {
+            Item::Change(c) => c,
+            Item::Duck(DuckItem::Set { group, change }) => {
+                ducks.insert((group, change.kind()), change);
+                continue;
+            }
+            Item::Duck(DuckItem::Depth { row, group, db }) => {
+                depths.insert((row, group), db);
+                continue;
+            }
+            Item::Duck(DuckItem::Mask {
+                input,
+                output,
+                mask,
+            }) => {
+                masks.insert((input * columns + output) as u32, mask);
+                continue;
+            }
+        };
         match c {
             Change::Gain {
                 input,
@@ -224,10 +327,11 @@ pub(crate) fn fold(
         + downs.len()
         + up.count_ones() as usize
         + routed.count_ones() as usize;
-    if facts == 0 {
+    let duck_facts = ducks.len() + depths.len() + masks.len();
+    if facts + duck_facts == 0 {
         return Ok(None);
     }
-    if facts == 1 {
+    if facts == 1 && duck_facts == 0 {
         let slot = (up | routed).trailing_zeros() as usize;
         let single = if let Some((&c, &gain)) = gains.first_key_value() {
             let c = c as usize;
@@ -253,9 +357,14 @@ pub(crate) fn fold(
         return Ok(Some((single, None)));
     }
     let batch = Batch {
-        gains: Gains::of(gains.into_iter().collect(), coefficients),
+        gains: Coefs::of(gains.into_iter().collect(), coefficients),
         strips: strips.into_iter().map(|((s, _), p)| (s, p)).collect(),
         downs,
+        ducks: ducks.into_iter().map(|((g, _), c)| (g, c)).collect(),
+        depths: (depths.into_iter())
+            .map(|((row, g), db)| (row, g, db))
+            .collect(),
+        masks: Coefs::of(masks.into_iter().collect(), coefficients),
     };
     let change = Change::Batch {
         strips: !batch.strips.is_empty(),
@@ -267,7 +376,14 @@ pub(crate) fn fold(
 
 #[cfg(test)]
 mod tests {
+    use samplez_dsp::{DetectorParams, DuckMode};
+
     use super::*;
+    use crate::ducks::KeySet;
+
+    fn items(changes: &[Change]) -> Vec<Item> {
+        changes.iter().map(|&c| Item::Change(c)).collect()
+    }
 
     fn gain(input: usize, output: usize, gain: f32) -> Change {
         Change::Gain {
@@ -295,7 +411,7 @@ mod tests {
             changes.push(trim(0, -(n as f32) / 100.0));
         }
         changes.push(Change::InputDown { slot: 1 });
-        let (change, batch) = fold(&changes, 3, 6).unwrap().unwrap();
+        let (change, batch) = fold(&items(&changes), 3, 6).unwrap().unwrap();
         let batch = batch.unwrap();
         assert_eq!(
             change,
@@ -308,8 +424,8 @@ mod tests {
         assert_eq!(batch.gains.list(), [(1, 0.998), (4, 0.999)]);
         assert_eq!(batch.strips, [(0, StripParam::Trim { db: -9.99 })]);
         assert_eq!(batch.downs, [1]);
-        assert!(batch.sane() && batch.fits(6, &[1, 1]));
-        assert!(!batch.fits(4, &[1, 1]), "coefficient 4 of 4");
+        assert!(batch.sane() && batch.fits(2, 3, &[1, 1]));
+        assert!(!batch.fits(1, 4, &[1, 1]), "coefficient 4 of 4");
     }
 
     /// Per slot a re-route and the up or down state are kept apart, in
@@ -326,7 +442,7 @@ mod tests {
         );
         // (downs, up mask, routed mask) of each sequence on slot 1.
         let facts = |changes: &[Change]| -> (Vec<u32>, u64, u64) {
-            match fold(changes, 2, 4).unwrap().unwrap() {
+            match fold(&items(changes), 2, 4).unwrap().unwrap() {
                 (Change::Batch { up, routed, .. }, Some(b)) => (b.downs.clone(), up, routed),
                 (Change::InputUp { slot }, None) => (vec![], 1 << slot, 0),
                 (Change::InputDown { slot }, None) => (vec![slot as u32], 0, 0),
@@ -357,11 +473,11 @@ mod tests {
             Change::InputUp { slot: 1 },
             Change::Route { slot: 1 },
         ] {
-            assert_eq!(fold(&[c, c], 2, 4).unwrap(), Some((c, None)));
+            assert_eq!(fold(&items(&[c, c]), 2, 4).unwrap(), Some((c, None)));
         }
         let up = |slot| Change::InputUp { slot };
         assert_eq!(
-            fold(&[up(0), Change::Route { slot: 1 }], 2, 4).unwrap(),
+            fold(&items(&[up(0), Change::Route { slot: 1 }]), 2, 4).unwrap(),
             Some((
                 Change::Batch {
                     strips: false,
@@ -372,6 +488,9 @@ mod tests {
                     gains: Gains::Sparse(Vec::new()),
                     strips: Vec::new(),
                     downs: Vec::new(),
+                    ducks: Vec::new(),
+                    depths: Vec::new(),
+                    masks: Coefs::default(),
                 }))
             ))
         );
@@ -382,15 +501,120 @@ mod tests {
     #[test]
     fn gains_take_the_smaller_form() {
         let all: Vec<Change> = (0..64).map(|c| gain(c / 8, c % 8, 0.25)).collect();
-        let (_, dense) = fold(&all, 8, 64).unwrap().unwrap();
+        let (_, dense) = fold(&items(&all), 8, 64).unwrap().unwrap();
         let dense = dense.unwrap();
         assert!(matches!(dense.gains, Gains::Dense { .. }));
-        let (_, sparse) = fold(&all[..3], 8, 64).unwrap().unwrap();
+        let (_, sparse) = fold(&items(&all[..3]), 8, 64).unwrap().unwrap();
         let sparse = sparse.unwrap();
         assert!(matches!(sparse.gains, Gains::Sparse(_)));
         let wire = serde_json::to_string(&dense).unwrap();
         let back: Batch = serde_json::from_str(&wire).unwrap();
         assert!(matches!(back.gains, Gains::Sparse(_)));
         assert_eq!(back, *dense);
+    }
+
+    fn duck(group: u8, change: DuckChange) -> Item {
+        Item::Duck(DuckItem::Set { group, change })
+    }
+
+    /// Per group and kind of setting, per depth's channel and group and
+    /// per mask's coefficient the last value counts; a duck item alone
+    /// folds into a batch, whose settings ascend by group and kind.
+    #[test]
+    fn duck_items_fold_to_the_last_value_per_key() {
+        let keys = |k: &[(usize, f32)]| DuckChange::Keys(KeySet::of(k).unwrap());
+        let depth = |row, group, db| Item::Duck(DuckItem::Depth { row, group, db });
+        let mask = |input, output, mask| {
+            Item::Duck(DuckItem::Mask {
+                input,
+                output,
+                mask,
+            })
+        };
+        let mut list = Vec::new();
+        for n in 0..100u8 {
+            list.push(duck(3, DuckChange::Mode(DuckMode::On)));
+            list.push(duck(1, keys(&[(usize::from(n % 4), 1.0)])));
+            list.push(duck(3, DuckChange::Hold(n % 2 == 0)));
+            list.push(depth(u32::from(n % 2), 3, f32::from(n) / 10.0));
+            list.push(mask(1, usize::from(n % 3), n));
+        }
+        list.push(duck(3, DuckChange::Mode(DuckMode::Off)));
+        list.push(duck(
+            1,
+            DuckChange::Detector(DetectorParams {
+                attack_ms: 5.0,
+                ..DetectorParams::DEFAULT
+            }),
+        ));
+        let (change, b) = fold(&list, 3, 6).unwrap().unwrap();
+        let b = b.unwrap();
+        assert_eq!(
+            change,
+            Change::Batch {
+                strips: false,
+                up: 0,
+                routed: 0
+            }
+        );
+        assert_eq!(
+            b.ducks,
+            [
+                (
+                    1,
+                    DuckChange::Detector(DetectorParams {
+                        attack_ms: 5.0,
+                        ..DetectorParams::DEFAULT
+                    })
+                ),
+                (1, keys(&[(3, 1.0)])),
+                (3, DuckChange::Mode(DuckMode::Off)),
+                (3, DuckChange::Hold(false)),
+            ]
+        );
+        assert_eq!(b.depths, [(0, 3, 9.8), (1, 3, 9.9)]);
+        assert_eq!(b.masks.list(), [(3, 99), (4, 97), (5, 98)]);
+        assert!(b.sane() && b.fits(2, 3, &[1, 1, 1, 1]));
+        assert!(!b.fits(2, 3, &[1, 1, 1]), "a key of slot 3 of 3");
+        assert!(!b.fits(1, 3, &[1, 1, 1, 1]), "a depth of channel 1 of 1");
+        for item in [
+            duck(0, DuckChange::Hold(true)),
+            depth(0, 0, 1.0),
+            mask(0, 0, 1),
+        ] {
+            let (change, b) = fold(&[item], 3, 6).unwrap().unwrap();
+            assert!(
+                matches!(change, Change::Batch { .. }) && b.is_some(),
+                "{item:?}"
+            );
+        }
+    }
+
+    /// A batch holding a duck value no engine holds is not sane.
+    #[test]
+    fn a_batch_with_a_duck_value_no_engine_holds_is_not_sane() {
+        let sane = |item: Item| fold(&[item], 3, 6).unwrap().unwrap().1.unwrap().sane();
+        assert!(sane(duck(7, DuckChange::Hold(true))));
+        assert!(!sane(duck(8, DuckChange::Hold(true))), "group");
+        let p = DetectorParams {
+            threshold_db: 1.0,
+            ..DetectorParams::DEFAULT
+        };
+        assert!(!sane(duck(0, DuckChange::Detector(p))), "threshold");
+        let twice = KeySet::of(&[(0, 1.0), (0, 1.0)]).unwrap();
+        assert!(
+            !sane(duck(0, DuckChange::Keys(twice))),
+            "a slot keyed twice"
+        );
+        assert!(!sane(Item::Duck(DuckItem::Depth {
+            row: 0,
+            group: 0,
+            db: 41.0
+        })));
+        assert!(!sane(Item::Duck(DuckItem::Depth {
+            row: 0,
+            group: 8,
+            db: 1.0
+        })));
     }
 }

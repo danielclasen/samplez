@@ -802,6 +802,8 @@ impl<P: Product> StateMachine<P> {
             up,
             flows: targets.flows,
             strips: targets.strips,
+            ducks: targets.ducks,
+            masks: targets.masks,
             pending: Vec::new(),
             last_id: n,
         }
@@ -1822,6 +1824,7 @@ mod derive_tests {
                     .iter()
                     .map(|&db| vec![StripParam::Trim { db }])
                     .collect(),
+                ..Targets::default()
             })
         }
         fn reroutes(&self, _: &Origin, command: &[u8]) -> Vec<u32> {

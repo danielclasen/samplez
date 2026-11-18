@@ -4,9 +4,10 @@
 //! channels to 96 output channels, on both dispatch paths, with every
 //! coefficient ramping, undocked and ducked; the strips, 64 mono ones, the meters of the 64
 //! input channels after them and eight duck detectors keyed by them have
-//! one path. It also
-//! gates the RT parts of a resync at that shape: the matrix copy of the
-//! core and one block's history stores. The hard limits are the
+//! one path, metered as the RT loop runs them, and idle as an engine with
+//! no duck group in use runs them. It also gates the RT parts of a resync
+//! at that shape: the matrix and detector copies of the core and one
+//! block's history stores. The hard limits are the
 //! instruction counts measured in the builder image plus 10 %, rounded
 //! up; a run above a limit fails.
 
@@ -297,6 +298,62 @@ fn duck_advance(mut detectors: Vec<Detector>) -> Vec<Detector> {
     detectors
 }
 
+// The duck stage as the RT loop runs it: the eight keyed detectors
+// metered, each returning its largest key.
+#[library_benchmark]
+#[bench::block(setup = detectors, config = limit(DUCK_METERED))]
+fn duck_metered(
+    (mut detectors, buf, mut envelope): (Vec<Detector>, PlanarBuffer, Vec<f32>),
+) -> (Vec<Detector>, PlanarBuffer, Vec<f32>) {
+    for (g, d) in detectors.iter_mut().enumerate() {
+        black_box(d.process_metered(
+            B,
+            |k, _| black_box(buf.channel(g * MAX_KEYS + k)),
+            &mut envelope,
+        ));
+    }
+    (detectors, buf, envelope)
+}
+
+// The duck stage of an engine with no group in use: eight idle
+// detectors advanced over a block and their envelopes written 0.
+#[library_benchmark]
+#[bench::block(setup = idle, config = limit(DUCK_IDLE))]
+fn duck_idle(
+    (mut detectors, mut envelopes): (Vec<Detector>, PlanarBuffer),
+) -> (Vec<Detector>, PlanarBuffer) {
+    for (g, d) in detectors.iter_mut().enumerate() {
+        if black_box(d.is_idle()) {
+            d.advance(B);
+            envelopes.channel_mut(g)[..B].fill(0.0);
+        }
+    }
+    (detectors, envelopes)
+}
+
+fn idle() -> (Vec<Detector>, PlanarBuffer) {
+    let v = vec![Detector::new(480); MAX_DUCKS];
+    assert!(v.iter().all(Detector::is_idle));
+    (v, PlanarBuffer::new(MAX_DUCKS, B))
+}
+
+// The detector part of the RT thread's core copy: the eight keyed
+// detectors mid-envelope into a buffer of the same length.
+#[library_benchmark]
+#[bench::full(setup = setup_duck_copy, config = limit(DUCK_COPY))]
+fn duck_copy((mut dst, src): (Vec<Detector>, Vec<Detector>)) -> (Vec<Detector>, Vec<Detector>) {
+    dst.copy_from_slice(black_box(&src));
+    (dst, src)
+}
+
+fn setup_duck_copy() -> (Vec<Detector>, Vec<Detector>) {
+    let (mut src, buf, mut envelope) = detectors();
+    for (g, d) in src.iter_mut().enumerate() {
+        d.process(B, |k, _| buf.channel(g * MAX_KEYS + k), &mut envelope);
+    }
+    (vec![Detector::new(480); MAX_DUCKS], src)
+}
+
 // The matrix part of the RT thread's core copy for a resync: every
 // coefficient and its ramp into a buffer of the same shape.
 #[library_benchmark]
@@ -331,6 +388,9 @@ fn setup_history() -> (Started, Vec<History>, PlanarBuffer) {
 }
 
 const CORE_COPY: u64 = 26_000;
+const DUCK_METERED: u64 = 409_172;
+const DUCK_IDLE: u64 = 4_002;
+const DUCK_COPY: u64 = 22_310;
 const HISTORY_BLOCK: u64 = 45_000;
 const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
@@ -357,9 +417,14 @@ library_benchmark_group!(
         input_meters,
         strip,
         duck,
+        duck_metered,
+        duck_idle,
         duck_advance
     ]
 );
-library_benchmark_group!(name = transfer, benchmarks = [core_copy, history]);
+library_benchmark_group!(
+    name = transfer,
+    benchmarks = [core_copy, duck_copy, history]
+);
 
 main!(library_benchmark_groups = block, transfer);
