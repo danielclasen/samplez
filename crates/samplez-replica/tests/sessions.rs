@@ -183,10 +183,12 @@ async fn an_expiry_applied_after_a_command_of_its_session_is_a_no_op() {
     let second = lease(&set, leader, "s").expect("leased");
     assert!(second > first, "the command renewed the lease");
     // An expiry decided on the first renewal, applied after the command.
-    set.replica(leader).append(Body::LeaseExpiry {
-        session: key("s"),
-        renewed: first,
-    });
+    set.replica(leader)
+        .append(Body::LeaseExpiry {
+            session: key("s"),
+            renewed: first,
+        })
+        .unwrap();
     sleep(Duration::from_millis(200)).await;
     holds(&set, "s", &["fader"]);
     for id in set.running() {

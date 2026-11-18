@@ -604,6 +604,7 @@ fn resync_after(n: u64) -> Result<(), String> {
         let processed = donor.progress().and_then(|p| p.processed).unwrap();
         at = (processed + 40) * B;
         let command = Command {
+            generation: None,
             origin: Origin {
                 principal: "p".into(),
                 session: "s".into(),
@@ -805,6 +806,7 @@ fn scene_recalls_on_a_large_shape_apply_on_every_replica() {
         let request = Request {
             stamp: at(id),
             body: Body::Commands(vec![Command {
+                generation: None,
                 origin: Origin {
                     principal: "p".into(),
                     session: "s".into(),
@@ -921,6 +923,7 @@ fn a_two_source_recall_applies_on_every_replica() {
     let request = |body: &[u8]| Request {
         stamp: at,
         body: Body::Commands(vec![Command {
+            generation: None,
             origin: Origin {
                 principal: "p".into(),
                 session: "s".into(),
@@ -1031,6 +1034,7 @@ fn rebuild_after_a_route() -> Result<(), String> {
     let request = Request {
         stamp: at,
         body: Body::Commands(vec![Command {
+            generation: None,
             origin: Origin {
                 principal: "p".into(),
                 session: "s".into(),

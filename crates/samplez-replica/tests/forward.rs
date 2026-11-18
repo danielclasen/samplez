@@ -205,6 +205,7 @@ async fn a_quiescing_leader_hands_forwarded_commands_to_the_next_leader() {
     let forward = PeerRequest::Forward {
         commands: vec![Forwarded {
             command: Command {
+                generation: None,
                 origin: Origin::from(&owner("s")),
                 id: "x".into(),
                 at_index: None,
@@ -245,6 +246,7 @@ async fn a_quiescing_leader_hands_forwarded_commands_to_the_next_leader() {
 fn forwarded(session: &str, id: &str, body: &str, within_ms: u64) -> Forwarded {
     Forwarded {
         command: Command {
+            generation: None,
             origin: Origin::from(&owner(session)),
             id: id.into(),
             at_index: None,

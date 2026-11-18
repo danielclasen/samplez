@@ -51,6 +51,13 @@ pub struct Replicated {
     pub highest_stamp: u64,
     /// The product revision ([`crate::state_machine::StateMachine::revision`]).
     pub revision: u64,
+    /// [`crate::state_machine::StateMachine::floor`]; absent from
+    /// snapshots written before it was kept.
+    #[serde(default)]
+    pub floor: Option<u64>,
+    /// [`crate::state_machine::StateMachine::derived`].
+    #[serde(default)]
+    pub derived: BTreeMap<u64, Vec<u32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

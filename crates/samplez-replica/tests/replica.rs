@@ -292,10 +292,12 @@ async fn a_queued_submit_times_out_at_its_own_deadline() {
         async move { refused(&*replica, "a").await }
     });
     tokio::time::sleep(Duration::from_secs(1)).await;
-    replica.append(Body::LeaseRenew(vec![SessionKey::from_parts(
-        "anonymous",
-        "s",
-    )]));
+    replica
+        .append(Body::LeaseRenew(vec![SessionKey::from_parts(
+            "anonymous",
+            "s",
+        )]))
+        .unwrap();
     let queued_at = tokio::time::Instant::now();
     let second = refused(&*replica, "b").await;
     assert_eq!(second.reason, Reason::Unavailable);
@@ -327,10 +329,12 @@ async fn a_command_past_its_deadline_while_queued_never_applies() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     // The writer takes this entry once the first write times out and
     // waits for it past the deadline of the command queued behind it.
-    replica.append(Body::LeaseRenew(vec![SessionKey::from_parts(
-        "anonymous",
-        "s",
-    )]));
+    replica
+        .append(Body::LeaseRenew(vec![SessionKey::from_parts(
+            "anonymous",
+            "s",
+        )]))
+        .unwrap();
     let queued = replica
         .submit(&owner("s"), "b", Bytes::from("pan=1@1"))
         .await

@@ -175,6 +175,12 @@ pub(crate) enum Queued {
 /// What the writer and the peer handlers share.
 pub(crate) struct Shared {
     settings: Settings,
+    /// The product drives an engine ([`Product::DRIVES_ENGINE`]).
+    drives_engine: bool,
+    /// Whether a command would re-route an input applied to the state as
+    /// it stands ([`Product::reroutes`]), for a product that drives an
+    /// engine; read under the store lock.
+    reroutes: Box<dyn Fn(&Command) -> bool + Send + Sync>,
     raft: Raft<TypeConfig>,
     peers: Arc<dyn PeerClient>,
     /// The longest a leader goes without a quorum, and a follower without
@@ -338,6 +344,18 @@ impl<P: Product> Replica<P> {
         let settings_epoch = settings.epoch;
         let shared = Arc::new(Shared {
             settings,
+            drives_engine: P::DRIVES_ENGINE,
+            reroutes: {
+                let store = store.clone();
+                Box::new(move |command: &Command| {
+                    P::DRIVES_ENGINE
+                        && store.with_state(|sm| {
+                            !sm.product
+                                .reroutes(&command.origin, &command.body)
+                                .is_empty()
+                        })
+                })
+            },
             raft,
             peers,
             lease: Duration::from_millis(raft_config.election_timeout_max),
@@ -402,8 +420,18 @@ impl<P: Product> Replica<P> {
 
     /// Orders an entry the replica set decides on rather than a client,
     /// behind every command submitted before it; a generation-needing
-    /// entry behind the earlier generation-needing ones only.
-    pub fn append(&self, body: Body) {
+    /// entry behind the earlier generation-needing ones only. A product
+    /// that drives an engine owns every input's flow: a `Route` or
+    /// `MasterEnable` for it is refused.
+    ///
+    /// # Errors
+    ///
+    /// When the product drives an engine and `body` is a `Route` or a
+    /// `MasterEnable`.
+    pub fn append(&self, body: Body) -> Result<(), String> {
+        if P::DRIVES_ENGINE && matches!(body, Body::Route { .. } | Body::MasterEnable { .. }) {
+            return Err("the product owns the inputs' flows".to_owned());
+        }
         let queue = if body.needs_generation() {
             &self.generations
         } else {
@@ -415,6 +443,7 @@ impl<P: Product> Replica<P> {
             reply: None,
             forwarded: false,
         });
+        Ok(())
     }
 
     /// Makes `members` the first voters; on one node of a new set only.
@@ -889,7 +918,7 @@ impl Shared {
     /// forwarding them to the leader, resending what a leader change or a
     /// quiescing leader refused, each until its deadline. Answers each
     /// once this replica applied the entry carrying it.
-    async fn order_commands(&self, mut items: Vec<Item>, estimate: &Estimate) {
+    async fn order_commands(&self, mut items: Vec<Item>, estimate: &Estimate, generation: bool) {
         loop {
             let now = Instant::now();
             items.retain_mut(|item| {
@@ -905,7 +934,26 @@ impl Shared {
                 return;
             }
             if let Some(proposing) = self.propose() {
-                let written = self.write_locally(items, estimate).await;
+                let stamp = match self.stamp(generation, estimate) {
+                    Ok(stamp) => stamp,
+                    // One pending generation at a time: wait for it
+                    // proposing nothing, so a quiesce goes on meanwhile,
+                    // and check the leadership again.
+                    Err(contact::StampRefusal::GenerationPending)
+                        if items
+                            .iter()
+                            .any(|item| Instant::now() + self.heartbeat < item.deadline) =>
+                    {
+                        drop(proposing);
+                        tokio::time::sleep(self.heartbeat / 10).await;
+                        continue;
+                    }
+                    Err(refusal) => {
+                        let _ = answer_all(items, stamp_refused(refusal));
+                        return;
+                    }
+                };
+                let written = self.write_locally(items, stamp, estimate).await;
                 drop(proposing);
                 match written {
                     Ok(()) => return,
@@ -936,13 +984,14 @@ impl Shared {
         }
     }
 
-    /// Appends `items` as one entry and answers them; gives them back when
-    /// this replica turned out not to lead.
-    async fn write_locally(&self, items: Vec<Item>, estimate: &Estimate) -> Result<(), Vec<Item>> {
-        let stamp = match self.stamp(false, estimate) {
-            Ok(stamp) => stamp,
-            Err(refusal) => return answer_all(items, stamp_refused(refusal)),
-        };
+    /// Appends `items` as one entry stamped `stamp` and answers them;
+    /// gives them back when this replica turned out not to lead.
+    async fn write_locally(
+        &self,
+        items: Vec<Item>,
+        stamp: contact::Stamp,
+        estimate: &Estimate,
+    ) -> Result<(), Vec<Item>> {
         // A member of another configuration would apply them into another
         // product state.
         if let Some(id) = self.contact.get().and_then(|c| c.config_differs()) {
@@ -958,6 +1007,22 @@ impl Shared {
             .partition(|item| item.received.saturating_add(max_age) >= e);
         for item in expired {
             let _ = item.reply.send(Err(Refused::Expired));
+        }
+        // A product that drives an engine derives its entries from the
+        // state at the command's place in the log, which already holds a
+        // scheduled command's effect: one asking for an index beyond the
+        // earliest is not ordered.
+        let earliest = stamp.earliest.next_multiple_of(self.settings.block);
+        let (scheduled, items): (Vec<Item>, Vec<Item>) = items
+            .into_iter()
+            .partition(|item| scheduled(self.drives_engine, item.command.at_index, earliest));
+        for item in scheduled {
+            let at = item.command.at_index.unwrap_or(0);
+            let refused = Refused::Invalid(format!(
+                "scheduled at_index {at} beyond the earliest, {earliest}: this product applies \
+                 commands as they are ordered"
+            ));
+            let _ = item.reply.send(Err(refused));
         }
         if items.is_empty() {
             return Ok(());
@@ -1060,6 +1125,13 @@ impl Shared {
     }
 }
 
+/// Whether a command asking for `at_index` is scheduled past `earliest`,
+/// the earliest block start the writer stamps: refused for a product that
+/// drives an engine.
+fn scheduled(drives_engine: bool, at_index: Option<u64>, earliest: u64) -> bool {
+    drives_engine && at_index.is_some_and(|at| at > earliest)
+}
+
 fn stamp_refused(refusal: contact::StampRefusal) -> Refused {
     Refused::Unavailable(
         match refusal {
@@ -1078,14 +1150,18 @@ fn answer_all(items: Vec<Item>, refused: Refused) -> Result<(), Vec<Item>> {
     Ok(())
 }
 
-/// The only writer: takes the queue in order, so commands commit in the
-/// order they were submitted, and puts what queued while the previous
-/// entry was written into the next one (group commit). A copy of a
-/// command the batch holds already is folded into it and answered from
-/// its outcome, an applied one as a duplicate. An entry carries at most
-/// [`MAX_ENTRY_BYTES`] of commands. On a follower the group is
-/// forwarded to the leader instead, one group at a time, so the order
-/// holds there too.
+/// A writer: takes its queue in order, so the commands of the one queue
+/// that carries them commit in the order they were submitted, and puts
+/// what queued while the previous entry was written into the next one
+/// (group commit). A copy of a command the batch holds already is folded
+/// into it and answered from its outcome, an applied one as a duplicate.
+/// An entry carries at most [`MAX_ENTRY_BYTES`] of commands. A command
+/// that would re-route an input ([`Product::reroutes`]) ends the group
+/// before it and is ordered alone, stamped for its generation. On a
+/// follower the group is forwarded to the leader instead, one group at a
+/// time, so the order holds there too. The generation-needing entries the
+/// replica set decides on have a writer of their own, so one waiting for
+/// the previous generation's index holds no command.
 ///
 /// A first cut: one entry is in flight at a time and the writer waits for
 /// it to commit and apply here before it proposes the next, so the
@@ -1125,6 +1201,12 @@ async fn write(
                     let _ = item.reply.send(Err(Refused::Invalid(why)));
                     continue;
                 }
+                // One that would re-route an input is ordered alone,
+                // stamped for its generation.
+                if (shared.reroutes)(&item.command) {
+                    shared.order_commands(vec![item], &estimate, true).await;
+                    continue;
+                }
                 let mut bytes = item.command.size();
                 let mut items = vec![item];
                 while let Ok(queued) = queued.try_recv() {
@@ -1133,6 +1215,7 @@ async fn write(
                         // opens an entry of its own.
                         Queued::Command(item)
                             if joins(&items[0].command, items.len(), bytes, &item.command)
+                                && !(shared.reroutes)(&item.command)
                                 && shared
                                     .admits(
                                         &items
@@ -1152,7 +1235,7 @@ async fn write(
                         }
                     }
                 }
-                shared.order_commands(items, &estimate).await;
+                shared.order_commands(items, &estimate, false).await;
             }
         }
     }
@@ -1170,6 +1253,7 @@ impl Shared {
         let commands = commands
             .iter()
             .map(|c| Command {
+                generation: None,
                 at_index: Some(c.at_index.unwrap_or(0)),
                 ..(*c).clone()
             })
@@ -1403,6 +1487,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         let deadline = Instant::now() + self.shared.settings.write_timeout;
         let item = Item {
             command: Command {
+                generation: None,
                 origin: Origin::from(owner),
                 id: id.to_owned(),
                 at_index: None,
@@ -1442,7 +1527,8 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     }
 
     fn renew_sessions(&self, live: &[Owner]) {
-        self.append(Body::LeaseRenew(
+        // Never a route: never refused.
+        let _ = self.append(Body::LeaseRenew(
             live.iter().map(SessionKey::from).collect(),
         ));
     }
@@ -1451,6 +1537,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::state_machine::tests::Paths;
     use openraft::error::{InstallSnapshotError, RPCError, Unreachable};
     use openraft::network::{RPCOption, RaftNetwork};
@@ -1464,12 +1551,24 @@ mod tests {
 
     const ID: NodeId = 7;
 
+    /// A product that drives an engine refuses a command asking for an
+    /// index beyond the earliest; one that does not keeps it, and an
+    /// index at or before the earliest, or none, is never refused.
+    #[test]
+    fn only_an_engine_product_refuses_a_scheduled_index() {
+        assert!(scheduled(true, Some(4848), 4800));
+        assert!(!scheduled(true, Some(4800), 4800));
+        assert!(!scheduled(true, None, 4800));
+        assert!(!scheduled(false, Some(48_000), 4800));
+    }
+
     /// An entry carries commands asking for one index only: the engine
     /// applies a log entry at one index, so a command asking for a later
     /// one is not folded into an entry applied earlier.
     #[test]
     fn commands_asking_for_other_indexes_take_entries_of_their_own() {
         let command = |at_index, bytes: usize| Command {
+            generation: None,
             origin: Origin {
                 principal: "p".into(),
                 session: "s".into(),

@@ -15,7 +15,9 @@
 //! the block. And on the fill of a product core between two blocks of the
 //! RT thread: every coefficient of the same two matrices, populated and
 //! ramping, replaced by a fade-in from silence (`Matrix::fade_in`), within
-//! the block it has.
+//! the block it has. And on the entries a product's state change derives
+//! (`Targets::diff`), a recall changing every coefficient of the same two
+//! shapes, which a replica computes as each log entry applies.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -490,12 +492,46 @@ fn product_fill((mut matrix, gains): (samplez_dsp::Matrix, Vec<f32>)) -> samplez
     matrix
 }
 
+/// The targets before and after a recall that changes every coefficient
+/// of `inputs` by `outputs`.
+fn targets(inputs: usize, outputs: usize) -> (samplez::Targets, samplez::Targets) {
+    let of = |g: fn(usize, usize) -> f32| samplez::Targets {
+        gains: (0..inputs)
+            .map(|i| (0..outputs).map(|o| g(i, o)).collect())
+            .collect(),
+        flows: Vec::new(),
+        strips: Vec::new(),
+    };
+    (of(|_, _| 0.5), of(|i, o| ((i + o) % 7) as f32 / 7.0 + 0.1))
+}
+
+fn targets_at_block_48() -> (samplez::Targets, samplez::Targets) {
+    targets(80, 90)
+}
+
+fn targets_at_block_1024() -> (samplez::Targets, samplez::Targets) {
+    targets(384, 400)
+}
+
+#[library_benchmark]
+#[bench::block_48(setup = targets_at_block_48, config = limit(DIFF_BLOCK_48))]
+#[bench::block_1024(setup = targets_at_block_1024, config = limit(DIFF_BLOCK_1024))]
+fn targets_diff((from, to): (samplez::Targets, samplez::Targets)) -> Vec<samplez::Entry> {
+    black_box(from.diff(&to))
+}
+
+const DIFF_BLOCK_48: u64 = 397_843;
+const DIFF_BLOCK_1024: u64 = 4_030_452;
+
 const FILL_BLOCK_48: u64 = 451_896;
 const FILL_BLOCK_1024: u64 = 9_631_507;
 
 const RECALL_BLOCK_48: u64 = 1_291_097;
 const RECALL_BLOCK_1024: u64 = 31_257_737;
 
-library_benchmark_group!(name = batches, benchmarks = [batch_recall, product_fill]);
+library_benchmark_group!(
+    name = batches,
+    benchmarks = [batch_recall, product_fill, targets_diff]
+);
 
 main!(library_benchmark_groups = hold, pages, strips, batches);

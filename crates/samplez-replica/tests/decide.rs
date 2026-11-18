@@ -90,10 +90,12 @@ async fn late_everywhere(kill: bool) -> (Set, u64) {
         }
     }
     let at = (index_at(set.clock(leader).tai_ns()) + 40 * 48).next_multiple_of(BLOCK);
-    set.replica(leader).append(Body::InputDown {
-        slot: 0,
-        at_index: at,
-    });
+    set.replica(leader)
+        .append(Body::InputDown {
+            slot: 0,
+            at_index: at,
+        })
+        .unwrap();
     let mut index = None;
     until("appended on the leader", 1, || {
         index = set

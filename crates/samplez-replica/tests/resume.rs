@@ -402,12 +402,14 @@ async fn a_killed_leader_and_baseline_is_renamed_to_a_survivor() {
     .await;
     let leader = set.leader().await;
     if baseline(&set, leader).unwrap().replica != leader {
-        set.replica(leader).append(Body::Baseline(Baseline {
-            replica: leader,
-            order: Vec::new(),
-            at_index: 0,
-            key: None,
-        }));
+        set.replica(leader)
+            .append(Body::Baseline(Baseline {
+                replica: leader,
+                order: Vec::new(),
+                at_index: 0,
+                key: None,
+            }))
+            .unwrap();
         until("the leader named", 2, || {
             ids.iter()
                 .all(|&id| baseline(&set, id).is_some_and(|b| b.replica == leader))
@@ -596,14 +598,18 @@ async fn a_verdict_waits_for_a_leader_and_a_stale_one_is_ignored() {
         .unwrap();
     let f = from(&set, healthy, 0).unwrap();
     let leader = set.leader().await;
-    set.replica(leader).append(Body::Diverged {
-        replica: healthy,
-        page: f / PAGE - 1,
-    });
-    set.replica(leader).append(Body::Diverged {
-        replica: odd,
-        page: k * BLOCK / PAGE,
-    });
+    set.replica(leader)
+        .append(Body::Diverged {
+            replica: healthy,
+            page: f / PAGE - 1,
+        })
+        .unwrap();
+    set.replica(leader)
+        .append(Body::Diverged {
+            replica: odd,
+            page: k * BLOCK / PAGE,
+        })
+        .unwrap();
     until("both verdicts in every log", 2, || {
         [healthy, odd]
             .iter()
