@@ -322,11 +322,13 @@ impl<P: Product> StateMachine<P> {
     /// The index entry `request` takes effect at, raised to the floor,
     /// and the floor after it: its own at_index, or its stamp, a block
     /// start, for one further than [`AHEAD_MAX`] past it or for a lease
-    /// expiry or void from an older leader, which stamps none.
+    /// expiry from an older leader, which stamps none. A void from an
+    /// older leader takes effect nowhere, as that leader's binary applies
+    /// it: the floor stays alike on both.
     fn floored(&self, request: &Request) -> Option<u64> {
         let own = match (request.at_index(), &request.body) {
             (Some(at), _) if at <= request.stamp.saturating_add(AHEAD_MAX) => at,
-            (Some(_), _) | (None, Body::LeaseExpiry { .. } | Body::Void { .. }) => request.stamp,
+            (Some(_), _) | (None, Body::LeaseExpiry { .. }) => request.stamp,
             (None, _) => return None,
         };
         Some(own.max(self.floor))
@@ -2067,26 +2069,40 @@ mod derive_tests {
         assert!(up.generation);
     }
 
-    /// A Void of an entry that derived engine entries drops it from
-    /// `derived`: nothing re-asserts it later.
+    /// A void or lease expiry from an older leader, which stamps none,
+    /// applies as that leader's binary applies it: the void drops the
+    /// entry and its `derived` bit, derives nothing and leaves the floor
+    /// where it was, the expiry derives at its stamp. One the leader
+    /// stamped derives at its own index.
     #[test]
-    fn a_void_clears_the_derived_bit() {
+    fn an_unstamped_void_or_expiry_applies_as_an_older_binary_does() {
         let mut sm = machine();
         sm.apply_at(10, 1, &one("1", "route 0 c", 0, 3000, Some(true)));
         assert_eq!(sm.derived.get(&10), Some(&vec![0]));
-        let void = Request {
-            stamp: 96,
-            body: Body::Void {
-                revision: 10,
-                term: 1,
-                at_index: None,
-                generation: None,
+        sm.apply_at(11, 1, &void(10, 4800, None));
+        assert!(!sm.derived.contains_key(&10));
+        assert!(!sm.terms.contains_key(&10));
+        assert!(!sm.terms.contains_key(&11), "an unstamped void is final");
+        assert!(!sm.records.contains_key(&11));
+        assert_eq!(sm.floor, 3000);
+
+        sm.apply_at(12, 1, &one("2", "solo", 0, 3000, None));
+        let expiry = |stamp, at_index| Request {
+            stamp,
+            body: Body::LeaseExpiry {
+                session: origin("s").key(),
+                renewed: 0,
+                at_index,
             },
         };
-        sm.apply_at(11, 1, &void);
-        assert!(!sm.derived.contains_key(&10));
-        assert!(!sm.derived.contains_key(&11), "an unstamped void is final");
-        assert_eq!(sm.records[&11].at_index, 3000, "re-asserted at the floor");
+        sm.apply_at(13, 1, &expiry(4800, None));
+        assert_eq!(sm.records[&13].at_index, 4800, "at its stamp");
+        assert_eq!(sm.floor, 4800);
+
+        sm.apply_at(14, 1, &one("3", "route 1 d", 0, 4800, Some(true)));
+        sm.apply_at(15, 1, &void(14, 4800, Some(6000)));
+        assert_eq!(sm.records[&15].at_index, 6000);
+        assert_eq!(sm.floor, 6000);
     }
 
     fn void(of: u64, stamp: u64, at_index: Option<u64>) -> Request {
@@ -2103,9 +2119,8 @@ mod derive_tests {
 
     /// A void of a product entry re-asserts the state at the void, on the
     /// generation path when the entry re-routed: the engine plays the
-    /// voided command's effect, which the state holds. One from an older
-    /// leader re-asserts at its stamp raised to the floor, one of an id
-    /// not held derives nothing.
+    /// voided command's effect, which the state holds. One of an id not
+    /// held derives nothing.
     #[test]
     fn a_void_reasserts_the_state_at_its_index() {
         let mut sm = machine();
@@ -2126,11 +2141,8 @@ mod derive_tests {
         }));
         assert!(void(10, 0, None).body.needs_generation());
 
-        sm.apply_at(13, 1, &one("3", "route 1 d", 0, 4800, Some(true)));
-        sm.apply_at(14, 1, &void(13, 4900, None));
-        assert_eq!(sm.records[&14].at_index, 4900, "the stamp, past the floor");
-        sm.apply_at(15, 1, &void(99, 96, Some(6000)));
-        assert!(!sm.records.contains_key(&15));
+        sm.apply_at(13, 1, &void(99, 96, Some(6000)));
+        assert!(!sm.records.contains_key(&13));
     }
 
     /// A stamped void can go unresolved itself: a restamp of it re-asserts
