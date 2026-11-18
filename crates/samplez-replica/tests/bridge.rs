@@ -92,6 +92,19 @@ fn bridge_on(domain: &Domain, changes: usize, flows: [&str; 2]) -> (Arc<Engine>,
 
 /// [`bridge`] of configuration `v`.
 fn bridge_of(v: &serde_json::Value, changes: usize) -> (Arc<Engine>, EngineAudio) {
+    let timing = Timing {
+        margin: 960,
+        ..Timing::defaults(B)
+    };
+    bridge_timed(v, changes, &timing)
+}
+
+/// [`bridge_of`] with contact's timers `timing`.
+fn bridge_timed(
+    v: &serde_json::Value,
+    changes: usize,
+    timing: &Timing,
+) -> (Arc<Engine>, EngineAudio) {
     let config = Config::parse(&v.to_string()).unwrap();
     let (reports, _) = std::sync::mpsc::sync_channel(64);
     let (status_tx, status_rx) = std::sync::mpsc::sync_channel(changes);
@@ -107,11 +120,7 @@ fn bridge_of(v: &serde_json::Value, changes: usize) -> (Arc<Engine>, EngineAudio
     wait_for("outputs realised", || {
         engine.status().outputs.iter().all(|o| o.realised)
     });
-    let timing = Timing {
-        margin: 960,
-        ..Timing::defaults(B)
-    };
-    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, &timing);
+    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, timing);
     (engine, audio)
 }
 
@@ -1051,4 +1060,134 @@ fn rebuild_after_a_route() -> Result<(), String> {
     }
     assert_eq!(joiner.status().inputs[0].flow_id, ROUTED);
     Ok(())
+}
+
+/// Two input slots in two input domains, `a` and `b`, into one output of
+/// domain `a`; no flow is written.
+fn two_domains(d0: &Domain, d1: &Domain, output: &str) -> serde_json::Value {
+    serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "a", "path": d0.0 }, { "name": "b", "path": d1.0 }],
+        "inputs": [
+            { "name": "in0", "domain": "a", "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd5a00", "channels": 1 },
+            { "name": "in1", "domain": "b", "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd5b00", "channels": 1 },
+        ],
+        "outputs": [{ "name": "out0", "domain": "a", "flowId": output,
+                      "label": "domains", "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0], [1.0]],
+        "rt": { "rtCpu": "none" },
+    })
+}
+
+/// A re-route of both slots, of two domains, as a command flagged `None`
+/// derives during a rollout: a live engine keeps the lower slot's route
+/// and leaves the other out. A replica rebuilt from the product state,
+/// which holds both, reads what the live one reads, and a gain the
+/// engine refuses is silenced in the rebuild rather than refusing it.
+#[test]
+fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
+    let (d0, d1) = (Domain::new(), Domain::new());
+    let (live, live_audio) = bridge_of(
+        &two_domains(&d0, &d1, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f30"),
+        1 << 12,
+    );
+    let (rebuilt, rebuilt_audio) = bridge_of(
+        &two_domains(&d0, &d1, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f31"),
+        1 << 12,
+    );
+    let processed = |e: &Engine| e.progress().and_then(|p| p.processed);
+    wait_for("both compute", || {
+        processed(&live).is_some() && processed(&rebuilt).is_some()
+    });
+    let routed = [
+        "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd5a01",
+        "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd5b01",
+    ];
+    let reroute: Vec<Entry> = (0..2)
+        .map(|slot| Entry::Route {
+            slot,
+            flow_id: routed[slot].to_owned(),
+        })
+        .collect();
+    let at = (processed(&live).unwrap() + 100) * B;
+    live_audio.appended(1, at, &reroute);
+    live_audio.committed(1);
+    let flows =
+        |e: &Engine| -> Vec<String> { e.status().inputs.into_iter().map(|i| i.flow_id).collect() };
+    wait_for("slot 0 re-routed", || flows(&live)[0] == routed[0]);
+    assert_eq!(live_audio.sample().entries_filtered, 1);
+    let mut state = samplez::ProductState {
+        gains: vec![vec![1.0], vec![1.0]],
+        up: vec![true, true],
+        flows: routed.map(str::to_owned).to_vec(),
+        strips: vec![Vec::new(), Vec::new()],
+        pending: Vec::new(),
+        last_id: 1,
+    };
+    rebuilt_audio.drop_engine();
+    assert!(rebuilt_audio.rebuild_engine(&state, 0), "rebuilt");
+    assert_eq!(
+        flows(&rebuilt),
+        flows(&live),
+        "the flows the live one reads"
+    );
+    state.gains[1][0] = f32::INFINITY;
+    state.last_id = 2;
+    assert!(rebuilt_audio.rebuild_engine(&state, 0), "rebuilt again");
+    // Past the gains' fade-in.
+    std::thread::sleep(Duration::from_millis(100));
+    let core = loop {
+        match rebuilt.copy_core(Duration::from_secs(2)) {
+            Err(samplez::CopyError::Passed { .. }) => continue,
+            c => break c.unwrap(),
+        }
+    };
+    assert_eq!((core.core.gain(0, 0), core.core.gain(1, 0)), (1.0, 0.0));
+}
+
+/// A rebuild offered for a floor further ahead than the rebuild's own
+/// wait, as continuous writes keep it with a `maxApplyLead` near 100 ms
+/// and a generation's build ahead of that, waits for the floor and
+/// installs: refused, the replica would never rebuild under writes.
+#[test]
+fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
+    let domain = Domain::new();
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "in0", "domain": "d",
+                     "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a", "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d", "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f32",
+                      "label": "bridge", "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let timing = Timing {
+        margin: 960,
+        max_apply_lead: Duration::from_millis(100),
+        ..Timing::defaults(B)
+    };
+    let (engine, audio) = bridge_timed(&v, 1 << 12, &timing);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let state = samplez::ProductState {
+        gains: vec![vec![0.5]],
+        up: vec![true],
+        flows: vec!["5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned()],
+        strips: vec![Vec::new()],
+        pending: Vec::new(),
+        last_id: 1,
+    };
+    audio.drop_engine();
+    // 180 ms ahead: past the 100 ms a rebuild waits beyond the lead.
+    let now = (engine.progress().unwrap().processed.unwrap() + 1) * B;
+    let floor = (now + 180 * 48).next_multiple_of(B);
+    assert!(audio.rebuild_engine(&state, floor), "rebuilt at the floor");
+    let installed = engine.progress().unwrap().processed.unwrap();
+    assert!(installed * B + B >= floor, "installed at {installed}");
 }

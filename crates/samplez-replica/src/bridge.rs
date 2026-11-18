@@ -11,7 +11,7 @@
 //! range, which no word records, is lost with its change.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,7 +25,8 @@ use crate::contact::{Audio, Sample, Timing};
 use crate::report::{ClockFlags, Own, Page, Unwritten, page_digest, runs};
 use crate::resync::{CoreReply, Missed, Resynced, Source};
 
-/// How long a rebuild waits for the RT thread to take the core.
+/// How long a rebuild waits for the RT thread to take the core, past the
+/// floor's lead over the engine ([`EngineAudio::rebuild_engine`]).
 const REBUILD_WAIT: Duration = Duration::from_millis(100);
 
 /// How long a donor waits for its RT thread to copy the core, and how
@@ -102,6 +103,10 @@ pub struct EngineAudio {
     refused: AtomicU64,
     /// Derived entries left out before the engine saw them.
     filtered: AtomicU64,
+    /// `maxApplyLeadMs`.
+    max_apply_lead: Duration,
+    /// A failed rebuild was logged; cleared by one that succeeds.
+    rebuild_failed: AtomicBool,
 }
 
 impl EngineAudio {
@@ -126,6 +131,8 @@ impl EngineAudio {
             window: samples.div_ceil(timing.block) + 1,
             refused: AtomicU64::new(0),
             filtered: AtomicU64::new(0),
+            max_apply_lead: timing.max_apply_lead,
+            rebuild_failed: AtomicBool::new(false),
             unwritten: Mutex::new(Unwrittens {
                 changes,
                 kept: VecDeque::new(),
@@ -135,14 +142,30 @@ impl EngineAudio {
         }
     }
 
-    /// The entries of entry `index`'s record the engine takes: all of
-    /// them, or, when it refuses them together, those it takes alone,
-    /// of the `InputUp`s and `Route`s only those it takes with the ones
-    /// of lower slots, so one generation's worth stays. What is left out
-    /// is counted and logged: the product derived what it must not. The
-    /// engine's configuration alone decides it, the same on every
-    /// replica of a compatibility key, so their outputs still agree.
+    /// The entries of entry `index`'s record the engine takes
+    /// ([`EngineAudio::kept`]). What is left out is counted and logged:
+    /// the product derived what it must not.
     fn filter(&self, index: u64, entries: &[Entry]) -> Vec<Entry> {
+        let kept = self.kept(entries);
+        let dropped = (entries.len() - kept.len()) as u64;
+        if dropped > 0 {
+            self.filtered.fetch_add(dropped, Ordering::Relaxed);
+            tracing::error!(
+                index,
+                dropped,
+                "the product derived engine entries the engine refuses: left out"
+            );
+        }
+        kept
+    }
+
+    /// Of `entries`, those the engine takes: all of them, or, when it
+    /// refuses them together, those it takes alone, of the `InputUp`s and
+    /// `Route`s only those it takes with the ones of lower slots, so one
+    /// generation's worth stays. The engine's configuration alone decides
+    /// it, the same on every replica of a compatibility key, so their
+    /// outputs still agree.
+    fn kept(&self, entries: &[Entry]) -> Vec<Entry> {
         if self.engine.admits(entries).is_ok() {
             return entries.to_vec();
         }
@@ -166,14 +189,54 @@ impl EngineAudio {
                 kept.pop();
             }
         }
-        let dropped = (entries.len() - kept.len()) as u64;
-        self.filtered.fetch_add(dropped, Ordering::Relaxed);
-        tracing::error!(
-            index,
-            dropped,
-            "the product derived engine entries the engine refuses: left out"
-        );
         kept
+    }
+
+    /// `state` as the records the bridge filters leave an engine: a flow
+    /// differing from the one its input reads is a re-route, kept by the
+    /// rules of [`EngineAudio::kept`] and else left at the one read; a
+    /// strip parameter the engine refuses is not set; a gain it refuses
+    /// is silent. A replica rebuilt from it holds what a live one that
+    /// read the same flows holds.
+    fn sanitised(&self, state: &ProductState) -> ProductState {
+        let mut state = state.clone();
+        let reading: Vec<String> = (self.engine.status().inputs.into_iter())
+            .map(|i| i.flow_id)
+            .collect();
+        let routes: Vec<Entry> = (state.flows.iter().enumerate())
+            .filter(|&(slot, flow)| reading.get(slot).is_some_and(|r| r != flow))
+            .map(|(slot, flow)| Entry::Route {
+                slot,
+                flow_id: flow.clone(),
+            })
+            .collect();
+        let kept = self.kept(&routes);
+        let mut dropped = routes.len() - kept.len();
+        for route in &routes {
+            if let Entry::Route { slot, .. } = *route
+                && !kept.contains(route)
+            {
+                state.flows[slot] = reading[slot].clone();
+            }
+        }
+        for (slot, params) in state.strips.iter_mut().enumerate() {
+            let before = params.len();
+            params.retain(|&param| self.engine.admits(&[Entry::Strip { slot, param }]).is_ok());
+            dropped += before - params.len();
+        }
+        for gain in state.gains.iter_mut().flatten() {
+            if !samplez_dsp::valid_gain(*gain) {
+                *gain = 0.0;
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            tracing::error!(
+                dropped,
+                "the product state holds what the engine refuses: left out of the rebuild"
+            );
+        }
+        state
     }
 
     /// The engine's refusal of an appended entry: the engine then lacks
@@ -358,11 +421,23 @@ impl Audio for EngineAudio {
         }
     }
 
+    /// Waits for the floor, which lies up to the lead and a generation's
+    /// build ahead of the engine under continuous writes, and the RT
+    /// thread's take; a failure is logged once until one succeeds.
     fn rebuild_engine(&self, state: &ProductState, at_least: u64) -> bool {
-        match self.engine.install_product(state, at_least, REBUILD_WAIT) {
-            Ok(_) => true,
+        let build_lead = self.engine.progress().map_or(0, |p| p.build_lead);
+        let ahead = Duration::from_nanos(crate::contact::time_of(build_lead));
+        let timeout = REBUILD_WAIT + self.max_apply_lead + ahead;
+        let state = self.sanitised(state);
+        match self.engine.install_product(&state, at_least, timeout) {
+            Ok(_) => {
+                self.rebuild_failed.store(false, Ordering::Relaxed);
+                true
+            }
             Err(e) => {
-                tracing::warn!(error = ?e, "the engine core was not rebuilt");
+                if !self.rebuild_failed.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(error = ?e, "the engine core was not rebuilt: retried");
+                }
                 false
             }
         }
