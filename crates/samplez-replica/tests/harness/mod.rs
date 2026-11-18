@@ -1107,10 +1107,21 @@ impl Audio for FakeAudio {
     }
 }
 
+/// A replica as its peers reach it, whatever its product.
+trait Handles: Send + Sync {
+    fn handle(&self, to: Option<NodeId>, request: PeerRequest) -> BoxFuture<'_, PeerReply>;
+}
+
+impl<P: Product + Sync> Handles for Replica<P> {
+    fn handle(&self, to: Option<NodeId>, request: PeerRequest) -> BoxFuture<'_, PeerReply> {
+        Box::pin(Replica::handle(self, to, request))
+    }
+}
+
 #[derive(Default)]
 struct Links {
     rafts: BTreeMap<NodeId, Raft<TypeConfig>>,
-    replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
+    replicas: BTreeMap<NodeId, Arc<dyn Handles>>,
     /// (from, to): RPCs from `from` to `to` do not arrive.
     cut: BTreeSet<(NodeId, NodeId)>,
     /// (from, to): RPCs from `from` to `to` get no answer, as through a
@@ -1534,15 +1545,17 @@ impl Default for Options {
     }
 }
 
-pub struct Set {
+pub struct Set<P: Product + Sync = Paths> {
     options: Options,
+    /// Builds a replica's product from its configuration hash.
+    product: Arc<dyn Fn(u64) -> P + Send + Sync>,
     root: PathBuf,
     pub net: Net,
     clocks: BTreeMap<NodeId, Arc<Clock>>,
     base: Instant,
     markers: Arc<FakeMarkers>,
     _panics: PanicGuard,
-    replicas: BTreeMap<NodeId, Arc<Replica<Paths>>>,
+    replicas: BTreeMap<NodeId, Arc<Replica<P>>>,
     audios: BTreeMap<NodeId, Arc<FakeAudio>>,
     /// Per replica, the compatibility key and revision it starts with
     /// next; key 1 at revision `r1` when not set.
@@ -1552,8 +1565,27 @@ pub struct Set {
 }
 
 impl Set {
-    /// Starts `options.voters` replicas and initializes them as one set.
+    /// Starts `options.voters` replicas of [`Paths`] and initializes them
+    /// as one set.
     pub async fn start(options: Options) -> Set {
+        Set::start_with(
+            options,
+            Arc::new(|config| Paths {
+                config,
+                ..Paths::default()
+            }),
+        )
+        .await
+    }
+}
+
+impl<P: Product + Sync> Set<P> {
+    /// Starts `options.voters` replicas of the products `product` builds
+    /// from a configuration hash and initializes them as one set.
+    pub async fn start_with(
+        options: Options,
+        product: Arc<dyn Fn(u64) -> P + Send + Sync>,
+    ) -> Set<P> {
         let root = root("replica-set");
         let _ = std::fs::remove_dir_all(&root);
         let base = Instant::now();
@@ -1570,6 +1602,7 @@ impl Set {
             .collect();
         let mut set = Set {
             options,
+            product,
             root,
             net: Net::default(),
             clocks,
@@ -1608,7 +1641,7 @@ impl Set {
         set
     }
 
-    pub fn ids(&self) -> impl Iterator<Item = NodeId> + use<> {
+    pub fn ids(&self) -> impl Iterator<Item = NodeId> + use<P> {
         self.options
             .ids
             .clone()
@@ -1624,7 +1657,7 @@ impl Set {
         self.audios.get(&id).expect("contact running")
     }
 
-    pub fn replica(&self, id: NodeId) -> &Arc<Replica<Paths>> {
+    pub fn replica(&self, id: NodeId) -> &Arc<Replica<P>> {
         self.replicas.get(&id).expect("replica running")
     }
 
@@ -1662,10 +1695,8 @@ impl Set {
                 let config = (self.options.configs.iter())
                     .find(|c| c.0 == id)
                     .map_or(0, |c| c.1);
-                Arc::new(move || Paths {
-                    config,
-                    ..Paths::default()
-                })
+                let product = self.product.clone();
+                Arc::new(move || product(config))
             },
             Factory {
                 from: id,
@@ -1717,7 +1748,9 @@ impl Set {
         }
         let mut links = self.net.links();
         links.rafts.insert(id, replica.raft().clone());
-        links.replicas.insert(id, replica.clone());
+        links
+            .replicas
+            .insert(id, replica.clone() as Arc<dyn Handles>);
         drop(links);
         self.replicas.insert(id, replica);
     }
@@ -1862,7 +1895,7 @@ impl Set {
     }
 }
 
-impl Drop for Set {
+impl<P: Product + Sync> Drop for Set<P> {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }

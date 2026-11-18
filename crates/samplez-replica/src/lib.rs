@@ -177,6 +177,10 @@ pub(crate) struct Shared {
     settings: Settings,
     /// The product drives an engine ([`Product::DRIVES_ENGINE`]).
     drives_engine: bool,
+    /// Whether a command would re-route an input applied to the state as
+    /// it stands ([`Product::reroutes`]), for a product that drives an
+    /// engine; read under the store lock.
+    reroutes: Box<dyn Fn(&Command) -> bool + Send + Sync>,
     raft: Raft<TypeConfig>,
     peers: Arc<dyn PeerClient>,
     /// The longest a leader goes without a quorum, and a follower without
@@ -341,6 +345,17 @@ impl<P: Product> Replica<P> {
         let shared = Arc::new(Shared {
             settings,
             drives_engine: P::DRIVES_ENGINE,
+            reroutes: {
+                let store = store.clone();
+                Box::new(move |command: &Command| {
+                    P::DRIVES_ENGINE
+                        && store.with_state(|sm| {
+                            !sm.product
+                                .reroutes(&command.origin, &command.body)
+                                .is_empty()
+                        })
+                })
+            },
             raft,
             peers,
             lease: Duration::from_millis(raft_config.election_timeout_max),
@@ -360,9 +375,9 @@ impl<P: Product> Replica<P> {
             receipts: Mutex::default(),
         });
         let (queue, queued) = mpsc::unbounded_channel();
-        tokio::spawn(write(shared.clone(), queued, estimate.clone(), false));
+        tokio::spawn(write(shared.clone(), queued, estimate.clone()));
         let (generations, waiting) = mpsc::unbounded_channel();
-        tokio::spawn(write(shared.clone(), waiting, estimate.clone(), true));
+        tokio::spawn(write(shared.clone(), waiting, estimate.clone()));
         if let Some(voters) = voters {
             tokio::spawn(membership::reconcile(shared.clone(), voters));
         }
@@ -429,26 +444,6 @@ impl<P: Product> Replica<P> {
             forwarded: false,
         });
         Ok(())
-    }
-
-    /// Queues a client command for the writer: one that would re-route
-    /// an input ([`Product::reroutes`]) for the writer of the
-    /// generation-needing entries, which orders it alone, stamped for its
-    /// generation; every other for the writer of the rest. False when the
-    /// writer stopped.
-    fn enqueue(&self, item: Item) -> bool {
-        let reroutes = P::DRIVES_ENGINE
-            && !self.store.with_state(|sm| {
-                sm.product
-                    .reroutes(&item.command.origin, &item.command.body)
-                    .is_empty()
-            });
-        let queue = if reroutes {
-            &self.generations
-        } else {
-            &self.queue
-        };
-        queue.send(Queued::Command(item)).is_ok()
     }
 
     /// Makes `members` the first voters; on one node of a new set only.
@@ -608,7 +603,7 @@ impl<P: Product> Replica<P> {
                         reply,
                         forwarded: true,
                     };
-                    let _ = self.enqueue(item);
+                    let _ = self.queue.send(Queued::Command(item));
                     replies.push(replied);
                 }
                 let mut results = Vec::with_capacity(replies.len());
@@ -1149,14 +1144,18 @@ fn answer_all(items: Vec<Item>, refused: Refused) -> Result<(), Vec<Item>> {
     Ok(())
 }
 
-/// The only writer: takes the queue in order, so commands commit in the
-/// order they were submitted, and puts what queued while the previous
-/// entry was written into the next one (group commit). A copy of a
-/// command the batch holds already is folded into it and answered from
-/// its outcome, an applied one as a duplicate. An entry carries at most
-/// [`MAX_ENTRY_BYTES`] of commands. On a follower the group is
-/// forwarded to the leader instead, one group at a time, so the order
-/// holds there too.
+/// A writer: takes its queue in order, so the commands of the one queue
+/// that carries them commit in the order they were submitted, and puts
+/// what queued while the previous entry was written into the next one
+/// (group commit). A copy of a command the batch holds already is folded
+/// into it and answered from its outcome, an applied one as a duplicate.
+/// An entry carries at most [`MAX_ENTRY_BYTES`] of commands. A command
+/// that would re-route an input ([`Product::reroutes`]) ends the group
+/// before it and is ordered alone, stamped for its generation. On a
+/// follower the group is forwarded to the leader instead, one group at a
+/// time, so the order holds there too. The generation-needing entries the
+/// replica set decides on have a writer of their own, so one waiting for
+/// the previous generation's index holds no command.
 ///
 /// A first cut: one entry is in flight at a time and the writer waits for
 /// it to commit and apply here before it proposes the next, so the
@@ -1167,7 +1166,6 @@ async fn write(
     shared: Arc<Shared>,
     mut queued: mpsc::UnboundedReceiver<Queued>,
     estimate: Estimate,
-    generation: bool,
 ) {
     let mut next = None;
     loop {
@@ -1197,8 +1195,9 @@ async fn write(
                     let _ = item.reply.send(Err(Refused::Invalid(why)));
                     continue;
                 }
-                // One that re-routes an input is ordered alone.
-                if generation {
+                // One that would re-route an input is ordered alone,
+                // stamped for its generation.
+                if (shared.reroutes)(&item.command) {
                     shared.order_commands(vec![item], &estimate, true).await;
                     continue;
                 }
@@ -1210,6 +1209,7 @@ async fn write(
                         // opens an entry of its own.
                         Queued::Command(item)
                             if joins(&items[0].command, items.len(), bytes, &item.command)
+                                && !(shared.reroutes)(&item.command)
                                 && shared
                                     .admits(
                                         &items
@@ -1492,13 +1492,11 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             reply,
             forwarded: false,
         };
-        let queued = self.enqueue(item);
+        let queued = self.queue.send(Queued::Command(item));
         let id = id.to_owned();
         Box::pin(async move {
             let stopped = || NotApplied::new(Reason::Unavailable, "replica stopped");
-            if !queued {
-                return Err(stopped());
-            }
+            queued.map_err(|_| stopped())?;
             let replied = match tokio::time::timeout_at(deadline, replied).await {
                 Ok(replied) => replied.unwrap_or_else(|_| Err(self::stopped())),
                 Err(_) => Err(Refused::Unavailable("timed out".into())),
