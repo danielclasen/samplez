@@ -52,29 +52,44 @@ pub(crate) struct Term {
 
 /// The duck of a term. Its gain moves linearly over the interval running
 /// from `from` to `to`, the gains computed at the ends of the last two
-/// intervals. After a mask change it crossfades over `len` samples, at
-/// `pos`, from `snap`, the gain the term was moving to at the change, to
-/// the gain of its new mask.
+/// intervals; `live` is the gain of the term's mask at the last end, before
+/// any crossfade. After a mask change it crossfades over `len` samples, at
+/// `pos`, from the live gain of `old`, the mask before the change, to the
+/// live gain of the new one. `bias` is what the gain at the change lay
+/// off the old mask's live gain, the remainder of a crossfade the change
+/// interrupted, and fades out with the crossfade, so no change steps.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Duck {
     pub(crate) from: f32,
     pub(crate) to: f32,
-    snap: f32,
+    live: f32,
+    old: u8,
+    bias: f32,
     pos: u32,
     len: u32,
 }
 
 impl Duck {
-    /// No duck, crossfading to the gain of the term's mask over `len`
-    /// samples.
+    /// No duck, crossfading from mask 0 to the term's over `len` samples.
     fn new(len: u32) -> Duck {
         Duck {
             from: 1.0,
             to: 1.0,
-            snap: 1.0,
+            live: 1.0,
+            old: 0,
+            bias: 0.0,
             pos: 0,
             len: len.min(MAX_RAMP_LEN),
         }
+    }
+
+    /// Starts a crossfade over `len` samples from `old`, the mask the
+    /// term had, to its new one.
+    fn change(&mut self, old: u8, len: u32) {
+        self.bias = self.to - self.live;
+        self.old = old;
+        self.pos = 0;
+        self.len = len.min(MAX_RAMP_LEN);
     }
 
     /// The gain change per sample over the interval running.
@@ -89,17 +104,23 @@ impl Duck {
         self.from == 1.0 && self.to == 1.0 && self.pos == self.len
     }
 
-    /// Gains within 0 and 1, which every duck gain is, and a crossfade
-    /// position within a length within [`MAX_RAMP_LEN`].
+    /// Gains within 0 and 1, which every duck gain is, a bias within the
+    /// distance of two of them, and a crossfade position within a length
+    /// within [`MAX_RAMP_LEN`].
     fn is_valid(&self) -> bool {
         let unit = |g: f32| (0.0..=1.0).contains(&g);
         unit(self.from)
             && unit(self.to)
-            && unit(self.snap)
+            && unit(self.live)
+            && (-1.0..=1.0).contains(&self.bias)
             && self.len <= MAX_RAMP_LEN
             && self.pos <= self.len
     }
 
+    /// Moves the crossfade `frames` samples on. The gain holds: it moves
+    /// to the crossfade's value only at the next end of an interval, so a
+    /// skip across the end of a crossfade moves the gain to the new
+    /// mask's over the interval after it.
     fn advance(&mut self, frames: usize) {
         let frames = u32::try_from(frames).unwrap_or(u32::MAX);
         self.pos = self.pos.saturating_add(frames).min(self.len);
@@ -124,16 +145,21 @@ pub(crate) struct Ducking<'a> {
     epoch: u64,
 }
 
-/// The duck gain of one input's mask at one sample of one block, kept
-/// for the terms of that input in the other outputs: a term with the same
-/// mask takes it in place of computing it again. Scratch, not state: it
-/// gives the bits computing gives.
+/// The attenuations of one input at one sample of one block, its depth
+/// times the envelope of each detector, and what every term of the input
+/// at that sample reads in place of computing it again, whatever its
+/// mask: the detectors of a positive attenuation from the deepest down,
+/// the lower detector first of two equal, byte `k` of `prefix` the bits
+/// of the first `k + 1` of them, and the duck gain of each of them.
+/// Scratch, not state: it gives the bits computing gives.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Memo {
     epoch: u64,
     n: usize,
-    mask: u8,
-    gain: f32,
+    atten: [f32; MAX_DUCKS],
+    order: [u8; MAX_DUCKS],
+    prefix: u64,
+    gains: [f32; MAX_DUCKS],
 }
 
 impl Memo {
@@ -141,9 +167,50 @@ impl Memo {
     const NONE: Memo = Memo {
         epoch: 0,
         n: 0,
-        mask: 0,
-        gain: 1.0,
+        atten: [0.0; MAX_DUCKS],
+        order: [0; MAX_DUCKS],
+        prefix: 0,
+        gains: [1.0; MAX_DUCKS],
     };
+
+    /// Orders the detectors of a positive attenuation, deepest first, and
+    /// computes their gains. A NaN fails the comparison and is never
+    /// taken; an infinite one gives a gain of 0, so the gain is within 0
+    /// and 1 whatever the envelope.
+    fn order(&mut self) {
+        let mut len = 0;
+        for (g, &a) in self.atten.iter().enumerate() {
+            if a > 0.0 {
+                let mut k = len;
+                while k > 0 && self.atten[self.order[k - 1] as usize] < a {
+                    self.order[k] = self.order[k - 1];
+                    k -= 1;
+                }
+                self.order[k] = g as u8;
+                len += 1;
+            }
+        }
+        let mut bits = 0u8;
+        for (k, &g) in self.order[..len].iter().enumerate() {
+            bits |= 1 << g;
+            self.prefix |= u64::from(bits) << (8 * k);
+            let g = g as usize;
+            self.gains[g] = exp2(-self.atten[g] * OCTAVES_PER_DB);
+        }
+    }
+
+    /// The duck gain of `mask`: that of the deepest attenuation of its
+    /// detectors, `exp2(-atten * OCTAVES_PER_DB)`, exactly 1 at none.
+    #[inline]
+    fn gain(&self, mask: u8) -> f32 {
+        // The bytes of the prefixes that meet the mask, from the first
+        // that holds one of its detectors, the deepest, on.
+        let met = self.prefix & (u64::from(mask) * 0x0101_0101_0101_0101);
+        if met == 0 {
+            return 1.0;
+        }
+        self.gains[self.order[(met.trailing_zeros() / 8) as usize] as usize]
+    }
 }
 
 impl Ducking<'_> {
@@ -155,10 +222,12 @@ impl Ducking<'_> {
 
     /// Moves `d`, the duck of a term from `input` with mask `mask`, into
     /// the next interval at sample `n` of the block, the last of the
-    /// interval running. The gain the next interval ends at is that of
-    /// the deepest attenuation of the detectors in the mask, each its
-    /// depth times its envelope at sample `n`, crossfaded from `snap` at
-    /// sample `n` of the crossfade. `memo` holds a gain per input.
+    /// interval running. The gain the next interval ends at is the live
+    /// gain of the mask, that of the deepest attenuation of its
+    /// detectors, each its depth times its envelope at sample `n`; while
+    /// a crossfade runs, at sample `n` of it, the crossfade from the live
+    /// gain of the old mask plus the bias to it. `memo` holds one
+    /// [`Memo`] per input.
     #[inline]
     pub(crate) fn retarget(
         &self,
@@ -169,49 +238,38 @@ impl Ducking<'_> {
         n: usize,
     ) {
         let m = &mut memo[input];
-        let gain = if m.epoch == self.epoch && m.n == n && m.mask == mask {
-            m.gain
-        } else {
-            let gain = self.gain(input, mask, n);
-            *m = Memo {
-                epoch: self.epoch,
-                n,
-                mask,
-                gain,
-            };
-            gain
-        };
+        if m.epoch != self.epoch || m.n != n {
+            self.attenuations(m, input, n);
+        }
+        let live = m.gain(mask);
         let k = d.pos.saturating_add(n as u32);
         let to = if k < d.len {
-            d.snap + (k as f32 / d.len as f32) * (gain - d.snap)
+            let old = (m.gain(d.old) + d.bias).clamp(0.0, 1.0);
+            old + (k as f32 / d.len as f32) * (live - old)
         } else {
-            gain
+            live
         };
+        d.live = live;
         d.from = d.to;
         d.to = to;
     }
 
-    /// The duck gain of `input`'s mask `mask` at sample `n` of the block.
-    fn gain(&self, input: usize, mask: u8, n: usize) -> f32 {
-        let mut atten = 0.0f32;
-        if let (Some((env, stride)), false) = (self.envelopes, self.depths.is_empty()) {
-            let depths = &self.depths[input * MAX_DUCKS..(input + 1) * MAX_DUCKS];
-            let env = &env[n..];
-            let mut bits = mask;
-            while bits != 0 {
-                let g = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let r = &depths[g];
-                // A NaN fails the comparison and an infinite one gives a
-                // gain of 0, so the gain is within 0 and 1 whatever the
-                // envelope.
-                let a = r.value_at(r.pos.saturating_add(n as u32)) * env[g * stride];
-                if a > atten {
-                    atten = a;
-                }
-            }
+    /// Fills `m` with the attenuations of `input` at sample `n`.
+    fn attenuations(&self, m: &mut Memo, input: usize, n: usize) {
+        *m = Memo {
+            epoch: self.epoch,
+            n,
+            ..Memo::NONE
+        };
+        let (Some((env, stride)), false) = (self.envelopes, self.depths.is_empty()) else {
+            return;
+        };
+        let depths = &self.depths[input * MAX_DUCKS..(input + 1) * MAX_DUCKS];
+        let env = &env[n..];
+        for (g, (a, r)) in m.atten.iter_mut().zip(depths).enumerate() {
+            *a = r.value_at(r.pos.saturating_add(n as u32)) * env[g * stride];
         }
-        exp2(-atten * OCTAVES_PER_DB)
+        m.order();
     }
 }
 
@@ -241,9 +299,13 @@ impl Ducking<'_> {
 /// interval, gives its gain ([`duck_gain`](crate::duck_gain)) at the end
 /// of the next interval, and the gain moves linearly over it; the sample
 /// gain is the coefficient times the duck gain. A mask change crossfades
-/// the gain over the given length from the one reached to that of the new
-/// mask, so no change steps. [`Matrix::process_ducked`] reads the
-/// envelopes; [`Matrix::process`] takes every envelope at 0.
+/// over the given length from the old mask's gain to the new one's, both
+/// following their envelopes, so no change steps.
+/// [`Matrix::process_ducked`] reads the envelopes; [`Matrix::process`]
+/// takes every envelope at 0 and is for a matrix without ducks. Without
+/// any duck, mask or depth set, the position in the interval is not part
+/// of the matrix's state, its serde form or its equality: a user that
+/// sets them [`align`](Matrix::align)s the matrix to the sample index.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(into = "MatrixWire", try_from = "MatrixWire")]
 pub struct Matrix {
@@ -270,15 +332,22 @@ pub struct Matrix {
 }
 
 impl PartialEq for Matrix {
-    /// Equal coefficients, ramps, ducks, masks, depths, position and
-    /// path.
+    /// Equal coefficients, ramps, ducks, masks, depths and path, and,
+    /// with any duck, mask or depth set, the position in the interval:
+    /// without, it moves nothing. An empty mask or depth table equals one
+    /// all at 0.
     fn eq(&self, o: &Matrix) -> bool {
+        let rest = Ramp::new(0.0);
+        let masks = self.masks == o.masks
+            || (self.masks.iter().all(|&k| k == 0) && o.masks.iter().all(|&k| k == 0));
+        let depths = self.depths == o.depths
+            || (self.depths.iter().all(|r| *r == rest) && o.depths.iter().all(|r| *r == rest));
         self.inputs == o.inputs
             && self.columns == o.columns
             && self.ducks == o.ducks
-            && self.masks == o.masks
-            && self.depths == o.depths
-            && self.phase == o.phase
+            && masks
+            && depths
+            && (self.phase == o.phase || !self.has_ducks())
             && self.path == o.path
     }
 }
@@ -323,6 +392,16 @@ struct MatrixWire {
 
 impl From<Matrix> for MatrixWire {
     fn from(m: Matrix) -> MatrixWire {
+        let rest = Ramp::new(0.0);
+        let masks: Vec<(usize, u8)> = (m.masks.iter().enumerate())
+            .filter(|&(_, &k)| k != 0)
+            .map(|(c, &k)| (c, k))
+            .collect();
+        let depths: Vec<(usize, Ramp)> = (m.depths.iter().enumerate())
+            .filter(|&(_, r)| *r != rest)
+            .map(|(c, &r)| (c, r))
+            .collect();
+        let phase = if m.has_ducks() { m.phase } else { 0 };
         let columns = m
             .columns
             .into_iter()
@@ -339,23 +418,12 @@ impl From<Matrix> for MatrixWire {
                     .collect()
             })
             .collect();
-        let rest = Ramp::new(0.0);
         MatrixWire {
             inputs: m.inputs,
             columns,
-            masks: (!m.masks.is_empty()).then(|| {
-                (m.masks.iter().enumerate())
-                    .filter(|&(_, &k)| k != 0)
-                    .map(|(c, &k)| (c, k))
-                    .collect()
-            }),
-            depths: (!m.depths.is_empty()).then(|| {
-                (m.depths.iter().enumerate())
-                    .filter(|&(_, r)| *r != rest)
-                    .map(|(c, &r)| (c, r))
-                    .collect()
-            }),
-            phase: m.phase,
+            masks: (!masks.is_empty()).then_some(masks),
+            depths: (!depths.is_empty()).then_some(depths),
+            phase,
         }
     }
 }
@@ -373,8 +441,8 @@ fn ascending_below(mut indices: impl Iterator<Item = usize>, end: usize) -> bool
 impl TryFrom<MatrixWire> for Matrix {
     type Error = String;
 
-    /// Refuses a matrix of more than [`MAX_COEFFICIENTS`] coefficients,
-    /// before allocating it, and a column with an input out of range,
+    /// Refuses a matrix of more than [`MAX_COEFFICIENTS`] coefficients or
+    /// inputs, before allocating it, and a column with an input out of range,
     /// out of order or twice, or a ramp a matrix never holds
     /// ([`crate::Ramp::is_valid`]): a gain beyond [`crate::MAX_GAIN`] or
     /// not finite, a length beyond [`crate::MAX_RAMP_LEN`], a position
@@ -385,15 +453,18 @@ impl TryFrom<MatrixWire> for Matrix {
     /// 1, a crossfade past its length or longer than
     /// [`crate::MAX_RAMP_LEN`], and a position in the interval past it.
     fn try_from(w: MatrixWire) -> Result<Matrix, String> {
-        let size = w.inputs.checked_mul(w.columns.len());
-        if size.is_none_or(|n| n > MAX_COEFFICIENTS) {
+        let (inputs, outputs) = (w.inputs, w.columns.len());
+        let size = inputs.checked_mul(outputs);
+        // A matrix allocates per input as well as per coefficient.
+        if !(inputs <= MAX_COEFFICIENTS
+            && size.is_some_and(|n| n <= MAX_COEFFICIENTS)
+            && inputs.checked_mul(MAX_DUCKS).is_some())
+        {
             return Err(format!(
-                "a matrix of {} inputs and {} outputs, at most {MAX_COEFFICIENTS} coefficients",
-                w.inputs,
-                w.columns.len()
+                "a matrix of {inputs} inputs and {outputs} outputs, at most \
+                 {MAX_COEFFICIENTS} coefficients and inputs"
             ));
         }
-        let (inputs, outputs) = (w.inputs, w.columns.len());
         let (masks, depths) = (w.masks.as_deref(), w.depths.as_deref());
         let masks_ok = masks.is_none_or(|v| {
             ascending_below(v.iter().map(|m| m.0), inputs * outputs) && v.iter().all(|m| m.1 != 0)
@@ -521,6 +592,15 @@ impl Matrix {
         self.path
     }
 
+    /// Whether any mask or depth is set or any term has a duck, a
+    /// crossfade to mask 0 included.
+    pub fn has_ducks(&self) -> bool {
+        let rest = Ramp::new(0.0);
+        self.masks.iter().any(|&k| k != 0)
+            || self.depths.iter().any(|r| *r != rest)
+            || self.ducks.iter().any(|d| !d.is_empty())
+    }
+
     /// Makes this matrix a copy of `src`, coefficients, ramps and ducks,
     /// without allocating: both have the same shape, and every column
     /// reserves room for every input, as [`Matrix::new`] and clones do.
@@ -634,9 +714,11 @@ impl Matrix {
 
     /// Sets the duck mask of the coefficient from `input` to `output`:
     /// bit `g` ducks it by detector `g`. A coefficient that is not 0
-    /// crossfades from the gain it was moving to towards the new mask's
-    /// over `len` samples, clamped to [`MAX_RAMP_LEN`]; the mask it had
-    /// is no longer read. The mask it has already leaves it unchanged.
+    /// crossfades over `len` samples, clamped to [`MAX_RAMP_LEN`], from
+    /// the live gain of the mask it had to that of the new one, both
+    /// moving with their envelopes; a change during a crossfade starts
+    /// from where that one has got to. The mask it has already leaves it
+    /// unchanged.
     ///
     /// Returns false and changes nothing if `input` or `output` is out of
     /// range.
@@ -653,7 +735,8 @@ impl Matrix {
             self.masks.resize(self.inputs * outputs, 0);
         }
         let held = &mut self.masks[input * outputs + output];
-        if *held == mask {
+        let old = *held;
+        if old == mask {
             return true;
         }
         *held = mask;
@@ -663,10 +746,7 @@ impl Matrix {
             let t = &mut col[k];
             t.mask = mask;
             if t.ducked {
-                let d = &mut ducks[i];
-                d.snap = d.to;
-                d.pos = 0;
-                d.len = len.min(MAX_RAMP_LEN);
+                ducks[i].change(old, len);
             } else {
                 t.ducked = true;
                 ducks.insert(i, Duck::new(len));
@@ -719,13 +799,15 @@ impl Matrix {
     }
 
     /// Mixes the first `frames` frames of `input` into `output` on
-    /// [`Matrix::path`], with every envelope at 0.
+    /// [`Matrix::path`], with every envelope at 0. A matrix whose terms
+    /// have ducks is processed with [`Matrix::process_ducked`]: here,
+    /// every duck releases within one interval.
     pub fn process(&mut self, input: &PlanarBuffer, output: &mut PlanarBuffer, frames: usize) {
-        self.mix(self.path, input, None, output, frames);
+        self.process_on(self.path, input, output, frames);
     }
 
     /// Mixes the first `frames` frames of `input` into `output` on `path`,
-    /// with every envelope at 0.
+    /// with every envelope at 0, as [`Matrix::process`] does.
     ///
     /// # Panics
     ///
@@ -738,6 +820,10 @@ impl Matrix {
         output: &mut PlanarBuffer,
         frames: usize,
     ) {
+        debug_assert!(
+            self.ducks.iter().all(Vec::is_empty),
+            "a matrix with ducks processed without envelopes"
+        );
         self.mix(path, input, None, output, frames);
     }
 
@@ -892,7 +978,9 @@ impl Matrix {
     /// `frames` samples on without mixing, as [`Matrix::process`] over
     /// `frames` frames does. Keeps ramp positions on the sample timeline
     /// over frames that are not mixed. Across the end of an interval the
-    /// duck gains hold at the last ones computed.
+    /// duck gains hold at the last ones computed, a crossfade's included:
+    /// one the skip ended moves the gain from the held one to the new
+    /// mask's over the next interval.
     pub fn advance(&mut self, frames: usize) {
         let wraps = self.phase as usize + frames >= GAIN_INTERVAL as usize;
         for (col, ducks) in self.columns.iter_mut().zip(&mut self.ducks) {
@@ -965,7 +1053,7 @@ pub(crate) fn mix_scalar(terms: &[Term], input: &PlanarBuffer, out: &mut [f32], 
 /// `ducked` in order per output: the samples up to the first interval
 /// starting in the block, then each interval over all of them, so that
 /// the terms of one input in several outputs move into the next interval
-/// at the same sample one after another and take the gain the memo keeps.
+/// at the same sample one after another and read the attenuations the memo keeps.
 #[allow(clippy::too_many_arguments)]
 fn mix_ducked(
     path: Path,
@@ -2051,7 +2139,10 @@ mod tests {
             term(w)["duck"]["to"] = json!(1.5)
         });
         refused("a negative duck gain", &|w| {
-            term(w)["duck"]["snap"] = json!(-0.25)
+            term(w)["duck"]["live"] = json!(-0.25)
+        });
+        refused("a bias beyond the distance of two gains", &|w| {
+            term(w)["duck"]["bias"] = json!(1.5)
         });
         refused("a crossfade past its length", &|w| {
             term(w)["duck"]["pos"] = json!(101)
@@ -2076,6 +2167,244 @@ mod tests {
         refused("a position past the interval", &|w| {
             w["phase"] = json!(GAIN_INTERVAL)
         });
+    }
+
+    /// A matrix the size of which a peer names beyond the limit in its
+    /// inputs alone is refused before anything is allocated for it: with
+    /// no output it has no coefficient, but a duck table per input.
+    #[test]
+    fn a_matrix_of_too_many_inputs_is_refused() {
+        for inputs in [MAX_COEFFICIENTS + 1, 1 << 34, usize::MAX / 2] {
+            let wire = format!("{{\"inputs\":{inputs},\"columns\":[]}}");
+            assert!(serde_json::from_str::<Matrix>(&wire).is_err(), "{inputs}");
+        }
+        let wire = format!("{{\"inputs\":{MAX_COEFFICIENTS},\"columns\":[]}}");
+        assert!(serde_json::from_str::<Matrix>(&wire).is_ok());
+    }
+
+    /// The top-level and term keys of `m`'s serde form.
+    fn keys(m: &Matrix) -> (Vec<String>, Vec<String>) {
+        let v = serde_json::to_value(m).unwrap();
+        let names = |o: &serde_json::Value| o.as_object().unwrap().keys().cloned().collect();
+        let term = v["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c.as_array().unwrap())
+            .map(names)
+            .fold(Vec::new(), |mut all: Vec<String>, k: Vec<String>| {
+                all.extend(k);
+                all.sort();
+                all.dedup();
+                all
+            });
+        (names(&v), term)
+    }
+
+    /// A matrix with no duck, processed or skipped over any number of
+    /// samples, has the serde form a matrix had before ducks existed,
+    /// and one that set masks and depths and cleared them again equals
+    /// and encodes as one that never set any.
+    #[test]
+    fn a_matrix_without_ducks_keeps_its_form() {
+        let mut rng = Rng::new(0xf0);
+        let mut m = Matrix::new(3, 2);
+        change(&mut rng, &mut m, 6);
+        assert!(m.set(1, 1, 0.5, 0));
+        let mut input = PlanarBuffer::new(3, CAP);
+        let mut out = PlanarBuffer::new(2, CAP);
+        fill(&mut rng, &mut input, 45);
+        m.process(&input, &mut out, 45);
+        m.advance(2);
+        assert_eq!(m.phase, 47 % 8);
+        let old = (
+            vec!["columns".to_owned(), "inputs".to_owned()],
+            vec!["input".to_owned(), "ramp".to_owned()],
+        );
+        assert_eq!(keys(&m), old);
+        let copy: Matrix = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(copy, m);
+
+        let fresh = m.clone();
+        assert!(m.set_mask(1, 1, 0b11, 0) && m.set_depth(2, 3, 12.0, 0));
+        assert_ne!(m, fresh);
+        assert!(m.set_mask(1, 1, 0, 0) && m.set_depth(2, 3, 0.0, 0));
+        m.process_ducked(&input, &PlanarBuffer::new(MAX_DUCKS, CAP), &mut out, 13);
+        let mut fresh = fresh;
+        fresh.process(&input, &mut out, 13);
+        assert!(!m.has_ducks() && !m.masks.is_empty() && fresh.masks.is_empty());
+        assert_eq!(m, fresh);
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            serde_json::to_string(&fresh).unwrap()
+        );
+        assert_eq!(keys(&m), old);
+    }
+
+    /// A matrix with ducks processed without envelopes would release
+    /// every duck within one interval, so it is refused in debug builds.
+    #[test]
+    #[should_panic(expected = "without envelopes")]
+    fn process_refuses_a_matrix_with_ducks() {
+        let mut m = Matrix::new(1, 1);
+        assert!(m.set(0, 0, 1.0, 0) && m.set_mask(0, 0, 1, 0));
+        let input = PlanarBuffer::new(1, 8);
+        m.process(&input, &mut PlanarBuffer::new(1, 8), 8);
+    }
+
+    /// A fade-in brings a coefficient with a mask back ducked, from no
+    /// duck to its mask's gain over the fade's length.
+    #[test]
+    fn a_fade_in_keeps_the_masks() {
+        for path in Path::ALL {
+            if !path_runs("a_fade_in_keeps_the_masks", path) {
+                continue;
+            }
+            let mut rng = Rng::new(0xfade);
+            let mut m = Matrix::new(3, 2);
+            assert!(m.set_mask(0, 1, 0b1, 0) && m.set_mask(2, 1, 0b10, 0));
+            assert!(m.set_depth(0, 0, 20.0, 0) && m.set_depth(2, 1, 10.0, 0));
+            assert!(m.fade_in(&[0.0, 0.5, 0.25, 0.0, 0.0, 0.75], 100));
+            assert_eq!(m.ducks[1].len(), 2);
+            let mut input = PlanarBuffer::new(3, CAP);
+            let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
+            env.channel_mut(0).fill(1.0);
+            env.channel_mut(1).fill(1.0);
+            let mut out = PlanarBuffer::new(2, CAP);
+            fill(&mut rng, &mut input, 120);
+            m.process_ducked_on(path, &input, &env, &mut out, 120);
+            fill(&mut rng, &mut input, 50);
+            m.process_ducked_on(path, &input, &env, &mut out, 50);
+            let (a, b) = (duck_gain(20.0, 1.0), duck_gain(10.0, 1.0));
+            for n in 0..50 {
+                let x = |i: usize| input.channel(i)[n];
+                let want = 0.0 + (0.5 * a) * x(0) + (0.75 * b) * x(2);
+                assert_eq!(out.channel(1)[n].to_bits(), want.to_bits(), "{path:?}");
+                assert_eq!(out.channel(0)[n].to_bits(), (0.0 + 0.25 * x(1)).to_bits());
+            }
+        }
+    }
+
+    /// The duck gain of a ducked term with every input sample 1: its
+    /// output divided by its coefficient.
+    fn duck_of(out: &PlanarBuffer, n: usize, coefficient: f32) -> f32 {
+        out.channel(0)[n] / coefficient
+    }
+
+    /// A coefficient that comes back from 0 with its mask set crossfades
+    /// from no duck to the mask's gain with its own ramp.
+    #[test]
+    fn a_coefficient_back_from_0_crossfades_its_duck() {
+        let mut m = Matrix::new(1, 1);
+        assert!(m.set_depth(0, 0, 20.0, 0) && m.set_mask(0, 0, 1, 0));
+        assert!(m.set(0, 0, 1.0, 0));
+        let mut input = PlanarBuffer::new(1, CAP);
+        input.channel_mut(0).fill(1.0);
+        let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
+        env.channel_mut(0).fill(1.0);
+        let mut out = PlanarBuffer::new(1, CAP);
+        m.process_ducked(&input, &env, &mut out, 64);
+        let full = duck_gain(20.0, 1.0);
+        assert_eq!(duck_of(&out, 63, 1.0), full);
+        assert!(m.set(0, 0, 0.0, 0) && m.ducks[0].is_empty());
+        m.process_ducked(&input, &env, &mut out, 64);
+        assert!(m.set(0, 0, 1.0, 480));
+        m.process_ducked(&input, &env, &mut out, 480);
+        let mid = duck_of(&out, 240, 240.0 / 480.0);
+        let half = 0.5 * (1.0 + full);
+        assert!((mid - half).abs() < 0.02, "{mid}, want about {half}");
+    }
+
+    /// A depth change while ducked ramps: the output does not step.
+    #[test]
+    fn a_depth_change_while_ducked_ramps() {
+        for path in Path::ALL {
+            if !path_runs("a_depth_change_while_ducked_ramps", path) {
+                continue;
+            }
+            let run = |len: u32| {
+                let mut m = Matrix::new(1, 1);
+                assert!(m.set(0, 0, 1.0, 0) && m.set_mask(0, 0, 1, 0));
+                let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
+                env.channel_mut(0).fill(1.0);
+                let prev = &mut None;
+                largest_step(&mut m, path, &env, prev, 3);
+                assert!(m.set_depth(0, 0, 40.0, len));
+                let step = largest_step(&mut m, path, &env, prev, 20);
+                assert_eq!(m.depth(0, 0), 40.0);
+                step
+            };
+            let (ramped, jumped) = (run(480), run(0));
+            assert!(
+                ramped * 8.0 < jumped,
+                "{path:?}: {ramped} ramped, {jumped} jumped"
+            );
+        }
+    }
+
+    /// A new position in the interval holds the duck gain where it is,
+    /// also in the middle of a move.
+    #[test]
+    fn align_holds_the_gain_mid_interval() {
+        let mut m = Matrix::new(1, 1);
+        assert!(m.set(0, 0, 1.0, 0) && m.set_mask(0, 0, 1, 0));
+        assert!(m.set_depth(0, 0, 20.0, 0));
+        let mut input = PlanarBuffer::new(1, CAP);
+        input.channel_mut(0).fill(1.0);
+        let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
+        env.channel_mut(0).fill(1.0);
+        let mut out = PlanarBuffer::new(1, CAP);
+        m.process_ducked(&input, &env, &mut out, 11);
+        let d = m.ducks[0][0];
+        assert!(d.from == 1.0 && d.to < 1.0);
+        m.align(6);
+        m.process_ducked(&input, &env, &mut out, 2);
+        assert_eq!(out.channel(0)[..2], [d.to; 2]);
+    }
+
+    /// A mask changed while its old group releases follows the old group
+    /// out: from the third interval after the change on, the term is never
+    /// ducked deeper than the shallower of the old and the new mask's live
+    /// gains, as it would be crossfading from the gain frozen at the
+    /// change.
+    #[test]
+    fn a_mask_crossfade_follows_the_live_gains() {
+        for path in Path::ALL {
+            if !path_runs("a_mask_crossfade_follows_the_live_gains", path) {
+                continue;
+            }
+            let mut m = Matrix::new(1, 1);
+            assert!(m.set(0, 0, 1.0, 0) && m.set_mask(0, 0, 0b01, 0));
+            assert!(m.set_depth(0, 0, 20.0, 0) && m.set_depth(0, 1, 10.0, 0));
+            let mut input = PlanarBuffer::new(1, CAP);
+            input.channel_mut(0).fill(1.0);
+            let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
+            env.channel_mut(0).fill(1.0);
+            env.channel_mut(1).fill(1.0);
+            let mut out = PlanarBuffer::new(1, CAP);
+            m.process_ducked_on(path, &input, &env, &mut out, 64);
+            assert!(m.set_mask(0, 0, 0b10, 4800));
+            // The old group releases, by one step of its envelope per
+            // block, while the crossfade runs.
+            let new = duck_gain(10.0, 1.0);
+            let mut index = 0;
+            for b in 0..100 {
+                let e = (1.0 - b as f32 / 20.0).max(0.0);
+                env.channel_mut(0).fill(e);
+                m.process_ducked_on(path, &input, &env, &mut out, 48);
+                if b > 0 {
+                    let old = duck_gain(20.0, (e + 1.0 / 20.0).min(1.0));
+                    let floor = old.min(new);
+                    for n in 0..48 {
+                        let g = out.channel(0)[n];
+                        assert!(g >= floor - 1e-6, "{path:?} sample {index}: {g} < {floor}");
+                        index += 1;
+                    }
+                }
+            }
+            m.process_ducked_on(path, &input, &env, &mut out, 48);
+            assert_eq!(out.channel(0)[47], new);
+        }
     }
 
     /// Masks and depths set out of range or to values no matrix takes are

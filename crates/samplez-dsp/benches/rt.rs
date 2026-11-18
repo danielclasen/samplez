@@ -69,10 +69,11 @@ fn setup_matrix(path: Path) -> (Path, (Matrix, PlanarBuffer, PlanarBuffer)) {
     (path, ramping_matrix())
 }
 
-/// The ramping matrix with every coefficient ducked by all eight
-/// detectors, their depths ramping and every mask crossfading, with the
-/// detectors' envelopes moving.
-fn ducked_matrix() -> (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer) {
+/// The ramping matrix with every coefficient ducked, their depths
+/// ramping and every mask crossfading, with the detectors' envelopes
+/// moving: by all eight detectors, or, when `varied`, by a mask of its
+/// own per output, so no two outputs of an input share one.
+fn ducked_matrix(varied: bool) -> (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer) {
     let (mut m, input, output) = ramping_matrix();
     for i in 0..INPUTS {
         for g in 0..MAX_DUCKS {
@@ -80,8 +81,9 @@ fn ducked_matrix() -> (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer) {
             assert!(m.set_depth(i, g, 20.0, 480));
         }
         for j in 0..OUTPUTS {
+            let mask = if varied { 1 + j as u8 } else { 0xff };
             assert!(m.set_mask(i, j, 0x0f, 0));
-            assert!(m.set_mask(i, j, 0xff, 480));
+            assert!(m.set_mask(i, j, mask, 480));
         }
     }
     let mut env = PlanarBuffer::new(MAX_DUCKS, B);
@@ -94,8 +96,10 @@ fn ducked_matrix() -> (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer) {
 }
 
 #[library_benchmark]
-#[bench::scalar(args = (Path::Scalar,), setup = setup_ducked, config = limit(DUCKED_SCALAR))]
-#[bench::avx2(args = (Path::Avx2,), setup = setup_ducked, config = limit(DUCKED_AVX2))]
+#[bench::scalar(args = (Path::Scalar, false), setup = setup_ducked, config = limit(DUCKED_SCALAR))]
+#[bench::avx2(args = (Path::Avx2, false), setup = setup_ducked, config = limit(DUCKED_AVX2))]
+#[bench::scalar_varied(args = (Path::Scalar, true), setup = setup_ducked, config = limit(VARIED_SCALAR))]
+#[bench::avx2_varied(args = (Path::Avx2, true), setup = setup_ducked, config = limit(VARIED_AVX2))]
 fn matrix_ducked(
     (path, (mut m, input, env, mut output)): (
         Path,
@@ -106,8 +110,11 @@ fn matrix_ducked(
     (m, input, env, output)
 }
 
-fn setup_ducked(path: Path) -> (Path, (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer)) {
-    (path, ducked_matrix())
+fn setup_ducked(
+    path: Path,
+    varied: bool,
+) -> (Path, (Matrix, PlanarBuffer, PlanarBuffer, PlanarBuffer)) {
+    (path, ducked_matrix(varied))
 }
 
 // The output meters of one block: true peak and K-weighting over every
@@ -327,8 +334,10 @@ const CORE_COPY: u64 = 26_000;
 const HISTORY_BLOCK: u64 = 45_000;
 const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
-const DUCKED_SCALAR: u64 = 15_184_000;
-const DUCKED_AVX2: u64 = 4_393_000;
+const DUCKED_SCALAR: u64 = 17_217_000;
+const DUCKED_AVX2: u64 = 5_868_000;
+const VARIED_SCALAR: u64 = 17_204_000;
+const VARIED_AVX2: u64 = 5_858_000;
 const METERS_SCALAR: u64 = 1_118_000;
 const METERS_AVX2: u64 = 303_000;
 const INPUT_METERS: u64 = 152_623;

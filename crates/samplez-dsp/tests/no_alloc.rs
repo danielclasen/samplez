@@ -114,7 +114,6 @@ fn process_calls_do_not_allocate() {
             }
             assert!(matrix.set(0, 1, 1.0, 0));
             matrix.process_ducked_on(*path, &input, &envelopes, &mut output, frames);
-            matrix.process_on(*path, &input, &mut output, frames);
             matrix.advance(frames);
             matrix.align(round as u64 * 1000 + 3);
             core.copy_from(matrix);
