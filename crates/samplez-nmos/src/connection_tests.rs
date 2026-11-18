@@ -822,6 +822,29 @@ async fn a_scheduled_activation_applies_lead_early_and_writes_active_on_time() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_read_at_the_activation_time_sees_the_activation() {
+    let fake = Arc::new(Fake::default());
+    let n = node(&fake);
+    let s = sender(&n);
+    let body = json!({
+        "master_enable": false,
+        "activation": { "mode": "activate_scheduled_relative", "requested_time": "0:200000000" },
+    });
+    assert_eq!(patch(&n, "senders", &s, body).await.0, StatusCode::ACCEPTED);
+    // The activation time has come on the TAI clock, but the task's timer
+    // has not fired yet.
+    tokio::time::sleep(Duration::from_micros(199_500)).await;
+    fake.clock.skip(Duration::from_micros(500));
+    let a = active(&n, "senders", &s).await;
+    assert_eq!(a["master_enable"], false, "{a}");
+    assert_eq!(a["activation"]["mode"], "activate_scheduled_relative");
+    assert_eq!(
+        staged(&n, "senders", &s).await["activation"]["mode"],
+        Value::Null
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_cancel_after_the_lead_hands_the_product_the_active_connection_again() {
     let fake = Arc::new(Fake {
         lead: Duration::from_millis(40),

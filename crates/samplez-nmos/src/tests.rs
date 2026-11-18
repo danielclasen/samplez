@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ impl TaiClock for Clock {
 pub(crate) struct Paused {
     base: Tai,
     start: tokio::time::Instant,
+    ahead: Arc<AtomicU64>,
 }
 
 impl Default for Paused {
@@ -42,13 +44,24 @@ impl Default for Paused {
         Paused {
             base: Tai::new(1_000_000, 0),
             start: tokio::time::Instant::now(),
+            ahead: Arc::default(),
         }
     }
 }
 
 impl TaiClock for Paused {
     fn now(&self) -> Tai {
-        self.base.after(self.start.elapsed())
+        self.base
+            .after(self.start.elapsed())
+            .after(Duration::from_nanos(self.ahead.load(Ordering::Relaxed)))
+    }
+}
+
+impl Paused {
+    /// Moves the TAI clock ahead of tokio's, as a timer that wakes late
+    /// leaves it.
+    pub fn skip(&self, d: Duration) {
+        self.ahead.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
     }
 }
 

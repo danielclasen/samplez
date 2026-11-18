@@ -34,6 +34,10 @@ use crate::{Inner, State};
 /// the PATCH that asked is refused with 500.
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a read of `/staged` or `/active` waits for a scheduled
+/// activation that is due but not written yet.
+const FIRE_GRACE: Duration = Duration::from_millis(50);
+
 const DOMAIN: &str = "mxl_domain_id";
 const FLOW: &str = "mxl_flow_id";
 const IMMEDIATE: &str = "activate_immediate";
@@ -268,7 +272,10 @@ async fn single(
             json!(["constraints/", "staged/", "active/", "transporttype/"])
         }),
         ["constraints"] if get => ok(&constraints(inner, port)),
-        ["staged"] if get => ok(&staged_json(port, &inner.lock().port(port).staged)),
+        ["staged"] if get => {
+            fired(inner, port).await;
+            ok(&staged_json(port, &inner.lock().port(port).staged))
+        }
         ["staged"] if method == Method::PATCH => match serde_json::from_slice::<Value>(body) {
             Ok(v) => match patch(inner, port, v).await {
                 Ok((status, v)) => respond(status, &v),
@@ -280,6 +287,7 @@ async fn single(
             ),
         },
         ["active"] if get => {
+            fired(inner, port).await;
             let st = inner.lock();
             let p = st.port(port);
             ok(&active_json(port, &p.active, &p.active_activation))
@@ -810,6 +818,25 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
         (Ok(_), None) => Ok(()),
     };
     settle(&inner, port, generation, result);
+}
+
+/// Waits, up to [`FIRE_GRACE`], for a scheduled activation whose time has
+/// come to be written: its task wakes on tokio's millisecond timer, so a
+/// read right at the activation time would otherwise see the state before.
+async fn fired(inner: &Inner, port: Port) {
+    let deadline = tokio::time::Instant::now() + FIRE_GRACE;
+    loop {
+        let due = inner
+            .lock()
+            .port(port)
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.at <= inner.clock.now());
+        if !due || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 /// Sleeps until `lead` before `at` on the node's TAI clock.
