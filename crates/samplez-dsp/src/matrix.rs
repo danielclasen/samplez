@@ -2322,6 +2322,7 @@ mod tests {
     /// A matrix with ducks processed without envelopes would release
     /// every duck within one interval, so it is refused in debug builds.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "without envelopes")]
     fn process_refuses_a_matrix_with_ducks() {
         let mut m = Matrix::new(1, 1);
