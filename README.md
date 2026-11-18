@@ -493,9 +493,9 @@ entry up to that index takes effect at or before the floor and every
 later one at or after it, so the records handed after the rebuild apply
 on top of it in order; an install the RT thread can no longer take is
 tried again with a fresh read. Under continuous writes the floor lies up
-to the stamping lead and a generation's build ahead, and the rebuild
-waits that long: `maxApplyLead`, or at the cap up to 64 ms past it (see
-below). `EngineAudio` installs the state as the records it filters
+to the stamping lead and a generation's build ahead, `maxApplyLead` or
+at the cap up to 64 ms past it (see below), and the rebuild waits that
+long and 100 ms more. `EngineAudio` installs the state as the records it filters
 leave an engine (below): a flow other than the one an input reads is a
 re-route kept by the same rules and else left as read, a strip parameter
 the engine refuses is not set, a gain it refuses is silent, a duck
