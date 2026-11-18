@@ -130,6 +130,27 @@ impl DetectorParams {
         release_ms: 1000.0,
     };
 
+    /// The parameters with every value moved to the nearest one its
+    /// range holds; none when a value is NaN or infinite.
+    pub fn clamped(&self) -> Option<DetectorParams> {
+        let c = crate::strip::clamp_in;
+        Some(DetectorParams {
+            threshold_db: c(self.threshold_db, &THRESHOLD_DB)?,
+            hysteresis_db: c(self.hysteresis_db, &HYSTERESIS_DB)?,
+            hpf: KeyFilter {
+                enabled: self.hpf.enabled,
+                freq: c(self.hpf.freq, &KEY_HPF_FREQ)?,
+            },
+            lpf: KeyFilter {
+                enabled: self.lpf.enabled,
+                freq: c(self.lpf.freq, &KEY_LPF_FREQ)?,
+            },
+            attack_ms: c(self.attack_ms, &ATTACK_MS)?,
+            hold_ms: c(self.hold_ms, &HOLD_MS)?,
+            release_ms: c(self.release_ms, &RELEASE_MS)?,
+        })
+    }
+
     fn refusal(&self) -> Result<(), Refusal> {
         within("duck threshold", self.threshold_db, &THRESHOLD_DB)?;
         within("duck hysteresis", self.hysteresis_db, &HYSTERESIS_DB)?;

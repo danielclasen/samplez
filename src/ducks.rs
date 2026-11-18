@@ -41,6 +41,46 @@ pub enum DuckSetting {
     Depth { slot: usize, db: f32 },
 }
 
+impl DuckSetting {
+    /// The setting with every value moved to the nearest one its range
+    /// holds: a depth of 99 dB is 40 dB, a key gain past its range at
+    /// its end. None when a value is NaN or infinite. Slots and keys as
+    /// given.
+    pub fn clamped(&self) -> Option<DuckSetting> {
+        let c = |v: f32, r: &std::ops::RangeInclusive<f32>| {
+            v.is_finite().then(|| v.clamp(*r.start(), *r.end()))
+        };
+        Some(match *self {
+            DuckSetting::Detector(ref p) => DuckSetting::Detector(Box::new(p.clamped()?)),
+            DuckSetting::Keys(ref keys) => DuckSetting::Keys(
+                (keys.iter())
+                    .map(|&(slot, gain)| Some((slot, c(gain, &KEY_GAIN)?)))
+                    .collect::<Option<_>>()?,
+            ),
+            DuckSetting::Depth { slot, db } => DuckSetting::Depth {
+                slot,
+                db: c(db, &DEPTH_DB)?,
+            },
+            ref other => other.clone(),
+        })
+    }
+
+    /// The setting of the same kind and slot at the value a group holds
+    /// before any entry sets one: the default detector, no key, a depth
+    /// of 0 dB; a mode or hold as given. What a setting refused for a
+    /// value that is not finite, or for keys the engine cannot take, is
+    /// replaced with, so a group that held another value and one that
+    /// held none end up alike.
+    pub fn neutral(&self) -> DuckSetting {
+        match *self {
+            DuckSetting::Detector(_) => DuckSetting::Detector(Box::new(DetectorParams::DEFAULT)),
+            DuckSetting::Keys(_) => DuckSetting::Keys(Vec::new()),
+            DuckSetting::Depth { slot, .. } => DuckSetting::Depth { slot, db: 0.0 },
+            ref other => other.clone(),
+        }
+    }
+}
+
 /// A duck group's targets as values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DuckTargets {

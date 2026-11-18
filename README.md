@@ -443,10 +443,10 @@ voter count stays odd, so a set starting from its first voter promotes
 no lone learner and grows by two, and its StatefulSet needs
 `podManagementPolicy: Parallel`: under `OrderedReady` the second
 ordinal waits for promotion, never reads ready, and the third is never
-created. Replicas reach each
-other through a headless Service that publishes not-ready addresses
-(`publishNotReadyAddresses: true`), so a replica that reads not ready
-still takes part in the log, contact and resync.
+created. Replicas reach each other through a headless Service that
+publishes not-ready addresses (`publishNotReadyAddresses: true`), so a
+replica that reads not ready still takes part in the log, contact and
+resync.
 
 `Engine::drop_core` drops the RT thread's core while the replica starts:
 the RT thread keeps its writers, flows, hold rings and statuses,
@@ -508,10 +508,9 @@ to the stamping lead and a generation's build ahead, `maxApplyLead` or
 at the cap up to 64 ms past it (see below), and the rebuild waits that
 long and 100 ms more. `EngineAudio` installs the state as the records it filters
 leave an engine (below): a flow other than the one an input reads is a
-re-route kept by the same rules and else left as read, a strip parameter
-the engine refuses is not set, a gain it refuses is silent, a duck
-setting it refuses is left at what no entry sets and a mask it refuses
-is 0. A
+re-route kept by the same rules and else left as read, a strip
+parameter, duck setting or mask the engine refuses is replaced as the
+filter replaces it (below), and a gain it refuses is silent. A
 product without targets gives an empty
 state, which an engine refuses: its replicas stay in `starting`.
 
@@ -578,23 +577,35 @@ or with one committing, and one taking entries late after it caught up,
 holds them unresolved. One AppendEntries carries up to
 `MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
 than the gap between entries takes every entry written meanwhile with
-one fsync rather than falling further behind. `EngineAudio` leaves out
-of a record the entries its engine refuses, and of the `InputUp`s and
-`Route`s of several input domains those not of the lowest slot's, before
-it appends it: the engine's configuration decides that alike on every
-replica of a key, so the outputs still agree, and it is counted in
-`entries_filtered` and logged as the product's fault. A resync's joiner
-replays the records of the entries applied after the donor core's last
-log id; one it no longer holds, past the second kept or before a
-snapshot it loaded, fails the attempt, which is retried on a newer core.
-A client command that would re-route an input (`Product::reroutes`) is
-ordered alone on the generation path, stamped the lead and the longest
-build time a counted replica reports past its stamp, since its
-generation is built once it applies, but at most `AHEAD_MAX` (one
-second) past its stamp: an entry further ahead would take effect at its
-stamp. A build longer than that leaves the entry applied on time and
-the slots it raises or re-routes silent until the generation is swapped
-in (`generation_late`). One asking for an index beyond the earliest is
+one fsync rather than falling further behind. `EngineAudio` replaces a
+strip parameter, duck setting or duck mask its engine refuses, so a
+replica holding a value before the refused one and one rebuilt without
+it hold the same. A finite value out of range moves to the nearest one
+its range holds (`StripParam::clamped`, `DuckSetting::clamped`): a trim
+of -30 dB sounds as -20 dB, a duck depth of 99 dB as 40 dB. A value
+that is not finite, or keys the engine cannot take, give the setting a
+strip or group holds before any is set (`StripParam::neutral`: trims
+at 0 dB, no inversion, high-pass, equaliser, gate and compressor off, a
+band at its default; `DuckSetting::neutral`: the default detector, no
+key, a depth of 0 dB): a trim at -20 dB set to NaN steps back to 0 dB,
+a closed gate opens and a ducked bed returns to full level, each over
+the strip's ramp. A refused mask is 0. It leaves out of a record the
+other entries its engine refuses, and of the `InputUp`s and `Route`s of
+several input domains those not of the lowest slot's, before it
+appends it: the engine's configuration decides that alike on every
+replica of a key, so the outputs still agree, and each one replaced or
+left out is counted in `entries_filtered` and logged as the product's
+fault. A resync's joiner replays the records of the entries applied
+after the donor core's last log id; one it no longer holds, past the
+second kept or before a snapshot it loaded, fails the attempt, which is
+retried on a newer core. A client command that would re-route an input
+(`Product::reroutes`) is ordered alone on the generation path, stamped
+the lead and the longest build time a counted replica reports past its
+stamp, since its generation is built once it applies, but at most
+`AHEAD_MAX` (one second) past its stamp: an entry further ahead would
+take effect at its stamp. A build that would need more leaves the entry
+applied on time and the slots it raises or re-routes silent until the
+generation is swapped in (`generation_late`). One asking for an index beyond the earliest is
 refused. Such a product owns every input's flow:
 `Replica::append` refuses a `Route` or `MasterEnable` for it.
 

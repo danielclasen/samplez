@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use samplez::blocks::{HEALTHY, PAGE};
-use samplez::{Config, Engine, Entry, InputState, Replication, Targets};
+use samplez::{Config, DuckTargets, Engine, Entry, InputState, Replication, Targets};
 use samplez_dsp::{GateParams, StripParam};
 use samplez_mxl::output::{self, Creation, OutputConfig};
 use samplez_mxl::{Instance, time};
@@ -1317,13 +1317,16 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
 
 /// Two mono input slots reading one flow into one output, as a product
 /// drives them: `fader <slot> <gain>`, `vca <gain>`, `gate <slot> <dB>`
-/// for the gate threshold, `recall <gain>` setting both faders.
+/// for the gate threshold, `recall <gain>` setting both faders, `duck
+/// <dB>` holding duck group 0 down on slot 0 by that depth.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Console {
     faders: [f32; 2],
     vca: f32,
     gates: [f32; 2],
     flow: String,
+    #[serde(default)]
+    duck: Option<f32>,
 }
 
 impl Console {
@@ -1333,6 +1336,7 @@ impl Console {
             vca: 1.0,
             gates: [-60.0, -60.0],
             flow: flow.to_owned(),
+            duck: None,
         }
     }
 }
@@ -1349,6 +1353,7 @@ impl Product for Console {
             ["vca", gain] => self.vca = number(gain),
             ["gate", slot, db] => self.gates[slot.parse::<usize>().unwrap()] = number(db),
             ["recall", gain] => self.faders = [number(gain), number(gain) / 2.0],
+            ["duck", db] => self.duck = Some(number(db)),
             _ => return Effect::Stale,
         }
         Effect::Changed(())
@@ -1383,17 +1388,36 @@ impl Product for Console {
                 release_ms: 200.0,
             })]
         };
+        let (ducks, masks) = match self.duck {
+            Some(db) => (
+                vec![DuckTargets {
+                    held: true,
+                    depths: vec![db, 0.0],
+                    ..DuckTargets::default()
+                }],
+                vec![vec![1], vec![0]],
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         Some(Targets {
             gains: (0..2).map(|s| vec![self.faders[s] * self.vca]).collect(),
             flows: vec![Some(self.flow.clone()); 2],
             strips: (0..2).map(gate).collect(),
+            ducks,
+            masks,
             ..Targets::default()
         })
     }
 }
 
-/// An engine of [`Console`]'s shape reading `input`, writing `output`.
-fn console(domain: &Domain, input: &str, output: &str) -> (Arc<Engine>, EngineAudio) {
+/// An engine of [`Console`]'s shape reading `input`, writing `output`,
+/// its output column ducked when `ducked`.
+fn console_with(
+    domain: &Domain,
+    input: &str,
+    output: &str,
+    ducked: bool,
+) -> (Arc<Engine>, EngineAudio) {
     let v = serde_json::json!({
         "blockSize": B,
         "readerMarginSamples": 960,
@@ -1405,6 +1429,7 @@ fn console(domain: &Domain, input: &str, output: &str) -> (Arc<Engine>, EngineAu
         "outputs": [{ "name": "out0", "domain": "d", "flowId": output, "label": "console",
                       "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
         "matrix": [[1.0], [1.0]],
+        "duckColumns": if ducked { vec![0] } else { Vec::new() },
         "rt": { "rtCpu": "none" },
     });
     bridge_of(&v, 1 << 12)
@@ -1498,21 +1523,28 @@ const CONSOLE_INPUT: &str = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd6a00";
 /// and two console engines reading it, past their fade-in from the
 /// attach.
 fn consoles(domain: &Domain) -> [(Arc<Engine>, EngineAudio); 2] {
+    consoles_with(domain, false)
+}
+
+/// [`consoles`], their output column ducked when `ducked`.
+fn consoles_with(domain: &Domain, ducked: bool) -> [(Arc<Engine>, EngineAudio); 2] {
     std::fs::write(
         domain.0.join("options.json"),
         r#"{"urn:x-mxl:option:history_duration/v1.0": 1000000000}"#,
     )
     .unwrap();
     let engines = [
-        console(
+        console_with(
             domain,
             CONSOLE_INPUT,
             "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f40",
+            ducked,
         ),
-        console(
+        console_with(
             domain,
             CONSOLE_INPUT,
             "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f41",
+            ducked,
         ),
     ];
     wait_for("both read the input", || {
@@ -1747,6 +1779,71 @@ fn refused_gain_live_and_rebuilt(gain: &str) -> Result<(), String> {
         .map_err(|e| format!("{gain}: {e}: the live engine holds another gain"))?;
     if compared < 4 {
         return Err(format!("{gain}: {compared} pages compared"));
+    }
+    Ok(())
+}
+
+/// A gate threshold the engine refuses as NaN and a duck depth past
+/// `DEPTH_DB` leave a live engine handed the records and one rebuilt
+/// from the product state past them computing the same pages: both take
+/// the gate off, its neutral form, and the depth at 40 dB, the end of
+/// its range, where the live one would hold its previous gate and depth
+/// and the rebuilt one, holding no previous value, the strip's and the
+/// group's defaults.
+#[test]
+fn a_refused_strip_and_duck_setting_leave_a_live_and_a_rebuilt_engine_alike() {
+    undisturbed(refused_settings_live_and_rebuilt);
+}
+
+fn refused_settings_live_and_rebuilt() -> Result<(), String> {
+    let domain = Domain::new();
+    let _pilot = Pilot::start(&domain, CONSOLE_INPUT);
+    let [(live, la), (rebuilt, ra)] = consoles_with(&domain, true);
+    let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
+    let silenced_before = silenced(&live) + silenced(&rebuilt);
+    let mut m = Machine::new(CONSOLE_INPUT);
+    let index = std::cell::Cell::new(0u64);
+    let write = |m: &mut Machine, body: &str| {
+        index.set(index.get() + 1);
+        let index = index.get();
+        let stamp = processed_of(&live).max(processed_of(&rebuilt)) * B;
+        let r = m.apply(index, stamp, stamp + 40 * B, body);
+        for audio in [&la, &ra] {
+            audio.appended(index, r.at_index, &r.entries);
+            audio.committed(index);
+        }
+        r
+    };
+    // A closed gate and a held duck, both audible on the pilot.
+    write(&mut m, "fader 0 0.5");
+    write(&mut m, "gate 0 0");
+    write(&mut m, "duck 12");
+    ra.drop_engine();
+    write(&mut m, "gate 0 NaN");
+    write(&mut m, "duck 99");
+    wait_for("the floor passed", || {
+        processed_of(&rebuilt) > m.0.floor / B + 20
+    });
+    let state = m.0.product_state(index.get());
+    if !ra.rebuild_engine(&state, m.0.floor) {
+        return Err("not rebuilt".into());
+    }
+    let installed = processed_of(&rebuilt);
+    let mut last = 0;
+    for n in 0..4 {
+        last = write(&mut m, &format!("fader 1 0.{}", n + 2)).at_index;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let from = ((installed + 1) * B + 2 * 480).div_ceil(PAGE) + 2;
+    let end = (last + 480) / B + 4 * PAGE / B;
+    let pages = pages_until(&[(&live, &la), (&rebuilt, &ra)], end + PAGE / B)?;
+    if silenced(&live) + silenced(&rebuilt) > silenced_before {
+        return Err("an input block silenced".into());
+    }
+    let compared = equal_pages(&pages[0], &pages[1], from, end * B / PAGE)
+        .map_err(|e| format!("{e}: the live engine holds another gate or depth"))?;
+    if compared < 4 {
+        return Err(format!("{compared} pages compared"));
     }
     Ok(())
 }

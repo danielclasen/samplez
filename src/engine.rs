@@ -4442,6 +4442,60 @@ fn minor_faults(tid: i32) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// A config of two mono inputs, one output, column 0 ducked.
+    fn ducked_config() -> Config {
+        let v = serde_json::json!({
+            "libmxl": "/nonexistent/libmxl.so",
+            "domains": [{ "name": "d", "path": "/nonexistent" }],
+            "inputs": (0..2).map(|n| serde_json::json!({
+                "name": format!("in{n}"), "domain": "d",
+                "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8d", "channels": 1 }))
+                .collect::<Vec<_>>(),
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "7fbec3b1-1b0f-417d-9059-8b94a47197ed", "label": "o",
+                          "group": "g", "role": "Audio", "channels": 1 }],
+            "matrix": [[1.0], [1.0]],
+            "duckColumns": [0],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        Config::parse(&v.to_string()).unwrap()
+    }
+
+    /// Every duck setting's neutral form is one an engine takes, so a
+    /// refused setting is replaced rather than left out; a refused
+    /// finite one clamped is taken too, and one with a NaN is not.
+    #[test]
+    fn a_duck_settings_neutral_and_clamped_forms_are_taken() {
+        let config = ducked_config();
+        let mut refused = samplez_dsp::DetectorParams::DEFAULT;
+        refused.attack_ms = 1e9;
+        let settings = [
+            DuckSetting::Detector(Box::new(refused)),
+            DuckSetting::Keys(vec![(0, 1e9), (1, 1.0)]),
+            DuckSetting::Depth { slot: 1, db: 99.0 },
+        ];
+        for s in &settings {
+            assert!(check_duck(&config, 0, s).is_err(), "{s:?} refused");
+            let clamped = s.clamped().expect("finite");
+            assert_eq!(check_duck(&config, 0, &clamped), Ok(()), "{clamped:?}");
+            assert_eq!(check_duck(&config, 0, &s.neutral()), Ok(()), "{s:?}");
+        }
+        assert_eq!(
+            DuckSetting::Depth { slot: 1, db: 99.0 }.clamped(),
+            Some(DuckSetting::Depth { slot: 1, db: 40.0 })
+        );
+        let nan = DuckSetting::Depth {
+            slot: 1,
+            db: f32::NAN,
+        };
+        assert_eq!(nan.clamped(), None);
+        // A key of a slot the engine lacks stays refused clamped; its
+        // neutral form, no key, is taken.
+        let missing = DuckSetting::Keys(vec![(7, 1.0)]);
+        assert!(check_duck(&config, 0, &missing.clamped().unwrap()).is_err());
+        assert_eq!(check_duck(&config, 0, &missing.neutral()), Ok(()));
+    }
+
     /// The percentile follows the build times: every build below 10 000
     /// counts, one slow build among 20 000 does not, and buildLead covers
     /// it, a supervisor tick and the lead in whole blocks.

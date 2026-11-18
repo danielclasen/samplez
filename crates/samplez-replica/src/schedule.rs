@@ -278,13 +278,15 @@ mod tests {
         assert_eq!(lead.samples(), 49 * B, "a minute needing less, it falls");
         assert!(!lead.capped);
         // Below the cap the slack's quantile alone decides: one entry
-        // that needed more holds no fall.
+        // with slack B, among over 10 000 slacks so the 0.01 % quantile
+        // passes over it, needed more than the lead and holds no fall.
         let mut lead = Lead::new(B, 30 * B, 50 * B);
         for minute in 0..10 {
-            for _ in 0..100 {
+            for _ in 0..1001 {
                 lead.add(5 * B as i64, 1, 1);
             }
             if minute == 9 {
+                lead.add(B as i64, 1, 1);
                 lead.needs(30 * B, B as i64);
             }
             tokio::time::advance(Duration::from_secs(60)).await;
