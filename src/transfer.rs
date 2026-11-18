@@ -573,7 +573,16 @@ impl Replay {
             return Err(ReplayError::Late { id, at_index });
         }
         if at_index < self.next * b {
-            self.unresolved(id, at_index)?;
+            // Into the unresolved list itself, not the control ring: only
+            // a computed block drains the ring, and these all come before
+            // the first block the replay computes. The engine admits at
+            // most [`UNRESOLVED`], as the RT thread does.
+            if let Some(r) = self.rt.replica.as_mut()
+                && let Err(n) = r.unresolved.binary_search_by_key(&id, |e| e.0)
+                && r.unresolved.len() < UNRESOLVED
+            {
+                r.unresolved.insert(n, (id, at_index));
+            }
             self.late.push((id, at_index));
             self.last_id = id;
             return Ok(());

@@ -632,6 +632,15 @@ fn a_resync_takes_entries_the_donor_applied_late() {
     undisturbed(|| resync_with(20, |id| id % 2 == 1));
 }
 
+/// More entries taken late after the core than the engine's control
+/// ring holds before the replay computes a block: the replay holds them
+/// unresolved without the ring, which only a computed block drains, so
+/// a burst of them does not fail the attempt.
+#[test]
+fn a_resync_takes_more_late_entries_than_the_control_ring_holds() {
+    undisturbed(|| resync_with(72, |_| true));
+}
+
 /// Runs `scenario` until a run is not disturbed, four times at most.
 fn undisturbed(scenario: impl Fn() -> Result<(), String>) {
     let mut seen = Vec::new();
