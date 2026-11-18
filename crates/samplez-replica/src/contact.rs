@@ -3223,6 +3223,8 @@ mod tests {
                 up: Vec::new(),
                 flows: Vec::new(),
                 strips: Vec::new(),
+                ducks: Vec::new(),
+                masks: Vec::new(),
                 pending: Vec::new(),
                 last_id: log.applied,
             };

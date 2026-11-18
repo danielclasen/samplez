@@ -16,19 +16,21 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use samplez_dsp::duck::{DEPTH_DB, MAX_KEYS};
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Matrix, PlanarBuffer, Started, StripParam};
+use samplez_dsp::{DuckParam, MAX_DUCKS, Matrix, PlanarBuffer, Started, StripParam};
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, Recovery, Timing,
 };
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
 
-use crate::batch::{self, Batch};
+use crate::batch::{self, Batch, Item};
 use crate::blocks::{
     BlockStatus, Cause, Hold, PAGE, PageHash, Pages, Ranks, Standing, StatusChange, Statuses,
 };
 use crate::config::Config;
+use crate::ducks::{DuckMeter, DuckRecord, DuckSetting};
 use crate::meters::{InputMeters, OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
@@ -38,7 +40,7 @@ use crate::rt_loop::{
 };
 use crate::transfer::{
     Answer, CopyError, Core, CoreCopy, Handover, ProductState, Replay, ReplayError, SlotCore,
-    change_of,
+    items_of,
 };
 
 const COMMAND_RING: usize = 64;
@@ -180,6 +182,9 @@ pub struct Status {
     /// Spent batches the RT thread leaked rather than free them: its
     /// return ring and spent list were full ([`Counters::batches_leaked`]).
     pub batches_leaked: u64,
+    /// Per duck group, [`MAX_DUCKS`] of them, its readings over the last
+    /// meter slice it was in use in.
+    pub ducks: Vec<DuckMeter>,
 }
 
 #[derive(Debug)]
@@ -228,6 +233,11 @@ impl std::fmt::Display for GainError {
 
 impl std::error::Error for GainError {}
 
+/// Why [`Engine::set_duck`] or [`Engine::set_duck_mask`] refused a
+/// setting: for what a gain change is refused for, and as invalid for a
+/// setting [`Engine::admits`] refuses.
+pub type DuckError = GainError;
+
 /// A log entry for the engine. Each sets an absolute target, so one
 /// applied again once its ramp has ended changes nothing.
 #[derive(Clone, Debug, PartialEq)]
@@ -252,6 +262,19 @@ pub enum Entry {
     /// Sets parameter `param` of input slot `slot`'s strip from the
     /// entry's index, ramping over the ramp length.
     Strip { slot: usize, param: StripParam },
+    /// Sets `setting` of duck group `group`, below [`MAX_DUCKS`], from the
+    /// entry's index.
+    Duck { group: usize, setting: DuckSetting },
+    /// Sets the duck mask of the coefficient from input channel `input`
+    /// to matrix column `output`, a column the configuration names in
+    /// `duckColumns` unless the mask is 0: bit `g` ducks it by group `g`.
+    /// A coefficient that is not 0 crossfades from the old mask's gain to
+    /// the new one's over the ramp length.
+    DuckMask {
+        input: usize,
+        output: usize,
+        mask: u8,
+    },
 }
 
 /// Why the engine refused an entry.
@@ -628,6 +651,117 @@ fn check_strip(config: &Config, slot: usize, param: &StripParam) -> Result<(), S
     param.check(legs)
 }
 
+/// Whether duck group `group` takes `setting` on `config`'s engine: a
+/// group below [`MAX_DUCKS`], detector parameters and depths within their
+/// ranges, at most [`MAX_KEYS`] keys of slots that exist, each once, each
+/// at most [`MAX_LEGS`] wide, with gains within their range.
+fn check_duck(config: &Config, group: usize, setting: &DuckSetting) -> Result<(), String> {
+    if group >= MAX_DUCKS {
+        return Err(format!("no duck group {group}, at most {MAX_DUCKS}"));
+    }
+    let slot_legs = |slot: usize| -> Result<usize, String> {
+        let input = (config.inputs.get(slot)).ok_or_else(|| format!("no input slot {slot}"))?;
+        Ok(input.channels as usize)
+    };
+    match *setting {
+        DuckSetting::Detector(ref p) => DuckParam::Detector(**p).check(),
+        DuckSetting::Keys(ref keys) => {
+            if keys.len() > MAX_KEYS {
+                return Err(format!(
+                    "{} keys for duck group {group}, at most {MAX_KEYS}",
+                    keys.len()
+                ));
+            }
+            for (key, &(slot, gain)) in keys.iter().enumerate() {
+                if keys[..key].iter().any(|k| k.0 == slot) {
+                    return Err(format!("input slot {slot} keyed twice"));
+                }
+                let legs = slot_legs(slot)?;
+                DuckParam::Key { key, legs, gain }
+                    .check()
+                    .map_err(|e| format!("input slot {slot}: {e}"))?;
+            }
+            Ok(())
+        }
+        DuckSetting::Mode(_) | DuckSetting::Hold { .. } => Ok(()),
+        DuckSetting::Depth { slot, db } => {
+            slot_legs(slot)?;
+            if DEPTH_DB.contains(&db) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "duck depth {db} dB, within {} to {}",
+                    DEPTH_DB.start(),
+                    DEPTH_DB.end()
+                ))
+            }
+        }
+    }
+}
+
+/// Whether `config`'s engine takes duck mask `mask` on the coefficient
+/// from `input` to `output`: it exists, and a mask other than 0 is of a
+/// column in `duckColumns`.
+fn check_mask(config: &Config, input: usize, output: usize, mask: u8) -> Result<(), String> {
+    if input >= config.input_channels() || output >= config.columns() {
+        return Err(format!("no matrix coefficient {input} -> {output}"));
+    }
+    if mask != 0 && !config.duck_columns.contains(&output) {
+        return Err(format!(
+            "duck mask on column {output}, which duckColumns does not name"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `config`'s engine takes the duck groups and masks of product
+/// state `state`: what an entry setting each could set.
+fn check_product_ducks(config: &Config, state: &ProductState) -> Result<(), String> {
+    if state.ducks.len() > MAX_DUCKS {
+        return Err(format!(
+            "{} duck groups, at most {MAX_DUCKS}",
+            state.ducks.len()
+        ));
+    }
+    for (g, d) in state.ducks.iter().enumerate() {
+        if d.depths.len() > config.inputs.len() {
+            return Err(format!("duck group {g}: depths of more slots than inputs"));
+        }
+        let depths =
+            (d.depths.iter().enumerate()).map(|(slot, &db)| DuckSetting::Depth { slot, db });
+        let settings = [
+            DuckSetting::Detector(Box::new(d.params)),
+            DuckSetting::Keys(d.keys.clone()),
+        ];
+        for setting in settings.into_iter().chain(depths) {
+            check_duck(config, g, &setting)?;
+        }
+    }
+    let (n, m) = (config.input_channels(), config.columns());
+    if !state.masks.is_empty() {
+        if state.masks.len() != n || state.masks.iter().any(|row| row.len() != m) {
+            return Err(format!("duck masks not of the shape {n} x {m}"));
+        }
+        for (input, row) in state.masks.iter().enumerate() {
+            for (output, &mask) in row.iter().enumerate() {
+                check_mask(config, input, output, mask)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per input slot of `config`, its first matrix row and its width.
+fn slot_rows(config: &Config) -> Vec<(usize, usize)> {
+    let mut first = 0;
+    (config.inputs.iter())
+        .map(|i| {
+            first += i.channels as usize;
+            (first - i.channels as usize, i.channels as usize)
+        })
+        .collect()
+}
+
 /// Where the next generation-needing or other entry for a slot may be
 /// stamped: at `earliest`, after the latest one for the slot and its ramp.
 fn stamp(earliest: u64, last_at: u64, ramp: u64, block: u64) -> u64 {
@@ -858,6 +992,7 @@ fn replay_rt(
         ret: sink(),
         tel: sink(),
         meters: sink(),
+        duck_meters: sink(),
         resets: none(),
         meter_seq: 0,
         counters: Arc::new(Counters::default()),
@@ -1011,6 +1146,18 @@ impl Engine {
         };
         while meter_tx.push(blank).is_ok() {}
         while meter_rx.pop().is_ok() {}
+        let (mut duck_tx, mut duck_rx) = rtrb::RingBuffer::new(
+            METER_RING_SECONDS * (samplez_mxl::SAMPLE_RATE as usize / SLICE as usize) * MAX_DUCKS,
+        );
+        let blank = DuckRecord {
+            group: 0,
+            slice: 0,
+            key: 0.0,
+            envelope: 0.0,
+            engaged: false,
+        };
+        while duck_tx.push(blank).is_ok() {}
+        while duck_rx.pop().is_ok() {}
         let (reset_tx, reset_rx) = rtrb::RingBuffer::new(
             (RESETS_PER_OUTPUT * (config.outputs.len() + config.meters.len())).max(1),
         );
@@ -1193,6 +1340,7 @@ impl Engine {
             ret: ret_tx,
             tel: tel_tx,
             meters: meter_tx,
+            duck_meters: duck_tx,
             resets: reset_rx,
             meter_seq: 0,
             counters: Arc::clone(&counters),
@@ -1228,6 +1376,7 @@ impl Engine {
             rt_panic: None,
             replay_speed,
             batches_leaked: 0,
+            ducks: vec![DuckMeter::default(); MAX_DUCKS],
             inputs: config
                 .inputs
                 .iter()
@@ -1351,6 +1500,7 @@ impl Engine {
             tel: tel_rx,
             meter_rx,
             next_meter_seq: 0,
+            duck_rx,
             change_rx,
             status_tx,
             hash_rx,
@@ -1484,9 +1634,68 @@ impl Engine {
         self.set_local(Change::Strip { slot, param }, at_index, "strip changes")
     }
 
+    /// Sets `setting` of duck group `group` from sample index `at_index`,
+    /// a multiple of the block size. Refused as [`Engine::set_gain`]
+    /// refuses a change, and as invalid for a setting
+    /// [`Engine::admits`] refuses as an [`Entry::Duck`].
+    pub fn set_duck(
+        &self,
+        group: usize,
+        setting: DuckSetting,
+        at_index: u64,
+    ) -> Result<(), DuckError> {
+        self.set_local_entry(&Entry::Duck { group, setting }, at_index, "duck changes")
+    }
+
+    /// Sets the duck mask of the coefficient from input channel `input`
+    /// to matrix column `output` from sample index `at_index`, as
+    /// [`Entry::DuckMask`] does. Refused as [`Engine::set_duck`] refuses a
+    /// setting.
+    pub fn set_duck_mask(
+        &self,
+        input: usize,
+        output: usize,
+        mask: u8,
+        at_index: u64,
+    ) -> Result<(), DuckError> {
+        let entry = Entry::DuckMask {
+            input,
+            output,
+            mask,
+        };
+        self.set_local_entry(&entry, at_index, "duck changes")
+    }
+
+    /// Appends `entry`, checked and folded, at `at_index` to the engine's
+    /// own log and commits it.
+    fn set_local_entry(&self, entry: &Entry, at_index: u64, what: &str) -> Result<(), GainError> {
+        let mut items = Vec::new();
+        self.items(entry, &mut items).map_err(|e| match e {
+            EntryError::Invalid(m) => GainError::Invalid(m),
+            other => GainError::Invalid(other.to_string()),
+        })?;
+        let (n, m) = self.shape;
+        let Some((change, batch)) = batch::fold(&items, m, n * m).map_err(GainError::Invalid)?
+        else {
+            return Ok(());
+        };
+        self.set_local_batch(change, batch, at_index, what)
+    }
+
     /// Appends `change` at `at_index` to the engine's own log and commits
     /// it; `what` names the changes in the refusal of a replicated engine.
     fn set_local(&self, change: Change, at_index: u64, what: &str) -> Result<(), GainError> {
+        self.set_local_batch(change, None, at_index, what)
+    }
+
+    /// [`Engine::set_local`] of `change` with its batch.
+    fn set_local_batch(
+        &self,
+        change: Change,
+        batch: Option<Arc<Batch>>,
+        at_index: u64,
+        what: &str,
+    ) -> Result<(), GainError> {
         if !at_index.is_multiple_of(self.block) {
             return Err(GainError::Invalid(format!(
                 "at_index {at_index} is not a multiple of the block size {}",
@@ -1511,7 +1720,7 @@ impl Engine {
             change,
         };
         let consumed = self.counters.entries_consumed.load(Acquire);
-        log.append(e, None, Vec::new(), consumed)
+        log.append(e, batch, Vec::new(), consumed)
             .map_err(|_| GainError::Full)?;
         log.commit(e.id);
         Ok(())
@@ -1640,10 +1849,10 @@ impl Engine {
         &self,
         entries: &[Entry],
     ) -> Result<Option<(Change, Option<Arc<Batch>>, Vec<(usize, String)>)>, EntryError> {
-        let mut changes = Vec::with_capacity(entries.len());
+        let mut items = Vec::with_capacity(entries.len());
         let mut flows = HashMap::new();
         for entry in entries {
-            changes.push(self.change(entry)?);
+            self.items(entry, &mut items)?;
             if let Entry::Route { slot, flow_id } = entry {
                 flows.insert(*slot, flow_id);
             }
@@ -1651,9 +1860,10 @@ impl Engine {
         // Every slot an `InputUp` or `Route` names, whether the fold keeps
         // it or not: then every subset of the entries passes as well, as a
         // restamp keeping some of a log entry's commands must.
-        let named = changes
-            .iter()
-            .fold(0, |m, c| m | (c.generating().0 | c.generating().1));
+        let named = items.iter().fold(0, |m, i| match i {
+            Item::Change(c) => m | (c.generating().0 | c.generating().1),
+            Item::Duck(_) => m,
+        });
         let mut domains = slots_of(named).map(|s| &self.config.inputs[s].domain);
         if let Some(first) = domains.next()
             && domains.any(|d| d != first)
@@ -1665,7 +1875,7 @@ impl Engine {
             ));
         }
         let (n, m) = self.shape;
-        let Some((change, batch)) = batch::fold(&changes, m, n * m).map_err(EntryError::Invalid)?
+        let Some((change, batch)) = batch::fold(&items, m, n * m).map_err(EntryError::Invalid)?
         else {
             return Ok(None);
         };
@@ -1674,7 +1884,29 @@ impl Engine {
         Ok(Some((change, batch, routes)))
     }
 
-    /// The change `entry` makes, checked against the configuration.
+    /// What `entry` sets, checked against the configuration, appended to
+    /// `items`.
+    fn items(&self, entry: &Entry, items: &mut Vec<Item>) -> Result<(), EntryError> {
+        let invalid = |m: String| EntryError::Invalid(m);
+        match *entry {
+            Entry::Duck { group, ref setting } => {
+                check_duck(&self.config, group, setting).map_err(invalid)?
+            }
+            Entry::DuckMask {
+                input,
+                output,
+                mask,
+            } => check_mask(&self.config, input, output, mask).map_err(invalid)?,
+            _ => {
+                items.push(Item::Change(self.change(entry)?));
+                return Ok(());
+            }
+        }
+        items_of(entry, &slot_rows(&self.config), items).map_err(invalid)
+    }
+
+    /// The change `entry`, other than a duck entry, makes, checked
+    /// against the configuration.
     fn change(&self, entry: &Entry) -> Result<Change, EntryError> {
         let invalid = |m: String| Err(EntryError::Invalid(m));
         let slots = self.config.inputs.len();
@@ -1712,6 +1944,9 @@ impl Engine {
             Entry::Strip { slot, param } => {
                 check_strip(&self.config, slot, &param).map_err(EntryError::Invalid)?;
                 Change::Strip { slot, param }
+            }
+            Entry::Duck { .. } | Entry::DuckMask { .. } => {
+                return invalid("a duck entry is no single change".to_owned());
             }
         })
     }
@@ -2054,7 +2289,8 @@ impl Engine {
             .expect("checked above");
         let (slots, in_domains) = new_slots(&self.config);
         let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
-        if !c.fits(n, m, &legs, self.config.ramp_samples, page) {
+        let ducked = &self.config.duck_columns;
+        if !c.fits(n, m, &legs, self.config.ramp_samples, page, ducked) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -2115,6 +2351,7 @@ impl Engine {
             silenced: Vec::new(),
             next: copy.k0 + 1,
             last_id: copy.last_id,
+            duck_columns: self.config.duck_columns.clone(),
         })
     }
 
@@ -2256,6 +2493,7 @@ impl Engine {
                 check_strip(&self.config, slot, param).map_err(ReplayError::Invalid)?;
             }
         }
+        check_product_ducks(&self.config, state).map_err(ReplayError::Invalid)?;
         if let Some(gain) = (state.gains.iter().flatten()).find(|g| !samplez_dsp::valid_gain(**g)) {
             return Err(ReplayError::Invalid(format!(
                 "gain {gain} is not finite within MAX_GAIN"
@@ -2265,10 +2503,15 @@ impl Engine {
         // The entries of one log entry are adjacent and fold into one.
         let mut pending = Vec::with_capacity(state.pending.len());
         let mut batches = Vec::new();
+        let rows = slot_rows(&self.config);
         for group in state.pending.chunk_by(|a, b| a.0 == b.0) {
             let (id, at_index, _) = group[0];
-            let changes: Vec<Change> = group.iter().map(|(_, _, e)| change_of(e)).collect();
-            let folded = batch::fold(&changes, m, n * m).map_err(ReplayError::Invalid)?;
+            let mut items = Vec::with_capacity(group.len());
+            for (_, _, e) in group {
+                self.items(e, &mut items)
+                    .map_err(|e| ReplayError::Invalid(e.to_string()))?;
+            }
+            let folded = batch::fold(&items, m, n * m).map_err(ReplayError::Invalid)?;
             let Some((change, b)) = folded else { continue };
             pending.push(RtEntry {
                 id,
@@ -2317,9 +2560,49 @@ impl Engine {
         let targets: Vec<f32> = state.gains.iter().flatten().copied().collect();
         let mut gains = targets.clone();
         let mut up = state.up.clone();
+        // Empty for none, as a fill takes them: a state and pending list
+        // without masks or depths pay nothing for them.
+        let pending_masks = batches.iter().any(|(_, b)| !b.masks.is_empty());
+        let pending_depths = batches.iter().any(|(_, b)| !b.depths.is_empty());
+        let mask_targets: Vec<u8> = if !state.masks.is_empty() {
+            state.masks.iter().flatten().copied().collect()
+        } else if pending_masks {
+            vec![0; n * m]
+        } else {
+            Vec::new()
+        };
+        let mut masks = mask_targets.clone();
+        // Per input channel and group, as the matrix holds them.
+        let any_depth = (state.ducks.iter()).any(|d| d.depths.iter().any(|&db| db != 0.0));
+        let mut depth_targets = if any_depth || pending_depths {
+            vec![0.0f32; n * MAX_DUCKS]
+        } else {
+            Vec::new()
+        };
+        let fill_depths = !depth_targets.is_empty();
+        for (g, d) in state.ducks.iter().enumerate().filter(|_| fill_depths) {
+            for (slot, &db) in d.depths.iter().enumerate() {
+                let (first, legs) = rows[slot];
+                for row in first..first + legs {
+                    depth_targets[row * MAX_DUCKS + g] = db;
+                }
+            }
+        }
+        let mut depths = depth_targets.clone();
+        let legs = |s: usize| self.config.inputs.get(s).map_or(0, |i| i.channels as usize);
+        // Cold detectors at the state's settings, settled, built here: an
+        // attempt copies them.
+        let mut cold = crate::ducks::DuckCore::new(ramp);
+        cold.cold(ramp, &state.ducks, legs);
+        cold.settle(ramp, 0);
         self.offer(left(), at_least, false, &strips, |j, core| {
             gains.copy_from_slice(&targets);
             up.copy_from_slice(&state.up);
+            masks.copy_from_slice(&mask_targets);
+            depths.copy_from_slice(&depth_targets);
+            // Whatever a spare core held.
+            core.ducks.copy_from(&cold);
+            let mut ducks_passed = false;
             // The entries whose index the install passed are folded in
             // like the rest of the state: reported late they would never
             // apply.
@@ -2344,6 +2627,14 @@ impl Engine {
                             for &slot in &b.downs {
                                 up[slot as usize] = false;
                             }
+                            b.masks.each(|c, k| masks[c] = k);
+                            for &(row, g, db) in &b.depths {
+                                depths[row as usize * MAX_DUCKS + usize::from(g)] = db;
+                            }
+                            for &(g, change) in &b.ducks {
+                                let _ = core.ducks.apply(usize::from(g), change, legs);
+                                ducks_passed = true;
+                            }
                         }
                         for slot in slots_of(raised) {
                             up[slot] = true;
@@ -2351,8 +2642,15 @@ impl Engine {
                     }
                 }
             }
-            // From silence, whatever a spare core held.
-            let ramping = core.matrix.fade_in(&gains, ramp);
+            if ducks_passed {
+                core.ducks.settle(ramp, next);
+            } else {
+                core.ducks.align(next);
+            }
+            // From silence, whatever a spare core held, ducked as the
+            // masks and depths say from the start.
+            let ramping = core.matrix.fade_in_ducked(&gains, &masks, &depths, ramp);
+            core.matrix.align(next);
             core.pos = Some(next);
             core.ramp_end = if ramping { next + u64::from(ramp) } else { 0 };
             core.pending.clear();
@@ -2690,6 +2988,7 @@ struct Supervisor {
     tel: rtrb::Consumer<Telemetry>,
     meter_rx: rtrb::Consumer<MeterRecord>,
     next_meter_seq: u64,
+    duck_rx: rtrb::Consumer<DuckRecord>,
     /// The RT thread's status changes and where they go.
     change_rx: Option<rtrb::Consumer<StatusChange>>,
     status_tx: Option<SyncSender<StatusChange>>,
@@ -2736,6 +3035,7 @@ impl Supervisor {
             self.status_changes();
             self.page_hashes();
             self.meters();
+            self.duck_meters();
             self.log_messages();
             self.hand_product();
             // Committed entries the ring had no room for.
@@ -2838,6 +3138,22 @@ impl Supervisor {
             }
             for (i, l) in st.inputs.iter_mut().zip(inputs) {
                 i.meters.update(&l.meters);
+            }
+        }
+    }
+
+    /// Turns the duck records into each group's readings.
+    fn duck_meters(&mut self) {
+        let mut st: Option<std::sync::MutexGuard<'_, Status>> = None;
+        while let Ok(r) = self.duck_rx.pop() {
+            let st = st.get_or_insert_with(|| self.status.lock().expect("status lock"));
+            if let Some(d) = st.ducks.get_mut(usize::from(r.group)) {
+                *d = DuckMeter {
+                    slice: Some(r.slice),
+                    key: r.key,
+                    envelope: r.envelope,
+                    engaged: r.engaged,
+                };
             }
         }
     }
@@ -5409,6 +5725,8 @@ mod tests {
             up: Vec::new(),
             flows: Vec::new(),
             strips: Vec::new(),
+            ducks: Vec::new(),
+            masks: Vec::new(),
             pending: Vec::new(),
             last_id: 0,
         };
@@ -5470,6 +5788,8 @@ mod tests {
             up: Vec::new(),
             flows: Vec::new(),
             strips: Vec::new(),
+            ducks: Vec::new(),
+            masks: Vec::new(),
             pending: Vec::new(),
             last_id: 0,
         };
@@ -5996,7 +6316,8 @@ mod tests {
         if up {
             changes.push(Change::InputUp { slot: 0 });
         }
-        batch::fold(&changes, 1, 2).unwrap().unwrap()
+        let items: Vec<Item> = changes.into_iter().map(Item::Change).collect();
+        batch::fold(&items, 1, 2).unwrap().unwrap()
     }
 
     /// An entry the pending list holds already is taken off the ring

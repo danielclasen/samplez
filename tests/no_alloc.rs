@@ -4,7 +4,9 @@
 //! generation is swapped in at its index with a fade-in, a re-route
 //! crossfade, a gain ramp, strip entries switching every strip unit on
 //! across a prune and a re-add, output, meter and input metering and
-//! loudness resets, and, for a replicated engine, every path of the hold
+//! loudness resets, duck groups keyed, forced and released, ducking a
+//! coefficient whose mask and depth change while it ducks, with their
+//! readings sent, and, for a replicated engine, every path of the hold
 //! ring (see `common::hold_scenario`) with its pages hashed. libmxl's own
 //! C++ allocations are not seen by this allocator.
 
@@ -18,6 +20,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use common::{B, Domain, MARGIN, Pilot, config, new_id, start, wait_for};
+use samplez::DuckSetting;
+use samplez_dsp::{DetectorParams, DuckMode};
 
 /// The tests count the allocations of one RT thread at a time.
 static ONE: Mutex<()> = Mutex::new(());
@@ -185,4 +189,87 @@ fn rt_thread_allocates_nothing() {
     RT_TID.store(0, Relaxed);
     assert_no_rt_calls();
     common::stop(engine);
+}
+
+/// Duck groups on the RT thread: a group keyed by a stereo input and one
+/// forced on, a coefficient whose mask and depth change while it ducks,
+/// a mode change that releases, and the readings of every slice sent.
+#[test]
+fn rt_thread_allocates_nothing_with_ducks() {
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let mut cfg = config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&dst, 2)],
+        common::diagonal(2, 0.5),
+        MARGIN,
+    );
+    cfg.duck_columns = vec![0, 1];
+    let (engine, rx) = start(cfg);
+    wait_for(Duration::from_secs(5), "input attached", || {
+        engine.status().inputs[0].state == InputState::Attached
+    });
+    RT_TID.store(engine.status().rt.thread.tid, Relaxed);
+    let api = common::api();
+    let index = samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
+    let at = (index / B + 20) * B;
+    let lpf = DetectorParams {
+        lpf: samplez_dsp::KeyFilter {
+            enabled: true,
+            freq: 4000.0,
+        },
+        ..DetectorParams::DEFAULT
+    };
+    let set = |group, setting, at| engine.set_duck(group, setting, at).unwrap();
+    set(0, DuckSetting::Detector(Box::new(lpf)), at);
+    set(0, DuckSetting::Keys(vec![(0, 0.5)]), at);
+    set(0, DuckSetting::Depth { slot: 0, db: 12.0 }, at);
+    set(5, DuckSetting::Mode(DuckMode::On), at);
+    set(5, DuckSetting::Depth { slot: 0, db: 30.0 }, at);
+    engine.set_duck_mask(0, 0, 1, at).unwrap();
+    engine.set_duck_mask(1, 1, 1 << 5, at).unwrap();
+    // While ducking: a mask and a depth change, then a release.
+    let later = at + 500 * B;
+    engine.set_duck_mask(0, 0, 1 | 1 << 5, later).unwrap();
+    set(0, DuckSetting::Depth { slot: 0, db: 6.0 }, later);
+    set(5, DuckSetting::Mode(DuckMode::Off), later + 200 * B);
+    set(0, DuckSetting::Hold { held: true }, later + 300 * B);
+    std::thread::sleep(Duration::from_millis(1500));
+    RT_TID.store(0, Relaxed);
+    let verdicts: Vec<_> = rx.try_iter().collect();
+    assert!(verdicts.iter().filter(|v| v.k * B > later).count() > 500);
+    let s = engine.status();
+    assert!(
+        s.ducks[0].engaged && s.ducks[5].slice.is_some(),
+        "{:?}",
+        s.ducks
+    );
+    assert_eq!(engine.counters().duck_refused.load(Relaxed), 0);
+    assert_eq!(s.diverged, None);
+    assert_no_rt_calls();
+    common::stop(engine);
+}
+
+/// Ducks through a resync on the RT thread: a key unkeyed and keyed
+/// again while its group ducks, the core with its detectors captured and
+/// a replayed one installed ([`common::duck_resync_scenario`]).
+#[test]
+fn rt_thread_allocates_nothing_with_ducks_through_a_resync() {
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let extra = serde_json::json!({ "duckColumns": [0] });
+    let (engine, _hashes) = common::start_held_with(&domain.0, &src, &dst, 2, extra);
+    wait_for(Duration::from_secs(5), "input attached", || {
+        engine.status().inputs[0].state == InputState::Attached
+    });
+    RT_TID.store(engine.status().rt.thread.tid, Relaxed);
+    common::duck_resync_scenario(&engine);
+    RT_TID.store(0, Relaxed);
+    assert_no_rt_calls();
+    engine.stop();
 }

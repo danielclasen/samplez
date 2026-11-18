@@ -474,6 +474,11 @@ impl Detector {
         self.params
     }
 
+    /// The samples a key filter change ramps over.
+    pub fn ramp(&self) -> u32 {
+        self.ramp
+    }
+
     pub fn mode(&self) -> DuckMode {
         self.mode
     }
@@ -486,6 +491,30 @@ impl Detector {
     /// Whether the last run triggered or held: the envelope rises.
     pub fn is_engaged(&self) -> bool {
         self.engaged
+    }
+
+    /// The width and gain of key `key`, none when it is not keyed or
+    /// beyond [`MAX_KEYS`].
+    pub fn key(&self, key: usize) -> Option<(usize, f32)> {
+        self.keys
+            .get(key)
+            .filter(|k| k.on)
+            .map(|k| (k.legs, k.gain))
+    }
+
+    /// Whether processing leaves the detector at rest whatever its input:
+    /// no key keyed, neither held nor in mode On, not engaged, the hold,
+    /// the envelope and its step at 0. [`Detector::advance`] over the
+    /// samples computes the same envelope, 0 throughout.
+    pub fn is_idle(&self) -> bool {
+        self.keys.iter().all(|k| !k.on)
+            && !self.held
+            && self.mode != DuckMode::On
+            && !self.engaged
+            && self.hold == 0
+            && self.pos == 0
+            && self.from == 0.0
+            && self.step == 0.0
     }
 
     /// The envelope of the last sample processed, 0 to 1.
@@ -547,7 +576,34 @@ impl Detector {
         leg: impl Fn(usize, usize) -> &'a [f32],
         envelope: &mut [f32],
     ) {
+        self.run_keys::<false>(frames, leg, envelope);
+    }
+
+    /// [`Detector::process`], returning the largest key of the samples:
+    /// per sample the largest over the keys keyed of each key's largest
+    /// leg magnitude after its filters times its gain, 0 with no key.
+    ///
+    /// # Panics
+    ///
+    /// If `envelope` or a leg is shorter than `frames`.
+    pub fn process_metered<'a>(
+        &mut self,
+        frames: usize,
+        leg: impl Fn(usize, usize) -> &'a [f32],
+        envelope: &mut [f32],
+    ) -> f32 {
+        self.run_keys::<true>(frames, leg, envelope)
+    }
+
+    /// Runs `frames` samples, and with `METER` returns their largest key.
+    fn run_keys<'a, const METER: bool>(
+        &mut self,
+        frames: usize,
+        leg: impl Fn(usize, usize) -> &'a [f32],
+        envelope: &mut [f32],
+    ) -> f32 {
         let envelope = &mut envelope[..frames];
+        let mut largest = 0.0f32;
         let mut done = 0;
         while done < frames {
             // Chunks end at the multiples of CHUNK of the sample index,
@@ -565,8 +621,12 @@ impl Detector {
             for (e, &k) in envelope[done..done + n].iter_mut().zip(&key[..n]) {
                 *e = self.tick(k);
             }
+            if METER {
+                largest = key[..n].iter().fold(largest, |m, &k| m.max(k));
+            }
             done += n;
         }
+        largest
     }
 
     /// Takes the key of the next sample and returns its envelope.
@@ -1794,5 +1854,89 @@ mod tests {
         for b in BLOCKS {
             assert!(states(b) == want, "blocks of {b}");
         }
+    }
+
+    /// The largest key `process_metered` returns is the largest per-sample
+    /// key: the louder key's largest leg magnitude after its filters times
+    /// its gain, and 0 without a key. The envelope it writes is the one
+    /// `process` writes.
+    #[test]
+    fn metering_returns_the_largest_key_and_the_same_envelope() {
+        let mut d = Detector::new(0);
+        let p = plain(DetectorParams::DEFAULT);
+        assert!(d.set(DuckParam::Detector(p)));
+        let mut env = [0.0; 48];
+        assert_eq!(d.process_metered(48, |_, _| &[0.0; 48], &mut env), 0.0);
+        assert!(d.set(DuckParam::Key {
+            key: 0,
+            legs: 2,
+            gain: 0.5,
+        }));
+        assert!(d.set(DuckParam::Key {
+            key: 3,
+            legs: 1,
+            gain: 2.0,
+        }));
+        let a = [[0.1f32; 48], [-0.8; 48]];
+        let mut b = [0.0f32; 48];
+        b[17] = -0.3;
+        let mut other = d;
+        let leg = |k: usize, l: usize| if k == 0 { &a[l][..] } else { &b[..] };
+        assert_eq!(d.process_metered(48, leg, &mut env), 0.6);
+        let mut plain_env = [0.0; 48];
+        other.process(48, leg, &mut plain_env);
+        assert_eq!(bits(&env), bits(&plain_env));
+        assert!(d == other);
+    }
+
+    /// An idle detector advanced computes what one processed computes:
+    /// envelope 0 throughout and the same state but for the transit its
+    /// envelope position counts in, at position 0 in either. A key, a
+    /// manual trigger or an envelope not at rest makes it not idle.
+    #[test]
+    fn an_idle_detector_advanced_equals_one_processed() {
+        let mut rng = Rng::new(7);
+        let keys = speech(&mut rng, samples(200.0));
+        let mut d = Detector::new(480);
+        assert!(d.is_idle());
+        let (mut processed, mut advanced) = (d, d);
+        let out = run(&mut processed, &keys, 55);
+        advanced.advance(keys[0][0].len());
+        assert!(out.iter().all(|&e| e == 0.0));
+        assert!(processed.is_idle() && advanced.is_idle());
+        assert_eq!(processed.envelope(), advanced.envelope());
+        assert!(processed == advanced, "{processed:?} {advanced:?}");
+        assert!(d.set(DuckParam::Mode(DuckMode::Off)));
+        assert!(d.is_idle());
+        for p in [
+            DuckParam::Mode(DuckMode::On),
+            DuckParam::Hold { held: true },
+            DuckParam::Key {
+                key: 2,
+                legs: 1,
+                gain: 0.0,
+            },
+        ] {
+            let mut busy = d;
+            assert!(busy.set(p));
+            assert!(!busy.is_idle(), "{p:?}");
+        }
+        let mut released = speech_detector();
+        run(&mut released, &keys, 48);
+        assert!(released.set(DuckParam::Unkey { key: 0 }));
+        assert!(released.set(DuckParam::Unkey { key: 1 }));
+        assert!(!released.is_idle(), "an envelope not at rest");
+        run(&mut released, &[vec![vec![0.0; samples(2000.0)]]], 48);
+        assert!(released.is_idle());
+    }
+
+    /// `key` names the width and gain of a key keyed, none otherwise.
+    #[test]
+    fn a_key_reads_back() {
+        let d = speech_detector();
+        assert_eq!(d.key(0), Some((1, 1.0)));
+        assert_eq!(d.key(1), Some((2, 0.7)));
+        assert_eq!(d.key(2), None);
+        assert_eq!(d.key(MAX_KEYS), None);
     }
 }

@@ -607,6 +607,12 @@ impl Matrix {
             || self.ducks.iter().any(|d| !d.is_empty())
     }
 
+    /// Whether any term of `output` has a duck: a mask other than 0, or
+    /// a crossfade from one. False out of range.
+    pub fn is_ducked(&self, output: usize) -> bool {
+        self.ducks.get(output).is_some_and(|d| !d.is_empty())
+    }
+
     /// Makes this matrix a copy of `src`, coefficients, ramps and ducks,
     /// without allocating: both have the same shape, and every column
     /// reserves room for every input, as [`Matrix::new`] and clones do.
@@ -979,6 +985,58 @@ impl Matrix {
         ramping
     }
 
+    /// [`Matrix::fade_in`] with every duck mask and depth replaced at
+    /// once, with no crossfade or ramp: `masks` holds one mask per
+    /// coefficient, row-major, or is empty for every mask 0, `depths` one
+    /// depth per input and detector, `input * MAX_DUCKS + detector`, or is
+    /// empty for every depth 0 dB; a depth outside [`DEPTH_DB`] counts as
+    /// 0 dB. A coefficient with a mask starts undocked and moves to its
+    /// mask's gain over the two intervals after the fill, as a mask set
+    /// with no crossfade does. Masks and depths all 0 cost a scan of the
+    /// two lists. Whether any coefficient ramps.
+    ///
+    /// # Panics
+    ///
+    /// When `gains`, or `masks` or `depths` when not empty, do not hold
+    /// one value per coefficient, or per input and detector.
+    pub fn fade_in_ducked(
+        &mut self,
+        gains: &[f32],
+        masks: &[u8],
+        depths: &[f32],
+        len: u32,
+    ) -> bool {
+        self.masks.clear();
+        self.depths.clear();
+        let ramping = self.fade_in(gains, len);
+        if masks.iter().any(|&k| k != 0) {
+            assert_eq!(masks.len(), gains.len(), "one mask per coefficient");
+            // Reserved at construction: nothing allocates.
+            self.masks.extend_from_slice(masks);
+            let outputs = self.columns.len();
+            let cols = self.columns.iter_mut().zip(&mut self.ducks);
+            for (j, (col, ducks)) in cols.enumerate() {
+                for t in col {
+                    t.mask = masks[t.input * outputs + j];
+                    if t.mask != 0 {
+                        t.ducked = true;
+                        ducks.push(Duck::new(0));
+                    }
+                }
+            }
+        }
+        if depths.iter().any(|&d| d != 0.0) {
+            assert_eq!(
+                depths.len(),
+                self.inputs * MAX_DUCKS,
+                "one depth per input and detector"
+            );
+            let depth = |&d: &f32| Ramp::new(if DEPTH_DB.contains(&d) { d } else { 0.0 });
+            self.depths.extend(depths.iter().map(depth));
+        }
+        ramping
+    }
+
     /// Moves every coefficient ramp, depth ramp and mask crossfade
     /// `frames` samples on without mixing, as [`Matrix::process`] over
     /// `frames` frames does. Keeps ramp positions on the sample timeline
@@ -1156,6 +1214,42 @@ mod tests {
         assert_eq!((m.gain(0, 0), m.gain(1, 1), m.gain(2, 0)), (0.25, 1.0, 0.5));
         assert!(!m.fade_in(&[0.0; 6], 100));
         assert_eq!(m.gain(1, 1), 0.0);
+    }
+
+    /// A ducked fill replaces whatever a matrix held, masks, depths and
+    /// crossfades included, with what a fresh matrix holds after a
+    /// fade-in and every nonzero mask and depth set with no crossfade or
+    /// ramp; all-zero masks and depths leave it without ducks.
+    #[test]
+    fn a_ducked_fill_replaces_every_mask_and_depth() {
+        let gains = [0.25, 0.0, 0.5, 1.0, 0.5, 0.75];
+        let masks = [1, 4, 0, 0, 0b11, 0];
+        let mut depths = [0.0; 3 * MAX_DUCKS];
+        depths[MAX_DUCKS + 2] = 12.0;
+        depths[2 * MAX_DUCKS] = 41.0;
+        let mut used = Matrix::new(3, 2);
+        for i in 0..3 {
+            for o in 0..2 {
+                assert!(used.set(i, o, 0.5, 480));
+                assert!(used.set_mask(i, o, 0b1000_0000, 480));
+            }
+            assert!(used.set_depth(i, 7, 30.0, 480));
+        }
+        used.advance(117);
+        used.align(240);
+        assert!(used.fade_in_ducked(&gains, &masks, &depths, 100));
+        let mut fresh = Matrix::new(3, 2);
+        fresh.align(240);
+        assert!(fresh.fade_in(&gains, 100));
+        for (c, &k) in masks.iter().enumerate().filter(|(_, k)| **k != 0) {
+            assert!(fresh.set_mask(c / 2, c % 2, k, 0));
+        }
+        assert!(fresh.set_depth(1, 2, 12.0, 0));
+        assert!(used == fresh, "{used:?}\n{fresh:?}");
+        assert!(used.fade_in_ducked(&gains, &[0; 6], &[0.0; 3 * MAX_DUCKS], 100));
+        assert!(!used.has_ducks());
+        assert!(used.fade_in_ducked(&gains, &[], &[], 100));
+        assert!(!used.has_ducks());
     }
 
     use super::*;

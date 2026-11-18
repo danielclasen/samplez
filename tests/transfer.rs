@@ -13,9 +13,12 @@ use common::{
 use common::{MARGIN, config, diagonal};
 use samplez::blocks::{PAGE, PageHash, StatusChange};
 use samplez::{
-    BlockVerdict, CopyError, Engine, Entry, InputState, ProductState, ReplayError, Replication,
+    BlockVerdict, Config, CopyError, DuckSetting, DuckTargets, Engine, Entry, InputState,
+    ProductState, ReplayError, Replication,
 };
-use samplez_dsp::{BandType, CompParams, EqBand, GateParams, Ramp, StripParam};
+use samplez_dsp::{
+    BandType, CompParams, DetectorParams, DuckMode, EqBand, GateParams, Ramp, StripParam,
+};
 
 /// The copy holds the state after block k0: entries due by then applied
 /// with their ramps run out, later ones pending, the input's log state,
@@ -133,6 +136,11 @@ fn hashed(domain: &Domain, src: &str) -> Hashed {
 /// [`hashed`] over the inputs `inputs`, as (flow, channels), one output
 /// channel per input channel.
 fn hashed_with(domain: &Domain, inputs: &[(&str, u32)]) -> Hashed {
+    hashed_of(domain, inputs, |_| {})
+}
+
+/// [`hashed_with`], its configuration changed by `f`.
+fn hashed_of(domain: &Domain, inputs: &[(&str, u32)], f: impl FnOnce(&mut Config)) -> Hashed {
     let channels = inputs.iter().map(|i| i.1).sum::<u32>();
     let mut config = config(
         &domain.0,
@@ -142,6 +150,7 @@ fn hashed_with(domain: &Domain, inputs: &[(&str, u32)]) -> Hashed {
         MARGIN,
     );
     config.ramp_samples = RAMP;
+    f(&mut config);
     let (report_tx, _reports) = sync_channel(64);
     let (hash_tx, hashes) = sync_channel(1 << 16);
     let (verdict_tx, verdicts) = sync_channel(1 << 16);
@@ -634,6 +643,8 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
         flows: vec![src.clone()],
 
         strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: Vec::new(),
         last_id: 0,
     };
@@ -706,6 +717,8 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
         up: vec![true],
         flows: vec![src.clone()],
         strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: Vec::new(),
         last_id: 0,
     };
@@ -742,6 +755,8 @@ fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
             up: vec![true],
             flows: vec![src.clone()],
             strips: vec![Vec::new()],
+            ducks: Vec::new(),
+            masks: Vec::new(),
             pending: Vec::new(),
             last_id: 0,
         };
@@ -833,6 +848,8 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
         flows: vec![src.clone()],
 
         strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: Vec::new(),
         last_id: 1,
     };
@@ -870,6 +887,8 @@ fn a_product_entry_the_install_passed_is_folded_in() {
         flows: vec![src.clone()],
 
         strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: vec![(
             1,
             at,
@@ -990,6 +1009,8 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
             flows: vec![src.clone()],
 
             strips: vec![Vec::new()],
+            ducks: Vec::new(),
+            masks: Vec::new(),
             pending: vec![(1, at, strip)],
             last_id: 1,
         };
@@ -1040,6 +1061,8 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
         flows: vec![src.clone()],
 
         strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: Vec::new(),
         last_id: 1,
     };
@@ -1128,6 +1151,8 @@ fn a_route_the_core_carried_is_not_applied_again() {
         flows: vec![src.clone()],
 
         strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: vec![(1, at, route)],
         last_id: 1,
     };
@@ -1476,6 +1501,8 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
             up: vec![true],
             flows: vec![next.clone()],
             strips: vec![vec![trim]],
+            ducks: Vec::new(),
+            masks: Vec::new(),
             pending: Vec::new(),
             last_id: last,
         };
@@ -1589,6 +1616,8 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
         up: vec![true, true],
         flows: vec![src0.clone(), next1.clone()],
         strips: vec![Vec::new(), Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: if sent {
             vec![(2, at, route(0, &next0))]
         } else {
@@ -1636,4 +1665,178 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
         assert_eq!(hb.hash, ha.hash, "page {p}");
     }
     Ok(())
+}
+
+/// The determinism rows of the ducks: replicas given the same entries
+/// compute the same pages while a group ducks by its key; a joiner whose
+/// ducks were set apart replays a donor's core copied 100 ms into a
+/// 500 ms attack and from the hand-over on computes the donor's pages.
+/// The core carries the detectors' key filter, hold and envelope state.
+#[test]
+fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let ducked = || hashed_of(&domain, &[(&src, 2)], |c| c.duck_columns = vec![0, 1]);
+        let (a, b, c) = (ducked(), ducked(), ducked());
+        let at1 = (now_block() + 20) * B;
+        let entries = |attack_ms: f32| {
+            let duck = |setting| Entry::Duck { group: 0, setting };
+            let p = DetectorParams {
+                attack_ms,
+                ..DetectorParams::DEFAULT
+            };
+            vec![
+                duck(DuckSetting::Detector(Box::new(p))),
+                duck(DuckSetting::Keys(vec![(0, 1.0)])),
+                duck(DuckSetting::Depth { slot: 0, db: 20.0 }),
+                Entry::DuckMask {
+                    input: 0,
+                    output: 0,
+                    mask: 1,
+                },
+                Entry::DuckMask {
+                    input: 1,
+                    output: 1,
+                    mask: 1,
+                },
+            ]
+        };
+        // The joiner's attack sets its detector apart, and nothing else:
+        // a joiner keeping its own detector would compute other pages.
+        for (e, attack) in [(&a.e, 500.0), (&c.e, 500.0), (&b.e, 50.0)] {
+            e.append_batch(1, at1, &entries(attack)).unwrap();
+            e.commit(1);
+        }
+        let mid = at1 / B + 100;
+        wait_for(Duration::from_secs(5), "into the attack", || {
+            processed(&a.e) > mid && processed(&b.e) > mid
+        });
+        let copy = copy(&a.e);
+        let e0 = copy.core.detector(0).unwrap().envelope();
+        if !(0.0 < e0 && e0 < 1.0) {
+            return Err(format!("copied at envelope {e0}"));
+        }
+        let k0 = copy.k0;
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+        let mut replay = b.e.replay(copy).unwrap();
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        if (j + 1) * B > at1 + 20_000 {
+            return Err(format!("handed over at block {j}, past the attack"));
+        }
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        let end = (from + 8) * PAGE / B + PAGE / B;
+        wait_for(Duration::from_secs(10), "pages compared", || {
+            [&a, &b, &c].iter().all(|h| processed(&h.e) > end)
+        });
+        let (pa, pb, pc) = (a.pages(), b.pages(), c.pages());
+        let disturbed: Vec<u64> = [&a, &b, &c].iter().flat_map(|h| h.disturbed()).collect();
+        let before = (at1 / PAGE + 1)..k0 * B / PAGE;
+        let differ = before
+            .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
+            .count();
+        assert!(differ > 0, "the joiner never diverged");
+        for p in from..from + 8 {
+            if disturbed.contains(&p) {
+                return Err(format!("page {p} disturbed"));
+            }
+            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+                return Err(format!("page {p} not hashed by both"));
+            };
+            assert_eq!(
+                (hb.hash, hb.fingerprint),
+                (ha.hash, ha.fingerprint),
+                "page {p}"
+            );
+        }
+        let mut alike = 0;
+        for (p, ha) in pa
+            .iter()
+            .filter(|(p, _)| **p > at1 / PAGE && !disturbed.contains(p))
+        {
+            let Some(hc) = pc.get(p) else { continue };
+            assert_eq!(
+                (hc.hash, hc.fingerprint),
+                (ha.hash, ha.fingerprint),
+                "page {p}"
+            );
+            alike += 1;
+        }
+        if alike < 10 {
+            return Err(format!("{alike} pages of two replicas compared"));
+        }
+        Ok(())
+    });
+}
+
+/// A product core starts its ducks cold at the state's settings: a group
+/// its manual controls trigger at full depth from the install, its keys
+/// keyed, the masks and depths at their targets, and every other group
+/// at rest. A state holding a duck value
+/// no entry could set is refused before anything changes.
+#[test]
+fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let h = hashed_of(&domain, &[(&src, 2)], |c| c.duck_columns = vec![0]);
+        let state = ProductState {
+            gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            up: vec![true],
+            flows: vec![src.clone()],
+            strips: vec![Vec::new()],
+            ducks: vec![DuckTargets {
+                keys: vec![(0, 0.5)],
+                mode: DuckMode::On,
+                depths: vec![20.0],
+                ..DuckTargets::default()
+            }],
+            masks: vec![vec![1, 0], vec![0, 0]],
+            pending: Vec::new(),
+            last_id: 0,
+        };
+        let refused = |what: &str, f: &dyn Fn(&mut ProductState)| {
+            let mut s = state.clone();
+            f(&mut s);
+            let r = h.e.install_product(&s, 0, Duration::from_secs(2));
+            assert!(matches!(r, Err(ReplayError::Invalid(_))), "{what}: {r:?}");
+        };
+        refused("a mask off the duck columns", &|s| s.masks[0][1] = 1);
+        refused("masks of another shape", &|s| {
+            s.masks.pop();
+        });
+        refused("nine keys", &|s| s.ducks[0].keys = vec![(0, 1.0); 9]);
+        refused("nine groups", &|s| {
+            s.ducks.resize(9, DuckTargets::default())
+        });
+        refused("a depth beyond its range", &|s| s.ducks[0].depths[0] = 41.0);
+        assert_eq!(h.e.counters().blocks_without_core.load(Relaxed), 0);
+        let at_least = (processed(&h.e) + 40) * B;
+        let j =
+            h.e.install_product(&state, at_least, Duration::from_secs(2))
+                .unwrap();
+        let copy = common::copy_core(&h.e);
+        if copy.k0 > j + 20 {
+            return Err(format!("copied {} blocks after the install", copy.k0 - j));
+        }
+        let d = copy.core.detector(0).unwrap();
+        assert_eq!(d.envelope(), 1.0);
+        assert!(d.is_engaged() && d.mode() == DuckMode::On);
+        assert_eq!(d.key(0), Some((2, 0.5)));
+        assert!((1..8).all(|g| copy.core.detector(g).unwrap().is_idle()));
+        assert_eq!(copy.core.duck_mask(0, 0), 1);
+        assert_eq!(copy.core.duck_mask(1, 1), 0);
+        assert_eq!(
+            (copy.core.duck_depth(0, 0), copy.core.duck_depth(1, 0)),
+            (20.0, 20.0)
+        );
+        h.e.stop();
+        Ok(())
+    });
 }

@@ -413,6 +413,8 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
         up: vec![true],
         flows: vec!["5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned()],
         strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: Vec::new(),
         last_id: 0,
     };
@@ -1004,6 +1006,8 @@ fn rebuild_after_a_route() -> Result<(), String> {
         up: vec![true],
         flows: vec![ROUTED.to_owned()],
         strips: vec![vec![StripParam::Trim { db: -6.0 }]],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: Vec::new(),
         last_id: 1,
     };
@@ -1128,6 +1132,8 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
         up: vec![true, true],
         flows: routed.map(str::to_owned).to_vec(),
         strips: vec![Vec::new(), Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: Vec::new(),
         last_id: 1,
     };
@@ -1152,6 +1158,31 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
         }
     };
     assert_eq!((core.core.gain(0, 0), core.core.gain(1, 0)), (1.0, 0.0));
+    // A duck setting or mask the engine refuses is left at what no entry
+    // sets, the others taken: nine keys, and a mask on a column the
+    // configuration names no duck column.
+    state.ducks = vec![samplez::DuckTargets {
+        keys: vec![(0, 1.0); 9],
+        mode: samplez_dsp::DuckMode::On,
+        depths: vec![12.0],
+        ..samplez::DuckTargets::default()
+    }];
+    state.masks = vec![vec![1], vec![0]];
+    state.last_id = 3;
+    assert!(
+        rebuilt_audio.rebuild_engine(&state, 0),
+        "rebuilt with ducks"
+    );
+    let core = loop {
+        match rebuilt.copy_core(Duration::from_secs(2)) {
+            Err(samplez::CopyError::Passed { .. }) => continue,
+            c => break c.unwrap(),
+        }
+    };
+    let d = core.core.detector(0).unwrap();
+    assert_eq!((d.key(0), d.mode()), (None, samplez_dsp::DuckMode::On));
+    assert_eq!(core.core.duck_depth(0, 0), 12.0);
+    assert_eq!(core.core.duck_mask(0, 0), 0);
 }
 
 /// A rebuild offered for a floor further ahead than the rebuild's own
@@ -1187,6 +1218,8 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
         up: vec![true],
         flows: vec!["5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned()],
         strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
         pending: Vec::new(),
         last_id: 1,
     };
@@ -1271,6 +1304,7 @@ impl Product for Console {
             gains: (0..2).map(|s| vec![self.faders[s] * self.vca]).collect(),
             flows: vec![self.flow.clone(); 2],
             strips: (0..2).map(gate).collect(),
+            ..Targets::default()
         })
     }
 }

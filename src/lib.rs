@@ -11,6 +11,7 @@ compile_error!("samplez supports x86_64 only");
 mod batch;
 pub mod blocks;
 pub mod config;
+mod ducks;
 pub mod engine;
 mod meters;
 pub mod rt;
@@ -19,9 +20,11 @@ mod targets;
 pub mod transfer;
 
 pub use config::Config;
+pub use ducks::{DuckMeter, DuckSetting, DuckTargets};
 pub use engine::{
-    ClockStatus, ControlError, Engine, Entry, EntryError, GainError, GenerationStatus, InputState,
-    InputStatus, MeterStatus, OutputStatus, Progress, Replication, Report, ResetError, Status,
+    ClockStatus, ControlError, DuckError, Engine, Entry, EntryError, GainError, GenerationStatus,
+    InputState, InputStatus, MeterStatus, OutputStatus, Progress, Replication, Report, ResetError,
+    Status,
 };
 pub use meters::{InputMeters, OutputMeters};
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};

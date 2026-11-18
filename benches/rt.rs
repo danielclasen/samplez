@@ -12,14 +12,20 @@
 //! every coefficient of a populated, ramping matrix: of the largest
 //! matrix a configuration of B = 48 takes and of the largest any takes,
 //! at B = 1024 (`COEFFICIENTS_PER_BLOCK_SAMPLE`), set within a quarter of
-//! the block. And on the fill of a product core between two blocks of the
-//! RT thread: every coefficient of the same two matrices, populated and
-//! ramping, replaced by a fade-in from silence (`Matrix::fade_in`), within
-//! the block it has. And on the entries a product's state change derives
-//! (`Targets::diff`), a recall changing every coefficient of the same two
-//! shapes, which a replica computes as each log entry applies, and a
-//! fader move on 64 stereo slots into 56 columns with every strip
-//! parameter unchanged.
+//! the block; and when it holds the duck mask of every coefficient of the
+//! duck columns and every depth of the largest matrices B = 48 and
+//! B = 1024 take with ten and twenty duck columns. And on the fill of a
+//! product core between two blocks of the RT thread: every coefficient
+//! of the same two matrices, populated and ramping, replaced by a fade-in
+//! from silence with the eight cold detectors copied in, and of the
+//! largest B = 48 takes with ten duck columns, its masks and depths
+//! filled with it (`Matrix::fade_in_ducked`), within the block it has.
+//! And on the entries a product's state change derives (`Targets::diff`):
+//! a recall changing every coefficient of the same two shapes, one
+//! changing every mask of twenty duck columns of the B = 1024 shape as
+//! well, which a replica computes as each log entry applies, and a fader
+//! move on 64 stereo slots into 56 columns with every strip parameter
+//! unchanged.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -478,20 +484,82 @@ fn fill(inputs: usize, outputs: usize) -> (samplez_dsp::Matrix, Vec<f32>) {
     (matrix, sets.into_iter().map(|(_, _, g)| g).collect())
 }
 
-fn fill_at_block_48() -> (samplez_dsp::Matrix, Vec<f32>) {
-    fill(80, 90)
+/// What a product core's fill puts into the core between two blocks of
+/// the RT thread besides its lists: the detectors, built before, copied
+/// and aligned, and the matrix filled with its masks and depths. The
+/// eight detectors keyed, a group forced on.
+struct Fill {
+    matrix: samplez_dsp::Matrix,
+    gains: Vec<f32>,
+    masks: Vec<u8>,
+    depths: Vec<f32>,
+    detectors: Vec<samplez_dsp::Detector>,
+    cold: Vec<samplez_dsp::Detector>,
 }
 
-fn fill_at_block_1024() -> (samplez_dsp::Matrix, Vec<f32>) {
-    fill(384, 400)
+fn product(inputs: usize, outputs: usize, ducked: usize) -> Fill {
+    use samplez_dsp::{Detector, DuckMode, DuckParam, MAX_DUCKS};
+    let (matrix, sets) = masked_recall(inputs, outputs, ducked);
+    // A product without masks fills from none, as the engine does.
+    let mut masks = vec![0; if ducked > 0 { inputs * outputs } else { 0 }];
+    for &(i, o, k) in &sets {
+        masks[i * outputs + o] = k;
+    }
+    let depths = if ducked > 0 {
+        (0..inputs * MAX_DUCKS).map(|c| (c % 40) as f32).collect()
+    } else {
+        Vec::new()
+    };
+    let mut cold = vec![Detector::new(480); MAX_DUCKS];
+    for (g, d) in cold.iter_mut().enumerate() {
+        for key in 0..8 {
+            assert!(d.set(DuckParam::Key {
+                key,
+                legs: 2,
+                gain: 1.0
+            }));
+        }
+        if g == 0 {
+            assert!(d.set(DuckParam::Mode(DuckMode::On)));
+        }
+        d.advance(48_000);
+    }
+    Fill {
+        matrix,
+        gains: fill(inputs, outputs).1,
+        masks,
+        depths,
+        detectors: vec![Detector::new(480); MAX_DUCKS],
+        cold,
+    }
+}
+
+fn fill_at_block_48() -> Fill {
+    product(80, 90, 0)
+}
+
+fn fill_at_block_1024() -> Fill {
+    product(384, 400, 0)
+}
+
+fn fill_ducked_at_block_48() -> Fill {
+    product(64, 60, 10)
 }
 
 #[library_benchmark]
 #[bench::block_48(setup = fill_at_block_48, config = limit(FILL_BLOCK_48))]
 #[bench::block_1024(setup = fill_at_block_1024, config = limit(FILL_BLOCK_1024))]
-fn product_fill((mut matrix, gains): (samplez_dsp::Matrix, Vec<f32>)) -> samplez_dsp::Matrix {
-    black_box(matrix.fade_in(&gains, 480));
-    matrix
+#[bench::ducked_block_48(setup = fill_ducked_at_block_48, config = limit(FILL_DUCKED_BLOCK_48))]
+fn product_fill(mut f: Fill) -> Fill {
+    let at = black_box(4_800_011);
+    f.detectors.copy_from_slice(&f.cold);
+    for d in &mut f.detectors {
+        d.align(at);
+    }
+    let ramping = f.matrix.fade_in_ducked(&f.gains, &f.masks, &f.depths, 480);
+    f.matrix.align(at);
+    black_box(ramping);
+    f
 }
 
 /// The targets before and after a recall that changes every coefficient
@@ -503,6 +571,7 @@ fn targets(inputs: usize, outputs: usize) -> (samplez::Targets, samplez::Targets
             .collect(),
         flows: Vec::new(),
         strips: Vec::new(),
+        ..Default::default()
     };
     (of(|_, _| 0.5), of(|i, o| ((i + o) % 7) as f32 / 7.0 + 0.1))
 }
@@ -513,6 +582,31 @@ fn targets_at_block_48() -> (samplez::Targets, samplez::Targets) {
 
 fn targets_at_block_1024() -> (samplez::Targets, samplez::Targets) {
     targets(384, 400)
+}
+
+/// A recall at the largest matrix B = 1024 takes with twenty duck
+/// columns: every coefficient's gain and every duck column's mask
+/// changed, the other masks at 0 in both.
+fn masked_targets_at_block_1024() -> (samplez::Targets, samplez::Targets) {
+    let (mut from, mut to) = targets(384, 300);
+    let masks = |shift: usize| -> Vec<Vec<u8>> {
+        (0..384)
+            .map(|i| {
+                (0..300)
+                    .map(|o| {
+                        if o < 20 {
+                            1 << ((i + o + shift) % 8)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    from.masks = masks(0);
+    to.masks = masks(1);
+    (from, to)
 }
 
 /// One stereo slot's strip parameters, every one a strip takes, in key
@@ -564,6 +658,7 @@ fn targets_at_stereo_64x56() -> (samplez::Targets, samplez::Targets) {
             .collect(),
         flows: (0..64).map(|s| format!("flow-{s}")).collect(),
         strips: (0..64).map(stereo_strip).collect(),
+        ..Default::default()
     };
     let mut to = from.clone();
     for row in &mut to.gains[10..12] {
@@ -578,15 +673,79 @@ fn targets_at_stereo_64x56() -> (samplez::Targets, samplez::Targets) {
 #[bench::block_48(setup = targets_at_block_48, config = limit(DIFF_BLOCK_48))]
 #[bench::block_1024(setup = targets_at_block_1024, config = limit(DIFF_BLOCK_1024))]
 #[bench::stereo_64x56(setup = targets_at_stereo_64x56, config = limit(DIFF_STEREO_64X56))]
+#[bench::masked_block_1024(setup = masked_targets_at_block_1024, config = limit(DIFF_MASKED_BLOCK_1024))]
 fn targets_diff((from, to): (samplez::Targets, samplez::Targets)) -> Vec<samplez::Entry> {
     black_box(from.diff(&to))
 }
 
+/// A matrix of `inputs` by `outputs` with every coefficient set and
+/// ramping and every coefficient of its first `ducked` columns masked,
+/// and the batch of a recall setting the mask of each of those anew.
+fn masked_recall(
+    inputs: usize,
+    outputs: usize,
+    ducked: usize,
+) -> (samplez_dsp::Matrix, Vec<(usize, usize, u8)>) {
+    let (mut matrix, _) = recall(inputs, outputs);
+    for i in 0..inputs {
+        for o in 0..ducked {
+            assert!(matrix.set_mask(i, o, 1, 480));
+        }
+    }
+    let sets = (0..inputs)
+        .flat_map(|i| (0..ducked).map(move |o| (i, o, 1u8 << ((i + o) % 8))))
+        .collect();
+    (matrix, sets)
+}
+
+/// A desk at the largest matrix B = 48 takes with ten duck columns: 64
+/// by 60 coefficients, 3,840, and five more for each of the 640 of the
+/// duck columns, 7,040 of 7,200.
+fn duck_recall() -> (samplez_dsp::Matrix, Vec<(usize, usize, u8)>) {
+    masked_recall(64, 60, 10)
+}
+
+/// One at the largest B = 1024 takes with twenty duck columns: 384 by
+/// 300, 115,200, and five more for each of the 7,680 of the duck columns,
+/// 153,600 of 153,600.
+fn duck_recall_at_block_1024() -> (samplez_dsp::Matrix, Vec<(usize, usize, u8)>) {
+    masked_recall(384, 300, 20)
+}
+
+#[library_benchmark]
+#[bench::block_48(setup = duck_recall, config = limit(DUCK_RECALL_BLOCK_48))]
+#[bench::block_1024(setup = duck_recall_at_block_1024, config = limit(DUCK_RECALL_BLOCK_1024))]
+fn duck_batch(
+    (mut matrix, sets): (samplez_dsp::Matrix, Vec<(usize, usize, u8)>),
+) -> samplez_dsp::Matrix {
+    for &(i, o, mask) in &sets {
+        black_box(matrix.set_mask(i, o, mask, 480));
+    }
+    for i in 0..matrix.inputs() {
+        for g in 0..samplez_dsp::MAX_DUCKS {
+            black_box(matrix.set_depth(i, g, (i + g) as f32 / 4.0, 480));
+        }
+    }
+    matrix
+}
+
+const DUCK_RECALL_BLOCK_48: u64 = 231_239;
+const DUCK_RECALL_BLOCK_1024: u64 = 6_158_561;
+const FILL_DUCKED_BLOCK_48: u64 = 353_003;
+const DIFF_MASKED_BLOCK_1024: u64 = 5_117_009;
+
 const DIFF_BLOCK_48: u64 = 397_843;
-const DIFF_BLOCK_1024: u64 = 4_030_452;
+// Raised from 4,030,452 with the duck entries: an entry list now holds
+// two more variants with heap data, a duck group's keys and parameters,
+// and dropping the 153,600 entries of this diff checks them, 3
+// instructions an entry (4,124,172 measured).
+const DIFF_BLOCK_1024: u64 = 4_536_590;
 const DIFF_STEREO_64X56: u64 = 374_284;
 
-const FILL_BLOCK_48: u64 = 451_896;
+// Raised from 451,896 by the duck_copy limit of samplez-dsp, 22,310: the
+// fill now copies the eight cold detectors into the core as well
+// (453,474 measured).
+const FILL_BLOCK_48: u64 = 474_206;
 const FILL_BLOCK_1024: u64 = 9_631_507;
 
 const RECALL_BLOCK_48: u64 = 1_291_097;
@@ -594,7 +753,7 @@ const RECALL_BLOCK_1024: u64 = 31_257_737;
 
 library_benchmark_group!(
     name = batches,
-    benchmarks = [batch_recall, product_fill, targets_diff]
+    benchmarks = [batch_recall, duck_batch, product_fill, targets_diff]
 );
 
 main!(library_benchmark_groups = hold, pages, strips, batches);
