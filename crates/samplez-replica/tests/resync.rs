@@ -155,7 +155,7 @@ fn sample(set: &Set, id: NodeId, name: &str, label: Option<(&str, &str)>) -> f64
         .value
 }
 
-/// The sc pod-kill test: 3 replicas after the apply lead reached its
+/// A pod-kill test: 3 replicas after the apply lead reached its
 /// cap, a follower diverged, then the leader killed. The diverged
 /// follower resyncs from the replica still committing and commits again
 /// within 5 s; `/metrics` shows the hand-over and the replica serving
@@ -570,6 +570,74 @@ async fn a_set_whose_commits_outlast_the_capped_lead_commits_with_bounded_unreso
     );
 }
 
+/// Submits command `n` to `leader`, then waits 50 ms.
+async fn submit(set: &Set, leader: NodeId, n: &mut u64) {
+    let command = Bytes::from(format!("g=1@{}", *n % 8));
+    let _ = (set.replica(leader))
+        .submit(&owner("s"), &n.to_string(), command)
+        .await;
+    *n += 1;
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// What `id` withheld for a cause and held unresolved so far.
+fn degraded(set: &Set, id: NodeId) -> (u64, u64) {
+    let m = set.replica(id).contact_metrics().unwrap();
+    let w = m.withholding;
+    let withheld = w.fence_deadline + w.hold_cap + w.other_digest + w.silence;
+    (withheld, m.unresolved)
+}
+
+/// Commands that keep coming while commits outlast the capped lead, as
+/// a fader drag does: followers stalled 6 ms per RPC under a 36 ms cap.
+/// Once the lead adapts, a command is stamped with the lead the entries
+/// needed, past the cap, so it applies in time on every replica: for
+/// two seconds of commands every 50 ms each replica keeps committing,
+/// withholds no block and holds nothing unresolved. Stamped with the
+/// capped lead, each command was late on every replica, each one a
+/// degraded block.
+#[tokio::test(start_paused = true)]
+async fn commands_during_commits_past_the_capped_lead_commit_without_gaps() {
+    let mut timing = Timing::defaults(BLOCK);
+    timing.max_apply_lead = Duration::from_millis(36);
+    let set = start_timed(vec![a(0), a(1), a(2)], false, timing).await;
+    let leader = set.leader().await;
+    let ids = audio(&set);
+    for &id in ids.iter().filter(|&&id| id != leader) {
+        set.net.stall(id, Duration::from_millis(6));
+    }
+    let mut n = 0u64;
+    // The lead reaches its cap and adapts past it; the replicas commit.
+    let adapt = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < adapt {
+        submit(&set, leader, &mut n).await;
+    }
+    let m = set.replica(leader).contact_metrics().unwrap();
+    assert!(m.apply_lead_capped, "the lead at its cap");
+    assert!(
+        m.decision_lead > m.lead,
+        "{} past {}",
+        m.decision_lead,
+        m.lead
+    );
+    until("committing under the stall", 5, || {
+        ids.iter()
+            .all(|&id| state(&set, id) == Some(ReplicaState::Committing))
+    })
+    .await;
+    let before: Vec<(u64, u64)> = ids.iter().map(|&id| degraded(&set, id)).collect();
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        submit(&set, leader, &mut n).await;
+        for &id in &ids {
+            assert_eq!(state(&set, id), Some(ReplicaState::Committing), "{id}");
+        }
+    }
+    for (&id, before) in ids.iter().zip(before) {
+        assert_eq!(degraded(&set, id), before, "{id}: withheld, unresolved");
+    }
+}
+
 /// `/readyz` after the whole set restarts: each replica finds the
 /// set's `Baseline` in its log, becomes ready withdrawn, and its engine
 /// stops computing, so nobody commits again. A replica that writes
@@ -586,7 +654,7 @@ async fn a_restarted_set_withdrawn_while_nobody_commits_is_not_ready() {
         set.restart(id).await;
         set.audio(id).lock().resyncs = true;
     }
-    until("each one ready", 10, || {
+    until("each one out of starting", 10, || {
         ids.iter().all(|&id| {
             set.replica(id)
                 .contact_metrics()

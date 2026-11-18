@@ -1753,6 +1753,12 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
             Gauge,
             flag(m.apply_lead_capped),
         ),
+        one(
+            "samplez_replica_decision_lead_samples",
+            "The lead decisions and baselines are stamped with, and commands at the cap.",
+            Gauge,
+            m.decision_lead as f64,
+        ),
     ]);
     if let Some(node) = m.apply_lead_raised_by {
         out.push(ReplicaMetric {

@@ -643,6 +643,12 @@ struct State {
     /// Slack of the entries learned committed, for the next reports.
     slack: Vec<Slack>,
     lead: Lead,
+    /// The lead each entry with an at_index was stamped with, by log
+    /// index, the lowest forgotten past [`SCHEDULED_MAX`]: kept after
+    /// `scheduled` drops an entry every voter reported committed, since a
+    /// replica that reported the commit may apply the entry, and report
+    /// its slack, only later.
+    leads: BTreeMap<u64, u64>,
     /// The replica whose slack last asked for a higher lead.
     lead_raised_by: Option<NodeId>,
     e_spread: Histogram,
@@ -733,10 +739,11 @@ pub struct Contact {
 
 /// Adds a counted replica's slack to the lead, naming the replica when
 /// it asked for more, and warning once as the lead reaches its cap; an
-/// entry still listed counts the lead it needed too ([`Lead::needs`]).
+/// entry whose stamp it knows counts the lead it needed too
+/// ([`Lead::needs`]).
 fn add_slack(st: &mut State, from: NodeId, slack: &Slack, current: u64) {
-    if let Some(&(_, at, stamp, _)) = st.scheduled.get(&slack.index) {
-        st.lead.needs(at.saturating_sub(stamp), slack.samples);
+    if let Some(&lead) = st.leads.get(&slack.index) {
+        st.lead.needs(lead, slack.samples);
     }
     let capped = st.lead.capped;
     if st.lead.add(slack.samples, slack.stamp, current) {
@@ -806,6 +813,9 @@ pub struct Metrics {
     /// The lead, in samples, and whether it wanted more than the cap.
     pub lead: u64,
     pub apply_lead_capped: bool,
+    /// The lead decisions and `Baseline`s are stamped with, and commands
+    /// at the cap ([`Contact::decision_lead`]), in samples.
+    pub decision_lead: u64,
     /// The counted audio replica whose slack last asked for a higher
     /// lead: while the lead is capped, the one applying entries past
     /// their deadline, which holds them unresolved.
@@ -950,6 +960,7 @@ impl Contact {
                     index_at(START_LEAD.as_nanos() as u64),
                     index_at(timing.max_apply_lead.as_nanos() as u64),
                 ),
+                leads: BTreeMap::new(),
                 lead_raised_by: None,
                 e_spread: Histogram::default(),
                 known_committed: applied,
@@ -1498,6 +1509,7 @@ impl Contact {
                 st.awaiting.remove(&key(id));
             }
             st.scheduled.split_off(&from);
+            st.leads.split_off(&from);
             st.generations.split_off(&from);
             st.taken_late.split_off(&from);
             st.baselines.truncated(from);
@@ -1570,6 +1582,10 @@ impl Contact {
             }
             if let Some(at) = at {
                 st.scheduled.insert(id.index, (id, at, stamp, false));
+                st.leads.insert(id.index, at.saturating_sub(stamp));
+                while st.leads.len() > SCHEDULED_MAX {
+                    st.leads.pop_first();
+                }
                 let late = tai >= self.timing.apply_deadline(at);
                 // Caught up once an entry past the commit named when
                 // catching up began is taken in time; one before it may
@@ -2949,7 +2965,11 @@ impl Contact {
         if self.log.pending_above(floor) >= FUTURE_LIST {
             return Err(StampRefusal::FutureListFull);
         }
-        let lead = st.lead.samples();
+        // At the cap a command takes the lead the entries needed too:
+        // stamped with the capped lead it would be late on every replica
+        // whose commit takes longer, as long as that lasts, and each one a
+        // degraded block.
+        let lead = st.lead.stamping();
         let earliest = if generation {
             // The last one's at_index has passed on the baseline, or on E
             // while no baseline is named.
@@ -2992,11 +3012,12 @@ impl Contact {
         Ok(Stamp { stamp, earliest })
     }
 
-    /// The lead a decision on an unresolved entry is stamped with: what
-    /// the entries applied lately needed, past the cap
-    /// ([`Lead::wanted`]). At the cap an entry is late wherever its
-    /// commit takes longer than the lead covers, and a restamp or void
-    /// stamped with the lead is late again, each decided in turn.
+    /// The lead a decision on an unresolved entry or a `Baseline` is
+    /// stamped with: what the entries applied lately needed, up to
+    /// [`crate::schedule::EXTRA_LEAD`] past the cap ([`Lead::wanted`]).
+    /// Stamped with a lead the commit outlasts, a restamp or void is late
+    /// again and decided in turn, and a `Baseline` lapses for the replica
+    /// it names.
     pub fn decision_lead(&self) -> u64 {
         self.lock().lead.wanted()
     }
@@ -3219,6 +3240,7 @@ impl Contact {
             estimate: self.estimate_in(&st, Instant::now()),
             counted: self.counted(&st, Instant::now()).into_iter().collect(),
             lead: st.lead.samples(),
+            decision_lead: st.lead.wanted(),
             apply_lead_capped: st.lead.capped,
             apply_lead_raised_by: st.lead_raised_by,
             e_spread_p9999: st.e_spread.quantile(0.9999),
