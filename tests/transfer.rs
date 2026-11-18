@@ -671,6 +671,37 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
     h.e.stop();
 }
 
+/// A product core is installed only once the core the RT thread held is
+/// dropped, as when the drop at a log overflow found the control ring
+/// full: the product state's generations are handed over across ticks,
+/// and a core held meanwhile could swap in an entry's generation built on
+/// the old flows over the new one.
+#[test]
+fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let c = h.e.counters();
+    let state = ProductState {
+        gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
+        up: vec![true],
+        flows: vec![src.clone()],
+        strips: vec![Vec::new()],
+        pending: Vec::new(),
+        last_id: 0,
+    };
+    let j = h.e.install_product(&state, Duration::from_secs(2)).unwrap();
+    assert!(
+        c.blocks_without_core.load(Relaxed) > 0,
+        "the core was held through the product hand-over"
+    );
+    let core = common::copy_core(&h.e).core;
+    assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.25, 0.5));
+    assert!(processed(&h.e) > j);
+    h.e.stop();
+}
+
 /// A re-route whose index passes while no core is held is applied once a
 /// product core that folds it in is installed: its generation is swapped
 /// in, as on every replica that computed it, where it was held pending

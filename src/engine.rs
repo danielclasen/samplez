@@ -402,6 +402,10 @@ struct ReplicaControl {
     unresolved: Vec<LogId>,
     /// The number of controls pushed to the ring.
     sent: u64,
+    /// The RT thread holds a core, or will once it takes the controls
+    /// pushed: false from a `DropCore` pushed until a hand-over installs
+    /// one.
+    core: bool,
 }
 
 /// The off-RT side of core copies: at most one buffer is with the RT
@@ -1093,6 +1097,7 @@ impl Engine {
                 ring: control_tx,
                 unresolved: Vec::with_capacity(UNRESOLVED),
                 sent: 0,
+                core: true,
             };
             (
                 Some((shared, Mutex::new(control))),
@@ -1709,7 +1714,8 @@ impl Engine {
             // Refused with one voter, which has no core to drop, and while
             // the control ring is full: the replica reads the overflow in
             // its next report period's sample and drops the core then
-            // (`Audio::drop_engine`), before its rebuild replaces it.
+            // (`Audio::drop_engine`), and `install_product` drops one
+            // still held before its rebuild replaces it.
             let _ = self.drop_core();
         }
     }
@@ -1766,8 +1772,12 @@ impl Engine {
             }
             _ => {}
         }
+        let dropped = matches!(c, Control::DropCore);
         control.ring.push(c).map_err(|_| ControlError::Full)?;
         control.sent += 1;
+        if dropped {
+            control.core = false;
+        }
         Ok(())
     }
 
@@ -2128,6 +2138,55 @@ impl Engine {
         self.control(Control::DropCore)
     }
 
+    /// Drops the RT thread's core, unless a drop was sent since the last
+    /// install known, and waits up to `timeout` for the RT thread to take
+    /// it. While a core is held, an entry could swap in a generation built
+    /// on the old flows after the product state's one for its domain.
+    fn drop_core_within(&self, timeout: Duration) -> Result<(), ReplayError> {
+        let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
+            return Err(ReplayError::Invalid(
+                "the engine is not replicated with more than one voter".to_owned(),
+            ));
+        };
+        let deadline = Instant::now() + timeout;
+        // A hand-over left unanswered by a timeout may install one: the
+        // drop has to follow its answer.
+        let mut unanswered = loop {
+            let t = transfer.lock().unwrap_or_else(|e| e.into_inner());
+            if !t.handing || t.handed.slots() > 0 {
+                break t.handing;
+            }
+            drop(t);
+            if Instant::now() >= deadline {
+                return Err(ReplayError::Timeout { passed: 0 });
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        loop {
+            let (core, taken) = {
+                let c = control.lock().expect("control lock");
+                (c.core, c.ring.slots() == UNRESOLVED)
+            };
+            if !core && !unanswered && taken {
+                return Ok(());
+            }
+            // A full ring refuses it: the RT thread empties it at its
+            // next wake.
+            let refused = (core || unanswered) && self.drop_core().is_err();
+            if !refused {
+                unanswered = false;
+            }
+            if Instant::now() >= deadline {
+                return Err(if refused {
+                    ReplayError::Full
+                } else {
+                    ReplayError::Timeout { passed: 0 }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Replicated mode with more than one voter: builds a core from
     /// `state` off the RT thread, its targets at their values, its fades
     /// and ramps cold, its pending entries, and installs it at a block
@@ -2138,7 +2197,9 @@ impl Engine {
     /// RT thread takes the entries needing no generation whose index
     /// passed off its pending list, applying only strip entries, to the
     /// strips the slots keep; [`ReplayError::Missed`] when it took one
-    /// above `state.last_id`.
+    /// above `state.last_id`. A core still held is dropped first, the
+    /// call failing with [`ReplayError::Full`] while the control ring
+    /// stays full.
     pub fn install_product(
         &self,
         state: &ProductState,
@@ -2187,6 +2248,7 @@ impl Engine {
             return Err(ReplayError::Full);
         }
         let batch = |id: LogId| batches.iter().find(|b| b.0 == id).map(|b| &*b.1);
+        self.drop_core_within(timeout)?;
         // The supervisor takes the slots' state and flows, and hands the
         // generations reading them over, before the core: a slot the core
         // has up reads its flow once installed.
@@ -2331,6 +2393,7 @@ impl Engine {
                 t.handing = false;
                 if h.answer == Answer::Installed {
                     let mut control = control.lock().expect("control lock");
+                    control.core = true;
                     control.unresolved.clear();
                     control
                         .unresolved
