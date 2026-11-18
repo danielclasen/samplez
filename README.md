@@ -259,7 +259,9 @@ in the background; `--cascade=orphan` keeps it. Reading the
 StatefulSet's uid takes the same `get` on `statefulsets` the rollout's
 target revision does. Without a name the marker has no owner. The leader
 of a running set recreates a missing marker under the set's cluster id,
-so a StatefulSet created again on kept volumes goes on as the same set.
+so a StatefulSet created again on kept volumes goes on as the same set;
+an owned marker is created only for the StatefulSet the process first
+read, and not while it is being deleted.
 With no set running, an empty volume waits for a marker; one created by
 hand with `data.cluster` from a member volume's `cluster` file and
 `data.volume` 0 lets it join.

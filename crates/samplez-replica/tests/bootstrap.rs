@@ -93,9 +93,10 @@ impl axum::serve::Listener for Tlsd {
 
 /// ConfigMaps by name in one namespace, over TLS: create (409 when it
 /// exists), get (404 when absent); and get on the StatefulSet
-/// [`STATEFULSET`]. Every request needs the bearer token.
+/// [`STATEFULSET`], its metadata [`STATEFULSET_UID`] and what the second
+/// field sets over it. Every request needs the bearer token.
 #[derive(Clone, Default)]
-struct Api(Arc<Mutex<BTreeMap<String, Value>>>);
+struct Api(Arc<Mutex<BTreeMap<String, Value>>>, Arc<Mutex<Value>>);
 
 impl Api {
     /// Serves the API; returns its address and the PEM of the CA its
@@ -134,7 +135,8 @@ impl Api {
                 None => (StatusCode::NOT_FOUND, Vec::new()),
             }
         };
-        let statefulset = move |Path((namespace, name)): Path<(String, String)>,
+        let statefulset = move |State(api): State<Api>,
+                                Path((namespace, name)): Path<(String, String)>,
                                 headers: HeaderMap| async move {
             if !authorized(&headers) {
                 return (StatusCode::UNAUTHORIZED, Vec::new());
@@ -143,10 +145,17 @@ impl Api {
             if name != STATEFULSET {
                 return (StatusCode::NOT_FOUND, Vec::new());
             }
+            let mut metadata =
+                serde_json::json!({ "name": name, "namespace": namespace, "uid": STATEFULSET_UID });
+            if let Value::Object(set) = &*api.1.lock().unwrap() {
+                for (k, v) in set {
+                    metadata[k] = v.clone();
+                }
+            }
             let set = serde_json::json!({
                 "apiVersion": "apps/v1",
                 "kind": "StatefulSet",
-                "metadata": { "name": name, "namespace": namespace, "uid": STATEFULSET_UID },
+                "metadata": metadata,
                 "status": { "updateRevision": "set-audio-1" },
             });
             (StatusCode::OK, serde_json::to_vec(&set).unwrap())
@@ -985,5 +994,37 @@ async fn the_marker_is_owned_by_the_statefulset_named() {
     let api = Api::default();
     assert!(kube(&api, &root).await.create(marker).await.unwrap());
     assert_eq!(metadata(&api).get("ownerReferences"), None);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The owned marker is created only for the StatefulSet this process first
+/// read: one created again under the name since, or one being deleted, is
+/// refused, so a replica of a deleted set that still leads never writes
+/// its cluster id into the marker of the set that replaces it.
+#[tokio::test]
+async fn the_owned_marker_is_refused_for_a_replaced_or_deleting_statefulset() {
+    let root = harness::root("bootstrap-replaced");
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = Marker {
+        cluster: 7,
+        volume: 0,
+    };
+    let api = Api::default();
+    let owned = kube(&api, &root).await.owned_by(STATEFULSET.into());
+    // The rollout's first read takes the uid.
+    owned.update_revision(STATEFULSET).await.unwrap();
+    *api.1.lock().unwrap() = serde_json::json!({ "uid": "5c0e9a7d-1f22-4b36-8e51-a3d0c4b7e912" });
+    let refused = owned.create(marker).await.unwrap_err();
+    assert!(refused.contains("was replaced"), "{refused}");
+    assert_eq!(api.marker(), None);
+
+    *api.1.lock().unwrap() = serde_json::json!({ "deletionTimestamp": "2026-01-01T00:00:00Z" });
+    let refused = owned.create(marker).await.unwrap_err();
+    assert!(refused.contains("being deleted"), "{refused}");
+    assert_eq!(api.marker(), None);
+
+    *api.1.lock().unwrap() = Value::Null;
+    assert!(owned.create(marker).await.unwrap());
+    assert_eq!(api.marker(), Some((7, 0)));
     let _ = std::fs::remove_dir_all(&root);
 }
