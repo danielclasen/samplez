@@ -2342,7 +2342,10 @@ impl Contact {
         .status
     }
 
-    /// Drops scheduled entries every voter reported committed.
+    /// Drops scheduled entries every voter reported committed and this
+    /// replica applied: one committed everywhere but not applied here
+    /// still gives its slack at the apply-hand ([`Contact::hand`]), the
+    /// sample of a replica that applies late.
     fn prune_scheduled(&self, st: &mut State) {
         let lowest = st
             .members
@@ -2360,7 +2363,8 @@ impl Contact {
                 }
             })
             .min()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .min(st.handed);
         st.scheduled = st.scheduled.split_off(&(lowest + 1));
     }
 
@@ -4226,6 +4230,40 @@ mod tests {
         assert_eq!(
             f.engine.calls(),
             [format!("unresolved 3 at {}", at + 3 * B)]
+        );
+    }
+
+    /// An entry every voter reported committed before it applied here
+    /// still gives its slack as it applies: the slack of a replica that
+    /// applies late reaches the lead.
+    #[tokio::test(start_paused = true)]
+    async fn an_entry_committed_everywhere_before_it_applies_here_gives_its_slack() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let timing = Timing::defaults(B);
+        let at = index_at(T0) + 400 * B;
+        f.log.push(1, 1, Some(at));
+        f.contact.log_changed();
+        for from in [2, 3] {
+            let mut r = f.report(from, None);
+            r.committed = Some(id(1, 1));
+            f.contact.receive(r);
+        }
+        assert_eq!(f.contact.metrics().known_committed, 1);
+        f.tick();
+        f.clock.set(timing.apply_deadline(at) - 1);
+        f.apply(1);
+        f.contact.log_changed();
+        let slack: Vec<(u64, i64)> = (f.tick().into_iter())
+            .flat_map(|(_, _, r)| r.slack)
+            .map(|s| (s.index, s.samples))
+            .collect();
+        assert!(!slack.is_empty(), "no slack reported");
+        assert!(
+            slack
+                .iter()
+                .all(|&(index, samples)| index == 1 && samples < B as i64),
+            "{slack:?}"
         );
     }
 
