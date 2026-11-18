@@ -1649,16 +1649,17 @@ impl<P: Product + Sync> Set<P> {
             .await
             .expect("initializes");
         set.leader().await;
-        // Ready, or out of `starting`: a replica withdrawn once the set's
-        // first `Baseline` applied writes nothing and reads not ready
-        // until it commits, which a set whose digests differ never does.
+        // Ready, or committing or withdrawn: a replica withdrawn once the
+        // set's first `Baseline` applied writes nothing and reads not
+        // ready until it commits, which in a set whose digests differ it
+        // may never do. Diverged or resyncing is not started.
         let deadline = Instant::now() + Duration::from_secs(30);
         while !set.replicas.iter().all(|(&id, r)| {
             let info = r.replica();
             let started = (r.contact_metrics())
                 .and_then(|m| m.replica)
                 .and_then(|l| l.state)
-                .is_some_and(|s| s != ReplicaState::Starting);
+                .is_some_and(|s| matches!(s, ReplicaState::Committing | ReplicaState::Withdrawn));
             (info.ready || started)
                 && (slot_of(id) == Slot::Witness || info.commitable || set.options.unverified)
         }) {

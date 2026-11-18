@@ -550,7 +550,7 @@ impl Audio for EngineAudio {
             // waits for a matched page and the attempt fails; the next
             // copies a newer core, whose next block is past the entry, and
             // holds it unresolved as below. Decisions are stamped with the
-            // lead the entries needed, so late entries do not keep coming.
+            // lead the entries needed, so a decision is not late again.
             for (n, (index, record)) in records.into_iter().enumerate() {
                 after = index;
                 let at_index = record.at_index.next_multiple_of(self.block);

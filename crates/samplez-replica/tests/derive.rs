@@ -839,9 +839,9 @@ async fn fsync_load(
     (n, out, leader)
 }
 
-/// The timing of the sc sets, on network block storage: `maxApplyLead`
-/// 80 ms (design D3).
-fn sc_timing() -> Timing {
+/// The timing of a set on network block storage: `maxApplyLead` 80 ms
+/// (design D3).
+fn network_storage_timing() -> Timing {
     Timing {
         max_apply_lead: Duration::from_millis(80),
         ..Timing::defaults(BLOCK)
@@ -851,12 +851,13 @@ fn sc_timing() -> Timing {
 /// A follower whose fsync takes 20 ms takes every entry written during
 /// one fsync with the next, so it applies each one to two fsyncs after
 /// its append on the leader, 20 to 40 ms; the lead it raises covers that
-/// at the sc cap. It hands its engine every record but under 1 %, the others
+/// at the 80 ms cap. It hands its engine every record but under 1 %, the others
 /// all of them. Returns the leader's contact metrics.
 async fn a_slow_follower_disk_is_covered_by_the_lead(
     run: Duration,
 ) -> samplez_replica::contact::Metrics {
-    let (n, out, leader) = fsync_load(run, Duration::from_millis(20), sc_timing()).await;
+    let (n, out, leader) =
+        fsync_load(run, Duration::from_millis(20), network_storage_timing()).await;
     let slow = &out[0];
     assert!(
         slow.unresolved * 100 < n,
@@ -870,7 +871,7 @@ async fn a_slow_follower_disk_is_covered_by_the_lead(
     leader
 }
 
-/// Over 3 s the lead stays below the sc cap: the margin E lags TAI by
+/// Over 3 s the lead stays below the 80 ms cap: the margin E lags TAI by
 /// here and applyGuard, 32 ms, plus 40 ms, the two blocks of slack the
 /// lead keeps and the jitter of E, at most 78 ms.
 #[tokio::test(start_paused = true)]
