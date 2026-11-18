@@ -637,6 +637,13 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
         pending: Vec::new(),
         last_id: 0,
     };
+    // A gain no entry could set is refused before the core is dropped.
+    let mut beyond = state.clone();
+    beyond.gains[1][1] = f32::INFINITY;
+    assert!(matches!(
+        h.e.install_product(&beyond, 0, Duration::from_secs(2)),
+        Err(ReplayError::Invalid(_))
+    ));
     assert_eq!(
         h.e.install_product(&state, 0, Duration::from_secs(2)),
         Err(ReplayError::Missed { id: 65 })

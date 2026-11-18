@@ -2215,7 +2215,9 @@ impl Engine {
     /// from the install, as the strips take their parameters, so an
     /// output fades in processed. Returns the block the core followed.
     /// An `at_least` further ahead than `timeout` is refused as invalid
-    /// before anything changes. The core holds no unresolved entry: the caller adds the ones still unresolved with
+    /// before anything changes, as is a state holding a gain, flow or
+    /// strip parameter an entry could not set. The core holds no
+    /// unresolved entry: the caller adds the ones still unresolved with
     /// [`Engine::unresolved`] after the install. While no core is held the
     /// RT thread takes the entries needing no generation whose index
     /// passed off its pending list, applying only strip entries, to the
@@ -2253,6 +2255,11 @@ impl Engine {
             for param in params {
                 check_strip(&self.config, slot, param).map_err(ReplayError::Invalid)?;
             }
+        }
+        if let Some(gain) = (state.gains.iter().flatten()).find(|g| !samplez_dsp::valid_gain(**g)) {
+            return Err(ReplayError::Invalid(format!(
+                "gain {gain} is not finite within MAX_GAIN"
+            )));
         }
         let strips = product_strips(&state.strips);
         // The entries of one log entry are adjacent and fold into one.
