@@ -605,6 +605,8 @@ CI also sets `SAMPLEZ_REQUIRE_PATHS=avx2`, so a matrix test fails rather
 than skips the AVX2 path on a CPU without it, lints with `cargo fmt --all --check` and `cargo
 clippy --workspace --all-targets --locked -- -D warnings`, checks every
 dependency's licence against `deny.toml` with `cargo deny check licenses`,
+fails a crates.io release that `Cargo.lock` gains under 14 days old unless
+`.github/lockfile-age/allow.txt` lists it,
 and runs the
 kernel clock tests of `samplez-replica` (`--test vm_clock`, a TAI offset
 step and a leap second) in a VM, since they step the clock.

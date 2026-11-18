@@ -1,0 +1,2 @@
+# crates.io releases under 14 days old that Cargo.lock may add, one per
+# line: <name> <version> <reason>. Each entry is reviewed like code.
