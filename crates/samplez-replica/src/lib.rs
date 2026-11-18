@@ -1159,9 +1159,10 @@ fn answer_all(items: Vec<Item>, refused: Refused) -> Result<(), Vec<Item>> {
 /// that would re-route an input ([`Product::reroutes`]) ends the group
 /// before it and is ordered alone, stamped for its generation. On a
 /// follower the group is forwarded to the leader instead, one group at a
-/// time, so the order holds there too. The generation-needing entries the
-/// replica set decides on have a writer of their own, so one waiting for
-/// the previous generation's index holds no command.
+/// time, so the order holds there too. A re-routing command waiting for
+/// the previous generation's index holds every command queued behind it.
+/// The `InputUp` and `Route` entries the replica set decides on have a
+/// writer of their own, so one of those waiting holds no command.
 ///
 /// A first cut: one entry is in flight at a time and the writer waits for
 /// it to commit and apply here before it proposes the next, so the

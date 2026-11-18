@@ -751,7 +751,10 @@ impl<P: Product> StateMachine<P> {
         // an entry still decidable takes effect at, the same on every
         // replica that loads it. One further than [`AHEAD_MAX`] past the
         // highest stamp is a far client index an older writer kept, which
-        // a replica applying that entry counts as its stamp.
+        // a replica applying that entry counts as its stamp. One within
+        // that bound but further than [`AHEAD_MAX`] past its own entry's
+        // stamp is kept here and counted as its stamp there, so the two
+        // floors can differ by up to [`AHEAD_MAX`].
         let highest_stamp = self.highest_stamp;
         self.floor = saved.floor.unwrap_or_else(|| {
             self.terms
