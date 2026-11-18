@@ -6,7 +6,8 @@
 //! duck detectors with their keys, filter, hold and envelope state, the
 //! entries pending and applied in the page in progress, each input slot's
 //! log state, fades and strip with its position, the entries waiting for
-//! their generation and the pending generation's entry id, and the
+//! their generation and the pending generation's entry id, the outputs
+//! disabled, and the
 //! unresolved entries with the late re-routes. Meters, hold rings, block statuses, page hashes in progress
 //! and the readers stay with the replica. The RT thread copies it into a
 //! buffer allocated off the RT thread, of the same shape, so the copy
@@ -63,6 +64,8 @@ pub struct Core {
     pub(crate) page_entries: Vec<(LogId, u64)>,
     pub(crate) entries_page: Option<u64>,
     pub(crate) entries_lost: bool,
+    /// The outputs disabled by an `Output` entry, a bit per output.
+    pub(crate) outputs_disabled: u64,
     pub(crate) slots: Vec<SlotCore>,
     pub(crate) awaiting_gen: Vec<RtEntry>,
     pub(crate) pending_gen: Option<LogId>,
@@ -102,6 +105,7 @@ impl Core {
             page_entries: Vec::with_capacity(page_entries),
             entries_page: None,
             entries_lost: false,
+            outputs_disabled: 0,
             slots: vec![SlotCore::default(); slots],
             awaiting_gen: Vec::with_capacity(PENDING_CHANGES),
             pending_gen: None,
@@ -274,8 +278,9 @@ impl Core {
         held == self.batches.len()
     }
 
-    /// Whether this sane core is of an engine with `inputs` and `outputs`
-    /// channels, input slots of `legs` legs each, strips and duck key
+    /// Whether this sane core is of an engine with `inputs` and `columns`
+    /// matrix channels, `outputs` outputs, none beyond them disabled,
+    /// input slots of `legs` legs each, strips and duck key
     /// filters ramping over `ramp` samples and room for `page_entries`
     /// entries of one page's fingerprint, every entry and every duck key
     /// within them, and ducks only on the duck columns `ducked`: checked
@@ -285,6 +290,7 @@ impl Core {
     pub(crate) fn fits(
         &self,
         inputs: usize,
+        columns: usize,
         outputs: usize,
         legs: &[usize],
         ramp: u32,
@@ -296,12 +302,12 @@ impl Core {
             Some(strip) => strip.legs() == legs && strip.ramp() == ramp,
             None => legs > MAX_LEGS,
         };
-        let entry = |e: &RtEntry| fits(&e.change, inputs, outputs, legs);
-        let batch = |(_, b): &(LogId, Arc<Batch>)| b.fits(inputs, outputs, legs, ducked);
+        let entry = |e: &RtEntry| fits(&e.change, inputs, columns, outputs, legs);
+        let batch = |(_, b): &(LogId, Arc<Batch>)| b.fits(inputs, columns, outputs, legs, ducked);
         // No duck on a column the configuration does not name: a ducked
         // term costs what Config::check counts only on those.
-        let columns = |m: &Matrix| {
-            (0..outputs)
+        let unducked = |m: &Matrix| {
+            (0..columns)
                 .filter(|o| !ducked.contains(o))
                 .all(|o| !m.is_ducked(o) && (0..inputs).all(|i| m.mask(i, o) == 0))
         };
@@ -311,28 +317,41 @@ impl Core {
             self.slots.len(),
         );
         self.sane()
-            && shape == (inputs, outputs, slots)
+            && shape == (inputs, columns, slots)
+            && self
+                .outputs_disabled
+                .checked_shr(outputs as u32)
+                .unwrap_or(0)
+                == 0
             && self.page_entries.len() <= page_entries
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
             && self.batches.iter().all(batch)
             && self.slots.iter().zip(legs).all(strip)
             && self.ducks.fits(legs, ramp)
-            && columns(&self.matrix)
+            && unducked(&self.matrix)
     }
 }
 
-/// Whether change `c` is within an engine of `inputs` and `outputs`
-/// channels and input slots of `legs` legs: a coefficient and a gain it
-/// has, a slot, and a strip parameter that slot's strip takes. A batch's
-/// own values are checked by [`Batch::fits`].
-pub(crate) fn fits(c: &Change, inputs: usize, outputs: usize, legs: &[usize]) -> bool {
+/// Whether change `c` is within an engine of `inputs` and `columns`
+/// matrix channels, `outputs` outputs and input slots of `legs` legs: a
+/// coefficient and a gain it has, a slot, an output, and a strip
+/// parameter that slot's strip takes. A batch's own values are checked
+/// by [`Batch::fits`].
+pub(crate) fn fits(
+    c: &Change,
+    inputs: usize,
+    columns: usize,
+    outputs: usize,
+    legs: &[usize],
+) -> bool {
     let slots = legs.len();
     match *c {
         Change::Gain {
             input,
             output,
             gain,
-        } => input < inputs && output < outputs && samplez_dsp::valid_gain(gain),
+        } => input < inputs && output < columns && samplez_dsp::valid_gain(gain),
+        Change::Output { output, .. } => output < outputs,
         Change::InputDown { slot }
         | Change::InputUp { slot }
         | Change::Route { slot }
@@ -500,6 +519,7 @@ impl Replay {
         }
         let matrix = &self.rt.mix.matrix;
         let (inputs, columns) = (matrix.inputs(), matrix.outputs());
+        let outputs = self.rt.outs.len();
         let legs: Vec<usize> = self.rt.slots.iter().map(|s| s.channels).collect();
         let rows: Vec<(usize, usize)> = (self.rt.slots.iter())
             .map(|s| (s.first_channel, s.channels))
@@ -512,7 +532,7 @@ impl Replay {
         }
         // The engine's checks: a donor took no entry outside them.
         let fit = |i: &Item| match i {
-            Item::Change(c) => fits(c, inputs, columns, &legs),
+            Item::Change(c) => fits(c, inputs, columns, outputs, &legs),
             Item::Duck(DuckItem::Mask {
                 input,
                 output,
@@ -534,10 +554,9 @@ impl Replay {
         let Some((change, batch)) = folded else {
             return Ok(());
         };
-        if batch
-            .as_ref()
-            .is_some_and(|b| !(b.sane() && b.fits(inputs, columns, &legs, &self.duck_columns)))
-        {
+        if batch.as_ref().is_some_and(|b| {
+            !(b.sane() && b.fits(inputs, columns, outputs, &legs, &self.duck_columns))
+        }) {
             return Err(outside());
         }
         if change.needs_generation() {
@@ -692,6 +711,10 @@ fn change_of(entry: &Entry) -> Change {
         Entry::InputUp { slot } => Change::InputUp { slot },
         Entry::Route { slot, .. } => Change::Route { slot },
         Entry::Detach { slot } => Change::Detach { slot },
+        Entry::Output { slot, enabled } => Change::Output {
+            output: slot,
+            enabled,
+        },
         Entry::Strip { slot, param } => Change::Strip { slot, param },
         Entry::Duck { .. } | Entry::DuckMask { .. } => {
             unreachable!("duck entries are items of their own")
@@ -712,6 +735,9 @@ pub struct ProductState {
     /// or its configured one; none for a slot whose last `Route` or
     /// `Detach` is a `Detach`.
     pub flows: Vec<Option<String>>,
+    /// Per output whether it is enabled in the log, its last `Output`'s
+    /// value; an output past the list is enabled.
+    pub outputs: Vec<bool>,
     /// Per input slot the strip parameters the log set, as values: each
     /// one set again at the install, the strip's own state kept.
     pub strips: Vec<Vec<StripParam>>,
@@ -1155,23 +1181,39 @@ mod tests {
     #[test]
     fn a_core_fits_only_its_own_shape() {
         let mut copy = copy();
-        assert!(copy.core.fits(2, 2, &[1, 1], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 3, &[1, 1], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 0, &[]));
+        assert!(copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 3, 1, &[1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 0, &[]));
         // Strips of other legs, another ramp, or none on a narrow slot;
         // a slot wider than a strip has none.
-        assert!(!copy.core.fits(2, 2, &[1, 2], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, &[1, 1], 480, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 2], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 480, 8, &[]));
         copy.core.slots[0].strip = None;
-        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 8, &[]));
-        assert!(copy.core.fits(2, 2, &[MAX_LEGS + 1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
+        assert!(copy.core.fits(2, 2, 1, &[MAX_LEGS + 1, 1], 48, 8, &[]));
         copy.core.slots[0].strip = Some(Strip::new(1, 48));
         copy.core.pending.push(RtEntry {
             id: 8,
             at_index: 9648,
             change: Change::InputDown { slot: 2 },
         });
-        assert!(!copy.core.fits(2, 2, &[1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
+        copy.core.pending.pop();
+        // Output 1 disabled: a core of two outputs, not of one.
+        copy.core.outputs_disabled = 0b10;
+        assert!(copy.core.fits(2, 2, 2, &[1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
+        copy.core.outputs_disabled = 0;
+        copy.core.pending.push(RtEntry {
+            id: 8,
+            at_index: 9648,
+            change: Change::Output {
+                output: 1,
+                enabled: false,
+            },
+        });
+        assert!(copy.core.fits(2, 2, 2, &[1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
     }
 
     /// A copy whose detector 2 is keyed by slot 1, forced on and
@@ -1212,17 +1254,17 @@ mod tests {
         );
         assert_eq!(a.envelope().to_bits(), b.envelope().to_bits());
         assert_eq!(decoded.core.duck_mask(1, 0), 0b100);
-        assert!(decoded.core.fits(2, 2, &[1, 1], 48, 8, &[0]));
+        assert!(decoded.core.fits(2, 2, 1, &[1, 1], 48, 8, &[0]));
         // Its mask is on column 0: refused on an engine whose duck
         // columns leave it out, or that has none.
-        assert!(!decoded.core.fits(2, 2, &[1, 1], 48, 8, &[1]));
-        assert!(!decoded.core.fits(2, 2, &[1, 1], 48, 8, &[]));
+        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], 48, 8, &[1]));
+        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
         assert!(
-            !decoded.core.fits(2, 2, &[1, 2], 48, 8, &[0]),
+            !decoded.core.fits(2, 2, 1, &[1, 2], 48, 8, &[0]),
             "key 0 of another width"
         );
         assert!(
-            !decoded.core.fits(2, 2, &[1, 1], 480, 8, &[0]),
+            !decoded.core.fits(2, 2, 1, &[1, 1], 480, 8, &[0]),
             "another key filter ramp"
         );
     }

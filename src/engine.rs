@@ -105,6 +105,8 @@ pub struct InputStatus {
 #[derive(Clone, Debug)]
 pub struct OutputStatus {
     pub name: String,
+    /// Enabled by the log: a disabled output has no writer and no flow.
+    pub enabled: bool,
     pub realised: bool,
     /// Why the output is not realised.
     pub reason: Option<String>,
@@ -269,6 +271,13 @@ pub enum Entry {
     /// is dropped, the flow is not polled and no `InputPruned` or
     /// `InputReadable` is reported for it. Its up or down state is kept.
     Detach { slot: usize },
+    /// Output `slot` is written from the entry's index on, or disabled:
+    /// nothing is written to it from the index on, its writer is
+    /// released and its flow deleted, unless another writer holds the
+    /// flow. Enabled again, its flow is created as at start-up, and an
+    /// output another writer holds the flow of is not realised. Every
+    /// output starts enabled.
+    Output { slot: usize, enabled: bool },
     /// Sets parameter `param` of input slot `slot`'s strip from the
     /// entry's index, ramping over the ramp length.
     Strip { slot: usize, param: StripParam },
@@ -926,6 +935,7 @@ fn replay_rt(
                 first_channel: channel - ch,
                 channels: ch,
                 writer: None,
+                enabled: true,
                 first_k: 0,
                 meter: OutMeter::new(ch),
                 hold: Hold::new(ch, b, 0, true),
@@ -1289,6 +1299,7 @@ impl Engine {
                 first_channel: channel,
                 channels: o.channels as usize,
                 writer: None,
+                enabled: true,
                 first_k: 0,
                 meter: OutMeter::new(o.channels as usize),
                 hold: if replica.is_some() {
@@ -1409,6 +1420,7 @@ impl Engine {
                 .iter()
                 .map(|o| OutputStatus {
                     name: o.name.clone(),
+                    enabled: true,
                     realised: false,
                     reason: Some("not created yet".to_owned()),
                     attempts: 0,
@@ -1500,6 +1512,7 @@ impl Engine {
             rebuild_errors: vec![None; in_domains.len()],
             outs: (0..config.outputs.len())
                 .map(|_| SupOut {
+                    enabled: true,
                     realised: false,
                     next_try: now,
                     backoff: BACKOFF_FIRST,
@@ -1837,6 +1850,49 @@ impl Engine {
         Ok(at_index)
     }
 
+    /// Enables output `slot` or disables it from the returned index,
+    /// `at_index` or, when that is nearer, the earliest index a gain
+    /// change is stamped at. Disabled, nothing is written to it from that
+    /// index on and the supervisor releases its writer, which deletes its
+    /// flow unless another writer holds it; enabled, the supervisor
+    /// creates its flow as at start-up and it is written from the first
+    /// block due once the writer is in. [`OutputStatus`] reports both, and
+    /// why a flow is not created. Refused as invalid on an engine that
+    /// follows a replicated log, for no such output, and for an
+    /// `at_index` that is not a multiple of the block size; as full while
+    /// [`PENDING_CHANGES`] entries are outstanding.
+    pub fn set_output_enabled(
+        &self,
+        slot: usize,
+        enabled: bool,
+        at_index: u64,
+    ) -> Result<u64, EntryError> {
+        if !at_index.is_multiple_of(self.block) {
+            return Err(EntryError::Invalid(format!(
+                "at_index {at_index} is not a multiple of the block size {}",
+                self.block
+            )));
+        }
+        let change = self.change(&Entry::Output { slot, enabled })?;
+        let mut log = self.log.lock().expect("log lock");
+        if log.local.is_none() {
+            return Err(EntryError::Invalid(
+                "output changes come from the replicated log".to_owned(),
+            ));
+        }
+        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead)
+            .next_multiple_of(self.block);
+        let e = RtEntry {
+            id: log.last + 1,
+            at_index: at_index.max(earliest),
+            change,
+        };
+        let consumed = self.counters.entries_consumed.load(Acquire);
+        log.append(e, None, Vec::new(), consumed)?;
+        log.commit(e.id);
+        Ok(e.at_index)
+    }
+
     /// Appends entry `entry` at log id `id`: [`Engine::append_batch`] of
     /// one entry.
     pub fn append(&self, id: LogId, at_index: u64, entry: Entry) -> Result<(), EntryError> {
@@ -2006,6 +2062,13 @@ impl Engine {
                 return invalid(format!("no input slot {slot}"));
             }
             Entry::Detach { slot } => Change::Detach { slot },
+            Entry::Output { slot, .. } if slot >= self.config.outputs.len() => {
+                return invalid(format!("no output {slot}"));
+            }
+            Entry::Output { slot, enabled } => Change::Output {
+                output: slot,
+                enabled,
+            },
             Entry::InputDown { slot } => Change::InputDown { slot },
             Entry::InputUp { slot } => Change::InputUp { slot },
             Entry::Route { slot, ref flow_id } => {
@@ -2365,7 +2428,8 @@ impl Engine {
         let (slots, in_domains) = new_slots(&self.config);
         let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
         let ducked = &self.config.duck_columns;
-        if !c.fits(n, m, &legs, self.config.ramp_samples, page, ducked) {
+        let outputs = self.config.outputs.len();
+        if !c.fits(n, m, outputs, &legs, self.config.ramp_samples, page, ducked) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -2562,9 +2626,12 @@ impl Engine {
             || state.up.len() != slots
             || state.flows.len() != slots
             || state.strips.len() != slots
+            || state.outputs.len() > self.config.outputs.len()
         {
             return Err(ReplayError::Invalid(format!(
-                "a product state of the shape {n} x {m} with {slots} inputs"
+                "a product state of the shape {n} x {m} with {slots} inputs and at most {} \
+                 outputs",
+                self.config.outputs.len()
             )));
         }
         for (slot, (flow, params)) in state.flows.iter().zip(&state.strips).enumerate() {
@@ -2644,6 +2711,10 @@ impl Engine {
         let targets: Vec<f32> = state.gains.iter().flatten().copied().collect();
         let mut gains = targets.clone();
         let mut up = state.up.clone();
+        // A bit per output disabled; one past the list is enabled.
+        let disabled_targets = (state.outputs.iter().enumerate())
+            .filter(|(_, e)| !**e)
+            .fold(0, |d, (o, _)| d | bit(o));
         // Empty for none, as a fill takes them: a state and pending list
         // without masks or depths pay nothing for them.
         let pending_masks = batches.iter().any(|(_, b)| !b.masks.is_empty());
@@ -2682,6 +2753,7 @@ impl Engine {
         self.offer(left(), at_least, false, &strips, |j, core| {
             gains.copy_from_slice(&targets);
             up.copy_from_slice(&state.up);
+            let mut disabled = disabled_targets;
             masks.copy_from_slice(&mask_targets);
             depths.copy_from_slice(&depth_targets);
             // Whatever a spare core held.
@@ -2701,6 +2773,9 @@ impl Engine {
                     } => gains[input * m + output] = gain,
                     Change::InputDown { slot } => up[slot] = false,
                     Change::InputUp { slot } => up[slot] = true,
+                    Change::Output { output, enabled } => {
+                        disabled = output_disabled(disabled, output, enabled);
+                    }
                     // The core holds neither a generation nor a strip:
                     // the RT thread applies a passed re-route, detach or
                     // strip entry itself, taken before the install or
@@ -2711,6 +2786,9 @@ impl Engine {
                             b.gains.each(|c, g| gains[c] = g);
                             for &slot in &b.downs {
                                 up[slot as usize] = false;
+                            }
+                            for &(o, enabled) in &b.outputs {
+                                disabled = output_disabled(disabled, o as usize, enabled);
                             }
                             b.masks.each(|c, k| masks[c] = k);
                             for &(row, g, db) in &b.depths {
@@ -2750,6 +2828,7 @@ impl Engine {
             core.page_entries.clear();
             core.entries_page = None;
             core.entries_lost = false;
+            core.outputs_disabled = disabled;
             // The RT thread keeps its strips.
             for ((c, &up), flow) in core.slots.iter_mut().zip(&up).zip(&state.flows) {
                 *c = SlotCore {
@@ -3026,6 +3105,8 @@ enum Stage {
 }
 
 struct SupOut {
+    /// Enabled as the supervisor last read it.
+    enabled: bool,
     realised: bool,
     next_try: Instant,
     backoff: Duration,
@@ -4105,11 +4186,51 @@ impl Supervisor {
         }
     }
 
+    /// Takes the outputs the RT thread released and the ones the log
+    /// disabled or enabled into the status, and creates a writer for each
+    /// enabled output without one, retried with a backoff while that
+    /// fails.
     fn outputs(&mut self) {
+        let released = self.counters.outputs_released.swap(0, Acquire);
+        if released != 0 {
+            // Their writers are in the return ring: dropped, deleting
+            // their flows, before a flow is created anew, so an output
+            // enabled again does not find its own writer live on it.
+            while let Ok(r) = self.ret.pop() {
+                release(r);
+            }
+        }
+        let disabled = self.counters.outputs_disabled.load(Acquire);
         let now = Instant::now();
         for o in 0..self.outs.len() {
             let out = &mut self.outs[o];
-            if out.realised || now < out.next_try || self.cmd.slots() == 0 {
+            let enabled = disabled & bit(o) == 0;
+            if released & bit(o) != 0 || enabled != out.enabled {
+                let name = &self.config.outputs[o].name;
+                let mut st = self.status.lock().expect("status lock");
+                let s = &mut st.outputs[o];
+                if released & bit(o) != 0 && out.realised {
+                    out.realised = false;
+                    s.realised = false;
+                    log(format_args!("output {name} released"));
+                }
+                if enabled != out.enabled {
+                    out.enabled = enabled;
+                    out.next_try = now;
+                    out.backoff = BACKOFF_FIRST;
+                    s.enabled = enabled;
+                    log(format_args!(
+                        "output {name} {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    ));
+                }
+                if !enabled {
+                    s.reason = Some("disabled".to_owned());
+                } else if !out.realised {
+                    s.reason = Some("not created yet".to_owned());
+                }
+            }
+            if !enabled || out.realised || now < out.next_try || self.cmd.slots() == 0 {
                 continue;
             }
             let cfg = &self.config.outputs[o];
@@ -4216,6 +4337,16 @@ fn unsynchronised() -> Option<bool> {
     // SAFETY: `t` is writable.
     let state = unsafe { libc::adjtimex(&mut t) };
     (state >= 0).then_some(state == libc::TIME_ERROR || t.status & libc::STA_UNSYNC != 0)
+}
+
+/// The outputs disabled, a bit per output, `disabled` with output
+/// `output` enabled or disabled.
+fn output_disabled(disabled: u64, output: usize, enabled: bool) -> u64 {
+    if enabled {
+        disabled & !bit(output)
+    } else {
+        disabled | bit(output)
+    }
 }
 
 /// Releases what the RT thread handed back: a generation's readers,
@@ -5865,6 +5996,7 @@ mod tests {
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
+            outputs: Vec::new(),
             strips: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -5928,6 +6060,7 @@ mod tests {
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
+            outputs: Vec::new(),
             strips: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),

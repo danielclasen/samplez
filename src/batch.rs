@@ -154,6 +154,8 @@ pub(crate) struct Batch {
     pub strips: Vec<(u32, StripParam)>,
     /// The slots going down, ascending.
     pub downs: Vec<u32>,
+    /// The outputs enabled (true) or disabled, ascending.
+    pub outputs: Vec<(u32, bool)>,
     /// Duck settings by group, one per kind ([`DuckChange::kind`]),
     /// ascending by group and kind.
     pub ducks: Vec<(u8, DuckChange)>,
@@ -193,6 +195,7 @@ impl Batch {
                 .windows(2)
                 .all(|w| (w[0].0, strip_key(&w[0].1)) < (w[1].0, strip_key(&w[1].1)))
             && self.downs.windows(2).all(|w| w[0] < w[1])
+            && self.outputs.windows(2).all(|w| w[0].0 < w[1].0)
             && self
                 .ducks
                 .iter()
@@ -210,9 +213,16 @@ impl Batch {
     }
 
     /// Whether every value fits an engine of `inputs` input and `columns`
-    /// matrix channels, input slots of `legs` legs and the duck columns
-    /// `ducked`: a mask other than 0 only on those.
-    pub fn fits(&self, inputs: usize, columns: usize, legs: &[usize], ducked: &[usize]) -> bool {
+    /// matrix channels, `outputs` outputs, input slots of `legs` legs and
+    /// the duck columns `ducked`: a mask other than 0 only on those.
+    pub fn fits(
+        &self,
+        inputs: usize,
+        columns: usize,
+        outputs: usize,
+        legs: &[usize],
+        ducked: &[usize],
+    ) -> bool {
         let coefficients = inputs * columns;
         let mut gains = true;
         self.gains.each(|c, _| gains &= c < coefficients);
@@ -223,6 +233,7 @@ impl Batch {
         gains
             && self.strips.iter().all(strip)
             && self.downs.iter().all(|&s| (s as usize) < legs.len())
+            && self.outputs.iter().all(|&(o, _)| (o as usize) < outputs)
             && self.ducks.iter().all(|(_, c)| c.fits(legs))
             && self
                 .depths
@@ -261,7 +272,8 @@ struct SlotFold {
 /// fold into: none for no change, a single change as itself, more, or
 /// any duck setting, depth or mask, as a [`Change::Batch`] with its
 /// batch. Per coefficient, strip parameter key, duck setting kind, depth
-/// and mask the last value counts. Per input slot a `Route` and its up or
+/// and mask the last value counts, and per output its last `Output`. Per
+/// input slot a `Route` and its up or
 /// down state are kept apart ([`SlotFold`]): an `InputUp` and a `Route`
 /// raise the slot on the new flow, a `Route` and an `InputDown` leave it
 /// down on the new flow. Of a slot's `Route`s and `Detach`es the last
@@ -279,6 +291,7 @@ pub(crate) fn fold(
     let mut ducks = BTreeMap::new();
     let mut depths = BTreeMap::new();
     let mut masks = BTreeMap::new();
+    let mut outputs = BTreeMap::new();
     for &item in items {
         let c = match item {
             Item::Change(c) => c,
@@ -321,6 +334,9 @@ pub(crate) fn fold(
                 s.up = false;
             }
             Change::InputUp { slot } => slots.entry(slot).or_default().up = true,
+            Change::Output { output, enabled } => {
+                outputs.insert(output as u32, enabled);
+            }
             Change::Batch { .. } => return Err("a batch inside a batch".to_owned()),
         }
     }
@@ -340,6 +356,7 @@ pub(crate) fn fold(
     let facts = gains.len()
         + strips.len()
         + downs.len()
+        + outputs.len()
         + up.count_ones() as usize
         + routed.count_ones() as usize;
     let duck_facts = ducks.len() + depths.len() + masks.len();
@@ -364,6 +381,11 @@ pub(crate) fn fold(
             Change::InputDown {
                 slot: slot as usize,
             }
+        } else if let Some((&output, &enabled)) = outputs.first_key_value() {
+            Change::Output {
+                output: output as usize,
+                enabled,
+            }
         } else if up != 0 {
             Change::InputUp { slot }
         } else if detached != 0 {
@@ -377,6 +399,7 @@ pub(crate) fn fold(
         gains: Coefs::of(gains.into_iter().collect(), coefficients),
         strips: strips.into_iter().map(|((s, _), p)| (s, p)).collect(),
         downs,
+        outputs: outputs.into_iter().collect(),
         ducks: ducks.into_iter().map(|((g, _), c)| (g, c)).collect(),
         depths: (depths.into_iter())
             .map(|((row, g), db)| (row, g, db))
@@ -443,8 +466,8 @@ mod tests {
         assert_eq!(batch.gains.list(), [(1, 0.998), (4, 0.999)]);
         assert_eq!(batch.strips, [(0, StripParam::Trim { db: -9.99 })]);
         assert_eq!(batch.downs, [1]);
-        assert!(batch.sane() && batch.fits(2, 3, &[1, 1], &[]));
-        assert!(!batch.fits(1, 4, &[1, 1], &[]), "coefficient 4 of 4");
+        assert!(batch.sane() && batch.fits(2, 3, 1, &[1, 1], &[]));
+        assert!(!batch.fits(1, 4, 1, &[1, 1], &[]), "coefficient 4 of 4");
     }
 
     /// Per slot a re-route and the up or down state are kept apart, in
@@ -483,6 +506,34 @@ mod tests {
     /// Of a slot's `Route`s and `Detach`es in one log entry the last
     /// counts: a `Detach` after a `Route` leaves the slot detached, a
     /// `Route` after a `Detach` re-routes it, and either is one change.
+    #[test]
+    fn an_outputs_last_enable_or_disable_wins() {
+        let set = |output, enabled| Change::Output { output, enabled };
+        let one = |changes: &[Change]| fold(&items(changes), 2, 4).unwrap().unwrap();
+        assert_eq!(one(&[set(1, false)]), (set(1, false), None));
+        assert_eq!(one(&[set(1, false), set(1, true)]), (set(1, true), None));
+        assert_eq!(one(&[set(1, true), set(1, false)]), (set(1, false), None));
+        // Two outputs: a batch holding each one's last, ascending.
+        let (change, batch) = one(&[set(3, false), set(0, false), set(3, true)]);
+        assert!(matches!(
+            change,
+            Change::Batch {
+                up: 0,
+                routed: 0,
+                ..
+            }
+        ));
+        let batch = batch.unwrap();
+        assert_eq!(batch.outputs, [(0, false), (3, true)]);
+        assert!(batch.sane() && batch.fits(2, 2, 4, &[1, 1], &[]));
+        assert!(!batch.fits(2, 2, 3, &[1, 1], &[]), "output 3 of 3");
+        let unordered = Batch {
+            outputs: vec![(3, true), (0, false)],
+            ..(*batch).clone()
+        };
+        assert!(!unordered.sane());
+    }
+
     #[test]
     fn a_slots_route_and_detach_fold_last_wins() {
         let (route, detach) = (Change::Route { slot: 1 }, Change::Detach { slot: 1 });
@@ -536,6 +587,7 @@ mod tests {
                     gains: Gains::Sparse(Vec::new()),
                     strips: Vec::new(),
                     downs: Vec::new(),
+                    outputs: Vec::new(),
                     ducks: Vec::new(),
                     depths: Vec::new(),
                     masks: Coefs::default(),
@@ -624,15 +676,15 @@ mod tests {
         assert_eq!(b.depths, [(0, 3, 9.8), (1, 3, 9.9)]);
         assert_eq!(b.masks.list(), [(3, 99), (4, 97), (5, 98)]);
         let all = [0, 1, 2];
-        assert!(b.sane() && b.fits(2, 3, &[1, 1, 1, 1], &all));
-        assert!(!b.fits(2, 3, &[1, 1, 1], &all), "a key of slot 3 of 3");
+        assert!(b.sane() && b.fits(2, 3, 1, &[1, 1, 1, 1], &all));
+        assert!(!b.fits(2, 3, 1, &[1, 1, 1], &all), "a key of slot 3 of 3");
         assert!(
-            !b.fits(1, 3, &[1, 1, 1, 1], &all),
+            !b.fits(1, 3, 1, &[1, 1, 1, 1], &all),
             "a depth of channel 1 of 1"
         );
         // Masks 99, 97 and 98 on columns 0, 1 and 2.
         assert!(
-            !b.fits(2, 3, &[1, 1, 1, 1], &[0, 2]),
+            !b.fits(2, 3, 1, &[1, 1, 1, 1], &[0, 2]),
             "a mask off the duck columns"
         );
         for item in [

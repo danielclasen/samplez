@@ -67,6 +67,12 @@ pub struct Counters {
     /// Replicated mode: a detected clock step fences the blocks after it
     /// until the replicated state clears it.
     pub step_fenced: AtomicBool,
+    /// The outputs disabled by the log, a bit per output.
+    pub outputs_disabled: AtomicU64,
+    /// The outputs whose writer was handed back since the supervisor last
+    /// took them, a bit per output: set after the writer is in the return
+    /// ring.
+    pub outputs_released: AtomicU64,
     /// Output blocks starting below the last commit, not written.
     pub output_held_blocks: AtomicU64,
     /// Output open or commit calls libmxl refused.
@@ -481,8 +487,13 @@ pub(crate) enum Change {
     Detach { slot: usize },
     /// Sets one parameter of the slot's strip from the index.
     Strip { slot: usize, param: StripParam },
+    /// The output is written from the index on, once it has a writer, or
+    /// disabled: nothing is written from the index on and its writer is
+    /// handed back.
+    Output { output: usize, enabled: bool },
     /// The engine entries of one log entry, folded: its gains, strip
-    /// parameters (`strips` says whether it has any) and `InputDown`s in
+    /// parameters (`strips` says whether it has any), `InputDown`s and
+    /// `Output`s in
     /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
     /// slots it raises after them and those it re-routes, all of one
     /// input domain, for which one generation is built; of the re-routed
@@ -532,14 +543,15 @@ impl Change {
     }
 
     /// Whether a core holds what this change did once applied: a gain
-    /// change is in the matrix, an `InputDown` in the slot state and a
+    /// change is in the matrix, an `InputDown` in the slot state, an
+    /// `Output` in the outputs disabled and a
     /// strip entry in the strip of a core holding `strips`, but a
     /// swapped-in generation, and the strips under a core built from
     /// product state, stay with the RT thread, so an entry making them
     /// must still reach it.
     pub fn in_core(&self, strips: bool) -> bool {
         match *self {
-            Change::Gain { .. } | Change::InputDown { .. } => true,
+            Change::Gain { .. } | Change::InputDown { .. } | Change::Output { .. } => true,
             Change::Strip { .. } => strips,
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => false,
             Change::Batch {
@@ -698,6 +710,9 @@ pub(crate) struct Out {
     pub first_channel: usize,
     pub channels: usize,
     pub writer: Option<Box<FlowWriter>>,
+    /// Enabled by the log: false from a disabling `Output`'s index until
+    /// an enabling one, while the output holds no writer.
+    pub enabled: bool,
     /// The first block written: the newest due block at handover.
     pub first_k: u64,
     pub meter: OutMeter,
@@ -1446,6 +1461,7 @@ fn capture_core(
     c: &mut Core,
     m: &Mix,
     slots: &[Slot],
+    outs: &[Out],
     awaiting: &[RtEntry],
     pending_gen: Option<LogId>,
     r: &Replica,
@@ -1460,6 +1476,9 @@ fn capture_core(
     c.page_entries.extend_from_slice(&m.page_entries);
     c.entries_page = m.entries_page;
     c.entries_lost = m.entries_lost;
+    c.outputs_disabled = (outs.iter().enumerate())
+        .filter(|(_, o)| !o.enabled)
+        .fold(0, |m, (o, _)| m | bit(o));
     for (d, s) in c.slots.iter_mut().zip(slots) {
         d.up = s.up;
         d.held = s.held;
@@ -2019,6 +2038,12 @@ impl Rt {
                     }
                 }
                 Command::Writer { output, writer } => {
+                    if !self.outs[output].enabled {
+                        // Created before the output was disabled: back,
+                        // for the supervisor to create anew once enabled.
+                        self.hand_back(output, writer);
+                        continue;
+                    }
                     let out = &mut self.outs[output];
                     out.first_k = newest;
                     if let Some(mut old) = out.writer.replace(writer) {
@@ -2275,6 +2300,9 @@ impl Rt {
                         ..e
                     });
                 }
+                for &(output, enabled) in &b.outputs {
+                    self.set_output(output as usize, enabled);
+                }
                 let slots = &self.slots;
                 let legs = |s: usize| slots.get(s).map_or(0, |s| s.channels);
                 let refused = self.mix.apply_ducks(e.at_index, b, legs);
@@ -2321,10 +2349,61 @@ impl Rt {
                 }
             }
             Change::Strip { slot, param } => self.set_strip(e, slot, param),
+            Change::Output { output, enabled } => self.set_output(output, enabled),
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => {
                 self.apply_generation(e)
             }
         }
+    }
+
+    /// Enables output `output` or disables it from the block being
+    /// computed. A disabled output's writer is handed back: in replicated
+    /// mode the committed blocks still in its ring are written to it and
+    /// the open ones withheld first, as when a writer is replaced. An
+    /// enabled one is written once a writer arrives. A replay only keeps
+    /// the flag.
+    fn set_output(&mut self, output: usize, enabled: bool) {
+        self.outs[output].enabled = enabled;
+        if self.replay {
+            return;
+        }
+        let disabled = &self.counters.outputs_disabled;
+        if enabled {
+            disabled.fetch_and(!bit(output), Release);
+            return;
+        }
+        disabled.fetch_or(bit(output), Release);
+        let out = &mut self.outs[output];
+        let Some(mut writer) = out.writer.take() else {
+            return;
+        };
+        if let Some(r) = &mut self.replica {
+            let mut changes = Changes {
+                ring: &mut r.changes,
+                dropped: &self.counters.status_changes_dropped,
+                output: output as u32,
+            };
+            let mut sink = WriterSink {
+                writer: &mut writer,
+                counters: &self.counters,
+                wrote: false,
+            };
+            out.hold.idle(
+                &r.shared.statuses[output],
+                &mut changes,
+                &mut sink,
+                Cause::Released,
+            );
+        }
+        self.hand_back(output, writer);
+    }
+
+    /// Returns output `output`'s writer `writer` and marks the output
+    /// released, so the supervisor drops the writer, which deletes its
+    /// flow, and creates one anew once the output is enabled.
+    fn hand_back(&mut self, output: usize, writer: Box<FlowWriter>) {
+        self.give_back(Returned::Writer(writer));
+        (self.counters.outputs_released).fetch_or(bit(output), Release);
     }
 
     /// Applies what of entry `e` its generation is built for: the slots
@@ -2741,6 +2820,7 @@ impl Rt {
             &mut core,
             &self.mix,
             &self.slots,
+            &self.outs,
             &self.awaiting_gen,
             pending_gen,
             r,
@@ -2763,6 +2843,7 @@ impl Rt {
                 c,
                 &self.mix,
                 &self.slots,
+                &self.outs,
                 &self.awaiting_gen,
                 pending_gen,
                 r,
@@ -2839,6 +2920,12 @@ impl Rt {
         m.page_entries.extend_from_slice(&c.page_entries);
         m.entries_page = c.entries_page;
         m.entries_lost = c.entries_lost;
+        for o in 0..self.outs.len() {
+            let enabled = c.outputs_disabled & bit(o) == 0;
+            if self.outs[o].enabled != enabled {
+                self.set_output(o, enabled);
+            }
+        }
         for (d, s) in self.slots.iter_mut().zip(&c.slots) {
             d.up = s.up;
             d.held = s.held;
@@ -3507,8 +3594,20 @@ mod tests {
         r.late_routes.push((10, 25 * B));
         r.late_lost_until = 26 * B;
 
+        let out = |enabled| Out {
+            first_channel: 0,
+            channels: 1,
+            writer: None,
+            enabled,
+            first_k: 0,
+            meter: OutMeter::new(1),
+            hold: crate::blocks::Hold::new(1, B, 0, true),
+            pages: None,
+        };
+        let outs = [out(true), out(false), out(true)];
+
         let mut c = Core::new(1, 1, 2, 4);
-        capture_core(&mut c, &m, &slots, &awaiting, Some(11), &r);
+        capture_core(&mut c, &m, &slots, &outs, &awaiting, Some(11), &r);
         let want = Core {
             matrix: m.matrix.clone(),
             ducks,
@@ -3518,6 +3617,7 @@ mod tests {
             page_entries: vec![(3, 2 * B), (4, 3 * B)],
             entries_page: Some(1),
             entries_lost: true,
+            outputs_disabled: 0b010,
             slots: vec![
                 SlotCore {
                     up: true,
@@ -3910,7 +4010,7 @@ mod tests {
                 slot(true, false, None, false, None),
             ];
             let mut c = Core::new(2, 2, 2, 0);
-            capture_core(&mut c, &self.mix, &slots, &[], None, &replica());
+            capture_core(&mut c, &self.mix, &slots, &[], &[], None, &replica());
             let copy = CoreCopy {
                 k0,
                 last_id: 0,

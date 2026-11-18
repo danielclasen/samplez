@@ -23,6 +23,8 @@ pub struct Targets {
     pub ducks: Vec<DuckTargets>,
     /// The duck mask of each coefficient, shaped as `gains`.
     pub masks: Vec<Vec<u8>>,
+    /// Per output, whether it is enabled; an output past the list is.
+    pub outputs: Vec<bool>,
 }
 
 impl Targets {
@@ -36,9 +38,11 @@ impl Targets {
     /// mask `self` does not hold counting as 0, the mask an engine holds
     /// before any entry sets one; a
     /// `Route` for each slot whose flow differs, a `Detach` for one
-    /// `next` holds none for. A target `next` holds and
-    /// `self` does not counts as different; one `self` holds and `next`
-    /// does not gets no entry, so the engine keeps it.
+    /// `next` holds none for; an `Output` for each output whose enabled
+    /// state differs, an output past either list enabled. Of the other
+    /// targets, one `next` holds and `self` does not counts as
+    /// different; one `self` holds and `next` does not gets no entry, so
+    /// the engine keeps it.
     pub fn diff(&self, next: &Targets) -> Vec<Entry> {
         let mut entries = Vec::new();
         for (input, row) in next.gains.iter().enumerate() {
@@ -61,13 +65,21 @@ impl Targets {
                 entries.push(flow_entry(slot, flow.as_deref()));
             }
         }
+        let enabled = |t: &Targets, o: usize| t.outputs.get(o).copied().unwrap_or(true);
+        for slot in 0..self.outputs.len().max(next.outputs.len()) {
+            if enabled(self, slot) != enabled(next, slot) {
+                let enabled = enabled(next, slot);
+                entries.push(Entry::Output { slot, enabled });
+            }
+        }
         entries
     }
 
     /// The entries that set every gain, strip parameter and duck setting
     /// of `self`, whatever an engine holds, in the order of
-    /// [`Targets::diff`], and a `Route`, or a `Detach` for a slot without
-    /// a flow, for each of `slots` in ascending order. Of the duck masks,
+    /// [`Targets::diff`], a `Route`, or a `Detach` for a slot without a
+    /// flow, for each of `slots` in ascending order, and an `Output` for
+    /// each output `self` holds. Of the duck masks,
     /// every one other than 0, and a 0 for each coefficient `masked`
     /// holds a mask other than 0 for: an engine holds
     /// a mask other than 0 only where an entry set one, so `masked`, every
@@ -78,6 +90,7 @@ impl Targets {
         // strip parameter, duck setting and mask other than 0.
         let mut entries = Targets::default().diff(&Targets {
             flows: Vec::new(),
+            outputs: Vec::new(),
             ..self.clone()
         });
         for (input, row) in self.masks.iter().enumerate() {
@@ -103,6 +116,9 @@ impl Targets {
             if let Some(flow) = self.flows.get(slot) {
                 entries.push(flow_entry(slot, flow.as_deref()));
             }
+        }
+        for (slot, &enabled) in self.outputs.iter().enumerate() {
+            entries.push(Entry::Output { slot, enabled });
         }
         entries
     }
@@ -527,6 +543,33 @@ mod tests {
     /// A slot whose flow `next` holds none for is detached, also when
     /// `self` holds no flow for it; one already detached gets no entry.
     /// Asserted, a slot without a flow is detached.
+    #[test]
+    fn an_outputs_enabled_state_is_diffed_and_asserted() {
+        let off = |slot| Entry::Output {
+            slot,
+            enabled: false,
+        };
+        let on = |slot| Entry::Output {
+            slot,
+            enabled: true,
+        };
+        let mut next = targets();
+        next.outputs = vec![true, false];
+        assert_eq!(targets().diff(&next), vec![off(1)]);
+        assert_eq!(next.diff(&next), Vec::new());
+        // Past the list an output is enabled: dropping a disabled one
+        // enables it, dropping an enabled one changes nothing.
+        assert_eq!(next.diff(&targets()), vec![on(1)]);
+        next.outputs = vec![true];
+        assert_eq!(targets().diff(&next), Vec::new());
+        // After the routes; one per output held, both values.
+        next.outputs = vec![false, true];
+        let all = next.assert(&[0], None);
+        let n = all.len();
+        assert_eq!(all[n - 2..], [off(0), on(1)]);
+        assert!(matches!(all[n - 3], Entry::Route { slot: 0, .. }));
+    }
+
     #[test]
     fn a_slot_without_a_flow_is_detached() {
         let mut next = targets();

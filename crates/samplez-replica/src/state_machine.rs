@@ -838,6 +838,7 @@ impl<P: Product> StateMachine<P> {
             gains: targets.gains,
             up,
             flows: targets.flows,
+            outputs: targets.outputs,
             strips: targets.strips,
             ducks: targets.ducks,
             masks: targets.masks,

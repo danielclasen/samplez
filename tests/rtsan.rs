@@ -2,7 +2,8 @@
 //! `-Zsanitizer=realtime --cfg samplez_rtsan` (CI's RTSan step), any call
 //! RTSan counts as blocking (allocation, pthread lock, sleep, blocking
 //! syscall) inside it aborts the process. The run covers input generation
-//! swaps, a re-route crossfade, detach and route cycles, a gain ramp,
+//! swaps, a re-route crossfade, detach and route cycles, output disable
+//! and enable cycles, a gain ramp,
 //! output commits, output, meter and input metering and loudness resets,
 //! strips with every unit on, a writer's refusals, a read of selected
 //! channels of a wide flow, and, for a replicated engine, every path of
@@ -109,6 +110,43 @@ fn the_rt_thread_passes_rtsan() {
         "the meter and the input were not metered"
     );
     assert!(verdicts.iter().filter(|v| v.written != 0).count() > 1_000);
+    assert_eq!(engine.status().diverged, None);
+    assert_eq!(engine.status().rt_panic, None);
+    common::stop(engine);
+}
+
+/// Cycles of an output's state under RealtimeSanitizer, each a disable,
+/// its writer handed back, then an enable and the new writer taken in.
+#[test]
+fn the_rt_thread_passes_rtsan_through_output_disable_and_enable() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let (engine, _rx) = start(config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&dst, 2)],
+        common::diagonal(2, 1.0),
+        MARGIN,
+    ));
+    let output = || engine.status().outputs[0].clone();
+    wait_for(Duration::from_secs(5), "output realised", || {
+        output().realised
+    });
+    for _ in 0..3 {
+        engine.set_output_enabled(0, false, 0).unwrap();
+        wait_for(Duration::from_secs(5), "output released", || {
+            let o = output();
+            !o.enabled && !o.realised && !domain.has_flow(&dst)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        engine.set_output_enabled(0, true, 0).unwrap();
+        wait_for(Duration::from_secs(5), "output realised again", || {
+            let o = output();
+            o.enabled && o.realised
+        });
+        std::thread::sleep(Duration::from_millis(300));
+    }
     assert_eq!(engine.status().diverged, None);
     assert_eq!(engine.status().rt_panic, None);
     common::stop(engine);

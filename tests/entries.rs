@@ -753,6 +753,121 @@ fn a_detached_input_on_an_engine_with_its_own_log_keeps_its_state() {
     common::stop(e);
 }
 
+/// A disabled output's flow is gone from the domain while the engine runs
+/// on; enabled again, a writer another process holds on the flow is
+/// reported and the output realised once that writer is gone, written
+/// from then on.
+#[test]
+fn a_disabled_output_leaves_no_flow_and_is_created_again_when_enabled() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let (e, rx) = common::start(config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    ));
+    running(&e);
+    assert!(domain.has_flow(&out));
+    for (slot, at) in [(1, 0), (0, B + 8)] {
+        assert!(
+            matches!(
+                e.set_output_enabled(slot, false, at),
+                Err(samplez::EntryError::Invalid(_))
+            ),
+            "output {slot} disabled at {at}"
+        );
+    }
+    let output = || e.status().outputs[0].clone();
+    e.set_output_enabled(0, false, 0).unwrap();
+    wait_for(10 * SECOND, "output released, its flow deleted", || {
+        let o = output();
+        !o.enabled && !o.realised && !domain.has_flow(&out)
+    });
+    std::thread::sleep(SECOND);
+    assert!(
+        !domain.has_flow(&out),
+        "the flow created again while disabled"
+    );
+    // Another writer on the flow when it is enabled.
+    let foreign = Pilot::start(&domain.0, &out, 1, B, 0);
+    wait_for(10 * SECOND, "foreign flow", || domain.has_flow(&out));
+    e.set_output_enabled(0, true, 0).unwrap();
+    wait_for(10 * SECOND, "the other writer reported", || {
+        let o = output();
+        o.enabled
+            && !o.realised
+            && o.reason.as_deref() == Some("another writer is live on the flow")
+    });
+    drop(foreign);
+    wait_for(40 * SECOND, "output realised again", || {
+        output().realised && domain.has_flow(&out)
+    });
+    // Written from then on: the pilot through a gain of 1.
+    let mut seen = Vec::new();
+    let k = now_kept(&rx, &mut seen) + 2;
+    wait_past(&rx, k + 10, &mut seen);
+    let x = common::read_blocks(&domain.0, &out, 1, k..k + 10);
+    for (i, k) in (k..k + 10).enumerate() {
+        if computed(&seen, k) {
+            assert!(block(&x, 1, i, 0) == ramped(0, k, 1.0, 1.0, 0), "block {k}");
+        }
+    }
+    assert_eq!(e.status().diverged, None);
+    common::stop(e);
+}
+
+/// Of the `Output`s of one log entry the last counts, on an engine that
+/// follows a replicated log.
+#[test]
+fn an_outputs_last_enable_or_disable_in_a_log_entry_counts() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+    let (e, rx, _reports) = start_replicated(config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    ));
+    running(&e);
+    assert!(
+        matches!(
+            e.set_output_enabled(0, false, 0),
+            Err(samplez::EntryError::Invalid(_))
+        ),
+        "an output disabled outside the replicated log"
+    );
+    let set = |enabled| Entry::Output { slot: 0, enabled };
+    let output = || e.status().outputs[0].clone();
+    let mut seen = Vec::new();
+    let at = (now_kept(&rx, &mut seen) + 100) * B;
+    e.append_batch(1, at, &[set(false), set(true)]).unwrap();
+    e.commit(1);
+    wait_past(&rx, at / B + 10, &mut seen);
+    let o = output();
+    assert!(o.enabled && o.realised && domain.has_flow(&out), "{o:?}");
+    let at = (now_kept(&rx, &mut seen) + 100) * B;
+    e.append_batch(2, at, &[set(true), set(false)]).unwrap();
+    e.commit(2);
+    wait_for(10 * SECOND, "output released, its flow deleted", || {
+        let o = output();
+        !o.enabled && !o.realised && !domain.has_flow(&out)
+    });
+    let at = (now_kept(&rx, &mut seen) + 100) * B;
+    e.append(3, at, set(true)).unwrap();
+    e.commit(3);
+    wait_for(10 * SECOND, "output realised again", || {
+        let o = output();
+        o.enabled && o.realised && domain.has_flow(&out)
+    });
+    assert_eq!(e.status().diverged, None);
+    common::stop(e);
+}
+
 /// A re-route at an index inside a block is refused, as a gain or strip
 /// change there is: taken at the next block start it would be late, its
 /// generation dropped although the call succeeded.

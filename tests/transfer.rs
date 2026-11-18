@@ -643,6 +643,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
         flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
+        outputs: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
@@ -716,6 +717,7 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
         flows: vec![Some(src.clone())],
+        outputs: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -754,6 +756,7 @@ fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
             gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
             up: vec![true],
             flows: vec![Some(src.clone())],
+            outputs: Vec::new(),
             strips: vec![Vec::new()],
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -848,6 +851,7 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
         flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
+        outputs: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
@@ -887,6 +891,7 @@ fn a_product_entry_the_install_passed_is_folded_in() {
         flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
+        outputs: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: vec![(
@@ -986,6 +991,7 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
             gains: identity,
             up: vec![true, true],
             flows: vec![None, Some(other.clone())],
+            outputs: Vec::new(),
             strips: vec![Vec::new(), Vec::new()],
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -1004,6 +1010,66 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
         }
         Ok(())
     });
+}
+
+/// A product state holding an output disabled installs a core that
+/// disables it: its writer is released. One holding it enabled, or not
+/// at all, enables it again, and a pending `Output` the install passed
+/// is folded in.
+#[test]
+fn a_product_state_disables_and_enables_an_output() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed(&domain, &src);
+    let output = || h.e.status().outputs[0].clone();
+    wait_for(Duration::from_secs(5), "output realised", || {
+        output().realised
+    });
+    let state = |outputs: Vec<bool>, pending: Vec<(u64, u64, Entry)>| ProductState {
+        gains: common::diagonal(2, 1.0),
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        outputs,
+        strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
+        pending,
+        last_id: 1,
+    };
+    let install = |s: &ProductState| {
+        h.e.drop_core().unwrap();
+        h.e.install_product(s, 0, Duration::from_secs(2)).unwrap()
+    };
+    install(&state(vec![false], Vec::new()));
+    wait_for(Duration::from_secs(5), "output released", || {
+        let o = output();
+        !o.enabled && !o.realised
+    });
+    install(&state(Vec::new(), Vec::new()));
+    wait_for(Duration::from_secs(5), "output realised again", || {
+        let o = output();
+        o.enabled && o.realised
+    });
+    // Enabled in the state, disabled by an entry whose index it passed.
+    let off = Entry::Output {
+        slot: 0,
+        enabled: false,
+    };
+    install(&state(vec![true], vec![(1, 0, off)]));
+    wait_for(
+        Duration::from_secs(5),
+        "output released by the entry",
+        || {
+            let o = output();
+            !o.enabled && !o.realised
+        },
+    );
+    let too_many = state(vec![true, true], Vec::new());
+    assert!(matches!(
+        h.e.install_product(&too_many, 0, Duration::from_secs(2)),
+        Err(samplez::ReplayError::Invalid(_))
+    ));
 }
 
 /// A core copied with a detached input decodes with it and is replayed
@@ -1102,6 +1168,7 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
             flows: vec![Some(src.clone())],
 
             strips: vec![Vec::new()],
+            outputs: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: vec![(1, at, strip)],
@@ -1154,6 +1221,7 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
         flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
+        outputs: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
@@ -1244,6 +1312,7 @@ fn a_route_the_core_carried_is_not_applied_again() {
         flows: vec![Some(src.clone())],
 
         strips: vec![Vec::new()],
+        outputs: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: vec![(1, at, route)],
@@ -1593,6 +1662,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
             flows: vec![Some(next.clone())],
+            outputs: Vec::new(),
             strips: vec![vec![trim]],
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -1708,6 +1778,7 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true, true],
         flows: vec![Some(src0.clone()), Some(next1.clone())],
+        outputs: Vec::new(),
         strips: vec![Vec::new(), Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1883,6 +1954,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
             flows: vec![Some(src.clone())],
+            outputs: Vec::new(),
             strips: vec![Vec::new()],
             ducks: vec![DuckTargets {
                 keys: vec![(0, 0.5)],

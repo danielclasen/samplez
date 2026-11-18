@@ -212,8 +212,13 @@ index on, whatever is readable), `InputUp` (it fades in from the index),
 `Route` (it crossfades to another flow over the ramp length from the
 index), `Detach` (it crossfades to silence over the ramp length from the
 index and reads no flow, is not polled and is not reported until a
-`Route` fades it in from silence; its up or down state is kept) and
-`Strip` (one parameter of an input's channel strip, a
+`Route` fades it in from silence; its up or down state is kept),
+`Output` (an output disabled: nothing is written to it from the index
+on and its writer is released, which deletes its flow unless another
+writer holds it; or enabled: its flow is created as at start-up and
+written from the first block due once the writer is in, another writer
+live on the flow reported in the output's status and the creation
+retried) and `Strip` (one parameter of an input's channel strip, a
 `samplez_dsp::StripParam`, ramping over the ramp length). Each sets an
 absolute target, so an entry applied again once its ramp has ended
 changes nothing; applied again while it ramps, it starts the ramp over
@@ -226,15 +231,16 @@ are stamped; `Engine::progress` reports buildLead and the build time,
 the percentile and a supervisor tick without the engine's lead.
 `Engine::start` keeps the log itself, stamping `InputDown`
 when an input is pruned and `InputUp` once its head has advanced for a
-second, wherever it stands against the clock, and each `InputUp`,
+second, wherever it stands against the clock, each `InputUp`,
 `Route` (`Engine::route`) or `Detach` (`Engine::detach`) at least
-buildLead after the one before;
+buildLead after the one before, and an `Output`
+(`Engine::set_output_enabled`) as a gain change;
 `Engine::start_replicated` takes entries through `append`, `commit` and
 `truncate` and sends those reports out instead.
 
 A replicated log entry may carry any number of engine entries
 (`append_batch`). They are folded off the RT thread: per matrix
-coefficient and strip parameter the last value; per input slot
+coefficient, strip parameter and output the last value; per input slot
 whether it is re-routed or detached, the last `Route` or `Detach`
 counting, goes down and comes up, an `InputUp` after an `InputDown`
 fading in from silence and a route kept whatever the state. The log
