@@ -191,6 +191,9 @@ pub(crate) fn config() -> NmosConfig {
             instance_id: "test/node".into(),
             functions: vec!["Mixer".into()],
         },
+        heartbeat: Duration::from_secs(5),
+        registries: Vec::new(),
+        dns_sd_domain: None,
     }
 }
 
@@ -534,6 +537,7 @@ fn bump_never_repeats_or_goes_back() {
         device_version: Tai::default(),
         senders: Vec::new(),
         receivers: Vec::new(),
+        changed: Default::default(),
     };
     let a = st.bump(Tai::new(5, 0));
     let b = st.bump(Tai::new(5, 0));
@@ -561,6 +565,8 @@ fn the_model_is_checked() {
     refuse(&|_, c| c.seed.clear());
     refuse(&|_, c| c.asset.functions.clear());
     refuse(&|_, c| c.asset.manufacturer.clear());
+    refuse(&|_, c| c.registries = vec!["https://192.0.2.1:8443".into()]);
+    refuse(&|_, c| c.registries = vec!["http://192.0.2.1".into(), "192.0.2.2:80".into()]);
     // One resource per role in a BCP-002-01 group, and no colon in it.
     refuse(&|m, _| {
         let mut s = m.senders[0].clone();
