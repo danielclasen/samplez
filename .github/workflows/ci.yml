@@ -437,10 +437,75 @@ jobs:
             .cargo-registry
           key: cargo-rt-${{ hashFiles('Cargo.lock', 'docker/builder/Dockerfile') }}-${{ github.sha }}
 
+  # The AMWA nmos-testing node suites against the samplez-nmos example
+  # node: IS-04-01 with unicast and with multicast DNS-SD, IS-05-01 and
+  # BCP-007-03-01, each against a freshly started node. tests/nmos/gate.py
+  # fails on any result not Pass that tests/nmos/expected.json does not
+  # list with its reason.
+  nmos:
+    runs-on: ubuntu-24.04
+    env:
+      NMOS_TESTING: b21639f3a187c0e027bb7894fbe0c21d22285dfb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the builder image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/builder
+          load: true
+          tags: samplez-builder:ci
+          cache-from: type=gha,scope=builder
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target
+            .cargo-registry
+          key: cargo-debug-${{ hashFiles('Cargo.lock', 'docker/builder/Dockerfile') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-debug-${{ hashFiles('Cargo.lock', 'docker/builder/Dockerfile') }}-
+            cargo-debug-
+      - name: Build the example node
+        run: |
+          mkdir -p .cargo-registry
+          docker run --rm --user "$(id -u):$(id -g)" -e CARGO_INCREMENTAL=0 \
+            -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
+            -w /w samplez-builder:ci cargo build --locked -p samplez-nmos --example nmos-node
+      - name: Check out nmos-testing
+        run: |
+          git init -q nmos-testing
+          git -C nmos-testing fetch -q --depth 1 https://github.com/AMWA-TV/nmos-testing "$NMOS_TESTING"
+          git -C nmos-testing checkout -q FETCH_HEAD
+      - name: Build the nmos-testing image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: nmos-testing
+          load: true
+          tags: nmos-testing:ci
+          cache-from: type=gha,scope=nmos-testing
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,scope=nmos-testing,mode=max' || '' }}
+      # The node reads CLOCK_TAI, the tool computes TAI from UTC: absolute
+      # activations meet only with the kernel's TAI offset set.
+      - name: Set the kernel TAI offset
+        run: sudo python3 tests/nmos/set-tai-offset.py 37
+      - name: Run the suites
+        run: tests/nmos/conformance.sh target/debug/examples/nmos-node samplez-builder:ci nmos-testing:ci nmos-results
+      - name: Gate on the results
+        run: |
+          python3 -B -m unittest tests/nmos/test_gate.py
+          python3 tests/nmos/gate.py tests/nmos/expected.json nmos-results
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nmos-testing-results
+          path: nmos-results
+
   # The required check: green only when every job above passed.
   ci:
     if: always()
-    needs: [lint, debug, vm-clock, release, e2e-release, rt-gates]
+    needs: [lint, debug, vm-clock, release, e2e-release, rt-gates, nmos]
     runs-on: ubuntu-24.04
     steps:
       - name: Every job passed

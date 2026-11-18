@@ -551,6 +551,46 @@ commit into an output's shared mapping can wait for the page's
 writeback, and the loop then skips blocks.
 
 
+## NMOS
+
+`samplez-nmos` gives a product an NMOS node for its MXL writers and
+readers per AMWA BCP-007-03: one Source, Flow and Sender per writer and
+one Receiver per reader, transport `urn:x-nmos:transport:mxl`. The
+product describes them in a `NodeModel`, implements `Connections`
+(what a domain holds under a flow id, and applying an activation) and
+`Store` (the last `/active` per port, read at start), serves
+`Nmos::router()` on its NMOS listener (`Service::nmos`) and runs
+`Nmos::registration()`. The crate links no libmxl and runs on the
+product's non-RT runtime.
+
+- IS-04 v1.3 (Node API and registration) and IS-05 v1.2 (single and
+  bulk) only.
+- `/active` is written when an activation fires. Each port hands its
+  activations to `Connections::apply` one at a time and in order: an
+  immediate one once `/active` shows it, a scheduled one
+  `Connections::lead` before its time. A cancel after that hands the
+  product the still-active connection for the same time. A failed apply
+  sets `master_enable` false in `/active` with a new IS-04 version.
+- Scheduled activations are held in memory: a restart drops them.
+- No IS-10 or BCP-003-01: the APIs answer without authentication, and
+  the registration client sends no credentials and uses registries
+  advertising `api_proto=http` and `api_auth=false` only, so no TLS.
+- No peer-to-peer mode: without a registry the node is not advertised.
+- `PUT /receivers/{id}/target` answers 501.
+
+CI runs the AMWA nmos-testing suites IS-04-01 (unicast and multicast
+DNS-SD), IS-05-01 and BCP-007-03-01 against the example node
+(`cargo run -p samplez-nmos --example nmos-node`), restarting it between
+suites and failing when a resource id changes across a restart. The tool
+validates against the AMWA specification commits pinned in
+`tests/nmos/specs.txt`, not against their latest state. Results other
+than Pass are accepted only as listed, with their reason from the
+tool's source, in `tests/nmos/expected.json`, and each suite has to run
+at least the number of tests listed there. Of the Manual tests,
+IS-04-01 test_22 (ids persist over a restart) is the restart check;
+BCP-007-03-01 test_15 (MXL reads and writes start and stop on
+activation) needs a product with an engine and is not covered here.
+
 ## Building and testing
 
 `docker/builder` holds the build environment: Rust 1.96.0, clang and

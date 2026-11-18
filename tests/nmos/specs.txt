@@ -1,0 +1,31 @@
+# The AMWA specification repositories nmos-testing validates against, at
+# pinned commits: <repository> <branch> <commit>. One line per version
+# branch nmos-testing's Config.SPECIFICATIONS lists, so the tool finds
+# every branch it looks for and clones none. spec-cache.sh fills the
+# tool's cache from it.
+is-04 v1.0.x 4563b5dcd09238f3dcb98ca1453c09900ff8ad82
+is-04 v1.1.x b836f93d288f8f7f2e1ff63375241b8cc3f8e55b
+is-04 v1.2.x 486622a42fd0d366e294ac019057f78c84e50292
+is-04 v1.3.x eaeb397a9c7de43007464e8db0d7b416654e0e3c
+is-05 v1.0.x 639adad666610d6ffe2ec8097051d047cf9469e9
+is-05 v1.1.x 78f74c539d5ef19ee6c1c2593bf21784940c0588
+is-05 v1.2.x 27eae6fdb1458b17de86e048cb30c0627ec75207
+is-06 v1.0.x 4d40f6a46c3a889adf99269f8e3b0768b174d038
+is-07 v1.0.x abe175c2fbe3f970d5e7650f3992a8e1dcb39afe
+is-08 v1.0.x 94304187434810d091b8e277109da031cf62cf46
+is-09 v1.0.x a32040822713113ebfd27a89dcd39a3cbd51a4ef
+is-10 v1.0.x a9f6ce5d685508ef64c59c70ba08f2b301c7ddd3
+is-11 v1.0.x 1ec2ded670c51369c275ee7a789d9ee990ce4c3b
+is-12 v1.0.x 0b0c477a76292970708305f7f161781c6faefce5
+is-14 v1.0.x 903611dc47d253685e4ef4434d40aacb55f70b7b
+ms-05-02 v1.0.x ecfa0406c181875a04713f9b27b081ee8fac84b5
+nmos-control-feature-sets main 0ba6c1c899f70c673adba5cb6d0c8a994fd3288c
+bcp-002-01 v1.0.x e7118200bd99f6d2ce037859588f9a9febded848
+bcp-002-02 v1.0.x f19fa9391a6e260699476acbefc1b62b08f39436
+bcp-003-01 v1.0.x 873cef44c397d4e8e6c5fc7923e15974553774d1
+bcp-004-01 v1.0.x d8e9fd3bee7ba41d87ff3c3c197ec5ab7fa4b353
+bcp-008-01 v1.0.x f7ea61b53e195289111ed64d2ac0cf68255a41e7
+bcp-008-02 v1.0.x ffdefabadb57055c1546195d82ae6fc23ac19434
+bcp-005-01 v1.0.x bed5e8f699b089710c488e459bcf09830c2ca087
+bcp-007-03 v1.0.x 51c081833a3eccc858122d2ede626271d6e67bf6
+nmos-parameter-registers main 340e1b6030efb5db270552d8667ede8ac072ffb0

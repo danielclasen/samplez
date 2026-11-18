@@ -3,3 +3,5 @@
 lint-probe.log
 rtsan.log
 /nmos-specs
+/nmos-testing
+/nmos-results

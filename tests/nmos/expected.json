@@ -1,0 +1,430 @@
+{
+  "minimum": {
+    "is-04-01-unicast": 71,
+    "is-04-01-multicast": 71,
+    "is-05-01": 78,
+    "bcp-007-03-01": 70
+  },
+  "expected": [
+    {
+      "run": "is-04-01-unicast",
+      "test": "auto_node_17",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "auto_node_18",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "auto_node_19",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "auto_node_20",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "auto_node_21",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "auto_node_22",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "auto_node_23",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "auto_node_17",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "auto_node_18",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "auto_node_19",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "auto_node_20",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "auto_node_21",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "auto_node_22",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "auto_node_23",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_node_17",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_node_18",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_node_19",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_node_20",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_node_21",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_node_22",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_node_23",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-05-01",
+      "test": "auto_connection_23",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-05-01",
+      "test": "auto_connection_24",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-05-01",
+      "test": "auto_connection_25",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-05-01",
+      "test": "auto_connection_26",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-05-01",
+      "test": "auto_connection_27",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-05-01",
+      "test": "auto_connection_28",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-05-01",
+      "test": "auto_connection_29",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_connection_23",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_connection_24",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_connection_25",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_connection_26",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_connection_27",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_connection_28",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "auto_connection_29",
+      "result": "Test Disabled",
+      "reason": "GenericTest: the Authorization checks run only with ENABLE_AUTH; IS-10 is out of scope"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "test_01",
+      "result": "Test Disabled",
+      "reason": "IS0401Test: multicast DNS-SD discovery runs only with DNS_SD_MODE 'multicast'"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "test_01_01",
+      "result": "Test Disabled",
+      "reason": "IS0401Test: multicast DNS-SD discovery runs only with DNS_SD_MODE 'multicast'"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "test_02",
+      "result": "Test Disabled",
+      "reason": "IS0401Test: unicast DNS-SD discovery runs only with DNS_SD_MODE 'unicast'"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "test_02_01",
+      "result": "Test Disabled",
+      "reason": "IS0401Test: unicast DNS-SD discovery runs only with DNS_SD_MODE 'unicast'"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "test_12",
+      "result": "Test Disabled",
+      "reason": "IS0401Test: disabled for Nodes >= v1.3"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "test_12",
+      "result": "Test Disabled",
+      "reason": "IS0401Test: disabled for Nodes >= v1.3"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "test_13",
+      "result": "Could Not Test",
+      "reason": "IS0401Test: exercises urn:x-nmos:transport:rtp receivers only; the node exposes MXL receivers"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "test_14",
+      "result": "Could Not Test",
+      "reason": "IS0401Test: exercises urn:x-nmos:transport:rtp receivers only; the node exposes MXL receivers"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "test_13",
+      "result": "Could Not Test",
+      "reason": "IS0401Test: exercises urn:x-nmos:transport:rtp receivers only; the node exposes MXL receivers"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "test_14",
+      "result": "Could Not Test",
+      "reason": "IS0401Test: exercises urn:x-nmos:transport:rtp receivers only; the node exposes MXL receivers"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "test_19",
+      "result": "Could Not Test",
+      "reason": "IS0401Test: Node 'interfaces' is empty; MXL ports have no interface bindings (BCP-007-03)"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "test_19_01",
+      "result": "Could Not Test",
+      "reason": "IS0401Test: Node 'interfaces' is empty; MXL ports have no interface bindings (BCP-007-03)"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "test_19",
+      "result": "Could Not Test",
+      "reason": "IS0401Test: Node 'interfaces' is empty; MXL ports have no interface bindings (BCP-007-03)"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "test_19_01",
+      "result": "Could Not Test",
+      "reason": "IS0401Test: Node 'interfaces' is empty; MXL ports have no interface bindings (BCP-007-03)"
+    },
+    {
+      "run": "is-04-01-unicast",
+      "test": "test_22",
+      "result": "Manual",
+      "reason": "IS0401Test: always Manual; conformance.sh compares every resource id across the restarts"
+    },
+    {
+      "run": "is-04-01-multicast",
+      "test": "test_22",
+      "result": "Manual",
+      "reason": "IS0401Test: always Manual; conformance.sh compares every resource id across the restarts"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_01",
+      "result": "Not Applicable",
+      "reason": "IS0501Test: replaced by the 'auto' tests"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_02",
+      "result": "Not Applicable",
+      "reason": "IS0501Test: replaced by the 'auto' tests"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_03",
+      "result": "Not Applicable",
+      "reason": "IS0501Test: replaced by the 'auto' tests"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_04",
+      "result": "Not Applicable",
+      "reason": "IS0501Test: replaced by the 'auto' tests"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_05",
+      "result": "Not Applicable",
+      "reason": "IS0501Test: replaced by the 'auto' tests"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_06",
+      "result": "Not Applicable",
+      "reason": "IS0501Test: replaced by the 'auto' tests"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_07",
+      "result": "Not Applicable",
+      "reason": "IS0501Test: replaced by the 'auto' tests"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_08",
+      "result": "Not Applicable",
+      "reason": "IS0501Test: replaced by the 'auto' tests"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_33",
+      "result": "Not Applicable",
+      "reason": "IS0501Test: replaced by the 'auto' tests"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_09_01",
+      "result": "Could Not Test",
+      "reason": "IS0501Test requires_compatible_resources: MXL senders and receivers are covered by BCP-007-03-01"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_11",
+      "result": "Could Not Test",
+      "reason": "IS0501Test requires_compatible_resources: MXL senders and receivers are covered by BCP-007-03-01"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_11_02",
+      "result": "Could Not Test",
+      "reason": "IS0501Test requires_compatible_resources: MXL senders and receivers are covered by BCP-007-03-01"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_12",
+      "result": "Could Not Test",
+      "reason": "IS0501Test requires_compatible_resources: MXL senders and receivers are covered by BCP-007-03-01"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_12_02",
+      "result": "Could Not Test",
+      "reason": "IS0501Test requires_compatible_resources: MXL senders and receivers are covered by BCP-007-03-01"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_15",
+      "result": "Could Not Test",
+      "reason": "IS0501Test requires_compatible_resources: MXL senders and receivers are covered by BCP-007-03-01"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_16",
+      "result": "Could Not Test",
+      "reason": "IS0501Test requires_compatible_resources: MXL senders and receivers are covered by BCP-007-03-01"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_41",
+      "result": "Could Not Test",
+      "reason": "IS0501Test requires_compatible_resources: MXL senders and receivers are covered by BCP-007-03-01"
+    },
+    {
+      "run": "is-05-01",
+      "test": "test_42",
+      "result": "Could Not Test",
+      "reason": "IS0501Test requires_compatible_resources: MXL senders and receivers are covered by BCP-007-03-01"
+    },
+    {
+      "run": "bcp-007-03-01",
+      "test": "test_15",
+      "result": "Manual",
+      "reason": "BCP0070301Test: always Manual; needs a product that reads and writes MXL"
+    }
+  ]
+}
