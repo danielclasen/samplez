@@ -25,7 +25,7 @@ use samplez_replica::bootstrap::{self, Bootstrap, Kube, Marker, Markers, Plan, V
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::NodeId;
 use samplez_replica::log_store::Store;
-use samplez_replica::membership::{NO_MEMBER_ROUNDS, PERIOD, Slot, Voters, slot_of};
+use samplez_replica::membership::{NO_MEMBER_ROUNDS, PERIOD, Slot, UNCOUNTED, Voters, slot_of};
 use samplez_replica::net::{Network, Pool};
 use samplez_replica::peer::{self, PeerClient, PeerRequest, Refused};
 use samplez_replica::{Replica, Settings, raft_config};
@@ -802,6 +802,16 @@ async fn ordinal_0_joins_the_running_set_after_its_marker_is_gone() {
     assert_eq!(set.api.marker().map(|m| m.0), Some(epoch));
     let revision = set.write(Slot::Audio(0), "1", "gain=1@1").await;
     assert!(revision > 0, "the set commits");
+    // The stopped replica asks nobody to take its old id back in: past
+    // the time it would have found itself uncounted and asked again, the
+    // membership still holds the running replicas alone.
+    tokio::time::sleep(UNCOUNTED + 2 * PERIOD).await;
+    let want: BTreeSet<NodeId> = set.nodes.values().map(|n| n.id).collect();
+    assert!(
+        set.voters_become(&want, PERIOD).await.is_some(),
+        "the stopped replica's id is back in the membership:\n{}",
+        set.describe()
+    );
 }
 
 /// A StatefulSet deleted with its marker and created again on the volumes

@@ -369,13 +369,18 @@ impl Counting {
 /// as a voter ([`Counting`]), checked each 100 ms; once it was not
 /// counted for [`UNCOUNTED`] it asks to join again under its own id each
 /// [`PERIOD`], as one removed from the voters while it was down must.
+/// Ends once the replica is shut down: a stopped replica asking under its
+/// id would put a node no process serves back into the membership.
 pub(crate) async fn watch(shared: Arc<Shared>, bootstrap: Bootstrap) {
     tokio::spawn(keep_marker(shared.clone(), bootstrap.markers.clone()));
     let mut empty_rounds = 0;
     let mut counting = Counting::default();
     let mut asked_at: Option<Instant> = None;
     loop {
-        if shared.raft.is_initialized().await.unwrap_or(true) {
+        let Ok(initialized) = shared.raft.is_initialized().await else {
+            return;
+        };
+        if initialized {
             let metrics = shared.raft.metrics().borrow().clone();
             let found = shared.counted_now().await;
             let counted = counting.check(found, &metrics, shared.settings.id);
