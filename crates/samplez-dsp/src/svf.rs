@@ -1,7 +1,8 @@
-//! The strip's filters: a state variable filter in the trapezoidal form
-//! of Andrew Simper (Cytomic, "SvfLinearTrapOptimised2"), whose outputs
-//! mix to the high-pass, bell and shelf responses of the RBJ Audio EQ
-//! Cookbook (Robert Bristow-Johnson), with the same bilinear prewarp.
+//! The filters of the strip and of the duck detector's keys: a state
+//! variable filter in the trapezoidal form of Andrew Simper (Cytomic,
+//! "SvfLinearTrapOptimised2"), whose outputs mix to the high-pass,
+//! low-pass, bell and shelf responses of the RBJ Audio EQ Cookbook
+//! (Robert Bristow-Johnson), with the same bilinear prewarp.
 //!
 //! The coefficients `(g, k, m0, m1, m2)` are computed in f64 with the
 //! pure-Rust `libm`, so every replica gets the same bits, and stored as
@@ -13,6 +14,9 @@
 //! below -400 dB is set to zero, so silence decays to exact zeros, and so
 //! is one above +600 dB or not finite, which only a non-finite or
 //! overflowing input leaves, so the section recovers at the next block.
+//! A caller can leave the states below -400 dB for a later block, so
+//! where they are zeroed does not depend on how samples are split into
+//! blocks.
 
 /// Sample rate the coefficients are computed for.
 pub const SAMPLE_RATE: f64 = 48_000.0;
@@ -53,6 +57,9 @@ pub(crate) enum Shape {
     /// Second-order Butterworth high-pass, 12 dB per octave, -3.01 dB at
     /// `freq`: the cookbook HPF with Q = 1/sqrt(2).
     HighPass { freq: f32 },
+    /// Second-order Butterworth low-pass, 12 dB per octave, -3.01 dB at
+    /// `freq`: the cookbook LPF with Q = 1/sqrt(2).
+    LowPass { freq: f32 },
     /// The cookbook peakingEQ.
     Bell { freq: f32, gain_db: f32, q: f32 },
     /// The cookbook lowShelf with its Q, `gain_db / 2` at `freq`.
@@ -76,6 +83,7 @@ pub(crate) fn coefficients(shape: Shape) -> Coefficients {
             let k = core::f64::consts::SQRT_2;
             (warp(freq), k, 1.0, -k, -1.0)
         }
+        Shape::LowPass { freq } => (warp(freq), core::f64::consts::SQRT_2, 0.0, 0.0, 1.0),
         Shape::Bell { freq, gain_db, q } => {
             let a = amplitude(gain_db);
             let k = 1.0 / (f64::from(q) * a);
@@ -276,8 +284,20 @@ impl<const L: usize> Svf<L> {
     /// Filters `frames` samples of each of the first `legs` legs of the
     /// planar `buf` in place and moves the ramp on.
     pub(crate) fn process(&mut self, buf: &mut [f32], legs: usize, frames: usize) {
+        self.process_flushing(buf, legs, frames, true);
+    }
+
+    /// Filters as [`Svf::process`] does, setting states below -400 dB to
+    /// zero only when `small`.
+    pub(crate) fn process_flushing(
+        &mut self,
+        buf: &mut [f32],
+        legs: usize,
+        frames: usize,
+        small: bool,
+    ) {
         let mut state = self.state;
-        self.filter(&mut state, buf, legs, frames);
+        self.filter_flushing(&mut state, buf, legs, frames, small);
         self.state = state;
         self.advance(frames);
     }
@@ -291,6 +311,17 @@ impl<const L: usize> Svf<L> {
         buf: &mut [f32],
         legs: usize,
         frames: usize,
+    ) {
+        self.filter_flushing(state, buf, legs, frames, true);
+    }
+
+    fn filter_flushing(
+        &self,
+        state: &mut [[f32; 2]; L],
+        buf: &mut [f32],
+        legs: usize,
+        frames: usize,
+        small: bool,
     ) {
         if self.is_bypassed() {
             *state = [[0.0; 2]; L];
@@ -307,13 +338,14 @@ impl<const L: usize> Svf<L> {
             for v in held {
                 *v = tick(&mut s, &self.target, &self.a, *v);
             }
-            // A state below FLUSH is set to zero: the trapezoidal
-            // integrators can stop on a small value once their increment
-            // underflows, under FTZ/DAZ or rounding, and silence must
-            // reach exact zeros. One above STATE_MAX, or a NaN, which
-            // fails both comparisons, is set to zero too.
+            // A state below FLUSH is set to zero, when `small`: the
+            // trapezoidal integrators can stop on a small value once their
+            // increment underflows, under FTZ/DAZ or rounding, and silence
+            // must reach exact zeros. One above STATE_MAX, or a NaN, which
+            // fails the comparison, is set to zero always.
+            let low = if small { FLUSH } else { 0.0 };
             for v in &mut s {
-                if !(FLUSH..=STATE_MAX).contains(&v.abs()) {
+                if !(low..=STATE_MAX).contains(&v.abs()) {
                     *v = 0.0;
                 }
             }
@@ -332,7 +364,9 @@ pub(crate) mod tests {
     /// against.
     pub(crate) fn cookbook(shape: Shape) -> [f64; 6] {
         let (freq, gain_db, q) = match shape {
-            Shape::HighPass { freq } => (freq, 0.0, core::f32::consts::FRAC_1_SQRT_2),
+            Shape::HighPass { freq } | Shape::LowPass { freq } => {
+                (freq, 0.0, core::f32::consts::FRAC_1_SQRT_2)
+            }
             Shape::Bell { freq, gain_db, q }
             | Shape::LowShelf { freq, gain_db, q }
             | Shape::HighShelf { freq, gain_db, q } => (freq, gain_db, q),
@@ -347,6 +381,14 @@ pub(crate) mod tests {
                 (1.0 + cw) / 2.0,
                 -(1.0 + cw),
                 (1.0 + cw) / 2.0,
+                1.0 + alpha,
+                -2.0 * cw,
+                1.0 - alpha,
+            ],
+            Shape::LowPass { .. } => [
+                (1.0 - cw) / 2.0,
+                1.0 - cw,
+                (1.0 - cw) / 2.0,
                 1.0 + alpha,
                 -2.0 * cw,
                 1.0 - alpha,
@@ -427,6 +469,9 @@ pub(crate) mod tests {
             Shape::HighPass { freq: 20.0 },
             Shape::HighPass { freq: 80.0 },
             Shape::HighPass { freq: 500.0 },
+            Shape::LowPass { freq: 1000.0 },
+            Shape::LowPass { freq: 4000.0 },
+            Shape::LowPass { freq: 20000.0 },
         ];
         for &(freq, gain_db, q) in &[
             (20.0, 18.0, 0.1),
@@ -474,9 +519,10 @@ pub(crate) mod tests {
     }
 
     /// Fixed points of the shapes, independent of the cookbook: the
-    /// Butterworth high-pass is 3.01 dB down at its frequency, a bell has
-    /// its gain at its centre, a shelf half its gain at its frequency and
-    /// all of it far into the shelf.
+    /// Butterworth high-pass and low-pass are 3.01 dB down and 90
+    /// degrees off at their frequency and about 12 dB down an octave
+    /// beyond it, a bell has its gain at its centre, a shelf half its
+    /// gain at its frequency and all of it far into the shelf.
     #[test]
     fn responses_hit_their_defining_points() {
         let half_power = -10.0 * 2f64.log10();
@@ -485,6 +531,11 @@ pub(crate) mod tests {
         assert!((deg - 90.0).abs() < 0.5, "{deg}");
         let (db, _) = svf_response(Shape::HighPass { freq: 100.0 }, 50.0);
         assert!((db + 12.3).abs() < 0.1, "one octave below: {db}");
+        let (db, deg) = svf_response(Shape::LowPass { freq: 4000.0 }, 4000.0);
+        assert!((db - half_power).abs() < 0.002, "{db}");
+        assert!((deg + 90.0).abs() < 0.5, "{deg}");
+        let (db, _) = svf_response(Shape::LowPass { freq: 1000.0 }, 2000.0);
+        assert!((db + 12.3).abs() < 0.1, "one octave above: {db}");
         let (db, deg) = svf_response(
             Shape::Bell {
                 freq: 1000.0,

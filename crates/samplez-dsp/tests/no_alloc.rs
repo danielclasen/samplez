@@ -4,10 +4,12 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use samplez_dsp::duck::MAX_KEYS;
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
-    BandType, CompParams, EqBand, GateParams, KWeighting, Loudness, Matrix, Meters, Path,
-    PlanarBuffer, Ramp, Strip, StripParam, TruePeak, restore_mxcsr, set_ftz_daz,
+    BandType, CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams,
+    KWeighting, KeyFilter, Loudness, Matrix, Meters, Path, PlanarBuffer, Ramp, Strip, StripParam,
+    TruePeak, duck_gain, restore_mxcsr, set_ftz_daz,
 };
 
 #[path = "../src/require.rs"]
@@ -77,6 +79,8 @@ fn process_calls_do_not_allocate() {
     let mut scratch = vec![0.0f32; cap];
     let mut strips: Vec<Strip> = [1, 2, 6, 8].map(|legs| Strip::new(legs, 480)).into();
     let mut strip_buf = vec![0.0f32; 8 * cap];
+    let mut detector = Detector::new(480);
+    let mut envelope = vec![0.0f32; cap];
 
     let before = allocations();
     let saved = set_ftz_daz(true);
@@ -183,6 +187,38 @@ fn process_calls_do_not_allocate() {
         }
         let first = strips[0].clone();
         strips[0].clone_from(&first);
+        // Every parameter of the detector, a refused one, its keys read
+        // from the strips' buffer, and a copy.
+        for p in [
+            DuckParam::Detector(DetectorParams {
+                lpf: KeyFilter {
+                    enabled: on,
+                    freq: 4000.0,
+                },
+                attack_ms: if on { 5.0 } else { 20.0 },
+                ..DetectorParams::DEFAULT
+            }),
+            DuckParam::Key {
+                key: round % MAX_KEYS,
+                legs: 1 + round % 8,
+                gain: 2.0,
+            },
+            DuckParam::Unkey {
+                key: (round + 1) % MAX_KEYS,
+            },
+            DuckParam::Mode(if on { DuckMode::Auto } else { DuckMode::Off }),
+            DuckParam::Hold { held: round == 3 },
+        ] {
+            assert!(detector.set(p));
+        }
+        assert!(!detector.set(DuckParam::Unkey { key: MAX_KEYS }));
+        let x = &strip_buf[..8 * frames];
+        detector.process(frames, |_, l| &x[l * frames..], &mut envelope);
+        assert!(duck_gain(10.0, envelope[frames - 1]) <= 1.0);
+        detector.advance(frames);
+        detector.align(round as u64 * 1000);
+        let copy = detector;
+        assert!(copy == detector);
     }
     restore_mxcsr(saved);
     let during = allocations() - before;

@@ -2,8 +2,9 @@
 //! by Gungraun (`cargo bench --bench rt`). Each benchmark processes one
 //! block of B = 48 samples at the largest shape measured here, 64 input
 //! channels to 96 output channels, on both dispatch paths, with every
-//! coefficient ramping; the strips, 64 mono ones, and the meters of the
-//! 64 input channels after them have one path. It also
+//! coefficient ramping; the strips, 64 mono ones, the meters of the 64
+//! input channels after them and eight duck detectors keyed by them have
+//! one path. It also
 //! gates the RT parts of a resync at that shape: the matrix copy of the
 //! core and one block's history stores. The hard limits are the
 //! instruction counts measured in the builder image plus 10 %, rounded
@@ -13,10 +14,12 @@ use std::hint::black_box;
 
 use gungraun::prelude::*;
 use gungraun::{Callgrind, EventKind};
+use samplez_dsp::duck::MAX_KEYS;
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
-    CompParams, EqBand, GateParams, History, KWeighting, Matrix, Path, PlanarBuffer, Started,
-    Strip, StripParam, TruePeak, accumulate,
+    CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams, History,
+    KWeighting, KeyFilter, Matrix, Path, PlanarBuffer, Started, Strip, StripParam, TruePeak,
+    accumulate,
 };
 
 const B: usize = 48;
@@ -173,6 +176,79 @@ fn strip((mut strips, mut buf): (Vec<Strip>, PlanarBuffer)) -> (Vec<Strip>, Plan
     (strips, buf)
 }
 
+/// Eight detectors, each keyed by eight of the 64 mono inputs through
+/// both key filters, the low-pass ramping on, the signal around the
+/// threshold.
+fn detectors() -> (Vec<Detector>, PlanarBuffer, Vec<f32>) {
+    let params = DetectorParams {
+        threshold_db: -12.0,
+        lpf: KeyFilter {
+            enabled: true,
+            freq: 4000.0,
+        },
+        ..DetectorParams::DEFAULT
+    };
+    let mut v = Vec::new();
+    for _ in 0..INPUTS / MAX_KEYS {
+        let mut d = Detector::new(480);
+        assert!(d.set(DuckParam::Detector(params)));
+        for key in 0..MAX_KEYS {
+            assert!(d.set(DuckParam::Key {
+                key,
+                legs: 1,
+                gain: 1.0,
+            }));
+        }
+        v.push(d);
+    }
+    (v, signal(INPUTS), vec![0.0; B])
+}
+
+#[library_benchmark]
+#[bench::block(setup = detectors, config = limit(DUCK))]
+fn duck(
+    (mut detectors, buf, mut envelope): (Vec<Detector>, PlanarBuffer, Vec<f32>),
+) -> (Vec<Detector>, PlanarBuffer, Vec<f32>) {
+    for (g, d) in detectors.iter_mut().enumerate() {
+        d.process(
+            B,
+            |k, _| black_box(buf.channel(g * MAX_KEYS + k)),
+            &mut envelope,
+        );
+    }
+    (detectors, buf, envelope)
+}
+
+/// The eight detectors at full depth, held there by mode On at the
+/// longest hold and release, then switched to mode Off.
+fn bypassed() -> Vec<Detector> {
+    let params = DetectorParams {
+        hold_ms: 5000.0,
+        release_ms: 10_000.0,
+        ..DetectorParams::DEFAULT
+    };
+    let mut v = detectors().0;
+    for d in &mut v {
+        assert!(d.set(DuckParam::Detector(params)));
+        assert!(d.set(DuckParam::Mode(DuckMode::On)));
+        d.advance(48_000);
+        assert!(d.envelope() == 1.0);
+        assert!(d.set(DuckParam::Mode(DuckMode::Off)));
+    }
+    v
+}
+
+// A skip of 15 s, the longest release and more, over detectors their
+// manual controls decide: it costs the same whatever its length.
+#[library_benchmark]
+#[bench::skip(setup = bypassed, config = limit(DUCK_ADVANCE))]
+fn duck_advance(mut detectors: Vec<Detector>) -> Vec<Detector> {
+    for d in &mut detectors {
+        d.advance(black_box(15 * 48_000));
+    }
+    detectors
+}
+
 // The matrix part of the RT thread's core copy for a resync: every
 // coefficient and its ramp into a buffer of the same shape.
 #[library_benchmark]
@@ -217,10 +293,12 @@ const STRIPS_RAMPING: u64 = 1_502_708;
 const STRIPS_SETTLED: u64 = 979_919;
 const STRIPS_RAMPING_FAST: u64 = 1_771_069;
 const STRIPS_SETTLED_FAST: u64 = 1_273_161;
+const DUCK: u64 = 407_817;
+const DUCK_ADVANCE: u64 = 4_065;
 
 library_benchmark_group!(
     name = block,
-    benchmarks = [matrix, meters, input_meters, strip]
+    benchmarks = [matrix, meters, input_meters, strip, duck, duck_advance]
 );
 library_benchmark_group!(name = transfer, benchmarks = [core_copy, history]);
 
