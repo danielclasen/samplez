@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.7.0](https://github.com/danielclasen/samplez/compare/v0.6.0...v0.7.0) (2026-11-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** Audio::appended takes the log index, at_index and derived entries; Audio::truncated, Audio::skip and Audio::admits are gone; Audio::rebuild_engine takes the product state and the index to install at or after. EngineAudio::new takes no Translate, and Translate, Translated, Rebuild, input_entry and with_rebuild are gone. Product::paths and LogView::paths are gone. resync::Source::entries returns records or Missed. LeaderLog::remaining is replaced by superseded. Sample gains entries_filtered.
+* **replica:** `Body` gains the `Protocol` variant; `Body::Restamp` gains `generation`, `Body::Void` gains `at_index` and `generation`, `Body::LeaseExpiry` gains `at_index`. A binary of an earlier protocol cannot read a log that holds `Body::Protocol`.
+* **replica:** `Product::apply` takes an `Apply` with how the command was ordered; `Command` has a `generation` field; `Replica::append` returns a `Result`.
+* **replica:** `Product` loses its `Default` bound and requires `config_hash`. `Store::open` and `Replica::start` take a `Factory<P>` in place of the product.
+* **engine:** `Engine::install_product` takes the index to install at, before the timeout; 0 keeps installing at the next block.
+
+### Features
+
+* **dsp:** duck matrix terms by detector envelopes ([#70](https://github.com/danielclasen/samplez/issues/70)) ([042a597](https://github.com/danielclasen/samplez/commit/042a597700e5892b838db7f6efe7ed2e2008192a))
+* **engine:** add engine targets and install a product core at an index ([#63](https://github.com/danielclasen/samplez/issues/63)) ([fc12d4a](https://github.com/danielclasen/samplez/commit/fc12d4ad61707eb8c6489725904e061a2ba04777))
+* **replica:** build the product from a factory, check its config ([#64](https://github.com/danielclasen/samplez/issues/64)) ([23de5f4](https://github.com/danielclasen/samplez/commit/23de5f4a65b7a0b5fba77cd9ae7a8d57d5f98a4f))
+* **replica:** derive engine records from product state at apply ([#66](https://github.com/danielclasen/samplez/issues/66)) ([f36f752](https://github.com/danielclasen/samplez/commit/f36f752e71dec766ef1e4bff03762e3f9c2ba42e))
+* **replica:** gate generation flags on protocol 2, re-assert at a void ([#68](https://github.com/danielclasen/samplez/issues/68)) ([6b3148a](https://github.com/danielclasen/samplez/commit/6b3148ad606879c0e2f7c0c601fd0c90000b158a))
+* **replica:** hand derived records to the engine at apply ([#71](https://github.com/danielclasen/samplez/issues/71)) ([7bd86dc](https://github.com/danielclasen/samplez/commit/7bd86dc61c6dbb6022411f62c497c11528d14f87))
+
+
+### Performance Improvements
+
+* **engine:** compare strip parameters without formatting in diff ([#69](https://github.com/danielclasen/samplez/issues/69)) ([277228c](https://github.com/danielclasen/samplez/commit/277228c69b3d25dbe4b8b049e3de2b7eeb2fa95f))
+
 ## [0.6.0](https://github.com/danielclasen/samplez/compare/v0.5.0...v0.6.0) (2026-11-18)
 
 
