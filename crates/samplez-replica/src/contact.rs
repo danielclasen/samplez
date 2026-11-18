@@ -557,6 +557,7 @@ struct Counts {
     purge_points: u64,
     contradicted: u64,
     clock_holds: u64,
+    late_rebuilds: u64,
 }
 
 /// What contact takes of a learner's newest report.
@@ -615,12 +616,21 @@ struct State {
     /// The appended entries not applied yet that need a generation, by
     /// log index, with the index they take effect at.
     generations: BTreeMap<u64, u64>,
+    /// Since the start or the last snapshot install this log appended no
+    /// entry before its apply deadline: the replica is catching up.
+    catching_up: bool,
     /// The entries not applied yet that this log took past their apply
-    /// deadline, by log index: ones a replica catching up takes.
+    /// deadline while catching up, by log index.
     taken_late: BTreeSet<u64>,
+    /// Entries taken late that went unresolved while a restart was under
+    /// way, for the rebuild past them once it ended.
+    late_given: BTreeSet<Key>,
     /// Entries taken late that the engine was rebuilt past instead of
-    /// holding them unresolved, the lowest forgotten first: a decision on
-    /// one neither resolves nor contradicts the rebuilt core.
+    /// holding them unresolved: a decision on one neither resolves nor
+    /// contradicts the rebuilt core. Past `GIVEN_KEPT` entries the lowest
+    /// is forgotten: a decision on a forgotten one counts as a
+    /// contradiction, which diverges the replica and costs it a resync,
+    /// never a wrong commit.
     rebuilt_past: BTreeSet<Key>,
     /// When `own` was sampled.
     own_at: Instant,
@@ -779,6 +789,8 @@ pub struct Metrics {
     pub purge_points: u64,
     /// Decisions on entries this replica had applied, each diverging it.
     pub contradicted: u64,
+    /// Rebuilds of the engine past entries taken late while catching up.
+    pub late_rebuilds: u64,
     /// E, and the audio replicas it counts.
     pub estimate: Option<u64>,
     pub counted: Vec<NodeId>,
@@ -915,7 +927,9 @@ impl Contact {
                 scheduled,
                 reserved: None,
                 generations: BTreeMap::new(),
+                catching_up: true,
                 taken_late: BTreeSet::new(),
+                late_given: BTreeSet::new(),
                 rebuilt_past: BTreeSet::new(),
                 own_at: Instant::now(),
                 judged: BTreeSet::new(),
@@ -1539,7 +1553,9 @@ impl Contact {
             }
             if let Some(at) = at {
                 st.scheduled.insert(id.index, (id, at, stamp, false));
-                if tai >= self.timing.apply_deadline(at) {
+                if tai < self.timing.apply_deadline(at) {
+                    st.catching_up = false;
+                } else if st.catching_up {
                     st.taken_late.insert(id.index);
                 }
                 self.note(st, id, at, tai);
@@ -1612,7 +1628,9 @@ impl Contact {
         st.handed = st.handed.max(applied);
         st.uncommitted.clear();
         st.generations.clear();
+        st.catching_up = true;
         st.taken_late.clear();
+        st.late_given.clear();
         st.rebuilt_past.clear();
         st.awaiting.clear();
         st.given.clear();
@@ -1782,8 +1800,9 @@ impl Contact {
     /// Hands the records of the entries applied since the last call to
     /// the engine, each at the index it derived. One applied at or past
     /// its apply deadline, or already given unresolved, is not: it goes
-    /// unresolved, the log deciding it, or, taken past its deadline on a
-    /// replica committing nothing, the engine is rebuilt past it. Awaited
+    /// unresolved, the log deciding it, or, taken past its deadline while
+    /// catching up on a replica committing nothing, the engine is rebuilt
+    /// past it, one rebuild at a time. Awaited
     /// entries up to the applied index are settled: this replica's own,
     /// or another at the same index that can no longer commit.
     fn hand(&self, st: &mut State) {
@@ -1812,11 +1831,13 @@ impl Contact {
             // nothing took late, so none of it stays given.
             if Self::commits_nothing(st) {
                 let folded: Vec<Key> = (st.given.keys())
-                    .filter(|&&(index, term, node)| {
-                        index > from
-                            && index <= up_to
-                            && taken_late.contains(&index)
-                            && self.log.log_id_at(index) == Some(StoredLogId { term, node, index })
+                    .filter(|&&k @ (index, term, node)| {
+                        st.late_given.contains(&k)
+                            || (index > from
+                                && index <= up_to
+                                && taken_late.contains(&index)
+                                && self.log.log_id_at(index)
+                                    == Some(StoredLogId { term, node, index }))
                     })
                     .copied()
                     .collect();
@@ -1824,6 +1845,7 @@ impl Contact {
                     st.given.remove(&k);
                     Self::rebuild_past(st, k);
                 }
+                st.late_given.clear();
             }
             self.begin_restart(st, up_to);
             return;
@@ -1837,8 +1859,12 @@ impl Contact {
         // it unresolved: no block it committed lacks it, and the log
         // appends no decision on an entry that stands, so one held
         // unresolved would degrade its blocks for good.
+        // One rebuild past them at a time: while a restart is under way
+        // they go unresolved, and are folded into a rebuild once it ended
+        // ([`Contact::fold_late`]).
         let rebuilds = Self::commits_nothing(st);
-        let mut late = false;
+        let at_once = rebuilds && st.restart.is_none();
+        let mut late: Option<(u64, u64)> = None;
         for (index, record) in records {
             let at = record.at_index;
             // Purged from the log since it applied: this log's own, which
@@ -1855,19 +1881,24 @@ impl Contact {
             let k = key(id);
             let rebuilt = rebuilds && taken_late.contains(&index);
             if st.given.contains_key(&k) {
-                if rebuilt {
+                if rebuilt && at_once {
                     st.given.remove(&k);
                     audio.resolved(index);
                     Self::rebuild_past(st, k);
-                    late = true;
+                    late = Some(late.map_or((index, index), |(first, _)| (first, index)));
+                } else if rebuilt {
+                    st.late_given.insert(k);
                 }
                 continue;
             }
             if tai >= self.timing.apply_deadline(at) {
-                if rebuilt {
+                if rebuilt && at_once {
                     Self::rebuild_past(st, k);
-                    late = true;
+                    late = Some(late.map_or((index, index), |(first, _)| (first, index)));
                     continue;
+                }
+                if rebuilt {
+                    st.late_given.insert(k);
                 }
                 st.awaiting.insert(
                     k,
@@ -1905,9 +1936,46 @@ impl Contact {
                 st.slack.push(s);
             }
         }
-        if late {
-            self.begin_restart(st, up_to);
+        if let Some((first, last)) = late {
+            self.rebuild_past_late(st, first, last, up_to);
         }
+        self.fold_late(st);
+    }
+
+    /// Entries from `first` to `last` taken late were left out of the
+    /// engine: it is rebuilt from the state after `after`.
+    fn rebuild_past_late(&self, st: &mut State, first: u64, last: u64, after: u64) {
+        st.counts.late_rebuilds += 1;
+        tracing::debug!(first, last, after, "engine rebuilt past entries taken late");
+        self.begin_restart(st, after);
+    }
+
+    /// Entries taken late that went unresolved while a restart was under
+    /// way: once it ended, on a replica still committing nothing, the
+    /// engine is rebuilt past them. Whether a restart began.
+    fn fold_late(&self, st: &mut State) -> bool {
+        if st.restart.is_some() || st.late_given.is_empty() {
+            return false;
+        }
+        let given = &st.given;
+        st.late_given.retain(|k| given.contains_key(k));
+        let Some(audio) = self.audio.clone() else {
+            return false;
+        };
+        let (Some(&(first, ..)), Some(&(last, ..))) = (st.late_given.first(), st.late_given.last())
+        else {
+            return false;
+        };
+        if !Self::commits_nothing(st) {
+            return false;
+        }
+        for k in std::mem::take(&mut st.late_given) {
+            st.given.remove(&k);
+            audio.resolved(k.0);
+            Self::rebuild_past(st, k);
+        }
+        self.rebuild_past_late(st, first, last, st.handed);
+        true
     }
 
     fn rebuild_past(st: &mut State, k: Key) {
@@ -2101,6 +2169,7 @@ impl Contact {
             Some(_) => true,
             None => false,
         };
+        let rebuilding = self.fold_late(st) || rebuilding;
         let Some(life) = st.life.as_mut() else { return };
         let known = st.known_committed;
         let due: Vec<u64> = st
@@ -3074,6 +3143,7 @@ impl Contact {
             snapshot_installs: c.installs,
             purge_points: c.purge_points,
             contradicted: c.contradicted,
+            late_rebuilds: c.late_rebuilds,
             estimate: self.estimate_in(&st, Instant::now()),
             counted: self.counted(&st, Instant::now()).into_iter().collect(),
             lead: st.lead.samples(),
@@ -3474,6 +3544,8 @@ mod tests {
         /// Each rebuild's state's last log id and the index it installs
         /// at or after.
         rebuilt_with: Mutex<Vec<(u64, u64)>>,
+        /// Whether it reports one output, withdrawn.
+        outputs: std::sync::atomic::AtomicBool,
     }
 
     impl Audio for Engine {
@@ -3485,6 +3557,11 @@ mod tests {
                     clock: ClockFlags {
                         step_fence: step,
                         ..ClockFlags::default()
+                    },
+                    standing: if self.outputs.load(Ordering::SeqCst) {
+                        vec![Standing::Withdrawn { since: 0 }]
+                    } else {
+                        Vec::new()
                     },
                     ..Own::default()
                 },
@@ -3605,6 +3682,7 @@ mod tests {
             rebuilds: std::sync::atomic::AtomicBool::new(true),
             holding: std::sync::atomic::AtomicBool::new(false),
             rebuilt_with: Mutex::new(Vec::new()),
+            outputs: std::sync::atomic::AtomicBool::new(false),
         });
         let contact = Contact::new(
             1,
@@ -4085,6 +4163,88 @@ mod tests {
         let calls = f.engine.calls();
         let rebuilds = calls.iter().filter(|c| *c == "rebuild").count();
         assert_eq!(rebuilds, 1, "{calls:?}");
+    }
+
+    /// Entry `index`, appended and applied `late` past its apply deadline
+    /// or else in time by a block, on a tick. A late entry's index lies
+    /// below the floor, which raises it to the last entry's, one block
+    /// past that entry's deadline at most: 5 ms passed since.
+    fn take(f: &Fixture, index: u64, late: bool) {
+        f.clock.add(Duration::from_millis(5));
+        let guard = Timing::defaults(B).apply_guard_ns();
+        let at = if late {
+            index_at(f.clock.get()) - 10 * B
+        } else {
+            index_at(f.clock.get() + guard) + B
+        };
+        f.log.push(1, index, Some(at));
+        f.contact.log_changed();
+        f.apply(index);
+        f.contact.log_changed();
+        f.contact.tick(f.members.clone());
+    }
+
+    /// A replica that took an entry in time and then takes every entry
+    /// past its deadline, as a log at the lead cap with a slow disk does,
+    /// is not catching up: it holds them unresolved and keeps its core. A
+    /// rebuild past each would leave it without a core while the lateness
+    /// lasts. Once entries come in time again they are handed.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_late_after_catching_up_keeps_its_core() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        take(&f, 1, false);
+        f.tick();
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        f.engine.calls();
+        for index in 2..=20 {
+            take(&f, index, true);
+            f.tick();
+            assert_eq!(f.state(), Some(ReplicaState::Withdrawn), "entry {index}");
+        }
+        let calls = f.engine.calls();
+        assert!(
+            !calls.iter().any(|c| c == "drop" || c == "rebuild"),
+            "{calls:?}"
+        );
+        assert_eq!(f.contact.metrics().late_rebuilds, 0);
+        assert_eq!(f.contact.lock().given.len(), 19, "held unresolved");
+        take(&f, 21, false);
+        f.tick();
+        assert!(f.engine.calls().contains(&"appended 21".to_owned()));
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+    }
+
+    /// A replica catching up past entries' deadlines is rebuilt past them
+    /// one rebuild at a time: what it takes late while a rebuild runs is
+    /// folded into one rebuild after it, not into a restart that makes
+    /// the running one stale. Once entries come in time it holds nothing
+    /// unresolved and is withdrawn with its core.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_catching_up_is_rebuilt_past_late_entries_once_per_rebuild() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        f.engine.holding.store(true, Ordering::SeqCst);
+        for index in 1..=10 {
+            take(&f, index, true);
+            assert_eq!(f.state(), Some(ReplicaState::Starting), "entry {index}");
+        }
+        assert_eq!(f.contact.metrics().late_rebuilds, 1);
+        assert_eq!(f.contact.lock().late_given.len(), 9, "held for the next");
+        f.engine.holding.store(false, Ordering::SeqCst);
+        f.contact.await_rebuild();
+        f.tick();
+        assert_eq!(f.contact.metrics().late_rebuilds, 2, "folded once it ended");
+        assert!(f.contact.lock().given.is_empty());
+        take(&f, 11, false);
+        f.tick();
+        f.tick();
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert_eq!(f.contact.metrics().late_rebuilds, 2);
+        let st = f.contact.lock();
+        assert!(st.given.is_empty() && st.late_given.is_empty() && !st.catching_up);
     }
 
     /// What an entry derived reaches the engine as it applies, not as it

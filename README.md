@@ -438,44 +438,41 @@ outside the engine.
 ### Starting a replica
 
 `Engine::drop_core` drops the RT thread's core while the replica starts:
-the RT thread keeps its writers, flows, hold rings and statuses, computes
-no block and withholds each one, overrun skips included, cause `NoCore`
-(`StatusChange::NoCore` ranges), with the replica withdrawn. Entries
-needing no generation whose index passes meanwhile are taken off the
-pending list, strip entries applied to the strips the slots keep and the
-others, duck entries included, not, and the core installed next must
-know them; a batch holding
-an `InputUp` or `Route` stays pending whole. A replayed core
-replaces the strips; one built from product state leaves them.
-`Engine::install_product` builds a core from product state off the RT
-thread (fades cold, the pending entries, no unresolved entry; the RT
+the RT thread keeps its writers, flows, hold rings and statuses,
+computes no block and withholds each one, overrun skips included, cause
+`NoCore` (`StatusChange::NoCore` ranges), with the replica withdrawn.
+Entries needing no generation whose index passes meanwhile are taken off
+the pending list, strip entries applied to the strips the slots keep and
+the others, duck entries included, not, and the core installed next must
+know them; a batch holding an `InputUp` or `Route` stays pending whole.
+A replayed core replaces the strips; one built from product state leaves
+them. `Engine::install_product` builds a core from product state off the
+RT thread (fades cold, the pending entries, no unresolved entry; the RT
 thread keeps its pending generation) and installs it through the same
 block-boundary hand-over as a replay, at the first block starting at or
 after the index its caller names; the first block committed after it
 follows the withdrawn rules. A state holding a gain, flow, strip
 parameter or duck value no entry could set is refused before anything
-changes. Its
-gains ramp from silence to their
-targets over the ramp length from the install, as the strips take their
-parameters, so an output fades in processed. Its duck groups start cold
-at the state's settings: key filters at rest, no hold, the envelope at 0
-or, for a group its mode On or hold triggers, at full depth; masks and
-depths at their targets, so a coefficient fades in ducked. A replica
-that kept computing holds its own key filter, hold and envelope state,
-so their outputs differ after the install until the gains' ramp has run,
-each key filter's state has reached the same bits and each group's
-envelope has reached 0 or full depth in both; on a test desk with an
-Auto group mid-duck, a group releasing after its force ended and a key
-filter ringing they are equal from the ramp, 50 ms and the longest
-attack, hold and release of a group on. A rebuilt replica does not
-wait for that: the first page it computes whole that differs from the
-one a committing replica committed diverges it, by Resume's comparison
-or by the leader's page verdict, and it resyncs from a donor's core,
-which carries every group's detector state. A keyed group whose
-envelope never reaches 0 or full depth, which would keep the two apart
-for good, so costs one page, the reports that carry it and a resync.
-The product state also
-names each slot's flow and strip parameters: the supervisor hands over
+changes. Its gains ramp from silence to their targets over the ramp
+length from the install, as the strips take their parameters, so an
+output fades in processed. Its duck groups start cold at the state's
+settings: key filters at rest, no hold, the envelope at 0 or, for a
+group its mode On or hold triggers, at full depth; masks and depths at
+their targets, so a coefficient fades in ducked. A replica that kept
+computing holds its own key filter, hold and envelope state, so their
+outputs differ after the install until the gains' ramp has run, each key
+filter's state has reached the same bits and each group's envelope has
+reached 0 or full depth in both; on a test desk with an Auto group
+mid-duck, a group releasing after its force ended and a key filter
+ringing they are equal from the ramp, 50 ms and the longest attack, hold
+and release of a group on. A rebuilt replica does not wait for that: the
+first page it computes whole that differs from the one a committing
+replica committed diverges it, by Resume's comparison or by the leader's
+page verdict, and it resyncs from a donor's core, which carries every
+group's detector state. A keyed group whose envelope never reaches 0 or
+full depth, which would keep the two apart for good, so costs one page,
+the reports that carry it and a resync. The product state also names
+each slot's flow and strip parameters: the supervisor hands over
 generations reading those flows before the core, a slot on another flow
 moving to it with no crossfade, and the strip parameters are set from
 the install's index, each strip keeping its own state. `Targets` holds
@@ -536,28 +533,33 @@ log decides it. The leader stamps entries the lead ahead, which it keeps
 on the slack every counted audio replica reports at its apply-hand, up
 to `maxApplyLead`; a replica that still applies past the deadline at the
 cap holds those entries unresolved alone, and the leader's contact
-metrics name it (`apply_lead_raised_by`). A replica in `starting`, or
-`withdrawn` with no output committing holds no entry unresolved that
-its log took only past the entry's deadline, as one catching up after a
-restart takes those written meanwhile: its engine is rebuilt from the
-state applied past it, as after a snapshot install. One AppendEntries carries up to
-`MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
-than the gap between entries takes every entry written meanwhile with
-one fsync rather than falling further behind. `EngineAudio` leaves out
-of a record the entries its engine refuses, and of the `InputUp`s and
-`Route`s of several input domains those not of the lowest slot's,
-before it appends it: the
-engine's configuration decides that alike on every replica of a key, so
-the outputs still agree, and it is counted in `entries_filtered` and
-logged as the product's fault. A resync's joiner replays the records of
-the entries applied after the donor core's last log id; one it no longer
-holds, past the second kept or before a snapshot it loaded, fails the
-attempt, which is retried on a newer core. A client command that would
-re-route an input (`Product::reroutes`) is ordered alone on the
-generation path, stamped the lead and the longest build time a counted
-replica reports past its stamp, since its generation is built once it
-applies; one asking for an index beyond the earliest is refused. Such a product owns every input's flow: `Replica::append`
-refuses a `Route` or `MasterEnable` for it.
+metrics name it (`apply_lead_raised_by`). A replica catching up, its log
+having taken no entry before the entry's deadline since it started or
+installed a snapshot, as one restarted takes those written meanwhile,
+holds none of those it took past the deadline unresolved while it is in
+`starting`, or `withdrawn` with outputs none of which commits: its
+engine is rebuilt from the state applied past them, as after a snapshot
+install, one rebuild at a time, the entries taken late while one runs
+going into the next (`late_rebuilds` in the contact metrics). A replica
+with no outputs or with one committing, and one taking entries late
+after it took one in time, holds them unresolved. One AppendEntries
+carries up to `MAX_APPEND_BYTES` of commands, so a follower whose fsync
+takes longer than the gap between entries takes every entry written
+meanwhile with one fsync rather than falling further behind.
+`EngineAudio` leaves out of a record the entries its engine refuses, and
+of the `InputUp`s and `Route`s of several input domains those not of the
+lowest slot's, before it appends it: the engine's configuration decides
+that alike on every replica of a key, so the outputs still agree, and it
+is counted in `entries_filtered` and logged as the product's fault. A
+resync's joiner replays the records of the entries applied after the
+donor core's last log id; one it no longer holds, past the second kept
+or before a snapshot it loaded, fails the attempt, which is retried on a
+newer core. A client command that would re-route an input
+(`Product::reroutes`) is ordered alone on the generation path, stamped
+the lead and the longest build time a counted replica reports past its
+stamp, since its generation is built once it applies; one asking for an
+index beyond the earliest is refused. Such a product owns every input's
+flow: `Replica::append` refuses a `Route` or `MasterEnable` for it.
 
 A replica's store builds its empty product with the `Factory` it is
 given, at open and for every snapshot it installs, so the product keeps
