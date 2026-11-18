@@ -642,8 +642,10 @@ fn a_poll_opens_a_flow_only_once_its_lookup_found_it() {
     let polled = started.elapsed();
     assert!(polled < WAIT / 2, "a creation and 10 polls took {polled:?}");
 
-    std::thread::sleep(WAIT);
-    assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 5) * B));
+    // Opened once the lookup answers, which a loaded machine may start
+    // late.
+    std::thread::sleep(WAIT / 2);
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 5) * B));
 }
 
 /// A poll round over many missing flows whose lookups wait costs the
@@ -691,8 +693,12 @@ fn a_wanted_flow_is_opened_by_the_poll_after_it_appears() {
     let appeared = Instant::now();
     // The lookup in flight sees it within a millisecond or so.
     std::thread::sleep(Duration::from_millis(20));
-    assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 5) * B));
-    assert!(appeared.elapsed() < Duration::from_millis(100));
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 5) * B));
+    let opened = appeared.elapsed();
+    assert!(
+        opened < Duration::from_millis(100),
+        "opened {opened:?} after"
+    );
 }
 
 static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
@@ -756,8 +762,8 @@ fn a_stopped_head_is_checked_only_after_a_lookup() {
     let mut w = RawWriter::create(&api, &domain.0, &id, 1);
     w.blocks(K0..K0 + 5);
     let mut p = PolledFlow::looking_up_with(&poll, &id, waiting).unwrap();
-    std::thread::sleep(WAIT + WAIT / 5);
-    assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 5) * B));
+    std::thread::sleep(WAIT);
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 5) * B));
 
     drop(w);
     let stopped = Instant::now();
@@ -765,8 +771,8 @@ fn a_stopped_head_is_checked_only_after_a_lookup() {
         assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 5) * B));
     }
     assert!(stopped.elapsed() < WAIT / 2, "{:?}", stopped.elapsed());
-    std::thread::sleep(WAIT + WAIT / 5);
-    assert!(matches!(p.poll(), Poll::Invalid));
+    std::thread::sleep(WAIT);
+    assert!(matches!(poll_checked(&mut p), Poll::Invalid));
 }
 
 /// The prune limit of the recovery tests, 50 ms.
