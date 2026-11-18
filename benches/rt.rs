@@ -12,7 +12,10 @@
 //! every coefficient of a populated, ramping matrix: of the largest
 //! matrix a configuration of B = 48 takes and of the largest any takes,
 //! at B = 1024 (`COEFFICIENTS_PER_BLOCK_SAMPLE`), set within a quarter of
-//! the block.
+//! the block. And on the fill of a product core between two blocks of the
+//! RT thread: every coefficient of the same two matrices, populated and
+//! ramping, replaced by a fade-in from silence (`Matrix::fade_in`), within
+//! the block it has.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -464,9 +467,35 @@ fn batch_recall(
     matrix
 }
 
+/// A populated, ramping matrix of `inputs` by `outputs` and a product
+/// state's gain for every coefficient.
+fn fill(inputs: usize, outputs: usize) -> (samplez_dsp::Matrix, Vec<f32>) {
+    let (matrix, sets) = recall(inputs, outputs);
+    (matrix, sets.into_iter().map(|(_, _, g)| g).collect())
+}
+
+fn fill_at_block_48() -> (samplez_dsp::Matrix, Vec<f32>) {
+    fill(80, 90)
+}
+
+fn fill_at_block_1024() -> (samplez_dsp::Matrix, Vec<f32>) {
+    fill(384, 400)
+}
+
+#[library_benchmark]
+#[bench::block_48(setup = fill_at_block_48, config = limit(FILL_BLOCK_48))]
+#[bench::block_1024(setup = fill_at_block_1024, config = limit(FILL_BLOCK_1024))]
+fn product_fill((mut matrix, gains): (samplez_dsp::Matrix, Vec<f32>)) -> samplez_dsp::Matrix {
+    black_box(matrix.fade_in(&gains, 480));
+    matrix
+}
+
+const FILL_BLOCK_48: u64 = 451_896;
+const FILL_BLOCK_1024: u64 = 9_631_507;
+
 const RECALL_BLOCK_48: u64 = 1_291_097;
 const RECALL_BLOCK_1024: u64 = 31_257_737;
 
-library_benchmark_group!(name = batches, benchmarks = [batch_recall]);
+library_benchmark_group!(name = batches, benchmarks = [batch_recall, product_fill]);
 
 main!(library_benchmark_groups = hold, pages, strips, batches);

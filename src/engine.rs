@@ -2198,8 +2198,7 @@ impl Engine {
     /// Its gains ramp from silence to their targets over the ramp length
     /// from the install, as the strips take their parameters, so an
     /// output fades in processed. Returns the block the core followed.
-    /// The core holds no
-    /// unresolved entry: the caller adds the ones still unresolved with
+    /// The core holds no unresolved entry: the caller adds the ones still unresolved with
     /// [`Engine::unresolved`] after the install. While no core is held the
     /// RT thread takes the entries needing no generation whose index
     /// passed off its pending list, applying only strip entries, to the
@@ -2280,21 +2279,26 @@ impl Engine {
             return Err(ReplayError::Timeout { passed: 0 });
         }
         let ramp = self.config.ramp_samples;
+        // Filled each attempt between two blocks of the RT thread: the
+        // buffers are allocated here, before the first.
+        let targets: Vec<f32> = state.gains.iter().flatten().copied().collect();
+        let mut gains = targets.clone();
+        let mut up = state.up.clone();
         self.offer(left(), at_least, false, &strips, |j, core| {
-            let mut gains = state.gains.clone();
+            gains.copy_from_slice(&targets);
+            up.copy_from_slice(&state.up);
             // The entries whose index the install passed are folded in
             // like the rest of the state: reported late they would never
             // apply.
             let next = (j + 1) * self.block;
             let passed = pending.partition_point(|e| e.at_index < next);
-            let mut up = state.up.clone();
             for e in &pending[..passed] {
                 match e.change {
                     Change::Gain {
                         input,
                         output,
                         gain,
-                    } => gains[input][output] = gain,
+                    } => gains[input * m + output] = gain,
                     Change::InputDown { slot } => up[slot] = false,
                     Change::InputUp { slot } => up[slot] = true,
                     // The core holds neither a generation nor a strip:
@@ -2303,7 +2307,7 @@ impl Engine {
                     Change::Route { .. } | Change::Strip { .. } => {}
                     Change::Batch { up: raised, .. } => {
                         if let Some(b) = batch(e.id) {
-                            b.gains.each(|c, g| gains[c / m][c % m] = g);
+                            b.gains.each(|c, g| gains[c] = g);
                             for &slot in &b.downs {
                                 up[slot as usize] = false;
                             }
@@ -2314,17 +2318,8 @@ impl Engine {
                     }
                 }
             }
-            // From silence: whatever a spare core held is set first.
-            let mut ramping = false;
-            for (i, row) in gains.iter().enumerate() {
-                for (o, &g) in row.iter().enumerate() {
-                    let _ = core.matrix.set(i, o, 0.0, 0);
-                    if g != 0.0 {
-                        let _ = core.matrix.set(i, o, g, ramp);
-                        ramping = true;
-                    }
-                }
-            }
+            // From silence, whatever a spare core held.
+            let ramping = core.matrix.fade_in(&gains, ramp);
             core.pos = Some(next);
             core.ramp_end = if ramping { next + u64::from(ramp) } else { 0 };
             core.pending.clear();

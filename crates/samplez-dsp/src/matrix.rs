@@ -263,6 +263,41 @@ impl Matrix {
         }
     }
 
+    /// Replaces every coefficient with a ramp from silence to its value in
+    /// `gains`, row-major (`input * outputs + output`), over `len`
+    /// samples; an invalid gain counts as silence. Keeps each column's
+    /// room and fills it in input order, so the work is one pass over
+    /// `gains` whatever the matrix held. Whether any coefficient ramps.
+    ///
+    /// # Panics
+    ///
+    /// When `gains` does not hold one value per coefficient.
+    pub fn fade_in(&mut self, gains: &[f32], len: u32) -> bool {
+        let outputs = self.columns.len();
+        assert_eq!(
+            gains.len(),
+            self.inputs * outputs,
+            "one gain per coefficient"
+        );
+        for col in &mut self.columns {
+            col.clear();
+        }
+        let mut ramping = false;
+        for (c, &g) in gains.iter().enumerate() {
+            if g == 0.0 || !valid_gain(g) {
+                continue;
+            }
+            let mut ramp = Ramp::new(0.0);
+            let _ = ramp.set_target(g, len);
+            ramping |= ramp.is_active();
+            self.columns[c % outputs].push(Term {
+                input: c / outputs,
+                ramp,
+            });
+        }
+        ramping
+    }
+
     /// Moves every coefficient ramp `frames` samples on without mixing,
     /// as [`Matrix::process`] over `frames` frames does. Keeps ramp
     /// positions on the sample timeline over frames that are not mixed.
@@ -295,6 +330,33 @@ pub(crate) fn mix_scalar(terms: &[Term], input: &PlanarBuffer, out: &mut [f32], 
 
 #[cfg(test)]
 mod tests {
+    /// A fade-in replaces a populated, ramping matrix whole: coefficients
+    /// it leaves at silence are gone, the others ramp from silence.
+    #[test]
+    fn a_fade_in_replaces_every_coefficient_from_silence() {
+        let mut m = Matrix::new(3, 2);
+        for i in 0..3 {
+            for o in 0..2 {
+                assert!(m.set(i, o, 0.5, 480));
+            }
+        }
+        let gains = [0.25, 0.0, 0.0, 1.0, 0.5, f32::NAN];
+        assert!(m.fade_in(&gains, 100));
+        let mut expect = Ramp::new(0.0);
+        assert!(expect.set_target(0.25, 100));
+        assert_eq!(m.gain(0, 0).to_bits(), expect.current().to_bits());
+        for (i, o) in [(0, 1), (1, 0), (2, 1)] {
+            assert_eq!(m.gain(i, o), 0.0);
+            assert!(!m.is_ramping(i, o));
+        }
+        m.advance(40);
+        assert!(m.is_ramping(1, 1) && m.is_ramping(2, 0));
+        m.advance(60);
+        assert_eq!((m.gain(0, 0), m.gain(1, 1), m.gain(2, 0)), (0.25, 1.0, 0.5));
+        assert!(!m.fade_in(&[0.0; 6], 100));
+        assert_eq!(m.gain(1, 1), 0.0);
+    }
+
     use super::*;
     use crate::require::path_runs;
     use crate::test_util::Rng;
