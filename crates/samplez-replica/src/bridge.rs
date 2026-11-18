@@ -463,6 +463,7 @@ impl Audio for EngineAudio {
             entries_refused: self.refused.load(Ordering::Relaxed),
             entries_filtered: self.filtered.load(Ordering::Relaxed),
             realised: status.outputs.iter().map(|o| o.realised).collect(),
+            enabled: status.outputs.iter().map(|o| o.enabled).collect(),
             generation_ready: status.generation.pending.is_none() || status.generation.ready,
             clock_steps: progress.steps,
             log_overflows: progress.log_overflows,

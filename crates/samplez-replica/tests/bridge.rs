@@ -1864,3 +1864,27 @@ fn refused_settings_live_and_rebuilt() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// A sample names each output's enabled state as the log left it:
+/// contact counts only enabled outputs when it finds the replica writing
+/// nothing.
+#[test]
+fn a_sample_names_the_outputs_the_log_disabled() {
+    let domain = Domain::new();
+    let (engine, audio) = bridge(&domain, 1 << 16);
+    assert_eq!(audio.sample().enabled, [true]);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let at = (engine.progress().unwrap().processed.unwrap() + 100) * B;
+    audio.appended(
+        1,
+        at,
+        &[Entry::Output {
+            slot: 0,
+            enabled: false,
+        }],
+    );
+    audio.committed(1);
+    wait_for("output 0 disabled", || audio.sample().enabled == [false]);
+}
