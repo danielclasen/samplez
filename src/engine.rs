@@ -341,6 +341,11 @@ pub struct Progress {
     pub status_changes_lost: u64,
     /// buildLead in samples ([`GenerationStatus::build_lead`]).
     pub build_lead: u64,
+    /// The 99.99th percentile of the generation build times, or the
+    /// build time assumed before any build, and a supervisor tick, in
+    /// samples: buildLead without the engine's lead, how long a generation
+    /// takes once its entry reaches the engine.
+    pub build_time: u64,
     /// Times the engine dropped its core for committed entries its RT
     /// thread did not take ([`Engine::commit`]).
     pub log_overflows: u64,
@@ -638,14 +643,18 @@ fn earliest(api: &MxlApi, counters: &Counters, margin: u64, lead: u64) -> u64 {
     produced.max(clock.saturating_sub(margin)) + lead
 }
 
-/// buildLead: `lead` plus the 99.99th percentile of the build times, or
-/// [`UNMEASURED_BUILD`] before any build, and a supervisor tick, in
-/// samples, rounded up to a block.
+/// buildLead: `lead` plus the build time ([`build_time_samples`]),
+/// rounded up to a block.
 fn build_lead_samples(p9999_ns: Option<u64>, lead: u64, block: u64) -> u64 {
+    (build_time_samples(p9999_ns) + lead).next_multiple_of(block)
+}
+
+/// The 99.99th percentile of the build times, or [`UNMEASURED_BUILD`]
+/// before any build, and a supervisor tick, in samples.
+fn build_time_samples(p9999_ns: Option<u64>) -> u64 {
     let ns =
         p9999_ns.unwrap_or(UNMEASURED_BUILD.as_nanos() as u64) + SUPERVISOR_TICK.as_nanos() as u64;
-    let samples = (u128::from(ns) * samplez_mxl::SAMPLE_RATE as u128).div_ceil(1_000_000_000);
-    (samples as u64 + lead).next_multiple_of(block)
+    (u128::from(ns) * samplez_mxl::SAMPLE_RATE as u128).div_ceil(1_000_000_000) as u64
 }
 
 /// Generation build times in quarter-octave buckets of nanoseconds.
@@ -897,6 +906,9 @@ pub struct Engine {
     lead: u64,
     /// buildLead in samples, kept by the supervisor.
     build_lead: Arc<AtomicU64>,
+    /// The build time in samples ([`Progress::build_time`]), kept by the
+    /// supervisor.
+    build_time: Arc<AtomicU64>,
     shape: (usize, usize),
     resets: Mutex<rtrb::Producer<LoudnessReset>>,
     config: Config,
@@ -1262,6 +1274,7 @@ impl Engine {
         let margin = u64::from(config.reader_margin_samples);
         let lead = (u64::from(config.max_catchup_blocks) + 2) * b;
         let build_lead = Arc::new(AtomicU64::new(build_lead_samples(None, lead, b)));
+        let build_time = Arc::new(AtomicU64::new(build_time_samples(None)));
         // Per meter, as MeterRecord numbers them: the outputs, the
         // configured meters, the inputs.
         let checked = "checked by Config::parse";
@@ -1315,6 +1328,7 @@ impl Engine {
             reports,
             build_times: BuildTimes::new(),
             build_lead: Arc::clone(&build_lead),
+            build_time: Arc::clone(&build_time),
             lead,
             ramp: u64::from(config.ramp_samples),
             dirty: vec![true; in_domains.len()],
@@ -1394,6 +1408,7 @@ impl Engine {
             margin,
             lead,
             build_lead,
+            build_time,
             shape: (n, m),
             resets: Mutex::new(reset_tx),
             config,
@@ -1919,6 +1934,7 @@ impl Engine {
             status_changes_lost: c.status_changes_dropped.load(Relaxed)
                 + c.status_changes_unsent.load(Relaxed),
             build_lead: self.build_lead.load(Relaxed),
+            build_time: self.build_time.load(Relaxed),
         })
     }
 
@@ -2659,6 +2675,7 @@ struct Supervisor {
     reports: Option<SyncSender<Report>>,
     build_times: BuildTimes,
     build_lead: Arc<AtomicU64>,
+    build_time: Arc<AtomicU64>,
     lead: u64,
     ramp: u64,
     cmd: rtrb::Producer<Command>,
@@ -3245,6 +3262,7 @@ impl Supervisor {
         let p = self.build_times.p9999();
         let lead = build_lead_samples(p, self.lead, self.timing.block);
         self.build_lead.store(lead, Relaxed);
+        self.build_time.store(build_time_samples(p), Relaxed);
         let mut st = self.status();
         st.generation.builds = self.build_times.total;
         st.generation.build_p9999_ns = p;
@@ -3835,6 +3853,9 @@ mod tests {
         assert_eq!(build_lead_samples(Some(1_000_000), 192, 48), 480);
         assert_eq!(build_lead_samples(Some(1_000_001), 192, 48), 528);
         assert_eq!(build_lead_samples(None, 0, 48), 5040);
+        // Without the lead, not rounded: 1 ms + 5 ms, 100 ms + 5 ms.
+        assert_eq!(build_time_samples(Some(1_000_000)), 288);
+        assert_eq!(build_time_samples(None), 5040);
     }
 
     fn log() -> (Log, rtrb::Consumer<RingEntry>, mpsc::Receiver<LogMsg>) {
