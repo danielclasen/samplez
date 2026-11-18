@@ -158,14 +158,20 @@ impl Lead {
     }
 
     /// Moves to the minute now runs in, falling by B per minute passed
-    /// while ten minutes of slack held 3B or more.
+    /// while ten minutes of slack held 3B or more, unless the entries of
+    /// this minute and the last needed more than the lead: at the cap
+    /// they are stamped with what they needed, so their slack says
+    /// nothing of the lead, and a fall would clear `capped` and stamp the
+    /// next commands with less than they need.
     pub fn roll(&mut self) {
         while self.minute_start.elapsed() >= Duration::from_secs(60) {
             self.minute_start += Duration::from_secs(60);
             self.needed = [self.needed[1], 0];
+            let needed = self.needed[0].max(self.needed[1]);
             if self.minutes.len() == MINUTES
                 && self.quantile().is_some_and(|q| q >= 3)
                 && self.lead > self.block
+                && needed <= self.lead
             {
                 self.lead -= self.block;
                 self.capped = false;
@@ -225,10 +231,13 @@ mod tests {
     async fn the_lead_wanted_covers_what_entries_needed_past_the_cap() {
         let mut lead = Lead::new(B, 30 * B, 50 * B);
         assert_eq!(lead.wanted(), 30 * B);
+        lead.needs(30 * B, -(20 * B as i64));
+        assert_eq!(lead.stamping(), 30 * B, "below the cap: the lead");
         lead.add(-(40 * B as i64), 0, 0);
         assert!(lead.capped);
         lead.needs(50 * B, -(20 * B as i64));
         assert_eq!(lead.wanted(), 72 * B, "20 blocks late and 2B of slack");
+        assert_eq!(lead.stamping(), 72 * B, "at the cap: what was needed");
         lead.needs(50 * B, -(200 * B as i64));
         assert_eq!(lead.wanted(), 50 * B + 3072, "64 ms past the cap");
         tokio::time::advance(Duration::from_secs(60)).await;
@@ -237,6 +246,36 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         lead.roll();
         assert_eq!(lead.wanted(), 50 * B, "the lead itself");
+    }
+
+    /// At the cap, entries stamped with what they needed keep slack of 3B
+    /// for ten minutes while still needing more than the lead: the lead
+    /// does not fall and commands keep the lead they need. Once they need
+    /// no more than the lead it falls again.
+    #[tokio::test(start_paused = true)]
+    async fn the_lead_holds_its_fall_while_entries_need_more_than_it() {
+        let mut lead = Lead::new(B, 30 * B, 50 * B);
+        lead.add(-(40 * B as i64), 0, 0);
+        assert!(lead.capped);
+        for minute in 0..12 {
+            for _ in 0..100 {
+                lead.add(5 * B as i64, 1, 1);
+                lead.needs(72 * B, 5 * B as i64);
+            }
+            tokio::time::advance(Duration::from_secs(60)).await;
+            lead.roll();
+            assert_eq!(lead.samples(), 50 * B, "minute {minute}");
+            assert!(lead.capped, "minute {minute}");
+            assert_eq!(lead.stamping(), 69 * B, "minute {minute}");
+        }
+        for _ in 0..100 {
+            lead.add(5 * B as i64, 1, 1);
+            lead.needs(40 * B, 5 * B as i64);
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        lead.roll();
+        assert_eq!(lead.samples(), 49 * B, "a minute needing less, it falls");
+        assert!(!lead.capped);
     }
 
     /// At the largest block size the lead wanted stays within 64 ms of

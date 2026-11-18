@@ -493,9 +493,9 @@ entry up to that index takes effect at or before the floor and every
 later one at or after it, so the records handed after the rebuild apply
 on top of it in order; an install the RT thread can no longer take is
 tried again with a fresh read. Under continuous writes the floor lies up
-to the stamping lead and a generation's build ahead, and the rebuild
-waits that long: `maxApplyLead`, or at the cap up to 64 ms past it (see
-below). `EngineAudio` installs the state as the records it filters
+to the stamping lead and a generation's build ahead, `maxApplyLead` or
+at the cap up to 64 ms past it (see below), and the rebuild waits that
+long and 100 ms more. `EngineAudio` installs the state as the records it filters
 leave an engine (below): a flow other than the one an input reads is a
 re-route kept by the same rules and else left as read, a strip parameter
 the engine refuses is not set, a gain it refuses is silent, a duck
@@ -535,16 +535,22 @@ on the slack every counted audio replica reports at its apply-hand, up
 to `maxApplyLead`; a replica that still applies past the deadline at the
 cap holds those entries unresolved, and the leader's contact metrics
 name it (`apply_lead_raised_by`). The leader also keeps the lead each
-applied entry needed, over the current minute and the last. It stamps
-every decision on an unresolved entry and every `Baseline` with that
-lead, and at the cap every command too, up to 64 ms past
-`maxApplyLead`, in whole blocks and under one second past the stamp:
-stamped with a lead the commits outlast, a decision would be late again
-and decided in turn, a `Baseline` would lapse for the replica it names,
-and each command would be late on every replica. A command appended
-while a decision is ahead takes effect no earlier than the decision, so
-at the cap a command takes effect up to `maxApplyLead` plus 64 ms after
-its stamp. `samplez_replica_decision_lead_samples` exports that lead.
+entry applied on a counted audio replica needed, over the current minute
+and the last. It stamps every decision on an unresolved entry and every
+`Baseline` with that lead, and at the cap every command too, up to 64
+ms past `maxApplyLead`, in whole blocks and under one second past the
+stamp: stamped with a lead the commits outlast, a decision would be late
+again and decided in turn, a `Baseline` would lapse for the replica it
+names, and each command would be late wherever its commit takes longer.
+One slow replica therefore raises the latency of every command by up to
+64 ms while the lead is capped, and `apply_lead_raised_by` names it.
+The lead does not fall while the entries need more than it. After two
+minutes without entries the lead they needed is forgotten, so the first
+command after such a gap at the cap is stamped with the capped lead. A
+command appended while a decision is ahead takes effect no earlier than
+the decision, so at the cap a command takes effect up to `maxApplyLead`
+plus 64 ms after its stamp. `samplez_replica_decision_lead_samples`
+exports that lead.
 A replica catching up, its log having taken no entry past the commit
 index the first voter report named
 before that entry's deadline since it started or installed a snapshot,

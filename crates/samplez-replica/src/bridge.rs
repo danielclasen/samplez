@@ -482,12 +482,13 @@ impl Audio for EngineAudio {
     }
 
     /// Waits for the floor, which lies up to the lead and a generation's
-    /// build ahead of the engine under continuous writes, and the RT
+    /// build ahead of the engine under continuous writes, the lead at the
+    /// cap up to [`crate::schedule::EXTRA_LEAD`] past it, and the RT
     /// thread's take; a failure is logged once until one succeeds.
     fn rebuild_engine(&self, state: &ProductState, at_least: u64) -> bool {
         let build_lead = self.engine.progress().map_or(0, |p| p.build_lead);
         let ahead = Duration::from_nanos(crate::contact::time_of(build_lead));
-        let timeout = REBUILD_WAIT + self.max_apply_lead + ahead;
+        let timeout = REBUILD_WAIT + self.max_apply_lead + crate::schedule::EXTRA_LEAD + ahead;
         let state = self.sanitised(state);
         match self.engine.install_product(&state, at_least, timeout) {
             Ok(_) => {
