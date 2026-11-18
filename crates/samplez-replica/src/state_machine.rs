@@ -740,10 +740,18 @@ impl<P: Product> StateMachine<P> {
         self.deltas_after = saved.revision;
         // A snapshot written before the floor was kept: the highest index
         // an entry still decidable takes effect at, the same on every
-        // replica that loads it.
-        self.floor = saved
-            .floor
-            .unwrap_or_else(|| self.terms.values().map(|&(_, at)| at).max().unwrap_or(0));
+        // replica that loads it. One further than [`AHEAD_MAX`] past the
+        // highest stamp is a far client index an older writer kept, which
+        // a replica applying that entry counts as its stamp.
+        let highest_stamp = self.highest_stamp;
+        self.floor = saved.floor.unwrap_or_else(|| {
+            self.terms
+                .values()
+                .map(|&(_, at)| at)
+                .filter(|&at| at <= highest_stamp.saturating_add(AHEAD_MAX))
+                .max()
+                .unwrap_or(0)
+        });
         self.derived = saved.derived;
         self.records.clear();
         self.image = if P::DRIVES_ENGINE {
@@ -1898,5 +1906,21 @@ mod derive_tests {
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
         assert_eq!(differ, 0, "{differ} of {} values moved", values.len());
+    }
+
+    /// A legacy snapshot whose decidable entries include a far client
+    /// index an older writer kept loads the floor a replica applying the
+    /// whole log holds, which counted that entry at its stamp.
+    #[test]
+    fn a_legacy_floor_skips_a_far_client_index() {
+        let mut sm = machine();
+        sm.apply_at(1, 1, &one("1", "fader 0 0.5", 0, 3000, None));
+        sm.apply_at(2, 1, &one("2", "fader 0 0.25", 0, 60 * 48_000, None));
+        assert_eq!(sm.floor, 3000);
+        let mut saved = sm.save();
+        saved.floor = None;
+        let mut legacy = machine();
+        legacy.load(saved, Limits::defaults(48_000)).unwrap();
+        assert_eq!(legacy.floor, sm.floor);
     }
 }
