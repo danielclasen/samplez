@@ -19,6 +19,7 @@ libc = "=0.2.191"
 openraft = "=0.9.26"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 samplez = { path = "../..", version = "0.6.0" }
+samplez-dsp = { path = "../samplez-dsp", version = "0.6.0" }
 samplez-mxl = { path = "../samplez-mxl", version = "0.6.0" }
 samplez-service = { path = "../samplez-service", version = "0.6.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -32,7 +33,6 @@ xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["alloc", "sink"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "crypto", "ring"] }
 rtrb = "=0.3.6"
-samplez-dsp = { path = "../samplez-dsp", version = "0.6.0" }
 tokio = { version = "=1.54.1", features = ["macros", "net", "rt", "sync", "test-util", "time"] }
 
 # clippy.toml's blocking primitives: allowed here, denied in the RT

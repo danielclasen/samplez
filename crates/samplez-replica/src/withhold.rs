@@ -436,7 +436,6 @@ mod tests {
 
     use super::*;
     use crate::contact::Sample;
-    use crate::entry::Request;
     use crate::membership::node_id;
     use crate::report::runs;
 
@@ -454,13 +453,11 @@ mod tests {
         fn settled(&self, _: u64) -> bool {
             false
         }
-        fn appended(&self, _: u64, _: &Request) {}
-        fn truncated(&self, _: u64) {}
+        fn appended(&self, _: u64, _: u64, _: &[samplez::Entry]) {}
         fn committed(&self, _: u64) {}
         fn unresolved(&self, _: u64, _: u64) -> bool {
             true
         }
-        fn skip(&self, _: u64) {}
         fn overwhelmed(&self) {}
         fn status(&self, _: usize, _: u64) -> Option<BlockStatus> {
             None

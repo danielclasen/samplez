@@ -1,7 +1,8 @@
 //! [`Audio`] over a replicated samplez [`Engine`]: F and unresolved
-//! entries go to the engine's control ring, the log's entries to its
-//! entry ring by log id, and reports read the status words, the
-//! processed index, the clock flags and the latest page hashes.
+//! entries go to the engine's control ring, the records the applied log
+//! entries derived to its entry ring by log id, and reports read the
+//! status words, the processed index, the clock flags and the latest page
+//! hashes.
 //!
 //! Reports carry the status words of the latest blocks rather than the
 //! changes since the last report, so a change the engine's ring or
@@ -10,7 +11,7 @@
 //! range, which no word records, is lost with its change.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,47 +19,14 @@ use std::time::{Duration, Instant};
 use samplez::blocks::{
     BlockStatus, Cause, HEALTHY, Kind, PAGE, PageHash, Range, Ranks, Standing, StatusChange,
 };
-use samplez::{CopyError, CoreCopy, Engine, Entry, EntryError, ReplayError};
+use samplez::{CopyError, CoreCopy, Engine, Entry, EntryError, ProductState, ReplayError};
 
 use crate::contact::{Audio, Sample, Timing};
-use crate::entry::{Body, Request};
 use crate::report::{ClockFlags, Own, Page, Unwritten, page_digest, runs};
-use crate::resync::{CoreReply, Resynced, Source};
+use crate::resync::{CoreReply, Missed, Resynced, Source};
 
-/// Turns a log entry into the engine entries it applies, in order, with
-/// the index they share; none, or no entries, for an entry the engine does
-/// not apply. The commands of one `Commands` entry ask for one index
-/// ([`Request::at_index`]). The engine folds the entries into one batch
-/// bounded by its shape ([`Engine::append_batch`]), so a command of any
-/// number of entries applies whole at its index.
-///
-/// It must be a pure function of the `Request`, the same on every
-/// replica: the leader checks what it orders against its own engine and
-/// translation ([`crate::contact::Audio::admits`]), so a translation that
-/// differed between replicas, or with anything but the request, could
-/// give another replica's engine an entry it refuses after its commit.
-/// The check holds for replicas of the leader's engine version and shape,
-/// which the compatibility key ([`crate::rollout::key`]) tells apart.
-///
-/// A `Commands` entry must translate to the concatenation of what each of
-/// its commands translates to alone, in order: a restamp keeps some of an
-/// entry's commands, and the engine admits every subset of the entries of
-/// an admitted entry, not every translation of a subset of its commands.
-pub type Translate = Box<dyn Fn(&Request) -> Option<Translated> + Send + Sync>;
-
-/// A log entry's index and the engine entries it applies there.
-pub type Translated = (u64, Vec<Entry>);
-
-/// The product state, as applied, that a dropped engine core is rebuilt
-/// from; none while it cannot be read. It holds everything the log set
-/// that the engine plays: the gains, each slot's state, flow and strip
-/// parameters, and the committed entries not applied yet, since a
-/// rebuild follows a snapshot install, a purge-point verdict or an engine
-/// that dropped committed entries, whose effects reach the engine through
-/// it alone.
-pub type Rebuild = Box<dyn Fn() -> Option<samplez::ProductState> + Send + Sync>;
-
-/// How long a rebuild waits for the RT thread to take the core.
+/// How long a rebuild waits for the RT thread to take the core, past the
+/// floor's lead over the engine ([`EngineAudio::rebuild_engine`]).
 const REBUILD_WAIT: Duration = Duration::from_millis(100);
 
 /// How long a donor waits for its RT thread to copy the core, and how
@@ -70,27 +38,6 @@ const COPY_TRIES: usize = 3;
 /// each hand-over is tried before the log is read again.
 const REPLAY_WAIT: Duration = Duration::from_secs(2);
 const HANDOVER_TRY: Duration = Duration::from_millis(20);
-
-/// The engine entry of an `InputDown` or `InputUp` body; a product's
-/// [`Translate`] adds the entries only it can read, such as a route or a
-/// command's gains and strip parameters.
-pub fn input_entry(request: &Request) -> Option<Translated> {
-    match request.body {
-        Body::InputDown { slot, at_index } => Some((
-            at_index,
-            vec![Entry::InputDown {
-                slot: slot as usize,
-            }],
-        )),
-        Body::InputUp { slot, at_index } => Some((
-            at_index,
-            vec![Entry::InputUp {
-                slot: slot as usize,
-            }],
-        )),
-        _ => None,
-    }
-}
 
 /// Unwritten ranges kept for reports, at most.
 const RANGES_KEPT: usize = 64;
@@ -147,7 +94,6 @@ pub fn word_or_skip(word: Option<BlockStatus>, k: u64) -> BlockStatus {
 
 pub struct EngineAudio {
     engine: Arc<Engine>,
-    translate: Translate,
     outputs: usize,
     block: u64,
     /// Blocks up to the processed one whose statuses reports carry.
@@ -155,7 +101,12 @@ pub struct EngineAudio {
     unwritten: Mutex<Unwrittens>,
     /// Appended entries the engine refused.
     refused: AtomicU64,
-    rebuild: Option<Rebuild>,
+    /// Derived entries left out before the engine saw them.
+    filtered: AtomicU64,
+    /// `maxApplyLeadMs`.
+    max_apply_lead: Duration,
+    /// A failed rebuild was logged; cleared by one that succeeds.
+    rebuild_failed: AtomicBool,
 }
 
 impl EngineAudio {
@@ -169,7 +120,6 @@ impl EngineAudio {
         changes: Receiver<StatusChange>,
         hashes: Receiver<PageHash>,
         timing: &Timing,
-        translate: Translate,
     ) -> EngineAudio {
         let outputs = engine.status().outputs.len();
         let span = timing.hold + timing.contact_window + 2 * timing.report_period;
@@ -177,11 +127,12 @@ impl EngineAudio {
         EngineAudio {
             outputs,
             engine,
-            translate,
             block: timing.block,
             window: samples.div_ceil(timing.block) + 1,
             refused: AtomicU64::new(0),
-            rebuild: None,
+            filtered: AtomicU64::new(0),
+            max_apply_lead: timing.max_apply_lead,
+            rebuild_failed: AtomicBool::new(false),
             unwritten: Mutex::new(Unwrittens {
                 changes,
                 kept: VecDeque::new(),
@@ -191,12 +142,101 @@ impl EngineAudio {
         }
     }
 
-    /// Where a core dropped on a snapshot install or a purge-point
-    /// verdict is rebuilt from; without it the replica stays in
-    /// `starting`.
-    pub fn with_rebuild(mut self, rebuild: Rebuild) -> EngineAudio {
-        self.rebuild = Some(rebuild);
-        self
+    /// The entries of entry `index`'s record the engine takes
+    /// ([`EngineAudio::kept`]). What is left out is counted and logged:
+    /// the product derived what it must not.
+    fn filter(&self, index: u64, entries: &[Entry]) -> Vec<Entry> {
+        let kept = self.kept(entries);
+        let dropped = (entries.len() - kept.len()) as u64;
+        if dropped > 0 {
+            self.filtered.fetch_add(dropped, Ordering::Relaxed);
+            tracing::error!(
+                index,
+                dropped,
+                "the product derived engine entries the engine refuses: left out"
+            );
+        }
+        kept
+    }
+
+    /// Of `entries`, those the engine takes: all of them, or, when it
+    /// refuses them together, those it takes alone, of the `InputUp`s and
+    /// `Route`s only those it takes with the ones of lower slots, so one
+    /// generation's worth stays. The engine's configuration alone decides
+    /// it, the same on every replica of a compatibility key, so their
+    /// outputs still agree.
+    fn kept(&self, entries: &[Entry]) -> Vec<Entry> {
+        if self.engine.admits(entries).is_ok() {
+            return entries.to_vec();
+        }
+        let built = |e: &Entry| matches!(e, Entry::InputUp { .. } | Entry::Route { .. });
+        let alone: Vec<&Entry> = (entries.iter())
+            .filter(|e| self.engine.admits(std::slice::from_ref(*e)).is_ok())
+            .collect();
+        let mut kept: Vec<Entry> = alone
+            .iter()
+            .filter(|e| !built(e))
+            .map(|e| (*e).clone())
+            .collect();
+        let mut generation: Vec<&Entry> = alone.into_iter().filter(|e| built(e)).collect();
+        generation.sort_by_key(|e| match e {
+            Entry::InputUp { slot } | Entry::Route { slot, .. } => *slot,
+            _ => usize::MAX,
+        });
+        for e in generation {
+            kept.push(e.clone());
+            if self.engine.admits(&kept).is_err() {
+                kept.pop();
+            }
+        }
+        kept
+    }
+
+    /// `state` as the records the bridge filters leave an engine: a flow
+    /// differing from the one its input reads is a re-route, kept by the
+    /// rules of [`EngineAudio::kept`] and else left at the one read; a
+    /// strip parameter the engine refuses is not set; a gain it refuses
+    /// is silent. A replica rebuilt from it holds what a live one that
+    /// read the same flows holds.
+    fn sanitised(&self, state: &ProductState) -> ProductState {
+        let mut state = state.clone();
+        let reading: Vec<String> = (self.engine.status().inputs.into_iter())
+            .map(|i| i.flow_id)
+            .collect();
+        let routes: Vec<Entry> = (state.flows.iter().enumerate())
+            .filter(|&(slot, flow)| reading.get(slot).is_some_and(|r| r != flow))
+            .map(|(slot, flow)| Entry::Route {
+                slot,
+                flow_id: flow.clone(),
+            })
+            .collect();
+        let kept = self.kept(&routes);
+        let mut dropped = routes.len() - kept.len();
+        for route in &routes {
+            if let Entry::Route { slot, .. } = *route
+                && !kept.contains(route)
+            {
+                state.flows[slot] = reading[slot].clone();
+            }
+        }
+        for (slot, params) in state.strips.iter_mut().enumerate() {
+            let before = params.len();
+            params.retain(|&param| self.engine.admits(&[Entry::Strip { slot, param }]).is_ok());
+            dropped += before - params.len();
+        }
+        for gain in state.gains.iter_mut().flatten() {
+            if !samplez_dsp::valid_gain(*gain) {
+                *gain = 0.0;
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            tracing::error!(
+                dropped,
+                "the product state holds what the engine refuses: left out of the rebuild"
+            );
+        }
+        state
     }
 
     /// The engine's refusal of an appended entry: the engine then lacks
@@ -254,6 +294,7 @@ impl Audio for EngineAudio {
                 .collect(),
             unwritten: Vec::new(),
             build_lead: Some(progress.build_lead),
+            build_time: Some(progress.build_time),
             pages: unwritten.pages.iter().flatten().copied().collect(),
             ..Own::default()
         };
@@ -271,6 +312,7 @@ impl Audio for EngineAudio {
             own,
             status_changes_lost: progress.status_changes_lost,
             entries_refused: self.refused.load(Ordering::Relaxed),
+            entries_filtered: self.filtered.load(Ordering::Relaxed),
             realised: status.outputs.iter().map(|o| o.realised).collect(),
             generation_ready: status.generation.pending.is_none() || status.generation.ready,
             clock_steps: progress.steps,
@@ -293,31 +335,26 @@ impl Audio for EngineAudio {
         })
     }
 
-    fn appended(&self, index: u64, request: &Request) {
-        if let Some((at_index, entries)) = (self.translate)(request)
-            && let Err(e) = self.engine.append_batch(index, at_index, &entries)
-        {
+    fn appended(&self, index: u64, at_index: u64, entries: &[Entry]) {
+        // A lease expiry from an older leader derives off a block start:
+        // the next one keeps the log's order.
+        let at_index = at_index.next_multiple_of(self.block);
+        // Filtered only when refused: the fold runs once for a record the
+        // engine takes.
+        let refused = match self.engine.append_batch(index, at_index, entries) {
+            Err(EntryError::Invalid(_)) => {
+                let kept = self.filter(index, entries);
+                self.engine.append_batch(index, at_index, &kept).err()
+            }
+            appended => appended.err(),
+        };
+        if let Some(e) = refused {
             self.refused(index, &e);
-        }
-    }
-
-    fn truncated(&self, from: u64) {
-        self.engine.truncate(from);
-    }
-
-    fn admits(&self, request: &Request) -> Result<(), String> {
-        match (self.translate)(request) {
-            Some((_, entries)) => self.engine.admits(&entries).map_err(|e| e.to_string()),
-            None => Ok(()),
         }
     }
 
     fn committed(&self, up_to: u64) {
         self.engine.commit(up_to);
-    }
-
-    fn skip(&self, index: u64) {
-        self.engine.skip(index);
     }
 
     fn overwhelmed(&self) {
@@ -384,14 +421,23 @@ impl Audio for EngineAudio {
         }
     }
 
-    fn rebuild_engine(&self) -> bool {
-        let Some(state) = self.rebuild.as_ref().and_then(|r| r()) else {
-            return false;
-        };
-        match self.engine.install_product(&state, 0, REBUILD_WAIT) {
-            Ok(_) => true,
+    /// Waits for the floor, which lies up to the lead and a generation's
+    /// build ahead of the engine under continuous writes, and the RT
+    /// thread's take; a failure is logged once until one succeeds.
+    fn rebuild_engine(&self, state: &ProductState, at_least: u64) -> bool {
+        let build_lead = self.engine.progress().map_or(0, |p| p.build_lead);
+        let ahead = Duration::from_nanos(crate::contact::time_of(build_lead));
+        let timeout = REBUILD_WAIT + self.max_apply_lead + ahead;
+        let state = self.sanitised(state);
+        match self.engine.install_product(&state, at_least, timeout) {
+            Ok(_) => {
+                self.rebuild_failed.store(false, Ordering::Relaxed);
+                true
+            }
             Err(e) => {
-                tracing::warn!(error = ?e, "the engine core was not rebuilt");
+                if !self.rebuild_failed.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(error = ?e, "the engine core was not rebuilt: retried");
+                }
                 false
             }
         }
@@ -425,21 +471,20 @@ impl Audio for EngineAudio {
         let deadline = Instant::now() + REPLAY_WAIT;
         let mut after = core.last_id;
         let j = loop {
-            let entries: Vec<(u64, Option<Translated>)> = source
+            // A gap is never replayed: the attempt fails, and the next
+            // takes a newer core.
+            let records = source
                 .entries(after)
-                .into_iter()
-                .map(|(index, request)| (index, (self.translate)(&request)))
-                .collect();
-            // The lowest index of the entries from each one on.
-            let mut lowest = vec![u64::MAX; entries.len() + 1];
-            for (n, (_, t)) in entries.iter().enumerate().rev() {
-                lowest[n] = lowest[n + 1].min(t.as_ref().map_or(u64::MAX, |t| t.0));
+                .map_err(|Missed| "a record after the donor's core is gone".to_owned())?;
+            // The lowest index of the records from each one on.
+            let mut lowest = vec![u64::MAX; records.len() + 1];
+            for (n, (_, r)) in records.iter().enumerate().rev() {
+                lowest[n] = lowest[n + 1].min(r.at_index);
             }
-            for (n, (index, translated)) in entries.into_iter().enumerate() {
+            for (n, (index, record)) in records.into_iter().enumerate() {
                 after = index;
-                let Some((at_index, list)) = translated else {
-                    continue;
-                };
+                let at_index = record.at_index.next_multiple_of(self.block);
+                let list = self.filter(index, &record.entries);
                 let mut appended = replay.append_batch(index, at_index, &list);
                 if appended == Err(ReplayError::Full) {
                     // Its pending list holds the entries before this one:

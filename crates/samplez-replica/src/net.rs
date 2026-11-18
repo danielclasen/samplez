@@ -392,7 +392,7 @@ impl RaftNetwork<TypeConfig> for Link {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        // Up to MAX_PAYLOAD_ENTRIES entries: encoded off the async worker.
+        // Up to MAX_APPEND_BYTES of commands: encoded off the async worker.
         let encoded =
             tokio::task::spawn_blocking(move || serde_json::to_vec(&AppendWire::from(&rpc)));
         let body = encoded

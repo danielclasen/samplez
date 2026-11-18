@@ -8,17 +8,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use samplez::blocks::{HEALTHY, PAGE};
-use samplez::{Config, Engine, Entry, InputState, Replication};
-use samplez_dsp::StripParam;
+use samplez::{Config, Engine, Entry, InputState, Replication, Targets};
+use samplez_dsp::{GateParams, StripParam};
 use samplez_mxl::output::{self, Creation, OutputConfig};
 use samplez_mxl::{Instance, time};
 use samplez_replica::bootstrap::random_id;
-use samplez_replica::bridge::{EngineAudio, PAGES_REPORTED, Translate, Translated, input_entry};
+use samplez_replica::bridge::{EngineAudio, PAGES_REPORTED};
 use samplez_replica::contact::{Audio, Timing};
-use samplez_replica::entry::{Body, Command, Origin, Request};
+use samplez_replica::dedup::Limits;
+use samplez_replica::entry::{Body, Command, Origin, Request, SessionKey};
 use samplez_replica::report::{Page, page_digest, status_of};
-use samplez_replica::resync::Source;
-use samplez_service::Role;
+use samplez_replica::resync::{Missed, Source};
+use samplez_replica::state_machine::{Apply, Changed, Effect, Product, Record, StateMachine};
 
 const B: u64 = 48;
 
@@ -72,17 +73,11 @@ fn bridge(domain: &Domain, changes: usize) -> (Arc<Engine>, EngineAudio) {
             "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a",
             "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01",
         ],
-        Box::new(input_entry),
     )
 }
 
-/// [`bridge`] with input and output flows `flows` and `translate`.
-fn bridge_on(
-    domain: &Domain,
-    changes: usize,
-    flows: [&str; 2],
-    translate: Translate,
-) -> (Arc<Engine>, EngineAudio) {
+/// [`bridge`] with input and output flows `flows`.
+fn bridge_on(domain: &Domain, changes: usize, flows: [&str; 2]) -> (Arc<Engine>, EngineAudio) {
     let v = serde_json::json!({
         "blockSize": B,
         "readerMarginSamples": 960,
@@ -94,14 +89,23 @@ fn bridge_on(
         "matrix": [[1.0]],
         "rt": { "rtCpu": "none" },
     });
-    bridge_of(&v, changes, translate)
+    bridge_of(&v, changes)
 }
 
 /// [`bridge`] of configuration `v`.
-fn bridge_of(
+fn bridge_of(v: &serde_json::Value, changes: usize) -> (Arc<Engine>, EngineAudio) {
+    let timing = Timing {
+        margin: 960,
+        ..Timing::defaults(B)
+    };
+    bridge_timed(v, changes, &timing)
+}
+
+/// [`bridge_of`] with contact's timers `timing`.
+fn bridge_timed(
     v: &serde_json::Value,
     changes: usize,
-    translate: Translate,
+    timing: &Timing,
 ) -> (Arc<Engine>, EngineAudio) {
     let config = Config::parse(&v.to_string()).unwrap();
     let (reports, _) = std::sync::mpsc::sync_channel(64);
@@ -118,11 +122,7 @@ fn bridge_of(
     wait_for("outputs realised", || {
         engine.status().outputs.iter().all(|o| o.realised)
     });
-    let timing = Timing {
-        margin: 960,
-        ..Timing::defaults(B)
-    };
-    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, &timing, translate);
+    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, timing);
     (engine, audio)
 }
 
@@ -174,15 +174,11 @@ fn entries_reach_the_engine_by_log_id_once_committed() {
     });
     let processed = engine.progress().unwrap().processed.unwrap();
     let at_index = (processed + 200) * B;
-    let request = Request {
-        stamp: 0,
-        body: Body::InputDown { slot: 0, at_index },
-    };
     let consumed = || engine.counters().entries_consumed.load(Ordering::Relaxed);
     let before = consumed();
-    audio.appended(7, &request);
+    audio.appended(7, at_index, &[Entry::InputDown { slot: 0 }]);
     std::thread::sleep(Duration::from_millis(30));
-    assert_eq!(consumed(), before, "appended, not yet committed");
+    assert_eq!(consumed(), before, "appended, not yet handed");
     audio.committed(7);
     wait_for("the entry taken by the RT thread", || {
         consumed() == before + 1
@@ -223,49 +219,100 @@ fn a_block_without_a_status_word_is_reported_withheld() {
 }
 
 #[test]
-fn a_skipped_entry_never_reaches_the_rt_thread() {
+fn an_entry_the_engine_refuses_is_counted_in_every_sample() {
+    let domain = Domain::new();
+    let (_engine, audio) = bridge(&domain, 1 << 16);
+    assert_eq!(audio.sample().entries_refused, 0);
+    // Off a block start, as a lease expiry from an older leader derives
+    // under a block size that does not divide the fallback lead: taken
+    // at the next one, which keeps the log's order.
+    audio.appended(3, 48_001, &[Entry::InputDown { slot: 0 }]);
+    assert_eq!(audio.sample().entries_refused, 0);
+    // Not above the last log id: the engine refuses the batch.
+    audio.appended(3, 48_048, &[Entry::InputDown { slot: 0 }]);
+    assert_eq!(audio.sample().entries_refused, 1);
+}
+
+/// An engine entry the engine refuses is left out of its record before
+/// the engine sees it, and counted; the rest of the record is appended.
+/// Unlike a refused batch it stops no writes: every replica of the key
+/// leaves it out alike.
+#[test]
+fn a_derived_entry_the_engine_refuses_is_left_out_and_counted() {
     let domain = Domain::new();
     let (engine, audio) = bridge(&domain, 1 << 16);
     wait_for("a block computed", || {
         engine.progress().unwrap().processed.is_some()
     });
-    let processed = engine.progress().unwrap().processed.unwrap();
-    let request = |at| Request {
-        stamp: 0,
-        body: Body::InputDown {
-            slot: 0,
-            at_index: at,
-        },
-    };
+    let at = (engine.progress().unwrap().processed.unwrap() + 100) * B;
     let consumed = || engine.counters().entries_consumed.load(Ordering::Relaxed);
     let before = consumed();
-    audio.appended(7, &request((processed + 200) * B));
-    audio.appended(8, &request((processed + 201) * B));
-    // Its commit came after its apply deadline: the log decides it.
-    audio.skip(7);
-    audio.committed(8);
-    wait_for("entry 8 taken by the RT thread", || {
+    // No input slot 5, and a gain beyond the engine's bound.
+    let entries = [
+        Entry::InputDown { slot: 5 },
+        Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: f32::INFINITY,
+        },
+        Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.5,
+        },
+    ];
+    audio.appended(3, at, &entries);
+    audio.committed(3);
+    let sample = audio.sample();
+    assert_eq!(
+        (sample.entries_filtered, sample.entries_refused),
+        (2, 0),
+        "two left out, the batch taken"
+    );
+    wait_for("the rest taken by the RT thread", || {
         consumed() == before + 1
     });
-    std::thread::sleep(Duration::from_millis(30));
-    assert_eq!(consumed(), before + 1, "entry 7 was applied");
+    wait_for("its index passed", || {
+        engine.progress().unwrap().processed.unwrap() > at / B + 480 / B
+    });
+    let copy = engine.copy_core(Duration::from_secs(2)).unwrap();
+    assert_eq!(copy.core.gain(0, 0), 0.5);
 }
 
+/// Of the `InputUp`s and `Route`s of one record whose slots lie in two
+/// input domains, the engine builds one generation: those of the domain
+/// of the lowest slot stay, the others are left out.
 #[test]
-fn an_entry_the_engine_refuses_is_counted_in_every_sample() {
-    let domain = Domain::new();
-    let (_engine, audio) = bridge(&domain, 1 << 16);
-    assert_eq!(audio.sample().entries_refused, 0);
-    // No input slot 5: the engine refuses the entry.
-    let request = Request {
-        stamp: 0,
-        body: Body::InputDown {
-            slot: 5,
-            at_index: 48_000,
-        },
-    };
-    audio.appended(3, &request);
-    assert_eq!(audio.sample().entries_refused, 1);
+fn a_record_raising_inputs_of_two_domains_keeps_the_lowest_slots_domain() {
+    let (d0, d1) = (Domain::new(), Domain::new());
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "a", "path": d0.0 }, { "name": "b", "path": d1.0 }],
+        "inputs": [
+            { "name": "in0", "domain": "b", "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd4a00", "channels": 1 },
+            { "name": "in1", "domain": "a", "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd4a01", "channels": 1 },
+            { "name": "in2", "domain": "a", "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd4a02", "channels": 1 },
+        ],
+        "outputs": [{ "name": "out0", "domain": "a", "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f20",
+                      "label": "domains", "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0], [1.0], [1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (engine, audio) = bridge_of(&v, 1 << 12);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let at = (engine.progress().unwrap().processed.unwrap() + 100) * B;
+    let up = |slot| Entry::InputUp { slot };
+    assert!(engine.admits(&[up(2), up(1), up(0)]).is_err());
+    audio.appended(4, at, &[up(2), up(1), up(0)]);
+    audio.committed(4);
+    // Slot 0's domain, b, stays, though slots 1 and 2 of domain a come
+    // first in the record.
+    let sample = audio.sample();
+    assert_eq!((sample.entries_filtered, sample.entries_refused), (2, 0));
 }
 
 #[test]
@@ -361,16 +408,14 @@ fn reports_carry_the_latest_page_hashes() {
 fn a_dropped_engine_keeps_reporting_its_processed_block() {
     let domain = Domain::new();
     let (_engine, audio) = bridge(&domain, 1 << 12);
-    let audio = audio.with_rebuild(Box::new(|| {
-        Some(samplez::ProductState {
-            gains: vec![vec![1.0]],
-            up: vec![true],
-            flows: vec!["5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned()],
-            strips: vec![Vec::new()],
-            pending: Vec::new(),
-            last_id: 0,
-        })
-    }));
+    let state = samplez::ProductState {
+        gains: vec![vec![1.0]],
+        up: vec![true],
+        flows: vec!["5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned()],
+        strips: vec![Vec::new()],
+        pending: Vec::new(),
+        last_id: 0,
+    };
     wait_for("a block processed", || {
         audio.sample().own.processed.is_some()
     });
@@ -383,24 +428,34 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
             .processed
             .is_some_and(|k| k > dropped_at + 4)
     });
-    wait_for("the core rebuilt", || audio.rebuild_engine());
+    wait_for("the core rebuilt", || audio.rebuild_engine(&state, 0));
 }
 
-struct Feed(bool);
+/// A joiner's replica: go while it says so, its records gone when
+/// `missed`.
+struct Feed {
+    go: bool,
+    missed: bool,
+}
 
 impl Source for Feed {
-    fn entries(&self, _after: u64) -> Vec<(u64, Request)> {
-        Vec::new()
+    fn entries(&self, _after: u64) -> Result<Vec<(u64, Arc<Record>)>, Missed> {
+        if self.missed {
+            Err(Missed)
+        } else {
+            Ok(Vec::new())
+        }
     }
     fn go(&self) -> bool {
-        self.0
+        self.go
     }
 }
 
 /// A resync between two engines through the bridge: the donor's core,
 /// encoded, is replayed on the joiner, which hands it over at a block
-/// boundary and holds the donor's unresolved entry; told to stop, a
-/// joiner hands nothing over.
+/// boundary and holds the donor's unresolved entry; told to stop, or
+/// without the records after the donor's core, a joiner hands nothing
+/// over.
 #[test]
 fn a_donors_core_is_replayed_and_handed_over_on_the_joiner() {
     let (da, db) = (Domain::new(), Domain::new());
@@ -419,39 +474,38 @@ fn a_donors_core_is_replayed_and_handed_over_on_the_joiner() {
             .load(Ordering::Relaxed)
     };
     let core = donor_audio.copy_core().expect("a core");
-    let r = joiner_audio.resync(&core, &Feed(true)).unwrap();
+    let feed = |go, missed| Feed { go, missed };
+    let r = joiner_audio.resync(&core, &feed(true, false)).unwrap();
     assert!(r.j >= core.k0, "handed over after {} from {}", r.j, core.k0);
     assert_eq!(r.unresolved, vec![(9, at)]);
     assert_eq!(installed(), 1);
     let core = donor_audio.copy_core().expect("a core");
-    assert!(joiner_audio.resync(&core, &Feed(false)).is_err());
+    assert!(joiner_audio.resync(&core, &feed(false, false)).is_err());
     assert_eq!(installed(), 1, "no hand-over once told to stop");
+    let core = donor_audio.copy_core().expect("a core");
+    assert!(joiner_audio.resync(&core, &feed(true, true)).is_err());
+    assert_eq!(installed(), 1, "no hand-over over a gap");
 }
 
-/// A mixer's translation: each command `<gain> <trim>` of a `Commands`
-/// entry ramps the coefficient to `gain` and trims the input's strip by
-/// `trim` dB, two engine entries for one command.
-fn mixer(request: &Request) -> Option<(u64, Vec<Entry>)> {
-    let Body::Commands(commands) = &request.body else {
-        return input_entry(request);
-    };
-    let mut entries = Vec::new();
-    for c in commands {
-        let text = std::str::from_utf8(&c.body).ok()?;
-        let (gain, trim) = text.split_once(' ')?;
-        entries.push(Entry::Gain {
-            input: 0,
-            output: 0,
-            gain: gain.parse().ok()?,
-        });
-        entries.push(Entry::Strip {
-            slot: 0,
-            param: StripParam::Trim {
-                db: trim.parse().ok()?,
+/// A mixer command's record: it ramps the coefficient to `gain` and
+/// trims the input's strip by `trim` dB, two engine entries for one log
+/// entry.
+fn mixer(at_index: u64, gain: f32, trim: f32) -> Record {
+    Record {
+        at_index,
+        entries: vec![
+            Entry::Gain {
+                input: 0,
+                output: 0,
+                gain,
             },
-        });
+            Entry::Strip {
+                slot: 0,
+                param: StripParam::Trim { db: trim },
+            },
+        ],
+        generation: false,
     }
-    Some((request.at_index()?, entries))
 }
 
 /// A sine on flow `id`, written block by block as libmxl's clock passes
@@ -551,20 +605,23 @@ fn undisturbed(scenario: impl Fn() -> Result<(), String>) {
     panic!("every run was disturbed: {seen:?}");
 }
 
-struct Log(Vec<(u64, Request)>);
+struct Log(Vec<(u64, Record)>);
 
 impl Source for Log {
-    fn entries(&self, after: u64) -> Vec<(u64, Request)> {
-        self.0.iter().filter(|(i, _)| *i > after).cloned().collect()
+    fn entries(&self, after: u64) -> Result<Vec<(u64, Arc<Record>)>, Missed> {
+        Ok((self.0.iter())
+            .filter(|(i, _)| *i > after)
+            .map(|(i, r)| (*i, Arc::new(r.clone())))
+            .collect())
     }
     fn go(&self) -> bool {
         true
     }
 }
 
-/// A donor's core copied, then `n` mixer commands committed on the
-/// donor, each 40 blocks ahead as it is appended, which a joiner learns
-/// only from the log in its resync.
+/// A donor's core copied, then the records of `n` mixer commands handed
+/// to the donor, each 40 blocks ahead as it applies, which a joiner
+/// learns only from its replica's records in its resync.
 fn resync_after(n: u64) -> Result<(), String> {
     let domain = Domain::new();
     // A second of history: the replay reads from the donor's core on.
@@ -579,13 +636,11 @@ fn resync_after(n: u64) -> Result<(), String> {
         &domain,
         1 << 12,
         [input, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f04"],
-        Box::new(mixer),
     );
     let (joiner, joiner_audio) = bridge_on(
         &domain,
         1 << 12,
         [input, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f05"],
-        Box::new(mixer),
     );
     wait_for("both read the input", || {
         [&donor, &joiner].iter().all(|e| {
@@ -603,26 +658,10 @@ fn resync_after(n: u64) -> Result<(), String> {
     for id in 1..=n {
         let processed = donor.progress().and_then(|p| p.processed).unwrap();
         at = (processed + 40) * B;
-        let command = Command {
-            generation: None,
-            origin: Origin {
-                principal: "p".into(),
-                session: "s".into(),
-                role: Role::Operator,
-                connection: "c".into(),
-            },
-            id: id.to_string(),
-            at_index: Some(at),
-            body: format!("0.{} -{}", 5 + id % 4, id % 7).into_bytes(),
-        };
-        let request = Request {
-            stamp: at,
-            body: Body::Commands(vec![command]),
-        };
-        assert_eq!(mixer(&request).map(|(_, e)| e.len()), Some(2));
-        donor_audio.appended(id, &request);
+        let record = mixer(at, 0.5 + (id % 4) as f32 / 10.0, -((id % 7) as f32));
+        donor_audio.appended(id, at, &record.entries);
         donor_audio.committed(id);
-        log.push((id, request));
+        log.push((id, record));
         std::thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(donor_audio.sample().entries_refused, 0);
@@ -679,14 +718,10 @@ fn resync_after(n: u64) -> Result<(), String> {
 const ROWS: usize = 32;
 const COLUMNS: usize = 22;
 
-/// A scene recall: every coefficient of the matrix and every strip
-/// parameter of the four strips, each set twice, 1616 engine entries for
-/// one command; the gains scaled by the command's body.
-fn scene(request: &Request) -> Option<Translated> {
-    let Body::Commands(commands) = &request.body else {
-        return None;
-    };
-    let scale: f32 = std::str::from_utf8(&commands[0].body).ok()?.parse().ok()?;
+/// A scene recall's engine entries: every coefficient of the matrix and
+/// every strip parameter of the four strips, each set twice, 1616 for one
+/// log entry; the gains scaled by `scale`.
+fn scene(scale: f32) -> Vec<Entry> {
     let mut entries = Vec::new();
     for pass in [0.5, 1.0] {
         for input in 0..ROWS {
@@ -704,7 +739,7 @@ fn scene(request: &Request) -> Option<Translated> {
             }
         }
     }
-    Some((request.at_index()?, entries))
+    entries
 }
 
 fn scene_gain(scale: f32, input: usize, output: usize) -> f32 {
@@ -788,7 +823,7 @@ fn scene_recalls_on_a_large_shape_apply_on_every_replica() {
                 "matrix": vec![vec![0.0; COLUMNS]; ROWS],
                 "rt": { "rtCpu": "none" },
             });
-            bridge_of(&v, 1 << 12, Box::new(scene))
+            bridge_of(&v, 1 << 12)
         })
         .collect();
     let processed = |e: &Engine| e.progress().and_then(|p| p.processed);
@@ -803,24 +838,10 @@ fn scene_recalls_on_a_large_shape_apply_on_every_replica() {
     let recalls = 64u64;
     let at = |id: u64| (first + 500 + id) * B;
     for id in 1..=recalls {
-        let request = Request {
-            stamp: at(id),
-            body: Body::Commands(vec![Command {
-                generation: None,
-                origin: Origin {
-                    principal: "p".into(),
-                    session: "s".into(),
-                    role: Role::Operator,
-                    connection: "c".into(),
-                },
-                id: id.to_string(),
-                at_index: Some(at(id)),
-                body: (id as f32 / recalls as f32).to_string().into_bytes(),
-            }]),
-        };
-        assert_eq!(scene(&request).map(|(_, e)| e.len()), Some(1616));
+        let entries = scene(id as f32 / recalls as f32);
+        assert_eq!(entries.len(), 1616);
         for (_, audio) in &replicas {
-            audio.appended(id, &request);
+            audio.appended(id, at(id), &entries);
         }
     }
     for (_, audio) in &replicas {
@@ -860,32 +881,19 @@ const SOURCES: [&str; 4] = [
     "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd3a03",
 ];
 
-/// A recall's translation: `route` re-routes both inputs to the other
-/// two sources, `outside` sets a coefficient the engine does not have.
-fn recall(request: &Request) -> Option<Translated> {
-    let Body::Commands(commands) = &request.body else {
-        return None;
-    };
-    let entries = match &commands[0].body[..] {
-        b"route" => (0..2)
-            .map(|slot| Entry::Route {
-                slot,
-                flow_id: SOURCES[2 + slot].to_owned(),
-            })
-            .collect(),
-        _ => vec![Entry::Gain {
-            input: 5,
-            output: 0,
-            gain: 0.5,
-        }],
-    };
-    Some((request.at_index()?, entries))
+/// A recall re-routing both inputs to the other two sources.
+fn recall() -> Vec<Entry> {
+    (0..2)
+        .map(|slot| Entry::Route {
+            slot,
+            flow_id: SOURCES[2 + slot].to_owned(),
+        })
+        .collect()
 }
 
-/// A recall changing the sources of two inputs commits and applies on
-/// every replica, one generation re-routing both; a command the engine
-/// would refuse once committed is refused by every replica's check
-/// before it is ordered, so no replica counts a refused entry.
+/// A recall changing the sources of two inputs of one domain applies on
+/// every replica, one generation re-routing both, and no replica counts
+/// a refused entry.
 #[test]
 fn a_two_source_recall_applies_on_every_replica() {
     let domains: Vec<Domain> = (0..3).map(|_| Domain::new()).collect();
@@ -907,7 +915,7 @@ fn a_two_source_recall_applies_on_every_replica() {
                 "matrix": [[1.0], [1.0]],
                 "rt": { "rtCpu": "none" },
             });
-            bridge_of(&v, 1 << 12, Box::new(recall))
+            bridge_of(&v, 1 << 12)
         })
         .collect();
     let processed = |e: &Engine| e.progress().and_then(|p| p.processed);
@@ -920,25 +928,8 @@ fn a_two_source_recall_applies_on_every_replica() {
         .max()
         .unwrap();
     let at = (first + 300) * B;
-    let request = |body: &[u8]| Request {
-        stamp: at,
-        body: Body::Commands(vec![Command {
-            generation: None,
-            origin: Origin {
-                principal: "p".into(),
-                session: "s".into(),
-                role: Role::Operator,
-                connection: "c".into(),
-            },
-            id: "1".into(),
-            at_index: Some(at),
-            body: body.to_vec(),
-        }]),
-    };
     for (_, audio) in &replicas {
-        assert!(audio.admits(&request(b"outside")).is_err());
-        assert_eq!(audio.admits(&request(b"route")), Ok(()));
-        audio.appended(1, &request(b"route"));
+        audio.appended(1, at, &recall());
         audio.committed(1);
     }
     wait_for("both inputs re-routed", || {
@@ -956,11 +947,8 @@ fn a_two_source_recall_applies_on_every_replica() {
 const ROUTED: &str = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b9e";
 
 /// A command re-routing input 0 to [`ROUTED`] and trimming its strip.
-fn route_and_trim(request: &Request) -> Option<Translated> {
-    let Body::Commands(_) = &request.body else {
-        return input_entry(request);
-    };
-    let entries = vec![
+fn route_and_trim() -> Vec<Entry> {
+    vec![
         Entry::Route {
             slot: 0,
             flow_id: ROUTED.to_owned(),
@@ -969,8 +957,7 @@ fn route_and_trim(request: &Request) -> Option<Translated> {
             slot: 0,
             param: StripParam::Trim { db: -6.0 },
         },
-    ];
-    Some((request.at_index()?, entries))
+    ]
 }
 
 /// A replica rebuilt from product state, as after a snapshot install,
@@ -1006,24 +993,20 @@ fn rebuild_after_a_route() -> Result<(), String> {
         &domain,
         1 << 12,
         [input, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f06"],
-        Box::new(route_and_trim),
     );
     let (joiner, joiner_audio) = bridge_on(
         &domain,
         1 << 12,
         [input, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f07"],
-        Box::new(route_and_trim),
     );
-    let joiner_audio = joiner_audio.with_rebuild(Box::new(|| {
-        Some(samplez::ProductState {
-            gains: vec![vec![1.0]],
-            up: vec![true],
-            flows: vec![ROUTED.to_owned()],
-            strips: vec![vec![StripParam::Trim { db: -6.0 }]],
-            pending: Vec::new(),
-            last_id: 1,
-        })
-    }));
+    let state = samplez::ProductState {
+        gains: vec![vec![1.0]],
+        up: vec![true],
+        flows: vec![ROUTED.to_owned()],
+        strips: vec![vec![StripParam::Trim { db: -6.0 }]],
+        pending: Vec::new(),
+        last_id: 1,
+    };
     let processed = |e: &Engine| e.progress().and_then(|p| p.processed).unwrap_or(0);
     wait_for("both read the input", || {
         [&donor, &joiner]
@@ -1031,27 +1014,12 @@ fn rebuild_after_a_route() -> Result<(), String> {
             .all(|e| e.status().inputs[0].state == InputState::Attached && processed(e) > 0)
     });
     let at = (processed(&donor) + 40) * B;
-    let request = Request {
-        stamp: at,
-        body: Body::Commands(vec![Command {
-            generation: None,
-            origin: Origin {
-                principal: "p".into(),
-                session: "s".into(),
-                role: Role::Operator,
-                connection: "c".into(),
-            },
-            id: "1".into(),
-            at_index: Some(at),
-            body: b"route".to_vec(),
-        }]),
-    };
-    donor_audio.appended(1, &request);
+    donor_audio.appended(1, at, &route_and_trim());
     donor_audio.committed(1);
     // The joiner's state jumps past entry 1, as a snapshot install does.
     joiner_audio.drop_engine();
     wait_for("the index passed", || processed(&donor) > at / B + 10);
-    wait_for("rebuilt", || joiner_audio.rebuild_engine());
+    wait_for("rebuilt", || joiner_audio.rebuild_engine(&state, 0));
     let rebuilt = processed(&joiner);
     drop(old);
     let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
@@ -1096,5 +1064,509 @@ fn rebuild_after_a_route() -> Result<(), String> {
         return Err(format!("{compared} pages compared"));
     }
     assert_eq!(joiner.status().inputs[0].flow_id, ROUTED);
+    Ok(())
+}
+
+/// Two input slots in two input domains, `a` and `b`, into one output of
+/// domain `a`; no flow is written.
+fn two_domains(d0: &Domain, d1: &Domain, output: &str) -> serde_json::Value {
+    serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "a", "path": d0.0 }, { "name": "b", "path": d1.0 }],
+        "inputs": [
+            { "name": "in0", "domain": "a", "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd5a00", "channels": 1 },
+            { "name": "in1", "domain": "b", "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd5b00", "channels": 1 },
+        ],
+        "outputs": [{ "name": "out0", "domain": "a", "flowId": output,
+                      "label": "domains", "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0], [1.0]],
+        "rt": { "rtCpu": "none" },
+    })
+}
+
+/// A re-route of both slots, of two domains, as a command flagged `None`
+/// derives during a rollout: a live engine keeps the lower slot's route
+/// and leaves the other out. A replica rebuilt from the product state,
+/// which holds both, reads what the live one reads, and a gain the
+/// engine refuses is silenced in the rebuild rather than refusing it.
+#[test]
+fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
+    let (d0, d1) = (Domain::new(), Domain::new());
+    let (live, live_audio) = bridge_of(
+        &two_domains(&d0, &d1, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f30"),
+        1 << 12,
+    );
+    let (rebuilt, rebuilt_audio) = bridge_of(
+        &two_domains(&d0, &d1, "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f31"),
+        1 << 12,
+    );
+    let processed = |e: &Engine| e.progress().and_then(|p| p.processed);
+    wait_for("both compute", || {
+        processed(&live).is_some() && processed(&rebuilt).is_some()
+    });
+    let routed = [
+        "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd5a01",
+        "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd5b01",
+    ];
+    let reroute: Vec<Entry> = (0..2)
+        .map(|slot| Entry::Route {
+            slot,
+            flow_id: routed[slot].to_owned(),
+        })
+        .collect();
+    let at = (processed(&live).unwrap() + 100) * B;
+    live_audio.appended(1, at, &reroute);
+    live_audio.committed(1);
+    let flows =
+        |e: &Engine| -> Vec<String> { e.status().inputs.into_iter().map(|i| i.flow_id).collect() };
+    wait_for("slot 0 re-routed", || flows(&live)[0] == routed[0]);
+    assert_eq!(live_audio.sample().entries_filtered, 1);
+    let mut state = samplez::ProductState {
+        gains: vec![vec![1.0], vec![1.0]],
+        up: vec![true, true],
+        flows: routed.map(str::to_owned).to_vec(),
+        strips: vec![Vec::new(), Vec::new()],
+        pending: Vec::new(),
+        last_id: 1,
+    };
+    rebuilt_audio.drop_engine();
+    assert!(rebuilt_audio.rebuild_engine(&state, 0), "rebuilt");
+    assert_eq!(
+        flows(&rebuilt),
+        flows(&live),
+        "the flows the live one reads"
+    );
+    state.gains[1][0] = f32::INFINITY;
+    state.last_id = 2;
+    assert!(rebuilt_audio.rebuild_engine(&state, 0), "rebuilt again");
+    // Past the gains' fade-in.
+    std::thread::sleep(Duration::from_millis(100));
+    let core = loop {
+        match rebuilt.copy_core(Duration::from_secs(2)) {
+            Err(samplez::CopyError::Passed { .. }) => continue,
+            c => break c.unwrap(),
+        }
+    };
+    assert_eq!((core.core.gain(0, 0), core.core.gain(1, 0)), (1.0, 0.0));
+}
+
+/// A rebuild offered for a floor further ahead than the rebuild's own
+/// wait, as continuous writes keep it with a `maxApplyLead` near 100 ms
+/// and a generation's build ahead of that, waits for the floor and
+/// installs: refused, the replica would never rebuild under writes.
+#[test]
+fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
+    let domain = Domain::new();
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "in0", "domain": "d",
+                     "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a", "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d", "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f32",
+                      "label": "bridge", "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let timing = Timing {
+        margin: 960,
+        max_apply_lead: Duration::from_millis(100),
+        ..Timing::defaults(B)
+    };
+    let (engine, audio) = bridge_timed(&v, 1 << 12, &timing);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let state = samplez::ProductState {
+        gains: vec![vec![0.5]],
+        up: vec![true],
+        flows: vec!["5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned()],
+        strips: vec![Vec::new()],
+        pending: Vec::new(),
+        last_id: 1,
+    };
+    audio.drop_engine();
+    // 180 ms ahead: past the 100 ms a rebuild waits beyond the lead.
+    let now = (engine.progress().unwrap().processed.unwrap() + 1) * B;
+    let floor = (now + 180 * 48).next_multiple_of(B);
+    assert!(audio.rebuild_engine(&state, floor), "rebuilt at the floor");
+    let installed = engine.progress().unwrap().processed.unwrap();
+    assert!(installed * B + B >= floor, "installed at {installed}");
+}
+
+/// Two mono input slots reading one flow into one output, as a product
+/// drives them: `fader <slot> <gain>`, `vca <gain>`, `gate <slot> <dB>`
+/// for the gate threshold, `recall <gain>` setting both faders.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Console {
+    faders: [f32; 2],
+    vca: f32,
+    gates: [f32; 2],
+    flow: String,
+}
+
+impl Console {
+    fn new(flow: &str) -> Console {
+        Console {
+            faders: [1.0, 1.0],
+            vca: 1.0,
+            gates: [-60.0, -60.0],
+            flow: flow.to_owned(),
+        }
+    }
+}
+
+impl Product for Console {
+    type Change = ();
+    const DRIVES_ENGINE: bool = true;
+
+    fn apply(&mut self, _: &Origin, command: &[u8], _: &Apply) -> Effect<()> {
+        let text = std::str::from_utf8(command).expect("utf-8");
+        let number = |s: &str| s.parse::<f32>().unwrap();
+        match text.split(' ').collect::<Vec<_>>()[..] {
+            ["fader", slot, gain] => self.faders[slot.parse::<usize>().unwrap()] = number(gain),
+            ["vca", gain] => self.vca = number(gain),
+            ["gate", slot, db] => self.gates[slot.parse::<usize>().unwrap()] = number(db),
+            ["recall", gain] => self.faders = [number(gain), number(gain) / 2.0],
+            _ => return Effect::Stale,
+        }
+        Effect::Changed(())
+    }
+    fn expire(&mut self, _: &SessionKey) -> Effect<()> {
+        Effect::Unchanged
+    }
+    fn forget(&mut self, _: &SessionKey) {}
+    fn delta(&self, _: u64, _: &[Changed<'_, ()>]) -> String {
+        String::new()
+    }
+    fn text(&self) -> String {
+        String::new()
+    }
+    fn save(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("encodes")
+    }
+    fn load(&mut self, saved: &[u8]) -> Result<(), String> {
+        *self = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    fn config_hash(&self) -> u64 {
+        0
+    }
+    fn targets(&self) -> Option<Targets> {
+        let gate = |slot: usize| {
+            vec![StripParam::Gate(GateParams {
+                enabled: true,
+                threshold_db: self.gates[slot],
+                range_db: 30.0,
+                attack_ms: 1.0,
+                release_ms: 200.0,
+            })]
+        };
+        Some(Targets {
+            gains: (0..2).map(|s| vec![self.faders[s] * self.vca]).collect(),
+            flows: vec![self.flow.clone(); 2],
+            strips: (0..2).map(gate).collect(),
+        })
+    }
+}
+
+/// An engine of [`Console`]'s shape reading `input`, writing `output`.
+fn console(domain: &Domain, input: &str, output: &str) -> (Arc<Engine>, EngineAudio) {
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": (0..2).map(|n| serde_json::json!({
+            "name": format!("in{n}"), "domain": "d", "flowId": input, "channels": 1 }))
+            .collect::<Vec<_>>(),
+        "outputs": [{ "name": "out0", "domain": "d", "flowId": output, "label": "console",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0], [1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    bridge_of(&v, 1 << 12)
+}
+
+/// A machine applying a log of [`Console`] commands, one per entry.
+struct Machine(StateMachine<Console>);
+
+impl Machine {
+    fn new(flow: &str) -> Machine {
+        Machine(StateMachine::new(
+            Console::new(flow),
+            Limits::defaults(48_000),
+        ))
+    }
+
+    /// Applies entry `index`, command `body` stamped `stamp` asking for
+    /// `at`: the record it derived.
+    fn apply(&mut self, index: u64, stamp: u64, at: u64, body: &str) -> Arc<Record> {
+        let command = Command {
+            origin: Origin {
+                principal: "anonymous".into(),
+                session: "s".into(),
+                role: samplez_service::Role::Operator,
+                connection: "r0:n:1".into(),
+            },
+            id: index.to_string(),
+            at_index: Some(at),
+            body: body.as_bytes().to_vec(),
+            generation: None,
+        };
+        let request = Request {
+            stamp,
+            body: Body::Commands(vec![command]),
+        };
+        self.0.apply_at(index, 1, &request);
+        Arc::clone(&self.0.records[&index])
+    }
+}
+
+/// Collects the page records of every engine of `audios` until each has
+/// processed block `end`: per engine, by page.
+fn pages_until(
+    engines: &[(&Engine, &EngineAudio)],
+    end: u64,
+) -> Result<Vec<BTreeMap<u64, Page>>, String> {
+    let mut pages = vec![BTreeMap::new(); engines.len()];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for (n, (_, audio)) in engines.iter().enumerate() {
+            for p in audio.sample().own.pages {
+                pages[n].insert(p.page, p);
+            }
+        }
+        let done = (engines.iter())
+            .all(|(e, _)| e.progress().and_then(|p| p.processed).unwrap_or(0) > end);
+        if done {
+            return Ok(pages);
+        }
+        if Instant::now() > deadline {
+            return Err("pages within 10 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Pages `from..=to` of `a` and `b` equal by hash and fingerprint: the
+/// number compared.
+fn equal_pages(
+    a: &BTreeMap<u64, Page>,
+    b: &BTreeMap<u64, Page>,
+    from: u64,
+    to: u64,
+) -> Result<usize, String> {
+    let mut compared = 0;
+    for p in from..=to {
+        let (Some(x), Some(y)) = (a.get(&p), b.get(&p)) else {
+            continue;
+        };
+        if (x.hash, x.fingerprint) != (y.hash, y.fingerprint) {
+            return Err(format!("page {p} differs"));
+        }
+        compared += 1;
+    }
+    Ok(compared)
+}
+
+const CONSOLE_INPUT: &str = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd6a00";
+
+/// A domain with a second of history and a pilot on [`CONSOLE_INPUT`],
+/// and two console engines reading it, past their fade-in from the
+/// attach.
+fn consoles(domain: &Domain) -> [(Arc<Engine>, EngineAudio); 2] {
+    std::fs::write(
+        domain.0.join("options.json"),
+        r#"{"urn:x-mxl:option:history_duration/v1.0": 1000000000}"#,
+    )
+    .unwrap();
+    let engines = [
+        console(
+            domain,
+            CONSOLE_INPUT,
+            "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f40",
+        ),
+        console(
+            domain,
+            CONSOLE_INPUT,
+            "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f41",
+        ),
+    ];
+    wait_for("both read the input", || {
+        engines.iter().all(|(e, _)| {
+            e.status()
+                .inputs
+                .iter()
+                .all(|i| i.state == InputState::Attached)
+                && e.progress().and_then(|p| p.processed).is_some()
+        })
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    engines
+}
+
+fn processed_of(e: &Engine) -> u64 {
+    e.progress().and_then(|p| p.processed).unwrap_or(0)
+}
+
+/// Two engines each handed the records its own machine derived from one
+/// log (design test 22): a VCA move, a gate change and a recall derive
+/// equal records on both machines, and the engines compute equal pages
+/// from the first entry's index on.
+#[test]
+fn two_engines_fed_two_machines_records_compute_equal_pages() {
+    undisturbed(machines_records_on_two_engines);
+}
+
+fn machines_records_on_two_engines() -> Result<(), String> {
+    let domain = Domain::new();
+    let _pilot = Pilot::start(&domain, CONSOLE_INPUT);
+    let [(ea, aa), (eb, ab)] = consoles(&domain);
+    let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
+    let silenced_before = silenced(&ea) + silenced(&eb);
+    let (mut ma, mut mb) = (Machine::new(CONSOLE_INPUT), Machine::new(CONSOLE_INPUT));
+    let log = ["vca 0.5", "gate 0 -20", "recall 0.8", "fader 1 0.25"];
+    let (mut first, mut last) = (None, 0);
+    for (n, body) in log.iter().enumerate() {
+        let index = n as u64 + 1;
+        let stamp = processed_of(&ea).max(processed_of(&eb)) * B;
+        let at = stamp + 40 * B;
+        let (ra, rb) = (
+            ma.apply(index, stamp, at, body),
+            mb.apply(index, stamp, at, body),
+        );
+        assert_eq!(ra, rb, "entry {index}: equal records");
+        aa.appended(index, ra.at_index, &ra.entries);
+        aa.committed(index);
+        ab.appended(index, rb.at_index, &rb.entries);
+        ab.committed(index);
+        first.get_or_insert(ra.at_index);
+        last = ra.at_index;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let end = (last + 480) / B + 4 * PAGE / B;
+    let pages = pages_until(&[(&ea, &aa), (&eb, &ab)], end + PAGE / B)?;
+    if silenced(&ea) + silenced(&eb) > silenced_before {
+        return Err("an input block silenced".into());
+    }
+    let from = first.unwrap() / PAGE;
+    let compared = equal_pages(&pages[0], &pages[1], from, end * B / PAGE)?;
+    if compared < 4 {
+        return Err(format!("{compared} pages compared"));
+    }
+    for e in [&ea, &eb] {
+        assert_eq!(e.counters().command_late.load(Ordering::Relaxed), 0);
+    }
+    Ok(())
+}
+
+/// How a rebuild meets the floor (design test 25).
+#[derive(Clone, Copy, Debug)]
+enum Floor {
+    /// An entry after the state read takes effect at exactly its floor.
+    At,
+    /// An entry after the state read passes before the install: the
+    /// install is missed, and a fresh read installs.
+    Passed,
+    /// Nothing written for a while: the floor lies in the past.
+    Idle,
+}
+
+/// A core rebuilt from a machine's product state at its floor, with the
+/// records after it handed on top while fader writes go on, computes the
+/// live engine's pages once the ramps of the install and of the last
+/// write ended.
+#[test]
+fn a_core_rebuilt_at_the_floor_computes_the_live_pages() {
+    for case in [Floor::At, Floor::Passed, Floor::Idle] {
+        undisturbed(|| rebuild_at_the_floor(case));
+    }
+}
+
+fn rebuild_at_the_floor(case: Floor) -> Result<(), String> {
+    let domain = Domain::new();
+    let _pilot = Pilot::start(&domain, CONSOLE_INPUT);
+    let [(live, la), (rebuilt, ra)] = consoles(&domain);
+    let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
+    let silenced_before = silenced(&live) + silenced(&rebuilt);
+    let mut m = Machine::new(CONSOLE_INPUT);
+    let index = std::cell::Cell::new(0u64);
+    // Entry `body` asking for `ahead` blocks past the latest block either
+    // engine computed, handed to both as contact hands it.
+    let write = |m: &mut Machine, body: &str, ahead: u64| {
+        index.set(index.get() + 1);
+        let index = index.get();
+        let stamp = processed_of(&live).max(processed_of(&rebuilt)) * B;
+        let r = m.apply(index, stamp, stamp + ahead * B, body);
+        for audio in [&la, &ra] {
+            audio.appended(index, r.at_index, &r.entries);
+            audio.committed(index);
+        }
+        (index, r)
+    };
+    for n in 0..3 {
+        write(&mut m, &format!("fader 0 0.{}", n + 3), 40);
+    }
+    ra.drop_engine();
+    match case {
+        Floor::At => {
+            write(&mut m, "fader 1 0.7", 40);
+            let (n, floor) = (index.get(), m.0.floor);
+            let state = m.0.product_state(n);
+            let (_, r) = write(&mut m, "fader 0 0.2", 5);
+            assert_eq!(r.at_index, floor, "at exactly the floor");
+            if !ra.rebuild_engine(&state, floor) {
+                return Err("not rebuilt".into());
+            }
+        }
+        Floor::Passed => {
+            write(&mut m, "fader 1 0.7", 40);
+            let (n, floor) = (index.get(), m.0.floor);
+            let stale = m.0.product_state(n);
+            write(&mut m, "fader 0 0.2", 5);
+            wait_for("its index passed", || {
+                processed_of(&rebuilt) > m.0.floor / B + 2
+            });
+            assert!(
+                !ra.rebuild_engine(&stale, floor),
+                "an entry it lacks passed"
+            );
+            let fresh = m.0.product_state(index.get());
+            if !ra.rebuild_engine(&fresh, m.0.floor) {
+                return Err("not rebuilt from a fresh read".into());
+            }
+        }
+        Floor::Idle => {
+            wait_for("the floor passed", || {
+                processed_of(&rebuilt) > m.0.floor / B + 20
+            });
+            let state = m.0.product_state(index.get());
+            if !ra.rebuild_engine(&state, m.0.floor) {
+                return Err("not rebuilt".into());
+            }
+        }
+    }
+    let installed = processed_of(&rebuilt);
+    let mut last = 0;
+    for n in 0..10 {
+        let (_, r) = write(&mut m, &format!("fader {} 0.{}", n % 2, n + 1), 40);
+        last = r.at_index;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let from = ((installed + 1) * B + 2 * 480).div_ceil(PAGE) + 2;
+    let end = (last + 480) / B + 4 * PAGE / B;
+    let pages = pages_until(&[(&live, &la), (&rebuilt, &ra)], end + PAGE / B)?;
+    if silenced(&live) + silenced(&rebuilt) > silenced_before {
+        return Err("an input block silenced".into());
+    }
+    let compared = equal_pages(&pages[0], &pages[1], from, end * B / PAGE)?;
+    if compared < 4 {
+        return Err(format!("{case:?}: {compared} pages compared"));
+    }
+    assert_eq!(rebuilt.counters().command_late.load(Ordering::Relaxed), 0);
     Ok(())
 }

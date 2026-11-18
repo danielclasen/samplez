@@ -3,13 +3,15 @@
 //! leader decides each one once the baseline committed the block holding
 //! its at_index, or once every live audio replica withheld that block:
 //! it stands when the baseline applied it there, and nothing is appended;
-//! else a `Restamp` gives it a fresh at_index, or a `Void` drops it when a
-//! later committed entry sets what it sets, or once three restamps were
-//! late. An id the leader's log does not hold is voided once the leader
-//! committed an entry of its own term, or draws a purge-point verdict at
-//! or below the leader's purge point. Replicas that hold an entry
-//! unresolved where it stands contradict the log's decision: page verdict
-//! rule (1) diverges them.
+//! else a `Restamp` gives it a fresh at_index, or a `Void` resolves it
+//! when it is an engine body a later committed entry supersedes, or once
+//! three restamps were late. A product entry's restamp or void re-asserts
+//! the state at its own place, so no later entry is undone. An id the
+//! leader's log does not hold is voided once the leader committed an
+//! entry of its own term, or draws a purge-point verdict at or below the
+//! leader's purge point. Replicas that hold an entry unresolved where it
+//! stands contradict the log's decision: page verdict rule (1) diverges
+//! them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -45,10 +47,10 @@ pub(crate) struct LeaderLog<'a> {
     pub own_term_committed: bool,
     /// The restamps behind the entry at an index.
     pub restamps: &'a dyn Fn(u64) -> u32,
-    /// The paths of the entry at an index, through the restamps behind
-    /// it, that no later committed entry sets: none when every one is set
-    /// later; empty for an engine entry still to restamp whole.
-    pub remaining: &'a dyn Fn(u64) -> Option<Vec<String>>,
+    /// Whether a later committed entry sets every engine target the entry
+    /// at an index, through the restamps behind it, sets: a restamp would
+    /// undo it.
+    pub superseded: &'a dyn Fn(u64) -> bool,
     /// A decision on (index, term) is in the log, committed or not.
     pub decided: &'a dyn Fn(u64, u64) -> bool,
 }
@@ -239,8 +241,7 @@ impl Decider {
             }
             self.seen.remove(&k);
             let late = (log.restamps)(id.index);
-            let remaining = (log.remaining)(id.index);
-            if late >= RESTAMPS_MAX || remaining.is_none() {
+            if late >= RESTAMPS_MAX || (log.superseded)(id.index) {
                 if late >= RESTAMPS_MAX {
                     self.counts.command_late += 1;
                 }
@@ -259,7 +260,7 @@ impl Decider {
                     revision: id.index,
                     term: id.term,
                     at_index: 0,
-                    paths: remaining.unwrap_or_default(),
+                    paths: Vec::new(),
                     generation: None,
                 });
             }
@@ -390,7 +391,7 @@ mod tests {
             .collect();
         let held = |i: u64| log.held.iter().copied().find(|h| h.index == i);
         let restamps = |_| log.restamps;
-        let remaining = |_| (!log.superseded).then(Vec::new);
+        let superseded = |_| log.superseded;
         let decided = |_, _| log.decided;
         let view = LeaderLog {
             log_id_at: &held,
@@ -398,7 +399,7 @@ mod tests {
             purged: log.purged,
             own_term_committed: log.own_term,
             restamps: &restamps,
-            remaining: &remaining,
+            superseded: &superseded,
             decided: &decided,
         };
         let b = base.map(baseline);
@@ -475,53 +476,6 @@ mod tests {
         assert_eq!(
             decide(&mut Decider::default(), &owns, Some(1), &held).append,
             []
-        );
-    }
-
-    /// Partly superseded: the restamp names the paths left.
-    #[tokio::test(start_paused = true)]
-    async fn a_restamp_names_only_the_paths_no_later_entry_sets() {
-        let e = id(7, 2);
-        let owns = [(1, false, own(Kind::Committed, &[e]))];
-        let audio: Vec<Voter> = owns
-            .iter()
-            .map(|(id, silent, own)| Voter {
-                id: *id,
-                silent: *silent,
-                own: Some(own),
-            })
-            .collect();
-        let held = |i: u64| (i == 7).then_some(e);
-        let zero = |_| 0;
-        let left = |_| Some(vec!["pan".to_owned()]);
-        let no = |_, _| false;
-        let view = LeaderLog {
-            log_id_at: &held,
-            committed: 9,
-            purged: 0,
-            own_term_committed: true,
-            restamps: &zero,
-            remaining: &left,
-            decided: &no,
-        };
-        let b = baseline(1);
-        let out = Decider::default().decide(
-            &audio,
-            Some(&b),
-            None,
-            &view,
-            &Timing::defaults(B),
-            Instant::now(),
-        );
-        assert_eq!(
-            out.append,
-            [Body::Restamp {
-                revision: 7,
-                term: 2,
-                at_index: 0,
-                paths: vec!["pan".into()],
-                generation: None,
-            }]
         );
     }
 
@@ -661,7 +615,7 @@ mod tests {
         let log = Log::default();
         let held = |i: u64| log.held.iter().copied().find(|h| h.index == i);
         let zero = |_| 0;
-        let whole = |_| Some(Vec::new());
+        let whole = |_| false;
         let no = |_, _| false;
         let view = LeaderLog {
             log_id_at: &held,
@@ -669,7 +623,7 @@ mod tests {
             purged: 0,
             own_term_committed: true,
             restamps: &zero,
-            remaining: &whole,
+            superseded: &whole,
             decided: &no,
         };
         let (old, new) = (baseline(1), baseline(2));

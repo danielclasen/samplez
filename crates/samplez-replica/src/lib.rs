@@ -81,21 +81,25 @@ pub const MAX_COMMAND_BYTES: usize = 32 << 10;
 /// single command can exceed it, by its id and owner.
 pub const MAX_ENTRY_BYTES: usize = 32 << 10;
 
-/// The commands one entry carries at most. Before a command joins an
-/// entry the engine checks the entry with it ([`contact::Audio::admits`]),
-/// translating and folding its commands again: bounded, the checks of
-/// one entry cost at most this many squared commands' translations.
+/// The commands one entry carries at most.
 pub const MAX_ENTRY_COMMANDS: usize = 64;
 
-/// The entries one AppendEntries carries at most. openraft gives an
-/// AppendEntries the heartbeat interval to complete; at this count and
-/// [`MAX_ENTRY_BYTES`] one carries about 128 KiB of commands, a third
-/// more encoded.
-pub const MAX_PAYLOAD_ENTRIES: u64 = 4;
+/// The entries one AppendEntries carries at most.
+pub const MAX_PAYLOAD_ENTRIES: u64 = 64;
+
+/// The command bytes ([`Command::size`]) one AppendEntries carries at
+/// most beside its first entry, about 128 KiB, a third more encoded:
+/// openraft gives an AppendEntries the heartbeat interval to complete.
+/// Counting bytes rather than entries lets one AppendEntries, and so one
+/// fsync on a follower, take every small entry written since the last
+/// one, so a follower whose fsync takes longer than the gap between
+/// entries does not fall further behind with each of them.
+pub const MAX_APPEND_BYTES: usize = 4 * MAX_ENTRY_BYTES;
 
 /// openraft's timers as the chart pins them (`replica.raft`): its 0.9.21
 /// defaults, so the election figures do not move with a dependency
-/// update; and [`MAX_PAYLOAD_ENTRIES`].
+/// update; and [`MAX_PAYLOAD_ENTRIES`], which [`MAX_APPEND_BYTES`]
+/// bounds further.
 pub fn raft_config(cluster: &str) -> openraft::Config {
     openraft::Config {
         cluster_name: cluster.to_owned(),
@@ -497,9 +501,10 @@ impl<P: Product> Replica<P> {
     }
 
     /// Starts contact with the other voters ([`contact`]): side reports
-    /// each report period, F published to `audio`, entries handed to it as
-    /// they are appended and known committed, and unresolved ones once
-    /// their apply deadline passes. The witness passes no `audio`.
+    /// each report period, F published to `audio`, what each entry derived
+    /// handed to it as the entry applies, and entries unresolved once
+    /// their apply deadline passes unapplied. The witness passes no
+    /// `audio`.
     pub fn contact(
         &self,
         timing: contact::Timing,
@@ -766,13 +771,7 @@ impl Shared {
         }
         if (self.protocol)() < PROTOCOL {
             // Another writer appending it: unflagged until it applied.
-            if self
-                .marking
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return None;
-            }
+            let _marking = Marking::take(&self.marking)?;
             let marker = Request {
                 stamp,
                 body: Body::Protocol(PROTOCOL),
@@ -780,7 +779,6 @@ impl Shared {
             let written =
                 tokio::time::timeout(self.settings.write_timeout, self.raft.client_write(marker))
                     .await;
-            self.marking.store(false, Ordering::SeqCst);
             if !matches!(written, Ok(Ok(_))) {
                 return None;
             }
@@ -1308,10 +1306,6 @@ async fn write(
                 }
             }
             Queued::Command(item) => {
-                if let Err(why) = shared.admits(&[&item.command]) {
-                    let _ = item.reply.send(Err(Refused::Invalid(why)));
-                    continue;
-                }
                 // One that would re-route an input is ordered alone,
                 // stamped for its generation.
                 if (shared.reroutes)(&item.command) {
@@ -1322,20 +1316,9 @@ async fn write(
                 let mut items = vec![item];
                 while let Ok(queued) = queued.try_recv() {
                     match queued {
-                        // One the engine refuses with the entry's others
-                        // opens an entry of its own.
                         Queued::Command(item)
                             if joins(&items[0].command, items.len(), bytes, &item.command)
-                                && !(shared.reroutes)(&item.command)
-                                && shared
-                                    .admits(
-                                        &items
-                                            .iter()
-                                            .map(|i| &i.command)
-                                            .chain([&item.command])
-                                            .collect::<Vec<_>>(),
-                                    )
-                                    .is_ok() =>
+                                && !(shared.reroutes)(&item.command) =>
                         {
                             bytes += item.command.size();
                             items.push(item);
@@ -1352,27 +1335,23 @@ async fn write(
     }
 }
 
-impl Shared {
-    /// Whether this replica's engine takes the entry `commands` make,
-    /// stamped at any index, once committed: checked before the entry is
-    /// ordered, so that no committed entry is refused
-    /// ([`contact::Audio::admits`]).
-    fn admits(&self, commands: &[&Command]) -> Result<(), String> {
-        let Some(contact) = self.contact.get() else {
-            return Ok(());
-        };
-        let commands = commands
-            .iter()
-            .map(|c| Command {
-                generation: None,
-                at_index: Some(c.at_index.unwrap_or(0)),
-                ..(*c).clone()
-            })
-            .collect();
-        contact.admits(&Request {
-            stamp: 0,
-            body: Body::Commands(commands),
-        })
+/// One writer's hold on appending the protocol marker
+/// ([`Body::Protocol`]), released when dropped: a write cancelled while it
+/// awaits the marker's commit leaves the next writer free to append it.
+struct Marking<'a>(&'a AtomicBool);
+
+impl<'a> Marking<'a> {
+    /// The hold, none while another writer has it.
+    fn take(flag: &'a AtomicBool) -> Option<Marking<'a>> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Marking(flag))
+    }
+}
+
+impl Drop for Marking<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1661,6 +1640,23 @@ mod tests {
     use std::path::PathBuf;
 
     const ID: NodeId = 7;
+
+    /// A writer cancelled while it awaits the marker's commit releases
+    /// the hold, so a later writer appends the marker rather than write
+    /// every flag unflagged.
+    #[test]
+    fn a_cancelled_marker_write_releases_the_hold() {
+        let flag = AtomicBool::new(false);
+        let mut write = Box::pin(async {
+            let _held = Marking::take(&flag).expect("free");
+            std::future::pending::<()>().await;
+        });
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(write.as_mut().poll(&mut cx).is_pending());
+        assert!(Marking::take(&flag).is_none(), "held while it writes");
+        drop(write);
+        assert!(Marking::take(&flag).is_some(), "released when cancelled");
+    }
 
     /// A product that drives an engine refuses a command asking for an
     /// index beyond the earliest; one that does not keeps it, and an

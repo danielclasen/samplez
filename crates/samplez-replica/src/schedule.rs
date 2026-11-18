@@ -91,10 +91,11 @@ impl Lead {
     /// `now` the stamping index at this moment. Slack of an entry stamped
     /// before the last raise is measured at the old lead: ignored, so one
     /// late entry, whichever replicas report it, raises the lead once.
-    pub fn add(&mut self, slack: i64, stamp: u64, now: u64) {
+    /// True when this slack asked for a higher lead, granted or capped.
+    pub fn add(&mut self, slack: i64, stamp: u64, now: u64) -> bool {
         self.roll();
         if stamp < self.raised_at {
-            return;
+            return false;
         }
         let b = self.block as i64;
         let blocks = slack.div_euclid(b);
@@ -110,7 +111,9 @@ impl Lead {
             // now on carry the raise, so the window starts again.
             self.minutes = VecDeque::from([Slacks::new()]);
             self.minute_start = Instant::now();
+            return true;
         }
+        false
     }
 
     /// Moves to the minute now runs in, falling by B per minute passed

@@ -28,13 +28,13 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::TypeConfig;
 use crate::dedup::Limits;
 use crate::entry::{Body, NodeId, Request, Response};
 use crate::snapshot::{
     StoredEntry, StoredLogId, StoredMembershipConfig, StoredPayload, StoredSnapshot, StoredVote,
 };
 use crate::state_machine::{Factory, Product, StateMachine};
+use crate::{MAX_APPEND_BYTES, TypeConfig};
 
 type Error = StorageError<NodeId>;
 
@@ -85,7 +85,6 @@ pub struct Store<P> {
     on_mismatch: Arc<dyn Fn(u64, u64) + Send + Sync>,
     snapshots: Arc<tokio::sync::Mutex<()>>,
     /// Added to every fsynced write, for tests of a slow volume.
-    #[cfg(test)]
     sync_delay: std::time::Duration,
 }
 
@@ -97,7 +96,6 @@ impl<P> Clone for Store<P> {
             config: self.config,
             on_mismatch: self.on_mismatch.clone(),
             snapshots: self.snapshots.clone(),
-            #[cfg(test)]
             sync_delay: self.sync_delay,
         }
     }
@@ -274,11 +272,6 @@ impl<P: Product> Store<P> {
         self
     }
 
-    /// The product paths `command` sets.
-    pub fn paths(&self, command: &[u8]) -> Vec<String> {
-        self.lock().sm.product.paths(command)
-    }
-
     /// Opens the storage in `dir`, creating it when absent, with an empty
     /// product `factory` builds as the state the snapshot (if any) is
     /// loaded into. Every snapshot installed later loads into one it
@@ -302,6 +295,7 @@ impl<P: Product> Store<P> {
                 sm.load(snapshot.state.clone(), limits)
                     .map_err(io::Error::other)?;
                 last_applied = snapshot.last_applied;
+                sm.records_from = last_applied.map_or(0, |id| id.index);
                 membership = snapshot.membership.clone();
                 Some(snapshot)
             }
@@ -356,21 +350,19 @@ impl<P: Product> Store<P> {
             config,
             on_mismatch: Arc::new(exit_on_mismatch),
             snapshots: Arc::default(),
-            #[cfg(test)]
             sync_delay: std::time::Duration::ZERO,
         })
     }
 
-    /// This store with every fsynced write taking `delay` longer.
-    #[cfg(test)]
-    pub(crate) fn with_sync_delay(mut self, delay: std::time::Duration) -> Store<P> {
+    /// This store with every fsynced write taking `delay` longer: a slow
+    /// disk, for tests.
+    pub fn with_sync_delay(mut self, delay: std::time::Duration) -> Store<P> {
         self.sync_delay = delay;
         self
     }
 
     /// Appends `records` to `log` as one frame, fsynced with `sync`.
     async fn write(&self, records: &[Record], sync: bool) -> io::Result<()> {
-        #[cfg(test)]
         if sync && !self.sync_delay.is_zero() {
             tokio::time::sleep(self.sync_delay).await;
         }
@@ -398,6 +390,12 @@ impl<P: Product> Store<P> {
     /// The index of the last entry applied.
     pub fn applied_index(&self) -> u64 {
         self.view(|applied, _| applied)
+    }
+
+    /// The applied index, the floor there and the engine state of the
+    /// applied log ([`StateMachine::product_state`]), read at once.
+    pub fn product_state(&self) -> (u64, u64, samplez::ProductState) {
+        self.view(|n, sm| (n, sm.floor, sm.product_state(n)))
     }
 
     /// Whether the volume holds nothing of a set: no vote, entry or
@@ -479,6 +477,71 @@ impl<P> Store<P> {
         self.lock().sm.restamps.get(&index).map_or(0, |&(n, _)| n)
     }
 
+    /// Calls `f` with the log index and record of every entry after
+    /// `after` up to `up_to` that derived engine entries and is held, in
+    /// log order; false when one is no longer held
+    /// ([`StateMachine::records_from`]).
+    pub fn records(
+        &self,
+        after: u64,
+        up_to: u64,
+        mut f: impl FnMut(u64, &Arc<crate::state_machine::Record>),
+    ) -> bool {
+        let inner = self.lock();
+        if after < up_to {
+            for (index, record) in inner.sm.records.range(after + 1..=up_to) {
+                f(*index, record);
+            }
+        }
+        after >= inner.sm.records_from
+    }
+
+    /// The log index after which the state machine holds every record
+    /// ([`StateMachine::records_from`]).
+    pub fn records_from(&self) -> u64 {
+        self.lock().sm.records_from
+    }
+
+    /// The floor after every entry below `index`: the applied state's,
+    /// raised over the entries held after it as the apply will raise it.
+    /// The applied state's for an `index` at or below the applied one.
+    pub fn floor_before(&self, index: u64) -> u64 {
+        let inner = self.lock();
+        let applied = inner.last_applied.map_or(0, |id| id.index);
+        let mut floor = inner.sm.floor;
+        let end = index.max(applied + 1);
+        for e in inner.log.range(applied + 1..end).map(|(_, e)| e) {
+            if let StoredPayload::Normal(request) = &e.payload
+                && let Some(at) = crate::state_machine::floored(floor, request)
+            {
+                floor = at;
+            }
+        }
+        floor
+    }
+
+    /// Engine entries pending above `floor`, read in one hold: the records
+    /// held that take effect above it, and the entries held unapplied
+    /// whose index, as their apply will raise it, lies above it.
+    pub fn pending_above(&self, floor: u64) -> usize {
+        let inner = self.lock();
+        let applied = inner.last_applied.map_or(0, |id| id.index);
+        let records = (inner.sm.records.values())
+            .filter(|r| r.at_index > floor)
+            .count();
+        let mut raised = inner.sm.floor;
+        let mut unapplied = 0;
+        for e in inner.log.range(applied + 1..).map(|(_, e)| e) {
+            if let StoredPayload::Normal(request) = &e.payload
+                && let Some(at) = crate::state_machine::floored(raised, request)
+            {
+                raised = at;
+                unapplied += usize::from(at > floor);
+            }
+        }
+        records + unapplied
+    }
+
     /// Calls `f` with the log index and body of every entry the engine
     /// applies at a future index, as the state machine holds them, purged
     /// ones included.
@@ -558,6 +621,40 @@ impl<P: Product> RaftLogReader<TypeConfig> for Store<P> {
             .range(range)
             .map(|(_, e)| e.into())
             .collect())
+    }
+
+    /// The entries of `[start, end)` up to [`MAX_APPEND_BYTES`] of
+    /// commands beside the first, which is always taken: what one
+    /// AppendEntries carries.
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<openraft::Entry<TypeConfig>>, Error> {
+        let inner = self.lock();
+        let mut bytes = 0;
+        Ok(inner
+            .log
+            .range(start..end)
+            .enumerate()
+            .take_while(|(i, (_, e))| {
+                bytes += command_bytes(e);
+                *i == 0 || bytes <= MAX_APPEND_BYTES
+            })
+            .map(|(_, (_, e))| e.into())
+            .collect())
+    }
+}
+
+/// The command bytes ([`crate::entry::Command::size`]) an entry carries;
+/// 0 for an entry without commands.
+fn command_bytes(entry: &StoredEntry) -> usize {
+    match &entry.payload {
+        StoredPayload::Normal(Request {
+            body: Body::Commands(commands),
+            ..
+        }) => commands.iter().map(|c| c.size()).sum(),
+        _ => 0,
     }
 }
 
@@ -780,6 +877,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         let mut sm = StateMachine::new((self.factory)(), limits);
         sm.load(stored.state.clone(), limits)
             .map_err(|e| read_error(&e))?;
+        sm.records_from = stored.last_applied.map_or(0, |id| id.index);
         blocking(move || replace(&dir, "snapshot", &bytes))
             .await
             .map_err(|e| {
@@ -847,6 +945,96 @@ mod tests {
 
     fn id(index: u64) -> LogId<NodeId> {
         LogId::new(CommittedLeaderId::new(1, 0), index)
+    }
+
+    /// Contact's floor at append is the one the apply reaches: the
+    /// applied state's, raised over the entries held after it as they
+    /// will apply; and the records the apply derives are read back at
+    /// it.
+    #[tokio::test]
+    async fn the_floor_before_an_entry_is_the_one_its_apply_reaches() {
+        let dir = dir("floor");
+        let mut store = open(&dir);
+        let down = |index, at_index| openraft::Entry {
+            log_id: id(index),
+            payload: EntryPayload::Normal(Request {
+                stamp: 0,
+                body: Body::InputDown { slot: 0, at_index },
+            }),
+        };
+        let entries = vec![down(1, 4800), down(2, 960), down(3, 9600)];
+        store.append_to_log(entries.clone()).await.expect("append");
+        store
+            .apply_to_state_machine(&entries[..1])
+            .await
+            .expect("apply");
+        assert_eq!(
+            [
+                store.floor_before(2),
+                store.floor_before(3),
+                store.floor_before(4)
+            ],
+            [4800, 4800, 9600]
+        );
+        // Entry 2 asks for 960 and applies at 4800: pending above 2400,
+        // as are the record of entry 1 and entry 3.
+        assert_eq!(store.pending_above(2400), 3);
+        store
+            .apply_to_state_machine(&entries[1..])
+            .await
+            .expect("apply");
+        assert_eq!(store.with_state(|sm| sm.floor), 9600);
+        let mut records = Vec::new();
+        assert!(store.records(0, 3, |i, r| records.push((i, r.at_index))));
+        assert_eq!(records, [(1, 4800), (2, 4800), (3, 9600)]);
+        // Read as held, not copied.
+        let mut shared = Vec::new();
+        store.records(0, 3, |i, r| shared.push((i, Arc::clone(r))));
+        store.with_state(|sm| {
+            for (i, r) in &shared {
+                assert!(Arc::ptr_eq(r, &sm.records[i]));
+            }
+        });
+    }
+
+    /// One AppendEntries takes every entry written since the last up to
+    /// [`MAX_APPEND_BYTES`] of commands, so a follower whose fsync takes
+    /// longer than the gap between small entries catches up in one; and
+    /// at least the first entry, whatever its size.
+    #[tokio::test]
+    async fn an_append_carries_entries_up_to_its_byte_bound() {
+        let dir = dir("limited");
+        let mut store = open(&dir);
+        // An entry of one command of `size` bytes.
+        let sized = |index: u64, size: usize| {
+            let mut c = command("s", &index.to_string(), "");
+            c.body = vec![b'x'; size - c.size()];
+            assert_eq!(c.size(), size);
+            openraft::Entry {
+                log_id: id(index),
+                payload: EntryPayload::Normal(Request {
+                    stamp: 0,
+                    body: Body::Commands(vec![c]),
+                }),
+            }
+        };
+        let quarter = MAX_APPEND_BYTES / 4;
+        let entries = (1..=64)
+            .map(|i| sized(i, 100))
+            .chain((65..=70).map(|i| sized(i, quarter)))
+            .chain([sized(71, MAX_APPEND_BYTES + 1), sized(72, 100)]);
+        store.append_to_log(entries).await.expect("append");
+        let taken = async |store: &mut Store<Paths>, start, end| {
+            let entries = store.limited_get_log_entries(start, end).await;
+            (entries.expect("entries").iter())
+                .map(|e| e.log_id.index)
+                .collect::<Vec<u64>>()
+        };
+        assert_eq!(taken(&mut store, 1, 65).await, (1..=64).collect::<Vec<_>>());
+        assert_eq!(taken(&mut store, 65, 73).await, [65, 66, 67, 68]);
+        assert_eq!(taken(&mut store, 64, 73).await, [64, 65, 66, 67]);
+        assert_eq!(taken(&mut store, 71, 73).await, [71]);
+        assert_eq!(taken(&mut store, 72, 73).await, [72]);
     }
 
     #[tokio::test]

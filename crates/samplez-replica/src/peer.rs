@@ -28,8 +28,8 @@ use crate::state_machine::Product;
 use crate::{Replica, net};
 
 /// The largest request the peer listener takes: above openraft's 3 MiB
-/// snapshot chunks and an AppendEntries of [`crate::MAX_PAYLOAD_ENTRIES`]
-/// entries of [`crate::MAX_ENTRY_BYTES`].
+/// snapshot chunks and an AppendEntries of [`crate::MAX_APPEND_BYTES`]
+/// of commands beside one entry of [`crate::MAX_ENTRY_BYTES`].
 pub const MAX_BODY: usize = 8 << 20;
 
 /// The largest answer a replica reads: [`MAX_BODY`] beside the largest
@@ -113,8 +113,9 @@ pub enum Refused {
     /// First received longer ago than the set deduplicates
     /// (`dedupRetentionS - ageGuard` of E): never ordered.
     Expired,
-    /// A command the engine would refuse once committed, with why: never
-    /// ordered.
+    /// A command the writer does not order, with why, such as one asking
+    /// for an index beyond the earliest of a product that drives an
+    /// engine.
     Invalid(String),
     /// A leader asked for a read index that no majority acknowledged
     /// within the lease: the asker reads its own state, marked stale.

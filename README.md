@@ -214,7 +214,9 @@ from where it is. `InputUp` and `Route` need a new input generation:
 the engine builds it when the entry is appended, one at a time, and
 swaps it in at the entry's index. The status reports the 99.99th
 percentile of the build times and buildLead, how far ahead such entries
-are stamped. `Engine::start` keeps the log itself, stamping `InputDown`
+are stamped; `Engine::progress` reports buildLead and the build time,
+the percentile and a supervisor tick without the engine's lead.
+`Engine::start` keeps the log itself, stamping `InputDown`
 when an input is pruned and `InputUp` once its head has advanced for a
 second, wherever it stands against the clock, and each `InputUp` or
 `Route` at least buildLead after the one before;
@@ -234,12 +236,9 @@ gains first; one generation covers every slot it raises or re-routes,
 and a late one counts once in `command_late`. A log entry raising or
 re-routing inputs of more than one domain, or with an entry refused
 alone, is refused whole (`append_batch`, `admits`); `samplez-replica`
-asks before it orders a command and refuses it to its client
-(`invalid`), so no committed entry is refused; an entry carries at most
-64 commands, which bounds those checks. The domain check covers every
-slot an `InputUp` or `Route` names, so every subset of an admitted
-entry, which a restamp may keep, is admitted too. One of no entries
-appends nothing. A replicated engine refuses no committed entry for
+leaves out of a derived record what the engine refuses before it
+appends it, so no committed entry is refused. One of no entries appends
+nothing. A replicated engine refuses no committed entry for
 room: up to 256 committed entries (`engine::WAITING`) wait in its log
 for room in its entry ring; past that it drops them and its core
 (`log_overflows`), and the replica is rebuilt or resynced. The RT thread
@@ -395,7 +394,9 @@ thread (fades cold, the pending entries, no unresolved entry; the RT
 thread keeps its pending generation) and installs it through the same
 block-boundary hand-over as a replay, at the first block starting at or
 after the index its caller names; the first block committed after it
-follows the withdrawn rules. Its gains ramp from silence to their
+follows the withdrawn rules. A state holding a gain, flow or strip
+parameter no entry could set is refused before anything changes. Its
+gains ramp from silence to their
 targets over the ramp length from the install, as the strips take their
 parameters, so an output fades in processed. The product state also
 names each slot's flow and strip parameters: the supervisor hands over
@@ -408,10 +409,24 @@ comparing gains by bit pattern, and `Targets::assert` the entries that
 set all of them.
 
 In `samplez-replica` every audio replica starts clock-unverified, which
-drops its engine's core until it verifies, and a snapshot install or a
-lag beyond the horizon drops it again. The core is rebuilt only from the
-product state that `EngineAudio::with_rebuild` supplies: a product that
-embeds the replica without one leaves every replica in `starting`.
+drops its engine's core until it verifies, and a snapshot install, a
+purge-point verdict, a log overflow or a lag beyond the horizon drops it
+again. The core is rebuilt from the applied state
+(`StateMachine::product_state`): the product's targets, each slot up as
+its latest `InputDown` or `InputUp` says and up where none is, no
+pending entry and the applied log index as its last id, installed at the
+first block at or after the floor of the applied log. Every record of an
+entry up to that index takes effect at or before the floor and every
+later one at or after it, so the records handed after the rebuild apply
+on top of it in order; an install the RT thread can no longer take is
+tried again with a fresh read. Under continuous writes the floor lies up
+to `maxApplyLead` and a generation's build ahead, and the rebuild waits
+that long. `EngineAudio` installs the state as the records it filters
+leave an engine (below): a flow other than the one an input reads is a
+re-route kept by the same rules and else left as read, a strip parameter
+the engine refuses is not set, and a gain it refuses is silent. A
+product without targets gives an empty
+state, which an engine refuses: its replicas stay in `starting`.
 
 A product that drives an engine (`Product::DRIVES_ENGINE`) gives its
 absolute engine targets (`Product::targets`), and the state machine
@@ -423,12 +438,43 @@ for a restamp of one that derived some, an input's state for an
 raised to the floor, the highest index of any entry before it, so the
 engine applies them in log order and each diff applies to the targets it
 was computed against; an index further than one second past the entry's
-stamp counts as the stamp. Records are kept in memory for a second past
-their index; the floor and which decidable entries derived records, with
-the inputs they re-routed, are in snapshots. A client command that would
+stamp counts as the stamp, and a lease expiry from an older leader, which
+stamps none, takes effect 2400 samples (50 ms) past its stamp.
+`EngineAudio` hands an index off a block start at the next one. An `InputDown` or `InputUp` derives its
+input's state for any product, since the engine's input health writes
+them. A restamp, or a void the leader stamped, of an entry that derived
+records re-asserts every target at its own index, so it undoes no later
+entry; one of an engine body moves or drops it. Records are kept in
+memory for a second past their index; the floor and which decidable
+entries derived records, with the inputs they re-routed, are in
+snapshots.
+
+Contact hands an entry's record to the engine as the entry applies on
+the replica, and the record's index is the one contact lists and awaits
+the entry at from its append on, the floor being a function of the log
+prefix. An entry not applied by its apply deadline is unresolved and its
+record never handed, however early reports made its commit known; the
+log decides it. The leader stamps entries the lead ahead, which it keeps
+on the slack every counted audio replica reports at its apply-hand, up
+to `maxApplyLead`; a replica that still applies past the deadline at the
+cap holds those entries unresolved alone, and the leader's contact
+metrics name it (`apply_lead_raised_by`). One AppendEntries carries up to
+`MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
+than the gap between entries takes every entry written meanwhile with
+one fsync rather than falling further behind. `EngineAudio` leaves out
+of a record the entries its engine refuses, and of the `InputUp`s and
+`Route`s of several input domains those not of the lowest slot's,
+before it appends it: the
+engine's configuration decides that alike on every replica of a key, so
+the outputs still agree, and it is counted in `entries_filtered` and
+logged as the product's fault. A resync's joiner replays the records of
+the entries applied after the donor core's last log id; one it no longer
+holds, past the second kept or before a snapshot it loaded, fails the
+attempt, which is retried on a newer core. A client command that would
 re-route an input (`Product::reroutes`) is ordered alone on the
-generation path, and one asking for an index beyond the earliest is
-refused. Such a product owns every input's flow: `Replica::append`
+generation path, stamped the lead and the longest build time a counted
+replica reports past its stamp, since its generation is built once it
+applies; one asking for an index beyond the earliest is refused. Such a product owns every input's flow: `Replica::append`
 refuses a `Route` or `MasterEnable` for it.
 
 A replica's store builds its empty product with the `Factory` it is
