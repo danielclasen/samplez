@@ -43,6 +43,9 @@ use tokio_rustls::server::TlsStream;
 const TOKEN: &str = "t0k3n";
 const NAMESPACE: &str = "replicas";
 const MARKER: &str = "set-replica-cluster";
+/// The one StatefulSet the fake API server serves, and its uid.
+const STATEFULSET: &str = "set-audio";
+const STATEFULSET_UID: &str = "0d6a3c1e-5b2f-4f7a-9c11-2e8b7d4a6f90";
 
 /// A CA, as PEM, and a certificate for 127.0.0.1 it issued.
 fn authority_for_loopback() -> (
@@ -89,7 +92,8 @@ impl axum::serve::Listener for Tlsd {
 }
 
 /// ConfigMaps by name in one namespace, over TLS: create (409 when it
-/// exists), get (404 when absent); every request needs the bearer token.
+/// exists), get (404 when absent); and get on the StatefulSet
+/// [`STATEFULSET`]. Every request needs the bearer token.
 #[derive(Clone, Default)]
 struct Api(Arc<Mutex<BTreeMap<String, Value>>>);
 
@@ -130,7 +134,28 @@ impl Api {
                 None => (StatusCode::NOT_FOUND, Vec::new()),
             }
         };
+        let statefulset = move |Path((namespace, name)): Path<(String, String)>,
+                                headers: HeaderMap| async move {
+            if !authorized(&headers) {
+                return (StatusCode::UNAUTHORIZED, Vec::new());
+            }
+            assert_eq!(namespace, NAMESPACE);
+            if name != STATEFULSET {
+                return (StatusCode::NOT_FOUND, Vec::new());
+            }
+            let set = serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "metadata": { "name": name, "namespace": namespace, "uid": STATEFULSET_UID },
+                "status": { "updateRevision": "set-audio-1" },
+            });
+            (StatusCode::OK, serde_json::to_vec(&set).unwrap())
+        };
         let router = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{namespace}/statefulsets/{name}",
+                get(statefulset),
+            )
             .route("/api/v1/namespaces/{namespace}/configmaps", post(create))
             .route(
                 "/api/v1/namespaces/{namespace}/configmaps/{name}",
@@ -895,4 +920,49 @@ async fn ordinal_0_does_not_start_a_set_while_its_peers_are_unreachable() {
         !replica.raft().is_initialized().await.unwrap(),
         "a second set was initialised"
     );
+}
+
+/// A marker created for the StatefulSet names it as its owner, with the
+/// uid the StatefulSet has, so Kubernetes deletes the marker with it and
+/// a StatefulSet created again under the same name starts a new set. A
+/// StatefulSet that cannot be read creates no marker; without one named,
+/// the marker has no owner.
+#[tokio::test]
+async fn the_marker_is_owned_by_the_statefulset_named() {
+    let root = harness::root("bootstrap-owner");
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = Marker {
+        cluster: 7,
+        volume: 9,
+    };
+    let metadata = |api: &Api| api.0.lock().unwrap()[MARKER]["metadata"].clone();
+
+    let api = Api::default();
+    let owned = kube(&api, &root).await.owned_by(STATEFULSET.into());
+    assert!(owned.create(marker).await.unwrap());
+    assert_eq!(
+        metadata(&api)["ownerReferences"],
+        serde_json::json!([{
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "name": STATEFULSET,
+            "uid": STATEFULSET_UID,
+            "controller": false,
+        }])
+    );
+    assert_eq!(api.marker(), Some((7, 9)));
+    assert_eq!(
+        owned.update_revision(STATEFULSET).await.unwrap().as_deref(),
+        Some("set-audio-1")
+    );
+
+    let api = Api::default();
+    let unknown = kube(&api, &root).await.owned_by("other".into());
+    assert!(unknown.create(marker).await.is_err());
+    assert_eq!(api.marker(), None);
+
+    let api = Api::default();
+    assert!(kube(&api, &root).await.create(marker).await.unwrap());
+    assert_eq!(metadata(&api).get("ownerReferences"), None);
+    let _ = std::fs::remove_dir_all(&root);
 }

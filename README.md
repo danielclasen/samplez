@@ -250,6 +250,15 @@ lag beyond the horizon drops it again. The core is rebuilt only from the
 product state that `EngineAudio::with_rebuild` supplies: a product that
 embeds the replica without one leaves every replica in `starting`.
 
+A replica set agrees on its cluster id through the marker ConfigMap that
+ordinal 0 creates on an empty volume (`bootstrap::Kube`). Given the audio
+StatefulSet's name, the one `rollout::follow` reads, with
+`Kube::owned_by`, the marker carries an owner reference to that
+StatefulSet and lives as long as it: Kubernetes deletes it with the
+StatefulSet. Reading the StatefulSet's uid takes the same `get` on
+`statefulsets` the rollout's target revision does. Without a name the
+marker has no owner and outlives the StatefulSet.
+
 The engine runs on libmxl's clock (CLOCK_TAI) and detects a step of it
 against CLOCK_MONOTONIC at each wake, when it also samples the kernel
 TAI offset (CLOCK_TAI - CLOCK_REALTIME); the status reports both, and

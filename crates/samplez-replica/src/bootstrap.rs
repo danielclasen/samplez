@@ -12,6 +12,14 @@
 //! loss included. The cluster id is the epoch: drawn with each new marker,
 //! so a state initialised empty starts a new history, and kept on the
 //! volume, so a restart, a snapshot install and a resync keep it.
+//!
+//! Created by a [`Kube`] given the audio StatefulSet ([`Kube::owned_by`]),
+//! the marker names that StatefulSet as its owner and lives as long as
+//! it: Kubernetes deletes it with the StatefulSet, and a StatefulSet
+//! created again under the same name on empty volumes starts a new set
+//! with a new cluster id. Volumes kept past the StatefulSet outlive the
+//! marker; an empty volume beside them waits for a marker that only
+//! ordinal 0 on an empty volume creates.
 
 use std::fs;
 use std::io::{self, Write};
@@ -227,6 +235,8 @@ pub struct Kube {
     token: Option<PathBuf>,
     namespace: String,
     name: String,
+    /// The StatefulSet the marker is created owned by.
+    owner: Option<String>,
 }
 
 const SERVICE_ACCOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
@@ -273,7 +283,18 @@ impl Kube {
             token,
             namespace,
             name,
+            owner: None,
         })
+    }
+
+    /// Creates the marker owned by the StatefulSet `statefulset` in its
+    /// namespace, the one [`crate::rollout::follow`] reads, so Kubernetes
+    /// deletes the marker with it. Its uid is read with a GET on the
+    /// StatefulSet at the create; the reference is no controller and does
+    /// not block the StatefulSet's deletion.
+    pub fn owned_by(mut self, statefulset: String) -> Kube {
+        self.owner = Some(statefulset);
+        self
     }
 
     /// The pod's own API server, service account and namespace, for the
@@ -331,10 +352,8 @@ impl Kube {
         format!("/api/v1/namespaces/{}/configmaps", self.namespace)
     }
 
-    /// `status.updateRevision` of the StatefulSet `name` in the marker's
-    /// namespace: the revision a rollout moves its pods to. None while
-    /// the StatefulSet reports none.
-    pub async fn update_revision(&self, name: &str) -> Result<Option<String>, String> {
+    /// The StatefulSet `name` in the marker's namespace.
+    async fn statefulset(&self, name: &str) -> Result<StatefulSet, String> {
         let path = format!(
             "/apis/apps/v1/namespaces/{}/statefulsets/{name}",
             self.namespace
@@ -343,19 +362,33 @@ impl Kube {
         if status != StatusCode::OK {
             return Err(format!("GET {path}: {status}"));
         }
-        #[derive(Deserialize)]
-        struct StatefulSet {
-            status: Option<SetStatus>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SetStatus {
-            update_revision: Option<String>,
-        }
-        let set: StatefulSet =
-            serde_json::from_slice(&body).map_err(|e| format!("StatefulSet {name}: {e}"))?;
+        serde_json::from_slice(&body).map_err(|e| format!("StatefulSet {name}: {e}"))
+    }
+
+    /// `status.updateRevision` of the StatefulSet `name` in the marker's
+    /// namespace: the revision a rollout moves its pods to. None while
+    /// the StatefulSet reports none.
+    pub async fn update_revision(&self, name: &str) -> Result<Option<String>, String> {
+        let set = self.statefulset(name).await?;
         Ok(set.status.and_then(|s| s.update_revision))
     }
+}
+
+#[derive(Deserialize)]
+struct StatefulSet {
+    metadata: SetMetadata,
+    status: Option<SetStatus>,
+}
+
+#[derive(Deserialize)]
+struct SetMetadata {
+    uid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetStatus {
+    update_revision: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -395,10 +428,21 @@ impl Markers for Kube {
 
     fn create(&self, marker: Marker) -> BoxFuture<'_, Result<bool, String>> {
         Box::pin(async move {
+            let mut metadata = serde_json::json!({ "name": self.name });
+            if let Some(owner) = &self.owner {
+                let set = self.statefulset(owner).await?;
+                metadata["ownerReferences"] = serde_json::json!([{
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "name": owner,
+                    "uid": set.metadata.uid,
+                    "controller": false,
+                }]);
+            }
             let body = serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "ConfigMap",
-                "metadata": { "name": self.name },
+                "metadata": metadata,
                 "data": Data {
                     cluster: marker.cluster.to_string(),
                     volume: marker.volume.to_string(),
