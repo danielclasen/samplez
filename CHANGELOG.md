@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.0](https://github.com/danielclasen/samplez/compare/v0.5.0...v0.6.0) (2026-11-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** a core copy's encoding carries the pending batches, and a Core's pending list holds one entry per log entry.
+
+### Features
+
+* **dsp:** add a duck detector ([#62](https://github.com/danielclasen/samplez/issues/62)) ([b416541](https://github.com/danielclasen/samplez/commit/b4165411f04030b7679d24475fc775f8af72dc5a))
+* **engine:** carry strip state in a core copy ([#55](https://github.com/danielclasen/samplez/issues/55)) ([39edace](https://github.com/danielclasen/samplez/commit/39edace0a078e7b34c772432c5a16c9f372081fc))
+* **engine:** fold a log entry's engine entries into one batch ([#56](https://github.com/danielclasen/samplez/issues/56)) ([9dcda4d](https://github.com/danielclasen/samplez/commit/9dcda4d22a1eac97eadf834a33b618e7e23fb421))
+* **replica:** own the cluster marker by the audio StatefulSet ([70e70c0](https://github.com/danielclasen/samplez/commit/70e70c0088282966442d17719a9187bdb4dd719e))
+
+
+### Bug Fixes
+
+* **engine:** drop a held core before installing a product core ([70e70c0](https://github.com/danielclasen/samplez/commit/70e70c0088282966442d17719a9187bdb4dd719e))
+* **engine:** refill a copy left behind across a hand-over install ([70e70c0](https://github.com/danielclasen/samplez/commit/70e70c0088282966442d17719a9187bdb4dd719e))
+* **engine:** refill a core copy that predates a later control ([70e70c0](https://github.com/danielclasen/samplez/commit/70e70c0088282966442d17719a9187bdb4dd719e))
+* **engine:** withdraw every output before F passes a withheld block ([#61](https://github.com/danielclasen/samplez/issues/61)) ([91720f5](https://github.com/danielclasen/samplez/commit/91720f5560c9f5175de3d292c4d766514fba1efb))
+* **replica:** recreate a missing marker from the running set ([70e70c0](https://github.com/danielclasen/samplez/commit/70e70c0088282966442d17719a9187bdb4dd719e))
+
 ## [0.5.0](https://github.com/danielclasen/samplez/compare/v0.4.0...v0.5.0) (2026-11-17)
 
 
