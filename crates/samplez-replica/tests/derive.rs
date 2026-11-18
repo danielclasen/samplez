@@ -168,6 +168,37 @@ async fn a_rerouting_command_is_ordered_alone_in_submission_order() {
     );
 }
 
+/// Two re-routing commands hold one generation in flight: the second is
+/// stamped once the first's index passed, which lies the build lead past
+/// its stamp.
+#[tokio::test(start_paused = true)]
+async fn rerouting_commands_hold_one_generation_in_flight() {
+    let set = start().await;
+    let leader = set.leader().await;
+    let build_lead = 100 * BLOCK;
+    for id in set.ids() {
+        set.audio(id).lock().build_lead = Some(build_lead);
+    }
+    sleep(Duration::from_millis(20)).await;
+    let r = set.replica(leader);
+    let o = owner("s");
+    let (a, b) = tokio::join!(
+        r.submit(&o, "1", Bytes::from("route 0 c")),
+        r.submit(&o, "2", Bytes::from("route 1 d")),
+    );
+    a.expect("committed");
+    b.expect("committed");
+    let routes: Vec<Request> = commands(&set, leader).into_iter().map(|(r, _)| r).collect();
+    assert_eq!(routes.len(), 2, "{routes:?}");
+    let first = routes[0].at_index().unwrap();
+    assert_eq!(first, routes[0].stamp + build_lead);
+    assert!(
+        routes[1].stamp >= first,
+        "the second stamped at {} before the first's index {first} passed",
+        routes[1].stamp
+    );
+}
+
 /// A re-routing command waiting for the pending generation proposes
 /// nothing meanwhile: a quiesce does not wait for it, and the leader that
 /// quiesced does not write it.

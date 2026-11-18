@@ -2464,8 +2464,12 @@ impl Contact {
 
     /// Where the leader stamps an entry: none while E counts nobody, or
     /// with [`FUTURE_LIST`] entries pending above `E - applyGuard - S`.
+    /// A generation's earliest index is the pending generation's from
+    /// here on, so the next waits for it to pass whatever entry carries
+    /// it, a command that re-routes an input included; one that is not
+    /// written after all holds the next for at most its lead.
     pub fn stamp(&self, generation: bool) -> Result<Stamp, StampRefusal> {
-        let st = self.lock();
+        let mut st = self.lock();
         let now = Instant::now();
         let e = self
             .estimate_in(&st, now)
@@ -2506,7 +2510,9 @@ impl Contact {
                 .filter_map(|(_, _, own)| own.build_lead)
                 .max()
                 .unwrap_or(0);
-            stamp + lead.max(build_lead).next_multiple_of(b)
+            let earliest = stamp + lead.max(build_lead).next_multiple_of(b);
+            st.generation_at = st.generation_at.max(Some(earliest));
+            earliest
         } else {
             stamp + lead
         };
