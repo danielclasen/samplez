@@ -800,28 +800,37 @@ impl Hold {
     }
 
     /// The first block in the ring, or block `next` before it is
-    /// computed, that is `withheld` though this output has not seen it
-    /// so, with whether any such block is for a cause
-    /// ([`BlockStatus::for_a_cause`]); none while idle. The replica is
-    /// withdrawn on every output from that block on
-    /// ([`Hold::advance_below`]).
+    /// computed, from which this output withdraws the replica for a
+    /// status it has not seen, with whether for a cause
+    /// ([`BlockStatus::for_a_cause`]); none while idle. A block
+    /// `withheld` withdraws from itself; a held block marked for commit
+    /// through only up to P inside its range withholds `[P, (k + 1)B)`
+    /// for a cause and withdraws from the block after it
+    /// ([`Hold::advance`]). The replica is withdrawn on every output from
+    /// there on ([`Hold::advance_below`]).
     pub fn withheld_unseen(&self, statuses: &Statuses, next: Option<u64>) -> Option<(u64, bool)> {
         if self.mode == Mode::Idle {
             return None;
         }
-        let ring = self
+        for p in self
             .pending
             .iter()
             .filter(|p| p.status.kind != Kind::Withheld)
-            .map(|p| p.status.k);
-        let mut found: Option<(u64, bool)> = None;
-        for k in ring.chain(next) {
-            if let Some(st) = statuses.get(k).filter(|s| s.kind == Kind::Withheld) {
-                let (first, cause) = found.unwrap_or((k, false));
-                found = Some((first.min(k), cause | st.for_a_cause()));
+        {
+            match statuses.get(p.status.k) {
+                Some(st) if st.kind == Kind::Withheld => return Some((st.k, st.for_a_cause())),
+                Some(BlockStatus {
+                    k,
+                    kind: Kind::Held,
+                    through: true,
+                    range: Range::UpTo(e),
+                    ..
+                }) if e < p.end => return Some((k + 1, true)),
+                _ => {}
             }
         }
-        found
+        let st = statuses.get(next?).filter(|s| s.kind == Kind::Withheld)?;
+        Some((st.k, st.for_a_cause()))
     }
 
     /// Blocks in the ring.

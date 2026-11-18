@@ -4768,6 +4768,62 @@ mod tests {
         });
     }
 
+    /// A held block committed through on one output only up to P inside
+    /// it withholds the rest of it for a cause, which withdraws the
+    /// replica on every output before any moves past it: output 0, its
+    /// ring moved first in a pass, does not commit the block after it
+    /// alone. Block k is degraded by an unresolved entry, the blocks after
+    /// it healthy and held behind it; the supervisor marks k on output 0
+    /// whole and on output 1 up to the middle of k, between two passes.
+    #[test]
+    fn a_commit_through_up_to_p_on_a_later_output_withdraws_the_first() {
+        use crate::blocks::{HEALTHY, Kind};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..10 {
+            let (e, _changes, _verdicts, domain) = outputs_only("through-up-to", 2);
+            let _unpause = Unpause;
+            let processed = || e.counters().processed.load(Acquire);
+            let held = |o: usize, k: u64, healthy: bool| {
+                e.block_status(o, k)
+                    .is_some_and(|s| s.kind == Kind::Held && (s.digest == Some(HEALTHY)) == healthy)
+            };
+            let committing_all =
+                || (0..2).all(|o| matches!(e.standing(o), Some(Standing::Committing { .. })));
+            committing(&e, 2);
+            // Block k alone carries the entry: it is resolved while the
+            // loop is paused in block k's pass, after k's digest.
+            let k = processed() + 10;
+            e.unresolved(1, k * 48).unwrap();
+            pause_at(&e, k, true);
+            paused();
+            e.resolved(1).unwrap();
+            pause_at(&e, k + 3, false);
+            resume();
+            paused();
+            let ready = committing_all()
+                && (0..2)
+                    .all(|o| held(o, k, false) && held(o, k + 1, true) && held(o, k + 2, true));
+            if !ready {
+                resume();
+                e.stop();
+                std::fs::remove_dir_all(&domain).unwrap();
+                continue;
+            }
+            assert!(e.commit_through(0, k, 0, None).unwrap());
+            assert!(e.commit_through(1, k, 0, Some(k * 48 + 24)).unwrap());
+            resume();
+            wait(&|| processed() > k + 10);
+            let st = e.block_status(0, k).unwrap();
+            assert_eq!(st.kind, Kind::Committed, "{st:?}");
+            let st = e.block_status(0, k + 1).unwrap();
+            assert_ne!(st.kind, Kind::Committed, "{st:?}");
+            e.stop();
+            std::fs::remove_dir_all(&domain).unwrap();
+            return;
+        }
+        panic!("no pass without an overrun in 10 attempts");
+    }
+
     /// A full hold ring moves at the F its block's pass read: with output
     /// 0's ring shorter than output 1's, output 1 does not commit block k
     /// while output 0 withholds it, also when the supervisor withholds k

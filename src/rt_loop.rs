@@ -1687,9 +1687,10 @@ impl Rt {
             return 0;
         };
         let mut written = 0;
-        // The first block withheld on any output that the output has not
-        // seen so: every ring moves up to it, then the replica is
-        // withdrawn on every output before any block from it on moves.
+        // The first block from which any output withdraws the replica for
+        // a status it has not seen: every ring moves below it, then the
+        // replica is withdrawn on every output before any block from it
+        // on moves.
         let mut found: Option<(u64, bool)> = None;
         for (o, out) in self.outs.iter().enumerate() {
             if out.writer.is_some()
@@ -1699,13 +1700,16 @@ impl Rt {
                 found = Some((first.min(k), cause | c));
             }
         }
-        if let Some((first, mut cause)) = found {
+        if let Some((first, cause)) = found {
             for o in 0..self.outs.len() {
                 if let Some((moved, wrote)) =
                     advance_ring(&mut self.outs[o], o, r, &self.counters, ctx, first)
                 {
-                    cause |= moved.cause;
                     written |= u64::from(wrote) << o;
+                    // As below: before the next output moves.
+                    if moved.withdraw {
+                        withdraw_all(&mut self.outs, r, &self.counters, moved.cause);
+                    }
                 }
             }
             withdraw_all(&mut self.outs, r, &self.counters, cause);
