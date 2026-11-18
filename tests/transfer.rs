@@ -15,7 +15,7 @@ use samplez::blocks::{PAGE, PageHash, StatusChange};
 use samplez::{
     BlockVerdict, CopyError, Engine, Entry, InputState, ProductState, ReplayError, Replication,
 };
-use samplez_dsp::{BandType, CompParams, EqBand, GateParams, StripParam};
+use samplez_dsp::{BandType, CompParams, EqBand, GateParams, Ramp, StripParam};
 
 /// The copy holds the state after block k0: entries due by then applied
 /// with their ramps run out, later ones pending, the input's log state,
@@ -720,42 +720,74 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
 /// its caller names, not before, however soon the RT thread could take
 /// it; and its gains ramp from silence to their targets over the ramp
 /// length from there, as the strips take their parameters, so an output
-/// fades in processed.
+/// fades in processed. An index further ahead than the timeout is
+/// refused before the core the RT thread holds is dropped.
 #[test]
 fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
-    let domain = Domain::new();
-    let src = new_id();
-    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
-    let h = hashed(&domain, &src);
-    let state = ProductState {
-        gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
-        up: vec![true],
-        flows: vec![src.clone()],
-        strips: vec![Vec::new()],
-        pending: Vec::new(),
-        last_id: 0,
-    };
-    // 40 blocks ahead, a block start plus a sample: the block after.
-    let at_least = (processed(&h.e) + 40) * B + 1;
-    let j =
-        h.e.install_product(&state, at_least, Duration::from_secs(2))
-            .unwrap();
-    let installed = (j + 1) * B;
-    assert!(
-        installed >= at_least && installed < at_least + 10 * B,
-        "installed at {installed}, asked for {at_least}"
-    );
-    // Ramping up from silence a few blocks into the ramp.
-    let core = common::copy_core(&h.e).core;
-    let (a, b) = (core.gain(0, 0), core.gain(1, 1));
-    assert!(a > 0.0 && a < 0.25, "gain 0 -> 0 at {a}");
-    assert!(b > 0.0 && b < 0.5, "gain 1 -> 1 at {b}");
-    assert_eq!(core.gain(0, 1), 0.0);
-    // At the targets once the ramp ended.
-    past_fade_in(&h.e, j);
-    let core = common::copy_core(&h.e).core;
-    assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.25, 0.5));
-    h.e.stop();
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let h = hashed(&domain, &src);
+        let c = h.e.counters();
+        let state = ProductState {
+            gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
+            up: vec![true],
+            flows: vec![src.clone()],
+            strips: vec![Vec::new()],
+            pending: Vec::new(),
+            last_id: 0,
+        };
+        let far = processed(&h.e) * B + 10 * 48_000;
+        assert!(matches!(
+            h.e.install_product(&state, far, Duration::from_secs(2)),
+            Err(ReplayError::Invalid(_))
+        ));
+        assert_eq!(
+            c.blocks_without_core.load(Relaxed),
+            0,
+            "the core was dropped"
+        );
+        // 40 blocks ahead, a block start plus a sample: the block after.
+        let at_least = (processed(&h.e) + 40) * B + 1;
+        let passed = c.handovers_passed.load(Relaxed);
+        let j =
+            h.e.install_product(&state, at_least, Duration::from_secs(2))
+                .unwrap();
+        let installed = (j + 1) * B;
+        assert!(
+            installed >= at_least,
+            "installed at {installed}, asked for {at_least}"
+        );
+        // Never more than a second late, whatever the load.
+        assert!(installed < at_least + 48_000, "installed at {installed}");
+        let retries = c.handovers_passed.load(Relaxed) - passed;
+        // The core after block k0 has the matrix at sample (k0 + 1) B: on
+        // the ramp from silence that started at the install.
+        let copy = common::copy_core(&h.e);
+        let at = (copy.k0 + 1) * B - installed;
+        if at >= u64::from(RAMP) {
+            return Err(format!(
+                "copied {at} samples after the install, past the ramp"
+            ));
+        }
+        for (i, target) in [(0, 0.25), (1, 0.5)] {
+            let mut ramp = Ramp::new(0.0);
+            assert!(ramp.set_target(target, RAMP));
+            ramp.advance(at as usize);
+            assert_eq!(
+                copy.core.gain(i, i).to_bits(),
+                ramp.current().to_bits(),
+                "gain {i} -> {i} {at} samples into the fade-in ({retries} retries)"
+            );
+        }
+        assert_eq!(copy.core.gain(0, 1), 0.0);
+        past_fade_in(&h.e, j);
+        let core = common::copy_core(&h.e).core;
+        assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.25, 0.5));
+        h.e.stop();
+        Ok(())
+    });
 }
 
 /// A re-route whose index passes while no core is held is applied once a

@@ -2198,7 +2198,8 @@ impl Engine {
     /// Its gains ramp from silence to their targets over the ramp length
     /// from the install, as the strips take their parameters, so an
     /// output fades in processed. Returns the block the core followed.
-    /// The core holds no unresolved entry: the caller adds the ones still unresolved with
+    /// An `at_least` further ahead than `timeout` is refused as invalid
+    /// before anything changes. The core holds no unresolved entry: the caller adds the ones still unresolved with
     /// [`Engine::unresolved`] after the install. While no core is held the
     /// RT thread takes the entries needing no generation whose index
     /// passed off its pending list, applying only strip entries, to the
@@ -2260,6 +2261,15 @@ impl Engine {
             return Err(ReplayError::Full);
         }
         let batch = |id: LogId| batches.iter().find(|b| b.0 == id).map(|b| &*b.1);
+        // One that cannot be installed within the timeout is refused while
+        // the core the RT thread holds is still there.
+        let within = (timeout.as_nanos() * samplez_mxl::SAMPLE_RATE as u128 / 1_000_000_000) as u64;
+        let now = self.counters.processed.load(Acquire) * self.block;
+        if at_least > now.saturating_add(within) {
+            return Err(ReplayError::Invalid(format!(
+                "index {at_least} lies beyond the timeout, {within} samples after {now}"
+            )));
+        }
         self.drop_core_by(deadline)?;
         // The supervisor takes the slots' state and flows, and hands the
         // generations reading them over, before the core: a slot the core
