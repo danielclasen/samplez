@@ -3003,7 +3003,12 @@ impl Contact {
                 .filter_map(|(_, _, own)| own.build_time.or(own.build_lead))
                 .max()
                 .unwrap_or(0);
-            let earliest = (stamp + lead + build).next_multiple_of(b);
+            // Further than `AHEAD_MAX` past its stamp an entry would take
+            // effect at the stamp, already passed: at most that far, where
+            // a build longer than the lead leaves takes the generation
+            // late rather than the entry.
+            let most = stamp + crate::state_machine::AHEAD_MAX / b * b;
+            let earliest = (stamp + lead + build).next_multiple_of(b).min(most);
             st.reserved = st.reserved.max(Some(earliest));
             earliest
         } else {
@@ -3642,6 +3647,8 @@ mod tests {
         rebuilt_with: Mutex<Vec<(u64, u64)>>,
         /// Whether it reports one output, withdrawn.
         outputs: std::sync::atomic::AtomicBool,
+        /// The build time it reports, in samples; none at 0.
+        build_time: AtomicU64,
     }
 
     impl Audio for Engine {
@@ -3659,6 +3666,7 @@ mod tests {
                     } else {
                         Vec::new()
                     },
+                    build_time: Some(self.build_time.load(Ordering::SeqCst)).filter(|&t| t > 0),
                     ..Own::default()
                 },
                 status_changes_lost: 0,
@@ -3779,6 +3787,7 @@ mod tests {
             holding: std::sync::atomic::AtomicBool::new(false),
             rebuilt_with: Mutex::new(Vec::new()),
             outputs: std::sync::atomic::AtomicBool::new(false),
+            build_time: AtomicU64::new(0),
         });
         let contact = Contact::new(
             1,
@@ -5428,6 +5437,31 @@ mod tests {
             "a silent voter"
         );
         assert_eq!(f.contact.metrics().protocol_blocker, Some(2));
+    }
+
+    /// A generation stamp leaves room for the slowest build, but never
+    /// further than `AHEAD_MAX` past its stamp, where the entry would take
+    /// effect at the stamp itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_generation_stamp_stays_within_ahead_max_of_its_stamp() {
+        let f = fixture(&[&[1]]);
+        f.engine.build_time.store(4800, Ordering::SeqCst);
+        f.tick();
+        let s = f.contact.stamp(true).expect("stamped");
+        assert_eq!(
+            s.earliest,
+            s.stamp + index_at(START_LEAD.as_nanos() as u64) + 4800
+        );
+        let f = fixture(&[&[1]]);
+        f.engine
+            .build_time
+            .store(2 * crate::state_machine::AHEAD_MAX, Ordering::SeqCst);
+        f.tick();
+        let s = f.contact.stamp(true).expect("stamped");
+        assert_eq!(
+            s.earliest,
+            s.stamp + crate::state_machine::AHEAD_MAX / B * B
+        );
     }
 
     /// An appended entry that needs a generation never lowers the
