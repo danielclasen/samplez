@@ -377,7 +377,10 @@ impl<P: Product> StateMachine<P> {
     /// With [`StateMachine::image`] taken from the product.
     fn imaged(mut self) -> StateMachine<P> {
         self.image = if P::DRIVES_ENGINE {
-            self.targets().map(|(targets, _)| targets)
+            self.targets().map(|(targets, silenced)| {
+                self.silenced(None, silenced);
+                targets
+            })
         } else {
             None
         };
@@ -404,6 +407,29 @@ impl<P: Product> StateMachine<P> {
             }
         }
         Some((targets, silenced))
+    }
+
+    /// Logs `silenced`, the count of target gains [`StateMachine::targets`]
+    /// silences, once per change, not per entry while the product keeps
+    /// such a gain: as the entry at `revision` derives, or as the state is
+    /// opened or loaded from a snapshot, with none.
+    fn silenced(&mut self, revision: Option<u64>, silenced: usize) {
+        if silenced == self.silenced {
+            return;
+        }
+        self.silenced = silenced;
+        if silenced > 0 {
+            tracing::warn!(
+                ?revision,
+                silenced,
+                "the product's targets hold gains an engine refuses: derived as silence"
+            );
+        } else {
+            tracing::info!(
+                ?revision,
+                "the product's targets hold no gain an engine refuses any more"
+            );
+        }
     }
 
     /// Derives the engine entries of the entry at log index `revision`,
@@ -457,18 +483,7 @@ impl<P: Product> StateMachine<P> {
                 let Some((next, silenced)) = self.targets() else {
                     return;
                 };
-                // Once per change of the count, not per entry while the
-                // product keeps such a gain.
-                if silenced != self.silenced {
-                    self.silenced = silenced;
-                    if silenced > 0 {
-                        tracing::warn!(
-                            revision,
-                            silenced,
-                            "the product's targets hold gains an engine refuses: derived as silence"
-                        );
-                    }
-                }
+                self.silenced(Some(revision), silenced);
                 let entries = self.image.as_ref().map_or_else(
                     || samplez::Targets::default().diff(&next),
                     |image| image.diff(&next),
@@ -950,7 +965,10 @@ impl<P: Product> StateMachine<P> {
         self.protocol = saved.protocol;
         self.records.clear();
         self.image = if P::DRIVES_ENGINE {
-            self.targets().map(|(targets, _)| targets)
+            self.targets().map(|(targets, silenced)| {
+                self.silenced(None, silenced);
+                targets
+            })
         } else {
             None
         };
