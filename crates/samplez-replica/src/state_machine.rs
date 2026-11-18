@@ -373,13 +373,33 @@ impl<P: Product> StateMachine<P> {
     /// With [`StateMachine::image`] taken from the product.
     fn imaged(mut self) -> StateMachine<P> {
         self.image = if P::DRIVES_ENGINE {
-            self.product.targets()
+            self.targets().map(|(targets, _)| targets)
         } else {
             None
         };
         // An engine is rebuilt from this state: its masks are these.
         self.masked = self.image.as_ref().map(|t| t.masks.clone());
         self
+    }
+
+    /// The product's targets as every replica derives from them, with how
+    /// many gains [`samplez_dsp::valid_gain`] refuses it holds: each of
+    /// those is 0.0. An engine refuses such a gain, so a live replica
+    /// handed it would hold the cell's previous value while one rebuilt
+    /// from the product state, which holds no previous value, silences it;
+    /// silence is a function of the state alone, so the records, the
+    /// image and [`StateMachine::product_state`] agree on every replica,
+    /// rebuilt or not.
+    fn targets(&self) -> Option<(samplez::Targets, usize)> {
+        let mut targets = self.product.targets()?;
+        let mut silenced = 0;
+        for gain in targets.gains.iter_mut().flatten() {
+            if !samplez_dsp::valid_gain(*gain) {
+                *gain = 0.0;
+                silenced += 1;
+            }
+        }
+        Some((targets, silenced))
     }
 
     /// Derives the engine entries of the entry at log index `revision`,
@@ -400,7 +420,7 @@ impl<P: Product> StateMachine<P> {
     ) {
         let (entries, routed) = match (&request.body, restamped) {
             (Body::Restamp { .. } | Body::Void { .. }, Some(slots)) => {
-                let Some(targets) = self.product.targets() else {
+                let Some((targets, _)) = self.targets() else {
                     return;
                 };
                 let slots: Vec<usize> = slots.iter().map(|&s| s as usize).collect();
@@ -430,9 +450,16 @@ impl<P: Product> StateMachine<P> {
                 Vec::new(),
             ),
             (Body::Commands(_) | Body::LeaseExpiry { .. }, _) if changed && P::DRIVES_ENGINE => {
-                let Some(next) = self.product.targets() else {
+                let Some((next, silenced)) = self.targets() else {
                     return;
                 };
+                if silenced > 0 {
+                    tracing::warn!(
+                        revision,
+                        silenced,
+                        "the product's targets hold gains an engine refuses: derived as silence"
+                    );
+                }
                 let entries = self.image.as_ref().map_or_else(
                     || samplez::Targets::default().diff(&next),
                     |image| image.diff(&next),
@@ -830,7 +857,7 @@ impl<P: Product> StateMachine<P> {
     /// installed with it there and given the records after `n` holds what
     /// one given every record holds. Empty targets for a product without.
     pub fn product_state(&self, n: u64) -> samplez::ProductState {
-        let targets = self.product.targets().unwrap_or_default();
+        let targets = self.targets().map_or_else(Default::default, |(t, _)| t);
         let mut up = vec![true; targets.flows.len()];
         for body in self.pending.values() {
             if let Body::InputDown { slot, .. } | Body::InputUp { slot, .. } = body
@@ -914,7 +941,7 @@ impl<P: Product> StateMachine<P> {
         self.protocol = saved.protocol;
         self.records.clear();
         self.image = if P::DRIVES_ENGINE {
-            self.product.targets()
+            self.targets().map(|(targets, _)| targets)
         } else {
             None
         };
@@ -1916,6 +1943,25 @@ mod derive_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A gain an engine refuses is derived as silence, and the product
+    /// state a rebuild reads holds the same: a live replica handed the
+    /// records and one rebuilt past them compute alike. A later valid gain
+    /// is derived over it.
+    #[test]
+    fn a_gain_an_engine_refuses_is_derived_as_silence_everywhere() {
+        let mut sm = machine();
+        sm.apply_at(1, 1, &one("1", "fader 0 0.5", 0, 960, None));
+        sm.apply_at(2, 1, &one("2", "fader 0 inf", 48, 1008, None));
+        assert_eq!(gains(&sm.records[&2]), [(0, 0, 0.0f32.to_bits())]);
+        assert_eq!(sm.product_state(2).gains[0][0].to_bits(), 0.0f32.to_bits());
+        // Silence already: nothing to derive.
+        sm.apply_at(3, 1, &one("3", "fader 0 NaN", 96, 1056, None));
+        assert!(!sm.records.contains_key(&3));
+        assert_eq!(sm.product_state(3).gains[0][0].to_bits(), 0.0f32.to_bits());
+        sm.apply_at(4, 1, &one("4", "fader 0 0.25", 144, 1104, None));
+        assert_eq!(gains(&sm.records[&4]), [(0, 0, 0.25f32.to_bits())]);
     }
 
     /// A VCA move derives every member coefficient as fader times VCA,

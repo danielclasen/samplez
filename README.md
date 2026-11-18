@@ -515,7 +515,10 @@ raised to the floor, the highest index of any entry before it, so the
 engine applies them in log order and each diff applies to the targets it
 was computed against; an index further than one second past the entry's
 stamp counts as the stamp, and a lease expiry from an older leader, which
-stamps none, takes effect 2400 samples (50 ms) past its stamp.
+stamps none, takes effect 3072 samples (64 ms) past its stamp. A target
+gain `valid_gain` refuses, which an engine refuses too, is read as 0.0,
+in the records and in the product state alike, so a live replica
+silences the cell as one rebuilt from the state does.
 `EngineAudio` hands an index off a block start at the next one. An `InputDown` or `InputUp` derives its
 input's state for any product, since the engine's input health writes
 them. A restamp, or a void the leader stamped, of an entry that derived

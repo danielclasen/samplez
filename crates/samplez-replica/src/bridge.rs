@@ -210,10 +210,10 @@ impl EngineAudio {
     /// input reading none and a slot without a flow detached, kept by the
     /// rules of [`EngineAudio::kept`] and else left at the one read; a
     /// strip parameter the engine refuses is not set; a gain it refuses
-    /// is silenced, not held at its previous value as a live replica
-    /// holds it: the product state keeps only the refused value, and the
-    /// core it replaces is gone. A replica rebuilt from it holds what a
-    /// live one that read the same flows holds, flows and strips alike.
+    /// is silenced, as the state machine derives it for every replica
+    /// ([`crate::state_machine::StateMachine::product_state`] holds none).
+    /// A replica rebuilt from it holds what a live one that read the same
+    /// flows holds, flows, strips and gains alike.
     fn sanitised(&self, state: &ProductState) -> ProductState {
         let mut state = state.clone();
         let reading: Vec<Option<String>> = (self.engine.status().inputs.into_iter())
