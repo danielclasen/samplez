@@ -2267,12 +2267,12 @@ impl Contact {
         st.own.state = Some(state);
         st.own.ready = ready;
         st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
-        // Withdrawn, diverged or resyncing, it writes none of what it
-        // computes, in contact or not.
+        // Withdrawn, diverged or resyncing with outputs, it writes none
+        // of what it computes, in contact or not.
         let writes_nothing = matches!(
             state,
             ReplicaState::Withdrawn | ReplicaState::Diverged | ReplicaState::Resync
-        );
+        ) && !st.own.standing.is_empty();
         if writes_nothing {
             st.serving = Some(false);
         } else if st.in_contact {
@@ -2386,9 +2386,9 @@ impl Contact {
     /// The audio `/readyz` term (plan 2.11, Deployment): committing, or no
     /// other audio replica committing within `w + D` by its reports;
     /// judged while in contact, kept out of it, false before the first
-    /// contact. False while withdrawn, diverged or resyncing, in contact
-    /// or not: the replica writes none of what it computes. Always true
-    /// for the witness and for one voter.
+    /// contact. False while withdrawn, diverged or resyncing with
+    /// outputs, in contact or not: the replica writes none of what it
+    /// computes. Always true for the witness and for one voter.
     pub fn serving(&self) -> bool {
         let st = self.lock();
         if self.audio.is_none() || st.members.voters().len() == 1 {
@@ -4146,7 +4146,7 @@ mod tests {
     /// `/readyz`: a replica that writes nothing is not serving while no
     /// other replica commits, in contact or out of it, where it read
     /// ready by "nobody else commits"; it becomes ready by committing. A
-    /// sole voter always serves.
+    /// sole voter always serves, and one without outputs as before.
     #[tokio::test(start_paused = true)]
     async fn a_replica_writing_nothing_is_not_serving_though_nobody_commits() {
         let f = fixture(&[&[1]]);
@@ -4160,10 +4160,21 @@ mod tests {
             f.contact.receive(f.report(3, None));
             f.tick();
         }
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert!(f.contact.serving(), "withdrawn without outputs");
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
         assert!(f.contact.metrics().in_contact);
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
         assert!(!f.contact.serving(), "withdrawn, nobody else commits");
         let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
         diverge(&f);
         for _ in 0..3 {
             f.contact.receive(f.report(2, None));

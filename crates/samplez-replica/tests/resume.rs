@@ -520,9 +520,10 @@ async fn the_per_output_rule_commits_an_output_nobody_commits() {
 }
 
 /// The audio `/readyz` term out of contact: a replica Ready when it lost
-/// contact stays Ready; one never in contact since its start is not.
+/// contact is not Ready once it withdrew, as it then writes nothing; one
+/// never in contact since its start is not either.
 #[tokio::test(start_paused = true)]
-async fn readiness_is_kept_out_of_contact_and_false_before_any() {
+async fn readiness_follows_a_withdrawal_out_of_contact_and_is_false_before_any() {
     let mut set = start(vec![a(0), a(1), witness()], 1).await;
     let ids = audio(&set);
     until("committing", 5, || {
@@ -531,10 +532,11 @@ async fn readiness_is_kept_out_of_contact_and_false_before_any() {
     .await;
     let all: Vec<NodeId> = set.ids().collect();
     set.net.isolate(a(1), all.iter().copied());
-    sleep(Duration::from_millis(300)).await;
+    until("withdrawn out of contact", 5, || !committing(&set, a(1))).await;
+    sleep(Duration::from_millis(10)).await;
     assert!(
-        set.replica(a(1)).replica().ready,
-        "Ready when it lost contact"
+        !set.replica(a(1)).replica().ready,
+        "not Ready while it writes nothing"
     );
     set.crash(a(1)).await;
     set.restart(a(1)).await;
