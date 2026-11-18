@@ -1789,6 +1789,23 @@ impl Contact {
             // Records this replica derived went before they were handed:
             // its engine lacks them, so it is built again.
             tracing::warn!(from, up_to, "derived records gone before they were handed");
+            // As below: the rebuild folds in what a replica committing
+            // nothing took late, so none of it stays given.
+            if Self::commits_nothing(st) {
+                let folded: Vec<Key> = (st.given.keys())
+                    .filter(|&&(index, term, node)| {
+                        index > from
+                            && index <= up_to
+                            && taken_late.contains(&index)
+                            && self.log.log_id_at(index) == Some(StoredLogId { term, node, index })
+                    })
+                    .copied()
+                    .collect();
+                for k in folded {
+                    st.given.remove(&k);
+                    Self::rebuild_past(st, k);
+                }
+            }
             self.begin_restart(st, up_to);
             return;
         }
