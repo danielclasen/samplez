@@ -508,13 +508,13 @@ impl<P> Store<P> {
 
     /// The floor after every entry below `index`: the applied state's,
     /// raised over the entries held after it as the apply will raise it.
-    /// At most the applied state's for an `index` at or below the applied
-    /// one.
+    /// The applied state's for an `index` at or below the applied one.
     pub fn floor_before(&self, index: u64) -> u64 {
         let inner = self.lock();
         let applied = inner.last_applied.map_or(0, |id| id.index);
         let mut floor = inner.sm.floor;
-        for e in inner.log.range(applied + 1..index).map(|(_, e)| e) {
+        let end = index.max(applied + 1);
+        for e in inner.log.range(applied + 1..end).map(|(_, e)| e) {
             if let StoredPayload::Normal(request) = &e.payload
                 && let Some(at) = crate::state_machine::floored(floor, request)
             {
@@ -522,6 +522,28 @@ impl<P> Store<P> {
             }
         }
         floor
+    }
+
+    /// Engine entries pending above `floor`, read in one hold: the records
+    /// held that take effect above it, and the entries held unapplied
+    /// whose index, as their apply will raise it, lies above it.
+    pub fn pending_above(&self, floor: u64) -> usize {
+        let inner = self.lock();
+        let applied = inner.last_applied.map_or(0, |id| id.index);
+        let records = (inner.sm.records.values())
+            .filter(|r| r.at_index > floor)
+            .count();
+        let mut raised = inner.sm.floor;
+        let mut unapplied = 0;
+        for e in inner.log.range(applied + 1..).map(|(_, e)| e) {
+            if let StoredPayload::Normal(request) = &e.payload
+                && let Some(at) = crate::state_machine::floored(raised, request)
+            {
+                raised = at;
+                unapplied += usize::from(at > floor);
+            }
+        }
+        records + unapplied
     }
 
     /// Calls `f` with the log index and body of every entry the engine
@@ -924,6 +946,9 @@ mod tests {
             ],
             [4800, 4800, 9600]
         );
+        // Entry 2 asks for 960 and applies at 4800: pending above 2400,
+        // as are the record of entry 1 and entry 3.
+        assert_eq!(store.pending_above(2400), 3);
         store
             .apply_to_state_machine(&entries[1..])
             .await

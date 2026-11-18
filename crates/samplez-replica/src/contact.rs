@@ -336,26 +336,17 @@ pub trait LogView: Send + Sync + 'static {
     }
     /// The applied index, the floor there and the engine state of the
     /// applied log, read at once.
-    fn product_state(&self) -> (u64, u64, ProductState) {
-        let n = self.applied();
-        (
-            n,
-            0,
-            ProductState {
-                gains: Vec::new(),
-                up: Vec::new(),
-                flows: Vec::new(),
-                strips: Vec::new(),
-                pending: Vec::new(),
-                last_id: n,
-            },
-        )
-    }
+    fn product_state(&self) -> (u64, u64, ProductState);
     /// The floor after every entry below `index`, as the apply raises
     /// it ([`crate::state_machine::floored`]).
-    fn floor_before(&self, _index: u64) -> u64 {
-        0
-    }
+    fn floor_before(&self, index: u64) -> u64;
+    /// The applied index and the floor after it, read at once.
+    fn applied_floor(&self) -> (u64, u64);
+    /// Engine entries pending above `floor`, read at once: the records
+    /// of applied entries that take effect above it, which every engine
+    /// holds until then, and the entries held unapplied whose index, as
+    /// the apply will raise it, lies above it.
+    fn pending_above(&self, floor: u64) -> usize;
     /// The product's configuration hash, none when it is not known.
     fn config_hash(&self) -> Option<u64> {
         None
@@ -418,6 +409,12 @@ impl<P: Product> LogView for Store<P> {
     }
     fn floor_before(&self, index: u64) -> u64 {
         Store::floor_before(self, index)
+    }
+    fn applied_floor(&self) -> (u64, u64) {
+        self.view(|n, sm| (n, sm.floor))
+    }
+    fn pending_above(&self, floor: u64) -> usize {
+        Store::pending_above(self, floor)
     }
     fn config_hash(&self) -> Option<u64> {
         Some(Store::config_hash(self))
@@ -823,8 +820,7 @@ impl Contact {
         log: Arc<dyn LogView>,
         first_seq: u64,
     ) -> Contact {
-        let applied = log.applied();
-        let floor_told = log.floor_before(applied + 1);
+        let (applied, floor_told) = log.applied_floor();
         let installs_seen = log.installs();
         let mut scheduled = BTreeMap::new();
         // Entries the engine applies later, purged ones included, for
@@ -1414,9 +1410,17 @@ impl Contact {
         let installs = self.log.installs();
         if installs > st.installs_seen {
             st.installs_seen = installs;
-            let applied = self.log.applied();
-            self.installed(st, applied);
+            let applied = self.installed(st);
             appended.retain(|(id, _)| id.index > applied);
+        }
+        // Purged past what was taken: the floor rises over the entries
+        // purged, all applied, as it did on their apply; at the applied
+        // state's when the first one held is applied too, never below
+        // the floor its apply derived.
+        if let Some((first, _)) = appended.iter().find(|(id, _)| id.index > st.told)
+            && first.index > st.told + 1
+        {
+            st.floor_told = self.log.floor_before(first.index);
         }
         let mut new = Vec::new();
         for (id, request) in appended {
@@ -1516,12 +1520,13 @@ impl Contact {
         superseded
     }
 
-    /// A snapshot replaced the state up to `applied`: the engine is built
-    /// again from it (plan 2.11, Unresolved entries), and every entry the
-    /// replica held unresolved is resolved by it.
-    fn installed(&self, st: &mut State, applied: u64) {
+    /// A snapshot replaced the state up to the applied index, returned:
+    /// the engine is built again from it (plan 2.11, Unresolved entries),
+    /// and every entry the replica held unresolved is resolved by it.
+    fn installed(&self, st: &mut State) -> u64 {
+        let (applied, floor) = self.log.applied_floor();
         st.told = applied;
-        st.floor_told = self.log.floor_before(applied + 1);
+        st.floor_told = floor;
         st.known_committed = st.known_committed.max(applied);
         st.handed = st.handed.max(applied);
         st.uncommitted.clear();
@@ -1535,6 +1540,7 @@ impl Contact {
         st.purge_points.retain(|&(index, _)| index > applied);
         st.counts.installs += 1;
         self.begin_restart(st, applied);
+        applied
     }
 
     /// Returns the replica to `starting` until its applied index passed
@@ -1646,11 +1652,17 @@ impl Contact {
         }
         let tai = self.clocks.tai_ns();
         let first = index_at(tai + self.timing.apply_guard_ns());
-        for (index, at, entries) in records {
-            // Purged from the log since it applied: it is this log's own,
-            // and only this log's own entries at an index are given by
-            // their id.
-            let k = self.log.log_id_at(index).map_or((index, 0, 0), key);
+        for (index, record) in records {
+            let at = record.at_index;
+            // Purged from the log since it applied: this log's own, which
+            // no decision names by an id this replica holds, so it is
+            // handed whatever its deadline, the engine counting it late if
+            // its index passed.
+            let Some(id) = self.log.log_id_at(index) else {
+                audio.appended(index, at, &record.entries);
+                continue;
+            };
+            let k = key(id);
             if st.given.contains_key(&k) {
                 continue;
             }
@@ -1664,7 +1676,7 @@ impl Contact {
                 );
                 continue;
             }
-            audio.appended(index, at, &entries);
+            audio.appended(index, at, &record.entries);
         }
         self.offer_unresolved(st);
         audio.committed(up_to);
@@ -2512,26 +2524,6 @@ impl Contact {
         self.estimate_in(st, now).map_or(0, |e| e.div_ceil(b) * b)
     }
 
-    /// Engine entries pending above `floor`: the records of applied
-    /// entries that take effect above it, which every engine holds until
-    /// then, and the entries this log holds unapplied that may derive
-    /// one.
-    fn pending_above(&self, floor: u64) -> usize {
-        let mut pending = 0;
-        self.log.records(0, u64::MAX, &mut |_, record| {
-            if record.at_index > floor {
-                pending += 1;
-            }
-        });
-        self.log
-            .entries_after(self.log.applied(), &mut |_, request| {
-                if request.at_index().is_some_and(|at| at > floor) {
-                    pending += 1;
-                }
-            });
-        pending
-    }
-
     fn estimate_in(&self, st: &State, now: Instant) -> Option<u64> {
         let counted = self.counted(st, now);
         let b = self.timing.block;
@@ -2597,7 +2589,7 @@ impl Contact {
         let floor = e.saturating_sub(index_at(self.timing.apply_guard_ns()) + spread);
         // Committed entries stay pending in every engine until their index:
         // counted from the state machine, not from what is still listed.
-        if self.pending_above(floor) >= FUTURE_LIST {
+        if self.log.pending_above(floor) >= FUTURE_LIST {
             return Err(StampRefusal::FutureListFull);
         }
         let lead = st.lead.samples();
@@ -3105,7 +3097,12 @@ mod tests {
             self.0.lock().unwrap().committed
         }
         fn applied(&self) -> u64 {
-            self.0.lock().unwrap().applied
+            let mut log = self.0.lock().unwrap();
+            let applied = log.applied;
+            if let Some((index, floor)) = log.apply_after_read.take() {
+                (log.applied, log.floor) = (index, floor);
+            }
+            applied
         }
         fn log_id_at(&self, index: u64) -> Option<StoredLogId> {
             self.0.lock().unwrap().log.get(&index).map(|(id, _)| *id)
@@ -3160,12 +3157,32 @@ mod tests {
         fn floor_before(&self, index: u64) -> u64 {
             let log = self.0.lock().unwrap();
             let mut floor = log.floor;
-            for (_, request) in log.log.range(log.applied + 1..index).map(|(_, e)| e) {
+            let end = index.max(log.applied + 1);
+            for (_, request) in log.log.range(log.applied + 1..end).map(|(_, e)| e) {
                 if let Some(at) = crate::state_machine::floored(floor, request) {
                     floor = at;
                 }
             }
             floor
+        }
+        fn applied_floor(&self) -> (u64, u64) {
+            let log = self.0.lock().unwrap();
+            (log.applied, log.floor)
+        }
+        fn pending_above(&self, floor: u64) -> usize {
+            let log = self.0.lock().unwrap();
+            let records = (log.records.values())
+                .filter(|r| r.at_index > floor)
+                .count();
+            let mut raised = log.floor;
+            let mut unapplied = 0;
+            for (_, request) in log.log.range(log.applied + 1..).map(|(_, e)| e) {
+                if let Some(at) = crate::state_machine::floored(raised, request) {
+                    raised = at;
+                    unapplied += usize::from(at > floor);
+                }
+            }
+            records + unapplied
         }
         fn product_state(&self) -> (u64, u64, ProductState) {
             let log = self.0.lock().unwrap();
@@ -3195,6 +3212,8 @@ mod tests {
         room: AtomicU64,
         /// What each append carried.
         requests: Mutex<Vec<(u64, u64, Vec<Entry>)>>,
+        /// Where each append's entries lie in memory.
+        handed_from: Mutex<Vec<usize>>,
         /// Whether a rebuild succeeds.
         rebuilds: std::sync::atomic::AtomicBool,
         /// Each rebuild's state's last log id and the index it installs
@@ -3233,6 +3252,8 @@ mod tests {
             self.calls.lock().unwrap().push(format!("appended {index}"));
             let call = (index, at_index, entries.to_vec());
             self.requests.lock().unwrap().push(call);
+            let from = entries.as_ptr() as usize;
+            self.handed_from.lock().unwrap().push(from);
         }
         fn resolved(&self, index: u64) {
             self.calls.lock().unwrap().push(format!("resolved {index}"));
@@ -3321,6 +3342,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             room: AtomicU64::new(u64::MAX),
             requests: Mutex::new(Vec::new()),
+            handed_from: Mutex::new(Vec::new()),
             rebuilds: std::sync::atomic::AtomicBool::new(true),
             rebuilt_with: Mutex::new(Vec::new()),
         });
@@ -3845,6 +3867,136 @@ mod tests {
             .map(|(i, r)| (*i, r.at_index))
             .collect();
         assert_eq!(replayed, [(2, at + 2 * B), (3, at + 3 * B)]);
+    }
+
+    /// A record reaches the engine, and a resync's replay, as the state
+    /// machine holds it: its entries are shared, not copied under the
+    /// store lock, so taking a recall of every coefficient at the largest
+    /// shape costs no more there than taking one gain.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_is_handed_and_replayed_without_copying_its_entries() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let at = index_at(T0) + 400 * B;
+        f.log.push(1, 1, Some(at));
+        let held = Arc::clone(&f.log.0.lock().unwrap().records[&1]);
+        f.contact.log_changed();
+        f.apply(1);
+        f.contact.log_changed();
+        let handed = f.engine.handed_from.lock().unwrap().clone();
+        assert_eq!(handed, [held.entries.as_ptr() as usize]);
+        let replayed = f.contact.replay_entries(0).expect("held");
+        assert!(Arc::ptr_eq(&replayed[0].1, &held));
+    }
+
+    /// A lease expiry from an older leader, which stamps no index, takes
+    /// effect [`crate::state_machine::FALLBACK_LEAD`] past its stamp: its
+    /// apply deadline has not passed when it applies promptly, so its
+    /// record reaches the engine rather than going unresolved, which no
+    /// decision could settle for an entry without an index.
+    #[tokio::test(start_paused = true)]
+    async fn an_unstamped_lease_expiry_applied_promptly_is_handed() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let stamp = index_at(T0).next_multiple_of(B);
+        let expiry = Request {
+            stamp,
+            body: Body::LeaseExpiry {
+                session: crate::state_machine::tests::origin("s").key(),
+                renewed: 0,
+                at_index: None,
+            },
+        };
+        let at = stamp + crate::state_machine::FALLBACK_LEAD;
+        {
+            let mut log = f.log.0.lock().unwrap();
+            log.log.insert(1, (id(1, 1), expiry));
+            let record = Record {
+                at_index: at,
+                entries: vec![Entry::InputDown { slot: 0 }],
+                generation: false,
+            };
+            log.records.insert(1, Arc::new(record));
+        }
+        f.contact.log_changed();
+        f.clock.add(Duration::from_millis(5));
+        f.apply(1);
+        f.contact.log_changed();
+        let calls = f.engine.calls();
+        assert_eq!(calls, ["appended 1", "committed 1"], "{calls:?}");
+    }
+
+    /// An apply landing between two reads of the applied state: contact
+    /// takes the applied index and the floor after it in one, so the
+    /// entries after that index are listed at the floor their apply
+    /// derives at, not one raised by entries it then re-walks.
+    #[tokio::test(start_paused = true)]
+    async fn contact_reads_the_applied_index_and_its_floor_at_once() {
+        let f = fixture(&[&[1, 2, 3]]);
+        for (index, at) in [(1, 10 * B), (2, 20 * B), (3, 30 * B)] {
+            f.log.push(1, index, Some(at));
+        }
+        {
+            let mut log = f.log.0.lock().unwrap();
+            (log.applied, log.floor) = (1, 10 * B);
+            log.apply_after_read = Some((3, 30 * B));
+        }
+        let contact = Contact::new(
+            1,
+            Timing::defaults(B),
+            f.clock.clone(),
+            Some(f.engine.clone()),
+            f.log.clone(),
+            1,
+        );
+        contact.log_changed();
+        assert_eq!(contact.lock().scheduled.get(&2).map(|s| s.1), Some(20 * B));
+    }
+
+    /// A log purged past what contact took: the entries purged all
+    /// applied, so the floor rises over them, and the next entry is
+    /// listed and awaited at the index its apply derives at, not at its
+    /// own lower one.
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_rises_over_entries_purged_before_contact_took_them() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let base = index_at(T0).next_multiple_of(B);
+        f.log.push(1, 3, Some(base + 20 * B));
+        {
+            let mut log = f.log.0.lock().unwrap();
+            (log.applied, log.floor) = (2, base + 40 * B);
+            log.committed = Some(id(1, 2));
+        }
+        f.contact.log_changed();
+        assert_eq!(
+            f.contact.lock().scheduled.get(&3).map(|s| s.1),
+            Some(base + 40 * B)
+        );
+    }
+
+    /// A record of an entry purged from the log since it applied is
+    /// handed whatever its deadline: no decision names it by an id this
+    /// replica holds, so given unresolved it would degrade blocks until
+    /// an install.
+    #[tokio::test(start_paused = true)]
+    async fn a_purged_applied_record_is_handed_past_its_deadline() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let at = index_at(T0) + 40 * B;
+        f.log.push(1, 1, Some(at));
+        f.log.push(1, 2, Some(at + 400 * B));
+        f.log.0.lock().unwrap().log.remove(&1);
+        f.clock.set(Timing::defaults(B).apply_deadline(at) + 1);
+        f.engine.calls();
+        f.apply(2);
+        f.contact.log_changed();
+        let calls = f.engine.calls();
+        assert_eq!(
+            calls,
+            ["appended 1", "appended 2", "committed 2"],
+            "{calls:?}"
+        );
     }
 
     /// The leader stamps nothing while [`FUTURE_LIST`] records of applied
