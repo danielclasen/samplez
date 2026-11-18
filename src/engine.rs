@@ -400,7 +400,8 @@ impl std::error::Error for ControlError {}
 struct ReplicaControl {
     ring: rtrb::Producer<Control>,
     unresolved: Vec<LogId>,
-    /// The number of controls pushed to the ring.
+    /// The number of controls pushed to the ring and of hand-overs found
+    /// installed: a copy buffer sent before either is filled again.
     sent: u64,
     /// The RT thread holds a core, or will once it takes the controls
     /// pushed: false from a `DropCore` pushed until a hand-over installs
@@ -1944,7 +1945,8 @@ impl Engine {
     /// history after `k0` (`historySlackMs`), which a copy of history
     /// rings needs; the engine keeps no delay line, so it holds the core
     /// alone. A copy left behind by a timeout is returned by the next
-    /// call unless a control was sent after its buffer. Calls serialise:
+    /// call unless a control was sent or a hand-over installed after its
+    /// buffer was. Calls serialise:
     /// one buffer is with the RT thread at a time. The copy holds every
     /// control sent before the call, such as an entry given as
     /// unresolved.
@@ -2394,6 +2396,7 @@ impl Engine {
                 if h.answer == Answer::Installed {
                     let mut control = control.lock().expect("control lock");
                     control.core = true;
+                    control.sent += 1;
                     control.unresolved.clear();
                     control
                         .unresolved
@@ -5084,6 +5087,63 @@ mod tests {
         assert_eq!(e.counters.handovers_passed.load(Relaxed), 1);
         assert_eq!(e.counters.handovers_installed.load(Relaxed), 0);
         drop(t);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A copy buffer left with the RT thread by a call that timed out, and
+    /// filled there, `slack` widened so the test thread may stall.
+    fn copy_left_behind(e: &Engine) {
+        let transfer = e.transfer.as_ref().unwrap();
+        transfer.lock().unwrap().slack_blocks = 1000;
+        // No control waits: the buffer is sent, and no copy is back yet.
+        assert_eq!(e.copy_core(Duration::ZERO).err(), Some(CopyError::Timeout));
+        assert!(transfer.lock().unwrap().in_flight, "no buffer sent");
+        wait(&|| transfer.lock().unwrap().copies.slots() == 1);
+    }
+
+    /// The copy a timed-out call left behind was filled before a control
+    /// sent after that call: the next call has a buffer filled again, so
+    /// its copy holds every control sent before it.
+    #[test]
+    fn a_copy_left_behind_holds_the_controls_sent_after_it() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("copy-behind", 1);
+        copy_left_behind(&e);
+        let far = (e.counters.processed.load(Acquire) + 1_000_000) * e.block;
+        e.unresolved(1, far).unwrap();
+        let c = e.copy_core(Duration::from_secs(2)).unwrap();
+        assert_eq!(c.core.unresolved(), &[(1, far)]);
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A core fit for a hand-over after block `j`, of an engine with no
+    /// inputs and no log entries taken.
+    fn bare_core(e: &Engine, j: u64, core: &mut Core) -> (u64, LogId) {
+        core.pos = Some((j + 1) * e.block);
+        (j, 0)
+    }
+
+    /// The copy a timed-out call left behind was filled before a core
+    /// handed over since: the next call has a buffer filled again, after
+    /// the install.
+    #[test]
+    fn a_copy_left_behind_is_filled_again_after_a_hand_over() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("copy-handover", 1);
+        copy_left_behind(&e);
+        let j = e
+            .offer(Duration::from_secs(5), false, &[], |j, core| {
+                bare_core(&e, j, core)
+            })
+            .unwrap();
+        let c = e.copy_core(Duration::from_secs(2)).unwrap();
+        assert!(
+            c.k0 > j,
+            "copy after block {} of a core installed after {j}",
+            c.k0
+        );
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }

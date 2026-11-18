@@ -1437,39 +1437,6 @@ fn a_copy_holds_every_unresolved_entry_given_before_it() {
     h.e.stop();
 }
 
-/// A copy left with the RT thread by a call that timed out was filled
-/// before an entry given as unresolved after that call: the next call
-/// has a buffer filled again rather than return it, so its copy holds
-/// the entry.
-#[test]
-fn a_copy_left_behind_by_a_timeout_holds_later_unresolved_entries() {
-    let domain = Domain::new();
-    let src = new_id();
-    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
-    let h = hashed(&domain, &src);
-    // No time to wait: the buffer stays with the RT thread.
-    loop {
-        match h.e.copy_core(Duration::ZERO) {
-            Err(CopyError::Timeout) => break,
-            Ok(_) | Err(CopyError::Passed { .. }) => {}
-            Err(err) => panic!("copy_core: {err}"),
-        }
-    }
-    // The RT thread fills it after its next block.
-    let p = processed(&h.e);
-    wait_for(Duration::from_secs(5), "the buffer filled", || {
-        processed(&h.e) > p + 2
-    });
-    let far = (now_block() + 1_000_000) * B;
-    h.e.unresolved(1, far).unwrap();
-    let c = copy(&h.e);
-    assert!(
-        c.core.unresolved().iter().any(|u| u.0 == 1),
-        "entry given before the copy and not in it"
-    );
-    h.e.stop();
-}
-
 /// A product state that moves an input to another flow while a log
 /// entry's generation for another input of its domain is built, or sent,
 /// on the old flows: that generation is built again on the new ones, so
