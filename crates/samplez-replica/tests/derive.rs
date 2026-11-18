@@ -639,11 +639,22 @@ async fn start_installable(options: Options) -> Set<Desk> {
     set
 }
 
-/// The leader cut off until another one leads, then healed.
+/// The leader cut off until another one leads, then healed; first every
+/// replica applies what it applied, so no entry is cut off from a
+/// follower between its commit and its apply, which would leave it
+/// unresolved there and handed elsewhere.
 async fn change_leader(set: &Set<Desk>) {
     let old = set.leader().await;
-    set.net.isolate(old, set.ids());
+    let applied = set.replica(old).store().applied_index();
     let deadline = Instant::now() + Duration::from_secs(5);
+    while set
+        .ids()
+        .any(|id| set.replica(id).store().applied_index() < applied)
+    {
+        assert!(Instant::now() < deadline, "applied everywhere within 5 s");
+        sleep(Duration::from_millis(5)).await;
+    }
+    set.net.isolate(old, set.ids());
     while !set.ids().any(|id| {
         id != old
             && set.replica(id).raft().metrics().borrow().state == openraft::ServerState::Leader
