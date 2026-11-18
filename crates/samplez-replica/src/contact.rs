@@ -1259,14 +1259,38 @@ impl Contact {
         }
 
         // Reports.
-        if !voters.contains(&self.id) {
-            return Vec::new();
-        }
         st.seq += 1;
         if st.sent.len() == SENT_KEPT {
             st.sent.pop_front();
         }
         st.sent.push_back((st.seq, tai));
+        if !voters.contains(&self.id) {
+            // A learner's report carries what its promotion needs, its
+            // configuration hash and protocol in `own`, and lists nothing:
+            // a voter takes nothing else of it.
+            st.slack.clear();
+            let mut out = Vec::new();
+            for to in voters {
+                let Some(addr) = st.members.addrs.get(&to).cloned() else {
+                    continue;
+                };
+                let report = Report {
+                    from: self.id,
+                    seq: st.seq,
+                    sent_at: tai,
+                    echo: None,
+                    committed: self.log.committed(),
+                    own: st.own.clone(),
+                    heard: Vec::new(),
+                    listed: Vec::new(),
+                    unlisted: None,
+                    estimate: None,
+                    slack: Vec::new(),
+                };
+                out.push((to, addr, report));
+            }
+            return out;
+        }
         self.prune_scheduled(st);
         // The commit point this replica knows, reports included, so peers
         // list nothing it knows committed.

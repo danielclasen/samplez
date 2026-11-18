@@ -554,7 +554,8 @@ the replica's configuration. Product state is shared by every replica,
 so every member, learners and the witness included, needs equal
 configuration as far as it changes how a command applies or a saved
 state loads (`Product::config_hash`). The checks detect a difference;
-they do not undo it. Reports carry the hash: the leader orders no
+they do not undo it. Reports carry the hash, a learner's too, sent to
+every voter, which takes its hash and protocol alone: the leader orders no
 client command while a voter or a learner reports another one
 (`unavailable`, naming it), until that member reports the set's hash or
 leaves the membership, and promotes no learner of another hash. A
