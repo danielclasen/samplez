@@ -372,6 +372,7 @@ pub(crate) async fn watch(shared: Arc<Shared>, bootstrap: Bootstrap) {
             Err(openraft::error::Fatal::Stopped) => return,
             Err(e) => {
                 tracing::warn!(error = %e, "raft stopped: no longer keeping the replica in its set");
+                shared.counted.store(false, Ordering::SeqCst);
                 return;
             }
         };

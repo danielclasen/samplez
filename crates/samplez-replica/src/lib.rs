@@ -143,6 +143,8 @@ impl RaftRpcs {
         reply
     }
 
+    /// A vote request; it records nothing, since a candidate's vote is no
+    /// leader's.
     pub async fn vote(
         &self,
         rpc: openraft::raft::VoteRequest<NodeId>,
@@ -513,6 +515,9 @@ impl<P: Product> Replica<P> {
         self.shared.settings.id
     }
 
+    /// The replica's raft. A network delivers other replicas' RPCs through
+    /// [`Replica::rpcs`], not through this: an AppendEntries delivered here
+    /// leaves no record of the leader, so no leader counts the replica.
     pub fn raft(&self) -> &Raft<TypeConfig> {
         &self.shared.raft
     }
@@ -2112,5 +2117,64 @@ mod tests {
         );
         tokio::time::advance(lease + Duration::from_millis(1)).await;
         assert!(!heard.within(&leader, lease), "past the lease");
+    }
+
+    /// The leader a replica took is recorded from what its raft answered:
+    /// an AppendEntries answered Conflict or Success took the sender's vote,
+    /// one answered HigherVote did not, nor an InstallSnapshot answered
+    /// with another vote.
+    #[tokio::test]
+    async fn rpcs_record_only_a_vote_the_raft_accepted() {
+        let dir = dir("rpcs");
+        let replica = start(open(&dir)).await;
+        let rpcs = replica.rpcs();
+        let lease = Duration::from_secs(60);
+        let heard = |vote: &Vote<NodeId>| replica.shared.heard.within(vote, lease);
+        let append = |vote: Vote<NodeId>, prev: Option<LogId<NodeId>>| AppendEntriesRequest {
+            vote,
+            prev_log_id: prev,
+            entries: Vec::new(),
+            leader_commit: None,
+        };
+        let five = Vote::new_committed(5, 1);
+        let behind = LogId::new(CommittedLeaderId::new(5, 1), 10);
+        let reply = rpcs.append_entries(append(five, Some(behind))).await;
+        assert!(
+            matches!(reply, Ok(AppendEntriesResponse::Conflict)),
+            "{reply:?}"
+        );
+        assert!(heard(&five), "a conflict took the vote");
+        let six = Vote::new_committed(6, 2);
+        let reply = rpcs.append_entries(append(six, None)).await;
+        assert!(
+            matches!(reply, Ok(AppendEntriesResponse::Success)),
+            "{reply:?}"
+        );
+        assert!(heard(&six));
+        let four = Vote::new_committed(4, 1);
+        let reply = rpcs.append_entries(append(four, None)).await;
+        assert!(
+            matches!(reply, Ok(AppendEntriesResponse::HigherVote(_))),
+            "{reply:?}"
+        );
+        assert!(
+            !heard(&four) && heard(&six),
+            "a refused append records nothing"
+        );
+        let snapshot = InstallSnapshotRequest {
+            vote: four,
+            meta: openraft::SnapshotMeta::default(),
+            offset: 0,
+            data: Vec::new(),
+            done: true,
+        };
+        let reply = rpcs.install_snapshot(snapshot).await.expect("answers");
+        assert_eq!(reply.vote, six);
+        assert!(
+            !heard(&four) && heard(&six),
+            "a refused snapshot records nothing"
+        );
+        replica.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
