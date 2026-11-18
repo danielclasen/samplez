@@ -62,10 +62,14 @@ pub fn newest_due_block(api: &MxlApi, now: u64, block: u64, margin: u64) -> Opti
 /// `mxlIndexToTimestamp((k + 1)B + max(0, max_offset))`, `max_offset` being
 /// the largest `offsetSamples` of the generation's inputs.
 pub fn group_timestamp(api: &MxlApi, k: u64, block: u64, max_offset: i64) -> u64 {
-    index_to_timestamp(
-        api,
-        end_index(k, block).saturating_add(max_offset.max(0).unsigned_abs()),
-    )
+    index_to_timestamp(api, group_index(k, block, max_offset))
+}
+
+/// The index every reader of an input generation is waited for before
+/// block `k`: `(k + 1)B + max(0, max_offset)`, the index of
+/// [`group_timestamp`].
+pub fn group_index(k: u64, block: u64, max_offset: i64) -> u64 {
+    end_index(k, block).saturating_add(max_offset.max(0).unsigned_abs())
 }
 
 /// `(k + 1)B`, saturating.

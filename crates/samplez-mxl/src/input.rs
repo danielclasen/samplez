@@ -454,12 +454,30 @@ impl Generation {
             .sum()
     }
 
+    /// RT. Whether every reader's head, the outgoing ones' included, has
+    /// reached `index`: the condition the group wait waits for, read from
+    /// the flows' shared memory alone. A head that cannot be read counts as
+    /// reached; the read reports it.
+    pub fn reached(&self, index: u64) -> bool {
+        self.inputs
+            .iter()
+            .chain(&self.outgoing)
+            .flatten()
+            .all(|i| !matches!(i.reader.head(), Ok(head) if head < index))
+    }
+
     /// RT. `mxlFlowSynchronizationGroupWaitForDataAt` on the generation's
     /// group: [`GroupWait::Ok`] once every reader's head reached the index
     /// of `timestamp`. Otherwise it blocks on a futex until `timeout_ns`
     /// passed, then fails with `MXL_ERR_OUT_OF_RANGE_TOO_EARLY`, or with
     /// `MXL_ERR_FLOW_INVALID` when the first reader found behind is on a
     /// replaced flow: libmxl checks validity only once the timeout expired.
+    /// That check is a `stat()` of the flow's data file, which on a file
+    /// system that waits for a missing name blocks for that wait once the
+    /// flow is deleted.
+    #[deprecated(
+        note = "the engine waits on `Generation::reached`; the group wait's validity check can block"
+    )]
     pub fn wait(&self, timestamp: u64, timeout_ns: u64) -> GroupWait {
         match self.group.wait(timestamp, timeout_ns) {
             MXL_STATUS_OK => GroupWait::Ok,
@@ -785,7 +803,13 @@ impl Input {
     /// probes the flow once with `mxlFlowReaderGetSamplesNonBlocking(head +
     /// 1, 1)`, which runs libmxl's validity check, and marks the slot
     /// invalid on `MXL_ERR_FLOW_INVALID`. A slot already marked is not
-    /// probed. Returns true when it marked the slot.
+    /// probed. Returns true when it marked the slot. The validity check is
+    /// a `stat()` of the flow's data file, which on a file system that
+    /// waits for a missing name blocks for that wait once the flow is
+    /// deleted.
+    #[deprecated(
+        note = "the engine prunes a frozen input and checks its flow on the supervisor side"
+    )]
     pub fn identify(&self, state: &mut SlotState, group: &GroupWait, outcome: Outcome) -> bool {
         if state.invalid
             || outcome != Outcome::Late

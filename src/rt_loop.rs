@@ -55,7 +55,9 @@ pub struct Counters {
     pub input_late_blocks: AtomicU64,
     /// Input blocks silenced for any reason, a pruned input included.
     pub input_silenced_blocks: AtomicU64,
-    /// Validity probes of the failed-input identification.
+    /// Validity probes of the failed-input identification. The RT thread
+    /// makes none: a frozen input is pruned and its flow checked on the
+    /// supervisor side.
     pub input_probes: AtomicU64,
     /// Clock steps: libmxl's clock moved by more than a block period
     /// against CLOCK_MONOTONIC between two wakes.
@@ -725,6 +727,11 @@ pub(crate) struct Out {
 }
 
 /// Samples of a meter slice: 10 ms at 48 kHz.
+/// How long the RT thread sleeps between two reads of the input heads
+/// while it waits for a block's input: 100 us, a tenth of a 48-sample
+/// block.
+const HEAD_POLL_NS: u64 = 100_000;
+
 pub(crate) const SLICE: u64 = samplez_dsp::SLICE;
 const WINDOW: u64 = samplez_dsp::WINDOW;
 /// Input samples before the current one in the true-peak interpolation
@@ -1855,25 +1862,38 @@ impl Rt {
         written
     }
 
-    /// Waits on each input domain's group for block `k`, until `deadline`.
+    /// Waits for each input domain's readers to reach block `k`'s group
+    /// index, until `deadline`: reads their heads, which are in the flows'
+    /// shared memory, and sleeps [`HEAD_POLL_NS`] between two reads. No
+    /// libmxl call that looks a flow's files up, as the group wait's and the
+    /// read's validity checks do once they time out, runs here: on a file
+    /// system that waits for a missing name, a deleted flow would hold the
+    /// RT thread for that wait. A frozen head is pruned instead, and its flow
+    /// checked on the supervisor side.
     fn wait(&mut self, k: u64, deadline: u64) {
         let mut waited = false;
         let mut all_ok = true;
-        for (g, status) in self.gens.iter().zip(self.statuses.iter_mut()) {
-            *status = match g {
+        for d in 0..self.gens.len() {
+            let status = match &self.gens[d] {
                 Some(g) if g.mxl.has_inputs() => {
-                    let ts = time::group_timestamp(&self.api, k, self.block, g.mxl.max_offset());
-                    let timeout = deadline.saturating_sub(clock_now(&self.api));
-                    let s = samplez_mxl::rtsan::allow(|| g.mxl.wait(ts, timeout));
-                    if matches!(s, GroupWait::Failed(MXL_ERR_OUT_OF_RANGE_TOO_EARLY)) {
-                        add(&self.counters.input_wait_timeout, 1);
-                    }
                     waited = true;
-                    s
+                    let index = time::group_index(k, self.block, g.mxl.max_offset());
+                    loop {
+                        if g.mxl.reached(index) {
+                            break GroupWait::Ok;
+                        }
+                        let now = self.now();
+                        if now >= deadline {
+                            add(&self.counters.input_wait_timeout, 1);
+                            break GroupWait::Failed(MXL_ERR_OUT_OF_RANGE_TOO_EARLY);
+                        }
+                        self.sleep_until(now.saturating_add(HEAD_POLL_NS).min(deadline));
+                    }
                 }
                 _ => GroupWait::Skipped,
             };
             all_ok &= matches!(status, GroupWait::Ok);
+            self.statuses[d] = status;
         }
         if waited && all_ok && self.now() < deadline {
             add(&self.counters.wait_early, 1);
@@ -2522,7 +2542,6 @@ impl Rt {
             let copied = match input {
                 Some((input, g)) => {
                     let group = &self.statuses[slot.domain];
-                    let probes = slot.state.counters.probes;
                     let outcome = input.read(&mut slot.state, k, group, dst);
                     let s = &mut slot.stats;
                     match outcome {
@@ -2536,17 +2555,9 @@ impl Rt {
                                 let slack = head as i64 - end as i64;
                                 s.min_slack = Some(s.min_slack.map_or(slack, |m| m.min(slack)));
                             }
-                            // The failure path (README): the probe runs
-                            // libmxl's flow validity check, a stat() and
-                            // path allocations.
-                            input.identify(&mut slot.state, group, outcome);
                         }
                         _ => {}
                     }
-                    add(
-                        &self.counters.input_probes,
-                        slot.state.counters.probes - probes,
-                    );
                     let frozen = u64::from(slot.state.frozen_late_blocks) * self.block;
                     if !slot.prune_requested && (slot.state.invalid || frozen >= g.prune_after[i]) {
                         let t = Telemetry::Prune {
