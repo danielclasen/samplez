@@ -1538,16 +1538,6 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
 mod tests {
     use super::*;
 
-    /// A product that drives an engine refuses a command asking for an
-    /// index beyond the earliest; one that does not keeps it, and an
-    /// index at or before the earliest, or none, is never refused.
-    #[test]
-    fn only_an_engine_product_refuses_a_scheduled_index() {
-        assert!(scheduled(true, Some(4848), 4800));
-        assert!(!scheduled(true, Some(4800), 4800));
-        assert!(!scheduled(true, None, 4800));
-        assert!(!scheduled(false, Some(48_000), 4800));
-    }
     use crate::state_machine::tests::Paths;
     use openraft::error::{InstallSnapshotError, RPCError, Unreachable};
     use openraft::network::{RPCOption, RaftNetwork};
@@ -1560,6 +1550,17 @@ mod tests {
     use std::path::PathBuf;
 
     const ID: NodeId = 7;
+
+    /// A product that drives an engine refuses a command asking for an
+    /// index beyond the earliest; one that does not keeps it, and an
+    /// index at or before the earliest, or none, is never refused.
+    #[test]
+    fn only_an_engine_product_refuses_a_scheduled_index() {
+        assert!(scheduled(true, Some(4848), 4800));
+        assert!(!scheduled(true, Some(4800), 4800));
+        assert!(!scheduled(true, None, 4800));
+        assert!(!scheduled(false, Some(48_000), 4800));
+    }
 
     /// An entry carries commands asking for one index only: the engine
     /// applies a log entry at one index, so a command asking for a later
