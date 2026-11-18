@@ -568,6 +568,22 @@ struct Learner {
     received: Instant,
 }
 
+/// A rebuild of the engine's core from product state. It waits for the
+/// RT thread for up to the lead, so it runs on a thread of its own and a
+/// later tick takes its result: contact goes on ticking meanwhile.
+enum Rebuild {
+    Idle,
+    /// The log index its state folds in; stale once a restart began
+    /// after it started.
+    Running {
+        n: u64,
+        job: std::thread::JoinHandle<bool>,
+        stale: bool,
+    },
+    /// Installed, given the entries still unresolved; not yet taken.
+    Done,
+}
+
 struct State {
     members: Members,
     /// Each learner's newest report: its configuration hash and protocol
@@ -632,6 +648,7 @@ struct State {
     /// Back in `starting` until the applied index passes this and the
     /// engine is rebuilt from product state.
     restart: Option<u64>,
+    rebuild: Rebuild,
     /// The resync attempt in progress and the counts.
     resync: crate::resync::Tracker,
     /// The log's snapshot installs acted on.
@@ -909,6 +926,7 @@ impl Contact {
                 decisions: Vec::new(),
                 purge_points: Vec::new(),
                 restart: None,
+                rebuild: Rebuild::Idle,
                 resync: crate::resync::Tracker::default(),
                 installs_seen,
                 fence: None,
@@ -1571,6 +1589,12 @@ impl Contact {
     /// `after` and its engine was rebuilt from product state.
     fn begin_restart(&self, st: &mut State, after: u64) {
         st.restart = Some(st.restart.map_or(after, |a| a.max(after)));
+        // A rebuild under way installs a state from before the restart.
+        if let Rebuild::Running { stale, .. } = &mut st.rebuild {
+            *stale = true;
+        } else {
+            st.rebuild = Rebuild::Idle;
+        }
         // The engine is rebuilt from product state: no resync hands over.
         st.resync.abandon(Instant::now());
         if let (Some(audio), Some(life)) = (&self.audio, st.life.as_mut()) {
@@ -1579,20 +1603,71 @@ impl Contact {
         }
     }
 
-    /// Builds the engine's core from the applied product state, at the
-    /// floor of the applied log, and gives it the entries still
-    /// unresolved: the log index the state folds in, none when that
-    /// failed.
-    fn rebuild(&self, audio: &dyn Audio, given: &BTreeMap<Key, u64>) -> Option<u64> {
-        let (n, floor, state) = self.log.product_state();
-        if !audio.rebuild_engine(&state, floor) {
-            return None;
+    /// Whether the engine's core was rebuilt from the applied product
+    /// state, at the floor of the applied log: true once, for a rebuild
+    /// done. Else one is started unless one runs, read fresh after one
+    /// that failed.
+    fn rebuild(&self, st: &mut State, audio: &Arc<dyn Audio>) -> bool {
+        match st.rebuild {
+            Rebuild::Done => {
+                st.rebuild = Rebuild::Idle;
+                return true;
+            }
+            Rebuild::Running { .. } => return false,
+            Rebuild::Idle => {}
         }
-        // The rebuilt core holds no unresolved entry.
-        for (&(index, _, _), &at) in given {
+        let (n, floor, state) = self.log.product_state();
+        let audio = Arc::clone(audio);
+        let job = std::thread::Builder::new()
+            .name("rebuild".into())
+            .spawn(move || audio.rebuild_engine(&state, floor));
+        match job {
+            Ok(job) => {
+                st.rebuild = Rebuild::Running {
+                    n,
+                    job,
+                    stale: false,
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "no thread for an engine rebuild: retried"),
+        }
+        false
+    }
+
+    /// Takes the result of a rebuild that ended. The rebuilt core holds no
+    /// unresolved entry: it is given those still held. A stale one's core
+    /// is dropped again; a failed one is retried.
+    fn rebuild_ended(&self, st: &mut State, audio: &dyn Audio) {
+        let Rebuild::Running { job, .. } = &st.rebuild else {
+            return;
+        };
+        if !job.is_finished() {
+            return;
+        }
+        let Rebuild::Running { n, job, stale } = std::mem::replace(&mut st.rebuild, Rebuild::Idle)
+        else {
+            return;
+        };
+        // One that panicked failed.
+        if !job.join().unwrap_or(false) {
+            return;
+        }
+        if stale {
+            audio.drop_engine();
+            return;
+        }
+        for (&(index, _, _), &at) in &st.given {
             let _ = audio.unresolved(index, at);
         }
-        Some(n)
+        self.rebuilt(st, n);
+        st.rebuild = Rebuild::Done;
+    }
+
+    #[cfg(test)]
+    fn await_rebuild(&self) {
+        while matches!(&self.lock().rebuild, Rebuild::Running { job, .. } if !job.is_finished()) {
+            std::thread::yield_now();
+        }
     }
 
     /// A core was rebuilt from the state the entries up to `n` left: what
@@ -1890,16 +1965,14 @@ impl Contact {
             self.begin_restart(st, self.log.applied());
         }
         st.held = held;
+        self.rebuild_ended(st, audio.as_ref());
         let rebuilding = match st.restart {
             Some(after) if !held && self.log.applied() >= after => {
-                match self.rebuild(audio.as_ref(), &st.given) {
-                    Some(n) => {
-                        st.restart = None;
-                        self.rebuilt(st, n);
-                        false
-                    }
-                    None => true,
+                let done = self.rebuild(st, audio);
+                if done {
+                    st.restart = None;
                 }
+                !done
             }
             Some(_) => true,
             None => false,
@@ -1934,12 +2007,12 @@ impl Contact {
             .copied()
             .filter(|&id| id != self.id && st.baselines.rank(k, id, &audio_voters, &t) < mine)
             .collect();
-        let given = &st.given;
-        let retargeted = std::cell::Cell::new(None);
+        // Taken once done, else started after the step.
+        let retargeted = matches!(st.rebuild, Rebuild::Done);
+        let retarget_asked = std::cell::Cell::new(false);
         let retarget = || {
-            let n = self.rebuild(audio.as_ref(), given);
-            retargeted.set(n);
-            n.is_some()
+            retarget_asked.set(true);
+            retargeted
         };
         let life = st.life.as_mut().expect("checked above");
         let view = View {
@@ -1967,8 +2040,13 @@ impl Contact {
         };
         life.step(&view, audio.as_ref());
         let state = life.state();
-        if let Some(n) = retargeted.get() {
-            self.rebuilt(st, n);
+        if retarget_asked.get() {
+            self.rebuild(st, audio);
+        }
+        // Done for a replica that no longer wants it: dropped again.
+        if matches!(st.rebuild, Rebuild::Done) {
+            st.rebuild = Rebuild::Idle;
+            audio.drop_engine();
         }
         if state == ReplicaState::Committing {
             st.resync.committing();
@@ -3250,6 +3328,8 @@ mod tests {
         handed_from: Mutex<Vec<usize>>,
         /// Whether a rebuild succeeds.
         rebuilds: std::sync::atomic::AtomicBool,
+        /// A rebuild waits while set, as for the RT thread, 1 s at most.
+        holding: std::sync::atomic::AtomicBool,
         /// Each rebuild's state's last log id and the index it installs
         /// at or after.
         rebuilt_with: Mutex<Vec<(u64, u64)>>,
@@ -3296,6 +3376,10 @@ mod tests {
             self.calls.lock().unwrap().push("drop".into());
         }
         fn rebuild_engine(&self, state: &ProductState, at_least: u64) -> bool {
+            let from = std::time::Instant::now();
+            while self.holding.load(Ordering::SeqCst) && from.elapsed() < Duration::from_secs(1) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             let ok = self.rebuilds.load(Ordering::SeqCst);
             if ok {
                 self.calls.lock().unwrap().push("rebuild".into());
@@ -3378,6 +3462,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
             handed_from: Mutex::new(Vec::new()),
             rebuilds: std::sync::atomic::AtomicBool::new(true),
+            holding: std::sync::atomic::AtomicBool::new(false),
             rebuilt_with: Mutex::new(Vec::new()),
         });
         let contact = Contact::new(
@@ -3408,8 +3493,11 @@ mod tests {
     }
 
     impl Fixture {
+        /// A tick, after which a rebuild it started has ended.
         fn tick(&self) -> Vec<(NodeId, String, Report)> {
-            self.contact.tick(self.members.clone())
+            let reports = self.contact.tick(self.members.clone());
+            self.contact.await_rebuild();
+            reports
         }
 
         /// A report from `from` echoing seq `echo` received at `at`.
@@ -3826,6 +3914,36 @@ mod tests {
         );
         f.tick();
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+    }
+
+    /// A rebuild waits for the RT thread for up to the lead: contact goes
+    /// on ticking and reporting meanwhile, and takes the rebuilt core on a
+    /// tick after it ended.
+    #[tokio::test(start_paused = true)]
+    async fn contact_ticks_on_while_a_rebuild_waits() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        f.engine.holding.store(true, Ordering::SeqCst);
+        f.apply(10);
+        f.log.0.lock().unwrap().installs += 1;
+        f.contact.log_changed();
+        for _ in 0..5 {
+            let from = std::time::Instant::now();
+            let reports = f.contact.tick(f.members.clone());
+            assert!(
+                from.elapsed() < Duration::from_millis(500),
+                "a tick waited for the rebuild"
+            );
+            assert_eq!(reports.len(), 2);
+            assert_eq!(f.state(), Some(ReplicaState::Starting));
+        }
+        f.engine.holding.store(false, Ordering::SeqCst);
+        f.contact.await_rebuild();
+        f.contact.tick(f.members.clone());
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        let calls = f.engine.calls();
+        let rebuilds = calls.iter().filter(|c| *c == "rebuild").count();
+        assert_eq!(rebuilds, 1, "{calls:?}");
     }
 
     /// What an entry derived reaches the engine as it applies, not as it
