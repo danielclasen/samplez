@@ -4755,44 +4755,235 @@ mod tests {
         std::fs::remove_dir_all(&domain).unwrap();
     }
 
+    /// Pauses the loop of `e` once in the step of the first block from
+    /// `k` on: right after output 0 moved its ring with `in_ring`, else
+    /// before the outputs decide the block
+    /// ([`crate::rt_loop::HOLD_PASS_PAUSE`]). Armed before F is frozen,
+    /// the loop pauses itself, so no ring fills while the test thread
+    /// waits to be scheduled.
+    fn pause_at(e: &Engine, k: u64, in_ring: bool) {
+        use crate::rt_loop::{HOLD_PASS_PAUSE, HOLD_PASS_PAUSE_IN_RING, HOLD_PASS_PAUSE_K};
+        HOLD_PASS_PAUSE_K.store(k, Relaxed);
+        HOLD_PASS_PAUSE_IN_RING.store(in_ring, Relaxed);
+        HOLD_PASS_PAUSE.store(std::ptr::from_ref(e.counters()) as usize, Release);
+    }
+
+    /// Waits for the loop [`pause_at`] armed to pause.
+    fn paused() {
+        let t = Instant::now();
+        while !crate::rt_loop::HOLD_PASS_PAUSED.load(Acquire) {
+            assert!(t.elapsed() < Duration::from_secs(10), "timed out");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Resumes the loop [`pause_at`] paused.
+    fn resume() {
+        crate::rt_loop::HOLD_PASS_PAUSED.store(false, Release);
+    }
+
+    /// Disarms and resumes the loop [`pause_at`] armed, also when a test
+    /// fails.
+    struct Unpause;
+
+    impl Drop for Unpause {
+        fn drop(&mut self) {
+            crate::rt_loop::HOLD_PASS_PAUSE.store(0, Relaxed);
+            resume();
+        }
+    }
+
     /// A block withheld on one output withdraws the replica on every
-    /// output before the next one advances: in the pass that moves F past
-    /// block k, output 1 does not commit k while output 0 withholds it.
+    /// output before the next one advances: output 1 does not commit
+    /// block k while output 0 withholds it, also when the supervisor
+    /// withholds k and moves F past it in the middle of a pass over the
+    /// hold rings, after output 0 moved its ring.
     #[test]
     fn a_block_withheld_on_one_output_withdraws_the_next_before_it_advances() {
+        use crate::blocks::Kind;
+        withhold_in_a_pass("withdraw-every", 0, true, |e, k| {
+            let st = e.block_status(1, k).unwrap();
+            assert_ne!(st.kind, Kind::Committed, "{st:?}");
+        });
+    }
+
+    /// Both outputs hold block k fenced, F frozen, with the loop paused in
+    /// a step after it: right after output 0 moved its ring with
+    /// `in_ring`, else after the pass over the rings. The supervisor
+    /// withholds k on output `on` alone and moves F past it; `check` runs
+    /// on the status once the loop went on. An overrun skip or a full ring
+    /// under load withdraws the replica or leaves k without a fenced
+    /// status: then the outputs are named again on a new engine, since a
+    /// withdrawn output's ring of fills overflows before its commit
+    /// start.
+    fn withhold_in_a_pass(name: &str, on: usize, in_ring: bool, check: impl Fn(&Engine, u64)) {
         use crate::blocks::{Cause, Kind};
         let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
-        let (e, _changes, _verdicts, domain) = outputs_only("withdraw-every", 2);
-        let processed = || e.counters().processed.load(Acquire);
-        let fenced =
-            |k: u64| (0..2).all(|o| e.block_status(o, k).is_some_and(|s| s.kind == Kind::Fenced));
-        let committing_all =
-            || (0..2).all(|o| matches!(e.standing(o), Some(Standing::Committing { .. })));
-        // F frozen: both outputs hold block k, the first block F has not
-        // passed, and the blocks after it fenced. An overrun skip under
-        // load withdraws the replica or leaves no status at k: then the
-        // outputs are named again and F frozen anew.
-        let mut k = None;
         for _ in 0..10 {
+            let (e, _changes, _verdicts, domain) = outputs_only(name, 2);
+            let _unpause = Unpause;
+            let processed = || e.counters().processed.load(Acquire);
+            let fenced = |k: u64| {
+                (0..2).all(|o| e.block_status(o, k).is_some_and(|s| s.kind == Kind::Fenced))
+            };
+            let committing_all =
+                || (0..2).all(|o| matches!(e.standing(o), Some(Standing::Committing { .. })));
             committing(&e, 2);
             let f = processed() + 2;
+            pause_at(&e, f + 5, in_ring);
             e.set_fence(f * 48).unwrap();
-            wait(&|| processed() > f + 5);
+            paused();
             let first = (f..=processed()).find(|&j| fenced(j));
-            if committing_all() && first == Some(f) {
-                k = first;
-                break;
+            if !committing_all() || first != Some(f) {
+                resume();
+                e.stop();
+                std::fs::remove_dir_all(&domain).unwrap();
+                continue;
             }
+            let st = e.withhold(on, f, Cause::Silence).unwrap().unwrap();
+            assert_eq!(st.kind, Kind::Withheld);
+            e.set_fence(u64::MAX).unwrap();
+            resume();
+            wait(&|| processed() > f + 15);
+            check(&e, f);
+            e.stop();
+            std::fs::remove_dir_all(&domain).unwrap();
+            return;
         }
-        let k = k.expect("no pass without an overrun in 10 attempts");
-        let st = e.withhold(0, k, Cause::HoldCap).unwrap().unwrap();
-        assert_eq!(st.kind, Kind::Withheld);
-        e.set_fence(u64::MAX).unwrap();
-        wait(&|| processed() > k + 15);
-        let st = e.block_status(1, k).unwrap();
-        assert_ne!(st.kind, Kind::Committed, "{st:?}");
-        e.stop();
-        std::fs::remove_dir_all(&domain).unwrap();
+        panic!("no pass without an overrun in 10 attempts");
+    }
+
+    /// A block withheld on a later output alone withdraws the replica on
+    /// every output before any ring moves at the F that passes it: output
+    /// 0 does not commit block k while output 1 withholds it, though
+    /// output 0's ring moves first in a pass.
+    #[test]
+    fn a_block_withheld_on_a_later_output_withdraws_the_first_before_it_advances() {
+        use crate::blocks::Kind;
+        withhold_in_a_pass("withdraw-later", 1, false, |e, k| {
+            let st = e.block_status(0, k).unwrap();
+            assert_ne!(st.kind, Kind::Committed, "{st:?}");
+        });
+    }
+
+    /// A held block committed through on one output only up to P inside
+    /// it withholds the rest of it for a cause, which withdraws the
+    /// replica on every output before any moves past it: output 0, its
+    /// ring moved first in a pass, does not commit the block after it
+    /// alone. Block k is degraded by an unresolved entry, the blocks after
+    /// it healthy and held behind it; the supervisor marks k on output 0
+    /// whole and on output 1 up to the middle of k, between two passes.
+    #[test]
+    fn a_commit_through_up_to_p_on_a_later_output_withdraws_the_first() {
+        use crate::blocks::{HEALTHY, Kind};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..10 {
+            let (e, _changes, _verdicts, domain) = outputs_only("through-up-to", 2);
+            let _unpause = Unpause;
+            let processed = || e.counters().processed.load(Acquire);
+            let held = |o: usize, k: u64, healthy: bool| {
+                e.block_status(o, k)
+                    .is_some_and(|s| s.kind == Kind::Held && (s.digest == Some(HEALTHY)) == healthy)
+            };
+            let committing_all =
+                || (0..2).all(|o| matches!(e.standing(o), Some(Standing::Committing { .. })));
+            committing(&e, 2);
+            // Block k alone carries the entry: it is resolved while the
+            // loop is paused in block k's pass, after k's digest.
+            let k = processed() + 10;
+            e.unresolved(1, k * 48).unwrap();
+            pause_at(&e, k, true);
+            paused();
+            e.resolved(1).unwrap();
+            pause_at(&e, k + 3, false);
+            resume();
+            paused();
+            let ready = committing_all()
+                && (0..2)
+                    .all(|o| held(o, k, false) && held(o, k + 1, true) && held(o, k + 2, true));
+            if !ready {
+                resume();
+                e.stop();
+                std::fs::remove_dir_all(&domain).unwrap();
+                continue;
+            }
+            assert!(e.commit_through(0, k, 0, None).unwrap());
+            assert!(e.commit_through(1, k, 0, Some(k * 48 + 24)).unwrap());
+            resume();
+            wait(&|| processed() > k + 10);
+            let st = e.block_status(0, k).unwrap();
+            assert_eq!(st.kind, Kind::Committed, "{st:?}");
+            let st = e.block_status(0, k + 1).unwrap();
+            assert_ne!(st.kind, Kind::Committed, "{st:?}");
+            e.stop();
+            std::fs::remove_dir_all(&domain).unwrap();
+            return;
+        }
+        panic!("no pass without an overrun in 10 attempts");
+    }
+
+    /// A full hold ring moves at the F its block's pass read: with output
+    /// 0's ring shorter than output 1's, output 1 does not commit block k
+    /// while output 0 withholds it, also when the supervisor withholds k
+    /// and moves F past it after the pass over the hold rings, before the
+    /// outputs decide the block at which output 1's ring is full.
+    #[test]
+    fn a_full_ring_moves_at_the_fence_of_its_pass() {
+        use crate::blocks::{Cause, Kind, PAGE};
+        // The hold ring at the default holdMs and contactWindowMs; the
+        // overflow of output 1's block f below proves it.
+        const RING: u64 = 20;
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        // An overrun skip under load leaves a block of the rings without a
+        // fenced status: then the outputs are named again on a new engine.
+        for _ in 0..10 {
+            let (e, _changes, _verdicts, domain) = outputs_only("full-ring", 2);
+            let _unpause = Unpause;
+            let processed = || e.counters().processed.load(Acquire);
+            let fenced =
+                |o: usize, k: u64| e.block_status(o, k).is_some_and(|s| s.kind == Kind::Fenced);
+            let committing_all =
+                || (0..2).all(|o| matches!(e.standing(o), Some(Standing::Committing { .. })));
+            // Output 1 commits from a page boundary before block f, and
+            // holds every block from f on, F frozen there. Output 0 commits
+            // from the page boundary in block kp, five blocks later: its
+            // ring is full five blocks after output 1's, which is full at
+            // block f + RING.
+            let now = processed();
+            let kp = ((now + 40) * 48).next_multiple_of(PAGE) / 48;
+            let (f, k) = (kp - 5, kp + 1);
+            e.set_fence(u64::MAX).unwrap();
+            e.commit_from(1, now + 2).unwrap();
+            e.set_fence(f * 48).unwrap();
+            e.commit_from(0, kp).unwrap();
+            pause_at(&e, f + RING, false);
+            paused();
+            if !committing_all() || !(f..f + RING).all(|j| fenced(1, j)) || !fenced(0, k) {
+                resume();
+                e.stop();
+                std::fs::remove_dir_all(&domain).unwrap();
+                continue;
+            }
+            let st = e.withhold(0, k, Cause::HoldCap).unwrap().unwrap();
+            assert_eq!(st.kind, Kind::Withheld);
+            e.set_fence(u64::MAX).unwrap();
+            resume();
+            wait(&|| processed() > f + RING + 5);
+            // Output 1's ring was full at the decision: its front block
+            // overflowed, at the F the pass read.
+            let st = e.block_status(1, f).unwrap();
+            assert_eq!(
+                (st.kind, st.cause),
+                (Kind::Withheld, Cause::Overflow),
+                "{st:?}"
+            );
+            let st = e.block_status(1, k).unwrap();
+            assert_ne!(st.kind, Kind::Committed, "{st:?}");
+            e.stop();
+            std::fs::remove_dir_all(&domain).unwrap();
+            return;
+        }
+        panic!("no pass without an overrun in 10 attempts");
     }
 
     /// The engine's own log stamps an `InputDown` or `InputUp` that

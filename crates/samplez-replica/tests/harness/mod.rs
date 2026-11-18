@@ -516,6 +516,41 @@ impl Fake {
         self.withdraw(true);
     }
 
+    /// As the engine does before its rings move: every ring moves below
+    /// the first block from which any output withdraws the replica for a
+    /// status it has not seen, block `next` before it is computed
+    /// included, and the replica is withdrawn on every output before any
+    /// block from it on moves.
+    fn withdraw_unseen(&mut self, ctx: Ctx, next: Option<u64>) {
+        let found = self
+            .outputs
+            .iter()
+            .filter(|out| out.realised)
+            .filter_map(|out| out.hold.withheld_unseen(&out.statuses, next))
+            .reduce(|(a, x), (b, y)| (a.min(b), x | y));
+        let Some((first, cause)) = found else {
+            return;
+        };
+        for o in 0..self.outputs.len() {
+            let out = &mut self.outputs[o];
+            if !out.realised {
+                continue;
+            }
+            let mut changes = Changes {
+                ring: &mut out.tx,
+                dropped: &out.dropped,
+                output: o as u32,
+            };
+            let moved =
+                out.hold
+                    .advance_below(ctx, first, &out.statuses, &mut changes, &mut out.sink);
+            if moved.withdraw {
+                self.withdraw(moved.cause);
+            }
+        }
+        self.withdraw(cause);
+    }
+
     /// Withdrawn on every output, `cause` as the engine's hold takes it.
     fn withdraw(&mut self, cause: bool) {
         self.withdrawals += 1;
@@ -741,6 +776,8 @@ impl FakeAudio {
             // Scaled: an offset is lost at these indices' magnitude.
             let hashed: Vec<f32> = data.iter().map(|&x| x * (1.0 + shift)).collect();
             let fingerprint = st.fingerprint(((k + 1) * b - 1) / PAGE);
+            // As the engine does before it computes block k.
+            st.withdraw_unseen(ctx, Some(k));
             for o in 0..st.outputs.len() {
                 let out = &mut st.outputs[o];
                 if !out.realised {
@@ -768,6 +805,7 @@ impl FakeAudio {
             st.computed = Some(k);
         }
         let ctx = st.ctx();
+        st.withdraw_unseen(ctx, None);
         for o in 0..st.outputs.len() {
             let out = &mut st.outputs[o];
             let mut changes = Changes {

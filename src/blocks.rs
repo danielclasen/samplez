@@ -799,6 +799,40 @@ impl Hold {
         self.mode
     }
 
+    /// The first block in the ring, or block `next` before it is
+    /// computed, from which this output withdraws the replica for a
+    /// status it has not seen, with whether for a cause
+    /// ([`BlockStatus::for_a_cause`]); none while idle. A block
+    /// `withheld` withdraws from itself; a held block marked for commit
+    /// through only up to P inside its range withholds `[P, (k + 1)B)`
+    /// for a cause and withdraws from the block after it
+    /// ([`Hold::advance`]). The replica is withdrawn on every output from
+    /// there on ([`Hold::advance_below`]).
+    pub fn withheld_unseen(&self, statuses: &Statuses, next: Option<u64>) -> Option<(u64, bool)> {
+        if self.mode == Mode::Idle {
+            return None;
+        }
+        for p in self
+            .pending
+            .iter()
+            .filter(|p| p.status.kind != Kind::Withheld)
+        {
+            match statuses.get(p.status.k) {
+                Some(st) if st.kind == Kind::Withheld => return Some((st.k, st.for_a_cause())),
+                Some(BlockStatus {
+                    k,
+                    kind: Kind::Held,
+                    through: true,
+                    range: Range::UpTo(e),
+                    ..
+                }) if e < p.end => return Some((k + 1, true)),
+                _ => {}
+            }
+        }
+        let st = statuses.get(next?).filter(|s| s.kind == Kind::Withheld)?;
+        Some((st.k, st.for_a_cause()))
+    }
+
     /// Blocks in the ring.
     pub fn len(&self) -> usize {
         self.pending.len()
@@ -1287,10 +1321,27 @@ impl Hold {
         changes: &mut Changes,
         sink: &mut impl Sink,
     ) -> Outcome {
+        self.advance_below(ctx, u64::MAX, statuses, changes, sink)
+    }
+
+    /// RT. [`Hold::advance`] for the blocks below block `limit` only: a
+    /// block another output withholds withdraws the replica on this one
+    /// before any block from it on moves.
+    pub fn advance_below(
+        &mut self,
+        ctx: Ctx,
+        limit: u64,
+        statuses: &Statuses,
+        changes: &mut Changes,
+        sink: &mut impl Sink,
+    ) -> Outcome {
         let mut out = Outcome::default();
         let mut prefix = true;
         for n in 0..self.pending.len() {
             let p = self.pending[n];
+            if p.status.k >= limit {
+                break;
+            }
             // The supervisor may have moved it.
             let mut cur = statuses.get(p.status.k).unwrap_or(p.status);
             loop {

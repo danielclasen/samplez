@@ -6,14 +6,15 @@
 
 mod harness;
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{BLOCK, Options, Set};
+use harness::{BLOCK, Clock, FakeAudio, Options, RATE, Set};
 use samplez::blocks::{Cause, Kind, PAGE, Range, Standing};
-use samplez_replica::contact::{Timing, index_at};
+use samplez_replica::contact::{Audio, Timing, index_at};
 use samplez_replica::entry::NodeId;
 use samplez_replica::membership::{Slot, node_id, slot_of};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 fn timing() -> Timing {
     Timing::defaults(BLOCK)
@@ -143,6 +144,34 @@ fn withdrawals(set: &Set, id: NodeId) -> u64 {
 /// Two degraded replicas with equal digests both commit through, and
 /// none withdraws; with different digests only the top-ranked commits,
 /// and the other withholds on its report.
+/// The fake decides a block as the engine does: a block the supervisor
+/// withheld on a later output alone before it was computed withdraws the
+/// replica on every output before output 0 decides it, so output 0 does
+/// not commit it.
+#[tokio::test(start_paused = true)]
+async fn the_fake_withdraws_every_output_before_it_decides_a_block_withheld_on_a_later_one() {
+    let clock = Arc::new(Clock::new(Instant::now()));
+    // Virtual time is paused: the clock moves only as the test moves it.
+    let to = |blocks: u64| clock.set_tai_offset((blocks * BLOCK * 1_000_000_000 / RATE) as i64);
+    to(0);
+    let audio = FakeAudio::new(clock.clone(), timing(), 2, false);
+    audio.fence(u64::MAX);
+    audio.commit_all();
+    to(100);
+    audio.step();
+    let k = audio.due().unwrap() + 50;
+    assert_eq!(
+        audio.status_of(0, k - 51).map(|s| s.kind),
+        Some(Kind::Committed)
+    );
+    let st = audio.withhold(1, k, Cause::FenceDeadline).unwrap();
+    assert_eq!(st.kind, Kind::Withheld);
+    to(200);
+    audio.step();
+    let st = audio.status_of(0, k).unwrap();
+    assert_ne!(st.kind, Kind::Committed, "{st:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn equal_digests_commit_together_and_different_ones_once() {
     let set = start(vec![a(0), a(1), witness()]).await;
