@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.1](https://github.com/danielclasen/samplez/compare/v0.8.0...v0.8.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* **engine:** look up input flows off the supervisor ([#92](https://github.com/danielclasen/samplez/issues/92)) ([41960aa](https://github.com/danielclasen/samplez/commit/41960aa2e4d93008366a6a53d79b47e56c43e715))
+* **replica:** count only enabled outputs when a replica writes nothing ([#98](https://github.com/danielclasen/samplez/issues/98)) ([6b42843](https://github.com/danielclasen/samplez/commit/6b428439b9edcbe5ce74b87a995b12fff9ed0a8b))
+* **replica:** replace a refused strip or duck setting alike everywhere ([b55f3d4](https://github.com/danielclasen/samplez/commit/b55f3d492753bc553dd17a1bc6fc021213b75d69))
+
 ## [0.8.0](https://github.com/danielclasen/samplez/compare/v0.7.0...v0.8.0) (2026-11-18)
 
 
