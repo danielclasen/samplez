@@ -749,6 +749,47 @@ fn a_long_missing_flow_is_looked_up_at_the_backoff_pace() {
     );
 }
 
+static CHECKS: AtomicUsize = AtomicUsize::new(0);
+
+/// A lookup that answers at once, counted.
+fn counted_check(dir: &std::path::Path) -> bool {
+    CHECKS.fetch_add(1, Ordering::Relaxed);
+    dir.exists()
+}
+
+/// A head that stops on a flow that stays, such as a paused producer's,
+/// is checked at once and then at the gaps of the backoff, 100 ms
+/// doubling to 5 s, not at every other poll. Polls are 100 ms apart on
+/// the clock the backoff reads.
+#[test]
+fn a_stopped_head_is_checked_at_the_backoff_pace() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let poll = Instance::new(&api, &domain.0).unwrap();
+    let mut w = RawWriter::create(&api, &domain.0, &id, 1);
+    w.blocks(K0..K0 + 5);
+    let t0 = Instant::now();
+    let mut p = PolledFlow::looking_up_with(&poll, &id, counted_check).unwrap();
+    let until = t0 + Duration::from_secs(1);
+    while !matches!(p.poll_at(t0), Poll::Head(_)) {
+        assert!(Instant::now() < until, "not opened");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let before = CHECKS.load(Ordering::Relaxed);
+    for k in 1..=300 {
+        let polled = p.poll_at(t0 + Duration::from_millis(100 * k));
+        assert!(
+            matches!(polled, Poll::Head(h) if h == (K0 + 5) * B),
+            "{polled:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let checks = CHECKS.load(Ordering::Relaxed) - before;
+    // At 0.1, 0.3, 0.7, 1.5, 3.1, 6.3 s and then every 5 s or so.
+    assert!((8..=14).contains(&checks), "{checks} checks in 30 s");
+}
+
 /// A flow deleted while its poll reader is open is checked with libmxl
 /// only once a lookup found its directory: until a lookup answers, the
 /// stopped head is reported unchecked, without waiting; once the lookup

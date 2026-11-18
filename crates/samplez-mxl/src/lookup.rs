@@ -99,12 +99,25 @@ impl Lookup {
     }
 }
 
+/// What a [`Gate`] knows of a directory at its deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Found {
+    Yes,
+    No,
+    /// No lookup answered in time; one still runs.
+    Pending,
+}
+
+/// How long a [`Gate`] keeps a lookup's finding a directory, with no
+/// lookup since finding it missing.
+pub const KEEP_FOUND: Duration = Duration::from_secs(1);
+
 /// The directories one caller is about to open, looked up together: what
-/// the caller finds absent, or not yet answered, it leaves out, and a
-/// lookup not answered keeps running for its next call.
+/// the caller does not find, it leaves out, and a lookup not answered
+/// keeps running for its next call.
 pub struct Gate {
     look: Look,
-    lookups: HashMap<PathBuf, Lookup>,
+    lookups: HashMap<PathBuf, (Lookup, Option<Instant>)>,
 }
 
 impl Gate {
@@ -115,31 +128,49 @@ impl Gate {
         }
     }
 
-    /// Whether each of `dirs` was found; a directory named twice is looked
-    /// up once. Starts a lookup for each that has none running, and waits
-    /// for the answers until `wait` has passed. A lookup that answered
-    /// since an earlier call is started afresh, so an answer is never
-    /// older than the call.
-    pub fn found(&mut self, dirs: &[PathBuf], wait: Duration) -> Vec<bool> {
-        let until = Instant::now() + wait;
-        // Answered lookups of directories not asked for now are dropped.
-        self.lookups.retain(|_, l| {
-            let _ = l.answer();
-            l.running()
+    /// What is known of each of `dirs`; a directory named twice is looked
+    /// up and answered once. A directory a lookup found within
+    /// [`KEEP_FOUND`], and no lookup found missing since, is found at once;
+    /// a lookup is started for it all the same, so the next call has a
+    /// fresh answer. For any other, a lookup is started unless one runs,
+    /// and waited for until `wait` has passed.
+    pub fn found(&mut self, dirs: &[PathBuf], wait: Duration) -> Vec<Found> {
+        let now = Instant::now();
+        let until = now + wait;
+        let read = |entry: &mut (Lookup, Option<Instant>), answer: Option<bool>, at| match answer {
+            Some(true) => entry.1 = Some(at),
+            Some(false) => entry.1 = None,
+            None => {}
+        };
+        // Directories not asked for now are dropped once their lookup ended
+        // and what it found is no longer kept.
+        self.lookups.retain(|_, e| {
+            let answer = e.0.answer();
+            read(e, answer, now);
+            e.0.running() || e.1.is_some_and(|at| now.duration_since(at) < KEEP_FOUND)
         });
+        let mut found: HashMap<&PathBuf, Found> = HashMap::new();
         for dir in dirs {
             let look = self.look;
-            let l = (self.lookups)
+            let e = (self.lookups)
                 .entry(dir.clone())
-                .or_insert_with(|| Lookup::new(dir.clone(), look));
-            l.start();
+                .or_insert_with(|| (Lookup::new(dir.clone(), look), None));
+            e.0.start();
+            if e.1.is_some_and(|at| now.duration_since(at) < KEEP_FOUND) {
+                found.insert(dir, Found::Yes);
+            }
         }
-        let mut found: HashMap<&PathBuf, bool> = HashMap::new();
         dirs.iter()
             .map(|dir| {
                 *found.entry(dir).or_insert_with(|| {
-                    let l = self.lookups.get_mut(dir).expect("inserted above");
-                    l.answer_by(until) == Some(true)
+                    let e = self.lookups.get_mut(dir).expect("inserted above");
+                    let answer = e.0.answer_by(until);
+                    read(e, answer, Instant::now());
+                    match answer {
+                        Some(true) => Found::Yes,
+                        Some(false) => Found::No,
+                        None => Found::Pending,
+                    }
                 })
             })
             .collect()
@@ -173,6 +204,15 @@ impl Backoff {
     pub fn new(now: Instant) -> Backoff {
         Backoff {
             since: now,
+            gap: Duration::ZERO,
+            next: now,
+        }
+    }
+
+    /// Wanted at `now` with no grace: due at once, then with the gaps.
+    pub fn paced(now: Instant) -> Backoff {
+        Backoff {
+            since: now.checked_sub(GRACE).unwrap_or(now),
             gap: Duration::ZERO,
             next: now,
         }
@@ -234,16 +274,23 @@ mod tests {
         let dir = std::env::temp_dir();
         let mut gate = Gate::new(slow);
         let started = Instant::now();
-        assert_eq!(
-            gate.found(std::slice::from_ref(&dir), Duration::from_millis(20)),
-            [false]
-        );
+        let one = std::slice::from_ref(&dir);
+        assert_eq!(gate.found(one, Duration::from_millis(20)), [Found::Pending]);
         assert!(started.elapsed() < Duration::from_millis(200));
-        assert_eq!(
-            gate.found(std::slice::from_ref(&dir), Duration::from_secs(5)),
-            [true]
-        );
+        assert_eq!(gate.found(one, Duration::from_secs(5)), [Found::Yes]);
         assert!(started.elapsed() < Duration::from_millis(600), "one lookup");
+        // Kept for a second: found at once though the new lookup is slow.
+        let again = Instant::now();
+        assert_eq!(gate.found(one, Duration::from_millis(20)), [Found::Yes]);
+        assert!(again.elapsed() < Duration::from_millis(10));
+        std::thread::sleep(KEEP_FOUND);
+        assert_eq!(gate.found(one, Duration::from_millis(20)), [Found::Yes]);
+        // A finding as old as KEEP_FOUND is not kept.
+        let mut gate = Gate::new(slow);
+        assert_eq!(gate.found(one, Duration::from_secs(5)), [Found::Yes]);
+        std::thread::sleep(KEEP_FOUND);
+        assert_eq!(gate.found(one, Duration::from_millis(20)), [Found::Pending]);
+
         let mut fast = Gate::new(exists);
         let missing = dir.join("samplez-no-such-directory");
         // Two slots reading one flow name its directory twice.
@@ -252,7 +299,7 @@ mod tests {
                 &[dir.clone(), missing.clone(), dir, missing],
                 Duration::from_secs(5)
             ),
-            [true, false, true, false]
+            [Found::Yes, Found::No, Found::Yes, Found::No]
         );
     }
 }

@@ -830,6 +830,8 @@ pub struct PolledFlow {
     backoff: Backoff,
     /// The head the last poll read.
     head: Option<u64>,
+    /// When a stopped head is checked: at once, then at the backoff's gaps.
+    check: Backoff,
 }
 
 impl PolledFlow {
@@ -858,6 +860,7 @@ impl PolledFlow {
             lookup,
             backoff: Backoff::new(now),
             head: None,
+            check: Backoff::paced(now),
         })
     }
 
@@ -924,7 +927,8 @@ impl PolledFlow {
     /// `Absent` until then, with the status libmxl gives a missing flow.
     ///
     /// While the head moves, nothing else is checked. A head unchanged
-    /// since the last poll is checked with
+    /// since the last poll is checked, at once and then with the gaps of a
+    /// [`Backoff`] past its grace while it stays, with
     /// `mxlFlowReaderGetSamplesNonBlocking(head + 1, 1)`, which runs
     /// libmxl's validity check, once a lookup found the flow's directory
     /// still there; until it answers the head is reported unchecked. On
@@ -970,17 +974,23 @@ impl PolledFlow {
         if moved {
             // Not a check pending from an earlier stop.
             let _ = self.lookup.answer();
+            self.check = Backoff::paced(now);
             return Poll::Head(head);
         }
         let valid = match self.lookup.answer() {
             Some(true) => self.readers[0].probe(head) != MXL_ERR_FLOW_INVALID,
             Some(false) => false,
             None => {
-                self.lookup.start();
+                if self.check.due(now) {
+                    self.lookup.start();
+                }
                 return Poll::Head(head);
             }
         };
-        if !valid {
+        if valid {
+            // Checked again after a gap, while the head stays.
+            self.check.missing(now);
+        } else {
             self.readers.clear();
             self.head = None;
             self.backoff = Backoff::new(now);

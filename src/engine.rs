@@ -22,7 +22,7 @@ use samplez_dsp::{DuckParam, MAX_DUCKS, Matrix, PlanarBuffer, Started, StripPara
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, Recovery, Timing,
 };
-use samplez_mxl::lookup::{self, Gate};
+use samplez_mxl::lookup::{self, Found, Gate};
 use samplez_mxl::output::{self, Creation};
 use samplez_mxl::{Instance, MxlApi, time};
 
@@ -819,12 +819,12 @@ fn build_time_samples(p9999_ns: Option<u64>) -> u64 {
     (u128::from(ns) * samplez_mxl::SAMPLE_RATE as u128).div_ceil(1_000_000_000) as u64
 }
 
-/// A flow a lookup did not find within [`GATE_WAIT`], as libmxl reports a
-/// missing flow.
-fn not_found() -> samplez_mxl::Error {
-    samplez_mxl::Error::Mxl {
-        call: "mxlCreateFlowReader",
-        status: mxl_sys::MXL_ERR_FLOW_NOT_FOUND,
+/// Why flow `flow_id` was not opened: its lookup found no directory, or
+/// gave no answer within [`GATE_WAIT`].
+fn unopened(flow_id: &str, found: Found) -> String {
+    match found {
+        Found::Pending => format!("flow {flow_id}: its lookup did not answer within {GATE_WAIT:?}"),
+        _ => format!("flow {flow_id} not found"),
     }
 }
 
@@ -1526,7 +1526,8 @@ impl Engine {
             reroute: vec![0; in_domains.len()],
             product: None,
             pollers: (0..in_domains.len()).map(|_| None).collect(),
-            gate: Gate::new(lookup::exists),
+            gate: Gate::new(config.look),
+            out_gate: Gate::new(config.look),
             poll_errors: vec![None; in_domains.len()],
             rebuild_errors: vec![None; in_domains.len()],
             outs: (0..config.outputs.len())
@@ -1591,6 +1592,7 @@ impl Engine {
                 return Err(Error::Thread(format!("spawning the supervisor: {e}")));
             }
         };
+        let replay_gate = Mutex::new(Gate::new(config.look));
         Ok(Engine {
             stop,
             supervisor: Some(supervisor),
@@ -1608,7 +1610,7 @@ impl Engine {
             config,
             replica,
             transfer,
-            replay_gate: Mutex::new(Gate::new(lookup::exists)),
+            replay_gate,
         })
     }
 
@@ -2494,11 +2496,11 @@ impl Engine {
             })
             .collect();
         let dirs: Vec<PathBuf> = attached.iter().map(|a| a.0.clone()).collect();
-        let found = (self.replay_gate.lock().expect("replay gate lock")).found(&dirs, GATE_WAIT);
-        if let Some(((_, id), _)) = attached.iter().zip(&found).find(|(_, f)| !**f) {
-            return Err(ReplayError::Attach(format!(
-                "flow {id} not found within {GATE_WAIT:?}"
-            )));
+        let found = (self.replay_gate.lock())
+            .unwrap_or_else(|e| e.into_inner())
+            .found(&dirs, GATE_WAIT);
+        if let Some(((_, id), f)) = attached.iter().zip(&found).find(|(_, f)| **f != Found::Yes) {
+            return Err(ReplayError::Attach(unopened(id, *f)));
         }
         let mut gens = Vec::with_capacity(in_domains.len());
         for (d, &domain) in in_domains.iter().enumerate() {
@@ -3182,6 +3184,8 @@ struct Supervisor {
     pollers: Vec<Option<Pollers>>,
     /// The lookups of the flows a generation build attaches.
     gate: Gate,
+    /// The lookups of the output flows about to be created.
+    out_gate: Gate,
     /// The last failure to create each input domain's poll instance and
     /// generation, logged once per change of its text.
     poll_errors: Vec<Option<String>>,
@@ -3586,7 +3590,7 @@ impl Supervisor {
             f.hold();
             f.want();
         } else {
-            match PolledFlow::new(&p.instance, &id) {
+            match PolledFlow::looking_up_with(&p.instance, &id, self.config.look) {
                 Ok(f) => {
                     p.flows.insert(id, f);
                 }
@@ -3777,14 +3781,11 @@ impl Supervisor {
         for (slot, outgoing, attach) in plan {
             let cfg = &self.config.inputs[slot];
             if let Some(old) = outgoing {
-                let result = if found.next() == Some(true) {
-                    generation.attach_outgoing(
-                        slot,
-                        &self.config.input_config(cfg, &old),
-                        &self.timing,
-                    )
-                } else {
-                    Err(not_found())
+                let result = match found.next() {
+                    Some(Found::Yes) => generation
+                        .attach_outgoing(slot, &self.config.input_config(cfg, &old), &self.timing)
+                        .map_err(|e| e.to_string()),
+                    f => Err(unopened(&old, f.unwrap_or(Found::No))),
                 };
                 if let Err(e) = result {
                     log(format_args!("input {}: flow {old} left: {e}", cfg.name));
@@ -3793,10 +3794,11 @@ impl Supervisor {
             let Some(flow_id) = attach else {
                 continue;
             };
-            let result = if found.next() == Some(true) {
-                generation.attach(slot, &self.config.input_config(cfg, &flow_id), &self.timing)
-            } else {
-                Err(not_found())
+            let result = match found.next() {
+                Some(Found::Yes) => generation
+                    .attach(slot, &self.config.input_config(cfg, &flow_id), &self.timing)
+                    .map_err(|e| e.to_string()),
+                f => Err(unopened(&flow_id, f.unwrap_or(Found::No))),
             };
             match result {
                 Ok(short) => {
@@ -3817,9 +3819,8 @@ impl Supervisor {
                     st.inputs[slot].error = None;
                     st.inputs[slot].margin_short = short;
                 }
-                Err(e) => {
+                Err(message) => {
                     complete = false;
-                    let message = e.to_string();
                     log(format_args!("input {} not attached: {message}", cfg.name));
                     self.status().inputs[slot].error = Some(message);
                 }
@@ -4333,7 +4334,16 @@ impl Supervisor {
                 batch: self.batch,
                 ..self.config.output_config(cfg)
             };
-            let result = output::create(instance, &oc);
+            // A flow whose directory is not found, or not yet, is created
+            // without libmxl's check for a live writer, which looks the
+            // missing name up and on a file system that waits for it would
+            // hold the supervisor; a flow there meanwhile is opened, not
+            // created, and reported raced.
+            let dir = lookup::flow_dir(&self.config.domains[d].path, oc.flow_id);
+            let result = match self.out_gate.found(std::slice::from_ref(&dir), GATE_WAIT)[..] {
+                [Found::Yes] => output::create(instance, &oc),
+                _ => output::create_new(instance, &oc),
+            };
             let mut st = self.status.lock().expect("status lock");
             let s = &mut st.outputs[o];
             s.attempts += 1;

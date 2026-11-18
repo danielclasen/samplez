@@ -94,6 +94,15 @@ pub struct Config {
     pub duck_columns: Vec<usize>,
     #[serde(default)]
     pub rt: Rt,
+    /// How the engine looks a flow's directory up before libmxl opens the
+    /// flow; tests replace it.
+    #[doc(hidden)]
+    #[serde(skip, default = "default_look")]
+    pub look: samplez_mxl::lookup::Look,
+}
+
+fn default_look() -> samplez_mxl::lookup::Look {
+    samplez_mxl::lookup::exists
 }
 
 #[derive(Clone, Debug, Deserialize)]

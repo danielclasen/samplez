@@ -3,9 +3,10 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{
     B, Domain, Pilot, copy_core as copy, new_id, processed, start_held, start_held_with, wait_for,
@@ -19,6 +20,55 @@ use samplez::{
 use samplez_dsp::{
     BandType, CompParams, DetectorParams, DuckMode, EqBand, GateParams, Ramp, StripParam,
 };
+
+/// Flow ids whose lookup [`slow_look`] makes wait.
+static SLOW: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The engine's lookup of a flow's directory, waiting 500 ms first for a
+/// flow [`SLOW`] names, as a file system does that waits for a name.
+fn slow_look(dir: &std::path::Path) -> bool {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if SLOW
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|id| name.starts_with(id.as_str()))
+    {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    samplez_mxl::lookup::exists(dir)
+}
+
+/// A replay opens no input flow its lookup has not found: one whose
+/// lookup does not answer within the replay's wait fails the replay at
+/// once, saying so, instead of libmxl's open waiting on a file system that
+/// waits for a missing name.
+#[test]
+fn a_replay_fails_at_once_on_a_flow_its_lookup_has_not_found() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let a = hashed(&domain, &src);
+    let b = hashed_of(&domain, &[(&src, 2)], |c| c.look = slow_look);
+    wait_for(Duration::from_secs(5), "both read the input", || {
+        [&a.e, &b.e]
+            .iter()
+            .all(|e| e.status().inputs[0].state == InputState::Attached && processed(e) > 0)
+    });
+    let copy = copy(&a.e);
+    SLOW.lock().unwrap().push(src.clone());
+    let started = Instant::now();
+    match b.e.replay(copy) {
+        Err(ReplayError::Attach(m)) => assert!(m.contains("did not answer"), "{m}"),
+        Err(e) => panic!("{e:?}"),
+        Ok(_) => panic!("replayed over a flow its lookup has not found"),
+    }
+    let failed = started.elapsed();
+    assert!(
+        failed < Duration::from_millis(250),
+        "failed after {failed:?}"
+    );
+}
 
 /// The copy holds the state after block k0: entries due by then applied
 /// with their ramps run out, later ones pending, the input's log state,

@@ -113,6 +113,21 @@ pub fn create(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
     create_writer(instance, c, def, collected)
 }
 
+/// Supervisor side. [`create`] for a flow whose directory a lookup did not
+/// find: `mxlCreateFlowWriter` without `mxlIsFlowActive` first, which
+/// would look the missing name up again. A flow created meanwhile is
+/// opened, not created: [`Creation::Raced`].
+pub fn create_new(instance: &Arc<Instance>, c: &OutputConfig) -> Result<Creation> {
+    let def = flow_definition(c)?;
+    if c.block == 0 || c.batch < c.block {
+        return Err(Error::Format(format!(
+            "output {}: block size 0, or a batch below it",
+            c.flow_id
+        )));
+    }
+    create_writer(instance, c, def, false)
+}
+
 /// `mxlCreateFlowWriter` with both batch size hints at B. libmxl wakes
 /// readers waiting in a synchronization group once per sync batch, so
 /// hints at a larger batch would leave the blocks committed one by one
