@@ -489,7 +489,7 @@ impl<P> Store<P> {
         &self,
         after: u64,
         up_to: u64,
-        mut f: impl FnMut(u64, &crate::state_machine::Record),
+        mut f: impl FnMut(u64, &Arc<crate::state_machine::Record>),
     ) -> bool {
         let inner = self.lock();
         if after < up_to {

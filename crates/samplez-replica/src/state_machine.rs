@@ -295,8 +295,9 @@ pub struct StateMachine<P> {
     /// an engine only.
     image: Option<samplez::Targets>,
     /// Not replicated: the records derived since start or load, by log
-    /// index, kept [`RECORDS_KEPT`] past their index.
-    pub records: BTreeMap<u64, Record>,
+    /// index, kept [`RECORDS_KEPT`] past their index; shared, so a reader
+    /// under the store lock copies none of a record's entries.
+    pub records: BTreeMap<u64, std::sync::Arc<Record>>,
     /// Not replicated: `records` holds the record of every entry after
     /// this log index that derived one: the index a snapshot was loaded
     /// at, or the last whose record retention dropped. The floor makes
@@ -426,14 +427,12 @@ impl<P: Product> StateMachine<P> {
         {
             self.derived.insert(revision, routed);
         }
-        self.records.insert(
-            revision,
-            Record {
-                at_index: at,
-                entries,
-                generation,
-            },
-        );
+        let record = Record {
+            at_index: at,
+            entries,
+            generation,
+        };
+        self.records.insert(revision, std::sync::Arc::new(record));
     }
 
     /// Applies the request of the entry at log index `revision`, of term
@@ -1054,7 +1053,7 @@ pub(crate) mod tests {
         };
         sm.apply(1, &down);
         assert_eq!(
-            sm.records[&1],
+            *sm.records[&1],
             Record {
                 at_index: 960,
                 entries: vec![samplez::Entry::InputDown { slot: 0 }],

@@ -287,7 +287,7 @@ async fn x_stopped_while_r_starts_after_a_snapshot_install() {
 fn the_fake_replay_reads_its_source_without_its_lock() {
     struct Probe(Arc<FakeAudio>);
     impl Source for Probe {
-        fn entries(&self, _after: u64) -> Result<Vec<(u64, Record)>, Missed> {
+        fn entries(&self, _after: u64) -> Result<Vec<(u64, Arc<Record>)>, Missed> {
             assert!(
                 self.0.state.try_lock().is_ok(),
                 "entries read under the lock"

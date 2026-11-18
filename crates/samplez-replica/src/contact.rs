@@ -325,11 +325,10 @@ pub trait LogView: Send + Sync + 'static {
         self.log_id_at(index).map(|id| id.term)
     }
     /// Calls `f` with the log index and record of every applied entry
-    /// after `after` up to `up_to` that derived engine entries.
+    /// after `after` up to `up_to` that derived engine entries, shared,
+    /// so taking one costs no copy of its entries under the store lock.
     /// False when a record after `after` is no longer held.
-    fn records(&self, _after: u64, _up_to: u64, _f: &mut dyn FnMut(u64, &Record)) -> bool {
-        true
-    }
+    fn records(&self, after: u64, up_to: u64, f: &mut dyn FnMut(u64, &Arc<Record>)) -> bool;
     /// The log index after which every applied entry's record is held
     /// ([`crate::state_machine::StateMachine::records_from`]).
     fn records_from(&self) -> u64 {
@@ -408,7 +407,7 @@ impl<P: Product> LogView for Store<P> {
     fn term_at(&self, index: u64) -> Option<u64> {
         Store::term_at(self, index)
     }
-    fn records(&self, after: u64, up_to: u64, f: &mut dyn FnMut(u64, &Record)) -> bool {
+    fn records(&self, after: u64, up_to: u64, f: &mut dyn FnMut(u64, &Arc<Record>)) -> bool {
         Store::records(self, after, up_to, f)
     }
     fn records_from(&self) -> u64 {
@@ -1636,7 +1635,7 @@ impl Contact {
         };
         let mut records = Vec::new();
         let whole = self.log.records(from, up_to, &mut |index, record| {
-            records.push((index, record.at_index, record.entries.clone()));
+            records.push((index, Arc::clone(record)));
         });
         if !whole {
             // Records this replica derived went before they were handed:
@@ -2763,11 +2762,11 @@ impl Contact {
 
     /// The records of the entries applied after index `after`, for a
     /// resync's replay; [`Missed`] when one is no longer held.
-    pub fn replay_entries(&self, after: u64) -> Result<Vec<(u64, Record)>, Missed> {
+    pub fn replay_entries(&self, after: u64) -> Result<Vec<(u64, Arc<Record>)>, Missed> {
         let applied = self.log.applied();
         let mut out = Vec::new();
         let whole = self.log.records(after, applied, &mut |index, record| {
-            out.push((index, record.clone()));
+            out.push((index, Arc::clone(record)));
         });
         if whole { Ok(out) } else { Err(Missed) }
     }
@@ -2990,7 +2989,7 @@ struct Feed {
 }
 
 impl Source for Feed {
-    fn entries(&self, after: u64) -> Result<Vec<(u64, Record)>, Missed> {
+    fn entries(&self, after: u64) -> Result<Vec<(u64, Arc<Record>)>, Missed> {
         self.contact.replay_entries(after)
     }
 
@@ -3065,10 +3064,13 @@ mod tests {
         /// [`LogView::pending_generation`].
         generation: Option<u64>,
         /// Records by log index, read up to the applied index.
-        records: BTreeMap<u64, Record>,
+        records: BTreeMap<u64, Arc<Record>>,
         records_from: u64,
         /// The floor of the applied state.
         floor: u64,
+        /// The applied index and floor an apply sets right after the next
+        /// read of the applied index.
+        apply_after_read: Option<(u64, u64)>,
     }
 
     #[derive(Default)]
@@ -3093,7 +3095,7 @@ mod tests {
                     entries,
                     generation: false,
                 };
-                log.records.insert(index, record);
+                log.records.insert(index, Arc::new(record));
             }
         }
     }
@@ -3143,7 +3145,7 @@ mod tests {
         fn pending_generation(&self) -> Option<u64> {
             self.0.lock().unwrap().generation
         }
-        fn records(&self, after: u64, up_to: u64, f: &mut dyn FnMut(u64, &Record)) -> bool {
+        fn records(&self, after: u64, up_to: u64, f: &mut dyn FnMut(u64, &Arc<Record>)) -> bool {
             let log = self.0.lock().unwrap();
             if after < up_to {
                 for (index, record) in log.records.range(after + 1..=up_to) {
@@ -3668,7 +3670,7 @@ mod tests {
             entries: vec![Entry::InputDown { slot: 0 }],
             generation: false,
         };
-        f.log.0.lock().unwrap().records.insert(2, record.clone());
+        (f.log.0.lock().unwrap().records).insert(2, Arc::new(record.clone()));
         f.contact.log_changed();
         f.engine.calls();
         f.tick();
@@ -3865,7 +3867,7 @@ mod tests {
                     }],
                     generation: false,
                 };
-                log.records.insert(index, record);
+                log.records.insert(index, Arc::new(record));
             }
         }
         assert_eq!(f.contact.stamp(false), Err(StampRefusal::FutureListFull));

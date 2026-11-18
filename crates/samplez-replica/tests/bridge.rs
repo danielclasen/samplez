@@ -437,7 +437,7 @@ struct Feed {
 }
 
 impl Source for Feed {
-    fn entries(&self, _after: u64) -> Result<Vec<(u64, Record)>, Missed> {
+    fn entries(&self, _after: u64) -> Result<Vec<(u64, Arc<Record>)>, Missed> {
         if self.missed {
             Err(Missed)
         } else {
@@ -606,8 +606,11 @@ fn undisturbed(scenario: impl Fn() -> Result<(), String>) {
 struct Log(Vec<(u64, Record)>);
 
 impl Source for Log {
-    fn entries(&self, after: u64) -> Result<Vec<(u64, Record)>, Missed> {
-        Ok(self.0.iter().filter(|(i, _)| *i > after).cloned().collect())
+    fn entries(&self, after: u64) -> Result<Vec<(u64, Arc<Record>)>, Missed> {
+        Ok((self.0.iter())
+            .filter(|(i, _)| *i > after)
+            .map(|(i, r)| (*i, Arc::new(r.clone())))
+            .collect())
     }
     fn go(&self) -> bool {
         true

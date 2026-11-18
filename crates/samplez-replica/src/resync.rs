@@ -6,6 +6,7 @@
 //! a failed attempt leaves it diverged, and it tries again with a newer
 //! core.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -49,7 +50,7 @@ pub trait Source: Send + Sync {
     /// The records of the entries applied after log index `after`, in
     /// log order, with their log index; [`Missed`] when one is no longer
     /// held.
-    fn entries(&self, after: u64) -> Result<Vec<(u64, Record)>, Missed>;
+    fn entries(&self, after: u64) -> Result<Vec<(u64, Arc<Record>)>, Missed>;
     /// Whether the hand-over may still happen: false once the replica
     /// left `resync` or the attempt was given up.
     fn go(&self) -> bool;
