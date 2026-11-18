@@ -179,7 +179,59 @@ pub(crate) fn within(
     }
 }
 
+/// The gate a refused gate setting is replaced with: off, every value at
+/// the low end of its range.
+pub const GATE_OFF: GateParams = GateParams {
+    enabled: false,
+    threshold_db: *GATE_THRESHOLD_DB.start(),
+    range_db: *GATE_RANGE_DB.start(),
+    attack_ms: *ATTACK_MS.start(),
+    release_ms: *RELEASE_MS.start(),
+};
+
+/// The compressor a refused compressor setting is replaced with: off,
+/// every value at the low end of its range.
+pub const COMP_OFF: CompParams = CompParams {
+    enabled: false,
+    threshold_db: *COMP_THRESHOLD_DB.start(),
+    ratio: *COMP_RATIO.start(),
+    attack_ms: *ATTACK_MS.start(),
+    release_ms: *RELEASE_MS.start(),
+    knee_db: *COMP_KNEE_DB.start(),
+    makeup_db: *MAKEUP_DB.start(),
+};
+
 impl StripParam {
+    /// The parameter of the same key, leg or band at the value that
+    /// changes nothing a strip passes: trims at 0 dB, no inversion, the
+    /// high-pass and equaliser off, a band at its default, the gate and
+    /// compressor off ([`GATE_OFF`], [`COMP_OFF`]), dynamics after the
+    /// equaliser. What a refused parameter is replaced with, so a strip
+    /// that held another value and one that held none end up alike. A
+    /// leg or band the strip lacks stays refused.
+    pub fn neutral(&self) -> StripParam {
+        match *self {
+            StripParam::Trim { .. } => StripParam::Trim { db: 0.0 },
+            StripParam::LegTrim { leg, .. } => StripParam::LegTrim { leg, db: 0.0 },
+            StripParam::Polarity { leg, .. } => StripParam::Polarity {
+                leg,
+                inverted: false,
+            },
+            StripParam::Hpf { .. } => StripParam::Hpf {
+                enabled: false,
+                freq: 80.0,
+            },
+            StripParam::Eq { .. } => StripParam::Eq { enabled: false },
+            StripParam::EqBand { band, value } => StripParam::EqBand {
+                band,
+                value: DEFAULT_BANDS.get(band).copied().unwrap_or(value),
+            },
+            StripParam::Gate(_) => StripParam::Gate(GATE_OFF),
+            StripParam::Comp(_) => StripParam::Comp(COMP_OFF),
+            StripParam::DynamicsBeforeEq { .. } => StripParam::DynamicsBeforeEq { enabled: false },
+        }
+    }
+
     /// Whether a strip of `legs` legs takes the parameter: legs and bands
     /// that exist, values within their ranges, no NaN.
     pub fn check(&self, legs: usize) -> Result<(), String> {
@@ -700,6 +752,65 @@ mod tests {
     use super::*;
     use crate::svf::tests::{measure, reference};
     use crate::svf::{Coefficients, coefficients};
+
+    /// Every parameter a strip refuses for its value has a neutral form
+    /// of the same key that it takes.
+    #[test]
+    fn a_refused_parameter_has_a_neutral_form_a_strip_takes() {
+        let nan = f32::NAN;
+        let band = EqBand {
+            kind: BandType::Peak,
+            freq: nan,
+            gain_db: 0.0,
+            q: 1.0,
+        };
+        let refused = [
+            StripParam::Trim { db: nan },
+            StripParam::LegTrim { leg: 1, db: 99.0 },
+            StripParam::Polarity {
+                leg: 1,
+                inverted: true,
+            },
+            StripParam::Hpf {
+                enabled: true,
+                freq: 1.0,
+            },
+            StripParam::Eq { enabled: true },
+            StripParam::EqBand {
+                band: 2,
+                value: band,
+            },
+            StripParam::Gate(GateParams {
+                threshold_db: nan,
+                ..GATE_OFF
+            }),
+            StripParam::Comp(CompParams {
+                ratio: 0.0,
+                ..COMP_OFF
+            }),
+            StripParam::DynamicsBeforeEq { enabled: true },
+        ];
+        for param in refused {
+            let neutral = param.neutral();
+            assert_eq!(neutral.check(2), Ok(()), "{param:?} -> {neutral:?}");
+            let same = core::mem::discriminant(&neutral) == core::mem::discriminant(&param);
+            assert!(same, "{param:?} -> {neutral:?}");
+        }
+        assert_eq!(
+            StripParam::EqBand {
+                band: 2,
+                value: band
+            }
+            .neutral(),
+            StripParam::EqBand {
+                band: 2,
+                value: DEFAULT_BANDS[2]
+            }
+        );
+        // A leg or band the strip lacks stays refused.
+        let missing = StripParam::LegTrim { leg: 3, db: 0.0 }.neutral();
+        assert!(missing.check(2).is_err());
+    }
 
     const RAMP: u32 = 480;
     const GATE: GateParams = GateParams {

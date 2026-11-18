@@ -150,11 +150,21 @@ impl EngineAudio {
     }
 
     /// The entries of entry `index`'s record the engine takes
-    /// ([`EngineAudio::kept`]). What is left out is counted and logged:
-    /// the product derived what it must not.
+    /// ([`EngineAudio::kept`]), a strip parameter, duck setting or duck
+    /// mask it refuses replaced first ([`EngineAudio::admitted`]). What is
+    /// replaced or left out is counted and logged: the product derived
+    /// what it must not.
     fn filter(&self, index: u64, entries: &[Entry]) -> Vec<Entry> {
-        let kept = self.kept(entries);
-        let dropped = (entries.len() - kept.len()) as u64;
+        let mut replaced = 0;
+        let admitted: Vec<Entry> = (entries.iter())
+            .filter_map(|e| {
+                let a = self.admitted(e);
+                replaced += usize::from(a.as_ref() != Some(e));
+                a
+            })
+            .collect();
+        let kept = self.kept(&admitted);
+        let dropped = (replaced + admitted.len() - kept.len()) as u64;
         if dropped > 0 {
             self.filtered.fetch_add(dropped, Ordering::Relaxed);
             tracing::error!(
@@ -205,15 +215,50 @@ impl EngineAudio {
         kept
     }
 
+    /// `entry`, or, for a strip parameter, duck setting or duck mask the
+    /// engine refuses alone, its neutral form ([`samplez_dsp::StripParam::neutral`],
+    /// [`DuckSetting::neutral`], mask 0) when the engine takes that; none
+    /// when it takes neither. Every other entry as given. The live filter
+    /// and the rebuild's state both go through it, so a replica that held
+    /// a value before the refused one and one rebuilt without it hold
+    /// the same; the engine's configuration alone decides it, the same on
+    /// every replica of a key.
+    fn admitted(&self, entry: &Entry) -> Option<Entry> {
+        let neutral = match entry {
+            Entry::Strip { slot, param } => Entry::Strip {
+                slot: *slot,
+                param: param.neutral(),
+            },
+            Entry::Duck { group, setting } => Entry::Duck {
+                group: *group,
+                setting: setting.neutral(),
+            },
+            &Entry::DuckMask { input, output, .. } => Entry::DuckMask {
+                input,
+                output,
+                mask: 0,
+            },
+            _ => return Some(entry.clone()),
+        };
+        let takes = |e: &Entry| self.engine.admits(std::slice::from_ref(e)).is_ok();
+        if takes(entry) {
+            Some(entry.clone())
+        } else {
+            takes(&neutral).then_some(neutral)
+        }
+    }
+
     /// `state` as the records the bridge filters leave an engine: a flow
     /// differing from the one its input reads is a re-route, a detached
     /// input reading none and a slot without a flow detached, kept by the
     /// rules of [`EngineAudio::kept`] and else left at the one read; a
-    /// strip parameter the engine refuses is not set; a gain it refuses
-    /// is silenced, as the state machine derives it for every replica
+    /// strip parameter, duck setting or duck mask the engine refuses is
+    /// replaced as the live filter replaces it ([`EngineAudio::admitted`])
+    /// or left out; a gain it refuses is silenced, as the state machine
+    /// derives it for every replica
     /// ([`crate::state_machine::StateMachine::product_state`] holds none).
     /// A replica rebuilt from it holds what a live one that read the same
-    /// flows holds, flows, strips and gains alike.
+    /// flows holds, flows, strips, gains and ducks alike.
     fn sanitised(&self, state: &ProductState) -> ProductState {
         let mut state = state.clone();
         let reading: Vec<Option<String>> = (self.engine.status().inputs.into_iter())
@@ -239,9 +284,17 @@ impl EngineAudio {
             }
         }
         for (slot, params) in state.strips.iter_mut().enumerate() {
-            let before = params.len();
-            params.retain(|&param| self.engine.admits(&[Entry::Strip { slot, param }]).is_ok());
-            dropped += before - params.len();
+            let mut kept = Vec::with_capacity(params.len());
+            for &param in params.iter() {
+                match self.admitted(&Entry::Strip { slot, param }) {
+                    Some(Entry::Strip { param: p, .. }) => {
+                        dropped += usize::from(p != param);
+                        kept.push(p);
+                    }
+                    _ => dropped += 1,
+                }
+            }
+            *params = kept;
         }
         for gain in state.gains.iter_mut().flatten() {
             if !samplez_dsp::valid_gain(*gain) {
@@ -249,30 +302,53 @@ impl EngineAudio {
                 dropped += 1;
             }
         }
-        // A duck setting the engine refuses is left at what no entry set,
-        // as a refused entry leaves it; a group beyond the engine's is
-        // left out.
-        let admits = |group: usize, setting: DuckSetting| {
-            self.engine
-                .admits(&[Entry::Duck { group, setting }])
-                .is_ok()
+        // A duck setting or mask the engine refuses is replaced as the
+        // live filter replaces it, or left at what no entry set where the
+        // engine takes neither; a group beyond the engine's is left out.
+        let duck = |group: usize, setting: DuckSetting| match self
+            .admitted(&Entry::Duck { group, setting })
+        {
+            Some(Entry::Duck { setting, .. }) => Some(setting),
+            _ => None,
         };
         dropped += state.ducks.len().saturating_sub(samplez_dsp::MAX_DUCKS);
         state.ducks.truncate(samplez_dsp::MAX_DUCKS);
         for (group, d) in state.ducks.iter_mut().enumerate() {
             let default = samplez::DuckTargets::default();
-            if !admits(group, DuckSetting::Detector(Box::new(d.params))) {
-                d.params = default.params;
-                dropped += 1;
+            match duck(group, DuckSetting::Detector(Box::new(d.params))) {
+                Some(DuckSetting::Detector(p)) if *p == d.params => {}
+                Some(DuckSetting::Detector(p)) => {
+                    d.params = *p;
+                    dropped += 1;
+                }
+                _ => {
+                    d.params = default.params;
+                    dropped += 1;
+                }
             }
-            if !admits(group, DuckSetting::Keys(d.keys.clone())) {
-                d.keys = default.keys;
-                dropped += 1;
+            match duck(group, DuckSetting::Keys(d.keys.clone())) {
+                Some(DuckSetting::Keys(k)) if k == d.keys => {}
+                Some(DuckSetting::Keys(k)) => {
+                    d.keys = k;
+                    dropped += 1;
+                }
+                _ => {
+                    d.keys = default.keys;
+                    dropped += 1;
+                }
             }
             for (slot, db) in d.depths.iter_mut().enumerate() {
-                if !admits(group, DuckSetting::Depth { slot, db: *db }) {
-                    *db = 0.0;
-                    dropped += 1;
+                match duck(group, DuckSetting::Depth { slot, db: *db }) {
+                    Some(DuckSetting::Depth { db: kept, .. }) if kept.to_bits() == db.to_bits() => {
+                    }
+                    Some(DuckSetting::Depth { db: kept, .. }) => {
+                        *db = kept;
+                        dropped += 1;
+                    }
+                    _ => {
+                        *db = 0.0;
+                        dropped += 1;
+                    }
                 }
             }
         }
@@ -283,7 +359,7 @@ impl EngineAudio {
                     output,
                     mask: *mask,
                 };
-                if *mask != 0 && self.engine.admits(&[entry]).is_err() {
+                if *mask != 0 && self.admitted(&entry) != Some(entry) {
                     *mask = 0;
                     dropped += 1;
                 }

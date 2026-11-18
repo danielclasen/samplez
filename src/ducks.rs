@@ -41,6 +41,22 @@ pub enum DuckSetting {
     Depth { slot: usize, db: f32 },
 }
 
+impl DuckSetting {
+    /// The setting of the same kind and slot at the value a group holds
+    /// before any entry sets one: the default detector, no key, a depth
+    /// of 0 dB; a mode or hold as given. What a refused setting is
+    /// replaced with, so a group that held another value and one that
+    /// held none end up alike.
+    pub fn neutral(&self) -> DuckSetting {
+        match *self {
+            DuckSetting::Detector(_) => DuckSetting::Detector(Box::new(DetectorParams::DEFAULT)),
+            DuckSetting::Keys(_) => DuckSetting::Keys(Vec::new()),
+            DuckSetting::Depth { slot, .. } => DuckSetting::Depth { slot, db: 0.0 },
+            ref other => other.clone(),
+        }
+    }
+}
+
 /// A duck group's targets as values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DuckTargets {
