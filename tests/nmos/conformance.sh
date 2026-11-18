@@ -2,8 +2,11 @@
 # Runs the AMWA nmos-testing node suites against the samplez-nmos example
 # node: IS-04-01 with unicast and with multicast DNS-SD, IS-05-01 and
 # BCP-007-03-01, each against a freshly started node, on one Docker bridge.
-# Writes each suite's JSON results and the node's log to <out>, fails when
-# a restart changed a resource id, and leaves the verdict to gate.py.
+# Writes each suite's JSON results, the tool's and the node's log to <out>,
+# fails when a restart changed a resource id or the tool cloned or pulled a
+# specification repository, and leaves the verdict to gate.py. The tool
+# validates against the specification commits pinned in specs.txt, which
+# spec-cache.sh puts into its cache.
 #
 # usage: tests/nmos/conformance.sh <node binary> <node image> <tool image> <out>
 #
@@ -12,12 +15,14 @@
 # node reads CLOCK_TAI, the tool computes TAI from UTC.
 set -euo pipefail
 
+here=$(cd "$(dirname "$0")" && pwd)
 node_bin=$(realpath "$1")
 node_image=$2
 tool_image=$3
 out=$(mkdir -p "$4" && realpath "$4")
 tag=nmos-$$
 net=$tag
+specs=$tag-specs
 # Documentation addresses: a bridge in TEST-NET-2, since the tool's DNS
 # zone uses TEST-NET-1 for its unreachable registry.
 subnet=198.51.100.0/24
@@ -34,10 +39,15 @@ fi
 cleanup() {
   docker rm -f "$tag-node" "$tag-tool" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
+  docker volume rm "$specs" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 docker network create --subnet "$subnet" "$net" >/dev/null
-docker volume create nmos-testing-specs >/dev/null
+# Filled in the tool's image, as the user the tool runs as, so its git
+# owns what it reads.
+docker volume create "$specs" >/dev/null
+docker run --rm -v "$specs:/cache" -v "$here:/nmos:ro" --entrypoint bash "$tool_image" \
+  /nmos/spec-cache.sh /cache
 
 # Every resource id of the running node, sorted.
 ids() {
@@ -86,12 +96,16 @@ run() {
   } > "$out/config-$name/UserConfig.py"
   echo "== $name: $suite ($mode)"
   docker run --rm --name "$tag-tool" --network "$net" --ip "$tool_ip" \
-    -v "$out/config-$name:/config:ro" -v "$out:/results" -v nmos-testing-specs:/home/nmos-testing/cache \
+    -v "$out/config-$name:/config:ro" -v "$out:/results" -v "$specs:/home/nmos-testing/cache" \
     --entrypoint python3 "$tool_image" nmos-test.py suite "$suite" --selection all "$@" \
-    --output "/results/$name.json" || true
+    --output "/results/$name.json" 2>&1 | tee "$out/$name-tool.log" || true
   docker logs "$tag-node" > "$out/$name-node.log" 2>&1
   docker rm -f "$tag-node" >/dev/null
-  test -s "$out/$name.json" || { echo "$name wrote no results" >&2; exit 1; }
+  test -s "$out/$name.json" || { cat "$out/$name-tool.log" >&2; echo "$name wrote no results" >&2; exit 1; }
+  if grep -E "Initialising repository|Pulling latest files" "$out/$name-tool.log" >&2; then
+    echo "$name: nmos-testing fetched a specification instead of the pinned cache" >&2
+    exit 1
+  fi
 }
 
 run is-04-01-unicast unicast IS-04-01 --host "$node_ip" --port 8081 --version v1.3

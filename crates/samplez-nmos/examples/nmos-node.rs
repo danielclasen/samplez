@@ -174,11 +174,19 @@ async fn main() {
     let registration = tokio::spawn(nmos.registration());
     let serve = tokio::spawn(axum::serve(listener, nmos.router()).into_future());
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
-        r = serve => tracing::error!("the listener stopped: {r:?}"),
-    }
+    let failed = tokio::select! {
+        _ = term.recv() => false,
+        _ = tokio::signal::ctrl_c() => false,
+        r = serve => {
+            tracing::error!("the listener stopped: {r:?}");
+            true
+        }
+    };
+    // A POST still in flight would land after the DELETE.
     registration.abort();
+    let _ = registration.await;
     nmos.unregister().await;
+    if failed {
+        exit(1);
+    }
 }
