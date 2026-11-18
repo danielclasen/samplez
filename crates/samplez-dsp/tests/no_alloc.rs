@@ -72,9 +72,16 @@ fn process_calls_do_not_allocate() {
     // has to fill columns beyond the clone's length.
     let mut sparse = Matrix::new(n, m);
     assert!(sparse.set(1, 0, 0.5, 0));
-    let mut runs: Vec<(Path, Matrix)> = paths
+    // Each with a twin that sets no mask and is processed without
+    // envelopes.
+    let mut runs: Vec<(Path, Matrix, Matrix)> = paths
         .iter()
-        .flat_map(|&p| [(p, Matrix::new(n, m)), (p, sparse.clone())])
+        .flat_map(|&p| {
+            [
+                (p, Matrix::new(n, m), Matrix::new(n, m)),
+                (p, sparse.clone(), sparse.clone()),
+            ]
+        })
         .collect();
     let mut core = Matrix::new(n, m);
     let mut envelopes = PlanarBuffer::new(MAX_DUCKS, cap);
@@ -93,7 +100,7 @@ fn process_calls_do_not_allocate() {
     let saved = set_ftz_daz(true);
     for round in 0..8usize {
         let frames = 16 + round * 131;
-        for (path, matrix) in &mut runs {
+        for (path, matrix, twin) in &mut runs {
             // Fill every column, ramp some, route some, then empty them, so
             // every insert and removal of a coefficient is covered.
             for j in 0..m {
@@ -104,7 +111,8 @@ fn process_calls_do_not_allocate() {
                         _ => 0.5,
                     };
                     let len = if (i + j) % 3 == 0 { 0 } else { 300 };
-                    assert!(matrix.set(i, j, if round == 7 { 0.0 } else { c }, len));
+                    let c = if round == 7 { 0.0 } else { c };
+                    assert!(matrix.set(i, j, c, len) && twin.set(i, j, c, len));
                     // Masks set, changed and cleared, crossfading while
                     // ducked.
                     let mask = ((round * 3 + i + j) % 5) as u8 * 51;
@@ -112,7 +120,8 @@ fn process_calls_do_not_allocate() {
                 }
                 assert!(matrix.set_depth(j % n, j % MAX_DUCKS, (round * 5) as f32, 300));
             }
-            assert!(matrix.set(0, 1, 1.0, 0));
+            assert!(matrix.set(0, 1, 1.0, 0) && twin.set(0, 1, 1.0, 0));
+            twin.process_on(*path, &input, &mut output, frames);
             matrix.process_ducked_on(*path, &input, &envelopes, &mut output, frames);
             matrix.advance(frames);
             matrix.align(round as u64 * 1000 + 3);

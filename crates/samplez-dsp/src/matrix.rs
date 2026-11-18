@@ -52,10 +52,10 @@ pub(crate) struct Term {
 
 /// The duck of a term. Its gain moves linearly over the interval running
 /// from `from` to `to`, the gains computed at the ends of the last two
-/// intervals; `live` is the gain of the term's mask at the last end, before
-/// any crossfade. After a mask change it crossfades over `len` samples, at
-/// `pos`, from the live gain of `old`, the mask before the change, to the
-/// live gain of the new one. `bias` is what the gain at the change lay
+/// intervals; `live` is the gain of `live_mask`, the term's mask then, at
+/// the last end, before any crossfade. After a mask change it crossfades
+/// over `len` samples, at `pos`, from the live gain of `old`, the mask
+/// `live` was taken for, to the live gain of the new one. `bias` is what the gain at the change lay
 /// off the old mask's live gain, the remainder of a crossfade the change
 /// interrupted, and fades out with the crossfade, so no change steps.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -63,6 +63,7 @@ pub(crate) struct Duck {
     pub(crate) from: f32,
     pub(crate) to: f32,
     live: f32,
+    live_mask: u8,
     old: u8,
     bias: f32,
     pos: u32,
@@ -76,6 +77,7 @@ impl Duck {
             from: 1.0,
             to: 1.0,
             live: 1.0,
+            live_mask: 0,
             old: 0,
             bias: 0.0,
             pos: 0,
@@ -83,11 +85,13 @@ impl Duck {
         }
     }
 
-    /// Starts a crossfade over `len` samples from `old`, the mask the
-    /// term had, to its new one.
-    fn change(&mut self, old: u8, len: u32) {
+    /// Starts a crossfade over `len` samples to the term's new mask from
+    /// the mask `live` was taken for, so that, the bias added, it starts
+    /// from the gain the term moves to, however many changes came since
+    /// the end of the last interval.
+    fn change(&mut self, len: u32) {
         self.bias = self.to - self.live;
-        self.old = old;
+        self.old = self.live_mask;
         self.pos = 0;
         self.len = len.min(MAX_RAMP_LEN);
     }
@@ -104,14 +108,15 @@ impl Duck {
         self.from == 1.0 && self.to == 1.0 && self.pos == self.len
     }
 
-    /// Gains within 0 and 1, which every duck gain is, a bias within the
-    /// distance of two of them, and a crossfade position within a length
-    /// within [`MAX_RAMP_LEN`].
+    /// Gains within 0 and 1, which every duck gain is, exactly 1 for mask
+    /// 0, a bias within the distance of two of them, and a crossfade
+    /// position within a length within [`MAX_RAMP_LEN`].
     fn is_valid(&self) -> bool {
         let unit = |g: f32| (0.0..=1.0).contains(&g);
         unit(self.from)
             && unit(self.to)
             && unit(self.live)
+            && (self.live_mask != 0 || self.live == 1.0)
             && (-1.0..=1.0).contains(&self.bias)
             && self.len <= MAX_RAMP_LEN
             && self.pos <= self.len
@@ -250,6 +255,7 @@ impl Ducking<'_> {
             live
         };
         d.live = live;
+        d.live_mask = mask;
         d.from = d.to;
         d.to = to;
     }
@@ -735,8 +741,7 @@ impl Matrix {
             self.masks.resize(self.inputs * outputs, 0);
         }
         let held = &mut self.masks[input * outputs + output];
-        let old = *held;
-        if old == mask {
+        if *held == mask {
             return true;
         }
         *held = mask;
@@ -746,7 +751,7 @@ impl Matrix {
             let t = &mut col[k];
             t.mask = mask;
             if t.ducked {
-                ducks[i].change(old, len);
+                ducks[i].change(len);
             } else {
                 t.ducked = true;
                 ducks.insert(i, Duck::new(len));
@@ -1996,6 +2001,75 @@ mod tests {
         }
     }
 
+    /// Two mask changes on one coefficient before the end of an interval,
+    /// with samples processed or skipped between them, step by no more
+    /// than a linear crossfade over the length does: one back to the
+    /// mask it started from does not move it at all.
+    #[test]
+    fn two_mask_changes_in_one_interval_do_not_step() {
+        const LEN: u32 = 4800;
+        let cases: [[u8; 3]; 4] = [
+            [0b01, 0, 0b01],
+            [0b01, 0b10, 0b01],
+            [0, 0b01, 0],
+            [0b01, 0b10, 0b10],
+        ];
+        let gain = |mask: u8| match mask {
+            0 => 1.0,
+            0b10 => duck_gain(20.0, 1.0),
+            _ => duck_gain(40.0, 1.0),
+        };
+        for path in Path::ALL {
+            if !path_runs("two_mask_changes_in_one_interval_do_not_step", path) {
+                continue;
+            }
+            for [a, b, c] in cases {
+                for skip in [false, true] {
+                    let mut m = Matrix::new(1, 1);
+                    assert!(m.set(0, 0, 1.0, 0));
+                    assert!(m.set_depth(0, 0, 40.0, 0) && m.set_depth(0, 1, 20.0, 0));
+                    assert!(m.set_mask(0, 0, a, 0));
+                    let mut input = PlanarBuffer::new(1, CAP);
+                    input.channel_mut(0).fill(0.5);
+                    let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
+                    env.channel_mut(0).fill(1.0);
+                    env.channel_mut(1).fill(1.0);
+                    let mut out = PlanarBuffer::new(1, CAP);
+                    let mut prev: Option<f32> = None;
+                    let mut step = 0.0f32;
+                    let mut run = |m: &mut Matrix, frames: usize, step: &mut f32| {
+                        m.process_ducked_on(path, &input, &env, &mut out, frames);
+                        for &s in &out.channel(0)[..frames] {
+                            if let Some(p) = prev {
+                                *step = step.max((s - p).abs());
+                            }
+                            prev = Some(s);
+                        }
+                    };
+                    // Settled, then to sample 2 of an interval.
+                    run(&mut m, 64 + 2, &mut 0.0);
+                    assert!(m.set_mask(0, 0, b, LEN));
+                    if skip {
+                        m.advance(3);
+                    } else {
+                        run(&mut m, 3, &mut step);
+                    }
+                    assert!(m.set_mask(0, 0, c, LEN));
+                    for _ in 0..140 {
+                        run(&mut m, 37, &mut step);
+                    }
+                    let whole = 0.5 * (gain(a) - gain(c)).abs().max((gain(b) - gain(c)).abs());
+                    let ctx = format!("{path:?} {a:#b} -> {b:#b} -> {c:#b}, skip {skip}");
+                    assert!(step <= 1.1 * whole / LEN as f32, "{ctx}: step {step}");
+                    if a == c {
+                        assert_eq!(step, 0.0, "{ctx}");
+                    }
+                    assert_eq!(prev, Some(0.5 * gain(c)), "{ctx}");
+                }
+            }
+        }
+    }
+
     /// A coefficient in several groups is ducked by the deepest of them,
     /// not by their sum or by the first, and by none outside its mask.
     #[test]
@@ -2140,6 +2214,10 @@ mod tests {
         });
         refused("a negative duck gain", &|w| {
             term(w)["duck"]["live"] = json!(-0.25)
+        });
+        refused("a live gain of mask 0 other than 1", &|w| {
+            term(w)["duck"]["live_mask"] = json!(0);
+            term(w)["duck"]["live"] = json!(0.5);
         });
         refused("a bias beyond the distance of two gains", &|w| {
             term(w)["duck"]["bias"] = json!(1.5)
