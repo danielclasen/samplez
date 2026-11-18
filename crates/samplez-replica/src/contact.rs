@@ -27,7 +27,7 @@ use crate::resync::{CoreReply, Resynced, Source};
 use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
 use crate::state::{Life, PageBook, ReplicaState, Seen, View};
-use crate::state_machine::Product;
+use crate::state_machine::{Product, StateMachine};
 use crate::withhold::Withhold;
 
 /// The engine's sample rate (plan 2.3).
@@ -340,6 +340,11 @@ pub trait LogView: Send + Sync + 'static {
     fn restamps(&self, _index: u64) -> u32 {
         0
     }
+    /// The generation applied decidable entries need
+    /// ([`crate::state_machine::StateMachine::pending_generation`]).
+    fn pending_generation(&self) -> Option<u64> {
+        None
+    }
     /// The replicas the latest applied `ClockVerdict` judges.
     fn judged(&self) -> BTreeSet<NodeId>;
     /// The replica the latest applied `ClockVerdict` judging one named.
@@ -386,6 +391,9 @@ impl<P: Product> LogView for Store<P> {
     }
     fn restamps(&self, index: u64) -> u32 {
         Store::restamps(self, index)
+    }
+    fn pending_generation(&self) -> Option<u64> {
+        self.with_state(StateMachine::pending_generation)
     }
     fn judged(&self) -> BTreeSet<NodeId> {
         self.with_state(|sm| {
@@ -770,11 +778,11 @@ impl Contact {
         let applied = log.applied();
         let installs_seen = log.installs();
         let mut scheduled = BTreeMap::new();
-        let mut generation_at = None;
-        // The pending generation is learned from the engine bodies the
-        // state machine holds and, in `sync_log`, from every entry appended
-        // after `applied` that needs one; a flagged `Commands` entry or
-        // decision applied before a restart is not seen here.
+        // The pending generation is learned from the applied entries that
+        // re-routed an input, the engine bodies the state machine holds
+        // and, in `sync_log`, every entry appended after `applied` that
+        // needs one.
+        let mut generation_at = log.pending_generation();
         // Entries the engine applies later, purged ones included, for
         // listings.
         // Collected first: the log's view is not re-entered from inside it.
@@ -3022,6 +3030,8 @@ mod tests {
         applied: u64,
         pending: Vec<(u64, Body)>,
         installs: u64,
+        /// [`LogView::pending_generation`].
+        generation: Option<u64>,
     }
 
     #[derive(Default)]
@@ -3082,6 +3092,9 @@ mod tests {
         }
         fn installs(&self) -> u64 {
             self.0.lock().unwrap().installs
+        }
+        fn pending_generation(&self) -> Option<u64> {
+            self.0.lock().unwrap().generation
         }
         fn paths(&self, command: &[u8]) -> Vec<String> {
             vec![crate::state_machine::tests::parse(command).0]
@@ -4293,6 +4306,29 @@ mod tests {
         command.at_index = Some(far);
         command.generation = Some(true);
         f.insert(2, Body::Commands(vec![command]));
+        restarted.tick(f.members.clone());
+        assert_eq!(restarted.lock().generation_at, Some(far));
+        assert_eq!(restarted.stamp(true), Err(StampRefusal::GenerationPending));
+    }
+
+    /// A replica restarted after it applied an entry that re-routed an
+    /// input, whose index has not passed, waits for that generation before
+    /// it stamps another: two would be pending.
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_contact_waits_for_an_applied_generation() {
+        let f = fixture(&[&[1]]);
+        f.tick();
+        let far = f.contact.stamp(false).expect("stamped").stamp + 400 * B;
+        f.log.0.lock().unwrap().generation = Some(far);
+        let restarted = Contact::new(
+            1,
+            Timing::defaults(B),
+            f.clock.clone(),
+            Some(f.engine.clone()),
+            f.log.clone(),
+            1,
+        );
+        restarted.verified_always();
         restarted.tick(f.members.clone());
         assert_eq!(restarted.lock().generation_at, Some(far));
         assert_eq!(restarted.stamp(true), Err(StampRefusal::GenerationPending));

@@ -743,6 +743,15 @@ impl<P: Product> StateMachine<P> {
         *renewed = (*renewed).max(stamp);
     }
 
+    /// The highest at_index of a decidable entry that re-routed an input:
+    /// the generation it needs, built on every replica that applied it.
+    pub fn pending_generation(&self) -> Option<u64> {
+        (self.derived.iter())
+            .filter(|(_, slots)| !slots.is_empty())
+            .filter_map(|(index, _)| self.terms.get(index).map(|&(_, at)| at))
+            .max()
+    }
+
     pub fn save(&self) -> Replicated {
         Replicated {
             product: self.product.save(),
@@ -2253,6 +2262,31 @@ mod derive_tests {
             assert_eq!(sm.floor, 1920);
             assert_eq!(sm.product.flows, ["a".to_owned(), "b".to_owned()]);
         }
+    }
+
+    /// The pending generation is the index of the latest decidable entry
+    /// that re-routed an input, under the restamp that moved it; one that
+    /// re-routed nothing needs none.
+    #[test]
+    fn the_pending_generation_is_the_latest_rerouting_entry() {
+        let mut sm = machine();
+        assert_eq!(sm.pending_generation(), None);
+        sm.apply_at(10, 1, &one("1", "route 0 c", 0, 3000, Some(true)));
+        sm.apply_at(11, 1, &one("2", "fader 0 0.2", 0, 5000, None));
+        assert!(sm.derived.contains_key(&11));
+        assert_eq!(sm.pending_generation(), Some(3000));
+        let restamp = Request {
+            stamp: 96,
+            body: Body::Restamp {
+                revision: 10,
+                term: 1,
+                at_index: 6000,
+                paths: Vec::new(),
+                generation: Some(true),
+            },
+        };
+        sm.apply_at(12, 1, &restamp);
+        assert_eq!(sm.pending_generation(), Some(6000));
     }
 
     /// `Body::Protocol` raises the replicated protocol, never lowers it,
