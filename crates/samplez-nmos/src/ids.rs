@@ -43,6 +43,14 @@ impl Ids {
     }
 }
 
+/// BCP-007-03's MXL UUID (mxl_uuid.json): a version other than 0 and the
+/// RFC 4122 variant. Lowercase is a matter of the text, which `Uuid`
+/// always writes so.
+pub(crate) fn is_mxl_uuid(u: Uuid) -> bool {
+    let b = u.as_bytes();
+    b[6] >> 4 != 0 && b[8] >> 6 == 0b10
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +84,24 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), n);
         assert!(all.iter().all(|u| u.get_version_num() == 5));
+    }
+
+    #[test]
+    fn mxl_uuids_need_a_version_and_the_rfc_4122_variant() {
+        for ok in [
+            "11111111-2222-4333-8444-555555555555",
+            "11111111-2222-1333-b444-555555555555",
+            "11111111-2222-f333-9444-555555555555",
+        ] {
+            assert!(is_mxl_uuid(ok.parse().unwrap()), "{ok}");
+        }
+        for bad in [
+            "00000000-0000-0000-0000-000000000000",
+            "11111111-2222-0333-8444-555555555555",
+            "11111111-2222-4333-7444-555555555555",
+            "11111111-2222-4333-c444-555555555555",
+        ] {
+            assert!(!is_mxl_uuid(bad.parse().unwrap()), "{bad}");
+        }
     }
 }

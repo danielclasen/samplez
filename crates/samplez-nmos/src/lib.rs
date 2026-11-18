@@ -1,6 +1,6 @@
-//! NMOS for samplez products: the IS-04 v1.3 Node API and registration and
-//! the IS-05 v1.2 Connection API for MXL senders and receivers per AMWA
-//! BCP-007-03, with BCP-004-01 receiver caps and BCP-002-01/02 tags.
+//! NMOS for samplez products: the IS-04 v1.3 Node API for MXL senders and
+//! receivers per AMWA BCP-007-03, with BCP-004-01 receiver caps and
+//! BCP-002-01/02 tags.
 //!
 //! The crate knows NMOS ids, MXL ids and TAI time; it links no libmxl and
 //! runs no real-time code. A product describes its writers and readers in
@@ -119,6 +119,9 @@ impl Nmos {
     /// enabled on their flow when they have one.
     pub fn new(model: NodeModel, cfg: NmosConfig, clock: impl TaiClock) -> Result<Nmos, Error> {
         check(&model, &cfg)?;
+        if let Some(w) = clock.utc_offset().and_then(tai::offset_warning) {
+            tracing::warn!("{w}");
+        }
         let ids = Ids::derive(
             &cfg.seed,
             model.senders.iter().map(|s| s.key.as_str()),
@@ -172,10 +175,9 @@ impl Nmos {
         })
     }
 
-    /// `/x-nmos/node/v1.3/` and `/x-nmos/connection/v1.2/`, for the
-    /// product's NMOS listener. Every path answers with and without a
-    /// trailing slash, every response carries CORS headers and every
-    /// `OPTIONS` is a pre-flight.
+    /// `/x-nmos/node/v1.3/`, for the product's NMOS listener. Every path
+    /// answers with and without a trailing slash, every response carries
+    /// CORS headers and every `OPTIONS` is a pre-flight.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/", any(handle))
@@ -226,10 +228,27 @@ fn check(model: &NodeModel, cfg: &NmosConfig) -> Result<(), Error> {
     {
         return fail("every asset tag needs a value and the device a function".into());
     }
+    // Every sender has the role `Audio out` and every receiver `Audio in`
+    // in its group, and BCP-002-01 allows one resource per role in a
+    // group; the colon separates the group from the role.
+    let group_ok = |g: &str| !g.is_empty() && !g.contains(':');
     let mut keys = BTreeSet::new();
+    let mut groups = BTreeSet::new();
     for s in &model.senders {
         if !keys.insert(s.key.as_str()) {
             return fail(format!("sender key {:?} is not unique", s.key));
+        }
+        if !group_ok(&s.group) || !groups.insert(s.group.as_str()) {
+            return fail(format!(
+                "sender {:?}: group {:?} is empty, holds a colon or has another sender",
+                s.key, s.group
+            ));
+        }
+        if !ids::is_mxl_uuid(s.domain) || !ids::is_mxl_uuid(s.flow) {
+            return fail(format!(
+                "sender {:?}: domain {} or flow {} is no MXL UUID",
+                s.key, s.domain, s.flow
+            ));
         }
         if s.channels.is_empty() {
             return fail(format!("sender {:?} has no channels", s.key));
@@ -243,9 +262,22 @@ fn check(model: &NodeModel, cfg: &NmosConfig) -> Result<(), Error> {
         }
     }
     keys.clear();
+    groups.clear();
     for r in &model.receivers {
         if !keys.insert(r.key.as_str()) {
             return fail(format!("receiver key {:?} is not unique", r.key));
+        }
+        if !group_ok(&r.group) || !groups.insert(r.group.as_str()) {
+            return fail(format!(
+                "receiver {:?}: group {:?} is empty, holds a colon or has another receiver",
+                r.key, r.group
+            ));
+        }
+        if !ids::is_mxl_uuid(r.domain) || r.flow.is_some_and(|f| !ids::is_mxl_uuid(f)) {
+            return fail(format!(
+                "receiver {:?}: domain {} or flow {:?} is no MXL UUID",
+                r.key, r.domain, r.flow
+            ));
         }
         let (ChannelCount::Exactly(n) | ChannelCount::AtLeast(n)) = r.channels;
         if n == 0 || n > MAX_CHANNELS {

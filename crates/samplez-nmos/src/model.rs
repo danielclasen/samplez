@@ -1,8 +1,6 @@
 //! What a product registers: one Node with one Device, a Source, Flow and
 //! Sender per MXL writer and a Receiver per MXL reader.
 
-use std::time::Duration;
-
 use uuid::Uuid;
 
 /// Every Flow and Receiver carries 32-bit float audio at this rate.
@@ -89,6 +87,4 @@ pub struct NmosConfig {
     pub advertise_host: String,
     pub advertise_port: u16,
     pub asset: Asset,
-    /// How often the Node heartbeats its registry.
-    pub heartbeat: Duration,
 }

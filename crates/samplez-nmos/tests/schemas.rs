@@ -6,7 +6,6 @@
 //! `--test schemas`.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -126,7 +125,6 @@ fn node() -> Nmos {
             instance_id: "schemas".into(),
             functions: vec!["Mixer".into()],
         },
-        heartbeat: Duration::from_secs(5),
     };
     Nmos::new(model, cfg, SystemTai).unwrap()
 }

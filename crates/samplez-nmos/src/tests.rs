@@ -1,5 +1,4 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
@@ -81,7 +80,6 @@ pub(crate) fn config() -> NmosConfig {
             instance_id: "test/node".into(),
             functions: vec!["Mixer".into()],
         },
-        heartbeat: Duration::from_secs(5),
     }
 }
 
@@ -421,12 +419,91 @@ fn the_model_is_checked() {
     refuse(&|_, c| c.seed.clear());
     refuse(&|_, c| c.asset.functions.clear());
     refuse(&|_, c| c.asset.manufacturer.clear());
+    // One resource per role in a BCP-002-01 group, and no colon in it.
+    refuse(&|m, _| {
+        let mut s = m.senders[0].clone();
+        s.key = "aux".into();
+        m.senders.push(s);
+    });
+    refuse(&|m, _| m.receivers[1].group = "pgm".into());
+    refuse(&|m, _| m.senders[0].group = "pgm:main".into());
+    refuse(&|m, _| m.receivers[0].group = "a:b".into());
+    refuse(&|m, _| m.receivers[0].group.clear());
+    // Ids served as BCP-007-03 MXL UUIDs must be ones.
+    refuse(&|m, _| m.senders[0].domain = Uuid::nil());
+    refuse(&|m, _| m.senders[0].flow = uuid::uuid!("aaaaaaaa-0000-0000-8000-000000000001"));
+    refuse(&|m, _| m.receivers[0].domain = uuid::uuid!("11111111-2222-4333-c444-555555555555"));
+    refuse(&|m, _| m.receivers[0].flow = Some(Uuid::nil()));
+    // A sender and a receiver may share a group: their roles differ.
+    let mut m = model();
+    m.receivers[1].group = "other".into();
+    assert_eq!(m.senders[0].group, m.receivers[0].group);
+    assert!(Nmos::new(m, config(), Clock::at(1)).is_ok());
     for ok in ["NSC128", "U64", "LFE", "NSC000"] {
         assert!(symbol_valid(ok), "{ok}");
     }
     for bad in ["NSC129", "U00", "U1", "lfe", ""] {
         assert!(!symbol_valid(bad), "{bad}");
     }
+}
+
+/// Records the warnings logged while it is the default subscriber.
+struct Warnings(Mutex<Vec<String>>);
+
+impl tracing::Subscriber for Warnings {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, e: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "message" {
+                    self.0 = format!("{v:?}");
+                }
+            }
+        }
+        if *e.metadata().level() == tracing::Level::WARN {
+            let mut m = Message(String::new());
+            e.record(&mut m);
+            self.0.lock().unwrap().push(m.0);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A clock whose distance from UTC is given.
+struct Offset(Option<i64>);
+
+impl TaiClock for Offset {
+    fn now(&self) -> Tai {
+        Tai::new(1_000, 0)
+    }
+    fn utc_offset(&self) -> Option<i64> {
+        self.0
+    }
+}
+
+#[test]
+fn a_tai_clock_without_the_tai_offset_is_warned_about_at_start() {
+    let warnings = |offset| {
+        let sub = Arc::new(Warnings(Mutex::new(Vec::new())));
+        tracing::subscriber::with_default(sub.clone(), || {
+            Nmos::new(model(), config(), Offset(offset)).unwrap();
+        });
+        sub.0.lock().unwrap().clone()
+    };
+    let w = warnings(Some(0));
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("37 s off TAI"), "{w:?}");
+    assert!(warnings(Some(37)).is_empty());
+    assert!(warnings(None).is_empty());
 }
 
 #[tokio::test]

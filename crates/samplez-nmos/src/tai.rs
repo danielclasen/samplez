@@ -72,9 +72,31 @@ impl FromStr for Tai {
     }
 }
 
+/// TAI - UTC since 2017-01-01, and until the next leap second.
+pub(crate) const TAI_UTC: i64 = 37;
+
 /// The node's TAI clock, read for resource versions and activations.
 pub trait TaiClock: Send + Sync + 'static {
     fn now(&self) -> Tai;
+
+    /// How many seconds the clock reads ahead of the system's UTC clock,
+    /// where it can tell; checked once at start.
+    fn utc_offset(&self) -> Option<i64> {
+        None
+    }
+}
+
+/// The warning for a clock `offset` seconds ahead of UTC, `None` when that
+/// is TAI - UTC give or take the second a reading may cross.
+pub(crate) fn offset_warning(offset: i64) -> Option<String> {
+    let off = TAI_UTC - offset;
+    (off.abs() > 1).then(|| {
+        format!(
+            "the TAI clock reads {offset} s ahead of UTC, not {TAI_UTC} s: the kernel's TAI \
+             offset is unset or wrong, so resource versions and IS-05 activation times are \
+             {off} s off TAI and an absolute activation fires that far from its time"
+        )
+    })
 }
 
 /// `CLOCK_TAI`, the clock libmxl's `mxlGetTime` reads. It is TAI only
@@ -91,6 +113,20 @@ impl TaiClock for SystemTai {
         // SAFETY: `ts` is writable; CLOCK_TAI exists on Linux.
         unsafe { libc::clock_gettime(libc::CLOCK_TAI, &mut ts) };
         Tai::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    fn utc_offset(&self) -> Option<i64> {
+        let read = |clock| {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `ts` is writable; both clocks exist on Linux.
+            unsafe { libc::clock_gettime(clock, &mut ts) };
+            ts.tv_sec as i128 * NANOS as i128 + ts.tv_nsec as i128
+        };
+        let ns = read(libc::CLOCK_TAI) - read(libc::CLOCK_REALTIME);
+        Some(((ns + NANOS as i128 / 2).div_euclid(NANOS as i128)) as i64)
     }
 }
 
@@ -152,5 +188,18 @@ mod tests {
         // have crossed into the next second.
         let offset = tai.sec as i64 - real.tv_sec;
         assert!((-1..=60).contains(&offset), "{offset}");
+        let measured = SystemTai.utc_offset().unwrap();
+        assert!((offset - measured).abs() <= 1, "{offset} {measured}");
+    }
+
+    #[test]
+    fn an_offset_other_than_tai_utc_warns_with_its_consequence() {
+        for ok in [36, 37, 38] {
+            assert_eq!(offset_warning(ok), None, "{ok}");
+        }
+        let w = offset_warning(0).unwrap();
+        assert!(w.contains("reads 0 s ahead of UTC, not 37 s"), "{w}");
+        assert!(w.contains("activation times are 37 s off TAI"), "{w}");
+        assert!(offset_warning(-37).is_some());
     }
 }
