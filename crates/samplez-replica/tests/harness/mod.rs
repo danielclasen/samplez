@@ -1880,9 +1880,14 @@ impl<P: Product + Sync> Set<P> {
             slot: 0,
             at_index: at,
         });
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Wall time: the paused runtime clock jumps ahead while the tasks
+        // are idle, which an fsync on a slow disk makes them.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while store.applied_index() <= before {
-            assert!(Instant::now() < deadline, "the entry applied on the leader");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the entry applied on the leader"
+            );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let index = store.applied_index();
@@ -1894,7 +1899,10 @@ impl<P: Product + Sync> Set<P> {
             .snapshot
             .is_none_or(|id| id.index < index)
         {
-            assert!(Instant::now() < deadline, "the leader's snapshot");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the leader's snapshot"
+            );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         raft.trigger().purge_log(index).await.expect("purge");
@@ -1904,7 +1912,7 @@ impl<P: Product + Sync> Set<P> {
             .purged
             .is_none_or(|id| id.index < index)
         {
-            assert!(Instant::now() < deadline, "the leader's purge");
+            assert!(std::time::Instant::now() < deadline, "the leader's purge");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         {
@@ -1914,7 +1922,10 @@ impl<P: Product + Sync> Set<P> {
                 .retain(|&(a, b)| a != follower && b != follower);
         }
         while self.replica(follower).store().installs() == installs {
-            assert!(Instant::now() < deadline, "{follower} installed a snapshot");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{follower} installed a snapshot"
+            );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }

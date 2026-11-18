@@ -1681,7 +1681,10 @@ impl Contact {
             // Purged from the log since it applied: this log's own, which
             // no decision names by an id this replica holds, so it is
             // handed whatever its deadline, the engine counting it late if
-            // its index passed.
+            // its index passed. A record this old needs a lag past the
+            // entries the log keeps before records are retained again, so
+            // it is rare; when it is late the engine marks itself diverged
+            // and this replica is rebuilt.
             let Some(id) = self.log.log_id_at(index) else {
                 audio.appended(index, at, &record.entries);
                 continue;

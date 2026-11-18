@@ -346,6 +346,24 @@ fn generation_needing_entries_are_built_one_at_a_time() {
 /// The other input, read through every new generation, stays exact.
 #[test]
 fn re_route_crossfades_at_its_index_and_leaves_other_inputs_exact() {
+    // An overrun skips blocks, and the skipped ones can be the crossfade
+    // itself, which this test exists to check: a run that left one
+    // uncomputed is run again.
+    let mut missed = Vec::new();
+    for _ in 0..4 {
+        let m = re_route_scenario();
+        if m.is_empty() {
+            return;
+        }
+        eprintln!("crossfade blocks {m:?} not computed: running it again");
+        missed.push(m);
+    }
+    panic!("no run computed every crossfade block: {missed:?}");
+}
+
+/// One run of the re-route scenario: the crossfade blocks the engine did
+/// not compute, which the run could not check.
+fn re_route_scenario() -> Vec<u64> {
     let domain = Domain::new();
     let (src0, src1, next, out) = (new_id(), new_id(), new_id(), new_id());
     let _p0 = Pilot::start(&domain.0, &src0, 1, B, 0);
@@ -369,27 +387,32 @@ fn re_route_crossfades_at_its_index_and_leaves_other_inputs_exact() {
     wait_past(&rx, d / B + 20, &mut seen);
     // Against the expected values on the blocks the engine computed: one
     // it skipped after an overrun is zero-filled by libmxl.
-    let check =
-        |range: std::ops::Range<u64>, seen: &[BlockVerdict], want: &dyn Fn(u64) -> Vec<f32>| {
-            let x = common::read_blocks(&domain.0, &out, 2, range.clone());
-            let mut compared = 0;
-            for (i, k) in range.clone().enumerate() {
-                if !computed(seen, k) {
-                    continue;
-                }
-                assert!(block(&x, 2, i, 0) == ramped(0, k, 1.0, 1.0, 0), "block {k}");
-                assert!(
-                    block(&x, 2, i, 1) == want(k),
-                    "block {k} of the re-routed input"
-                );
-                compared += 1;
+    let check = |range: std::ops::Range<u64>,
+                 must: std::ops::Range<u64>,
+                 seen: &[BlockVerdict],
+                 want: &dyn Fn(u64) -> Vec<f32>|
+     -> Vec<u64> {
+        let x = common::read_blocks(&domain.0, &out, 2, range.clone());
+        let mut compared = 0;
+        for (i, k) in range.clone().enumerate() {
+            if !computed(seen, k) {
+                continue;
             }
+            assert!(block(&x, 2, i, 0) == ramped(0, k, 1.0, 1.0, 0), "block {k}");
             assert!(
-                compared * 4 > range.count() as u64 * 3,
-                "{compared} blocks compared"
+                block(&x, 2, i, 1) == want(k),
+                "block {k} of the re-routed input"
             );
-        };
-    check(r / B - 20..d / B + 20, &seen, &|k| {
+            compared += 1;
+        }
+        assert!(
+            compared * 4 > range.count() as u64 * 3,
+            "{compared} blocks compared"
+        );
+        must.filter(|&k| !computed(seen, k)).collect()
+    };
+    let ramp = u64::from(RAMP).div_ceil(B);
+    let mut missed = check(r / B - 20..d / B + 20, r / B..d / B + 1, &seen, &|k| {
         if k * B < r {
             ramped(0, k, 1.0, 1.0, 0)
         } else {
@@ -413,13 +436,18 @@ fn re_route_crossfades_at_its_index_and_leaves_other_inputs_exact() {
     let end = u / B + 2 * u64::from(RAMP) / B;
     wait_past(&rx, end, &mut seen);
 
-    check(u / B - 20..end, &seen, &|k| {
-        if k * B < u {
-            vec![0.0; B as usize]
-        } else {
-            ramped(0, k, 0.0, 1.0, u)
-        }
-    });
+    missed.extend(check(
+        u / B - 20..end,
+        u / B..u / B + ramp + 1,
+        &seen,
+        &|k| {
+            if k * B < u {
+                vec![0.0; B as usize]
+            } else {
+                ramped(0, k, 0.0, 1.0, u)
+            }
+        },
+    ));
     for v in seen.iter().filter(|v| v.k > k0 + 50) {
         assert_eq!(v.silenced & 1, 0, "{v:?}");
     }
@@ -428,6 +456,7 @@ fn re_route_crossfades_at_its_index_and_leaves_other_inputs_exact() {
     assert_eq!(s.inputs[0].counters.below_last_read, 0);
     assert_eq!(s.diverged, None);
     common::stop(e);
+    missed
 }
 
 /// A generation built on append and handed over after its entry's commit

@@ -932,10 +932,13 @@ async fn ordinal_0_does_not_start_a_set_while_its_peers_are_unreachable() {
     let mut set = Set::new(Voters::new(3, false).unwrap()).await;
     set.start_all().await;
     set.settled().await;
-    set.api.delete();
     set.crash(Slot::Audio(1)).await;
     set.crash(Slot::Audio(2)).await;
     set.crash(Slot::Audio(0)).await;
+    // Deleted once no leader is left: a leader with a quorum recreates a
+    // missing marker each second, which on a loaded host the crashes
+    // above outlast.
+    set.api.delete();
     std::fs::remove_dir_all(set.dir(Slot::Audio(0))).unwrap();
     let node = set.start(Slot::Audio(0)).await;
     let replica = node.replica.clone();

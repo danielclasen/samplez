@@ -134,11 +134,15 @@ pub const AHEAD_MAX: u64 = 48_000;
 pub const RECORDS_KEPT: u64 = 48_000;
 
 /// How far past its stamp a lease expiry from an older leader, which
-/// stamps no index, takes effect: 50 ms at 48 kHz, the default
-/// `maxApplyLead`. A constant, never a replica's own timing, so every
-/// replica derives at the same index; far enough ahead that the record
-/// still reaches the engines before its apply deadline.
-pub const FALLBACK_LEAD: u64 = 2_400;
+/// stamps no index, takes effect: 64 ms at 48 kHz, at least the 50 ms
+/// default `maxApplyLead`. A constant, never a replica's own timing, so
+/// every replica derives at the same index; far enough ahead that the
+/// record still reaches the engines before its apply deadline. The stamp
+/// is a block start, so the index is one too for every block size that
+/// divides 3072: all powers of two within the allowed 16..=1024, and 48,
+/// 96, 192, 384 and 768. Contact lists, awaits and floors at this
+/// index; the bridge rounds it up to a block for any other block size.
+pub const FALLBACK_LEAD: u64 = 3_072;
 
 /// The index the entry `request` takes effect at after entries that
 /// left the floor at `floor`, and the floor after it: its own at_index,
@@ -1913,6 +1917,26 @@ mod derive_tests {
         sm.apply(4, &one("3", "fader 0 0.5", 0, 2400, None));
         assert_eq!(sm.records.keys().copied().collect::<Vec<_>>(), [3]);
         assert_eq!(sm.floor, 2400);
+    }
+
+    /// The index an unstamped lease expiry derives at is a block start for
+    /// the block sizes the bridge hands records at unrounded, so the index
+    /// contact lists, awaits and floors at is the one the engine applies.
+    #[test]
+    fn the_fallback_index_is_a_block_start_for_the_usual_block_sizes() {
+        let blocks = (4..=10).map(|n| 1u64 << n).chain([48, 96, 192, 384, 768]);
+        for block in blocks {
+            let request = Request {
+                stamp: 7 * block,
+                body: Body::LeaseExpiry {
+                    session: origin("s").key(),
+                    renewed: 0,
+                    at_index: None,
+                },
+            };
+            let at = floored(0, &request).expect("an expiry takes effect");
+            assert_eq!(at % block, 0, "block {block}: index {at}");
+        }
     }
 
     /// A lease expiry that releases what its session held derives the

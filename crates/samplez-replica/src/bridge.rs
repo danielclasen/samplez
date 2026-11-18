@@ -196,8 +196,10 @@ impl EngineAudio {
     /// differing from the one its input reads is a re-route, kept by the
     /// rules of [`EngineAudio::kept`] and else left at the one read; a
     /// strip parameter the engine refuses is not set; a gain it refuses
-    /// is silent. A replica rebuilt from it holds what a live one that
-    /// read the same flows holds.
+    /// is silenced, not held at its previous value as a live replica
+    /// holds it: the product state keeps only the refused value, and the
+    /// core it replaces is gone. A replica rebuilt from it holds what a
+    /// live one that read the same flows holds, flows and strips alike.
     fn sanitised(&self, state: &ProductState) -> ProductState {
         let mut state = state.clone();
         let reading: Vec<String> = (self.engine.status().inputs.into_iter())
@@ -336,8 +338,9 @@ impl Audio for EngineAudio {
     }
 
     fn appended(&self, index: u64, at_index: u64, entries: &[Entry]) {
-        // A lease expiry from an older leader derives off a block start:
-        // the next one keeps the log's order.
+        // A lease expiry from an older leader derives at a block start
+        // for every block size dividing `FALLBACK_LEAD`; for another one
+        // the next block start keeps the log's order.
         let at_index = at_index.next_multiple_of(self.block);
         // Filtered only when refused: the fold runs once for a record the
         // engine takes.
