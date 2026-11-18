@@ -535,16 +535,22 @@ on the slack every counted audio replica reports at its apply-hand, up
 to `maxApplyLead`; a replica that still applies past the deadline at the
 cap holds those entries unresolved, and the leader's contact metrics
 name it (`apply_lead_raised_by`). The leader also keeps the lead each
-applied entry needed, over the current minute and the last. It stamps
-every decision on an unresolved entry and every `Baseline` with that
-lead, and at the cap every command too, up to 64 ms past
-`maxApplyLead`, in whole blocks and under one second past the stamp:
-stamped with a lead the commits outlast, a decision would be late again
-and decided in turn, a `Baseline` would lapse for the replica it names,
-and each command would be late on every replica. A command appended
-while a decision is ahead takes effect no earlier than the decision, so
-at the cap a command takes effect up to `maxApplyLead` plus 64 ms after
-its stamp. `samplez_replica_decision_lead_samples` exports that lead.
+entry applied on a counted audio replica needed, over the current minute
+and the last. It stamps every decision on an unresolved entry and every
+`Baseline` with that lead, and at the cap every command too, up to 64
+ms past `maxApplyLead`, in whole blocks and under one second past the
+stamp: stamped with a lead the commits outlast, a decision would be late
+again and decided in turn, a `Baseline` would lapse for the replica it
+names, and each command would be late wherever its commit takes longer.
+One slow replica therefore raises the latency of every command by up to
+64 ms while the lead is capped, and `apply_lead_raised_by` names it.
+The lead does not fall while the entries need more than it. After two
+minutes without entries the lead they needed is forgotten, so the first
+command after such a gap at the cap is stamped with the capped lead. A
+command appended while a decision is ahead takes effect no earlier than
+the decision, so at the cap a command takes effect up to `maxApplyLead`
+plus 64 ms after its stamp. `samplez_replica_decision_lead_samples`
+exports that lead.
 A replica catching up, its log having taken no entry past the commit
 index the first voter report named
 before that entry's deadline since it started or installed a snapshot,
