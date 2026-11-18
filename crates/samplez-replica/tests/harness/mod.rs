@@ -1888,11 +1888,25 @@ impl<P: Product + Sync> Set<P> {
 
     /// Forces a snapshot install on `follower`, which must not lead: cut
     /// off from openraft's RPCs (peer requests still flow), it falls
-    /// behind an entry the leader appends, snapshots and purges; once its
-    /// RPCs flow again the leader can only send it the snapshot. Returns
-    /// once it installed one. The set needs `max_in_snapshot_log_to_keep`
-    /// 0 and no snapshot policy of its own.
+    /// behind an entry the leader appends, and every other running replica
+    /// snapshots and purges past it; once its RPCs flow again whichever
+    /// replica leads can only send it a snapshot. Cut off past its election
+    /// timeout the follower campaigns, and its higher term can move the
+    /// leadership once the RPCs flow: a purge on the leader alone left a
+    /// new leader that still held the entries. Returns once it installed
+    /// one. The set needs `max_in_snapshot_log_to_keep` 0 and no snapshot
+    /// policy of its own.
     pub async fn force_install(&self, follower: NodeId) {
+        self.force_install_after(follower, async {}).await;
+    }
+
+    /// [`Set::force_install`], awaiting `before_reconnect` once every other
+    /// replica purged and before the follower's RPCs flow again.
+    pub async fn force_install_after(
+        &self,
+        follower: NodeId,
+        before_reconnect: impl Future<Output = ()>,
+    ) {
         let leader = self.leader().await;
         assert_ne!(leader, follower, "the follower leads");
         let installs = self.replica(follower).store().installs();
@@ -1915,23 +1929,31 @@ impl<P: Product + Sync> Set<P> {
         })
         .await;
         let index = store.applied_index();
-        let raft = self.replica(leader).raft().clone();
-        raft.trigger().snapshot().await.expect("snapshot");
-        until_wall(deadline, "the leader's snapshot", || {
-            raft.metrics()
-                .borrow()
-                .snapshot
-                .is_some_and(|id| id.index >= index)
-        })
-        .await;
-        raft.trigger().purge_log(index).await.expect("purge");
-        until_wall(deadline, "the leader's purge", || {
-            raft.metrics()
-                .borrow()
-                .purged
-                .is_some_and(|id| id.index >= index)
-        })
-        .await;
+        for &id in &others {
+            let store = self.replica(id).store();
+            let applied = format!("{id} applied the entry");
+            until_wall(deadline, &applied, || store.applied_index() >= index).await;
+            let raft = self.replica(id).raft().clone();
+            raft.trigger().snapshot().await.expect("snapshot");
+            let snapshot = format!("{id}'s snapshot");
+            until_wall(deadline, &snapshot, || {
+                raft.metrics()
+                    .borrow()
+                    .snapshot
+                    .is_some_and(|s| s.index >= index)
+            })
+            .await;
+            raft.trigger().purge_log(index).await.expect("purge");
+            let purged = format!("{id}'s purge");
+            until_wall(deadline, &purged, || {
+                raft.metrics()
+                    .borrow()
+                    .purged
+                    .is_some_and(|p| p.index >= index)
+            })
+            .await;
+        }
+        before_reconnect.await;
         {
             let mut links = self.net.links();
             links

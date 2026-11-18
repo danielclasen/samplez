@@ -701,3 +701,30 @@ async fn a_wall_time_wait_keeps_the_paused_clock_to_wall_time() {
         "the paused clock moved {clock:?} in {wall:?} of wall time"
     );
 }
+
+/// A snapshot install forced on a follower holds through a leader change
+/// while the follower is cut off, as its campaigns past the election
+/// timeout can bring about: the new leader purged as well, so it can only
+/// send the follower a snapshot.
+#[tokio::test(start_paused = true)]
+async fn a_forced_install_holds_through_a_leader_change() {
+    let set = start(vec![a(0), a(1), a(2)], true).await;
+    let leader = set.leader().await;
+    let r = audio(&set).into_iter().find(|&id| id != leader).unwrap();
+    let other = audio(&set)
+        .into_iter()
+        .find(|&id| id != leader && id != r)
+        .unwrap();
+    let raft = set.replica(other).raft().clone();
+    set.force_install_after(r, async {
+        // Votes are refused while the leader's lease runs: called again
+        // until one election is won.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while raft.metrics().borrow().state != openraft::ServerState::Leader {
+            assert!(std::time::Instant::now() < deadline, "{other} leads");
+            let _ = raft.trigger().elect().await;
+            sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await;
+}
