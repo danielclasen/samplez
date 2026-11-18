@@ -367,10 +367,12 @@ async fn a_retargeted_core_is_given_the_entries_still_unresolved() {
     assert_ne!(leader, n);
     set.net.stall(n, Duration::from_millis(60));
     let at = (index_at(set.clock(leader).tai_ns()) + 40 * 48).next_multiple_of(BLOCK);
-    set.replica(leader).append(Body::InputDown {
-        slot: 0,
-        at_index: at,
-    });
+    set.replica(leader)
+        .append(Body::InputDown {
+            slot: 0,
+            at_index: at,
+        })
+        .unwrap();
     set.set_target(Some("r2"));
     sleep(Duration::from_millis(100)).await;
     set.net.unstall(n);

@@ -175,6 +175,8 @@ pub(crate) enum Queued {
 /// What the writer and the peer handlers share.
 pub(crate) struct Shared {
     settings: Settings,
+    /// The product drives an engine ([`Product::DRIVES_ENGINE`]).
+    drives_engine: bool,
     raft: Raft<TypeConfig>,
     peers: Arc<dyn PeerClient>,
     /// The longest a leader goes without a quorum, and a follower without
@@ -338,6 +340,7 @@ impl<P: Product> Replica<P> {
         let settings_epoch = settings.epoch;
         let shared = Arc::new(Shared {
             settings,
+            drives_engine: P::DRIVES_ENGINE,
             raft,
             peers,
             lease: Duration::from_millis(raft_config.election_timeout_max),
@@ -357,9 +360,9 @@ impl<P: Product> Replica<P> {
             receipts: Mutex::default(),
         });
         let (queue, queued) = mpsc::unbounded_channel();
-        tokio::spawn(write(shared.clone(), queued, estimate.clone()));
+        tokio::spawn(write(shared.clone(), queued, estimate.clone(), false));
         let (generations, waiting) = mpsc::unbounded_channel();
-        tokio::spawn(write(shared.clone(), waiting, estimate.clone()));
+        tokio::spawn(write(shared.clone(), waiting, estimate.clone(), true));
         if let Some(voters) = voters {
             tokio::spawn(membership::reconcile(shared.clone(), voters));
         }
@@ -402,8 +405,18 @@ impl<P: Product> Replica<P> {
 
     /// Orders an entry the replica set decides on rather than a client,
     /// behind every command submitted before it; a generation-needing
-    /// entry behind the earlier generation-needing ones only.
-    pub fn append(&self, body: Body) {
+    /// entry behind the earlier generation-needing ones only. A product
+    /// that drives an engine owns every input's flow: a `Route` or
+    /// `MasterEnable` for it is refused.
+    ///
+    /// # Errors
+    ///
+    /// When the product drives an engine and `body` is a `Route` or a
+    /// `MasterEnable`.
+    pub fn append(&self, body: Body) -> Result<(), String> {
+        if P::DRIVES_ENGINE && matches!(body, Body::Route { .. } | Body::MasterEnable { .. }) {
+            return Err("the product owns the inputs' flows".to_owned());
+        }
         let queue = if body.needs_generation() {
             &self.generations
         } else {
@@ -415,6 +428,27 @@ impl<P: Product> Replica<P> {
             reply: None,
             forwarded: false,
         });
+        Ok(())
+    }
+
+    /// Queues a client command for the writer: one that would re-route
+    /// an input ([`Product::reroutes`]) for the writer of the
+    /// generation-needing entries, which orders it alone, stamped for its
+    /// generation; every other for the writer of the rest. False when the
+    /// writer stopped.
+    fn enqueue(&self, item: Item) -> bool {
+        let reroutes = P::DRIVES_ENGINE
+            && !self.store.with_state(|sm| {
+                sm.product
+                    .reroutes(&item.command.origin, &item.command.body)
+                    .is_empty()
+            });
+        let queue = if reroutes {
+            &self.generations
+        } else {
+            &self.queue
+        };
+        queue.send(Queued::Command(item)).is_ok()
     }
 
     /// Makes `members` the first voters; on one node of a new set only.
@@ -574,7 +608,7 @@ impl<P: Product> Replica<P> {
                         reply,
                         forwarded: true,
                     };
-                    let _ = self.queue.send(Queued::Command(item));
+                    let _ = self.enqueue(item);
                     replies.push(replied);
                 }
                 let mut results = Vec::with_capacity(replies.len());
@@ -889,7 +923,7 @@ impl Shared {
     /// forwarding them to the leader, resending what a leader change or a
     /// quiescing leader refused, each until its deadline. Answers each
     /// once this replica applied the entry carrying it.
-    async fn order_commands(&self, mut items: Vec<Item>, estimate: &Estimate) {
+    async fn order_commands(&self, mut items: Vec<Item>, estimate: &Estimate, generation: bool) {
         loop {
             let now = Instant::now();
             items.retain_mut(|item| {
@@ -905,7 +939,7 @@ impl Shared {
                 return;
             }
             if let Some(proposing) = self.propose() {
-                let written = self.write_locally(items, estimate).await;
+                let written = self.write_locally(items, estimate, generation).await;
                 drop(proposing);
                 match written {
                     Ok(()) => return,
@@ -938,10 +972,24 @@ impl Shared {
 
     /// Appends `items` as one entry and answers them; gives them back when
     /// this replica turned out not to lead.
-    async fn write_locally(&self, items: Vec<Item>, estimate: &Estimate) -> Result<(), Vec<Item>> {
-        let stamp = match self.stamp(false, estimate) {
-            Ok(stamp) => stamp,
-            Err(refusal) => return answer_all(items, stamp_refused(refusal)),
+    async fn write_locally(
+        &self,
+        items: Vec<Item>,
+        estimate: &Estimate,
+        generation: bool,
+    ) -> Result<(), Vec<Item>> {
+        let latest = items.iter().map(|item| item.deadline).max();
+        let stamp = loop {
+            match self.stamp(generation, estimate) {
+                Ok(stamp) => break stamp,
+                // One pending generation at a time: wait for it.
+                Err(contact::StampRefusal::GenerationPending)
+                    if latest.is_some_and(|l| Instant::now() + self.heartbeat < l) =>
+                {
+                    tokio::time::sleep(self.heartbeat / 10).await;
+                }
+                Err(refusal) => return answer_all(items, stamp_refused(refusal)),
+            }
         };
         // A member of another configuration would apply them into another
         // product state.
@@ -958,6 +1006,22 @@ impl Shared {
             .partition(|item| item.received.saturating_add(max_age) >= e);
         for item in expired {
             let _ = item.reply.send(Err(Refused::Expired));
+        }
+        // A product that drives an engine derives its entries from the
+        // state at the command's place in the log, which already holds a
+        // scheduled command's effect: one asking for an index beyond the
+        // earliest is not ordered.
+        let earliest = stamp.earliest.next_multiple_of(self.settings.block);
+        let (scheduled, items): (Vec<Item>, Vec<Item>) = items
+            .into_iter()
+            .partition(|item| scheduled(self.drives_engine, item.command.at_index, earliest));
+        for item in scheduled {
+            let at = item.command.at_index.unwrap_or(0);
+            let refused = Refused::Invalid(format!(
+                "scheduled at_index {at} beyond the earliest, {earliest}: this product applies \
+                 commands as they are ordered"
+            ));
+            let _ = item.reply.send(Err(refused));
         }
         if items.is_empty() {
             return Ok(());
@@ -1060,6 +1124,13 @@ impl Shared {
     }
 }
 
+/// Whether a command asking for `at_index` is scheduled past `earliest`,
+/// the earliest block start the writer stamps: refused for a product that
+/// drives an engine.
+fn scheduled(drives_engine: bool, at_index: Option<u64>, earliest: u64) -> bool {
+    drives_engine && at_index.is_some_and(|at| at > earliest)
+}
+
 fn stamp_refused(refusal: contact::StampRefusal) -> Refused {
     Refused::Unavailable(
         match refusal {
@@ -1096,6 +1167,7 @@ async fn write(
     shared: Arc<Shared>,
     mut queued: mpsc::UnboundedReceiver<Queued>,
     estimate: Estimate,
+    generation: bool,
 ) {
     let mut next = None;
     loop {
@@ -1125,6 +1197,11 @@ async fn write(
                     let _ = item.reply.send(Err(Refused::Invalid(why)));
                     continue;
                 }
+                // One that re-routes an input is ordered alone.
+                if generation {
+                    shared.order_commands(vec![item], &estimate, true).await;
+                    continue;
+                }
                 let mut bytes = item.command.size();
                 let mut items = vec![item];
                 while let Ok(queued) = queued.try_recv() {
@@ -1152,7 +1229,7 @@ async fn write(
                         }
                     }
                 }
-                shared.order_commands(items, &estimate).await;
+                shared.order_commands(items, &estimate, false).await;
             }
         }
     }
@@ -1170,6 +1247,7 @@ impl Shared {
         let commands = commands
             .iter()
             .map(|c| Command {
+                generation: None,
                 at_index: Some(c.at_index.unwrap_or(0)),
                 ..(*c).clone()
             })
@@ -1403,6 +1481,7 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
         let deadline = Instant::now() + self.shared.settings.write_timeout;
         let item = Item {
             command: Command {
+                generation: None,
                 origin: Origin::from(owner),
                 id: id.to_owned(),
                 at_index: None,
@@ -1413,11 +1492,13 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
             reply,
             forwarded: false,
         };
-        let queued = self.queue.send(Queued::Command(item));
+        let queued = self.enqueue(item);
         let id = id.to_owned();
         Box::pin(async move {
             let stopped = || NotApplied::new(Reason::Unavailable, "replica stopped");
-            queued.map_err(|_| stopped())?;
+            if !queued {
+                return Err(stopped());
+            }
             let replied = match tokio::time::timeout_at(deadline, replied).await {
                 Ok(replied) => replied.unwrap_or_else(|_| Err(self::stopped())),
                 Err(_) => Err(Refused::Unavailable("timed out".into())),
@@ -1442,7 +1523,8 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
     }
 
     fn renew_sessions(&self, live: &[Owner]) {
-        self.append(Body::LeaseRenew(
+        // Never a route: never refused.
+        let _ = self.append(Body::LeaseRenew(
             live.iter().map(SessionKey::from).collect(),
         ));
     }
@@ -1451,6 +1533,17 @@ impl<P: Product + Sync> ReplicatedState for Replica<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A product that drives an engine refuses a command asking for an
+    /// index beyond the earliest; one that does not keeps it, and an
+    /// index at or before the earliest, or none, is never refused.
+    #[test]
+    fn only_an_engine_product_refuses_a_scheduled_index() {
+        assert!(scheduled(true, Some(4848), 4800));
+        assert!(!scheduled(true, Some(4800), 4800));
+        assert!(!scheduled(true, None, 4800));
+        assert!(!scheduled(false, Some(48_000), 4800));
+    }
     use crate::state_machine::tests::Paths;
     use openraft::error::{InstallSnapshotError, RPCError, Unreachable};
     use openraft::network::{RPCOption, RaftNetwork};
@@ -1470,6 +1563,7 @@ mod tests {
     #[test]
     fn commands_asking_for_other_indexes_take_entries_of_their_own() {
         let command = |at_index, bytes: usize| Command {
+            generation: None,
             origin: Origin {
                 principal: "p".into(),
                 session: "s".into(),

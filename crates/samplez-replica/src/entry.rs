@@ -73,6 +73,11 @@ pub struct Command {
     /// The product's encoding.
     #[serde(with = "bytes")]
     pub body: Vec<u8>,
+    /// Whether the writer ordered it on the generation path, as one that
+    /// re-routes inputs ([`crate::state_machine::Product::reroutes`]);
+    /// `None` from a writer that did not classify it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<bool>,
 }
 
 impl Command {

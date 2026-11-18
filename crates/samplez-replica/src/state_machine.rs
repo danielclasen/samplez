@@ -22,7 +22,36 @@ pub trait Product: Send + 'static {
     /// a later one's effect carries the ordering its apply needs and is
     /// refused as [`Effect::Stale`] when older, with no effect: a copy can
     /// apply again once its dedup record retired.
-    fn apply(&mut self, origin: &Origin, command: &[u8]) -> Effect<Self::Change>;
+    ///
+    /// `ctx` says how the writer ordered it. A product that drives an
+    /// engine refuses, with no effect, a command that would re-route an
+    /// input and was ordered off the generation path
+    /// (`ctx.generation == Some(false)`), and one that would re-route
+    /// inputs of more than one domain: every replica decides that alike
+    /// from its state.
+    fn apply(&mut self, origin: &Origin, command: &[u8], ctx: &Apply) -> Effect<Self::Change>;
+
+    /// Whether the product drives an engine through [`Product::targets`]:
+    /// its engine entries are derived from its state as each entry
+    /// applies, it owns every input's flow, and a client command asking
+    /// for an index beyond the earliest is refused.
+    const DRIVES_ENGINE: bool = false;
+
+    /// The engine targets of the current state: absolute, a function of
+    /// the state and the configuration the product was built with alone,
+    /// the same bits on every replica. None for a product that drives no
+    /// engine.
+    fn targets(&self) -> Option<samplez::Targets> {
+        None
+    }
+
+    /// The input slots `command` from `origin` would re-route applied to
+    /// the current state: the writer orders such a command alone on the
+    /// generation path. Read before the command is ordered, so the state
+    /// it applies to may differ; [`Product::apply`] decides.
+    fn reroutes(&self, _origin: &Origin, _command: &[u8]) -> Vec<u32> {
+        Vec::new()
+    }
 
     /// Ends what `session` held under its lease, such as touch ownership:
     /// [`Effect::Changed`] when that changed the state. The session's
@@ -83,6 +112,33 @@ pub trait Product: Send + 'static {
 /// Builds an empty product with the replica's configuration: the state a
 /// store opens into and every snapshot install loads into.
 pub type Factory<P> = std::sync::Arc<dyn Fn() -> P + Send + Sync>;
+
+/// How the writer ordered a command, as [`Product::apply`] gets it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Apply {
+    /// [`Command::generation`].
+    pub generation: Option<bool>,
+}
+
+/// An entry's at_index further than this past its stamping index, one
+/// second at 48 kHz, does not move [`StateMachine::floor`] past the stamp:
+/// an entry from a writer that kept a far client index would hold every
+/// later entry back until it.
+pub const AHEAD_MAX: u64 = 48_000;
+
+/// How long a derived record is kept past its index: a resync replays the
+/// records after a donor's core, copied after the block in progress.
+pub const RECORDS_KEPT: u64 = 48_000;
+
+/// The engine entries one log entry derived, and where they apply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Record {
+    /// The entry's index raised to [`StateMachine::floor`].
+    pub at_index: u64,
+    pub entries: Vec<samplez::Entry>,
+    /// Whether it raises or re-routes an input: built a generation.
+    pub generation: bool,
+}
 
 /// How the product applied a command or an expiry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +250,22 @@ pub struct StateMachine<P> {
     pub deltas: VecDeque<Change>,
     /// `deltas` holds every delta after this product revision.
     pub deltas_after: u64,
+    /// The highest index any entry applied so far takes effect at: an
+    /// entry's own index is raised to it, so the engine applies the
+    /// entries in log order whatever their indexes, and each diff applies
+    /// to the targets it was computed against.
+    pub floor: u64,
+    /// The decidable entries that derived engine entries, by the log index
+    /// they are known under, with the input slots they re-routed: a
+    /// restamp of one re-asserts the targets, of one that derived nothing
+    /// nothing.
+    pub derived: BTreeMap<u64, Vec<u32>>,
+    /// Not replicated: the targets as last derived, a product that drives
+    /// an engine only.
+    image: Option<samplez::Targets>,
+    /// Not replicated: the records derived since start or load, by log
+    /// index, kept [`RECORDS_KEPT`] past their index.
+    pub records: BTreeMap<u64, Record>,
 }
 
 impl<P: Product> StateMachine<P> {
@@ -216,7 +288,115 @@ impl<P: Product> StateMachine<P> {
             revision: 0,
             deltas: VecDeque::new(),
             deltas_after: 0,
+            floor: 0,
+            derived: BTreeMap::new(),
+            image: None,
+            records: BTreeMap::new(),
         }
+        .imaged()
+    }
+
+    /// With [`StateMachine::image`] taken from the product.
+    fn imaged(mut self) -> StateMachine<P> {
+        self.image = if P::DRIVES_ENGINE {
+            self.product.targets()
+        } else {
+            None
+        };
+        self
+    }
+
+    /// The index entry `request` takes effect at, raised to the floor,
+    /// and the floor after it: its own at_index, or its stamp for one
+    /// further than [`AHEAD_MAX`] past it or for a lease expiry, which
+    /// carries none.
+    fn floored(&self, request: &Request) -> Option<u64> {
+        let own = match (request.at_index(), &request.body) {
+            (Some(at), _) if at <= request.stamp.saturating_add(AHEAD_MAX) => at,
+            (Some(_), _) | (None, Body::LeaseExpiry { .. }) => request.stamp,
+            (None, _) => return None,
+        };
+        Some(own.max(self.floor))
+    }
+
+    /// Derives the engine entries of the entry at log index `revision`,
+    /// applied at `at`: the diff of the targets when it `changed` the
+    /// product, every target and the routes of the entry it names for a
+    /// restamp of one that derived some, an input's state for an
+    /// `InputDown` or `InputUp`.
+    fn derive(
+        &mut self,
+        revision: u64,
+        request: &Request,
+        at: u64,
+        changed: bool,
+        restamped: Option<Vec<u32>>,
+    ) {
+        if !P::DRIVES_ENGINE {
+            return;
+        }
+        let (entries, routed) = match (&request.body, restamped) {
+            (Body::Restamp { .. }, Some(slots)) => {
+                let Some(targets) = self.product.targets() else {
+                    return;
+                };
+                let slots: Vec<usize> = slots.iter().map(|&s| s as usize).collect();
+                let entries = targets.assert(&slots);
+                self.image = Some(targets);
+                (entries, Vec::new())
+            }
+            (Body::InputDown { slot, .. }, _) => (
+                vec![samplez::Entry::InputDown {
+                    slot: *slot as usize,
+                }],
+                Vec::new(),
+            ),
+            (Body::InputUp { slot, .. }, _) => (
+                vec![samplez::Entry::InputUp {
+                    slot: *slot as usize,
+                }],
+                Vec::new(),
+            ),
+            (Body::Commands(_) | Body::LeaseExpiry { .. }, _) if changed => {
+                let Some(next) = self.product.targets() else {
+                    return;
+                };
+                let entries = self.image.as_ref().map_or_else(
+                    || samplez::Targets::default().diff(&next),
+                    |image| image.diff(&next),
+                );
+                self.image = Some(next);
+                let routed = entries
+                    .iter()
+                    .filter_map(|e| match e {
+                        samplez::Entry::Route { slot, .. } => Some(*slot as u32),
+                        _ => None,
+                    })
+                    .collect();
+                (entries, routed)
+            }
+            _ => return,
+        };
+        if entries.is_empty() {
+            return;
+        }
+        let generation = entries.iter().any(|e| {
+            matches!(
+                e,
+                samplez::Entry::InputUp { .. } | samplez::Entry::Route { .. }
+            )
+        });
+        if matches!(request.body, Body::Commands(_)) && self.terms.contains_key(&revision) {
+            self.derived.insert(revision, routed);
+        }
+        self.records.insert(
+            revision,
+            Record {
+                at_index: at,
+                entries,
+                generation,
+            },
+        );
     }
 
     /// Applies the request of the entry at log index `revision`, of term
@@ -230,6 +410,23 @@ impl<P: Product> StateMachine<P> {
     pub fn apply_at(&mut self, revision: u64, term: u64, request: &Request) -> Response {
         let stamp = request.stamp;
         self.forget_ended(stamp);
+        let at = self.floored(request);
+        if let Some(at) = at {
+            self.floor = at;
+        }
+        // A restamp of an entry held that derived engine entries: the
+        // slots it re-routed, read before the restamp moves it.
+        let restamped = match request.body {
+            Body::Restamp {
+                revision: of,
+                term: of_term,
+                ..
+            } if self.terms.get(&of).is_some_and(|&(t, _)| t == of_term) => {
+                self.derived.get(&of).cloned()
+            }
+            _ => None,
+        };
+        let revision_before = self.revision;
         if let Some(at) = request.at_index()
             && request.body.decides().is_none()
         {
@@ -244,6 +441,10 @@ impl<P: Product> StateMachine<P> {
             self.decided.entry(named).or_insert((revision, until));
         }
         let response = self.apply_body(revision, term, request);
+        if let Some(at) = at {
+            let changed = self.revision != revision_before;
+            self.derive(revision, request, at, changed, restamped);
+        }
         self.prune();
         response
     }
@@ -272,6 +473,9 @@ impl<P: Product> StateMachine<P> {
                     let behind = self.restamps.remove(of).map_or(0, |(n, _)| n);
                     self.restamps.insert(revision, (behind + 1, *at_index));
                     self.terms.insert(revision, (term, *at_index));
+                    if let Some(routed) = self.derived.remove(of) {
+                        self.derived.insert(revision, routed);
+                    }
                 }
                 Response::default()
             }
@@ -283,6 +487,7 @@ impl<P: Product> StateMachine<P> {
                     self.pending.remove(of);
                     self.restamps.remove(of);
                     self.terms.remove(of);
+                    self.derived.remove(of);
                 }
                 Response::default()
             }
@@ -374,6 +579,10 @@ impl<P: Product> StateMachine<P> {
         self.terms
             .retain(|index, &mut (_, at)| at >= passed || pending.contains_key(index));
         self.decided.retain(|_, &mut (_, until)| until >= passed);
+        let terms = &self.terms;
+        self.derived.retain(|index, _| terms.contains_key(index));
+        let kept = self.highest_stamp.saturating_sub(RECORDS_KEPT);
+        self.records.retain(|_, r| r.at_index >= kept);
     }
 
     /// Applies every command of an entry, then makes its changes one delta
@@ -400,7 +609,10 @@ impl<P: Product> StateMachine<P> {
                 outcomes.push(Outcome { revision, result });
                 continue;
             }
-            let result = match self.product.apply(&command.origin, &command.body) {
+            let ctx = Apply {
+                generation: command.generation,
+            };
+            let result = match self.product.apply(&command.origin, &command.body, &ctx) {
                 Effect::Changed(change) => {
                     changes.push((n, change));
                     Resolution::Applied
@@ -502,6 +714,8 @@ impl<P: Product> StateMachine<P> {
             ended: self.ended.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             highest_stamp: self.highest_stamp,
             revision: self.revision,
+            floor: Some(self.floor),
+            derived: self.derived.clone(),
         }
     }
 
@@ -524,6 +738,19 @@ impl<P: Product> StateMachine<P> {
         self.revision = saved.revision;
         self.deltas.clear();
         self.deltas_after = saved.revision;
+        // A snapshot written before the floor was kept: the highest index
+        // an entry still decidable takes effect at, the same on every
+        // replica that loads it.
+        self.floor = saved
+            .floor
+            .unwrap_or_else(|| self.terms.values().map(|&(_, at)| at).max().unwrap_or(0));
+        self.derived = saved.derived;
+        self.records.clear();
+        self.image = if P::DRIVES_ENGINE {
+            self.product.targets()
+        } else {
+            None
+        };
         Ok(())
     }
 }
@@ -580,7 +807,12 @@ pub(crate) mod tests {
     impl Product for Paths {
         type Change = (String, String);
 
-        fn apply(&mut self, origin: &Origin, command: &[u8]) -> Effect<(String, String)> {
+        fn apply(
+            &mut self,
+            origin: &Origin,
+            command: &[u8],
+            _: &Apply,
+        ) -> Effect<(String, String)> {
             let (path, value, seq) = parse(command);
             let held = self.values.get(&path).cloned();
             if held.as_ref().is_some_and(|(_, last)| *last >= seq) {
@@ -654,6 +886,7 @@ pub(crate) mod tests {
 
     pub fn command(session: &str, id: &str, body: &str) -> Command {
         Command {
+            generation: None,
             origin: origin(session),
             id: id.into(),
             at_index: None,
@@ -1293,5 +1526,377 @@ pub(crate) mod tests {
             .expect("loads");
         assert_eq!(loaded.terms, sm.terms);
         assert_eq!(loaded.pending, sm.pending);
+    }
+}
+
+/// Engine entries derived from product state: a desk whose coefficients
+/// depend on more than one command.
+#[cfg(test)]
+mod derive_tests {
+    use samplez::{Entry, Targets};
+    use samplez_dsp::StripParam;
+    use serde::{Deserialize, Serialize};
+
+    use super::tests::{command, origin};
+    use super::*;
+
+    /// Two input slots of one channel into one output: each coefficient is
+    /// the slot's fader times the VCA, slot 1 silent while a session holds
+    /// solo on slot 0. Commands: `fader <slot> <gain>`, `vca <gain>`,
+    /// `trim <slot> <db>`, `route <slot> <flow>`, `solo`, `noop`, `stale`.
+    #[derive(Serialize, Deserialize)]
+    struct Desk {
+        faders: [f64; 2],
+        vca: f64,
+        trims: [f32; 2],
+        flows: [String; 2],
+        solo: Option<SessionKey>,
+    }
+
+    impl Desk {
+        fn new() -> Desk {
+            Desk {
+                faders: [1.0, 1.0],
+                vca: 1.0,
+                trims: [0.0, 0.0],
+                flows: ["a".into(), "b".into()],
+                solo: None,
+            }
+        }
+    }
+
+    impl Product for Desk {
+        type Change = ();
+        const DRIVES_ENGINE: bool = true;
+
+        fn apply(&mut self, origin: &Origin, command: &[u8], ctx: &Apply) -> Effect<()> {
+            let text = std::str::from_utf8(command).expect("utf-8");
+            let words: Vec<&str> = text.split(' ').collect();
+            match words[..] {
+                ["fader", slot, gain] => {
+                    self.faders[slot.parse::<usize>().unwrap()] = gain.parse().unwrap()
+                }
+                ["vca", gain] => self.vca = gain.parse().unwrap(),
+                ["trim", slot, db] => {
+                    self.trims[slot.parse::<usize>().unwrap()] = db.parse().unwrap()
+                }
+                // Ordered off the generation path: refused.
+                ["route", ..] if ctx.generation == Some(false) => return Effect::Unchanged,
+                ["route", slot, flow] => self.flows[slot.parse::<usize>().unwrap()] = flow.into(),
+                ["solo"] => self.solo = Some(origin.key()),
+                ["noop"] => return Effect::Unchanged,
+                _ => return Effect::Stale,
+            }
+            Effect::Changed(())
+        }
+        fn expire(&mut self, session: &SessionKey) -> Effect<()> {
+            if self.solo.as_ref() != Some(session) {
+                return Effect::Unchanged;
+            }
+            self.solo = None;
+            Effect::Changed(())
+        }
+        fn forget(&mut self, _: &SessionKey) {}
+        fn delta(&self, _: u64, _: &[Changed<'_, ()>]) -> String {
+            String::new()
+        }
+        fn text(&self) -> String {
+            String::new()
+        }
+        fn save(&self) -> Vec<u8> {
+            serde_json::to_vec(self).expect("encodes")
+        }
+        fn load(&mut self, saved: &[u8]) -> Result<(), String> {
+            *self = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        fn paths(&self, _: &[u8]) -> Vec<String> {
+            Vec::new()
+        }
+        fn config_hash(&self) -> u64 {
+            0
+        }
+        fn targets(&self) -> Option<Targets> {
+            let gain = |slot: usize| {
+                let muted = slot == 1 && self.solo.is_some();
+                if muted {
+                    0.0
+                } else {
+                    (self.faders[slot] * self.vca) as f32
+                }
+            };
+            Some(Targets {
+                gains: vec![vec![gain(0)], vec![gain(1)]],
+                flows: self.flows.to_vec(),
+                strips: self
+                    .trims
+                    .iter()
+                    .map(|&db| vec![StripParam::Trim { db }])
+                    .collect(),
+            })
+        }
+        fn reroutes(&self, _: &Origin, command: &[u8]) -> Vec<u32> {
+            let text = std::str::from_utf8(command).expect("utf-8");
+            match text.split(' ').collect::<Vec<_>>()[..] {
+                ["route", slot, _] => vec![slot.parse().unwrap()],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    fn machine() -> StateMachine<Desk> {
+        StateMachine::new(Desk::new(), Limits::defaults(48_000))
+    }
+
+    /// A `Commands` entry of one command `body` of session `s`, stamped
+    /// `stamp`, asking for `at`, flagged `generation`.
+    fn one(id: &str, body: &str, stamp: u64, at: u64, generation: Option<bool>) -> Request {
+        let mut c = command("s", id, body);
+        c.at_index = Some(at);
+        c.generation = generation;
+        Request {
+            stamp,
+            body: Body::Commands(vec![c]),
+        }
+    }
+
+    fn gains(r: &Record) -> Vec<(usize, usize, u32)> {
+        r.entries
+            .iter()
+            .filter_map(|e| match *e {
+                Entry::Gain {
+                    input,
+                    output,
+                    gain,
+                } => Some((input, output, gain.to_bits())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A VCA move derives every member coefficient as fader times VCA,
+    /// which no translation of the VCA command alone could give, and two
+    /// replicas derive the same bits.
+    #[test]
+    fn a_vca_move_derives_every_member_coefficient() {
+        let log = [
+            one("1", "fader 0 0.5", 0, 960, None),
+            one("2", "fader 1 0.25", 0, 960, None),
+            one("3", "vca 0.5", 48, 1008, None),
+        ];
+        let (mut a, mut b) = (machine(), machine());
+        for (n, r) in log.iter().enumerate() {
+            a.apply(n as u64 + 1, r);
+            b.apply(n as u64 + 1, r);
+        }
+        let vca = &a.records[&3];
+        assert_eq!(
+            gains(vca),
+            [(0, 0, 0.25f32.to_bits()), (1, 0, 0.125f32.to_bits())]
+        );
+        assert_eq!(vca.at_index, 1008);
+        assert_eq!(a.records, b.records);
+    }
+
+    /// A strip parameter is derived whole from the state.
+    #[test]
+    fn a_strip_parameter_is_derived_from_the_state() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "trim 1 -6", 0, 960, None));
+        assert_eq!(
+            sm.records[&1].entries,
+            [Entry::Strip {
+                slot: 1,
+                param: StripParam::Trim { db: -6.0 }
+            }]
+        );
+    }
+
+    /// A stale, an unchanged and a duplicate command derive nothing, and
+    /// the floor still advances to their index.
+    #[test]
+    fn a_command_that_changes_nothing_derives_nothing() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "stale", 0, 960, None));
+        sm.apply(2, &one("2", "noop", 0, 1440, None));
+        sm.apply(3, &one("3", "fader 0 0.5", 0, 1920, None));
+        sm.apply(4, &one("3", "fader 0 0.5", 0, 2400, None));
+        assert_eq!(sm.records.keys().copied().collect::<Vec<_>>(), [3]);
+        assert_eq!(sm.floor, 2400);
+    }
+
+    /// A lease expiry that releases what its session held derives the
+    /// coefficients it changes, at its stamp raised to the floor.
+    #[test]
+    fn a_lease_expiry_derives_through_the_same_hook() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "solo", 0, 960, None));
+        assert_eq!(gains(&sm.records[&1]), [(1, 0, 0.0f32.to_bits())]);
+        let expiry = |renewed| Request {
+            stamp: 4800,
+            body: Body::LeaseExpiry {
+                session: origin("s").key(),
+                renewed,
+            },
+        };
+        sm.apply(2, &expiry(0));
+        assert_eq!(gains(&sm.records[&2]), [(1, 0, 1.0f32.to_bits())]);
+        assert_eq!(sm.records[&2].at_index, 4800);
+        // One the session outlived changes nothing.
+        sm.apply(3, &one("3", "solo", 4848, 5808, None));
+        sm.apply(4, &expiry(0));
+        assert!(!sm.records.contains_key(&4));
+    }
+
+    /// An entry stamped earlier than the one before it in the log takes
+    /// effect at that one's index: the engine applies them in log order,
+    /// and the fader ends at the later entry's value.
+    #[test]
+    fn an_entry_never_takes_effect_before_the_one_before_it() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "route 0 c", 0, 3000, Some(true)));
+        sm.apply(2, &one("2", "fader 0 0.5", 0, 1000, None));
+        assert_eq!(sm.records[&1].at_index, 3000);
+        assert!(sm.records[&1].generation);
+        assert_eq!(sm.records[&2].at_index, 3000);
+        assert_eq!(gains(&sm.records[&2]), [(0, 0, 0.5f32.to_bits())]);
+    }
+
+    /// A restamp re-asserts every target of the state at its own place in
+    /// the log, with the routes of the entry it names: a value set after
+    /// that entry is not undone, and an entry after the restamp applies at
+    /// or after it. A second decision on the entry derives nothing.
+    #[test]
+    fn a_restamp_reasserts_the_state_at_its_place() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "route 0 c", 0, 3000, Some(true)));
+        sm.apply_at(11, 1, &one("2", "fader 0 0.2", 0, 3000, None));
+        let restamp = |at_index| Request {
+            stamp: 96,
+            body: Body::Restamp {
+                revision: 10,
+                term: 1,
+                at_index,
+                paths: Vec::new(),
+            },
+        };
+        sm.apply_at(12, 1, &restamp(4000));
+        let r = &sm.records[&12];
+        assert_eq!(r.at_index, 4000);
+        assert!(r.generation);
+        assert!(r.entries.contains(&Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.2
+        }));
+        assert!(r.entries.contains(&Entry::Route {
+            slot: 0,
+            flow_id: "c".into()
+        }));
+        assert!(
+            !r.entries
+                .iter()
+                .any(|e| matches!(e, Entry::Route { slot: 1, .. }))
+        );
+        sm.apply_at(13, 1, &one("3", "fader 1 0.5", 96, 1000, None));
+        assert_eq!(sm.records[&13].at_index, 4000);
+        sm.apply_at(14, 1, &restamp(5000));
+        assert!(!sm.records.contains_key(&14));
+    }
+
+    /// A restamp of an entry that derived nothing derives nothing.
+    #[test]
+    fn a_restamp_of_an_entry_that_derived_nothing_derives_nothing() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "noop", 0, 3000, None));
+        sm.apply_at(
+            11,
+            1,
+            &Request {
+                stamp: 96,
+                body: Body::Restamp {
+                    revision: 10,
+                    term: 1,
+                    at_index: 4000,
+                    paths: Vec::new(),
+                },
+            },
+        );
+        assert!(!sm.records.contains_key(&11));
+    }
+
+    /// An entry asking for an index further than `AHEAD_MAX` past its
+    /// stamp, as a writer that kept a far client index orders it, moves
+    /// the floor to its stamp only.
+    #[test]
+    fn a_far_index_does_not_move_the_floor_past_its_stamp() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "fader 0 0.5", 960, 960 + 60 * 48_000, None));
+        assert_eq!(sm.floor, 960);
+        assert_eq!(sm.records[&1].at_index, 960);
+    }
+
+    /// A snapshot written before the floor was kept loads with the highest
+    /// index an entry still decidable takes effect at; one with the floor
+    /// loads it.
+    #[test]
+    fn a_snapshot_without_a_floor_loads_the_highest_decidable_index() {
+        let mut sm = machine();
+        sm.apply_at(1, 1, &one("1", "fader 0 0.5", 0, 3000, None));
+        sm.apply_at(2, 1, &one("2", "fader 0 0.25", 0, 2000, None));
+        let mut saved = sm.save();
+        assert_eq!(saved.floor, Some(3000));
+        let mut loaded = machine();
+        loaded
+            .load(saved.clone(), Limits::defaults(48_000))
+            .unwrap();
+        assert_eq!(loaded.floor, 3000);
+        saved.floor = None;
+        let mut legacy = machine();
+        legacy.load(saved, Limits::defaults(48_000)).unwrap();
+        assert_eq!(legacy.floor, 3000);
+        // The next entry derives the same on both.
+        let next = one("3", "vca 0.5", 96, 1000, None);
+        loaded.apply_at(3, 1, &next);
+        legacy.apply_at(3, 1, &next);
+        assert_eq!(loaded.records, legacy.records);
+    }
+
+    /// A command that would re-route, ordered off the generation path, is
+    /// refused by the product, which reads the flag it was ordered with;
+    /// one from a writer that did not classify applies.
+    #[test]
+    fn the_product_reads_how_a_command_was_ordered() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "route 0 c", 0, 960, Some(false)));
+        assert!(!sm.records.contains_key(&1));
+        assert_eq!(sm.product.flows[0], "a");
+        sm.apply(2, &one("2", "route 0 c", 0, 960, None));
+        assert!(sm.records[&2].generation);
+        assert_eq!(sm.product.flows[0], "c");
+    }
+
+    /// Floats survive a snapshot bit for bit: serde_json parses each one
+    /// correctly rounded.
+    #[test]
+    fn product_floats_survive_a_snapshot_bit_for_bit() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let values: Vec<f64> = (0..20_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                f64::from_bits(x).abs() % 10.0
+            })
+            .filter(|v| v.is_finite())
+            .collect();
+        let text = serde_json::to_string(&values).unwrap();
+        let back: Vec<f64> = serde_json::from_str(&text).unwrap();
+        let differ = values
+            .iter()
+            .zip(&back)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differ, 0, "{differ} of {} values moved", values.len());
     }
 }

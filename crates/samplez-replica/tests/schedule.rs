@@ -139,10 +139,12 @@ async fn commands_are_stamped_a_lead_past_e_and_later_indices_kept() {
     assert_eq!(at, request.stamp + lead());
     // An engine entry asked for far ahead keeps its index.
     let far = request.stamp + 480_000;
-    set.replica(leader).append(Body::InputDown {
-        slot: 0,
-        at_index: far,
-    });
+    set.replica(leader)
+        .append(Body::InputDown {
+            slot: 0,
+            at_index: far,
+        })
+        .unwrap();
     sleep(Duration::from_millis(20)).await;
     let request = entries(&set, leader).pop().unwrap();
     assert_eq!(request.at_index(), Some(far));
@@ -154,10 +156,12 @@ async fn the_future_list_holds_64_entries() {
     let leader = set.leader().await;
     let far = e(&set, leader) + 4_800_000;
     for n in 0..FUTURE_LIST as u64 + 6 {
-        set.replica(leader).append(Body::InputDown {
-            slot: 0,
-            at_index: far + n * BLOCK,
-        });
+        set.replica(leader)
+            .append(Body::InputDown {
+                slot: 0,
+                at_index: far + n * BLOCK,
+            })
+            .unwrap();
     }
     sleep(Duration::from_millis(200)).await;
     let pending = entries(&set, leader)
@@ -176,14 +180,18 @@ async fn generation_needing_entries_wait_for_the_last_one_and_buildlead() {
         set.audio(id).lock().build_lead = Some(build_lead);
     }
     sleep(Duration::from_millis(20)).await;
-    set.replica(leader).append(Body::InputUp {
-        slot: 0,
-        at_index: 0,
-    });
-    set.replica(leader).append(Body::InputUp {
-        slot: 1,
-        at_index: 0,
-    });
+    set.replica(leader)
+        .append(Body::InputUp {
+            slot: 0,
+            at_index: 0,
+        })
+        .unwrap();
+    set.replica(leader)
+        .append(Body::InputUp {
+            slot: 1,
+            at_index: 0,
+        })
+        .unwrap();
     sleep(Duration::from_millis(300)).await;
     let ups: Vec<Request> = entries(&set, leader)
         .into_iter()
@@ -205,6 +213,7 @@ fn forwarded(received: u64) -> PeerRequest {
     PeerRequest::Forward {
         commands: vec![Forwarded {
             command: Command {
+                generation: None,
                 origin: Origin::from(&o),
                 id: "late".into(),
                 at_index: None,
@@ -314,10 +323,12 @@ async fn review_the_future_list_counts_committed_entries() {
     let leader = set.leader().await;
     let far = e(&set, leader) + 4_800_000;
     for n in 0..FUTURE_LIST as u64 + 6 {
-        set.replica(leader).append(Body::InputDown {
-            slot: 0,
-            at_index: far + n * BLOCK,
-        });
+        set.replica(leader)
+            .append(Body::InputDown {
+                slot: 0,
+                at_index: far + n * BLOCK,
+            })
+            .unwrap();
         // Each committed and reported committed by every voter before the
         // next one.
         sleep(Duration::from_millis(10)).await;
@@ -340,14 +351,18 @@ async fn review_a_pending_generation_does_not_hold_commands() {
         set.audio(id).lock().build_lead = Some(400 * BLOCK);
     }
     sleep(Duration::from_millis(20)).await;
-    set.replica(leader).append(Body::InputUp {
-        slot: 0,
-        at_index: 0,
-    });
-    set.replica(leader).append(Body::InputUp {
-        slot: 1,
-        at_index: 0,
-    });
+    set.replica(leader)
+        .append(Body::InputUp {
+            slot: 0,
+            at_index: 0,
+        })
+        .unwrap();
+    set.replica(leader)
+        .append(Body::InputUp {
+            slot: 1,
+            at_index: 0,
+        })
+        .unwrap();
     sleep(Duration::from_millis(5)).await;
     let t = tokio::time::Instant::now();
     set.replica(leader)
@@ -438,6 +453,7 @@ async fn a_command_asking_for_an_index_off_a_block_start_is_ordered_at_the_next(
     let request = PeerRequest::Forward {
         commands: vec![Forwarded {
             command: Command {
+                generation: None,
                 origin: Origin::from(&o),
                 id: "off".into(),
                 at_index: Some(asked),

@@ -43,7 +43,7 @@ use samplez_replica::membership::{Slot, slot_of};
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest, PeerResponse};
 use samplez_replica::report::{ClockFlags, Own, Page, Report, Run, runs};
 use samplez_replica::resync::{CoreReply, Resynced, Source};
-use samplez_replica::state_machine::{Changed, Effect, Product};
+use samplez_replica::state_machine::{Apply, Changed, Effect, Product};
 use samplez_replica::{Replica, Settings, TypeConfig, raft_config};
 use samplez_service::{Owner, ReplicatedState, Role};
 use tokio::time::Instant;
@@ -124,7 +124,7 @@ fn parse(command: &[u8]) -> (String, String, u64) {
 impl Product for Paths {
     type Change = (String, String);
 
-    fn apply(&mut self, origin: &Origin, command: &[u8]) -> Effect<(String, String)> {
+    fn apply(&mut self, origin: &Origin, command: &[u8], _: &Apply) -> Effect<(String, String)> {
         let text = std::str::from_utf8(command).expect("utf-8");
         if text.starts_with("touch ") || text.starts_with("release ") {
             return self.touch(origin, text);
@@ -1818,7 +1818,7 @@ impl Set {
         let store = self.replica(leader).store();
         let before = store.applied_index();
         let at = (contact::index_at(self.clock(leader).tai_ns()) + RATE).next_multiple_of(BLOCK);
-        self.replica(leader).append(Body::InputDown {
+        let _ = self.replica(leader).append(Body::InputDown {
             slot: 0,
             at_index: at,
         });

@@ -187,10 +187,12 @@ async fn links_recovering_6_ms_apart_hold_nobody_silent() {
 /// appended it; its log index and at_index.
 async fn append_ahead(set: &Set, leader: NodeId, on: NodeId) -> (u64, u64) {
     let at = (index_at(tai(set)) + 40 * 48).next_multiple_of(BLOCK);
-    set.replica(leader).append(Body::InputDown {
-        slot: 0,
-        at_index: at,
-    });
+    set.replica(leader)
+        .append(Body::InputDown {
+            slot: 0,
+            at_index: at,
+        })
+        .unwrap();
     for _ in 0..20 {
         let appended = set.audio(on).lock().appended.clone();
         if let Some(&(index, _)) = appended.iter().find(|(_, a)| *a == Some(at)) {
@@ -251,10 +253,12 @@ async fn a_stalled_append_response_leaves_the_commit_to_the_listing() {
     // the leader's committed id lies past a's log end.
     set.net.cut_one_way(b, a);
     let second = (at + BLOCK, index + 1);
-    set.replica(leader).append(Body::InputUp {
-        slot: 0,
-        at_index: second.0,
-    });
+    set.replica(leader)
+        .append(Body::InputUp {
+            slot: 0,
+            at_index: second.0,
+        })
+        .unwrap();
     committed_in_time(&set, a, index, at).await;
     assert!(
         set.replica(a).store().log_id_at(second.1).is_none(),

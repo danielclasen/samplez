@@ -413,6 +413,24 @@ lag beyond the horizon drops it again. The core is rebuilt only from the
 product state that `EngineAudio::with_rebuild` supplies: a product that
 embeds the replica without one leaves every replica in `starting`.
 
+A product that drives an engine (`Product::DRIVES_ENGINE`) gives its
+absolute engine targets (`Product::targets`), and the state machine
+derives each log entry's engine entries as it applies, from the state
+after it: the diff of the targets for a command or a lease expiry that
+changed the product, every target and the routes of the entry it names
+for a restamp of one that derived some, an input's state for an
+`InputDown` or `InputUp`. Each record applies at the entry's index
+raised to the floor, the highest index of any entry before it, so the
+engine applies them in log order and each diff applies to the targets it
+was computed against; an index further than one second past the entry's
+stamp counts as the stamp. Records are kept in memory for a second past
+their index; the floor and which decidable entries derived records, with
+the inputs they re-routed, are in snapshots. A client command that would
+re-route an input (`Product::reroutes`) is ordered alone on the
+generation path, and one asking for an index beyond the earliest is
+refused. Such a product owns every input's flow: `Replica::append`
+refuses a `Route` or `MasterEnable` for it.
+
 A replica's store builds its empty product with the `Factory` it is
 given, at open and for every snapshot it installs, so the product keeps
 the replica's configuration. Product state is shared by every replica,
