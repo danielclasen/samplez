@@ -187,7 +187,14 @@ impl PortState {
     /// effect at their time, after the change.
     pub fn changed_by_product(&mut self) -> u64 {
         self.queue.retain(|j| j.schedule.is_some());
-        self.supersede()
+        let change = self.supersede();
+        // Those that stay come after the change: they get generations
+        // above it, so the product does not take them for stale.
+        for i in 0..self.queue.len() {
+            let g = self.supersede();
+            self.queue[i].generation = g;
+        }
+        change
     }
 }
 

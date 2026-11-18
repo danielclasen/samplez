@@ -1098,6 +1098,50 @@ async fn an_external_change_drops_the_activations_queued_before_it() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_scheduled_activation_kept_past_an_external_change_is_newer_than_it() {
+    let fake = Arc::new(Fake {
+        lead: Duration::from_millis(40),
+        ..Fake::default()
+    });
+    // An earlier activation keeps the product busy past the lead.
+    fake.results
+        .lock()
+        .unwrap()
+        .push_back((Duration::from_millis(100), Ok(())));
+    let n = node(&fake);
+    let r = receiver(&n, 0);
+    let body = json!({ "transport_params": [{ "mxl_flow_id": OTHER }], "activation": { "mode": "activate_immediate" } });
+    assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    let body = json!({
+        "transport_params": [{ "mxl_flow_id": IN_FLOW }],
+        "activation": { "mode": "activate_scheduled_relative", "requested_time": "0:60000000" },
+    });
+    assert_eq!(
+        patch(&n, "receivers", &r, body).await.0,
+        StatusCode::ACCEPTED
+    );
+    // Past the lead the scheduled one waits in the queue; then the product
+    // switches by itself.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let switched = Active {
+        master_enable: true,
+        peer: None,
+        domain: Some(DOMAIN),
+        flow: Some(THIRD),
+    };
+    let change = n.external_change(Port::Receiver(0), switched);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[0].4 < change);
+    assert_eq!(calls[1].1.flow, Some(IN_FLOW));
+    assert!(calls[1].4 > change, "{} <= {change}", calls[1].4);
+    let a = active(&n, "receivers", &r).await;
+    assert_eq!(leg(&a)["mxl_flow_id"], json!(IN_FLOW));
+    assert_eq!(n.status().ports[1].applied, Applied::Applied);
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_apply_that_does_not_resolve_fails_and_the_queue_moves_on() {
     let fake = Arc::new(Fake {
         apply_timeout: Some(Duration::from_secs(3)),
