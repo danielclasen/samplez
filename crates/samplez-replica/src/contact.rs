@@ -706,9 +706,6 @@ struct State {
     /// The audio `/readyz` term, as of the last period in contact; none
     /// before the first.
     serving: Option<bool>,
-    /// Committing since it last started: a withdrawal after it stops
-    /// writing, one before its first commit does not.
-    committed_since_start: bool,
     /// `Diverged` verdicts naming this replica, by log index and page,
     /// until their commit is known.
     verdicts: Vec<(u64, u64)>,
@@ -986,7 +983,6 @@ impl Contact {
                 verified_always: false,
                 decider: crate::decide::Decider::default(),
                 serving: None,
-                committed_since_start: false,
                 verdicts: Vec::new(),
                 realised: Vec::new(),
                 generation_ready: true,
@@ -2275,19 +2271,16 @@ impl Contact {
         st.own.state = Some(state);
         st.own.ready = ready;
         st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
-        match state {
-            ReplicaState::Committing => st.committed_since_start = true,
-            ReplicaState::Starting => st.committed_since_start = false,
-            _ => {}
-        }
-        // Diverged or resyncing, or withdrawn after it committed, with
-        // outputs it writes none of what it computes, in contact or not.
-        // A replica withdrawn before its first commit, as every one is
-        // once ready, keeps the term by its peers: the first of a set
-        // becomes ready.
+        // Diverged, resyncing or in `version_mismatch`, or withdrawn once
+        // a `Baseline` applied, with outputs it writes none of what it
+        // computes, in contact or not. Before the first `Baseline` no
+        // replica of the set committed, as the Named rule starts the
+        // first commit, and every one is withdrawn once ready: it keeps
+        // the term by its peers, so the first of a set becomes ready. A
+        // restarted replica finds the baseline in its log.
         let stopped = match state {
-            ReplicaState::Diverged | ReplicaState::Resync => true,
-            ReplicaState::Withdrawn => st.committed_since_start,
+            ReplicaState::Diverged | ReplicaState::Resync | ReplicaState::VersionMismatch => true,
+            ReplicaState::Withdrawn => st.own.baseline.is_some(),
             _ => false,
         };
         let writes_nothing = stopped && !st.own.standing.is_empty();
@@ -2404,10 +2397,10 @@ impl Contact {
     /// The audio `/readyz` term (plan 2.11, Deployment): committing, or no
     /// other audio replica committing within `w + D` by its reports;
     /// judged while in contact, kept out of it, false before the first
-    /// contact. False while diverged or resyncing, or withdrawn after it
-    /// committed since its start, with outputs, in contact or not: the
-    /// replica writes none of what it computes. Always true for the
-    /// witness and for one voter.
+    /// contact. False while diverged, resyncing or in `version_mismatch`,
+    /// or withdrawn once a `Baseline` applied, with outputs, in contact or
+    /// not: the replica writes none of what it computes. Always true for
+    /// the witness and for one voter.
     pub fn serving(&self) -> bool {
         let st = self.lock();
         if self.audio.is_none() || st.members.voters().len() == 1 {
@@ -3462,6 +3455,8 @@ mod tests {
         /// The applied index and floor an apply sets right after the next
         /// read of the applied index.
         apply_after_read: Option<(u64, u64)>,
+        /// [`LogView::baseline`].
+        baseline: Option<Baseline>,
     }
 
     #[derive(Default)]
@@ -3530,7 +3525,7 @@ mod tests {
             BTreeSet::new()
         }
         fn baseline(&self) -> Option<Baseline> {
-            None
+            self.0.lock().unwrap().baseline.clone()
         }
         fn disrupting(&self) -> Option<NodeId> {
             None
@@ -4175,8 +4170,9 @@ mod tests {
 
     /// `/readyz`: a replica that writes nothing is not serving while no
     /// other replica commits, in contact or out of it, where it read
-    /// ready by "nobody else commits"; one withdrawn before its first
-    /// commit is, so the first replica of a set becomes ready. A sole
+    /// ready by "nobody else commits"; one withdrawn before the set's
+    /// first `Baseline` is, so the first replica of a set becomes ready,
+    /// and one withdrawn after it or in `version_mismatch` is not. A sole
     /// voter always serves, and one without outputs as before.
     #[tokio::test(start_paused = true)]
     async fn a_replica_writing_nothing_is_not_serving_though_nobody_commits() {
@@ -4207,6 +4203,39 @@ mod tests {
             f.contact.serving(),
             "withdrawn before its first commit, nobody else commits"
         );
+        // Once a `Baseline` applied the set committed: a replica withdrawn
+        // since, restarted or not, writes nothing.
+        f.log.0.lock().unwrap().baseline = Some(Baseline {
+            replica: 2,
+            order: vec![2, 1, 3],
+            at_index: index_at(T0),
+            key: None,
+        });
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+        assert!(!f.contact.serving(), "withdrawn after a baseline");
+        // A replica whose key differs from the baseline's computes nothing.
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.contact.set_rollout(crate::rollout::Fixed::new(1, None));
+        f.log.0.lock().unwrap().baseline = Some(Baseline {
+            replica: 2,
+            order: vec![2, 1, 3],
+            at_index: index_at(T0),
+            key: Some(2),
+        });
+        f.tick();
+        for _ in 0..3 {
+            f.contact.receive(f.report(2, None));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert_eq!(f.state(), Some(ReplicaState::VersionMismatch));
+        assert!(!f.contact.serving(), "version mismatch");
         let f = fixture(&[&[1, 2, 3]]);
         f.engine.outputs.store(true, Ordering::SeqCst);
         diverge(&f);
