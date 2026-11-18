@@ -1410,8 +1410,14 @@ impl Product for Console {
     }
 }
 
-/// An engine of [`Console`]'s shape reading `input`, writing `output`.
-fn console(domain: &Domain, input: &str, output: &str) -> (Arc<Engine>, EngineAudio) {
+/// An engine of [`Console`]'s shape reading `input`, writing `output`,
+/// its output column ducked when `ducked`.
+fn console_with(
+    domain: &Domain,
+    input: &str,
+    output: &str,
+    ducked: bool,
+) -> (Arc<Engine>, EngineAudio) {
     let v = serde_json::json!({
         "blockSize": B,
         "readerMarginSamples": 960,
@@ -1423,7 +1429,7 @@ fn console(domain: &Domain, input: &str, output: &str) -> (Arc<Engine>, EngineAu
         "outputs": [{ "name": "out0", "domain": "d", "flowId": output, "label": "console",
                       "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
         "matrix": [[1.0], [1.0]],
-        "duckColumns": [0],
+        "duckColumns": if ducked { vec![0] } else { Vec::new() },
         "rt": { "rtCpu": "none" },
     });
     bridge_of(&v, 1 << 12)
@@ -1517,21 +1523,28 @@ const CONSOLE_INPUT: &str = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd6a00";
 /// and two console engines reading it, past their fade-in from the
 /// attach.
 fn consoles(domain: &Domain) -> [(Arc<Engine>, EngineAudio); 2] {
+    consoles_with(domain, false)
+}
+
+/// [`consoles`], their output column ducked when `ducked`.
+fn consoles_with(domain: &Domain, ducked: bool) -> [(Arc<Engine>, EngineAudio); 2] {
     std::fs::write(
         domain.0.join("options.json"),
         r#"{"urn:x-mxl:option:history_duration/v1.0": 1000000000}"#,
     )
     .unwrap();
     let engines = [
-        console(
+        console_with(
             domain,
             CONSOLE_INPUT,
             "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f40",
+            ducked,
         ),
-        console(
+        console_with(
             domain,
             CONSOLE_INPUT,
             "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f41",
+            ducked,
         ),
     ];
     wait_for("both read the input", || {
@@ -1770,12 +1783,13 @@ fn refused_gain_live_and_rebuilt(gain: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A gate threshold and a duck depth the engine refuses, NaN and past
-/// `DEPTH_DB`, leave a live engine handed the records and one rebuilt
+/// A gate threshold the engine refuses as NaN and a duck depth past
+/// `DEPTH_DB` leave a live engine handed the records and one rebuilt
 /// from the product state past them computing the same pages: both take
-/// the gate off and the depth at 0 dB, where the live one would hold its
-/// previous gate and depth and the rebuilt one, holding no previous
-/// value, the strip's and the group's defaults.
+/// the gate off, its neutral form, and the depth at 40 dB, the end of
+/// its range, where the live one would hold its previous gate and depth
+/// and the rebuilt one, holding no previous value, the strip's and the
+/// group's defaults.
 #[test]
 fn a_refused_strip_and_duck_setting_leave_a_live_and_a_rebuilt_engine_alike() {
     undisturbed(refused_settings_live_and_rebuilt);
@@ -1784,7 +1798,7 @@ fn a_refused_strip_and_duck_setting_leave_a_live_and_a_rebuilt_engine_alike() {
 fn refused_settings_live_and_rebuilt() -> Result<(), String> {
     let domain = Domain::new();
     let _pilot = Pilot::start(&domain, CONSOLE_INPUT);
-    let [(live, la), (rebuilt, ra)] = consoles(&domain);
+    let [(live, la), (rebuilt, ra)] = consoles_with(&domain, true);
     let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
     let silenced_before = silenced(&live) + silenced(&rebuilt);
     let mut m = Machine::new(CONSOLE_INPUT);

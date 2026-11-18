@@ -108,7 +108,7 @@ pub struct EngineAudio {
     unwritten: Mutex<Unwrittens>,
     /// Appended entries the engine refused.
     refused: AtomicU64,
-    /// Derived entries left out before the engine saw them.
+    /// Derived entries replaced or left out before the engine saw them.
     filtered: AtomicU64,
     /// `maxApplyLeadMs`.
     max_apply_lead: Duration,
@@ -170,7 +170,7 @@ impl EngineAudio {
             tracing::error!(
                 index,
                 dropped,
-                "the product derived engine entries the engine refuses: left out"
+                "the product derived engine entries the engine refuses: replaced or left out"
             );
         }
         kept
@@ -216,9 +216,14 @@ impl EngineAudio {
     }
 
     /// `entry`, or, for a strip parameter, duck setting or duck mask the
-    /// engine refuses alone, its neutral form ([`samplez_dsp::StripParam::neutral`],
-    /// [`DuckSetting::neutral`], mask 0) when the engine takes that; none
-    /// when it takes neither. Every other entry as given. The live filter
+    /// engine refuses alone, the first of these the engine takes: its
+    /// values moved to the nearest ones their ranges hold
+    /// ([`samplez_dsp::StripParam::clamped`], [`DuckSetting::clamped`]),
+    /// for a finite value out of range; its neutral form
+    /// ([`samplez_dsp::StripParam::neutral`], [`DuckSetting::neutral`],
+    /// mask 0), for a value that is not finite or a key the engine
+    /// cannot take, such as a slot or key it lacks. None when it takes
+    /// neither. Every other entry as given. The live filter
     /// and the rebuild's state both go through it, so a replica that held
     /// a value before the refused one and one rebuilt without it hold
     /// the same; the engine's configuration alone decides it, the same on
@@ -240,12 +245,21 @@ impl EngineAudio {
             },
             _ => return Some(entry.clone()),
         };
+        let clamped = match entry {
+            Entry::Strip { slot, param } => param
+                .clamped()
+                .map(|param| Entry::Strip { slot: *slot, param }),
+            Entry::Duck { group, setting } => setting.clamped().map(|setting| Entry::Duck {
+                group: *group,
+                setting,
+            }),
+            _ => None,
+        };
         let takes = |e: &Entry| self.engine.admits(std::slice::from_ref(e)).is_ok();
         if takes(entry) {
-            Some(entry.clone())
-        } else {
-            takes(&neutral).then_some(neutral)
+            return Some(entry.clone());
         }
+        [clamped, Some(neutral)].into_iter().flatten().find(takes)
     }
 
     /// `state` as the records the bridge filters leave an engine: a flow
@@ -284,17 +298,17 @@ impl EngineAudio {
             }
         }
         for (slot, params) in state.strips.iter_mut().enumerate() {
-            let mut kept = Vec::with_capacity(params.len());
+            let mut admitted = Vec::with_capacity(params.len());
             for &param in params.iter() {
                 match self.admitted(&Entry::Strip { slot, param }) {
                     Some(Entry::Strip { param: p, .. }) => {
                         dropped += usize::from(p != param);
-                        kept.push(p);
+                        admitted.push(p);
                     }
                     _ => dropped += 1,
                 }
             }
-            *params = kept;
+            *params = admitted;
         }
         for gain in state.gains.iter_mut().flatten() {
             if !samplez_dsp::valid_gain(*gain) {
@@ -339,10 +353,10 @@ impl EngineAudio {
             }
             for (slot, db) in d.depths.iter_mut().enumerate() {
                 match duck(group, DuckSetting::Depth { slot, db: *db }) {
-                    Some(DuckSetting::Depth { db: kept, .. }) if kept.to_bits() == db.to_bits() => {
-                    }
-                    Some(DuckSetting::Depth { db: kept, .. }) => {
-                        *db = kept;
+                    Some(DuckSetting::Depth { db: depth, .. })
+                        if depth.to_bits() == db.to_bits() => {}
+                    Some(DuckSetting::Depth { db: depth, .. }) => {
+                        *db = depth;
                         dropped += 1;
                     }
                     _ => {
@@ -368,7 +382,7 @@ impl EngineAudio {
         if dropped > 0 {
             tracing::error!(
                 dropped,
-                "the product state holds what the engine refuses: left out of the rebuild"
+                "the product state holds what the engine refuses: replaced or left out of the rebuild"
             );
         }
         state

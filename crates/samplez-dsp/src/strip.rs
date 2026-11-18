@@ -167,6 +167,11 @@ impl Refusal {
     }
 }
 
+/// `v` moved into `range`; none when it is NaN or infinite.
+pub(crate) fn clamp_in(v: f32, range: &RangeInclusive<f32>) -> Option<f32> {
+    v.is_finite().then(|| v.clamp(*range.start(), *range.end()))
+}
+
 pub(crate) fn within(
     what: &'static str,
     v: f32,
@@ -202,13 +207,14 @@ pub const COMP_OFF: CompParams = CompParams {
 };
 
 impl StripParam {
-    /// The parameter of the same key, leg or band at the value that
-    /// changes nothing a strip passes: trims at 0 dB, no inversion, the
-    /// high-pass and equaliser off, a band at its default, the gate and
-    /// compressor off ([`GATE_OFF`], [`COMP_OFF`]), dynamics after the
-    /// equaliser. What a refused parameter is replaced with, so a strip
-    /// that held another value and one that held none end up alike. A
-    /// leg or band the strip lacks stays refused.
+    /// The parameter of the same key, leg or band at the value a strip
+    /// holds before any is set ([`Strip::new`]): trims at 0 dB, no
+    /// inversion, the high-pass and equaliser off, a band at its default,
+    /// the gate and compressor off ([`GATE_OFF`], [`COMP_OFF`]), dynamics
+    /// after the equaliser. What a parameter refused for a value that is
+    /// not finite is replaced with, so a strip that held another value
+    /// and one that held none end up alike. A leg or band the strip lacks
+    /// stays refused.
     pub fn neutral(&self) -> StripParam {
         match *self {
             StripParam::Trim { .. } => StripParam::Trim { db: 0.0 },
@@ -230,6 +236,52 @@ impl StripParam {
             StripParam::Comp(_) => StripParam::Comp(COMP_OFF),
             StripParam::DynamicsBeforeEq { .. } => StripParam::DynamicsBeforeEq { enabled: false },
         }
+    }
+
+    /// The parameter with every value moved to the nearest one its range
+    /// holds: a trim of -30 dB is -20 dB. None when a value is NaN or
+    /// infinite, which has no nearest one. Legs and bands as given.
+    pub fn clamped(&self) -> Option<StripParam> {
+        let c = clamp_in;
+        Some(match *self {
+            StripParam::Trim { db } => StripParam::Trim {
+                db: c(db, &TRIM_DB)?,
+            },
+            StripParam::LegTrim { leg, db } => StripParam::LegTrim {
+                leg,
+                db: c(db, &TRIM_DB)?,
+            },
+            StripParam::Hpf { enabled, freq } => StripParam::Hpf {
+                enabled,
+                freq: c(freq, &HPF_FREQ)?,
+            },
+            StripParam::EqBand { band, value } => StripParam::EqBand {
+                band,
+                value: EqBand {
+                    kind: value.kind,
+                    freq: c(value.freq, &EQ_FREQ)?,
+                    gain_db: c(value.gain_db, &EQ_GAIN_DB)?,
+                    q: c(value.q, &EQ_Q)?,
+                },
+            },
+            StripParam::Gate(g) => StripParam::Gate(GateParams {
+                enabled: g.enabled,
+                threshold_db: c(g.threshold_db, &GATE_THRESHOLD_DB)?,
+                range_db: c(g.range_db, &GATE_RANGE_DB)?,
+                attack_ms: c(g.attack_ms, &ATTACK_MS)?,
+                release_ms: c(g.release_ms, &RELEASE_MS)?,
+            }),
+            StripParam::Comp(p) => StripParam::Comp(CompParams {
+                enabled: p.enabled,
+                threshold_db: c(p.threshold_db, &COMP_THRESHOLD_DB)?,
+                ratio: c(p.ratio, &COMP_RATIO)?,
+                attack_ms: c(p.attack_ms, &ATTACK_MS)?,
+                release_ms: c(p.release_ms, &RELEASE_MS)?,
+                knee_db: c(p.knee_db, &COMP_KNEE_DB)?,
+                makeup_db: c(p.makeup_db, &MAKEUP_DB)?,
+            }),
+            other => other,
+        })
     }
 
     /// Whether a strip of `legs` legs takes the parameter: legs and bands
@@ -754,9 +806,12 @@ mod tests {
     use crate::svf::{Coefficients, coefficients};
 
     /// Every parameter a strip refuses for its value has a neutral form
-    /// of the same key that it takes.
+    /// of the same key that it takes, and a strip given every neutral
+    /// form computes what one given none computes; a finite value out of
+    /// range clamps to its range's nearest end, and a NaN or infinity
+    /// has no clamped form.
     #[test]
-    fn a_refused_parameter_has_a_neutral_form_a_strip_takes() {
+    fn a_refused_parameter_has_a_neutral_and_a_clamped_form() {
         let nan = f32::NAN;
         let band = EqBand {
             kind: BandType::Peak,
@@ -767,35 +822,51 @@ mod tests {
         let refused = [
             StripParam::Trim { db: nan },
             StripParam::LegTrim { leg: 1, db: 99.0 },
-            StripParam::Polarity {
-                leg: 1,
-                inverted: true,
-            },
             StripParam::Hpf {
                 enabled: true,
                 freq: 1.0,
             },
-            StripParam::Eq { enabled: true },
             StripParam::EqBand {
                 band: 2,
                 value: band,
             },
             StripParam::Gate(GateParams {
-                threshold_db: nan,
+                threshold_db: f32::INFINITY,
                 ..GATE_OFF
             }),
             StripParam::Comp(CompParams {
                 ratio: 0.0,
                 ..COMP_OFF
             }),
-            StripParam::DynamicsBeforeEq { enabled: true },
         ];
+        let mut set = Strip::new(2, RAMP);
         for param in refused {
+            assert!(param.check(2).is_err(), "{param:?} refused");
             let neutral = param.neutral();
             assert_eq!(neutral.check(2), Ok(()), "{param:?} -> {neutral:?}");
             let same = core::mem::discriminant(&neutral) == core::mem::discriminant(&param);
             assert!(same, "{param:?} -> {neutral:?}");
+            assert!(set.set(neutral));
         }
+        let kinds = [
+            StripParam::Polarity {
+                leg: 1,
+                inverted: true,
+            },
+            StripParam::Eq { enabled: true },
+            StripParam::DynamicsBeforeEq { enabled: true },
+        ];
+        for param in kinds {
+            assert!(set.set(param.neutral()));
+        }
+        let mut fresh = Strip::new(2, RAMP);
+        let signal = |n: usize| ((n as f32) * 0.37).sin() * 0.5;
+        let mut a: Vec<f32> = (0..2 * 960).map(signal).collect();
+        let mut b = a.clone();
+        set.process(&mut a, 960);
+        fresh.process(&mut b, 960);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&a), bits(&b), "neutral forms change nothing");
         assert_eq!(
             StripParam::EqBand {
                 band: 2,
@@ -807,9 +878,33 @@ mod tests {
                 value: DEFAULT_BANDS[2]
             }
         );
-        // A leg or band the strip lacks stays refused.
-        let missing = StripParam::LegTrim { leg: 3, db: 0.0 }.neutral();
-        assert!(missing.check(2).is_err());
+        // Clamped: a finite value at its range's nearest end.
+        assert_eq!(
+            StripParam::Trim { db: -30.0 }.clamped(),
+            Some(StripParam::Trim { db: -20.0 })
+        );
+        assert_eq!(
+            StripParam::LegTrim { leg: 1, db: 99.0 }.clamped(),
+            Some(StripParam::LegTrim { leg: 1, db: 20.0 })
+        );
+        let gate = StripParam::Gate(GateParams {
+            threshold_db: 10.0,
+            ..GATE_OFF
+        });
+        assert_eq!(gate.clamped().unwrap().check(2), Ok(()));
+        assert_eq!(StripParam::Trim { db: nan }.clamped(), None);
+        assert_eq!(gate_inf().clamped(), None);
+        // A leg or band the strip lacks stays refused either way.
+        let missing = StripParam::LegTrim { leg: 3, db: 0.0 };
+        assert!(missing.neutral().check(2).is_err());
+        assert!(missing.clamped().unwrap().check(2).is_err());
+    }
+
+    fn gate_inf() -> StripParam {
+        StripParam::Gate(GateParams {
+            threshold_db: f32::INFINITY,
+            ..GATE_OFF
+        })
     }
 
     const RAMP: u32 = 480;
