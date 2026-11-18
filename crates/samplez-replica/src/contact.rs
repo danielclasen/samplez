@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use openraft::{BasicNode, RaftMetrics};
-use samplez::blocks::{BlockStatus, Cause, Ranks};
+use samplez::blocks::{BlockStatus, Cause, Ranks, Standing};
 use samplez::{Entry, ProductState};
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -597,6 +597,13 @@ struct State {
     /// The appended entries not applied yet that need a generation, by
     /// log index, with the index they take effect at.
     generations: BTreeMap<u64, u64>,
+    /// The entries not applied yet that this log took past their apply
+    /// deadline, by log index: ones a replica catching up takes.
+    taken_late: BTreeSet<u64>,
+    /// Entries taken late that the engine was rebuilt past instead of
+    /// holding them unresolved, the lowest forgotten first: a decision on
+    /// one neither resolves nor contradicts the rebuilt core.
+    rebuilt_past: BTreeSet<Key>,
     /// When `own` was sampled.
     own_at: Instant,
     judged: BTreeSet<NodeId>,
@@ -889,6 +896,8 @@ impl Contact {
                 scheduled,
                 reserved: None,
                 generations: BTreeMap::new(),
+                taken_late: BTreeSet::new(),
+                rebuilt_past: BTreeSet::new(),
                 own_at: Instant::now(),
                 judged: BTreeSet::new(),
                 learners: BTreeMap::new(),
@@ -1439,6 +1448,7 @@ impl Contact {
             }
             st.scheduled.split_off(&from);
             st.generations.split_off(&from);
+            st.taken_late.split_off(&from);
             st.baselines.truncated(from);
             st.verdicts.retain(|&(index, _)| index < from);
             st.decisions.retain(|&(index, _, _)| index < from);
@@ -1509,6 +1519,9 @@ impl Contact {
             }
             if let Some(at) = at {
                 st.scheduled.insert(id.index, (id, at, stamp, false));
+                if tai >= self.timing.apply_deadline(at) {
+                    st.taken_late.insert(id.index);
+                }
                 self.note(st, id, at, tai);
             }
             // Listed, never unresolved: it changes no engine state.
@@ -1579,6 +1592,8 @@ impl Contact {
         st.handed = st.handed.max(applied);
         st.uncommitted.clear();
         st.generations.clear();
+        st.taken_late.clear();
+        st.rebuilt_past.clear();
         st.awaiting.clear();
         st.given.clear();
         st.unlisted.clear();
@@ -1626,6 +1641,7 @@ impl Contact {
             st.handed = n;
             st.awaiting = st.awaiting.split_off(&(n + 1, 0, 0));
             st.generations = st.generations.split_off(&(n + 1));
+            st.taken_late = st.taken_late.split_off(&(n + 1));
         }
     }
 
@@ -1672,9 +1688,10 @@ impl Contact {
     /// Hands the records of the entries applied since the last call to
     /// the engine, each at the index it derived. One applied at or past
     /// its apply deadline, or already given unresolved, is not: it goes
-    /// unresolved, the log deciding it. Awaited entries up to the applied
-    /// index are settled: this replica's own, or another at the same
-    /// index that can no longer commit.
+    /// unresolved, the log deciding it, or, taken past its deadline on a
+    /// replica committing nothing, the engine is rebuilt past it. Awaited
+    /// entries up to the applied index are settled: this replica's own,
+    /// or another at the same index that can no longer commit.
     fn hand(&self, st: &mut State) {
         let up_to = self.log.applied().min(st.told);
         if up_to <= st.handed {
@@ -1684,6 +1701,8 @@ impl Contact {
         st.handed = up_to;
         st.awaiting = st.awaiting.split_off(&(up_to + 1, 0, 0));
         st.generations = st.generations.split_off(&(up_to + 1));
+        let later = st.taken_late.split_off(&(up_to + 1));
+        let taken_late = std::mem::replace(&mut st.taken_late, later);
         let Some(audio) = self.audio.clone() else {
             return;
         };
@@ -1700,6 +1719,15 @@ impl Contact {
         }
         let tai = self.clocks.tai_ns();
         let first = index_at(tai + self.timing.apply_guard_ns());
+        // An entry this log took past its deadline, as a replica catching
+        // up takes the entries written while it was away, cannot have been
+        // applied in time anywhere here. A replica committing nothing takes
+        // it through a rebuild from the state after it rather than holding
+        // it unresolved: no block it committed lacks it, and the log
+        // appends no decision on an entry that stands, so one held
+        // unresolved would degrade its blocks for good.
+        let rebuilds = Self::commits_nothing(st);
+        let mut late = false;
         for (index, record) in records {
             let at = record.at_index;
             // Purged from the log since it applied: this log's own, which
@@ -1714,10 +1742,22 @@ impl Contact {
                 continue;
             };
             let k = key(id);
+            let rebuilt = rebuilds && taken_late.contains(&index);
             if st.given.contains_key(&k) {
+                if rebuilt {
+                    st.given.remove(&k);
+                    audio.resolved(index);
+                    Self::rebuild_past(st, k);
+                    late = true;
+                }
                 continue;
             }
             if tai >= self.timing.apply_deadline(at) {
+                if rebuilt {
+                    Self::rebuild_past(st, k);
+                    late = true;
+                    continue;
+                }
                 st.awaiting.insert(
                     k,
                     Waiting {
@@ -1754,6 +1794,30 @@ impl Contact {
                 st.slack.push(s);
             }
         }
+        if late {
+            self.begin_restart(st, up_to);
+        }
+    }
+
+    fn rebuild_past(st: &mut State, k: Key) {
+        st.rebuilt_past.insert(k);
+        while st.rebuilt_past.len() > GIVEN_KEPT {
+            st.rebuilt_past.pop_first();
+        }
+    }
+
+    /// Whether this audio replica is starting or withdrawn with outputs
+    /// none of which commits, as of its last sample.
+    fn commits_nothing(st: &State) -> bool {
+        let state = st.life.as_ref().map(Life::state);
+        let standing = &st.own.standing;
+        matches!(
+            state,
+            Some(ReplicaState::Starting | ReplicaState::Withdrawn)
+        ) && !standing.is_empty()
+            && !standing
+                .iter()
+                .any(|s| matches!(s, Standing::Committing { .. }))
     }
 
     /// F (B1): block k is valid when a majority of every configuration,
@@ -2034,6 +2098,19 @@ impl Contact {
                     st.given.remove(&k);
                 }
                 audio.resolved(revision);
+                continue;
+            }
+            // Rebuilt past: the core holds the state after it and resumes
+            // only on matching pages.
+            let past: Vec<Key> = st
+                .rebuilt_past
+                .range((revision, term, 0)..=(revision, term, u64::MAX))
+                .copied()
+                .collect();
+            if !past.is_empty() {
+                for k in past {
+                    st.rebuilt_past.remove(&k);
+                }
                 continue;
             }
             // Applied here: its own committed entry, handed to the engine.

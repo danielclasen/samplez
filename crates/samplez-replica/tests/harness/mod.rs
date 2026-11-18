@@ -455,6 +455,9 @@ pub struct Fake {
     pub refused_rebuilds: u64,
     /// Entries the core holds unresolved: a rebuilt core holds none.
     pub core_unresolved: BTreeSet<u64>,
+    /// Blocks computed while the core holds an entry unresolved carry a
+    /// digest of them, as the engine's do; off, they are healthy.
+    pub digest_unresolved: bool,
     /// The length of `unresolved` at each rebuild.
     pub rebuilt_at: Vec<usize>,
     /// Entries resolved, with the length of `unresolved` then.
@@ -488,6 +491,12 @@ pub const FOR_GOOD: u64 = u64::MAX;
 
 impl Fake {
     fn digest(&self, k: u64) -> u64 {
+        if self.digest_unresolved && !self.core_unresolved.is_empty() {
+            return self
+                .core_unresolved
+                .iter()
+                .fold(HEALTHY ^ (1 << 63), |d, &i| d ^ i);
+        }
         self.degraded
             .iter()
             .rev()

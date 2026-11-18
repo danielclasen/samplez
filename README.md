@@ -529,7 +529,11 @@ log decides it. The leader stamps entries the lead ahead, which it keeps
 on the slack every counted audio replica reports at its apply-hand, up
 to `maxApplyLead`; a replica that still applies past the deadline at the
 cap holds those entries unresolved alone, and the leader's contact
-metrics name it (`apply_lead_raised_by`). One AppendEntries carries up to
+metrics name it (`apply_lead_raised_by`). A replica in `starting`, or
+`withdrawn` with no output committing holds no entry unresolved that
+its log took only past the entry's deadline, as one catching up after a
+restart takes those written meanwhile: its engine is rebuilt from the
+state applied past it, as after a snapshot install. One AppendEntries carries up to
 `MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
 than the gap between entries takes every entry written meanwhile with
 one fsync rather than falling further behind. `EngineAudio` leaves out

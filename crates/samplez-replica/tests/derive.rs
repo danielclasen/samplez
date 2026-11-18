@@ -14,6 +14,7 @@ use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{Body, Command, NodeId, Origin, Request, SessionKey};
 use samplez_replica::membership::{Slot, node_id};
 use samplez_replica::peer::{Forwarded, PeerRequest, PeerResponse, Refused};
+use samplez_replica::state::ReplicaState;
 use samplez_replica::state_machine::{Apply, Changed, Effect, Product, StateMachine};
 use samplez_service::ReplicatedState;
 use tokio::time::{Instant, sleep};
@@ -968,5 +969,84 @@ async fn a_command_late_everywhere_is_restamped_and_reasserted() {
     for id in set.ids() {
         assert_eq!(handed(&set, id, late), None, "{id} handed the late entry");
         assert_eq!(handed(&set, id, restamp).as_ref(), Some(&first), "on {id}");
+    }
+}
+
+fn committing(set: &Set<Desk>, id: NodeId) -> bool {
+    set.replica(id)
+        .contact_metrics()
+        .and_then(|m| m.replica)
+        .and_then(|r| r.state)
+        == Some(ReplicaState::Committing)
+}
+
+/// One fader move through the leader of the moment, a command each
+/// 5 ms; one refused in an election is dropped.
+async fn move_fader(set: &Set<Desk>, n: u64) {
+    let leader = set.leader().await;
+    let replica = set.replica(leader).clone();
+    tokio::spawn(async move {
+        let command = Bytes::from(format!("fader {} 0.{}", n % 2, n % 10));
+        let _ = replica.submit(&owner("s"), &n.to_string(), command).await;
+    });
+    sleep(Duration::from_millis(5)).await;
+}
+
+/// A follower restarted while commands keep coming applies what was
+/// written while it was down past each entry's apply deadline as it
+/// catches up. Holding those entries unresolved, which the log never
+/// decides where they stand, would degrade its blocks for good: it
+/// commits again, holding no entry unresolved, within a bound.
+#[tokio::test(start_paused = true)]
+async fn a_follower_restarted_under_continuous_commands_commits_again() {
+    let mut set = Set::start_with(
+        Options {
+            contact: Some(Timing::defaults(BLOCK)),
+            outputs: 1,
+            ..Options::default()
+        },
+        Arc::new(|_| Desk::new()),
+    )
+    .await;
+    let mut n = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !set.ids().all(|id| committing(&set, id)) {
+        assert!(Instant::now() < deadline, "every replica committing");
+        sleep(Duration::from_millis(10)).await;
+    }
+    let leader = set.leader().await;
+    let follower = set.ids().find(|&id| id != leader).unwrap();
+    set.crash(follower).await;
+    let down = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < down {
+        n += 1;
+        move_fader(&set, n).await;
+    }
+    set.restart(follower).await;
+    set.audio(follower).lock().digest_unresolved = true;
+    let held = |set: &Set<Desk>| set.audio(follower).lock().core_unresolved.len();
+    let start = Instant::now();
+    let mut since: Option<Instant> = None;
+    loop {
+        n += 1;
+        move_fader(&set, n).await;
+        if committing(&set, follower) && held(&set) == 0 {
+            let from = *since.get_or_insert_with(Instant::now);
+            if from.elapsed() >= Duration::from_millis(500) {
+                break;
+            }
+        } else {
+            since = None;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the follower committing for 500 ms, holding nothing unresolved, within 5 s; \
+             {} unresolved, {:?}",
+            held(&set),
+            set.replica(follower)
+                .contact_metrics()
+                .and_then(|m| m.replica)
+                .and_then(|r| r.state)
+        );
     }
 }
