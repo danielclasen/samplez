@@ -6,11 +6,12 @@
 //! else a `Restamp` gives it a fresh at_index, or a `Void` resolves it
 //! when it is an engine body a later committed entry supersedes, or once
 //! three restamps were late. A product entry's restamp or void re-asserts
-//! the state at its own place, so no later entry is undone. An id the leader's log does not hold is voided once the leader
-//! committed an entry of its own term, or draws a purge-point verdict at
-//! or below the leader's purge point. Replicas that hold an entry
-//! unresolved where it stands contradict the log's decision: page verdict
-//! rule (1) diverges them.
+//! the state at its own place, so no later entry is undone. An id the
+//! leader's log does not hold is voided once the leader committed an
+//! entry of its own term, or draws a purge-point verdict at or below the
+//! leader's purge point. Replicas that hold an entry unresolved where it
+//! stands contradict the log's decision: page verdict rule (1) diverges
+//! them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;

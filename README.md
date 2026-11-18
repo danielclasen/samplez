@@ -214,7 +214,9 @@ from where it is. `InputUp` and `Route` need a new input generation:
 the engine builds it when the entry is appended, one at a time, and
 swaps it in at the entry's index. The status reports the 99.99th
 percentile of the build times and buildLead, how far ahead such entries
-are stamped. `Engine::start` keeps the log itself, stamping `InputDown`
+are stamped; `Engine::progress` reports buildLead and the build time,
+the percentile and a supervisor tick without the engine's lead.
+`Engine::start` keeps the log itself, stamping `InputDown`
 when an input is pruned and `InputUp` once its head has advanced for a
 second, wherever it stands against the clock, and each `InputUp` or
 `Route` at least buildLead after the one before;
@@ -392,7 +394,9 @@ thread (fades cold, the pending entries, no unresolved entry; the RT
 thread keeps its pending generation) and installs it through the same
 block-boundary hand-over as a replay, at the first block starting at or
 after the index its caller names; the first block committed after it
-follows the withdrawn rules. Its gains ramp from silence to their
+follows the withdrawn rules. A state holding a gain, flow or strip
+parameter no entry could set is refused before anything changes. Its
+gains ramp from silence to their
 targets over the ramp length from the install, as the strips take their
 parameters, so an output fades in processed. The product state also
 names each slot's flow and strip parameters: the supervisor hands over
@@ -415,7 +419,13 @@ first block at or after the floor of the applied log. Every record of an
 entry up to that index takes effect at or before the floor and every
 later one at or after it, so the records handed after the rebuild apply
 on top of it in order; an install the RT thread can no longer take is
-tried again with a fresh read. A product without targets gives an empty
+tried again with a fresh read. Under continuous writes the floor lies up
+to `maxApplyLead` and a generation's build ahead, and the rebuild waits
+that long. `EngineAudio` installs the state as the records it filters
+leave an engine (below): a flow other than the one an input reads is a
+re-route kept by the same rules and else left as read, a strip parameter
+the engine refuses is not set, and a gain it refuses is silent. A
+product without targets gives an empty
 state, which an engine refuses: its replicas stay in `starting`.
 
 A product that drives an engine (`Product::DRIVES_ENGINE`) gives its
@@ -428,7 +438,9 @@ for a restamp of one that derived some, an input's state for an
 raised to the floor, the highest index of any entry before it, so the
 engine applies them in log order and each diff applies to the targets it
 was computed against; an index further than one second past the entry's
-stamp counts as the stamp. An `InputDown` or `InputUp` derives its
+stamp counts as the stamp, and a lease expiry from an older leader, which
+stamps none, takes effect 2400 samples (50 ms) past its stamp.
+`EngineAudio` hands an index off a block start at the next one. An `InputDown` or `InputUp` derives its
 input's state for any product, since the engine's input health writes
 them. A restamp, or a void the leader stamped, of an entry that derived
 records re-asserts every target at its own index, so it undoes no later
@@ -452,8 +464,9 @@ the entries applied after the donor core's last log id; one it no longer
 holds, past the second kept or before a snapshot it loaded, fails the
 attempt, which is retried on a newer core. A client command that would
 re-route an input (`Product::reroutes`) is ordered alone on the
-generation path, and one asking for an index beyond the earliest is
-refused. Such a product owns every input's flow: `Replica::append`
+generation path, stamped the lead and the longest build time a counted
+replica reports past its stamp, since its generation is built once it
+applies; one asking for an index beyond the earliest is refused. Such a product owns every input's flow: `Replica::append`
 refuses a `Route` or `MasterEnable` for it.
 
 A replica's store builds its empty product with the `Factory` it is

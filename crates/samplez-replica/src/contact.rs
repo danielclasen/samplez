@@ -4638,10 +4638,12 @@ mod tests {
         assert_eq!(restarted.stamp(true), Err(StampRefusal::GenerationPending));
     }
 
-    /// A command the leader flagged for its generation that the product
-    /// refused builds none: once it applied, the applied state alone
-    /// names the pending generation, live as after a restart, and the
-    /// next generation is stamped without waiting for its index.
+    /// A command flagged for its generation that the product refused
+    /// builds none: once it applied, the applied state, the source a
+    /// restarted contact reads, names no generation for it, and the
+    /// appended entries no longer do. On a live leader the stamp that
+    /// ordered it still reserves its index, for at most its lead
+    /// (`State::reserved`); this contact never stamped it.
     #[tokio::test(start_paused = true)]
     async fn an_applied_flagged_command_that_built_nothing_holds_no_generation() {
         let f = fixture(&[&[1]]);
