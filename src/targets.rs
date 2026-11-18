@@ -23,7 +23,10 @@ pub struct Targets {
     pub ducks: Vec<DuckTargets>,
     /// The duck mask of each coefficient, shaped as `gains`.
     pub masks: Vec<Vec<u8>>,
-    /// Per output, whether it is enabled; an output past the list is.
+    /// Per output, whether it is enabled; an output past the list is. A
+    /// product lists every output its engine has: [`Targets::assert`]
+    /// sets only the outputs listed, so an engine holding one past the
+    /// list disabled keeps it so.
     pub outputs: Vec<bool>,
 }
 
@@ -540,9 +543,8 @@ mod tests {
         assert_eq!(t.assert(&[], None).len(), 5);
     }
 
-    /// A slot whose flow `next` holds none for is detached, also when
-    /// `self` holds no flow for it; one already detached gets no entry.
-    /// Asserted, a slot without a flow is detached.
+    /// An output's enabled state is diffed, an output past a list counting
+    /// as enabled, and asserted after the routes, one entry per output held.
     #[test]
     fn an_outputs_enabled_state_is_diffed_and_asserted() {
         let off = |slot| Entry::Output {
@@ -570,6 +572,9 @@ mod tests {
         assert!(matches!(all[n - 3], Entry::Route { slot: 0, .. }));
     }
 
+    /// A slot whose flow `next` holds none for is detached, also when
+    /// `self` holds no flow for it; one already detached gets no entry.
+    /// Asserted, a slot without a flow is detached.
     #[test]
     fn a_slot_without_a_flow_is_detached() {
         let mut next = targets();

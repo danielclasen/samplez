@@ -289,7 +289,28 @@ fn fingerprint_full(mut entries: Vec<(u64, u64)>) -> u64 {
     fingerprint(black_box(&mut entries))
 }
 
+// An output disabled with a full ring, the part of the RT thread's
+// `Output` entry that is not a flag: the ring emptied, every fenced
+// block withheld.
+#[library_benchmark]
+#[bench::open(setup = Out::full, config = limit(RELEASE_OPEN))]
+fn output_release(mut o: Out) -> Out {
+    let mut changes = Changes {
+        ring: &mut o.tx,
+        dropped: &o.dropped,
+        output: 0,
+    };
+    o.hold.idle(
+        black_box(&o.statuses),
+        &mut changes,
+        &mut Null,
+        samplez::blocks::Cause::Released,
+    );
+    o
+}
+
 const BACKWARD: u64 = 8_300;
+const RELEASE_OPEN: u64 = 8_360;
 const AT_ONCE: u64 = 437;
 const FLUSH: u64 = 18_154;
 const OVERFLOW: u64 = 12_012;
@@ -433,7 +454,8 @@ library_benchmark_group!(
         flush_full_ring,
         overflow,
         withdraw,
-        backward_step
+        backward_step,
+        output_release
     ]
 );
 
