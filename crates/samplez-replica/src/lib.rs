@@ -752,7 +752,15 @@ impl Shared {
     /// every flag in the log.
     async fn flag(&self, generation: bool, stamp: u64) -> Option<bool> {
         let contact = self.contact.get()?;
-        if let Some(blocker) = contact.protocol_blocker() {
+        // The membership as applied now, not as contact's last tick saw it.
+        // A member added after this read and before the entry is written
+        // still receives it. A binary of an older protocol among those
+        // never applies the flag: the marker precedes every flag in the
+        // log and it cannot decode the marker, nor install a snapshot of a
+        // log past it (`snapshot::StoredSnapshot`). From its first report
+        // on it shuts the gate.
+        let members = contact::Members::of(&self.raft.metrics().borrow());
+        if let Some(blocker) = contact.protocol_blocker(&members) {
             tracing::debug!(?blocker, "protocol gate shut: no generation flag");
             return None;
         }

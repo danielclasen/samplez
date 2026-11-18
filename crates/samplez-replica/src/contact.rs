@@ -2377,18 +2377,19 @@ impl Contact {
                 .is_some_and(|l| l.protocol >= PROTOCOL)
     }
 
-    /// The protocol gate: the first member of the membership, learners
+    /// The protocol gate: the first member of `members`, learners
     /// included, whose newest report, direct or relayed, is older than
     /// `w + D`, missing, or speaks a protocol below [`PROTOCOL`]; none
     /// while every member speaks it, when the leader may write generation
-    /// flags. This replica counts as its own binary's.
-    pub fn protocol_blocker(&self) -> Option<NodeId> {
+    /// flags. This replica counts as its own binary's. A member contact's
+    /// last tick did not know yet has no report here, so it blocks.
+    pub fn protocol_blocker(&self, members: &Members) -> Option<NodeId> {
         let st = self.lock();
         let now = Instant::now();
         let fresh = self.timing.contact_window + self.timing.hold;
         let copies = self.copies(&st, now);
-        let voters = st.members.voters();
-        st.members.addrs.keys().copied().find(|&id| {
+        let voters = members.voters();
+        members.addrs.keys().copied().find(|&id| {
             let speaks = if id == self.id {
                 true
             } else if voters.contains(&id) {
@@ -2759,7 +2760,8 @@ impl Contact {
 
     pub fn metrics(&self) -> Metrics {
         // Takes the lock itself.
-        let protocol_blocker = self.protocol_blocker();
+        let members = self.lock().members.clone();
+        let protocol_blocker = self.protocol_blocker(&members);
         let st = self.lock();
         let c = &st.counts;
         let q = |h: &Histogram| h.quantile(0.9999);
@@ -4245,14 +4247,30 @@ mod tests {
         let mut f = fixture(&[&[1, 2, 3]]);
         f.members.addrs.insert(9, "9".into());
         f.tick();
-        assert_eq!(f.contact.protocol_blocker(), Some(2), "no report yet");
+        assert_eq!(
+            f.contact.protocol_blocker(&f.members),
+            Some(2),
+            "no report yet"
+        );
         f.contact.receive(protocol_report(&f, 2, PROTOCOL));
         f.contact.receive(protocol_report(&f, 3, 1));
-        assert_eq!(f.contact.protocol_blocker(), Some(3), "a voter at 1");
+        assert_eq!(
+            f.contact.protocol_blocker(&f.members),
+            Some(3),
+            "a voter at 1"
+        );
         f.contact.receive(protocol_report(&f, 3, PROTOCOL));
-        assert_eq!(f.contact.protocol_blocker(), Some(9), "a learner not heard");
+        assert_eq!(
+            f.contact.protocol_blocker(&f.members),
+            Some(9),
+            "a learner not heard"
+        );
         f.contact.receive(protocol_report(&f, 9, 1));
-        assert_eq!(f.contact.protocol_blocker(), Some(9), "a learner at 1");
+        assert_eq!(
+            f.contact.protocol_blocker(&f.members),
+            Some(9),
+            "a learner at 1"
+        );
         assert!(f.contact.learner_holds_set_config(9));
         assert!(!f.contact.learner_promotable(9), "a learner at 1");
         let m = f.contact.metrics();
@@ -4260,15 +4278,32 @@ mod tests {
         assert_eq!(m.protocol_blocker, Some(9));
         f.contact.receive(protocol_report(&f, 9, PROTOCOL));
         assert!(f.contact.learner_promotable(9));
-        assert_eq!(f.contact.protocol_blocker(), None);
+        assert_eq!(f.contact.protocol_blocker(&f.members), None);
         assert!(f.contact.metrics().protocol_gate_open);
+        // A member added since the last tick, which contact holds no
+        // report of yet, blocks as soon as it is in the membership passed.
+        let mut added = f.members.clone();
+        added.addrs.insert(10, "10".into());
+        assert_eq!(
+            f.contact.protocol_blocker(&added),
+            Some(10),
+            "a new learner"
+        );
+        let mut added = f.members.clone();
+        added.configs[0].insert(11);
+        added.addrs.insert(11, "11".into());
+        assert_eq!(f.contact.protocol_blocker(&added), Some(11), "a new voter");
         // Voter 2 falls silent: its newest report ages past w + D.
         let fresh = W + Timing::defaults(B).hold;
         f.clock.add(fresh);
         tokio::time::advance(fresh + Duration::from_millis(1)).await;
         f.contact.receive(protocol_report(&f, 3, PROTOCOL));
         f.contact.receive(protocol_report(&f, 9, PROTOCOL));
-        assert_eq!(f.contact.protocol_blocker(), Some(2), "a silent voter");
+        assert_eq!(
+            f.contact.protocol_blocker(&f.members),
+            Some(2),
+            "a silent voter"
+        );
         assert_eq!(f.contact.metrics().protocol_blocker, Some(2));
     }
 
