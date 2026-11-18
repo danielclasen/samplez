@@ -187,6 +187,7 @@ async fn an_expiry_applied_after_a_command_of_its_session_is_a_no_op() {
         .append(Body::LeaseExpiry {
             session: key("s"),
             renewed: first,
+            at_index: None,
         })
         .unwrap();
     sleep(Duration::from_millis(200)).await;

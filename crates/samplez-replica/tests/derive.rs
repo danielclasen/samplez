@@ -136,8 +136,9 @@ fn bodies(set: &Set<Desk>, id: NodeId) -> Vec<Vec<String>> {
 /// One session's commands, a re-routing one between two fader moves,
 /// commit in the order submitted: the re-routing one in an entry of its
 /// own, not batched with the others nor overtaken by them, at the leader
-/// and through a follower alike. The writer writes no flag until every
-/// member applies it.
+/// and through a follower alike. Every member speaks protocol 2, so the
+/// leader appends the protocol marker once, before the first flag, and
+/// flags the re-routing command for its generation and the others not.
 #[tokio::test(start_paused = true)]
 async fn a_rerouting_command_is_ordered_alone_in_submission_order() {
     let set = start().await;
@@ -161,12 +162,85 @@ async fn a_rerouting_command_is_ordered_alone_in_submission_order() {
         bodies(&set, leader),
         [&expected[..], &expected[..]].concat()
     );
+    let flags: Vec<Option<bool>> = commands(&set, leader)
+        .iter()
+        .flat_map(|(_, c)| c)
+        .map(|c| c.generation)
+        .collect();
+    let flagged = [Some(false), Some(true), Some(false)];
+    assert_eq!(flags, [flagged, flagged].concat());
+    let log = entries(&set, leader);
+    let markers: Vec<usize> = (log.iter().enumerate())
+        .filter(|(_, b)| matches!(b, Body::Protocol(2)))
+        .map(|(n, _)| n)
+        .collect();
+    let first = log
+        .iter()
+        .position(|b| matches!(b, Body::Commands(_)))
+        .unwrap();
+    assert_eq!(markers.len(), 1, "{log:?}");
+    assert!(markers[0] < first, "{log:?}");
     assert!(
-        commands(&set, leader)
+        set.replica(leader)
+            .contact_metrics()
+            .unwrap()
+            .protocol_gate_open
+    );
+}
+
+/// Every body `id`'s log holds, in order.
+fn entries(set: &Set<Desk>, id: NodeId) -> Vec<Body> {
+    let mut out = Vec::new();
+    set.replica(id)
+        .store()
+        .entries_after(0, |_, r| out.push(r.body.clone()));
+    out
+}
+
+/// A forwarded command carries the flag the leader classified it with,
+/// never the forwarding replica's: with the gate open its own, with the
+/// gate shut, here with no contact running, none, and no marker.
+#[tokio::test(start_paused = true)]
+async fn the_leader_flags_a_forwarded_command_itself() {
+    let forged = |e| PeerRequest::Forward {
+        commands: vec![Forwarded {
+            command: Command {
+                generation: Some(true),
+                origin: Origin::from(&owner("s")),
+                id: "1".into(),
+                at_index: None,
+                body: b"fader 0 0.5".to_vec(),
+            },
+            received: e,
+            within_ms: 1000,
+        }],
+    };
+    let open = start().await;
+    let shut = Set::start_with(Options::default(), Arc::new(|_| Desk::new())).await;
+    for (set, want) in [(&open, Some(false)), (&shut, None)] {
+        let leader = set.leader().await;
+        let e = set
+            .replica(leader)
+            .contact_metrics()
+            .and_then(|m| m.estimate)
+            .unwrap_or(0);
+        let Ok(PeerResponse::Forwarded(results)) =
+            set.replica(leader).handle(Some(leader), forged(e)).await
+        else {
+            panic!("not forwarded");
+        };
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        let flags: Vec<Option<bool>> = commands(set, leader)
             .iter()
             .flat_map(|(_, c)| c)
-            .all(|c| c.generation.is_none())
-    );
+            .map(|c| c.generation)
+            .collect();
+        assert_eq!(flags, [want]);
+        let marked = entries(set, leader)
+            .iter()
+            .any(|b| matches!(b, Body::Protocol(_)));
+        assert_eq!(marked, want.is_some());
+    }
 }
 
 /// Two re-routing commands hold one generation in flight: the second is
@@ -305,4 +379,74 @@ async fn a_route_or_master_enable_is_refused() {
         })
         .is_ok()
     );
+}
+
+/// The leader stamps a void and a lease expiry like a command, and flags
+/// a void of an entry that re-routed an input for its generation itself,
+/// whatever the body asked: every replica re-asserts the route at the
+/// void's index.
+#[tokio::test(start_paused = true)]
+async fn the_leader_stamps_and_classifies_a_void_and_an_expiry() {
+    let set = start().await;
+    let leader = set.leader().await;
+    let r = set.replica(leader);
+    r.submit(&owner("s"), "1", Bytes::from("route 0 c"))
+        .await
+        .expect("committed");
+    let mut route = None;
+    r.store().entries_after(0, |id, req| {
+        if matches!(req.body, Body::Commands(_)) {
+            route = Some((id.index, id.term));
+        }
+    });
+    let (revision, term) = route.unwrap();
+    r.append(Body::Void {
+        revision,
+        term,
+        at_index: Some(0),
+        generation: None,
+    })
+    .unwrap();
+    r.append(Body::LeaseExpiry {
+        session: SessionKey::from_parts("p", "gone"),
+        renewed: 0,
+        at_index: Some(0),
+    })
+    .unwrap();
+    sleep(Duration::from_millis(500)).await;
+    let mut stamped = Vec::new();
+    r.store().entries_after(revision, |id, req| {
+        stamped.push((id.index, req.clone()));
+    });
+    let void = stamped
+        .iter()
+        .find(|(_, req)| matches!(req.body, Body::Void { .. }))
+        .expect("void written");
+    let Body::Void {
+        at_index: Some(at),
+        generation,
+        ..
+    } = void.1.body
+    else {
+        panic!("{void:?}");
+    };
+    assert!(at >= void.1.stamp && at > 0, "{void:?}");
+    assert_eq!(generation, Some(true));
+    let expiry = stamped
+        .iter()
+        .find(|(_, req)| matches!(req.body, Body::LeaseExpiry { .. }))
+        .expect("expiry written");
+    assert!(
+        matches!(expiry.1.body, Body::LeaseExpiry { at_index: Some(at), .. } if at >= expiry.1.stamp && at > 0),
+        "{expiry:?}"
+    );
+    for id in set.ids() {
+        let records = set
+            .replica(id)
+            .store()
+            .with_state(|sm| sm.records.get(&void.0).cloned());
+        let record = records.unwrap_or_else(|| panic!("replica {id} derived nothing"));
+        assert_eq!(record.at_index, at);
+        assert!(record.generation);
+    }
 }

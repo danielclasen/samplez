@@ -269,6 +269,9 @@ pub struct StateMachine<P> {
     /// restamp of one re-asserts the targets, of one that derived nothing
     /// nothing.
     pub derived: BTreeMap<u64, Vec<u32>>,
+    /// The highest [`Body::Protocol`] applied: the leader flags commands
+    /// only once its own state holds [`crate::entry::PROTOCOL`].
+    pub protocol: u32,
     /// Not replicated: the targets as last derived, a product that drives
     /// an engine only.
     image: Option<samplez::Targets>,
@@ -299,6 +302,7 @@ impl<P: Product> StateMachine<P> {
             deltas_after: 0,
             floor: 0,
             derived: BTreeMap::new(),
+            protocol: 0,
             image: None,
             records: BTreeMap::new(),
         }
@@ -316,13 +320,13 @@ impl<P: Product> StateMachine<P> {
     }
 
     /// The index entry `request` takes effect at, raised to the floor,
-    /// and the floor after it: its own at_index, or its stamp for one
-    /// further than [`AHEAD_MAX`] past it or for a lease expiry, which
-    /// carries none.
+    /// and the floor after it: its own at_index, or its stamp, a block
+    /// start, for one further than [`AHEAD_MAX`] past it or for a lease
+    /// expiry or void from an older leader, which stamps none.
     fn floored(&self, request: &Request) -> Option<u64> {
         let own = match (request.at_index(), &request.body) {
             (Some(at), _) if at <= request.stamp.saturating_add(AHEAD_MAX) => at,
-            (Some(_), _) | (None, Body::LeaseExpiry { .. }) => request.stamp,
+            (Some(_), _) | (None, Body::LeaseExpiry { .. } | Body::Void { .. }) => request.stamp,
             (None, _) => return None,
         };
         Some(own.max(self.floor))
@@ -331,8 +335,8 @@ impl<P: Product> StateMachine<P> {
     /// Derives the engine entries of the entry at log index `revision`,
     /// applied at `at`: the diff of the targets when it `changed` the
     /// product, every target and the routes of the entry it names for a
-    /// restamp of one that derived some, an input's state for an
-    /// `InputDown` or `InputUp`.
+    /// restamp or void of one that derived some, an input's state for an
+    /// `InputDown` or `InputUp` and for a restamp of one.
     fn derive(
         &mut self,
         revision: u64,
@@ -345,7 +349,7 @@ impl<P: Product> StateMachine<P> {
             return;
         }
         let (entries, routed) = match (&request.body, restamped) {
-            (Body::Restamp { .. }, Some(slots)) => {
+            (Body::Restamp { .. } | Body::Void { .. }, Some(slots)) => {
                 let Some(targets) = self.product.targets() else {
                     return;
                 };
@@ -354,6 +358,14 @@ impl<P: Product> StateMachine<P> {
                 self.image = Some(targets);
                 (entries, Vec::new())
             }
+            // A restamped input state: the body moved to the restamp's
+            // index.
+            (Body::Restamp { .. }, None) => match self.pending.get(&revision) {
+                Some(body @ (Body::InputDown { .. } | Body::InputUp { .. })) => {
+                    (input_entries(body), Vec::new())
+                }
+                _ => return,
+            },
             (Body::InputDown { slot, .. }, _) => (
                 vec![samplez::Entry::InputDown {
                     slot: *slot as usize,
@@ -423,14 +435,10 @@ impl<P: Product> StateMachine<P> {
         if let Some(at) = at {
             self.floor = at;
         }
-        // A restamp of an entry held that derived engine entries: the
-        // slots it re-routed, read before the restamp moves it.
-        let restamped = match request.body {
-            Body::Restamp {
-                revision: of,
-                term: of_term,
-                ..
-            } if self.terms.get(&of).is_some_and(|&(t, _)| t == of_term) => {
+        // A restamp or void of an entry held that derived engine entries:
+        // the slots it re-routed, read before the decision moves it.
+        let restamped = match request.body.decides() {
+            Some((of, of_term)) if self.terms.get(&of).is_some_and(|&(t, _)| t == of_term) => {
                 self.derived.get(&of).cloned()
             }
             _ => None,
@@ -491,13 +499,32 @@ impl<P: Product> StateMachine<P> {
             Body::Void {
                 revision: of,
                 term: of_term,
+                at_index,
+                ..
             } => {
                 if self.terms.get(of).is_some_and(|&(t, _)| t == *of_term) {
                     self.pending.remove(of);
-                    self.restamps.remove(of);
+                    let behind = self.restamps.remove(of);
                     self.terms.remove(of);
-                    self.derived.remove(of);
+                    let derived = self.derived.remove(of);
+                    // A void the leader stamped re-asserts the entry's
+                    // effect at its own index: one that goes unresolved is
+                    // decided like the entry, known under the void's id,
+                    // the restamps behind the entry counting.
+                    if let Some(at) = *at_index {
+                        self.terms.insert(revision, (term, at));
+                        if let Some((behind, _)) = behind {
+                            self.restamps.insert(revision, (behind, at));
+                        }
+                        if let Some(derived) = derived {
+                            self.derived.insert(revision, derived);
+                        }
+                    }
                 }
+                Response::default()
+            }
+            Body::Protocol(protocol) => {
+                self.protocol = self.protocol.max(*protocol);
                 Response::default()
             }
             // Acted on by the replica it names.
@@ -522,7 +549,9 @@ impl<P: Product> StateMachine<P> {
                 }
                 Response::default()
             }
-            Body::LeaseExpiry { session, renewed } => {
+            Body::LeaseExpiry {
+                session, renewed, ..
+            } => {
                 // A renewal after the one the expiry was decided on keeps
                 // the lease: the expiry is a no-op.
                 if self.leases.get(session).is_some_and(|at| at <= renewed) {
@@ -725,6 +754,7 @@ impl<P: Product> StateMachine<P> {
             revision: self.revision,
             floor: Some(self.floor),
             derived: self.derived.clone(),
+            protocol: self.protocol,
         }
     }
 
@@ -765,6 +795,7 @@ impl<P: Product> StateMachine<P> {
                 .unwrap_or(0)
         });
         self.derived = saved.derived;
+        self.protocol = saved.protocol;
         self.records.clear();
         self.image = if P::DRIVES_ENGINE {
             self.product.targets()
@@ -775,6 +806,19 @@ impl<P: Product> StateMachine<P> {
     }
 }
 
+/// The engine entry of an `InputDown` or `InputUp`.
+fn input_entries(body: &Body) -> Vec<samplez::Entry> {
+    match *body {
+        Body::InputDown { slot, .. } => vec![samplez::Entry::InputDown {
+            slot: slot as usize,
+        }],
+        Body::InputUp { slot, .. } => vec![samplez::Entry::InputUp {
+            slot: slot as usize,
+        }],
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn restamp(body: &mut Body, to: u64) {
     match body {
         Body::InputDown { at_index, .. }
@@ -782,6 +826,14 @@ pub(crate) fn restamp(body: &mut Body, to: u64) {
         | Body::Route { at_index, .. }
         | Body::MasterEnable { at_index, .. }
         | Body::Restamp { at_index, .. } => *at_index = to,
+        Body::Void {
+            at_index: Some(at_index),
+            ..
+        }
+        | Body::LeaseExpiry {
+            at_index: Some(at_index),
+            ..
+        } => *at_index = to,
         Body::Commands(commands) => {
             for c in commands {
                 c.at_index = Some(to);
@@ -1009,6 +1061,7 @@ pub(crate) mod tests {
             body: Body::LeaseExpiry {
                 session: key.clone(),
                 renewed,
+                at_index: None,
             },
         };
         sm.apply(2, &expiry(0));
@@ -1046,6 +1099,7 @@ pub(crate) mod tests {
             body: Body::LeaseExpiry {
                 session: session.clone(),
                 renewed,
+                at_index: None,
             },
         }
     }
@@ -1273,6 +1327,7 @@ pub(crate) mod tests {
                 body: Body::LeaseExpiry {
                     session: key.clone(),
                     renewed: 48,
+                    at_index: None,
                 },
             },
         );
@@ -1285,6 +1340,7 @@ pub(crate) mod tests {
                 body: Body::LeaseExpiry {
                     session: key.clone(),
                     renewed: 96,
+                    at_index: None,
                 },
             },
         );
@@ -1312,6 +1368,7 @@ pub(crate) mod tests {
                 body: Body::LeaseExpiry {
                     session: key.clone(),
                     renewed: 144,
+                    at_index: None,
                 },
             },
         );
@@ -1351,6 +1408,7 @@ pub(crate) mod tests {
                     term: 0,
                     at_index: 1920,
                     paths: vec![],
+                    generation: None,
                 },
             },
         );
@@ -1361,6 +1419,8 @@ pub(crate) mod tests {
                 body: Body::Void {
                     revision: 2,
                     term: 0,
+                    at_index: None,
+                    generation: None,
                 },
             },
         );
@@ -1396,6 +1456,8 @@ pub(crate) mod tests {
                 Body::Void {
                     revision: 5,
                     term: 1,
+                    at_index: None,
+                    generation: None,
                 },
             ),
         );
@@ -1409,6 +1471,7 @@ pub(crate) mod tests {
                     term: 1,
                     at_index: 1920,
                     paths: vec![],
+                    generation: None,
                 },
             ),
         );
@@ -1420,6 +1483,7 @@ pub(crate) mod tests {
                 term: of.1,
                 at_index: 960 * (index - 6),
                 paths: vec![],
+                generation: None,
             };
             sm.apply_at(index, 3, &at(0, restamp));
             assert_eq!(sm.restamps[&index].0, n as u32 + 1);
@@ -1435,6 +1499,8 @@ pub(crate) mod tests {
                 Body::Void {
                     revision: 10,
                     term: 3,
+                    at_index: None,
+                    generation: None,
                 },
             ),
         );
@@ -1458,6 +1524,7 @@ pub(crate) mod tests {
             term: 2,
             at_index: 1920,
             paths: vec![],
+            generation: None,
         };
         sm.apply_at(6, 3, &at(0, restamp));
         let (pending, restamps) = (sm.pending.clone(), sm.restamps.clone());
@@ -1469,6 +1536,8 @@ pub(crate) mod tests {
                 Body::Void {
                     revision: 5,
                     term: 2,
+                    at_index: None,
+                    generation: None,
                 },
             ),
         );
@@ -1497,6 +1566,8 @@ pub(crate) mod tests {
                 Body::Void {
                     revision: 5,
                     term: 2,
+                    at_index: None,
+                    generation: None,
                 },
             ),
         );
@@ -1563,7 +1634,11 @@ mod derive_tests {
     /// Two input slots of one channel into one output: each coefficient is
     /// the slot's fader times the VCA, slot 1 silent while a session holds
     /// solo on slot 0. Commands: `fader <slot> <gain>`, `vca <gain>`,
-    /// `trim <slot> <db>`, `route <slot> <flow>`, `solo`, `noop`, `stale`.
+    /// `trim <slot> <db>`, `route <slot> <flow>`, `pair <flow> <flow>`
+    /// (both slots), `solo`, `noop`, `stale`.
+    /// The input domain of each slot, as configured.
+    const DOMAINS: [u8; 2] = [0, 1];
+
     #[derive(Serialize, Deserialize)]
     struct Desk {
         faders: [f64; 2],
@@ -1600,8 +1675,13 @@ mod derive_tests {
                 ["trim", slot, db] => {
                     self.trims[slot.parse::<usize>().unwrap()] = db.parse().unwrap()
                 }
-                // Ordered off the generation path: refused.
-                ["route", ..] if ctx.generation == Some(false) => return Effect::Unchanged,
+                // Ordered off the generation path, or across two input
+                // domains: refused.
+                ["route", ..] | ["pair", ..] if ctx.generation == Some(false) => {
+                    return Effect::Unchanged;
+                }
+                ["pair", ..] if DOMAINS[0] != DOMAINS[1] => return Effect::Unchanged,
+                ["pair", a, b] => self.flows = [a.into(), b.into()],
                 ["route", slot, flow] => self.flows[slot.parse::<usize>().unwrap()] = flow.into(),
                 ["solo"] => self.solo = Some(origin.key()),
                 ["noop"] => return Effect::Unchanged,
@@ -1659,6 +1739,7 @@ mod derive_tests {
             let text = std::str::from_utf8(command).expect("utf-8");
             match text.split(' ').collect::<Vec<_>>()[..] {
                 ["route", slot, _] => vec![slot.parse().unwrap()],
+                ["pair", ..] => vec![0, 1],
                 _ => Vec::new(),
             }
         }
@@ -1757,6 +1838,7 @@ mod derive_tests {
             body: Body::LeaseExpiry {
                 session: origin("s").key(),
                 renewed,
+                at_index: None,
             },
         };
         sm.apply(2, &expiry(0));
@@ -1798,6 +1880,7 @@ mod derive_tests {
                 term: 1,
                 at_index,
                 paths: Vec::new(),
+                generation: None,
             },
         };
         sm.apply_at(12, 1, &restamp(4000));
@@ -1839,6 +1922,7 @@ mod derive_tests {
                     term: 1,
                     at_index: 4000,
                     paths: Vec::new(),
+                    generation: None,
                 },
             },
         );
@@ -1979,11 +2063,194 @@ mod derive_tests {
             body: Body::Void {
                 revision: 10,
                 term: 1,
+                at_index: None,
+                generation: None,
             },
         };
         sm.apply_at(11, 1, &void);
         assert!(!sm.derived.contains_key(&10));
-        assert!(!sm.records.contains_key(&11));
+        assert!(!sm.derived.contains_key(&11), "an unstamped void is final");
+        assert_eq!(sm.records[&11].at_index, 3000, "re-asserted at the floor");
+    }
+
+    fn void(of: u64, stamp: u64, at_index: Option<u64>) -> Request {
+        Request {
+            stamp,
+            body: Body::Void {
+                revision: of,
+                term: 1,
+                at_index,
+                generation: Some(true),
+            },
+        }
+    }
+
+    /// A void of a product entry re-asserts the state at the void, on the
+    /// generation path when the entry re-routed: the engine plays the
+    /// voided command's effect, which the state holds. One from an older
+    /// leader re-asserts at its stamp raised to the floor, one of an id
+    /// not held derives nothing.
+    #[test]
+    fn a_void_reasserts_the_state_at_its_index() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "route 0 c", 0, 3000, Some(true)));
+        sm.apply_at(11, 1, &one("2", "fader 0 0.2", 0, 3000, None));
+        sm.apply_at(12, 1, &void(10, 96, Some(4800)));
+        let r = &sm.records[&12];
+        assert_eq!(r.at_index, 4800);
+        assert!(r.generation);
+        assert!(r.entries.contains(&Entry::Route {
+            slot: 0,
+            flow_id: "c".into()
+        }));
+        assert!(r.entries.contains(&Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.2
+        }));
+        assert!(void(10, 0, None).body.needs_generation());
+
+        sm.apply_at(13, 1, &one("3", "route 1 d", 0, 4800, Some(true)));
+        sm.apply_at(14, 1, &void(13, 4900, None));
+        assert_eq!(sm.records[&14].at_index, 4900, "the stamp, past the floor");
+        sm.apply_at(15, 1, &void(99, 96, Some(6000)));
+        assert!(!sm.records.contains_key(&15));
+    }
+
+    /// A stamped void can go unresolved itself: a restamp of it re-asserts
+    /// again, and the restamps behind the voided entry count against it.
+    #[test]
+    fn a_stamped_void_is_decided_like_the_entry() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "route 0 c", 0, 3000, Some(true)));
+        sm.restamps.insert(10, (2, 3000));
+        sm.apply_at(11, 1, &void(10, 96, Some(4800)));
+        assert_eq!(sm.terms.get(&11), Some(&(1, 4800)));
+        assert_eq!(sm.restamps.get(&11), Some(&(2, 4800)));
+        let restamp = Request {
+            stamp: 96,
+            body: Body::Restamp {
+                revision: 11,
+                term: 1,
+                at_index: 6000,
+                paths: Vec::new(),
+                generation: Some(true),
+            },
+        };
+        sm.apply_at(12, 1, &restamp);
+        assert_eq!(sm.records[&12].at_index, 6000);
+        assert!(sm.records[&12].entries.contains(&Entry::Route {
+            slot: 0,
+            flow_id: "c".into()
+        }));
+        assert_eq!(sm.restamps.get(&12).map(|r| r.0), Some(3));
+    }
+
+    /// A restamp of an `InputUp` or `InputDown` derives it at the
+    /// restamp's index, so the engine raises the input there.
+    #[test]
+    fn a_restamped_input_state_derives_it_at_the_restamp() {
+        let mut sm = machine();
+        let restamp = |revision, at_index| Request {
+            stamp: 96,
+            body: Body::Restamp {
+                revision,
+                term: 1,
+                at_index,
+                paths: Vec::new(),
+                generation: None,
+            },
+        };
+        for (n, body) in [
+            Body::InputUp {
+                slot: 1,
+                at_index: 960,
+            },
+            Body::InputDown {
+                slot: 0,
+                at_index: 960,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = 10 + 2 * n as u64;
+            sm.apply_at(at, 1, &Request { stamp: 0, body });
+            sm.apply_at(at + 1, 1, &restamp(at, 2000));
+            let r = &sm.records[&(at + 1)];
+            assert_eq!(r.at_index, 2000);
+            let want = match n {
+                0 => Entry::InputUp { slot: 1 },
+                _ => Entry::InputDown { slot: 0 },
+            };
+            assert_eq!(r.entries, [want]);
+            assert_eq!(r.generation, n == 0);
+        }
+    }
+
+    /// A lease expiry the leader stamped derives at its own index.
+    #[test]
+    fn a_stamped_lease_expiry_derives_at_its_index() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "solo", 0, 960, None));
+        let expiry = Request {
+            stamp: 96,
+            body: Body::LeaseExpiry {
+                session: origin("s").key(),
+                renewed: 0,
+                at_index: Some(2400),
+            },
+        };
+        sm.apply_at(11, 1, &expiry);
+        assert_eq!(sm.records[&11].at_index, 2400);
+        assert_eq!(sm.floor, 2400);
+    }
+
+    /// Two input domains: a command re-routing slots of both is refused
+    /// with any flag, and one re-routing off the generation path too; every
+    /// machine refuses alike, derives nothing and still moves the floor.
+    #[test]
+    fn a_rerouting_command_off_its_path_or_across_domains_is_refused_everywhere() {
+        let log = [
+            one("1", "pair c d", 0, 960, Some(true)),
+            one("2", "route 0 c", 0, 1920, Some(false)),
+        ];
+        for mut sm in [machine(), machine()] {
+            for (n, request) in log.iter().enumerate() {
+                let response = sm.apply_at(10 + n as u64, 1, request);
+                assert_eq!(response.0[0].result, Resolution::Unchanged);
+            }
+            assert!(sm.records.is_empty());
+            assert_eq!(sm.floor, 1920);
+            assert_eq!(sm.product.flows, ["a".to_owned(), "b".to_owned()]);
+        }
+    }
+
+    /// `Body::Protocol` raises the replicated protocol, never lowers it,
+    /// and a snapshot carries it; one written before it was kept loads at
+    /// 0.
+    #[test]
+    fn the_protocol_marker_is_replicated() {
+        let mut sm = machine();
+        let marker = |p| Request {
+            stamp: 0,
+            body: Body::Protocol(p),
+        };
+        sm.apply_at(1, 1, &marker(2));
+        sm.apply_at(2, 1, &marker(1));
+        assert_eq!(sm.protocol, 2);
+        let mut loaded = machine();
+        loaded
+            .load(sm.save(), Limits::defaults(48_000))
+            .expect("loads");
+        assert_eq!(loaded.protocol, 2);
+        let mut legacy = serde_json::to_value(sm.save()).unwrap();
+        legacy.as_object_mut().unwrap().remove("protocol");
+        let legacy: Replicated = serde_json::from_value(legacy).unwrap();
+        loaded
+            .load(legacy, Limits::defaults(48_000))
+            .expect("loads");
+        assert_eq!(loaded.protocol, 0);
     }
 
     /// A record is kept until its index lies [`RECORDS_KEPT`] below the
@@ -2017,6 +2284,7 @@ mod derive_tests {
                 body: Body::LeaseExpiry {
                     session: origin("s").key(),
                     renewed: 0,
+                    at_index: None,
                 },
             },
         );
@@ -2041,6 +2309,7 @@ mod derive_tests {
                 body: Body::LeaseExpiry {
                     session: origin("s").key(),
                     renewed: 240,
+                    at_index: None,
                 },
             },
         ];

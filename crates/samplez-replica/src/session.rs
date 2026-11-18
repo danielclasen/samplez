@@ -84,7 +84,12 @@ pub(crate) async fn expire<P: Product>(
                 continue;
             }
             sent.insert(session.clone(), (renewed, at));
-            let body = Body::LeaseExpiry { session, renewed };
+            // The leader stamps it on append.
+            let body = Body::LeaseExpiry {
+                session,
+                renewed,
+                at_index: Some(0),
+            };
             let _ = queue.send(Queued::Entry {
                 body,
                 deadline: at + timeout,

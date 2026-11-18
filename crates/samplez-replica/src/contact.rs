@@ -18,7 +18,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::Shared;
 use crate::baseline::{Leader, LeaderView, Voter};
-use crate::entry::{Baseline, Body, NodeId, Request};
+use crate::entry::{Baseline, Body, NodeId, PROTOCOL, Request};
 use crate::log_store::Store;
 use crate::peer::{PeerRequest, PeerResponse};
 use crate::rank::Baselines;
@@ -521,11 +521,20 @@ struct Counts {
     clock_holds: u64,
 }
 
+/// What contact takes of a learner's newest report.
+struct Learner {
+    /// The product configuration hash it named.
+    config: Option<u64>,
+    /// The log protocol it speaks ([`crate::report::Own::protocol`]).
+    protocol: u32,
+    received: Instant,
+}
+
 struct State {
     members: Members,
-    /// The product configuration hash of each learner's newest report:
-    /// the only part of a learner's report taken.
-    learner_configs: BTreeMap<NodeId, Option<u64>>,
+    /// Each learner's newest report: its configuration hash and protocol
+    /// are the only parts of it taken.
+    learners: BTreeMap<NodeId, Learner>,
     seq: u64,
     sent: VecDeque<(u64, u64)>,
     peers: BTreeMap<NodeId, Peer>,
@@ -632,6 +641,12 @@ pub struct Contact {
 /// Contact as status and metrics show it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Metrics {
+    /// `replica_protocol_gate_open`: every member speaks
+    /// [`PROTOCOL`] ([`Contact::protocol_blocker`]), so the leader writes
+    /// generation flags.
+    pub protocol_gate_open: bool,
+    /// The first member keeping the gate shut, its label.
+    pub protocol_blocker: Option<NodeId>,
     /// This replica's product configuration hash
     /// ([`crate::state_machine::Product::config_hash`]), to compare with
     /// the other replicas'.
@@ -756,6 +771,10 @@ impl Contact {
         let installs_seen = log.installs();
         let mut scheduled = BTreeMap::new();
         let mut generation_at = None;
+        // The pending generation is learned from the engine bodies the
+        // state machine holds and, in `sync_log`, from every entry appended
+        // after `applied` that needs one; a flagged `Commands` entry or
+        // decision applied before a restart is not seen here.
         // Entries the engine applies later, purged ones included, for
         // listings.
         // Collected first: the log's view is not re-entered from inside it.
@@ -802,7 +821,7 @@ impl Contact {
                 generation_at,
                 own_at: Instant::now(),
                 judged: BTreeSet::new(),
-                learner_configs: BTreeMap::new(),
+                learners: BTreeMap::new(),
                 slack: Vec::new(),
                 lead: Lead::new(
                     timing.block,
@@ -887,9 +906,15 @@ impl Contact {
             return;
         }
         if !voters.contains(&report.from) {
-            // A learner applies the log too: its configuration counts.
+            // A learner applies the log too: its configuration and
+            // protocol count.
             if st.members.addrs.contains_key(&report.from) {
-                st.learner_configs.insert(report.from, report.own.config);
+                let learner = Learner {
+                    config: report.own.config,
+                    protocol: report.own.protocol,
+                    received: now,
+                };
+                st.learners.insert(report.from, learner);
             }
             return;
         }
@@ -1076,7 +1101,7 @@ impl Contact {
         let st = &mut *st;
         let voters = members.voters();
         st.peers.retain(|id, _| voters.contains(id));
-        st.learner_configs
+        st.learners
             .retain(|id, _| members.addrs.contains_key(id) && !voters.contains(id));
         st.members = members;
         self.expire(st, tai);
@@ -1114,6 +1139,7 @@ impl Contact {
             st.own.clock.tai_offset_s = self.clocks.tai_offset_s();
         }
         st.own.config = self.log.config_hash();
+        st.own.protocol = PROTOCOL;
         st.judged = self.log.judged();
         st.lead.roll();
         self.verify(st, now);
@@ -1413,6 +1439,7 @@ impl Contact {
             term,
             at_index,
             ref paths,
+            ..
         } = request.body
         else {
             return None;
@@ -1422,7 +1449,12 @@ impl Contact {
         if self.first_decision(revision, term) != Some(index) {
             return Some(Request {
                 stamp: request.stamp,
-                body: Body::Void { revision, term },
+                body: Body::Void {
+                    revision,
+                    term,
+                    at_index: None,
+                    generation: None,
+                },
             });
         }
         let (_, original) = self.original(revision)?;
@@ -2300,8 +2332,8 @@ impl Contact {
                 .then_some(id)
         });
         voter.or_else(|| {
-            (st.learner_configs.iter())
-                .find(|(_, c)| c.is_some_and(|c| c != ours))
+            (st.learners.iter())
+                .find(|(_, l)| l.config.is_some_and(|c| c != ours))
                 .map(|(&id, _)| id)
         })
     }
@@ -2313,9 +2345,49 @@ impl Contact {
     pub fn learner_holds_set_config(&self, id: NodeId) -> bool {
         let ours = self.log.config_hash();
         self.lock()
-            .learner_configs
+            .learners
             .get(&id)
-            .is_some_and(|c| c.is_none_or(|c| ours.is_none_or(|o| o == c)))
+            .is_some_and(|l| l.config.is_none_or(|c| ours.is_none_or(|o| o == c)))
+    }
+
+    /// Whether learner `id` may be promoted: it holds the set's product
+    /// configuration ([`Contact::learner_holds_set_config`]) and its newest
+    /// report speaks [`PROTOCOL`] or later, since a voter of an older
+    /// protocol would apply generation flags it does not know.
+    pub fn learner_promotable(&self, id: NodeId) -> bool {
+        self.learner_holds_set_config(id)
+            && self
+                .lock()
+                .learners
+                .get(&id)
+                .is_some_and(|l| l.protocol >= PROTOCOL)
+    }
+
+    /// The protocol gate: the first member of the membership, learners
+    /// included, whose newest report, direct or relayed, is older than
+    /// `w + D`, missing, or speaks a protocol below [`PROTOCOL`]; none
+    /// while every member speaks it, when the leader may write generation
+    /// flags. This replica counts as its own binary's.
+    pub fn protocol_blocker(&self) -> Option<NodeId> {
+        let st = self.lock();
+        let now = Instant::now();
+        let fresh = self.timing.contact_window + self.timing.hold;
+        let copies = self.copies(&st, now);
+        let voters = st.members.voters();
+        st.members.addrs.keys().copied().find(|&id| {
+            let speaks = if id == self.id {
+                true
+            } else if voters.contains(&id) {
+                copies
+                    .iter()
+                    .any(|(v, age, own)| *v == id && *age <= fresh && own.protocol >= PROTOCOL)
+            } else {
+                st.learners
+                    .get(&id)
+                    .is_some_and(|l| since(now, l.received) <= fresh && l.protocol >= PROTOCOL)
+            };
+            !speaks
+        })
     }
 
     /// The engine refused an appended entry: the replica's output no
@@ -2672,6 +2744,8 @@ impl Contact {
     }
 
     pub fn metrics(&self) -> Metrics {
+        // Takes the lock itself.
+        let protocol_blocker = self.protocol_blocker();
         let st = self.lock();
         let c = &st.counts;
         let q = |h: &Histogram| h.quantile(0.9999);
@@ -2682,6 +2756,8 @@ impl Contact {
             .map(|(d, th)| 2 * self.timing.report_period + Duration::from_nanos(2 * d + th));
         let status_lag = q(&c.status_lag).map(Duration::from_nanos);
         Metrics {
+            protocol_gate_open: protocol_blocker.is_none(),
+            protocol_blocker,
             config_hash: self.log.config_hash(),
             fence: st.fence,
             in_contact: st.in_contact,
@@ -3477,6 +3553,7 @@ mod tests {
             term: 1,
             at_index: at + 96,
             paths: Vec::new(),
+            generation: None,
         };
         f.insert(2, restamp);
         f.contact.log_changed();
@@ -3525,6 +3602,8 @@ mod tests {
             Body::Void {
                 revision: 1,
                 term: 1,
+                at_index: None,
+                generation: None,
             },
         );
         f.apply(2);
@@ -3622,6 +3701,7 @@ mod tests {
             term: 1,
             at_index,
             paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+            generation: None,
         }
     }
 
@@ -3725,6 +3805,8 @@ mod tests {
             Body::Void {
                 revision: 3,
                 term: 7,
+                at_index: None,
+                generation: None,
             },
         );
         f.apply(5);
@@ -4128,13 +4210,59 @@ mod tests {
         assert_eq!(n, 1, "withdrawn {n} times: {calls:?}");
     }
 
+    /// A report from `from` speaking `protocol`.
+    fn protocol_report(f: &Fixture, from: NodeId, protocol: u32) -> Report {
+        let mut r = f.config_report(from, None);
+        r.own.protocol = protocol;
+        r
+    }
+
+    /// The gate opens only while every member, learners included, sent a
+    /// report within `w + D` speaking protocol 2: a member not heard from,
+    /// one speaking protocol 1 and one gone silent each keep it shut, and
+    /// the metric names it. A learner of protocol 1 is not promoted.
+    #[tokio::test(start_paused = true)]
+    async fn the_protocol_gate_opens_only_while_every_member_speaks_protocol_2() {
+        let mut f = fixture(&[&[1, 2, 3]]);
+        f.members.addrs.insert(9, "9".into());
+        f.tick();
+        assert_eq!(f.contact.protocol_blocker(), Some(2), "no report yet");
+        f.contact.receive(protocol_report(&f, 2, PROTOCOL));
+        f.contact.receive(protocol_report(&f, 3, 1));
+        assert_eq!(f.contact.protocol_blocker(), Some(3), "a voter at 1");
+        f.contact.receive(protocol_report(&f, 3, PROTOCOL));
+        assert_eq!(f.contact.protocol_blocker(), Some(9), "a learner not heard");
+        f.contact.receive(protocol_report(&f, 9, 1));
+        assert_eq!(f.contact.protocol_blocker(), Some(9), "a learner at 1");
+        assert!(f.contact.learner_holds_set_config(9));
+        assert!(!f.contact.learner_promotable(9), "a learner at 1");
+        let m = f.contact.metrics();
+        assert!(!m.protocol_gate_open);
+        assert_eq!(m.protocol_blocker, Some(9));
+        f.contact.receive(protocol_report(&f, 9, PROTOCOL));
+        assert!(f.contact.learner_promotable(9));
+        assert_eq!(f.contact.protocol_blocker(), None);
+        assert!(f.contact.metrics().protocol_gate_open);
+        // Voter 2 falls silent: its newest report ages past w + D.
+        let fresh = W + Timing::defaults(B).hold;
+        f.clock.add(fresh);
+        tokio::time::advance(fresh + Duration::from_millis(1)).await;
+        f.contact.receive(protocol_report(&f, 3, PROTOCOL));
+        f.contact.receive(protocol_report(&f, 9, PROTOCOL));
+        assert_eq!(f.contact.protocol_blocker(), Some(2), "a silent voter");
+        assert_eq!(f.contact.metrics().protocol_blocker, Some(2));
+    }
+
     /// An appended entry that needs a generation never lowers the pending
-    /// generation a re-routing command's stamp raised.
+    /// generation a re-routing command's stamp raised, and a `Commands`
+    /// entry the leader flagged for its generation counts, so a leader
+    /// that only appended it waits for it too.
     #[tokio::test(start_paused = true)]
     async fn appended_entries_never_lower_the_pending_generation() {
         let f = fixture(&[&[1]]);
         f.tick();
         let raised = f.contact.stamp(true).expect("stamped").earliest;
+        let far = raised + 400 * B;
         f.insert(
             1,
             Body::InputUp {
@@ -4145,5 +4273,22 @@ mod tests {
         f.contact.log_changed();
         f.tick();
         assert_eq!(f.contact.lock().generation_at, Some(raised));
+
+        let restarted = Contact::new(
+            1,
+            Timing::defaults(B),
+            f.clock.clone(),
+            Some(f.engine.clone()),
+            f.log.clone(),
+            1,
+        );
+        restarted.verified_always();
+        let mut command = crate::state_machine::tests::command("s", "1", "route");
+        command.at_index = Some(far);
+        command.generation = Some(true);
+        f.insert(2, Body::Commands(vec![command]));
+        restarted.tick(f.members.clone());
+        assert_eq!(restarted.lock().generation_at, Some(far));
+        assert_eq!(restarted.stamp(true), Err(StampRefusal::GenerationPending));
     }
 }

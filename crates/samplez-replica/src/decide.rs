@@ -188,6 +188,9 @@ impl Decider {
                     out.append.push(Body::Void {
                         revision: id.index,
                         term: id.term,
+                        // The leader stamps it on append.
+                        at_index: Some(0),
+                        generation: None,
                     });
                 } else {
                     continue;
@@ -245,6 +248,9 @@ impl Decider {
                 out.append.push(Body::Void {
                     revision: id.index,
                     term: id.term,
+                    // The leader stamps it on append.
+                    at_index: Some(0),
+                    generation: None,
                 });
             } else {
                 self.counts.restamps += 1;
@@ -254,6 +260,7 @@ impl Decider {
                     term: id.term,
                     at_index: 0,
                     paths: remaining.unwrap_or_default(),
+                    generation: None,
                 });
             }
             self.hold(k, now);
@@ -411,6 +418,7 @@ mod tests {
             term,
             at_index: 0,
             paths: Vec::new(),
+            generation: None,
         }
     }
 
@@ -512,6 +520,7 @@ mod tests {
                 term: 2,
                 at_index: 0,
                 paths: vec!["pan".into()],
+                generation: None,
             }]
         );
     }
@@ -571,6 +580,8 @@ mod tests {
         let void = Body::Void {
             revision: 7,
             term: 2,
+            at_index: Some(0),
+            generation: None,
         };
         for (restamps, superseded, want, late) in [
             (2, false, restamp(7, 2), 0),
@@ -611,7 +622,9 @@ mod tests {
             decide(&mut Decider::default(), &owns, Some(1), &Log::default()).append,
             [Body::Void {
                 revision: 8,
-                term: 1
+                term: 1,
+                at_index: Some(0),
+                generation: None,
             }]
         );
         let purged = Log {

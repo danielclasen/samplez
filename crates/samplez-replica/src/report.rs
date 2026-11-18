@@ -145,6 +145,10 @@ pub struct Own {
     /// replica that does not report one.
     #[serde(default)]
     pub config: Option<u64>,
+    /// The log protocol its binary speaks ([`crate::entry::PROTOCOL`]); 0
+    /// from a binary that reports none, which speaks protocol 1.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 /// One page of one output as the sender computed it (plan 2.11, page
