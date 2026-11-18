@@ -133,18 +133,26 @@ pub const AHEAD_MAX: u64 = 48_000;
 /// stay held.
 pub const RECORDS_KEPT: u64 = 48_000;
 
+/// How far past its stamp a lease expiry from an older leader, which
+/// stamps no index, takes effect: 50 ms at 48 kHz, the default
+/// `maxApplyLead`. A constant, never a replica's own timing, so every
+/// replica derives at the same index; far enough ahead that the record
+/// still reaches the engines before its apply deadline.
+pub const FALLBACK_LEAD: u64 = 2_400;
+
 /// The index the entry `request` takes effect at after entries that
 /// left the floor at `floor`, and the floor after it: its own at_index,
 /// or its stamp, a block start, for one further than [`AHEAD_MAX`] past
-/// it or for a lease expiry from an older leader, which stamps none. A
-/// void from an older leader takes effect nowhere, as that leader's
-/// binary applies it: the floor stays alike on both. A function of the
-/// log prefix alone, so contact computes at append the index the apply
-/// derives at.
+/// it, or [`FALLBACK_LEAD`] past its stamp for a lease expiry from an
+/// older leader, which stamps none. A void from an older leader takes
+/// effect nowhere, as that leader's binary applies it: the floor stays
+/// alike on both. A function of the log prefix alone, so contact
+/// computes at append the index the apply derives at.
 pub fn floored(floor: u64, request: &Request) -> Option<u64> {
     let own = match (request.at_index(), &request.body) {
         (Some(at), _) if at <= request.stamp.saturating_add(AHEAD_MAX) => at,
-        (Some(_), _) | (None, Body::LeaseExpiry { .. }) => request.stamp,
+        (Some(_), _) => request.stamp,
+        (None, Body::LeaseExpiry { .. }) => request.stamp.saturating_add(FALLBACK_LEAD),
         (None, _) => return None,
     };
     Some(own.max(floor))
@@ -1909,7 +1917,8 @@ mod derive_tests {
     }
 
     /// A lease expiry that releases what its session held derives the
-    /// coefficients it changes, at its stamp raised to the floor.
+    /// coefficients it changes, [`FALLBACK_LEAD`] past its stamp when the
+    /// leader stamped no index, raised to the floor.
     #[test]
     fn a_lease_expiry_derives_through_the_same_hook() {
         let mut sm = machine();
@@ -1925,7 +1934,7 @@ mod derive_tests {
         };
         sm.apply(2, &expiry(0));
         assert_eq!(gains(&sm.records[&2]), [(1, 0, 1.0f32.to_bits())]);
-        assert_eq!(sm.records[&2].at_index, 4800);
+        assert_eq!(sm.records[&2].at_index, 4800 + FALLBACK_LEAD);
         // One the session outlived changes nothing.
         sm.apply(3, &one("3", "solo", 4848, 5808, None));
         sm.apply(4, &expiry(0));
@@ -2133,10 +2142,11 @@ mod derive_tests {
         assert!(up.generation);
     }
 
-    /// A void or lease expiry from an older leader, which stamps none,
-    /// applies as that leader's binary applies it: the void drops the
-    /// entry and its `derived` bit, derives nothing and leaves the floor
-    /// where it was, the expiry derives at its stamp. One the leader
+    /// A void or lease expiry from an older leader, which stamps none:
+    /// the void applies as that leader's binary applies it, dropping the
+    /// entry and its `derived` bit, deriving nothing and leaving the floor
+    /// where it was; the expiry derives [`FALLBACK_LEAD`] past its stamp,
+    /// so its record can still reach the engines in time. One the leader
     /// stamped derives at its own index.
     #[test]
     fn an_unstamped_void_or_expiry_applies_as_an_older_binary_does() {
@@ -2160,13 +2170,13 @@ mod derive_tests {
             },
         };
         sm.apply_at(13, 1, &expiry(4800, None));
-        assert_eq!(sm.records[&13].at_index, 4800, "at its stamp");
-        assert_eq!(sm.floor, 4800);
+        assert_eq!(sm.records[&13].at_index, 4800 + FALLBACK_LEAD);
+        assert_eq!(sm.floor, 4800 + FALLBACK_LEAD);
 
-        sm.apply_at(14, 1, &one("3", "route 1 d", 0, 4800, Some(true)));
-        sm.apply_at(15, 1, &void(14, 4800, Some(6000)));
-        assert_eq!(sm.records[&15].at_index, 6000);
-        assert_eq!(sm.floor, 6000);
+        sm.apply_at(14, 1, &one("3", "route 1 d", 0, 7200, Some(true)));
+        sm.apply_at(15, 1, &void(14, 7200, Some(9600)));
+        assert_eq!(sm.records[&15].at_index, 9600);
+        assert_eq!(sm.floor, 9600);
     }
 
     fn void(of: u64, stamp: u64, at_index: Option<u64>) -> Request {
