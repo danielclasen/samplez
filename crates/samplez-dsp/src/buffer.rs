@@ -48,6 +48,11 @@ impl PlanarBuffer {
         &self.data[ch * self.capacity..(ch + 1) * self.capacity]
     }
 
+    /// Every channel's `capacity` samples, one after another.
+    pub(crate) fn data(&self) -> &[f32] {
+        &self.data
+    }
+
     /// All `capacity` samples of channel `ch`.
     pub fn channel_mut(&mut self, ch: usize) -> &mut [f32] {
         &mut self.data[ch * self.capacity..(ch + 1) * self.capacity]
