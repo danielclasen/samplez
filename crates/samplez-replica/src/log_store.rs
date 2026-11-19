@@ -19,7 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openraft::storage::{LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot};
@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::dedup::Limits;
 use crate::entry::{Body, NodeId, Request, Response};
-use crate::lock_watch::{ProductCode, WatchedGuard, WatchedMutex, assert_no_product_code};
+use crate::lock_watch::{
+    ProductCode, WatchedGuard, WatchedMutex, WatchedReadGuard, WatchedRwLock, WatchedWriteGuard,
+    assert_no_product_code,
+};
 use crate::snapshot::{
     StoredEntry, StoredLogId, StoredMembershipConfig, StoredPayload, StoredSnapshot, StoredVote,
 };
@@ -77,9 +80,13 @@ thread_local! {
     static GATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A store's gate held by this thread; released on drop.
+/// A store's gate held by this thread, for reading or writing; released
+/// on drop.
 struct Gate<'a> {
-    _held: WatchedGuard<'a, ()>,
+    _held: (
+        Option<WatchedReadGuard<'a, ()>>,
+        Option<WatchedWriteGuard<'a, ()>>,
+    ),
     key: usize,
 }
 
@@ -104,15 +111,17 @@ impl Drop for Gate<'_> {
 ///
 /// The applied state has a lock of its own, `applied`, which the replica
 /// reads under its contact lock. [`Store::with_state`] and
-/// [`Store::view`] take the `gate` first, and every change to the
-/// applied state takes it too: while a closure given to them runs, no
-/// change waits for `applied`, so the replica's own reads of it go on
-/// and the closure may call into the [`crate::Replica`]. Locks are
-/// taken in the order gate, `inner`, `applied`.
+/// [`Store::view`] take the `gate` for reading first, and every change to
+/// the applied state takes it for writing: while a closure given to them
+/// runs, no change waits for `applied`, so the replica's own reads of it
+/// go on and the closure may call into the [`crate::Replica`]. A change
+/// waiting for the gate holds off closures that come after it, so it
+/// waits only for those already running. Locks are taken in the order
+/// gate, `inner`, `applied`.
 pub struct Store<P> {
     inner: Arc<WatchedMutex<Inner>>,
-    applied: Arc<RwLock<Applied<P>>>,
-    gate: Arc<WatchedMutex<()>>,
+    applied: Arc<WatchedRwLock<Applied<P>>>,
+    gate: Arc<WatchedRwLock<()>>,
     /// Builds the empty product a snapshot install loads into.
     factory: Factory<P>,
     /// The product's configuration hash, fixed when the store opened.
@@ -383,12 +392,15 @@ impl<P: Product> Store<P> {
         }
         Ok(Store {
             inner: Arc::new(WatchedMutex::new("store", inner)),
-            applied: Arc::new(RwLock::new(Applied {
-                sm,
-                last_applied,
-                membership,
-            })),
-            gate: Arc::new(WatchedMutex::new("state", ())),
+            applied: Arc::new(WatchedRwLock::new(
+                "applied",
+                Applied {
+                    sm,
+                    last_applied,
+                    membership,
+                },
+            )),
+            gate: Arc::new(WatchedRwLock::new("state gate", ())),
             factory,
             config,
             on_mismatch: Arc::new(exit_on_mismatch),
@@ -422,18 +434,36 @@ impl<P: Product> Store<P> {
     /// Reads the state machine as applied up to an entry, never part way
     /// through one. `f` runs with no lock the replica's contact loop
     /// waits for, so it may call [`crate::Replica`] methods and this
-    /// store's reads, `with_state` included; entries are applied once it
-    /// returns. Not from a [`Product`] method: one the store calls panics
-    /// here rather than deadlock.
+    /// store's reads, `with_state` included. Closures run side by side;
+    /// an entry is applied once those running when it arrived return.
+    ///
+    /// `f` must therefore not wait for an entry to be applied, as
+    /// blocking on a `ReplicatedState::applied` or `read_index` future
+    /// does, nor for another thread that reads this store with
+    /// `with_state` or `view`: an apply arriving meanwhile waits for `f`
+    /// and holds the other thread off, and neither ever returns. Not from
+    /// a [`Product`] method: one the store calls panics here rather than
+    /// deadlock.
     pub fn with_state<T>(&self, f: impl FnOnce(&StateMachine<P>) -> T) -> T {
         self.view(|_, sm| f(sm))
     }
 
     /// [`Store::with_state`] with the index of the last entry applied.
     pub fn view<T>(&self, f: impl FnOnce(u64, &StateMachine<P>) -> T) -> T {
-        let _gate = self.gate();
+        let _gate = self.gate(false);
         let applied = self.read();
         f(applied.last_applied.map_or(0, |id| id.index), &applied.sm)
+    }
+
+    /// The product revision and the product's whole text there, for a
+    /// client snapshot: built after the gate is released when the
+    /// product gives [`Product::text_later`].
+    pub fn text(&self) -> (u64, String) {
+        let (revision, text) = self.with_state(|sm| {
+            let text = sm.product.text_later().ok_or_else(|| sm.product.text());
+            (sm.revision, text)
+        });
+        (revision, text.map_or_else(|text| text, |later| later()))
     }
 
     /// Reads the applied state without the gate, as the replica does
@@ -642,27 +672,35 @@ impl<P> Store<P> {
         self.inner.lock()
     }
 
-    fn read(&self) -> RwLockReadGuard<'_, Applied<P>> {
-        assert_no_product_code("store");
-        self.applied.read().expect("applied state lock poisoned")
-    }
-
-    /// Changes to the applied state take the gate first.
-    fn change(&self) -> RwLockWriteGuard<'_, Applied<P>> {
-        assert_no_product_code("store");
-        self.applied.write().expect("applied state lock poisoned")
-    }
-
-    /// Takes the gate, or nothing when this thread holds it already: a
-    /// `with_state` closure reading the store again.
     #[track_caller]
-    fn gate(&self) -> Option<Gate<'_>> {
+    fn read(&self) -> WatchedReadGuard<'_, Applied<P>> {
+        assert_no_product_code("store");
+        self.applied.read()
+    }
+
+    /// Changes to the applied state take the gate for writing first.
+    #[track_caller]
+    fn change(&self) -> WatchedWriteGuard<'_, Applied<P>> {
+        assert_no_product_code("store");
+        self.applied.write()
+    }
+
+    /// Takes the gate, for writing when `write`, or nothing when this
+    /// thread holds it already: a `with_state` closure reading the store
+    /// again, which a writer waiting for the gate would otherwise hold
+    /// off.
+    #[track_caller]
+    fn gate(&self, write: bool) -> Option<Gate<'_>> {
         assert_no_product_code("store");
         let key = Arc::as_ptr(&self.gate) as usize;
         if GATES.with(|g| g.borrow().contains(&key)) {
             return None;
         }
-        let held = self.gate.lock();
+        let held = if write {
+            (None, Some(self.gate.write()))
+        } else {
+            (Some(self.gate.read()), None)
+        };
         GATES.with(|g| g.borrow_mut().push(key));
         Some(Gate { _held: held, key })
     }
@@ -921,7 +959,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         &mut self,
         entries: &[openraft::Entry<TypeConfig>],
     ) -> Result<Vec<Response>, Error> {
-        let _gate = self.gate();
+        let _gate = self.gate(true);
         let mut applied = self.change();
         let _product = ProductCode::enter();
         let mut responses = Vec::with_capacity(entries.len());
@@ -1001,7 +1039,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
                     &e,
                 )
             })?;
-        let _gate = self.gate();
+        let gate = self.gate(true);
         let mut inner = self.lock();
         let mut applied = self.change();
         let old = std::mem::replace(&mut applied.sm, sm);
@@ -1009,7 +1047,7 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         applied.membership = stored.membership.clone();
         inner.snapshot = Some(stored);
         inner.installs += 1;
-        drop((applied, inner));
+        drop((applied, inner, gate));
         // The product replaced is dropped with no lock held.
         drop(old);
         Ok(())
@@ -1061,10 +1099,16 @@ mod tests {
         let mut store = open(&dir);
         let (entered, inside) = std::sync::mpsc::channel();
         let reader = store.clone();
+        let gate = store.gate.record();
         let read = std::thread::spawn(move || {
             reader.with_state(|_| {
                 entered.send(()).unwrap();
-                std::thread::sleep(Duration::from_millis(50));
+                // Read only once the apply waits for the gate.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while gate.waiters() == 0 {
+                    assert!(Instant::now() < deadline, "the apply never waited");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 (
                     reader.applied_index(),
                     reader.committed(),
@@ -1083,6 +1127,159 @@ mod tests {
             "the closure saw the state before the apply"
         );
         assert_eq!(store.applied_index(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A product the size of a large mixer: its text is its whole state,
+    /// built under the state or, `later`, from a clone of its `Arc`.
+    struct Mixer {
+        state: Arc<serde_json::Value>,
+        later: bool,
+    }
+
+    impl Mixer {
+        fn new(later: bool) -> Mixer {
+            let input = |i: usize| {
+                serde_json::json!({
+                    "name": format!("input {i}"), "gain": -3.5, "trim": 0.0, "pan": 0.0,
+                    "mute": false, "solo": false, "phase": false, "delay": 0.0,
+                    "eq": (0..4).map(|b| serde_json::json!({"f": 100.0 * f64::from(b + 1),
+                        "g": 0.0, "q": 0.7, "on": true})).collect::<Vec<_>>(),
+                    "dyn": {"threshold": -20.0, "ratio": 4.0, "attack": 5.0, "release": 80.0},
+                    "sends": (0..32).map(|_| serde_json::json!({"level": -90.0, "on": false}))
+                        .collect::<Vec<_>>(),
+                })
+            };
+            let output = |o: usize| {
+                serde_json::json!({
+                    "name": format!("output {o}"), "level": 0.0, "mute": false,
+                    "delay": 0.0, "limiter": {"on": true, "ceiling": -1.0},
+                    "source": format!("bus {o}"),
+                })
+            };
+            let state = serde_json::json!({
+                "inputs": (0..384).map(input).collect::<Vec<_>>(),
+                "outputs": (0..256).map(output).collect::<Vec<_>>(),
+            });
+            Mixer {
+                state: Arc::new(state),
+                later,
+            }
+        }
+    }
+
+    impl Product for Mixer {
+        type Change = ();
+        fn apply(
+            &mut self,
+            _: &crate::entry::Origin,
+            _: &[u8],
+            _: &crate::state_machine::Apply,
+        ) -> crate::state_machine::Effect<()> {
+            crate::state_machine::Effect::Unchanged
+        }
+        fn expire(&mut self, _: &crate::entry::SessionKey) -> crate::state_machine::Effect<()> {
+            crate::state_machine::Effect::Unchanged
+        }
+        fn forget(&mut self, _: &crate::entry::SessionKey) {}
+        fn delta(&self, _: u64, _: &[crate::state_machine::Changed<'_, ()>]) -> String {
+            String::new()
+        }
+        fn text(&self) -> String {
+            serde_json::json!({ "state": *self.state }).to_string()
+        }
+        fn text_later(&self) -> Option<Box<dyn FnOnce() -> String + Send>> {
+            let state = self.state.clone();
+            self.later.then(|| {
+                Box::new(move || {
+                    assert!(
+                        GATES.with(|g| g.borrow().is_empty()),
+                        "the text is built under the gate"
+                    );
+                    serde_json::json!({ "state": *state }).to_string()
+                }) as Box<dyn FnOnce() -> String + Send>
+            })
+        }
+        fn save(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn load(&mut self, _: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn config_hash(&self) -> u64 {
+            0
+        }
+    }
+
+    fn mixer(name: &str, later: bool) -> (PathBuf, Store<Mixer>) {
+        let dir = dir(name);
+        let factory = Arc::new(move || Mixer::new(later));
+        let store = Store::open(&dir, factory, Limits::defaults(48_000)).unwrap();
+        (dir, store)
+    }
+
+    /// A client snapshot of a product that gives `text_later` builds the
+    /// text once the gate is released, and the same text as `text`.
+    #[test]
+    fn a_snapshot_builds_a_later_text_after_the_gate() {
+        let (dir, store) = mixer("text-later", true);
+        let (_, text) = store.text();
+        assert_eq!(text, store.with_state(|sm| sm.product.text()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// How long a client snapshot holds the gate on a large state, with
+    /// the text built under it and with `text_later`.
+    #[test]
+    #[ignore = "a measurement: prints how long a snapshot holds the gate"]
+    fn snapshot_text_gate_hold() {
+        let quantiles = |mut d: Vec<Duration>| {
+            d.sort();
+            format!(
+                "min {:?} median {:?} max {:?}",
+                d[0],
+                d[d.len() / 2],
+                d[d.len() - 1]
+            )
+        };
+        let (under_dir, under) = mixer("gate-hold-under", false);
+        let (later_dir, later) = mixer("gate-hold-later", true);
+        let (mut held, mut gate, mut whole) = (Vec::new(), Vec::new(), Vec::new());
+        let mut bytes = 0;
+        for _ in 0..50 {
+            let started = Instant::now();
+            bytes = under.text().1.len();
+            held.push(started.elapsed());
+            let started = Instant::now();
+            let text = later.with_state(|sm| sm.product.text_later());
+            gate.push(started.elapsed());
+            drop(text);
+            let started = Instant::now();
+            later.text();
+            whole.push(started.elapsed());
+        }
+        eprintln!("text {bytes} bytes");
+        eprintln!("text under the gate: gate held {}", quantiles(held));
+        eprintln!("text_later: gate held {}", quantiles(gate));
+        eprintln!("text_later: whole snapshot {}", quantiles(whole));
+        let _ = fs::remove_dir_all(&under_dir);
+        let _ = fs::remove_dir_all(&later_dir);
+    }
+
+    /// Two `with_state` closures run side by side: the second starts
+    /// while the first waits for it.
+    #[test]
+    fn with_state_closures_run_side_by_side() {
+        let dir = dir("with-state-side-by-side");
+        let store = open(&dir);
+        let (started, second) = std::sync::mpsc::channel();
+        let other = store.clone();
+        store.with_state(|_| {
+            std::thread::spawn(move || other.with_state(|_| started.send(()).unwrap()));
+            second
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the second closure waited for the first");
+        });
         let _ = fs::remove_dir_all(&dir);
     }
 

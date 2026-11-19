@@ -1,7 +1,8 @@
-//! A mutex that records its holder, and a watchdog for locks held too long.
+//! Locks that record their holders, and a watchdog for locks held too long.
 //!
-//! [`WatchedMutex`] wraps `std::sync::Mutex` and notes, while it is held,
-//! which thread holds it, since when, and the call site of the acquisition.
+//! [`WatchedMutex`] wraps `std::sync::Mutex` and [`WatchedRwLock`]
+//! `std::sync::RwLock`; each notes, while it is held, which threads hold
+//! it, since when, and the call site of each acquisition.
 //! A thread that has to wait for it is noted with its call site as well.
 //! [`start_watchdog`] runs a thread that, once a lock has been held past the
 //! limit, writes each such lock and its holder and waiters, each with its call site, to stderr and
@@ -13,7 +14,9 @@
 use std::fmt::Write as _;
 use std::ops::{Deref, DerefMut};
 use std::panic::Location;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError, Weak,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,6 +24,7 @@ use std::time::{Duration, Instant};
 pub const HELD_LIMIT: Duration = Duration::from_secs(10);
 
 struct Held {
+    id: u64,
     thread: String,
     since: Instant,
     taken: &'static Location<'static>,
@@ -42,7 +46,7 @@ pub(crate) struct Record {
 
 #[derive(Default)]
 struct Notes {
-    held: Option<Held>,
+    held: Vec<Held>,
     waiting: Vec<Waiter>,
 }
 
@@ -67,16 +71,8 @@ pub struct WatchedMutex<T> {
 
 impl<T> WatchedMutex<T> {
     pub fn new(name: &'static str, value: T) -> Self {
-        let record = Arc::new(Record {
-            name,
-            state: Mutex::default(),
-        });
-        let mut all = registry().lock().expect("lock registry poisoned");
-        all.retain(|w| w.strong_count() > 0);
-        all.push(Arc::downgrade(&record));
-        drop(all);
         Self {
-            record,
+            record: register(name),
             inner: Mutex::new(value),
         }
     }
@@ -102,14 +98,10 @@ impl<T> WatchedMutex<T> {
                     .unwrap_or_else(|_| panic!("{name} lock poisoned"))
             }
         };
-        self.record.notes().held = Some(Held {
-            thread: current(),
-            since: Instant::now(),
-            taken: at,
-        });
         WatchedGuard {
             guard,
             record: &self.record,
+            id: self.record.hold(at),
         }
     }
 }
@@ -122,8 +114,7 @@ struct Waiting<'a> {
 
 impl<'a> Waiting<'a> {
     fn note(record: &'a Record, at: &'static Location<'static>) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = next_id();
         record.notes().waiting.push(Waiter {
             id,
             thread: current(),
@@ -140,11 +131,53 @@ impl Drop for Waiting<'_> {
     }
 }
 
+/// A new lock's record, registered with the watchdog.
+fn register(name: &'static str) -> Arc<Record> {
+    let record = Arc::new(Record {
+        name,
+        state: Mutex::default(),
+    });
+    let mut all = registry().lock().expect("lock registry poisoned");
+    all.retain(|w| w.strong_count() > 0);
+    all.push(Arc::downgrade(&record));
+    record
+}
+
+fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Record {
-    /// How long the lock has been held at `now`; none while it is free.
+    /// How long the lock has been held at `now`, by its longest holder;
+    /// none while it is free.
     #[cfg(test)]
     pub(crate) fn held_for(&self, now: Instant) -> Option<Duration> {
-        (self.notes().held.as_ref()).map(|h| now.saturating_duration_since(h.since))
+        (self.notes().held.iter())
+            .map(|h| now.saturating_duration_since(h.since))
+            .max()
+    }
+
+    /// The threads waiting for the lock.
+    #[cfg(test)]
+    pub(crate) fn waiters(&self) -> usize {
+        self.notes().waiting.len()
+    }
+
+    /// Notes the current thread as a holder, taken at `at`.
+    fn hold(&self, at: &'static Location<'static>) -> u64 {
+        let id = next_id();
+        self.notes().held.push(Held {
+            id,
+            thread: current(),
+            since: Instant::now(),
+            taken: at,
+        });
+        id
+    }
+
+    fn release(&self, id: u64) {
+        self.notes().held.retain(|h| h.id != id);
     }
 
     fn notes(&self) -> MutexGuard<'_, Notes> {
@@ -156,6 +189,7 @@ impl Record {
 pub struct WatchedGuard<'a, T> {
     guard: MutexGuard<'a, T>,
     record: &'a Record,
+    id: u64,
 }
 
 impl<T> Deref for WatchedGuard<'_, T> {
@@ -175,7 +209,116 @@ impl<T> Drop for WatchedGuard<'_, T> {
     /// Runs before `guard` unlocks, so a new holder's note is never
     /// cleared by the previous one.
     fn drop(&mut self) {
-        self.record.notes().held = None;
+        self.record.release(self.id);
+    }
+}
+
+/// A read-write lock the watchdog can name and whose holders it can
+/// report, readers and writer alike.
+pub struct WatchedRwLock<T> {
+    record: Arc<Record>,
+    inner: RwLock<T>,
+}
+
+impl<T> WatchedRwLock<T> {
+    pub fn new(name: &'static str, value: T) -> Self {
+        Self {
+            record: register(name),
+            inner: RwLock::new(value),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record(&self) -> Arc<Record> {
+        self.record.clone()
+    }
+
+    /// Takes the lock for reading, panicking on a poisoned lock.
+    #[track_caller]
+    pub fn read(&self) -> WatchedReadGuard<'_, T> {
+        let at = Location::caller();
+        let name = self.record.name;
+        let guard = match self.inner.try_read() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(_)) => panic!("{name} lock poisoned"),
+            Err(TryLockError::WouldBlock) => {
+                let _waiting = Waiting::note(&self.record, at);
+                self.inner
+                    .read()
+                    .unwrap_or_else(|_| panic!("{name} lock poisoned"))
+            }
+        };
+        WatchedReadGuard {
+            guard,
+            record: &self.record,
+            id: self.record.hold(at),
+        }
+    }
+
+    /// Takes the lock for writing, panicking on a poisoned lock.
+    #[track_caller]
+    pub fn write(&self) -> WatchedWriteGuard<'_, T> {
+        let at = Location::caller();
+        let name = self.record.name;
+        let guard = match self.inner.try_write() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(_)) => panic!("{name} lock poisoned"),
+            Err(TryLockError::WouldBlock) => {
+                let _waiting = Waiting::note(&self.record, at);
+                self.inner
+                    .write()
+                    .unwrap_or_else(|_| panic!("{name} lock poisoned"))
+            }
+        };
+        WatchedWriteGuard {
+            guard,
+            record: &self.record,
+            id: self.record.hold(at),
+        }
+    }
+}
+
+pub struct WatchedReadGuard<'a, T> {
+    guard: RwLockReadGuard<'a, T>,
+    record: &'a Record,
+    id: u64,
+}
+
+impl<T> Deref for WatchedReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> Drop for WatchedReadGuard<'_, T> {
+    fn drop(&mut self) {
+        self.record.release(self.id);
+    }
+}
+
+pub struct WatchedWriteGuard<'a, T> {
+    guard: RwLockWriteGuard<'a, T>,
+    record: &'a Record,
+    id: u64,
+}
+
+impl<T> Deref for WatchedWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> DerefMut for WatchedWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for WatchedWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        self.record.release(self.id);
     }
 }
 
@@ -188,8 +331,10 @@ pub(crate) fn overdue(records: &[Arc<Record>], limit: Duration, now: Instant) ->
         // Copied out, so that no note lock is held while formatting.
         let (held, waiting) = {
             let notes = r.notes();
-            let Some(held) = &notes.held else { continue };
-            let held = (held.thread.clone(), held.since, held.taken);
+            let held: Vec<_> = (notes.held.iter())
+                .map(|h| (h.thread.clone(), h.since, h.taken))
+                .filter(|&(_, since, _)| now.saturating_duration_since(since) > limit)
+                .collect();
             let waiting: Vec<_> = notes
                 .waiting
                 .iter()
@@ -197,18 +342,18 @@ pub(crate) fn overdue(records: &[Arc<Record>], limit: Duration, now: Instant) ->
                 .collect();
             (held, waiting)
         };
-        let (thread, since, taken) = held;
-        let age = now.saturating_duration_since(since);
-        if age <= limit {
+        if held.is_empty() {
             continue;
         }
-        let _ = writeln!(
-            out,
-            "lock {:?} held for {:.1} s (limit {:.1} s) by thread {thread} at {taken}",
-            r.name,
-            age.as_secs_f64(),
-            limit.as_secs_f64(),
-        );
+        for (thread, since, taken) in held {
+            let _ = writeln!(
+                out,
+                "lock {:?} held for {:.1} s (limit {:.1} s) by thread {thread} at {taken}",
+                r.name,
+                now.saturating_duration_since(since).as_secs_f64(),
+                limit.as_secs_f64(),
+            );
+        }
         for (thread, since, at) in waiting {
             let _ = writeln!(
                 out,
@@ -235,8 +380,8 @@ pub(crate) fn live() -> Vec<Arc<Record>> {
 /// A later call changes nothing and panics when its `limit` differs from
 /// the first call's.
 ///
-/// Only [`WatchedMutex`] locks are watched, which are the replica's
-/// `Contact` and log `Store` locks. Any process that starts a replica,
+/// Only [`WatchedMutex`] and [`WatchedRwLock`] locks are watched: the
+/// replica's `Contact` lock and the log `Store`'s locks. Any process that starts a replica,
 /// a test included, aborts when one of them is held past the limit.
 pub fn start_watchdog(limit: Duration) {
     static STARTED: OnceLock<Duration> = OnceLock::new();
@@ -273,7 +418,7 @@ pub fn start_watchdog(limit: Duration) {
 /// ([`assert_no_product_code`]): a product that calls back into the
 /// replica from there would deadlock against the contact loop, which
 /// holds the contact lock and waits for the store.
-pub(crate) struct ProductCode(());
+pub(crate) struct ProductCode(std::marker::PhantomData<*const ()>);
 
 thread_local! {
     static PRODUCT_CODE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -282,7 +427,7 @@ thread_local! {
 impl ProductCode {
     pub(crate) fn enter() -> ProductCode {
         PRODUCT_CODE.with(|n| n.set(n.get() + 1));
-        ProductCode(())
+        ProductCode(std::marker::PhantomData)
     }
 }
 

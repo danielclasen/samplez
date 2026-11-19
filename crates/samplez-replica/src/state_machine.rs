@@ -92,6 +92,16 @@ pub trait Product: Send + Sync + 'static {
     /// The whole state as the product's clients read it.
     fn text(&self) -> String;
 
+    /// [`Product::text`] as a closure the replica calls once it no
+    /// longer holds the state, for a client snapshot: a product that
+    /// keeps its state behind an `Arc` it replaces or copies on apply
+    /// returns one holding a clone of that `Arc`, so the snapshot holds
+    /// the state, and holds off applies, only for the clone. None, the
+    /// default, builds the text under the state.
+    fn text_later(&self) -> Option<Box<dyn FnOnce() -> String + Send>> {
+        None
+    }
+
     /// The state as snapshots carry it.
     fn save(&self) -> Vec<u8>;
 

@@ -1677,11 +1677,12 @@ impl<P: Product> ReplicatedState for Replica<P> {
 
     fn snapshot(&self) -> BoxFuture<'_, Snapshot> {
         let epoch = self.epoch();
-        let snapshot = self.store.with_state(|sm| Snapshot {
+        let (revision, text) = self.store.text();
+        let snapshot = Snapshot {
             epoch,
-            revision: sm.revision,
-            text: sm.product.text().into(),
-        });
+            revision,
+            text: text.into(),
+        };
         Box::pin(async move { snapshot })
     }
 

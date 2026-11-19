@@ -545,10 +545,11 @@ state on the runtime's blocking pool (at most 4 threads) and answer 503
 with a body naming the timeout when the read has not returned within 1 s,
 so neither can hold up `/healthz`.
 
-The replica's `Contact` lock, the log `Store` lock and the store's
-state gate record their holder; no other lock is watched. A watchdog thread, started with the first replica,
-checks them every second. When one has been held for more than 10 s, it
-writes the lock's name, the holder's thread, how long it has held it and
+The replica's `Contact` lock and the `Store`'s log lock, applied-state
+lock and state gate record their holders; no other lock is watched. A
+watchdog thread, started with the first replica, checks them every
+second. When one has been held for more than 10 s, it writes the lock's
+name, each such holder's thread, how long it has held it and
 the call site (file, line, column) where it took it, and every thread
 waiting for it with its call site, to stderr, and aborts the process. A
 lock-order deadlock thus ends the process at once with a report, not at a
@@ -570,11 +571,15 @@ handling, each bounded by the state or batch size.
 The contact loop holds the `Contact` lock while it reads the store, so
 no code may hold a store lock and wait for `Contact`. The applied state
 has a read-write lock of its own beside the log's. `Store::with_state`
-and `Store::view` take the state gate before it, as every apply and
-snapshot install does, so while a product's closure runs no apply waits
-for the state and the contact loop's reads of it go on: the closure may
-call `Replica` methods, `ReplicatedState::replica` included, and read
-the store again. `Product` is `Sync` because those reads run beside it.
+and `Store::view` take the state gate for reading before it, and every
+apply and snapshot install takes it for writing, so while a product's
+closure runs no apply waits for the state and the contact loop's reads
+of it go on: the closure may call `Replica` methods,
+`ReplicatedState::replica` included, and read the store again. Closures
+run side by side; an apply waits for those running when it arrives and
+holds off later ones. A closure therefore must not wait for an entry to
+be applied, nor for another thread reading the store with `with_state`
+or `view`. `Product` is `Sync` because those reads run beside it.
 `Product` methods run under the store's locks, as do the closures the
 store's other reads (`pending`, `records`, `entries_after`) take; there
 a call into the `Replica` or the `Store` panics, naming the lock, rather

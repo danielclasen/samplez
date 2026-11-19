@@ -368,7 +368,10 @@ async fn a_with_state_closure_asks_for_readiness_while_contact_ticks() {
         }
         let _ = done.send(());
     });
-    finished
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the closure and the contact loop deadlocked");
+    if finished.recv_timeout(Duration::from_secs(5)).is_err() {
+        // Deadlocked threads never return, and dropping the runtime
+        // waits for the contact task among them: end the process.
+        eprintln!("the with_state closure and the contact loop deadlocked");
+        std::process::exit(1);
+    }
 }
