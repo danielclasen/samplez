@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.15.0](https://github.com/danielclasen/samplez/compare/v0.14.0...v0.15.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** `OutputMeters` loses `valid` and gains `gaps` and `lost`. `samplez_dsp::Loudness::push` takes a `Slice`, `reset` takes the slice index the measurement restarts at, and `valid` and `gap` are removed in favour of `gaps`, `lost`, `start` and `skip`.
+
+### Features
+
+* **engine:** keep measuring loudness across gaps and count them ([#140](https://github.com/danielclasen/samplez/issues/140)) ([558186e](https://github.com/danielclasen/samplez/commit/558186e7218240b927c19a9bf9480c4131d008f6))
+
 ## [0.14.0](https://github.com/danielclasen/samplez/compare/v0.13.1...v0.14.0) (2026-11-19)
 
 
