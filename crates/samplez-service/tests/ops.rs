@@ -44,6 +44,88 @@ async fn healthz_follows_the_heartbeat_within_one_second() {
     assert_eq!(healthz().await, StatusCode::OK, "advancing for 3 s");
 }
 
+/// A liveness probe that waits on the replicated state's locks fails
+/// whenever the replica machinery holds them, though the process lives.
+#[allow(clippy::await_holding_lock, reason = "the held lock is the test")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healthz_takes_no_lock_of_the_replicated_state() {
+    let ops = Ops::default();
+    let state = FakeState::new("r1", "leader");
+    let router = ops.router(state.clone());
+    ops.heartbeat().beat();
+    tokio::spawn(ops.clone().watch_heartbeat());
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let held = state.replica.lock().unwrap();
+    let healthz = tokio::spawn(async move { send(&router, get_req("/healthz")).await });
+    let answered = tokio::time::timeout(Duration::from_secs(2), healthz).await;
+    drop(held);
+
+    let (code, _, body) = answered
+        .expect("/healthz waited on the replicated state")
+        .unwrap();
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body, r#"{"ok":true}"#);
+}
+
+/// The ops listener answers while every worker of the runtime that
+/// serves the others is held by a blocking call, as a product's replica
+/// or engine futures holding their workers would hold them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healthz_answers_while_every_worker_is_blocked() {
+    use std::io::{Read, Write};
+    let ops = Ops::default();
+    let state = FakeState::new("r1", "leader");
+    let mut config = config("none", "blocked");
+    let loopback = serde_json::json!({ "bind": "127.0.0.1", "port": 0 });
+    config["listeners"] = serde_json::json!({ "api": loopback, "ops": loopback, "nmos": loopback });
+    let bound = service_from(config, ops.clone(), state)
+        .bind()
+        .await
+        .unwrap();
+    let addr = bound.ops_addr().unwrap();
+    // Beats off the runtime, as an engine's RT thread does.
+    let heartbeat = ops.heartbeat();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let beating = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                heartbeat.beat();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let serving = tokio::spawn(bound.serve());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Both workers held for 3 s.
+    let blocked: Vec<_> = (0..2)
+        .map(|_| tokio::spawn(async { std::thread::sleep(Duration::from_secs(3)) }))
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: ops\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .expect("/healthz was not answered while every worker was blocked");
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(reply.ends_with(r#"{"ok":true}"#), "{reply}");
+
+    for b in blocked {
+        b.await.unwrap();
+    }
+    serving.abort();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    beating.join().unwrap();
+}
+
 #[tokio::test]
 async fn readyz_is_api_serving_engine_started_and_the_replicated_term_whatever_the_role() {
     let ops = Ops::default();

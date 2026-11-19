@@ -15,7 +15,7 @@ use crate::replica::{MetricKind, ReplicaInfo, ReplicaMetric, ReplicatedState};
 
 /// `/healthz` fails once the heartbeat has not advanced for this long.
 pub const HEARTBEAT_WINDOW: Duration = Duration::from_secs(1);
-const SAMPLE_PERIOD: Duration = Duration::from_millis(100);
+pub(crate) const SAMPLE_PERIOD: Duration = Duration::from_millis(100);
 
 /// Health, readiness and metrics state shared by the engine and the ops
 /// listener.
@@ -60,18 +60,31 @@ impl Ops {
         self.0.api_serving.store(serving, Ordering::Relaxed);
     }
 
-    /// Samples the heartbeat every 100 ms; never returns. `Bound::serve`
-    /// runs it.
+    /// Samples the heartbeat every 100 ms; never returns. [`Bound::serve`]
+    /// samples on the ops listener's thread instead, so that a busy runtime
+    /// does not stall the sampling.
+    ///
+    /// [`Bound::serve`]: crate::Bound::serve
     pub async fn watch_heartbeat(self) {
         let mut seen = 0;
         let mut ticks = tokio::time::interval(SAMPLE_PERIOD);
         loop {
             ticks.tick().await;
-            let value = self.0.heartbeat.load(Ordering::Relaxed);
-            if value != seen {
-                seen = value;
-                *self.0.advanced.lock().expect("ops lock poisoned") = Some(Instant::now());
-            }
+            self.sample_heartbeat(&mut seen);
+        }
+    }
+
+    /// Notes when the heartbeat last differed from `seen`.
+    pub(crate) fn sample_heartbeat(&self, seen: &mut u64) {
+        let value = self.0.heartbeat.load(Ordering::Relaxed);
+        if value != *seen {
+            *seen = value;
+            // A poisoned lock still holds an instant: the sampling goes on.
+            let mut advanced = self.0.advanced.lock().unwrap_or_else(|e| {
+                tracing::error!("the heartbeat sampling took a poisoned lock");
+                e.into_inner()
+            });
+            *advanced = Some(Instant::now());
         }
     }
 
@@ -91,18 +104,20 @@ impl Ops {
             && replica.ready
     }
 
-    /// `/healthz` and `/readyz` answer with the replica's [`ReplicaInfo`];
-    /// `/metrics` adds its id and role as `samplez_replica_info`. The role
-    /// does not enter readiness.
+    /// `/readyz` answers with the replica's [`ReplicaInfo`]; `/metrics` adds
+    /// its id and role as `samplez_replica_info`. The role does not enter
+    /// readiness. `/healthz` reads the heartbeat alone and answers `{"ok":
+    /// bool}`: it takes no lock of the replicated state, so a replica busy
+    /// under its own locks cannot fail a liveness probe.
     pub fn router(&self, state: Arc<dyn ReplicatedState>) -> Router {
         let health = self.clone();
         let ready = self.clone();
         let metrics = self.0.metrics.clone();
-        let (s1, s2, s3) = (state.clone(), state.clone(), state);
+        let (s2, s3) = (state.clone(), state);
         Router::new()
             .route(
                 "/healthz",
-                get(move || async move { status(health.healthy(), s1.replica()) }),
+                get(move || async move { liveness(health.healthy()) }),
             )
             .route(
                 "/readyz",
@@ -159,6 +174,15 @@ fn render_replica(id: &str, samples: &[ReplicaMetric]) -> String {
         out.push_str(&format!("{}{} {}\n", m.name, label_set(labels), m.value));
     }
     out
+}
+
+fn liveness(ok: bool) -> impl IntoResponse + use<> {
+    let code = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(serde_json::json!({ "ok": ok })))
 }
 
 fn status(ok: bool, replica: ReplicaInfo) -> impl IntoResponse + use<> {

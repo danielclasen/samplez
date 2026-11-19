@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use crate::auth::{self, Auth, Identity, Listener, Role, SessionEnd};
 use crate::config::{AuthMode, ServiceConfig};
 use crate::oidc;
-use crate::ops::Ops;
+use crate::ops::{self, Ops};
 use crate::replica::{Owner, ReplicatedState};
 use crate::tls::{ListenerTls, TlsListener, TlsStatus};
 use crate::ws::Sessions;
@@ -373,7 +373,19 @@ impl Service {
             Some(l) => Some(bind("machine", l).await?),
             None => None,
         };
-        let ops = bind("ops", &listeners.ops).await?;
+        // The ops listener is registered with a runtime of its own when it
+        // serves ([`Bound::serve`]): bound here without one.
+        let ops = {
+            let std = std::net::TcpListener::bind(SocketAddr::new(
+                listeners.ops.bind,
+                listeners.ops.port,
+            ))?;
+            std.set_nonblocking(true)?;
+            OpsSocket {
+                std,
+                tls: self.tls.iter().position(|t| t.listener() == "ops"),
+            }
+        };
         let nmos = bind("nmos", &listeners.nmos).await?;
         Ok(Bound {
             routers: self.routers(),
@@ -407,12 +419,19 @@ impl Socket {
     }
 }
 
+/// The ops listener before it serves: a bound socket on no runtime, and
+/// the TLS of the service's list it runs, if any.
+struct OpsSocket {
+    std: std::net::TcpListener,
+    tls: Option<usize>,
+}
+
 pub struct Bound {
     service: Service,
     routers: Routers,
     api: Socket,
     machine: Option<Socket>,
-    ops: Socket,
+    ops: OpsSocket,
     nmos: Socket,
 }
 
@@ -426,7 +445,7 @@ impl Bound {
     }
 
     pub fn ops_addr(&self) -> io::Result<SocketAddr> {
-        self.ops.local_addr()
+        self.ops.std.local_addr()
     }
 
     pub fn nmos_addr(&self) -> io::Result<SocketAddr> {
@@ -436,6 +455,13 @@ impl Bound {
     /// Serves every listener, watches the heartbeat and reloads the token
     /// and TLS files until a listener fails. A failed reload keeps the
     /// previous token or certificate. `/readyz` reports the API as serving while this runs.
+    ///
+    /// The ops listener and the heartbeat sampling run on a thread of their
+    /// own with a runtime of its own, the listener's socket and TLS
+    /// handshakes registered there: whatever blocks the calling runtime's
+    /// workers, such as a product's replica and engine futures, cannot hold
+    /// back `/healthz`. The thread is stopped and joined when this returns
+    /// or is dropped.
     pub async fn serve(self) -> io::Result<()> {
         let Bound {
             service,
@@ -451,11 +477,54 @@ impl Bound {
                 _ => std::future::pending().await,
             }
         };
+        service.ops.set_api_serving(true);
+        let _serving = Serving(service.ops.clone());
+        let (done, ops_done) = tokio::sync::oneshot::channel::<io::Result<()>>();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (tls, router, sampled) = (service.tls.clone(), routers.ops, service.ops.clone());
+        let thread = std::thread::Builder::new()
+            .name("samplez-ops".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let served = runtime.and_then(|runtime| {
+                    runtime.block_on(async move {
+                        let tcp = TcpListener::from_std(ops.std)?;
+                        let socket = match ops.tls {
+                            Some(i) => Socket::Tls(tls[i].bind(tcp)?),
+                            None => Socket::Plain(tcp),
+                        };
+                        let sampling = async {
+                            let mut seen = 0;
+                            let mut ticks = tokio::time::interval(ops::SAMPLE_PERIOD);
+                            loop {
+                                ticks.tick().await;
+                                sampled.sample_heartbeat(&mut seen);
+                            }
+                        };
+                        tokio::select! {
+                            r = socket.serve(router) => r,
+                            () = sampling => unreachable!("the sampling never returns"),
+                            _ = stopped => Ok(()),
+                        }
+                    })
+                });
+                let _ = done.send(served);
+            })?;
+        let _ops = OpsThread {
+            stop: Some(stop),
+            thread: Some(thread),
+        };
         let servers = async {
             tokio::try_join!(
                 api.serve(routers.api),
                 machine,
-                ops.serve(routers.ops),
+                async {
+                    ops_done.await.unwrap_or_else(|_| {
+                        Err(io::Error::other("the ops listener's thread ended"))
+                    })
+                },
                 nmos.serve(routers.nmos),
             )
         };
@@ -467,13 +536,28 @@ impl Bound {
             }
         };
         let renew = renew_sessions(&service.sessions, &*service.state);
-        service.ops.set_api_serving(true);
-        let _serving = Serving(service.ops.clone());
         tokio::select! {
             r = servers => r.map(|_| ()),
-            () = service.ops.clone().watch_heartbeat() => unreachable!("the watch never returns"),
             () = reload => unreachable!("the reload loop never returns"),
             () = renew => unreachable!("the renew loop never returns"),
+        }
+    }
+}
+
+/// The thread of the ops listener and the heartbeat sampling, on a
+/// runtime of its own: stopped and joined when dropped.
+struct OpsThread {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for OpsThread {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
