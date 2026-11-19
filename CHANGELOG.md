@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.11.0](https://github.com/danielclasen/samplez/compare/v0.10.0...v0.11.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** add a delay line per input ([#113](https://github.com/danielclasen/samplez/issues/113))
+* **service:** /healthz no longer carries the "replica" object. Read it from /readyz.
+
+### Features
+
+* **engine:** add a delay line per input ([#113](https://github.com/danielclasen/samplez/issues/113)) ([669e1ae](https://github.com/danielclasen/samplez/commit/669e1ae97c644ba2d69dc364b4794e2140f93b04))
+
+
+### Bug Fixes
+
+* **replica:** rebuild past entries applied late while committing ([#116](https://github.com/danielclasen/samplez/issues/116)) ([c5fe396](https://github.com/danielclasen/samplez/commit/c5fe396321d9bd9235cbfdb84c2e2d6488de6226))
+* **service:** answer /healthz without the replica's locks or the shared task ([#115](https://github.com/danielclasen/samplez/issues/115)) ([0bf29a7](https://github.com/danielclasen/samplez/commit/0bf29a751cfe4fedbb2040e51c8d00ff39ed79d3))
+
+
+### Reverts
+
+* rebuild past entries applied late while committing ([#118](https://github.com/danielclasen/samplez/issues/118)) ([c2307a1](https://github.com/danielclasen/samplez/commit/c2307a1ab787f158aac6480c4faed5685aabf1bb))
+
 ## [0.10.0](https://github.com/danielclasen/samplez/compare/v0.9.1...v0.10.0) (2026-11-19)
 
 
