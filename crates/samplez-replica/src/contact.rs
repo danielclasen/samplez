@@ -636,9 +636,8 @@ struct State {
     /// The entries not applied yet that this log took past their apply
     /// deadline while catching up, by log index.
     taken_late: BTreeSet<u64>,
-    /// Entries taken late that went unresolved, while a restart was under
-    /// way or the replica committed, for the rebuild past them once it
-    /// ended or the replica commits nothing.
+    /// Entries taken late that went unresolved while a restart was under
+    /// way, for the rebuild past them once it ended.
     late_given: BTreeSet<Key>,
     /// Entries taken late that the engine was rebuilt past instead of
     /// holding them unresolved: a decision on one neither resolves nor
@@ -1943,19 +1942,6 @@ impl Contact {
                     Self::rebuild_past(st, k);
                 }
                 st.late_given.clear();
-            } else {
-                // Committing, those taken late stay given until it commits
-                // nothing: the restart must not drop them, as below.
-                let late: Vec<Key> = (st.given.keys())
-                    .filter(|&&(index, term, node)| {
-                        index > from
-                            && index <= up_to
-                            && taken_late.contains(&index)
-                            && self.log.log_id_at(index) == Some(StoredLogId { term, node, index })
-                    })
-                    .copied()
-                    .collect();
-                st.late_given.extend(late);
             }
             self.begin_restart(st, up_to);
             return;
@@ -2000,11 +1986,7 @@ impl Contact {
         // unresolved would degrade its blocks for good.
         // One rebuild past them at a time: while a restart is under way
         // they go unresolved, and are folded into a rebuild once it ended
-        // ([`Contact::fold_late`]). So do those applied while the replica
-        // commits, as one restarted does for a moment before its log has
-        // caught up: they stand on the replicas that applied them in time,
-        // which the log never decides, so they are left out of the rebuild
-        // that follows once it commits nothing.
+        // ([`Contact::fold_late`]).
         let rebuilds = Self::commits_nothing(st);
         let at_once = rebuilds && st.restart.is_none();
         let mut late: Option<(u64, u64)> = None;
@@ -2022,15 +2004,14 @@ impl Contact {
                 continue;
             };
             let k = key(id);
-            let taken = taken_late.contains(&index);
-            let rebuilt = rebuilds && taken;
+            let rebuilt = rebuilds && taken_late.contains(&index);
             if st.given.contains_key(&k) {
                 if rebuilt && at_once {
                     st.given.remove(&k);
                     audio.resolved(index);
                     Self::rebuild_past(st, k);
                     late = Some(late.map_or((index, index), |(first, _)| (first, index)));
-                } else if taken {
+                } else if rebuilt {
                     st.late_given.insert(k);
                 }
                 continue;
@@ -2041,7 +2022,7 @@ impl Contact {
                     late = Some(late.map_or((index, index), |(first, _)| (first, index)));
                     continue;
                 }
-                if taken {
+                if rebuilt {
                     st.late_given.insert(k);
                 }
                 st.awaiting.insert(
@@ -2095,9 +2076,8 @@ impl Contact {
     }
 
     /// Entries taken late that went unresolved while a restart was under
-    /// way or the replica committed: once it ended, on a replica
-    /// committing nothing, the engine is rebuilt past them. Whether a
-    /// restart began.
+    /// way: once it ended, on a replica still committing nothing, the
+    /// engine is rebuilt past them. Whether a restart began.
     fn fold_late(&self, st: &mut State) -> bool {
         if st.restart.is_some() || st.late_given.is_empty() {
             return false;
