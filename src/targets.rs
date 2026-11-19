@@ -23,10 +23,13 @@ pub struct Targets {
     pub ducks: Vec<DuckTargets>,
     /// The duck mask of each coefficient, shaped as `gains`.
     pub masks: Vec<Vec<u8>>,
-    /// Per output, whether it is enabled; an output past the list is. A
-    /// product lists every output its engine has: [`Targets::assert`]
-    /// sets only the outputs listed, so an engine holding one past the
-    /// list disabled keeps it so.
+    /// Per output, whether it is enabled; an output past the list keeps
+    /// its configured start state (`enabled`), as an install of a product
+    /// state does. A product lists every output its engine has:
+    /// [`Targets::assert`] sets only the outputs listed, and a diff emits
+    /// an `Output` only for an output whose value changes, so a listed
+    /// output that starts other than configured is set only by its first
+    /// change.
     pub outputs: Vec<bool>,
 }
 
@@ -42,7 +45,8 @@ impl Targets {
     /// before any entry sets one; a
     /// `Route` for each slot whose flow differs, a `Detach` for one
     /// `next` holds none for; an `Output` for each output whose enabled
-    /// state differs, an output past either list enabled. Of the other
+    /// state differs, an output past either list compared as enabled,
+    /// whatever start the engine configures for it. Of the other
     /// targets, one `next` holds and `self` does not counts as
     /// different; one `self` holds and `next` does not gets no entry, so
     /// the engine keeps it.

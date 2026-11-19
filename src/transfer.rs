@@ -760,10 +760,11 @@ pub struct ProductState {
     pub up: Vec<bool>,
     /// Per input slot the flow it reads in the log, its last `Route`'s
     /// or its configured one; none for a slot whose last `Route` or
-    /// `Detach` is a `Detach`.
+    /// `Detach` is a `Detach`, or that is configured without a flow and
+    /// was never routed.
     pub flows: Vec<Option<String>>,
     /// Per output whether it is enabled in the log, its last `Output`'s
-    /// value; an output past the list is enabled.
+    /// value; an output past the list is as configured (`enabled`).
     pub outputs: Vec<bool>,
     /// Per input slot the strip parameters the log set, as values: each
     /// one set again at the install, the strip's own state kept.

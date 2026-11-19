@@ -149,7 +149,8 @@ Further keys and their defaults: `maxCatchupBlocks` 2, `pruneAfterBlocks`
 50, `rampSamples` 480, `holdMs` 10, `contactWindowMs` 8, `duckColumns`
 none (below),
 `historySlackMs` 50, `resyncBudgetMs` 50, per input
-`offsetSamples` 0 and `flowChannels` (below), per input and output `loudnessChannels` (one of `L`,
+`offsetSamples` 0, `flowChannels` (below) and `flowId` none, per output
+`enabled` true, per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
 Table 3; without it every channel weighs 1), and `meters`, each with a
 `name`, `channels` and `loudnessChannels`: matrix columns after the
@@ -163,6 +164,11 @@ within `samplez_dsp::MAX_GAIN` (1e6), `rt.priority` 1 to 99 and
 `rt.rtCpu` `auto`, `none`, `first`, `last` or an index into the allowed
 CPUs. Unknown keys are refused. Output flow ids are unique,
 and no input reads a flow an output writes in the same domain.
+
+An input without `flowId` starts as a `Detach` leaves it (below): it
+opens no reader, is not polled and is not reported until a `Route`. An
+output with `enabled` false starts as a disabled `Output` leaves it: no
+flow is created for it until an `Output` entry enables it.
 
 An input's `channels` are its legs: its matrix rows, meter and strip.
 Without `flowChannels` the input reads a flow of exactly that many
@@ -520,6 +526,16 @@ parameter, duck setting or mask the engine refuses is replaced as the
 filter replaces it (below), and a gain it refuses is silent. A
 product without targets gives an empty
 state, which an engine refuses: its replicas stay in `starting`.
+
+An engine starts each output and input as configured (`enabled`,
+`flowId`). In replicated mode the product's targets set every listed
+flow from their first records and every rebuild on; an output only by
+an `Output` entry, which a diff emits when the output's enabled state
+changes, an output past either list counting as enabled, or by a
+rebuild. So a product's initial targets have to match the configured
+start: a configured-disabled output the product lists as enabled is
+enabled only by its first change or a rebuild. An install of a product
+state whose outputs list leaves an output out starts it as configured.
 
 A product that drives an engine (`Product::DRIVES_ENGINE`) gives its
 absolute engine targets (`Product::targets`), and the state machine

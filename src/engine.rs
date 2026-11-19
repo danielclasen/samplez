@@ -93,7 +93,8 @@ pub struct InputStatus {
     /// `InputDown` entry, applied by the RT thread.
     pub up: bool,
     /// The flow the input reads, changed by `Route` entries; for a
-    /// detached input, the flow it read last.
+    /// detached input, the flow it read last, empty for one that has read
+    /// none.
     pub flow_id: String,
     /// Why the last attach failed.
     pub error: Option<String>,
@@ -890,13 +891,16 @@ fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
             in_domains.push(d);
             in_domains.len() - 1
         });
-        slots.push(Slot::new(
+        let mut slot = Slot::new(
             domain,
             channel,
             i.channels as usize,
             i.offset_samples,
             config.ramp_samples,
-        ));
+        );
+        // Without a flow it starts as a `Detach` leaves it.
+        slot.detached = i.flow_id.is_none();
+        slots.push(slot);
         channel += i.channels as usize;
     }
     (slots, in_domains)
@@ -1140,6 +1144,10 @@ impl Engine {
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(Counters::default());
         counters.tai_offset_s.store(i64::MIN, Relaxed);
+        let disabled = (config.outputs.iter().enumerate())
+            .filter(|(_, o)| !o.enabled)
+            .fold(0, |d, (o, _)| d | bit(o));
+        counters.outputs_disabled.store(disabled, Relaxed);
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(COMMAND_RING);
         let (ret_tx, ret_rx) = rtrb::RingBuffer::new(RETURN_RING);
         let (mut tel_tx, mut tel_rx) = rtrb::RingBuffer::new(TELEMETRY_RING);
@@ -1317,7 +1325,7 @@ impl Engine {
                 first_channel: channel,
                 channels: o.channels as usize,
                 writer: None,
-                enabled: true,
+                enabled: o.enabled,
                 first_k: 0,
                 meter: OutMeter::new(o.channels as usize),
                 hold: if replica.is_some() {
@@ -1423,9 +1431,13 @@ impl Engine {
                 .iter()
                 .map(|i| InputStatus {
                     name: i.name.clone(),
-                    state: InputState::Pruned,
+                    state: if i.flow_id.is_some() {
+                        InputState::Pruned
+                    } else {
+                        InputState::Detached
+                    },
                     up: true,
-                    flow_id: i.flow_id.clone(),
+                    flow_id: i.flow_id.clone().unwrap_or_default(),
                     error: None,
                     margin_short: None,
                     margin_warning: None,
@@ -1438,9 +1450,16 @@ impl Engine {
                 .iter()
                 .map(|o| OutputStatus {
                     name: o.name.clone(),
-                    enabled: true,
+                    enabled: o.enabled,
                     realised: false,
-                    reason: Some("not created yet".to_owned()),
+                    reason: Some(
+                        if o.enabled {
+                            "not created yet"
+                        } else {
+                            "disabled"
+                        }
+                        .to_owned(),
+                    ),
                     attempts: 0,
                     races: 0,
                     create_failures: 0,
@@ -1504,9 +1523,13 @@ impl Engine {
                 .inputs
                 .iter()
                 .map(|i| SupSlot {
-                    state: SupState::Wanted,
+                    state: if i.flow_id.is_some() {
+                        SupState::Wanted
+                    } else {
+                        SupState::Detached
+                    },
                     window: VecDeque::new(),
-                    flow: i.flow_id.clone(),
+                    flow: i.flow_id.clone().unwrap_or_default(),
                     up: true,
                     reported: false,
                     prune_unsent: false,
@@ -1530,9 +1553,9 @@ impl Engine {
             out_gate: Gate::fresh(config.look),
             poll_errors: vec![None; in_domains.len()],
             rebuild_errors: vec![None; in_domains.len()],
-            outs: (0..config.outputs.len())
-                .map(|_| SupOut {
-                    enabled: true,
+            outs: (config.outputs.iter())
+                .map(|o| SupOut {
+                    enabled: o.enabled,
                     realised: false,
                     next_try: now,
                     backoff: BACKOFF_FIRST,
@@ -2751,8 +2774,9 @@ impl Engine {
         let mut gains = targets.clone();
         let mut up = state.up.clone();
         // A bit per output disabled; one past the list is enabled.
-        let disabled_targets = (state.outputs.iter().enumerate())
-            .filter(|(_, e)| !**e)
+        // An output past the state's list starts as configured.
+        let disabled_targets = (self.config.outputs.iter().enumerate())
+            .filter(|&(o, cfg)| !state.outputs.get(o).copied().unwrap_or(cfg.enabled))
             .fold(0, |d, (o, _)| d | bit(o));
         // Empty for none, as a fill takes them: a state and pending list
         // without masks or depths pay nothing for them.
@@ -3106,7 +3130,8 @@ fn detach_routing(state: &SupState, end: u64, flow: &str) -> Option<(u64, String
 struct SupSlot {
     state: SupState,
     window: VecDeque<SlotStats>,
-    /// The flow the slot reads; detached, the one it read last.
+    /// The flow the slot reads; detached, the one it read last, empty
+    /// for one that has read none.
     flow: String,
     /// The slot's state in the log, as the RT thread applied it.
     up: bool,

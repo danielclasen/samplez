@@ -2055,3 +2055,75 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
         Ok(())
     });
 }
+
+/// An install of a product state whose outputs list leaves an output out,
+/// empty or shorter, starts it as configured: one configured disabled
+/// stays disabled and gets no flow, as on a replica that never dropped
+/// its core. Listed enabled, it is enabled.
+#[test]
+fn an_install_leaving_an_output_out_starts_it_as_configured() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let (out0, out1) = (new_id(), new_id());
+    let mut config = config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&out0, 2), (&out1, 1)],
+        vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 1.0]],
+        MARGIN,
+    );
+    config.outputs[1].enabled = false;
+    let (report_tx, _reports) = sync_channel(64);
+    let process = samplez::rt::setup_process(&config.rt);
+    let replication = Replication {
+        voters: 2,
+        reports: report_tx,
+        statuses: None,
+        hashes: None,
+    };
+    let e = Engine::start_replicated(config, process, None, replication).unwrap();
+    wait_for(Duration::from_secs(5), "attached and realised", || {
+        let s = e.status();
+        s.outputs[0].realised && s.inputs[0].state == InputState::Attached
+    });
+    let install = |outputs: Vec<bool>| {
+        e.drop_core().unwrap();
+        let state = ProductState {
+            gains: vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 1.0]],
+            up: vec![true],
+            flows: vec![Some(src.clone())],
+            strips: vec![Vec::new()],
+            outputs,
+            ducks: Vec::new(),
+            masks: Vec::new(),
+            pending: Vec::new(),
+            last_id: 0,
+        };
+        let j = e
+            .install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
+        wait_for(Duration::from_secs(5), "computing again", || {
+            processed(&e) > j + 50
+        });
+    };
+    // None listed, or a shorter list: output 1 as configured.
+    for outputs in [Vec::new(), vec![true]] {
+        install(outputs.clone());
+        std::thread::sleep(Duration::from_millis(500));
+        let o = e.status().outputs[1].clone();
+        assert!(!o.enabled && !o.realised, "{outputs:?}: {o:?}");
+        assert!(
+            !domain.has_flow(&out1),
+            "{outputs:?}: the disabled output's flow created"
+        );
+    }
+    // Listed enabled, it is enabled whatever its configured start.
+    install(vec![true, true]);
+    wait_for(Duration::from_secs(10), "output 1 realised", || {
+        let o = e.status().outputs[1].clone();
+        o.enabled && o.realised && domain.has_flow(&out1)
+    });
+    assert!(e.status().outputs[0].realised);
+    e.stop();
+}
