@@ -397,7 +397,14 @@ the slack after k0. The engine keeps no delay line yet, so a copy holds
 the core alone. With more than one voter every input flow must offer
 `resyncBudgetMs` of history beyond the read window; an input whose flow
 is shorter is refused with an error naming the `history_duration` it
-needs. A lone voter has no donor to resync from and needs none.
+needs. A lone voter has no donor to resync from and needs none. A copy
+carries no flows and a replay reads the inputs the joiner's engine
+reads, so a diverged replica whose input reads another flow than its
+applied state names, as one does after holding a `Route` unresolved
+that stands, is rebuilt from product state instead, which moves the
+input, in place of an attempt and on its backoff
+(`samplez_replica_resync_rebuilt_for_flows_total`); a page that still
+differs then resyncs.
 
 `Engine::replay` builds a replay clone from a donor's core: the engine's
 block computation off the RT thread, its readers on a new instance per
@@ -565,16 +572,26 @@ the decision, so at the cap a command takes effect up to `maxApplyLead`
 plus 64 ms after its stamp. `samplez_replica_decision_lead_samples`
 exports that lead.
 A replica catching up, its log having taken no entry past the commit
-index the first voter report named
-before that entry's deadline since it started or installed a snapshot,
-as one restarted takes the entries written meanwhile, holds none of
-those it took past the deadline unresolved while it is in `starting`, or
-`withdrawn` with outputs none of which commits: its engine is rebuilt
-from the state applied past them, as after a snapshot install, one
-rebuild at a time, the entries taken late while one runs going into the
-next (`late_rebuilds` in the contact metrics). A replica with no outputs
-or with one committing, and one taking entries late after it caught up,
-holds them unresolved. One AppendEntries carries up to
+index the first voter report named before that entry's deadline since
+it started or installed a snapshot, as one restarted takes the entries
+written meanwhile, holds none of those it took past the deadline
+unresolved while it is in `starting`, `withdrawn` or `diverged` with
+outputs none of which commits: its engine is rebuilt from the state
+applied past them, as after a snapshot install, one rebuild at a time,
+the entries taken late while one runs going into the next
+(`late_rebuilds` in the contact metrics). A replica with no outputs or
+with one committing, and one taking entries late after it caught up,
+holds them unresolved. An entry held unresolved that applies without
+deriving a record, such as a re-route to the flow an input reads
+already, changes no engine state and is released as it applies: the
+log decides only an entry that does not stand, so held it could stay
+unresolved for good. A decision that comes for it after all neither
+resolves nor contradicts the replica: it is rebuilt past. For the same
+reason a rebuild from product state on a replica committing nothing
+takes the entries held unresolved that its state applied: rebuilt past,
+as entries taken late, not given to the new core again. A replica about
+to commit, such as one retargeted from `version_mismatch`, holds them
+again, as its peers do. One AppendEntries carries up to
 `MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
 than the gap between entries takes every entry written meanwhile with
 one fsync rather than falling further behind. `EngineAudio` replaces a

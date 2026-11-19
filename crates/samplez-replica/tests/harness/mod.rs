@@ -418,6 +418,15 @@ pub struct Fake {
     pub withdrawals: u64,
     /// The RT thread neither computes nor moves a block.
     pub frozen: bool,
+    /// The flows the inputs read from a block on, as a rebuild installed
+    /// them: `(block, flows)`.
+    pub flows: Vec<(u64, Vec<Option<String>>)>,
+    /// `Route` and `Detach` entries handed: `(block, slot, flow)`, the
+    /// block holding their index.
+    pub routes: Vec<(u64, usize, Option<String>)>,
+    /// A block's digest names the flows its inputs read, so a replica
+    /// reading another flow computes other pages.
+    pub route_digests: bool,
     /// Commit starts and cancels the supervisor named are recorded and not
     /// applied: a test names them by hand.
     pub manual: bool,
@@ -495,7 +504,37 @@ pub struct Fake {
 pub const FOR_GOOD: u64 = u64::MAX;
 
 impl Fake {
+    /// The flows the inputs read in block `k`: the last rebuild's, with
+    /// the routes handed since whose block is due by `k`.
+    pub fn reads(&self, k: u64) -> Vec<Option<String>> {
+        let Some((from, base)) = self.flows.iter().rev().find(|(from, _)| *from <= k) else {
+            return Vec::new();
+        };
+        let mut flows = base.clone();
+        let mut routes: Vec<&(u64, usize, Option<String>)> = (self.routes.iter())
+            .filter(|(at, _, _)| (*from..=k).contains(at))
+            .collect();
+        routes.sort_by_key(|r| r.0);
+        for (_, slot, flow) in routes {
+            if let Some(f) = flows.get_mut(*slot) {
+                *f = flow.clone();
+            }
+        }
+        flows
+    }
+
     fn digest(&self, k: u64) -> u64 {
+        let d = self.digest_of(k);
+        if !self.route_digests {
+            return d;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.reads(k).hash(&mut h);
+        d ^ h.finish()
+    }
+
+    fn digest_of(&self, k: u64) -> u64 {
         if self.digest_unresolved && !self.core_unresolved.is_empty() {
             return self
                 .core_unresolved
@@ -939,6 +978,14 @@ impl Audio for FakeAudio {
         if due.is_some_and(|k| at_index < (k + 1) * self.timing.block) {
             st.late += 1;
         }
+        let k = at_index / self.timing.block;
+        for e in entries {
+            match e {
+                Entry::Route { slot, flow_id } => st.routes.push((k, *slot, Some(flow_id.clone()))),
+                Entry::Detach { slot } => st.routes.push((k, *slot, None)),
+                _ => {}
+            }
+        }
         st.appended.push((index, at_index, entries.to_vec()));
     }
     fn committed(&self, up_to: u64) {
@@ -1041,6 +1088,7 @@ impl Audio for FakeAudio {
         }
         st.rebuilds.push(at);
         st.rebuilt_with.push((state.last_id, at_least));
+        st.flows.push((k, state.flows.clone()));
         if let Some(by) = st.rebuild_glitch {
             st.glitched.push((k, FOR_GOOD, by));
         }
@@ -1049,6 +1097,10 @@ impl Audio for FakeAudio {
         let n = st.unresolved.len();
         st.rebuilt_at.push(n);
         true
+    }
+    fn follows(&self, state: &ProductState) -> bool {
+        let st = self.lock();
+        st.flows.is_empty() || st.reads(st.computed.unwrap_or(0)) == state.flows
     }
     /// The open glitches as of the next block, in place of an engine core.
     fn copy_core(&self) -> Option<CoreReply> {

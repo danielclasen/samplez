@@ -1051,3 +1051,160 @@ async fn a_follower_restarted_under_continuous_commands_commits_again() {
         );
     }
 }
+
+/// A follower restarted after a re-route committed while it was down,
+/// contact running from the start: one that routes an input to the flow
+/// it reads already, ordered on the generation path, derives no record,
+/// and one that moves it derives a `Route`. The follower takes both past
+/// their apply deadlines and holds them unresolved. The log decides
+/// neither, both stand, so the follower resolves the first as it applies
+/// it, deriving nothing, and its inputs read the flows of the second. It
+/// commits again, reading what the leader reads, within a bound.
+#[tokio::test(start_paused = true)]
+async fn a_follower_restarted_past_a_re_route_commits_on_its_flows() {
+    let mut set = Set::start_with(
+        Options {
+            contact: Some(Timing::defaults(BLOCK)),
+            outputs: 1,
+            ..Options::default()
+        },
+        Arc::new(|_| Desk::new()),
+    )
+    .await;
+    for id in set.ids().collect::<Vec<_>>() {
+        let mut fake = set.audio(id).lock();
+        fake.digest_unresolved = true;
+        fake.route_digests = true;
+        fake.resyncs = true;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !set.ids().all(|id| committing(&set, id)) {
+        assert!(Instant::now() < deadline, "every replica committing");
+        sleep(Duration::from_millis(10)).await;
+    }
+    let leader = set.leader().await;
+    let follower = set.ids().find(|&id| id != leader).unwrap();
+    set.crash(follower).await;
+    for (n, route) in ["route 0 a", "route 1 c"].into_iter().enumerate() {
+        set.replica(leader)
+            .submit(&owner("s"), &n.to_string(), Bytes::from(route))
+            .await
+            .expect("committed");
+    }
+    sleep(Duration::from_millis(200)).await;
+    set.restart(follower).await;
+    {
+        let mut fake = set.audio(follower).lock();
+        fake.digest_unresolved = true;
+        fake.route_digests = true;
+        fake.resyncs = true;
+    }
+    let reads = |set: &Set<Desk>, id: NodeId| {
+        let fake = set.audio(id).lock();
+        fake.reads(fake.computed.unwrap_or(0))
+    };
+    let start = Instant::now();
+    let mut since: Option<Instant> = None;
+    loop {
+        if committing(&set, follower) && reads(&set, follower) == reads(&set, leader) {
+            let from = *since.get_or_insert_with(Instant::now);
+            if from.elapsed() >= Duration::from_millis(500) {
+                break;
+            }
+        } else {
+            since = None;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the follower committing on the leader's flows for 500 ms within 5 s: \
+             {:?} reads {:?}, the leader {:?}, {} unresolved",
+            set.replica(follower)
+                .contact_metrics()
+                .and_then(|m| m.replica)
+                .and_then(|r| r.state),
+            reads(&set, follower),
+            reads(&set, leader),
+            set.audio(follower).lock().core_unresolved.len(),
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        reads(&set, leader),
+        [Some("a".to_owned()), Some("c".to_owned())]
+    );
+}
+
+/// A diverged replica whose input reads another flow than the applied
+/// state names, as one does after holding a `Route` unresolved that
+/// stands, cannot be resynced: a replay reads the inputs the engine
+/// reads, so every replayed page differs. It is rebuilt from product
+/// state instead, which moves the input, and commits again.
+#[tokio::test(start_paused = true)]
+async fn a_diverged_replica_on_another_flow_is_rebuilt_rather_than_resynced() {
+    let set = Set::start_with(
+        Options {
+            contact: Some(Timing::defaults(BLOCK)),
+            outputs: 1,
+            ..Options::default()
+        },
+        Arc::new(|_| Desk::new()),
+    )
+    .await;
+    for id in set.ids().collect::<Vec<_>>() {
+        let mut fake = set.audio(id).lock();
+        fake.route_digests = true;
+        fake.resyncs = true;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !set.ids().all(|id| committing(&set, id)) {
+        assert!(Instant::now() < deadline, "every replica committing");
+        sleep(Duration::from_millis(10)).await;
+    }
+    let leader = set.leader().await;
+    let follower = set.ids().find(|&id| id != leader).unwrap();
+    // The follower's input 0 moves to a flow the log never named, and a
+    // glitch diverges it.
+    {
+        let mut fake = set.audio(follower).lock();
+        let k = fake.computed.unwrap() + 20;
+        fake.routes.push((k, 0, Some("z".to_owned())));
+        fake.glitched.push((k, harness::FOR_GOOD, 0.5));
+    }
+    let diverged = Instant::now() + Duration::from_secs(5);
+    while set
+        .replica(follower)
+        .contact_metrics()
+        .and_then(|m| m.replica)
+        .is_none_or(|r| r.divergences == 0)
+    {
+        assert!(Instant::now() < diverged, "the follower diverged");
+        sleep(Duration::from_millis(10)).await;
+    }
+    let start = Instant::now();
+    let mut since: Option<Instant> = None;
+    loop {
+        let reads = {
+            let fake = set.audio(follower).lock();
+            fake.reads(fake.computed.unwrap_or(0))
+        };
+        if committing(&set, follower) && reads == [Some("a".to_owned()), Some("b".to_owned())] {
+            let from = *since.get_or_insert_with(Instant::now);
+            if from.elapsed() >= Duration::from_millis(500) {
+                break;
+            }
+        } else {
+            since = None;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the follower committing on the log's flows within 10 s: {:?} reads {reads:?}",
+            set.replica(follower)
+                .contact_metrics()
+                .and_then(|m| m.replica)
+                .and_then(|r| r.state),
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    let m = set.replica(follower).contact_metrics().unwrap();
+    assert!(m.resync.rebuilt_for_flows >= 1, "{:?}", m.resync);
+}
