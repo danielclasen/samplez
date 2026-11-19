@@ -18,8 +18,7 @@ use samplez::{
     ProductState, ReplayError, Replication,
 };
 use samplez_dsp::{
-    BandType, CompParams, DetectorParams, DuckMode, EqBand, GateParams, LimiterParams, Ramp,
-    StripParam,
+    BandType, CompParams, DetectorParams, DuckMode, EqBand, GateParams, LimiterParams, StripParam,
 };
 
 /// Flow ids whose lookup [`slow_look`] makes wait.
@@ -1033,12 +1032,11 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
 
 /// A product core is installed at the first block at or after the index
 /// its caller names, not before, however soon the RT thread could take
-/// it; and its gains ramp from silence to their targets over the ramp
-/// length from there, as the strips take their parameters, so an output
-/// fades in processed. An index further ahead than the timeout is
-/// refused before the core the RT thread holds is dropped.
+/// it; its gains hold their targets from the first sample, with no ramp
+/// from silence. An index further ahead than the timeout is refused
+/// before the core the RT thread holds is dropped.
 #[test]
-fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
+fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -1070,7 +1068,6 @@ fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
         );
         // 40 blocks ahead, a block start plus a sample: the block after.
         let at_least = (processed(&h.e) + 40) * B + 1;
-        let passed = c.handovers_passed.load(Relaxed);
         let j =
             h.e.install_product(&state, at_least, Duration::from_secs(2))
                 .unwrap();
@@ -1081,30 +1078,10 @@ fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
         );
         // Never more than a second late, whatever the load.
         assert!(installed < at_least + 48_000, "installed at {installed}");
-        let retries = c.handovers_passed.load(Relaxed) - passed;
-        // The core after block k0 has the matrix at sample (k0 + 1) B: on
-        // the ramp from silence that started at the install.
-        let copy = common::copy_core(&h.e);
-        let at = (copy.k0 + 1) * B - installed;
-        if at >= u64::from(RAMP) {
-            return Err(format!(
-                "copied {at} samples after the install, past the ramp"
-            ));
-        }
-        for (i, target) in [(0, 0.25), (1, 0.5)] {
-            let mut ramp = Ramp::new(0.0);
-            assert!(ramp.set_target(target, RAMP));
-            ramp.advance(at as usize);
-            assert_eq!(
-                copy.core.gain(i, i).to_bits(),
-                ramp.current().to_bits(),
-                "gain {i} -> {i} {at} samples into the fade-in ({retries} retries)"
-            );
-        }
-        assert_eq!(copy.core.gain(0, 1), 0.0);
-        past_fade_in(&h.e, j);
+        // At the targets from the install on, not on a ramp from silence.
         let core = common::copy_core(&h.e).core;
         assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.25, 0.5));
+        assert_eq!(core.gain(0, 1), 0.0);
         h.e.stop();
         Ok(())
     });
@@ -1303,8 +1280,9 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
             c.e.install_product(&state, 0, Duration::from_secs(2))
                 .unwrap();
         assert_eq!(c.e.status().inputs[0].state, InputState::Detached);
-        // After the fade-in from silence the install starts with.
-        let from = ((processed(&c.e) + 2) * B).max((j + 1) * B + u64::from(RAMP));
+        // From the first page whole after the install: no ramp from
+        // silence in between.
+        let from = (j + 1) * B;
         assert_same_within(a, c, from, from + 4 * PAGE)?;
         for h in &hs {
             assert_eq!(h.e.status().diverged, None);

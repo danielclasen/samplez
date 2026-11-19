@@ -3053,12 +3053,12 @@ impl Engine {
                 } else {
                     core.ducks.align(next);
                 }
-                // From silence, whatever a spare core held, ducked as the
-                // masks and depths say from the start.
-                let ramping = core.matrix.fade_in_ducked(&gains, &masks, &depths, ramp);
+                // At the targets from the first sample, whatever a spare
+                // core held, ducked as the masks and depths say.
+                let _ = core.matrix.fade_in_ducked(&gains, &masks, &depths, 0);
                 core.matrix.align(next);
                 core.pos = Some(next);
-                core.ramp_end = if ramping { next + u64::from(ramp) } else { 0 };
+                core.ramp_end = 0;
                 core.pending.clear();
                 core.pending.extend_from_slice(&pending[passed..]);
                 // Shared: nothing is allocated in the hand-over's window.
@@ -3074,9 +3074,11 @@ impl Engine {
                 core.outputs_disabled = disabled;
                 // The RT thread keeps its strips.
                 for ((c, &up), flow) in core.slots.iter_mut().zip(&up).zip(&state.flows) {
+                    // An input that is up and attached continues, as it
+                    // does on a replica that ran through: no fade-in.
                     *c = SlotCore {
                         up,
-                        silenced_last: true,
+                        silenced_last: !up || flow.is_none(),
                         detached: flow.is_none(),
                         ..SlotCore::default()
                     };

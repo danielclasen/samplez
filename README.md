@@ -615,19 +615,20 @@ block-boundary hand-over as a replay, at the first block starting at or
 after the index its caller names; the first block committed after it
 follows the withdrawn rules. A state holding a gain, flow, strip
 parameter or duck value no entry could set is refused before anything
-changes. Its gains ramp from silence to their targets over the ramp
-length from the install, as the strips take their parameters, so an
-output fades in processed. Its duck groups start cold at the state's
-settings: key filters at rest, no hold, the envelope at 0 or, for a
-group its mode On or hold triggers, at full depth; masks and depths at
-their targets, so a coefficient fades in ducked. A replica that kept
-computing holds its own key filter, hold and envelope state, so their
-outputs differ after the install until the gains' ramp has run, each key
-filter's state has reached the same bits and each group's envelope has
-reached 0 or full depth in both; on a test desk with an Auto group
-mid-duck, a group releasing after its force ended and a key filter
-ringing they are equal from the ramp, 50 ms and the longest attack, hold
-and release of a group on. A rebuilt replica does not wait for that: the
+changes. Its gains are at their targets from the first sample of the
+install, with no ramp from silence, and an input that is up and attached
+continues with no fade-in, so a rebuilt replica computes the
+output of a peer that ran through from its first block, as far as the
+gains go. Its duck groups start cold at the state's settings: key
+filters at rest, no hold, the envelope at 0 or, for a group its mode On
+or hold triggers, at full depth; masks and depths at their targets, so a
+coefficient is ducked from the start. A replica that kept computing holds
+its own key filter, hold and envelope state, so their outputs differ
+after the install until each key filter's state has reached the same
+bits and each group's envelope has reached 0 or full depth in both; on a
+test desk with an Auto group mid-duck, a group releasing after its force
+ended and a key filter ringing they are equal after 50 ms and the
+longest attack, hold and release of a group on. A rebuilt replica does not wait for that: the
 first page it computes whole that differs from the one a committing
 replica committed diverges it, by Resume's comparison or by the leader's
 page verdict, and it resyncs from a donor's core, which carries every
