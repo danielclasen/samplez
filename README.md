@@ -420,7 +420,9 @@ outlasts `maxApplyLead` and 64 ms, the longest lead a re-route still to
 take effect is stamped with
 (`samplez_replica_resync_rebuilt_for_flows_total`); a page that still
 differs then resyncs. A hand-over moves no input, so the mismatch counts
-on across one; it counts anew once the applied state names other flows.
+on across one; it counts anew once an applied entry re-routes or
+detaches an input, and once the replica is neither diverged nor
+resyncing.
 
 `Engine::replay` builds a replay clone from a donor's core: the engine's
 block computation off the RT thread, its readers on a new instance per

@@ -1158,8 +1158,8 @@ async fn a_replica_handed_over_on_another_flow_is_rebuilt() {
 
 /// A follower's input 0 moves to a flow the log never named and a glitch
 /// diverges it, every replay handing over on other flows when
-/// `hands_over`. Its resync counts once it committed on the log's flows
-/// for 500 ms.
+/// `hands_over`. Returns its resync metrics once it committed on the log's
+/// flows for 500 ms.
 async fn rebuilt_off_flows(hands_over: bool) -> samplez_replica::resync::Metrics {
     let set = Set::start_with(
         Options {
