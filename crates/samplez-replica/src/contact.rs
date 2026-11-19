@@ -3504,6 +3504,22 @@ pub enum StampRefusal {
     GenerationPending,
 }
 
+/// The membership the metrics show, with the term they show entered into
+/// `contact`. The metrics guard is released before `contact` is locked: a
+/// read guard held while waiting on a busy lock would queue behind the
+/// metrics writer every other reader then queues behind.
+fn enter_term(
+    contact: &Contact,
+    metrics: &watch::Receiver<RaftMetrics<NodeId, BasicNode>>,
+) -> Members {
+    let (members, term) = {
+        let seen = metrics.borrow();
+        (Members::of(&seen), seen.current_term)
+    };
+    contact.in_term(term);
+    members
+}
+
 /// Runs contact for `contact` until the replica shuts down: a report to
 /// every other voter each period, each sent as soon as the one before it
 /// to the same voter was answered, a newer one replacing one not yet
@@ -3520,8 +3536,7 @@ pub(crate) async fn run(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let members = Members::of(&metrics.borrow());
-                contact.in_term(metrics.borrow().current_term);
+                let members = enter_term(&contact, &metrics);
                 let voters = members.voters();
                 senders.retain(|id, _| voters.contains(id));
                 for (to, addr, report) in contact.tick(members) {
@@ -4000,6 +4015,87 @@ mod tests {
         engine: Arc<Engine>,
         contact: Contact,
         members: Members,
+    }
+
+    /// A busy contact lock stalls `enter_term` only: the metrics sender
+    /// and the readers of the metrics, the ops path among them, are not
+    /// queued behind a read guard held across the wait.
+    #[test]
+    fn a_busy_contact_lock_does_not_block_the_metrics_watch() {
+        use std::sync::mpsc;
+        const BOUND: Duration = Duration::from_secs(1);
+        let f = fixture(&[&[1, 2, 3]]);
+        let contact = Arc::new(f.contact);
+        let (tx, rx) = watch::channel(RaftMetrics::new_initial(1));
+        let (hold, release) = mpsc::channel::<()>();
+        let (held_tx, held) = mpsc::channel::<()>();
+        let holder = {
+            let contact = contact.clone();
+            std::thread::spawn(move || {
+                let _st = contact.lock();
+                held_tx.send(()).unwrap();
+                let _ = release.recv();
+            })
+        };
+        held.recv().unwrap();
+        // The ticking thread names itself, then runs `enter_term`, whose
+        // only blocking point is the contact lock. Its kernel state turns
+        // to sleeping once it waits there, holding the metrics read guard
+        // when the guard is not released first.
+        let (named_tx, named) = mpsc::channel::<String>();
+        let ticking = {
+            let (contact, rx) = (contact.clone(), rx.clone());
+            std::thread::spawn(move || {
+                let me = std::fs::read_link("/proc/thread-self").expect("linux procfs");
+                named_tx.send(me.to_string_lossy().into_owned()).unwrap();
+                enter_term(&contact, &rx)
+            })
+        };
+        let task = named.recv().unwrap();
+        let tid = task.rsplit('/').next().unwrap().to_owned();
+        let stat = format!("/proc/self/task/{tid}/stat");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let line = std::fs::read_to_string(&stat).unwrap_or_default();
+            // `pid (comm) S ...`: the state follows the last parenthesis.
+            let state = line
+                .rsplit(')')
+                .next()
+                .and_then(|r| r.trim().chars().next());
+            if state == Some('S') {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ticking thread never waited on the contact lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (sent_tx, sent) = mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            let mut m = RaftMetrics::new_initial(1);
+            m.current_term = 9;
+            tx.send(m).unwrap();
+            sent_tx.send(()).unwrap();
+        });
+        // The sender has to be a queued writer before the reader arrives;
+        // it has no observable state, so the wait is a lower bound only: a
+        // reader first in line passes against either code.
+        std::thread::sleep(Duration::from_millis(300));
+        let (read_tx, read) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let term = rx.borrow().clone().current_term;
+            read_tx.send(term).unwrap();
+        });
+        let sent_ok = sent.recv_timeout(BOUND);
+        let read_ok = read.recv_timeout(BOUND);
+        hold.send(()).unwrap();
+        holder.join().unwrap();
+        ticking.join().unwrap();
+        sender.join().unwrap();
+        reader.join().unwrap();
+        assert!(sent_ok.is_ok(), "a metrics send waited on the contact lock");
+        assert!(read_ok.is_ok(), "a metrics read waited on the contact lock");
     }
 
     fn fixture(configs: &[&[NodeId]]) -> Fixture {

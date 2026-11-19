@@ -1016,7 +1016,8 @@ impl Shared {
     }
 
     fn refuse_unless_leading(&self) -> Result<(), Refused> {
-        match self.raft.metrics().borrow().state {
+        let state = self.raft.metrics().borrow().state;
+        match state {
             ServerState::Leader if self.quiescing() => Err(Refused::Quiescing),
             ServerState::Leader => Ok(()),
             _ => Err(Refused::NotLeader),
