@@ -756,9 +756,10 @@ fn head_zero_at_attach() {
 
 /// The producer commits at the nominal rate a second behind the clock, as
 /// one that stamps its indices on another clock does: every block is late
-/// and the head never freezes. The input is pruned, so that its late reads
-/// stop degrading every block, and is not re-added while its head stays
-/// out of reach, which would prune it again a prune limit later.
+/// and the head never freezes. The input is pruned and goes down, so that
+/// its late reads stop degrading every block, and is not re-added or
+/// raised while its head stays out of reach, which would prune it again a
+/// prune limit later.
 fn behind_the_clock() {
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
@@ -776,6 +777,9 @@ fn behind_the_clock() {
         state() == InputState::Attached
     });
     wait_for(5 * SECOND, "input pruned", || state() == InputState::Pruned);
+    // Down in the log: a down slot's unread blocks degrade no digest.
+    let up = || engine.status().inputs[0].up;
+    wait_for(SECOND, "input down", || !up());
     // Twice the recovery period, and the prune limit after it.
     let t = Instant::now();
     while t.elapsed() < 3 * SECOND {
@@ -785,6 +789,7 @@ fn behind_the_clock() {
             "re-added after {:?}",
             t.elapsed()
         );
+        assert!(!up(), "raised after {:?}", t.elapsed());
         std::thread::sleep(SECOND / 100);
     }
     common::stop(engine);
