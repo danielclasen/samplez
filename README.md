@@ -478,7 +478,9 @@ the slack after k0. A delay line's history its taps still reach is
 copied that way, off the RT thread, after the core, as base64 of the
 samples' bit patterns. A replay fills its own rings from the copy; a
 hand-over writes the replay's history into the RT thread's other set
-of rings, which the RT thread takes only when it installs the core, so
+of rings, all of it once before the first attempt and only the blocks
+computed since at each attempt, so an attempt fits between two blocks
+however long the delay, which the RT thread takes only when it installs the core, so
 a refused hand-over leaves the set it reads as it was. With more than
 one voter every input flow must offer
 `resyncBudgetMs` of history beyond the read window; an input whose flow
