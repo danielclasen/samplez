@@ -44,7 +44,8 @@ pub fn hand_over_at(at: u64, block: u64) -> u64 {
     at.next_multiple_of(PAGE / a * block)
 }
 
-/// What a replica knows of a rollout.
+/// What a replica knows of a rollout. The contact loop calls it under
+/// its lock: a call back into the [`crate::Replica`] panics there.
 pub trait Rollout: Send + Sync + 'static {
     /// This replica's compatibility key.
     fn key(&self) -> u64;

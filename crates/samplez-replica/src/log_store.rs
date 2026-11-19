@@ -12,6 +12,7 @@
 //! the acknowledged entries or vote it held. `snapshot` is replaced by
 //! rename.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
@@ -30,7 +31,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::dedup::Limits;
 use crate::entry::{Body, NodeId, Request, Response};
-use crate::lock_watch::{WatchedGuard, WatchedMutex};
+use crate::lock_watch::{
+    ProductCode, WatchedGuard, WatchedMutex, WatchedReadGuard, WatchedRwLock, WatchedWriteGuard,
+    assert_no_product_code,
+};
 use crate::snapshot::{
     StoredEntry, StoredLogId, StoredMembershipConfig, StoredPayload, StoredSnapshot, StoredVote,
 };
@@ -50,21 +54,51 @@ enum Record {
     Purge(StoredLogId),
 }
 
-struct Inner<P> {
+struct Inner {
     dir: PathBuf,
     file: Arc<File>,
     vote: Option<StoredVote>,
     committed: Option<StoredLogId>,
     log: BTreeMap<u64, StoredEntry>,
     last_purged: Option<StoredLogId>,
-    sm: StateMachine<P>,
     limits: Limits,
-    last_applied: Option<StoredLogId>,
-    membership: StoredMembershipConfig,
     snapshot: Option<StoredSnapshot>,
     snapshots_built: u64,
     /// Snapshots installed from a leader since the store was opened.
     installs: u64,
+}
+
+/// The state machine and what was applied to it, changed together.
+struct Applied<P> {
+    sm: StateMachine<P>,
+    last_applied: Option<StoredLogId>,
+    membership: StoredMembershipConfig,
+}
+
+thread_local! {
+    /// The gates ([`Store::with_state`]) this thread holds, by address.
+    static GATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A store's gate held by this thread, for reading or writing; released
+/// on drop.
+struct Gate<'a> {
+    _held: (
+        Option<WatchedReadGuard<'a, ()>>,
+        Option<WatchedWriteGuard<'a, ()>>,
+    ),
+    key: usize,
+}
+
+impl Drop for Gate<'_> {
+    fn drop(&mut self) {
+        GATES.with(|g| {
+            let mut g = g.borrow_mut();
+            if let Some(i) = g.iter().rposition(|&k| k == self.key) {
+                g.remove(i);
+            }
+        });
+    }
 }
 
 /// One replica's storage. Clones share it.
@@ -74,8 +108,20 @@ struct Inner<P> {
 /// is done. openraft's adaptor makes one log or state machine call at a
 /// time; a snapshot build runs beside them and `snapshots` orders it
 /// with an install.
+///
+/// The applied state has a lock of its own, `applied`, which the replica
+/// reads under its contact lock. [`Store::with_state`] and
+/// [`Store::view`] take the `gate` for reading first, and every change to
+/// the applied state takes it for writing: while a closure given to them
+/// runs, no change waits for `applied`, so the replica's own reads of it
+/// go on and the closure may call into the [`crate::Replica`]. A change
+/// waiting for the gate holds off closures that come after it, so it
+/// waits only for those already running. Locks are taken in the order
+/// gate, `inner`, `applied`.
 pub struct Store<P> {
-    inner: Arc<WatchedMutex<Inner<P>>>,
+    inner: Arc<WatchedMutex<Inner>>,
+    applied: Arc<WatchedRwLock<Applied<P>>>,
+    gate: Arc<WatchedRwLock<()>>,
     /// Builds the empty product a snapshot install loads into.
     factory: Factory<P>,
     /// The product's configuration hash, fixed when the store opened.
@@ -93,6 +139,8 @@ impl<P> Clone for Store<P> {
     fn clone(&self) -> Self {
         Store {
             inner: self.inner.clone(),
+            applied: self.applied.clone(),
+            gate: self.gate.clone(),
             factory: self.factory.clone(),
             config: self.config,
             on_mismatch: self.on_mismatch.clone(),
@@ -329,10 +377,7 @@ impl<P: Product> Store<P> {
             committed: None,
             log: BTreeMap::new(),
             last_purged: None,
-            sm,
             limits,
-            last_applied,
-            membership,
             snapshot,
             snapshots_built: 0,
             installs: 0,
@@ -347,6 +392,15 @@ impl<P: Product> Store<P> {
         }
         Ok(Store {
             inner: Arc::new(WatchedMutex::new("store", inner)),
+            applied: Arc::new(WatchedRwLock::new(
+                "applied",
+                Applied {
+                    sm,
+                    last_applied,
+                    membership,
+                },
+            )),
+            gate: Arc::new(WatchedRwLock::new("state gate", ())),
             factory,
             config,
             on_mismatch: Arc::new(exit_on_mismatch),
@@ -377,26 +431,59 @@ impl<P: Product> Store<P> {
         .await
     }
 
-    /// Reads the state machine.
+    /// Reads the state machine as applied up to an entry, never part way
+    /// through one. `f` runs with no lock the replica's contact loop
+    /// waits for, so it may call [`crate::Replica`] methods and this
+    /// store's reads, `with_state` included. Closures run side by side;
+    /// an entry is applied once those running when it arrived return.
+    ///
+    /// `f` must therefore not wait for an entry to be applied, as
+    /// blocking on a `ReplicatedState::applied` or `read_index` future
+    /// does, nor for another thread that reads this store with
+    /// `with_state` or `view`: an apply arriving meanwhile waits for `f`
+    /// and holds the other thread off, and neither ever returns. Not from
+    /// a [`Product`] method: one the store calls panics here rather than
+    /// deadlock.
     pub fn with_state<T>(&self, f: impl FnOnce(&StateMachine<P>) -> T) -> T {
-        f(&self.lock().sm)
+        self.view(|_, sm| f(sm))
     }
 
-    /// Reads the state machine with the index of the last entry applied.
+    /// [`Store::with_state`] with the index of the last entry applied.
     pub fn view<T>(&self, f: impl FnOnce(u64, &StateMachine<P>) -> T) -> T {
-        let inner = self.lock();
-        f(inner.last_applied.map_or(0, |id| id.index), &inner.sm)
+        let _gate = self.gate(false);
+        let applied = self.read();
+        f(applied.last_applied.map_or(0, |id| id.index), &applied.sm)
+    }
+
+    /// The product revision and the product's whole text there, for a
+    /// client snapshot: built after the gate is released when the
+    /// product gives [`Product::text_later`].
+    pub fn text(&self) -> (u64, String) {
+        let (revision, text) = self.with_state(|sm| {
+            let text = sm.product.text_later().ok_or_else(|| sm.product.text());
+            (sm.revision, text)
+        });
+        (revision, text.map_or_else(|text| text, |later| later()))
+    }
+
+    /// Reads the applied state without the gate, as the replica does
+    /// under its contact lock: `f` runs as product code
+    /// ([`ProductCode`]), so it must not call back into the replica.
+    pub(crate) fn read_state<T>(&self, f: impl FnOnce(u64, &StateMachine<P>) -> T) -> T {
+        let applied = self.read();
+        let _product = ProductCode::enter();
+        f(applied.last_applied.map_or(0, |id| id.index), &applied.sm)
     }
 
     /// The index of the last entry applied.
     pub fn applied_index(&self) -> u64 {
-        self.view(|applied, _| applied)
+        self.read().last_applied.map_or(0, |id| id.index)
     }
 
     /// The applied index, the floor there and the engine state of the
     /// applied log ([`StateMachine::product_state`]), read at once.
     pub fn product_state(&self) -> (u64, u64, samplez::ProductState) {
-        self.view(|n, sm| (n, sm.floor, sm.product_state(n)))
+        self.read_state(|n, sm| (n, sm.floor, sm.product_state(n)))
     }
 
     /// Whether the volume holds nothing of a set: no vote, entry or
@@ -419,7 +506,7 @@ impl<P: Product> Store<P> {
             return false;
         }
         let committed = inner.capped_committed().map_or(0, |id| id.index);
-        inner.last_applied.map_or(0, |id| id.index) >= committed
+        self.applied_index() >= committed
     }
 }
 
@@ -439,6 +526,7 @@ impl<P> Store<P> {
     /// above `index`, in log order.
     pub fn entries_after(&self, index: u64, mut f: impl FnMut(StoredLogId, &Request)) {
         let inner = self.lock();
+        let _product = ProductCode::enter();
         for e in inner.log.range(index.saturating_add(1)..).map(|(_, e)| e) {
             if let StoredPayload::Normal(request) = &e.payload {
                 f(e.log_id, request);
@@ -460,6 +548,7 @@ impl<P> Store<P> {
                 StoredPayload::Normal(request) => Some((e.log_id, request)),
                 _ => None,
             });
+        let _product = ProductCode::enter();
         for (id, request) in requests.by_ref().take(max) {
             f(id, request);
         }
@@ -469,7 +558,7 @@ impl<P> Store<P> {
     /// The first decision applied on (`index`, `term`), by its log
     /// index.
     pub fn decided(&self, index: u64, term: u64) -> Option<u64> {
-        self.lock().sm.decided.get(&(index, term)).map(|&(d, _)| d)
+        self.read().sm.decided.get(&(index, term)).map(|&(d, _)| d)
     }
 
     /// The term of the entry at `index`: from the log, else from the
@@ -480,7 +569,7 @@ impl<P> Store<P> {
             .log
             .get(&index)
             .map(|e| e.log_id.term)
-            .or_else(|| inner.sm.terms.get(&index).map(|&(t, _)| t))
+            .or_else(|| self.read().sm.terms.get(&index).map(|&(t, _)| t))
     }
 
     /// Snapshots installed from a leader since the store was opened.
@@ -495,7 +584,7 @@ impl<P> Store<P> {
 
     /// The restamps behind the entry at `index`, as applied.
     pub fn restamps(&self, index: u64) -> u32 {
-        self.lock().sm.restamps.get(&index).map_or(0, |&(n, _)| n)
+        self.read().sm.restamps.get(&index).map_or(0, |&(n, _)| n)
     }
 
     /// Calls `f` with the log index and record of every entry after
@@ -508,19 +597,20 @@ impl<P> Store<P> {
         up_to: u64,
         mut f: impl FnMut(u64, &Arc<crate::state_machine::Record>),
     ) -> bool {
-        let inner = self.lock();
+        let applied = self.read();
+        let _product = ProductCode::enter();
         if after < up_to {
-            for (index, record) in inner.sm.records.range(after + 1..=up_to) {
+            for (index, record) in applied.sm.records.range(after + 1..=up_to) {
                 f(*index, record);
             }
         }
-        after >= inner.sm.records_from
+        after >= applied.sm.records_from
     }
 
     /// The log index after which the state machine holds every record
     /// ([`StateMachine::records_from`]).
     pub fn records_from(&self) -> u64 {
-        self.lock().sm.records_from
+        self.read().sm.records_from
     }
 
     /// The floor after every entry below `index`: the applied state's,
@@ -528,8 +618,9 @@ impl<P> Store<P> {
     /// The applied state's for an `index` at or below the applied one.
     pub fn floor_before(&self, index: u64) -> u64 {
         let inner = self.lock();
-        let applied = inner.last_applied.map_or(0, |id| id.index);
-        let mut floor = inner.sm.floor;
+        let state = self.read();
+        let applied = state.last_applied.map_or(0, |id| id.index);
+        let mut floor = state.sm.floor;
         let end = index.max(applied + 1);
         for e in inner.log.range(applied + 1..end).map(|(_, e)| e) {
             if let StoredPayload::Normal(request) = &e.payload
@@ -546,11 +637,12 @@ impl<P> Store<P> {
     /// whose index, as their apply will raise it, lies above it.
     pub fn pending_above(&self, floor: u64) -> usize {
         let inner = self.lock();
-        let applied = inner.last_applied.map_or(0, |id| id.index);
-        let records = (inner.sm.records.values())
+        let state = self.read();
+        let applied = state.last_applied.map_or(0, |id| id.index);
+        let records = (state.sm.records.values())
             .filter(|r| r.at_index > floor)
             .count();
-        let mut raised = inner.sm.floor;
+        let mut raised = state.sm.floor;
         let mut unapplied = 0;
         for e in inner.log.range(applied + 1..).map(|(_, e)| e) {
             if let StoredPayload::Normal(request) = &e.payload
@@ -567,19 +659,54 @@ impl<P> Store<P> {
     /// applies at a future index, as the state machine holds them, purged
     /// ones included.
     pub fn pending(&self, mut f: impl FnMut(u64, &Body)) {
-        let inner = self.lock();
-        for (index, body) in &inner.sm.pending {
+        let applied = self.read();
+        let _product = ProductCode::enter();
+        for (index, body) in &applied.sm.pending {
             f(*index, body);
         }
     }
 
     #[track_caller]
-    fn lock(&self) -> WatchedGuard<'_, Inner<P>> {
+    fn lock(&self) -> WatchedGuard<'_, Inner> {
+        assert_no_product_code("store");
         self.inner.lock()
+    }
+
+    #[track_caller]
+    fn read(&self) -> WatchedReadGuard<'_, Applied<P>> {
+        assert_no_product_code("store");
+        self.applied.read()
+    }
+
+    /// Changes to the applied state take the gate for writing first.
+    #[track_caller]
+    fn change(&self) -> WatchedWriteGuard<'_, Applied<P>> {
+        assert_no_product_code("store");
+        self.applied.write()
+    }
+
+    /// Takes the gate, for writing when `write`, or nothing when this
+    /// thread holds it already: a `with_state` closure reading the store
+    /// again, which a writer waiting for the gate would otherwise hold
+    /// off.
+    #[track_caller]
+    fn gate(&self, write: bool) -> Option<Gate<'_>> {
+        assert_no_product_code("store");
+        let key = Arc::as_ptr(&self.gate) as usize;
+        if GATES.with(|g| g.borrow().contains(&key)) {
+            return None;
+        }
+        let held = if write {
+            (None, Some(self.gate.write()))
+        } else {
+            (Some(self.gate.read()), None)
+        };
+        GATES.with(|g| g.borrow_mut().push(key));
+        Some(Gate { _held: held, key })
     }
 }
 
-impl<P> Inner<P> {
+impl Inner {
     fn capped_committed(&self) -> Option<StoredLogId> {
         match (self.committed, self.last_log_id()) {
             (Some(committed), Some(last)) if committed.index > last.index => Some(last),
@@ -686,8 +813,10 @@ impl<P: Product> RaftSnapshotBuilder<TypeConfig> for Store<P> {
         let _building = self.snapshots.lock().await;
         let (dir, snapshot) = {
             let mut inner = self.lock();
+            let applied = self.read();
+            let _product = ProductCode::enter();
             inner.snapshots_built += 1;
-            let last = inner.last_applied;
+            let last = applied.last_applied;
             // The build time keeps ids apart across restarts, where the
             // count starts again.
             let started = SystemTime::now()
@@ -700,8 +829,8 @@ impl<P: Product> RaftSnapshotBuilder<TypeConfig> for Store<P> {
                     inner.snapshots_built
                 ),
                 last_applied: last,
-                membership: inner.membership.clone(),
-                state: inner.sm.save(),
+                membership: applied.membership.clone(),
+                state: applied.sm.save(),
                 config: Some(self.config),
             };
             (inner.dir.clone(), snapshot)
@@ -819,10 +948,10 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
     async fn last_applied_state(
         &mut self,
     ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), Error> {
-        let inner = self.lock();
+        let applied = self.read();
         Ok((
-            inner.last_applied.map(LogId::from),
-            inner.membership.stored(),
+            applied.last_applied.map(LogId::from),
+            applied.membership.stored(),
         ))
     }
 
@@ -830,16 +959,18 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
         &mut self,
         entries: &[openraft::Entry<TypeConfig>],
     ) -> Result<Vec<Response>, Error> {
-        let mut inner = self.lock();
+        let _gate = self.gate(true);
+        let mut applied = self.change();
+        let _product = ProductCode::enter();
         let mut responses = Vec::with_capacity(entries.len());
         for entry in entries {
             let id = StoredLogId::from(&entry.log_id);
-            inner.last_applied = Some(id);
+            applied.last_applied = Some(id);
             responses.push(match &entry.payload {
                 EntryPayload::Blank => Response::default(),
-                EntryPayload::Normal(request) => inner.sm.apply_at(id.index, id.term, request),
+                EntryPayload::Normal(request) => applied.sm.apply_at(id.index, id.term, request),
                 EntryPayload::Membership(membership) => {
-                    inner.membership = StoredMembershipConfig {
+                    applied.membership = StoredMembershipConfig {
                         log_id: Some(id),
                         ..StoredMembershipConfig::from(membership)
                     };
@@ -908,12 +1039,17 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
                     &e,
                 )
             })?;
+        let gate = self.gate(true);
         let mut inner = self.lock();
-        inner.sm = sm;
-        inner.last_applied = stored.last_applied;
-        inner.membership = stored.membership.clone();
+        let mut applied = self.change();
+        let old = std::mem::replace(&mut applied.sm, sm);
+        applied.last_applied = stored.last_applied;
+        applied.membership = stored.membership.clone();
         inner.snapshot = Some(stored);
         inner.installs += 1;
+        drop((applied, inner, gate));
+        // The product replaced is dropped with no lock held.
+        drop(old);
         Ok(())
     }
 
@@ -952,6 +1088,219 @@ mod tests {
 
     fn open(dir: &Path) -> Store<Paths> {
         Store::open(dir, Arc::new(Paths::default), Limits::defaults(48_000)).expect("opens")
+    }
+
+    /// A `with_state` closure reads the store again, `with_state`
+    /// included, while another thread applies: the apply waits for the
+    /// closure, and the closure's reads do not wait for the apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_with_state_closure_reads_the_store_while_an_apply_waits() {
+        let dir = dir("with-state-reads");
+        let mut store = open(&dir);
+        let (entered, inside) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        let gate = store.gate.record();
+        let read = std::thread::spawn(move || {
+            reader.with_state(|_| {
+                entered.send(()).unwrap();
+                // Read only once the apply waits for the gate.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while gate.waiters() == 0 {
+                    assert!(Instant::now() < deadline, "the apply never waited");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (
+                    reader.applied_index(),
+                    reader.committed(),
+                    reader.with_state(|sm| sm.floor),
+                    reader.product_state().0,
+                )
+            })
+        });
+        inside.recv().unwrap();
+        store.append_to_log(vec![entry(1)]).await.unwrap();
+        store.apply_to_state_machine(&[entry(1)]).await.unwrap();
+        let (applied, _, _, at) = read.join().unwrap();
+        assert_eq!(
+            (applied, at),
+            (0, 0),
+            "the closure saw the state before the apply"
+        );
+        assert_eq!(store.applied_index(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A product the size of a large mixer: its text is its whole state,
+    /// built under the state or, `later`, from a clone of its `Arc`.
+    struct Mixer {
+        state: Arc<serde_json::Value>,
+        later: bool,
+    }
+
+    impl Mixer {
+        fn new(later: bool) -> Mixer {
+            let input = |i: usize| {
+                serde_json::json!({
+                    "name": format!("input {i}"), "gain": -3.5, "trim": 0.0, "pan": 0.0,
+                    "mute": false, "solo": false, "phase": false, "delay": 0.0,
+                    "eq": (0..4).map(|b| serde_json::json!({"f": 100.0 * f64::from(b + 1),
+                        "g": 0.0, "q": 0.7, "on": true})).collect::<Vec<_>>(),
+                    "dyn": {"threshold": -20.0, "ratio": 4.0, "attack": 5.0, "release": 80.0},
+                    "sends": (0..32).map(|_| serde_json::json!({"level": -90.0, "on": false}))
+                        .collect::<Vec<_>>(),
+                })
+            };
+            let output = |o: usize| {
+                serde_json::json!({
+                    "name": format!("output {o}"), "level": 0.0, "mute": false,
+                    "delay": 0.0, "limiter": {"on": true, "ceiling": -1.0},
+                    "source": format!("bus {o}"),
+                })
+            };
+            let state = serde_json::json!({
+                "inputs": (0..384).map(input).collect::<Vec<_>>(),
+                "outputs": (0..256).map(output).collect::<Vec<_>>(),
+            });
+            Mixer {
+                state: Arc::new(state),
+                later,
+            }
+        }
+    }
+
+    impl Product for Mixer {
+        type Change = ();
+        fn apply(
+            &mut self,
+            _: &crate::entry::Origin,
+            _: &[u8],
+            _: &crate::state_machine::Apply,
+        ) -> crate::state_machine::Effect<()> {
+            crate::state_machine::Effect::Unchanged
+        }
+        fn expire(&mut self, _: &crate::entry::SessionKey) -> crate::state_machine::Effect<()> {
+            crate::state_machine::Effect::Unchanged
+        }
+        fn forget(&mut self, _: &crate::entry::SessionKey) {}
+        fn delta(&self, _: u64, _: &[crate::state_machine::Changed<'_, ()>]) -> String {
+            String::new()
+        }
+        fn text(&self) -> String {
+            serde_json::json!({ "state": *self.state }).to_string()
+        }
+        fn text_later(&self) -> Option<Box<dyn FnOnce() -> String + Send>> {
+            let state = self.state.clone();
+            self.later.then(|| {
+                Box::new(move || {
+                    assert!(
+                        GATES.with(|g| g.borrow().is_empty()),
+                        "the text is built under the gate"
+                    );
+                    serde_json::json!({ "state": *state }).to_string()
+                }) as Box<dyn FnOnce() -> String + Send>
+            })
+        }
+        fn save(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn load(&mut self, _: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn config_hash(&self) -> u64 {
+            0
+        }
+    }
+
+    fn mixer(name: &str, later: bool) -> (PathBuf, Store<Mixer>) {
+        let dir = dir(name);
+        let factory = Arc::new(move || Mixer::new(later));
+        let store = Store::open(&dir, factory, Limits::defaults(48_000)).unwrap();
+        (dir, store)
+    }
+
+    /// A client snapshot of a product that gives `text_later` builds the
+    /// text once the gate is released, and the same text as `text`.
+    #[test]
+    fn a_snapshot_builds_a_later_text_after_the_gate() {
+        let (dir, store) = mixer("text-later", true);
+        let (_, text) = store.text();
+        assert_eq!(text, store.with_state(|sm| sm.product.text()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// How long a client snapshot holds the gate on a large state, with
+    /// the text built under it and with `text_later`.
+    #[test]
+    #[ignore = "a measurement: prints how long a snapshot holds the gate"]
+    fn snapshot_text_gate_hold() {
+        let quantiles = |mut d: Vec<Duration>| {
+            d.sort();
+            format!(
+                "min {:?} median {:?} max {:?}",
+                d[0],
+                d[d.len() / 2],
+                d[d.len() - 1]
+            )
+        };
+        let (under_dir, under) = mixer("gate-hold-under", false);
+        let (later_dir, later) = mixer("gate-hold-later", true);
+        let (mut held, mut gate, mut whole) = (Vec::new(), Vec::new(), Vec::new());
+        let mut bytes = 0;
+        for _ in 0..50 {
+            let started = Instant::now();
+            bytes = under.text().1.len();
+            held.push(started.elapsed());
+            let started = Instant::now();
+            let text = later.with_state(|sm| sm.product.text_later());
+            gate.push(started.elapsed());
+            drop(text);
+            let started = Instant::now();
+            later.text();
+            whole.push(started.elapsed());
+        }
+        eprintln!("text {bytes} bytes");
+        eprintln!("text under the gate: gate held {}", quantiles(held));
+        eprintln!("text_later: gate held {}", quantiles(gate));
+        eprintln!("text_later: whole snapshot {}", quantiles(whole));
+        let _ = fs::remove_dir_all(&under_dir);
+        let _ = fs::remove_dir_all(&later_dir);
+    }
+
+    /// Two `with_state` closures run side by side: the second starts
+    /// while the first waits for it.
+    #[test]
+    fn with_state_closures_run_side_by_side() {
+        let dir = dir("with-state-side-by-side");
+        let store = open(&dir);
+        let (started, second) = std::sync::mpsc::channel();
+        let other = store.clone();
+        store.with_state(|_| {
+            std::thread::spawn(move || other.with_state(|_| started.send(()).unwrap()));
+            second
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the second closure waited for the first");
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A closure the store runs under its lock, as it runs product code,
+    /// that calls back into the store panics rather than deadlock.
+    #[test]
+    #[should_panic(expected = "lock taken from product code")]
+    fn a_read_from_product_code_under_the_lock_panics() {
+        let dir = dir("product-code-reads");
+        let store = open(&dir);
+        store.read_state(|_, _| store.committed());
+    }
+
+    /// `with_state` from product code under the lock panics as well: an
+    /// apply holds the gate and the state, and would wait for itself.
+    #[test]
+    #[should_panic(expected = "lock taken from product code")]
+    fn with_state_from_product_code_under_the_lock_panics() {
+        let dir = dir("product-code-with-state");
+        let store = open(&dir);
+        store.read_state(|_, _| store.with_state(|sm| sm.floor));
     }
 
     fn entry(index: u64) -> openraft::Entry<TypeConfig> {

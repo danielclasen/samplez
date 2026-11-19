@@ -13,7 +13,15 @@ use crate::snapshot::Replicated;
 /// The product's state, applied in log order on every replica. A
 /// snapshot install loads into an empty one its [`Factory`] builds, with
 /// the replica's configuration, before it replaces the state.
-pub trait Product: Send + 'static {
+///
+/// The store calls these methods under its own locks, as it applies an
+/// entry, builds a snapshot or reads the state for the replica's contact
+/// loop, which holds the contact lock meanwhile. None of them may call
+/// back into the [`crate::Replica`] or its [`crate::log_store::Store`]:
+/// the call panics rather than deadlock. Code the product runs inside
+/// [`crate::log_store::Store::with_state`] may. `Sync`, because the
+/// contact loop reads the state beside such a closure.
+pub trait Product: Send + Sync + 'static {
     /// What one command or expiry changed, as [`Product::delta`] gets it
     /// back.
     type Change;
@@ -83,6 +91,16 @@ pub trait Product: Send + 'static {
 
     /// The whole state as the product's clients read it.
     fn text(&self) -> String;
+
+    /// [`Product::text`] as a closure the replica calls once it no
+    /// longer holds the state, for a client snapshot: a product that
+    /// keeps its state behind an `Arc` it replaces or copies on apply
+    /// returns one holding a clone of that `Arc`, so the snapshot holds
+    /// the state, and holds off applies, only for the clone. None, the
+    /// default, builds the text under the state.
+    fn text_later(&self) -> Option<Box<dyn FnOnce() -> String + Send>> {
+        None
+    }
 
     /// The state as snapshots carry it.
     fn save(&self) -> Vec<u8>;
