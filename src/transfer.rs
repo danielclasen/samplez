@@ -189,6 +189,12 @@ impl Core {
         self.matrix.gain(input, output)
     }
 
+    /// The parameters of output `output`'s limiter; none for an output
+    /// without one.
+    pub fn limiter(&self, output: usize) -> Option<LimiterParams> {
+        self.limiters.get(output)?.as_ref().map(Limiter::params)
+    }
+
     /// The `(log id, at_index)` of the entries pending before their index.
     pub fn pending(&self) -> impl Iterator<Item = (LogId, u64)> + '_ {
         self.pending.iter().map(|e| (e.id, e.at_index))

@@ -279,6 +279,47 @@ fn a_derived_entry_the_engine_refuses_is_left_out_and_counted() {
     assert_eq!(copy.core.gain(0, 0), 0.5);
 }
 
+/// Limiter parameters out of range are clamped into it, as a rebuild
+/// clamps them in the product state, so a live replica and a rebuilt one
+/// hold the same; counted as replaced.
+#[test]
+fn limiter_parameters_out_of_range_are_clamped() {
+    let domain = Domain::new();
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "in0", "domain": "d",
+                     "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a", "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d",
+                      "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01", "label": "bridge",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1,
+                      "limiter": true }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (engine, audio) = bridge_of(&v, 1 << 16);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let at = (engine.progress().unwrap().processed.unwrap() + 100) * B;
+    let params = samplez_dsp::LimiterParams {
+        enabled: true,
+        ceiling_db: 3.0,
+        release_ms: 50.0,
+    };
+    audio.appended(3, at, &[Entry::Limiter { output: 0, params }]);
+    audio.committed(3);
+    assert_eq!(audio.sample().entries_filtered, 1);
+    wait_for("its index passed", || {
+        engine.progress().unwrap().processed.unwrap() > at / B + 2
+    });
+    let copy = engine.copy_core(Duration::from_secs(2)).unwrap();
+    assert_eq!(copy.core.limiter(0), params.clamped());
+    assert_eq!(params.clamped().unwrap().ceiling_db, 0.0);
+}
+
 /// Of the `InputUp`s and `Route`s of one record whose slots lie in two
 /// input domains, the engine builds one generation: those of the domain
 /// of the lowest slot stay, the others are left out.

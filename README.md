@@ -574,8 +574,10 @@ at the cap up to 64 ms past it (see below), and the rebuild waits that
 long and 100 ms more. `EngineAudio` installs the state as the records it filters
 leave an engine (below): a flow other than the one an input reads is a
 re-route kept by the same rules and else left as read, a strip
-parameter, duck setting or mask the engine refuses is replaced as the
-filter replaces it (below), and a gain it refuses is silent. A
+parameter, limiter parameters, a duck setting or mask the engine refuses
+is replaced as the filter replaces it (below), limiter parameters of an
+output it lacks or that has no limiter left out, and a gain it refuses
+is silent. A
 product without targets gives an empty
 state, which an engine refuses: its replicas stay in `starting`.
 
@@ -665,18 +667,21 @@ again, as its peers do. One AppendEntries carries up to
 `MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
 than the gap between entries takes every entry written meanwhile with
 one fsync rather than falling further behind. `EngineAudio` replaces a
-strip parameter, duck setting or duck mask its engine refuses, so a
-replica holding a value before the refused one and one rebuilt without
-it hold the same. A finite value out of range moves to the nearest one
-its range holds (`StripParam::clamped`, `DuckSetting::clamped`): a trim
-of -30 dB sounds as -20 dB, a duck depth of 99 dB as 40 dB. A value
+strip parameter, limiter parameters, a duck setting or duck mask its
+engine refuses, so a replica holding a value before the refused one and
+one rebuilt without it hold the same. A finite value out of range moves
+to the nearest one its range holds (`StripParam::clamped`,
+`LimiterParams::clamped`, `DuckSetting::clamped`): a trim of -30 dB
+sounds as -20 dB, a duck depth of 99 dB as 40 dB, a ceiling of +3 dBTP
+as 0 dBTP. A value
 that is not finite, or keys the engine cannot take, give the setting a
 strip or group holds before any is set (`StripParam::neutral`: trims
 at 0 dB, no inversion, high-pass, equaliser, gate and compressor off, a
 band at its default; `DuckSetting::neutral`: the default detector, no
 key, a depth of 0 dB): a trim at -20 dB set to NaN steps back to 0 dB,
 a closed gate opens and a ducked bed returns to full level, each over
-the strip's ramp. A refused mask is 0. It leaves out of a record the
+the strip's ramp; limiter parameters that are not finite give
+`LimiterParams::OFF`. A refused mask is 0. It leaves out of a record the
 other entries its engine refuses, and of the `InputUp`s and `Route`s of
 several input domains those not of the lowest slot's, before it
 appends it: the engine's configuration decides that alike on every
@@ -759,8 +764,7 @@ primitives listed in `clippy.toml` in the RT modules. `cargo bench
 --bench rt` in samplez, samplez-dsp and samplez-mxl fails when the
 instruction count of the hold ring's paths, the page hashes, the strip
 calls of the RT loop, a block's DSP, limiters, duck detectors and input
-meters,
-the matrix and detector copies of the core, a duck batch, a block's
+meters, the matrix and detector copies of the core, a duck batch, a block's
 history stores or an output commit, gap zero-fill included, exceeds the
 limit in the benchmark. An input is pruned after `pruneAfterBlocks`
 consecutive late blocks with its head frozen, or twice the producer's

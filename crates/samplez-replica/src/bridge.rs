@@ -215,13 +215,14 @@ impl EngineAudio {
         kept
     }
 
-    /// `entry`, or, for a strip parameter, duck setting or duck mask the
-    /// engine refuses alone, the first of these the engine takes: its
-    /// values moved to the nearest ones their ranges hold
-    /// ([`samplez_dsp::StripParam::clamped`], [`DuckSetting::clamped`]),
+    /// `entry`, or, for a strip parameter, limiter parameters, duck
+    /// setting or duck mask the engine refuses alone, the first of these
+    /// the engine takes: its values moved to the nearest ones their
+    /// ranges hold ([`samplez_dsp::StripParam::clamped`],
+    /// [`samplez_dsp::LimiterParams::clamped`], [`DuckSetting::clamped`]),
     /// for a finite value out of range; its neutral form
     /// ([`samplez_dsp::StripParam::neutral`], [`DuckSetting::neutral`],
-    /// mask 0), for a value that is not finite or a key the engine
+    /// mask 0, [`samplez_dsp::LimiterParams::OFF`]), for a value that is not finite or a key the engine
     /// cannot take, such as a slot or key it lacks. None when it takes
     /// neither. Every other entry as given. The live filter
     /// and the rebuild's state both go through it, so a replica that held
@@ -243,6 +244,10 @@ impl EngineAudio {
                 output,
                 mask: 0,
             },
+            &Entry::Limiter { output, .. } => Entry::Limiter {
+                output,
+                params: samplez_dsp::LimiterParams::OFF,
+            },
             _ => return Some(entry.clone()),
         };
         let clamped = match entry {
@@ -252,6 +257,10 @@ impl EngineAudio {
             Entry::Duck { group, setting } => setting.clamped().map(|setting| Entry::Duck {
                 group: *group,
                 setting,
+            }),
+            Entry::Limiter { output, params } => params.clamped().map(|params| Entry::Limiter {
+                output: *output,
+                params,
             }),
             _ => None,
         };
@@ -275,8 +284,8 @@ impl EngineAudio {
     /// rules of [`EngineAudio::kept`] and else left at the one read; a
     /// strip parameter, duck setting or duck mask the engine refuses is
     /// replaced as the live filter replaces it ([`EngineAudio::admitted`])
-    /// or left out, limiter parameters it refuses left out; a gain it
-    /// refuses is silenced, as the state machine
+    /// or left out, limiter parameters too; a gain it refuses is
+    /// silenced, as the state machine
     /// derives it for every replica
     /// ([`crate::state_machine::StateMachine::product_state`] holds none).
     /// A replica rebuilt from it holds what a live one that read the same
@@ -320,18 +329,23 @@ impl EngineAudio {
             }
             *params = admitted;
         }
-        // Limiter parameters the engine refuses, of an output without a
-        // limiter or out of range, are left out, as the live filter
-        // leaves out their entries.
+        // Limiter parameters the engine refuses are replaced as the live
+        // filter replaces them, or left out, for an output without a
+        // limiter; those of an output beyond the engine's too.
+        dropped += state.limiters.len().saturating_sub(self.outputs);
+        state.limiters.truncate(self.outputs);
         for (output, params) in state.limiters.iter_mut().enumerate() {
-            if let Some(p) = *params
-                && (self.engine)
-                    .admits(&[Entry::Limiter { output, params: p }])
-                    .is_err()
-            {
-                *params = None;
-                dropped += 1;
-            }
+            let Some(p) = *params else { continue };
+            *params = match self.admitted(&Entry::Limiter { output, params: p }) {
+                Some(Entry::Limiter { params: q, .. }) => {
+                    dropped += usize::from(q != p);
+                    Some(q)
+                }
+                _ => {
+                    dropped += 1;
+                    None
+                }
+            };
         }
         for gain in state.gains.iter_mut().flatten() {
             if !samplez_dsp::valid_gain(*gain) {

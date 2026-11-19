@@ -1399,6 +1399,69 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
     });
 }
 
+/// A limiter entry a product state folds in, which reaches the RT
+/// thread only after the install, still sets the limiter, as on the
+/// engines that applied it at its index.
+#[test]
+fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let limited = |c: &mut Config| {
+            c.outputs[0].limiter = true;
+            c.matrix = diagonal(2, 4.0);
+        };
+        let (a, b) = (
+            hashed_of(&domain, &[(&src, 2)], limited),
+            hashed_of(&domain, &[(&src, 2)], limited),
+        );
+        b.e.drop_core().unwrap();
+        let at = (now_block() + 20) * B;
+        let limiter = Entry::Limiter {
+            output: 0,
+            params: LimiterParams {
+                enabled: true,
+                ceiling_db: -6.0,
+                release_ms: 50.0,
+            },
+        };
+        a.e.append(1, at, limiter.clone()).unwrap();
+        a.e.commit(1);
+        // Appended, committed only after the install.
+        b.e.append(1, at, limiter.clone()).unwrap();
+        wait_for(Duration::from_secs(5), "index passed", || {
+            processed(&b.e) > (at + u64::from(RAMP)) / B + 2
+        });
+        let state = ProductState {
+            limiters: Vec::new(),
+            gains: diagonal(2, 4.0),
+            up: vec![true],
+            flows: vec![Some(src.clone())],
+            strips: vec![Vec::new()],
+            outputs: Vec::new(),
+            ducks: Vec::new(),
+            masks: Vec::new(),
+            pending: vec![(1, at, limiter)],
+            last_id: 1,
+        };
+        let j =
+            b.e.install_product(&state, 0, Duration::from_secs(2))
+                .unwrap();
+        b.e.commit(1);
+        // Past the fade-in from silence, and the limiter's release from
+        // the silence it restarted with.
+        let from = ((processed(&b.e) + 2) * B).max((j + 1) * B + u64::from(RAMP)) + 48_000;
+        let want = (from / B) + 2;
+        wait_for(Duration::from_secs(5), "past the release", || {
+            processed(&a.e) > want && processed(&b.e) > want
+        });
+        assert_same_within(&a, &b, from, from + 4 * PAGE)?;
+        assert_eq!(b.e.counters().command_late.load(Relaxed), 0);
+        Ok(())
+    });
+}
+
 /// A re-route a product state folds in, appended but committed only after
 /// the install, still swaps its generation in. Its generation is built
 /// but held until the commit, so the install must not need the RT thread

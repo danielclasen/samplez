@@ -39,7 +39,7 @@ use core::ops::RangeInclusive;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::level::db_to_gain;
-use crate::strip::{MAX_LEGS, within};
+use crate::strip::{MAX_LEGS, clamp_in, within};
 use crate::svf::SAMPLE_RATE;
 use crate::true_peak::{HISTORY, phase_peaks};
 use crate::{Path, Ramp};
@@ -95,6 +95,23 @@ impl LimiterParams {
             .and_then(|()| within("limiter release", self.release_ms, &LIMITER_RELEASE_MS))
             .map_err(|r| r.message())
     }
+
+    /// The parameters with the ceiling and release moved to the nearest
+    /// values their ranges hold; none when one is not finite.
+    pub fn clamped(&self) -> Option<LimiterParams> {
+        Some(LimiterParams {
+            enabled: self.enabled,
+            ceiling_db: clamp_in(self.ceiling_db, &LIMITER_CEILING_DB)?,
+            release_ms: clamp_in(self.release_ms, &LIMITER_RELEASE_MS)?,
+        })
+    }
+}
+
+/// Whether two parameter sets agree in every field's bits.
+fn same(a: &LimiterParams, b: &LimiterParams) -> bool {
+    a.enabled == b.enabled
+        && a.ceiling_db.to_bits() == b.ceiling_db.to_bits()
+        && a.release_ms.to_bits() == b.release_ms.to_bits()
 }
 
 /// The one-pole coefficient of the release, per sample.
@@ -301,7 +318,11 @@ impl Limiter {
 
     /// Sets `params` from the next sample processed on. Returns false and
     /// changes nothing when [`LimiterParams::check`] refuses them; a
-    /// refusal does not allocate.
+    /// refusal does not allocate. The parameters held, bit for bit,
+    /// change nothing, so a switch ramping goes on as it was. Switched on
+    /// from off at rest, the sidechain starts at rest, however long the
+    /// limiter ran on before: what it holds then depends only on the
+    /// index.
     #[must_use]
     pub fn set(&mut self, params: LimiterParams) -> bool {
         let ok = |r: &RangeInclusive<f32>, v: f32| r.contains(&v);
@@ -309,6 +330,12 @@ impl Limiter {
             || !ok(&LIMITER_RELEASE_MS, params.release_ms)
         {
             return false;
+        }
+        if same(&params, &self.params) {
+            return true;
+        }
+        if params.enabled && self.is_off() {
+            self.rest();
         }
         self.params = params;
         self.ceiling = db_to_gain(params.ceiling_db);
@@ -529,7 +556,12 @@ impl Limiter {
         }
         for i in 0..len {
             let w = self.wet.value_at(self.wet.pos + (n + i) as u32);
-            let k = 1.0 + w * (gains[i] - 1.0);
+            // At w = 1 the gain itself: 1 + (g - 1) rounds above g.
+            let k = if w == 1.0 {
+                gains[i]
+            } else {
+                1.0 + w * (gains[i] - 1.0)
+            };
             let late = &self.x[at((first + i as u64).wrapping_sub(LIMITER_DELAY as u64))];
             for leg in 0..self.legs {
                 let y = &mut buf[leg * frames + n + i];
@@ -934,11 +966,70 @@ mod tests {
         let yb = run(&mut b, 1000, &x[1000..], 50);
         assert_eq!(ya, yb);
         assert!(ya[LIMITER_DELAY + 1] > 1.5 && ya[RAMP as usize + LIMITER_DELAY] < 0.51);
+        // Set while its switch ramps, from an index past the samples
+        // processed: the ramp moves on over the samples not processed, so
+        // it ended by then and the ceiling holds at once.
+        let mut c = Limiter::new(1, RAMP);
+        assert!(c.set(on(-1.0, 50.0)));
+        let _ = run(&mut c, 0, &x[..200], 50);
+        assert!(c.set_at(1000, on(-6.0, 50.0)));
+        let yc = run(&mut c, 1000, &x[1000..], 50);
+        let ceiling = db_to_gain(-6.0);
+        assert!(yc.iter().all(|v| v.abs() <= ceiling * (1.0 + 1e-6)));
     }
 
-    /// Parameters out of range, or NaN, are refused and change nothing.
+    /// Off and on again, a limiter computes the same bits whatever the
+    /// block size, though a block of one size starts while the switch
+    /// still ramps off where one of another size starts after it.
+    #[test]
+    fn switching_off_and_on_does_not_depend_on_the_blocks() {
+        let x = programme(4800, 21);
+        let mut outs = Vec::new();
+        for b in [48usize, 96] {
+            let mut l = Limiter::new(2, 500);
+            assert!(l.set(on(-3.0, 300.0)));
+            let len = 4800;
+            let part = |from: usize, to: usize| -> Vec<f32> {
+                (0..2)
+                    .flat_map(|leg| x[leg * len + from..leg * len + to].iter().copied())
+                    .collect()
+            };
+            let mut y = run(&mut l, 0, &part(0, 960), b);
+            assert!(l.set_at(
+                960,
+                LimiterParams {
+                    enabled: false,
+                    ..on(-3.0, 300.0)
+                }
+            ));
+            y.extend(run(&mut l, 960, &part(960, 1536), b));
+            assert!(l.set_at(1536, on(-3.0, 300.0)));
+            y.extend(run(&mut l, 1536, &part(1536, 4800), b));
+            outs.push(y);
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&outs[0]), bits(&outs[1]));
+    }
+
+    /// The parameters held, set again, leave a ramping switch as it was.
+    #[test]
+    fn the_same_parameters_change_nothing() {
+        let mut l = Limiter::new(1, RAMP);
+        assert!(l.set(on(-1.0, 50.0)));
+        let _ = run(&mut l, 0, &[0.1; 100], 50);
+        let before = l.clone();
+        assert!(l.set(on(-1.0, 50.0)));
+        assert_eq!(l, before);
+    }
+
+    /// Parameters out of range, or NaN, are refused and change nothing;
+    /// clamped, a finite one moves into its range.
     #[test]
     fn parameters_out_of_range_are_refused() {
+        assert_eq!(on(3.0, 0.5).clamped(), Some(on(0.0, 1.0)));
+        assert_eq!(on(-30.0, 2000.0).clamped(), Some(on(-20.0, 1000.0)));
+        assert_eq!(on(f32::NAN, 50.0).clamped(), None);
+        assert_eq!(on(-1.0, f32::INFINITY).clamped(), None);
         let mut l = Limiter::new(2, RAMP);
         for p in [
             on(0.5, 50.0),
