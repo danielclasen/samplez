@@ -58,8 +58,8 @@ pub struct Counters {
     /// Input blocks silenced for any reason, a pruned input included.
     pub input_silenced_blocks: AtomicU64,
     /// Validity probes of the failed-input identification. The RT thread
-    /// makes none: a frozen input is pruned and its flow checked on the
-    /// supervisor side.
+    /// makes none: a late input is pruned, frozen or not, and its flow
+    /// checked on the supervisor side.
     pub input_probes: AtomicU64,
     /// Clock steps: libmxl's clock moved by more than a block period
     /// against CLOCK_MONOTONIC between two wakes.
@@ -318,11 +318,13 @@ pub(crate) struct SlotStats {
 
 pub(crate) enum Telemetry {
     Block(BlockVerdict),
-    /// The slot is to be pruned: marked invalid, or its head has not moved
-    /// for the slot's prune limit.
+    /// The slot is to be pruned: marked invalid, or its blocks have been
+    /// late for the slot's prune limit, `frozen` with its head unchanged
+    /// or for the longer one of a moving head.
     Prune {
         slot: usize,
         invalid: bool,
+        frozen: bool,
         /// The last head seen and the end of the block range read.
         head: u64,
         end: u64,
@@ -369,10 +371,12 @@ pub(crate) enum Telemetry {
 }
 
 /// An input generation of one domain and, per slot, the number of
-/// samples its head may stay frozen before the slot is pruned.
+/// samples its blocks may stay late before the slot is pruned: with its
+/// head frozen, and with its head moving.
 pub(crate) struct Gen {
     pub mxl: Generation,
     pub prune_after: Vec<u64>,
+    pub prune_late: Vec<u64>,
     /// The slots, by bit, a re-route moved to another flow: each one's
     /// reader is on the new flow, its outgoing reader on the old one.
     pub rerouted: u64,
@@ -2040,6 +2044,7 @@ impl Rt {
                         s.last_end = None;
                         s.head = 0;
                         s.frozen_late_blocks = 0;
+                        s.late_blocks = 0;
                         s.invalid = false;
                         slot.xfade = None;
                     }
@@ -2238,6 +2243,7 @@ impl Rt {
             if is && !was {
                 slot.state.invalid = false;
                 slot.state.frozen_late_blocks = 0;
+                slot.state.late_blocks = 0;
             }
             if is != was {
                 slot.prune_requested = false;
@@ -2278,6 +2284,7 @@ impl Rt {
                 s.last_end = None;
                 s.head = 0;
                 s.frozen_late_blocks = 0;
+                s.late_blocks = 0;
                 s.invalid = false;
                 // Anchored at the index whatever the slot's last block
                 // was: an outgoing flow that is silent fades the new one
@@ -2569,11 +2576,18 @@ impl Rt {
                         }
                         _ => {}
                     }
-                    let frozen = u64::from(slot.state.frozen_late_blocks) * self.block;
-                    if !slot.prune_requested && (slot.state.invalid || frozen >= g.prune_after[i]) {
+                    // A head that advances behind its blocks for good, as one
+                    // stamped on another clock does, is as unreadable as a
+                    // frozen one, and keeps every block degraded; it is
+                    // given longer, as a moving head may catch up.
+                    let frozen =
+                        u64::from(slot.state.frozen_late_blocks) * self.block >= g.prune_after[i];
+                    let late = u64::from(slot.state.late_blocks) * self.block >= g.prune_late[i];
+                    if !slot.prune_requested && (slot.state.invalid || frozen || late) {
                         let t = Telemetry::Prune {
                             slot: i,
                             invalid: slot.state.invalid,
+                            frozen,
                             head: slot.state.head,
                             end: ((k + 1) * self.block).saturating_add_signed(slot.offset),
                         };

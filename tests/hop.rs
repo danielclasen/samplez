@@ -1,7 +1,8 @@
 //! The engine end to end on real libmxl flows: one hop, a gain change,
 //! two replicas, a chain of three, a killed and restarted producer, an
 //! input offset, two inputs with one pruned, a late producer, a flow
-//! whose first commit comes after its input was pruned, a vanished
+//! whose first commit comes after its input was pruned, a producer a
+//! second behind the clock and one half a block past the margin, a vanished
 //! domain, a foreign writer on the output and the `samplez-hop` binary.
 //! Runs without the test harness, one scenario at a time so their timing
 //! does not interfere, and re-executes itself as a producer process that
@@ -60,6 +61,14 @@ fn main() {
         (
             "input_pruned_at_head_0_is_re_added_once_its_late_head_advances",
             head_zero_at_attach,
+        ),
+        (
+            "input_advancing_a_second_behind_the_clock_is_pruned_for_good",
+            behind_the_clock,
+        ),
+        (
+            "input_half_a_block_past_the_margin_is_pruned_once",
+            past_the_margin,
         ),
         (
             "input_whose_domain_vanished_is_re_added_once_it_is_back",
@@ -746,6 +755,59 @@ fn head_zero_at_attach() {
     wait_for(5 * SECOND, "blocks read after the re-add", || {
         copied() > before + 100
     });
+    common::stop(engine);
+}
+
+/// The producer commits at the nominal rate a second behind the clock, as
+/// one that stamps its indices on another clock does: every block is late
+/// and the head never freezes.
+fn behind_the_clock() {
+    pruned_for_good(48_000);
+}
+
+/// The producer commits half a block past the margin: every block is late
+/// at its deadline, while a poll finds the newest block due held about
+/// half the time. The input is pruned once and not re-added, which would
+/// have it late again and pruned again a second later.
+fn past_the_margin() {
+    pruned_for_good(MARGIN + B / 2);
+}
+
+/// A producer committing `delay` samples behind the clock: the input is
+/// pruned with its head moving and goes down, so that its late reads stop
+/// degrading every block, and is neither re-added nor raised for twice
+/// the recovery period and the prune limit after it.
+fn pruned_for_good(delay: u64) {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, delay);
+    let cfg = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&dst, 1)],
+        vec![vec![1.0]],
+        MARGIN,
+    );
+    let (engine, _rx) = start(cfg);
+    let state = || engine.status().inputs[0].state;
+    wait_for(5 * SECOND, "input attached", || {
+        state() == InputState::Attached
+    });
+    wait_for(5 * SECOND, "input pruned", || state() == InputState::Pruned);
+    // Down in the log: a down slot's unread blocks degrade no digest.
+    let up = || engine.status().inputs[0].up;
+    wait_for(SECOND, "input down", || !up());
+    let t = Instant::now();
+    while t.elapsed() < 3 * SECOND {
+        assert_eq!(
+            state(),
+            InputState::Pruned,
+            "re-added after {:?}",
+            t.elapsed()
+        );
+        assert!(!up(), "raised after {:?}", t.elapsed());
+        std::thread::sleep(SECOND / 100);
+    }
     common::stop(engine);
 }
 

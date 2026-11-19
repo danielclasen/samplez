@@ -604,6 +604,8 @@ pub struct SlotState {
     pub head: u64,
     /// Consecutive late blocks with `head` unchanged.
     pub frozen_late_blocks: u32,
+    /// Consecutive late blocks, `head` moving or not.
+    pub late_blocks: u32,
     /// Set by an [`Outcome::Invalid`] read or by [`Input::identify`];
     /// cleared by the supervisor.
     pub invalid: bool,
@@ -743,6 +745,7 @@ impl Input {
         }
         if *group == GroupWait::Ok {
             state.frozen_late_blocks = 0;
+            state.late_blocks = 0;
         } else {
             let head = match self.reader.head() {
                 Ok(head) => head,
@@ -754,11 +757,13 @@ impl Input {
                 } else {
                     state.frozen_late_blocks = 1;
                 }
+                state.late_blocks = state.late_blocks.saturating_add(1);
                 state.head = head;
                 return Outcome::Late;
             }
             state.head = head;
             state.frozen_late_blocks = 0;
+            state.late_blocks = 0;
         }
 
         let mut slice = WrappedMultiBufferSlice::default();
@@ -812,7 +817,7 @@ impl Input {
     /// waits for a missing name blocks for that wait once the flow is
     /// deleted.
     #[deprecated(
-        note = "the engine prunes a frozen input and checks its flow on the supervisor side"
+        note = "the engine prunes a late input and checks its flow on the supervisor side"
     )]
     #[allow(deprecated, reason = "FROZEN_PROBE_BLOCKS goes with this probe")]
     pub fn identify(&self, state: &mut SlotState, group: &GroupWait, outcome: Outcome) -> bool {
@@ -1060,10 +1065,9 @@ impl Recovery {
     /// True once the head has advanced for [`RECOVERY_NS`]: it moved, and
     /// it never stayed unchanged between two polls for more than `limit`
     /// samples, the prune limit an attached slot of the flow gets. How far
-    /// the head is from the clock is not checked: an attached input is
-    /// pruned only for a frozen head, so a late head counts as readable
-    /// here as it does there, where its late blocks are silenced and
-    /// raise the margin warning. No head starts the period again.
+    /// the head is from the clock is the caller's to check: an attached
+    /// slot is pruned for late blocks whether its head moves or not. No
+    /// head starts the period again.
     pub fn update(&mut self, api: &MxlApi, head: Option<u64>, now: u64, limit: u64) -> bool {
         let Some(head) = head else {
             *self = Recovery::default();

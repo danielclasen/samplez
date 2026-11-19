@@ -237,7 +237,8 @@ are stamped; `Engine::progress` reports buildLead and the build time,
 the percentile and a supervisor tick without the engine's lead.
 `Engine::start` keeps the log itself, stamping `InputDown`
 when an input is pruned and `InputUp` once its head has advanced for a
-second, wherever it stands against the clock, each `InputUp`,
+second and held, at every poll of that second, the newest block due by
+then, so that block read then would have been on time, each `InputUp`,
 `Route` (`Engine::route`) or `Detach` (`Engine::detach`) at least
 buildLead after the one before, and an `Output`
 (`Engine::set_output_enabled`) as a gain change;
@@ -721,16 +722,31 @@ instruction count of the hold ring's paths, the page hashes, the strip
 calls of the RT loop, a block's DSP, duck detectors and input meters,
 the matrix and detector copies of the core, a duck batch, a block's
 history stores or an output commit, gap zero-fill included, exceeds the
-limit in the benchmark. A late input is pruned after `pruneAfterBlocks`
-blocks of a frozen head, or twice the producer's
+limit in the benchmark. An input is pruned after `pruneAfterBlocks`
+consecutive late blocks with its head frozen, or twice the producer's
 `maxCommitBatchSizeHint` plus `readerMarginSamples` when that is longer,
 with no validity check on the RT thread: the supervisor's poll reader
 checks the pruned input's flow once a lookup found it. A producer that
 replaces its flow under the same id therefore leaves the input silent
 for the prune limit before the supervisor reads the new flow, as one
-that stops does. libmxl's read runs its validity check only when the
-head moves back between the head read and the read, which reports the
-block `TooEarly`.
+that stops does. An input whose head advances behind its blocks, as
+that of a producer stamping its indices on another clock does, is
+pruned after that limit or one second of consecutive late blocks,
+whichever is longer: left up, its late reads would degrade every
+block's digest, and a lag shorter than the second it takes to come
+back is silenced only while it lasts. libmxl's read runs its validity
+check only when the head moves back between the head read and the read,
+which reports the block `TooEarly`.
+
+In replicated mode a prune is a report the product appends as an
+`InputDown`, so the view of the flow on the replica whose report is
+appended decides for every replica: a mirror late on that replica's
+node takes the input down on all of them. That is accepted because the
+lateness has lasted a second by then, every block of that replica
+degraded meanwhile and its outputs withdrawn whenever evidence came
+late. A replica whose clock is not verified, its kernel TAI offset not
+the set's or its clock beyond `clockGuard` of a majority, holds no
+engine core: it reads no input and prunes none.
 
 The host needs swap off and `vm.compact_unevictable_allowed=0`, so that
 neither swapping nor compaction moves the locked pages of the RT

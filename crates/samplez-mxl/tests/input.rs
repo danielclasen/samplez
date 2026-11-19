@@ -329,10 +329,40 @@ fn each_outcome_is_produced() {
     assert_eq!(s.counters.invalid, 1);
 }
 
+/// Late blocks are counted in a row whether the head moves or not: the
+/// engine prunes an input whose head advances behind its blocks as it does
+/// one whose head froze. A block read on time starts the count again, as
+/// does a group wait that found the data.
+#[test]
+fn late_blocks_count_in_a_row_with_the_head_moving_or_not() {
+    let mut f = fixture(20);
+    let mut dst = vec![0.0; 2 * B as usize];
+    let timeout = GroupWait::Failed(MXL_ERR_OUT_OF_RANGE_TOO_EARLY);
+    let mut s = SlotState::default();
+    let r = f.generation.input(0).unwrap();
+    for (i, k) in (1..).zip([K0 + 30, K0 + 31]) {
+        assert_eq!(r.read(&mut s, k, &timeout, &mut dst), Outcome::Late);
+        assert_eq!((s.late_blocks, s.frozen_late_blocks), (i, i));
+    }
+    // The head moves, still behind the block.
+    f.writer.blocks(K0 + 20..K0 + 25);
+    assert_eq!(r.read(&mut s, K0 + 32, &timeout, &mut dst), Outcome::Late);
+    assert_eq!((s.late_blocks, s.frozen_late_blocks), (3, 1));
+    // Read on time.
+    f.writer.blocks(K0 + 25..K0 + 34);
+    assert_eq!(r.read(&mut s, K0 + 33, &timeout, &mut dst), Outcome::Copy);
+    assert_eq!((s.late_blocks, s.frozen_late_blocks), (0, 0));
+    // Late again, then a group wait that found the data.
+    assert_eq!(r.read(&mut s, K0 + 40, &timeout, &mut dst), Outcome::Late);
+    assert_eq!(s.late_blocks, 1);
+    r.read(&mut s, K0 + 41, &GroupWait::Ok, &mut dst);
+    assert_eq!((s.late_blocks, s.frozen_late_blocks), (0, 0));
+}
+
 #[test]
 #[allow(
     deprecated,
-    reason = "the probe libmxl gives; the engine prunes a frozen input instead"
+    reason = "the probe libmxl gives; the engine prunes a late input instead"
 )]
 fn identify_probes_and_marks_a_replaced_flow() {
     let f = fixture(20);
