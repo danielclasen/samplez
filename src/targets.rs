@@ -17,13 +17,12 @@ pub struct Targets {
     /// The gain targets: one row per input channel, one column per output
     /// or meter column.
     pub gains: Vec<Vec<f32>>,
-    /// The fade of each gain, shaped as `gains`, or empty for every gain
-    /// with no fade: over the ramp length from the entry's index.
-    pub fades: Vec<Vec<Option<Fade>>>,
-    /// The gain fades still running at the state `self` describes, shaped
-    /// as `gains`, or empty for none, in absolute sample indices: what an
-    /// install of the state continues ([`ProductState::fading`]). Entries
-    /// are not derived from it.
+    /// The gain fades not over yet, shaped as `gains`, or empty for none:
+    /// per coefficient the fade towards its gain in absolute sample
+    /// indices, as [`Fading`] defines it. The one source of the fades:
+    /// [`Targets::diff`] and [`Targets::assert`] turn it into entry fades
+    /// for the index they are given, and an install of a product state
+    /// resumes it (`ProductState::fading`).
     pub fading: Vec<Vec<Option<Fading>>>,
     /// Per input slot, the flow it reads; none for a detached slot.
     pub flows: Vec<Option<String>>,
@@ -51,6 +50,25 @@ pub struct Targets {
     pub outputs: Vec<bool>,
 }
 
+/// The entry fade that, applied at `at`, takes a coefficient to its
+/// target as `f` does: before the start the delay left, during the ramp
+/// the remaining ramp (the same value at its end, the steps between taken
+/// over the remaining length), after it a jump.
+fn entry_fade(f: &Fading, at: u64) -> Fade {
+    if at <= f.start {
+        let delay = (f.start - at).min(u64::from(samplez_dsp::MAX_EXACT_RAMP_LEN)) as u32;
+        return Fade { delay, len: f.len };
+    }
+    let done = at - f.start;
+    if done >= u64::from(f.len) {
+        return Fade { delay: 0, len: 0 };
+    }
+    Fade {
+        delay: 0,
+        len: f.len - done as u32,
+    }
+}
+
 impl Targets {
     /// The entries that move an engine holding `self` to `next`: a `Gain`
     /// for each coefficient whose bit pattern differs, row by row; a
@@ -70,7 +88,7 @@ impl Targets {
     /// targets, one `next` holds and `self` does not counts as
     /// different; one `self` holds and `next` does not gets no entry, so
     /// the engine keeps it.
-    pub fn diff(&self, next: &Targets) -> Vec<Entry> {
+    pub fn diff(&self, next: &Targets, at: u64) -> Vec<Entry> {
         let mut entries = Vec::new();
         for (input, row) in next.gains.iter().enumerate() {
             let was = self.gains.get(input);
@@ -82,11 +100,12 @@ impl Targets {
                         output,
                         gain,
                         fade: next
-                            .fades
+                            .fading
                             .get(input)
                             .and_then(|r| r.get(output))
                             .copied()
-                            .flatten(),
+                            .flatten()
+                            .map(|f| entry_fade(&f, at)),
                     });
                 }
             }
@@ -131,14 +150,17 @@ impl Targets {
     /// a mask other than 0 only where an entry set one, so `masked`, every
     /// mask an engine may have been given ORed together, names every
     /// coefficient a 0 has to clear; none for every coefficient.
-    pub fn assert(&self, slots: &[usize], masked: Option<&[Vec<u8>]>) -> Vec<Entry> {
+    pub fn assert(&self, slots: &[usize], masked: Option<&[Vec<u8>]>, at: u64) -> Vec<Entry> {
         // Against no targets at all: every gain, zeros included, every
         // strip parameter, duck setting and mask other than 0.
-        let mut entries = Targets::default().diff(&Targets {
-            flows: Vec::new(),
-            outputs: Vec::new(),
-            ..self.clone()
-        });
+        let mut entries = Targets::default().diff(
+            &Targets {
+                flows: Vec::new(),
+                outputs: Vec::new(),
+                ..self.clone()
+            },
+            at,
+        );
         for (input, row) in self.masks.iter().enumerate() {
             for (output, &mask) in row.iter().enumerate() {
                 let held = masked.is_none_or(|m| {
@@ -414,7 +436,7 @@ mod tests {
 
     #[test]
     fn equal_targets_need_no_entry() {
-        assert_eq!(targets().diff(&targets()), Vec::new());
+        assert_eq!(targets().diff(&targets(), 0), Vec::new());
     }
 
     /// A VCA move as a product sees it: several coefficients, a strip
@@ -427,7 +449,7 @@ mod tests {
         next.strips[1].push(StripParam::Gate(gate()));
         next.flows[0] = Some("c".into());
         assert_eq!(
-            targets().diff(&next),
+            targets().diff(&next, 0),
             vec![
                 Entry::Gain {
                     input: 0,
@@ -460,7 +482,7 @@ mod tests {
         let mut next = targets();
         next.gains[0][1] = -0.0;
         assert_eq!(
-            targets().diff(&next),
+            targets().diff(&next, 0),
             vec![Entry::Gain {
                 input: 0,
                 output: 1,
@@ -479,7 +501,7 @@ mod tests {
         let mut base = targets();
         base.strips[0] = vec![StripParam::Trim { db: 0.0 }];
         assert_eq!(
-            base.diff(&next),
+            base.diff(&next, 0),
             vec![Entry::Strip {
                 slot: 0,
                 param: StripParam::Trim { db: -0.0 }
@@ -501,7 +523,7 @@ mod tests {
         };
         next.strips[1] = vec![StripParam::Gate(moved)];
         assert_eq!(
-            base.diff(&next),
+            base.diff(&next, 0),
             vec![Entry::Strip {
                 slot: 1,
                 param: StripParam::Gate(moved)
@@ -536,7 +558,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            targets().diff(&next),
+            targets().diff(&next, 0),
             vec![
                 Entry::Strip {
                     slot: 0,
@@ -564,7 +586,7 @@ mod tests {
             gains: vec![vec![0.5]],
             ..Targets::default()
         };
-        assert_eq!(targets().diff(&next), Vec::new());
+        assert_eq!(targets().diff(&next, 0), Vec::new());
     }
 
     /// Asserting sets every gain, zeros included, and every strip
@@ -572,7 +594,7 @@ mod tests {
     #[test]
     fn assert_sets_every_gain_and_parameter_and_the_routes_named() {
         let t = targets();
-        let entries = t.assert(&[1, 1], None);
+        let entries = t.assert(&[1, 1], None, 0);
         let gains = entries
             .iter()
             .filter(|e| matches!(e, Entry::Gain { .. }))
@@ -593,7 +615,7 @@ mod tests {
                 flow_id: "b".into()
             }]
         );
-        assert_eq!(t.assert(&[], None).len(), 5);
+        assert_eq!(t.assert(&[], None, 0).len(), 5);
     }
 
     /// An output's enabled state is diffed, an output past a list counting
@@ -610,16 +632,16 @@ mod tests {
         };
         let mut next = targets();
         next.outputs = vec![true, false];
-        assert_eq!(targets().diff(&next), vec![off(1)]);
-        assert_eq!(next.diff(&next), Vec::new());
+        assert_eq!(targets().diff(&next, 0), vec![off(1)]);
+        assert_eq!(next.diff(&next, 0), Vec::new());
         // Past the list an output is enabled: dropping a disabled one
         // enables it, dropping an enabled one changes nothing.
-        assert_eq!(next.diff(&targets()), vec![on(1)]);
+        assert_eq!(next.diff(&targets(), 0), vec![on(1)]);
         next.outputs = vec![true];
-        assert_eq!(targets().diff(&next), Vec::new());
+        assert_eq!(targets().diff(&next, 0), Vec::new());
         // After the routes; one per output held, both values.
         next.outputs = vec![false, true];
-        let all = next.assert(&[0], None);
+        let all = next.assert(&[0], None, 0);
         let n = all.len();
         assert_eq!(all[n - 2..], [off(0), on(1)]);
         assert!(matches!(all[n - 3], Entry::Route { slot: 0, .. }));
@@ -632,14 +654,14 @@ mod tests {
     fn a_slot_without_a_flow_is_detached() {
         let mut next = targets();
         next.flows[1] = None;
-        assert_eq!(targets().diff(&next), vec![Entry::Detach { slot: 1 }]);
-        assert_eq!(next.diff(&next), Vec::new());
+        assert_eq!(targets().diff(&next, 0), vec![Entry::Detach { slot: 1 }]);
+        assert_eq!(next.diff(&next, 0), Vec::new());
         let unknown = Targets {
             flows: Vec::new(),
             ..next.clone()
         };
-        assert!(unknown.diff(&next).contains(&Entry::Detach { slot: 1 }));
-        let flows: Vec<Entry> = (next.assert(&[1, 0], None).into_iter())
+        assert!(unknown.diff(&next, 0).contains(&Entry::Detach { slot: 1 }));
+        let flows: Vec<Entry> = (next.assert(&[1, 0], None, 0).into_iter())
             .filter(|e| matches!(e, Entry::Route { .. } | Entry::Detach { .. }))
             .collect();
         assert_eq!(
@@ -887,7 +909,7 @@ mod tests {
             ..Targets::default()
         };
         assert_eq!(
-            was.diff(&next),
+            was.diff(&next, 0),
             [
                 Entry::Limiter {
                     output: 1,
@@ -899,9 +921,13 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(next.diff(&was).len(), 1, "output 1 none keeps the engine's");
-        assert!(was.diff(&was).is_empty());
-        let all = next.assert(&[], None);
+        assert_eq!(
+            next.diff(&was, 0).len(),
+            1,
+            "output 1 none keeps the engine's"
+        );
+        assert!(was.diff(&was, 0).is_empty());
+        let all = next.assert(&[], None, 0);
         assert_eq!(
             all.iter()
                 .filter(|e| matches!(e, Entry::Limiter { .. }))
@@ -923,14 +949,14 @@ mod tests {
             ..Targets::default()
         };
         assert_eq!(
-            was.diff(&next),
+            was.diff(&next, 0),
             [Entry::Delay {
                 slot: 1,
                 samples: 960
             }]
         );
-        assert!(was.diff(&was).is_empty());
-        let all = was.assert(&[], None);
+        assert!(was.diff(&was, 0).is_empty());
+        let all = was.assert(&[], None, 0);
         assert_eq!(
             all.iter()
                 .filter(|e| matches!(e, Entry::Delay { .. }))
@@ -1051,7 +1077,7 @@ mod tests {
             }
             // By `Debug` forms, as a NaN gain or field never equals itself.
             assert_eq!(
-                format!("{:?}", was.diff(&next)),
+                format!("{:?}", was.diff(&next, 0)),
                 format!("{:?}", reference_diff(&was, &next)),
                 "{was:?} -> {next:?}"
             );
@@ -1094,7 +1120,7 @@ mod tests {
         let mut base = targets();
         base.ducks = vec![duck()];
         base.masks = vec![vec![0, 1], vec![0, 0]];
-        assert_eq!(base.diff(&base.clone()), Vec::new());
+        assert_eq!(base.diff(&base.clone(), 0), Vec::new());
         let mut next = base.clone();
         next.ducks[0].params.attack_ms = 10.0;
         next.ducks[0].keys[0].1 = 0.5;
@@ -1104,7 +1130,7 @@ mod tests {
         next.masks[1][0] = 3;
         let group = |setting| Entry::Duck { group: 0, setting };
         assert_eq!(
-            base.diff(&next),
+            base.diff(&next, 0),
             vec![
                 group(DuckSetting::Detector(Box::new(next.ducks[0].params))),
                 group(DuckSetting::Keys(vec![(0, 0.5)])),
@@ -1136,11 +1162,11 @@ mod tests {
         }
         let mut grown = base.clone();
         grown.ducks.push(DuckTargets::default());
-        assert_eq!(base.diff(&grown).len(), 4, "a new group: every setting");
+        assert_eq!(base.diff(&grown, 0).len(), 4, "a new group: every setting");
         let mut keyed = base.clone();
         keyed.ducks[0].keys.push((1, 1.0));
         assert_eq!(
-            base.diff(&keyed),
+            base.diff(&keyed, 0),
             vec![group(DuckSetting::Keys(vec![(0, 1.0), (1, 1.0)]))]
         );
     }
@@ -1165,7 +1191,7 @@ mod tests {
                 })
                 .collect()
         };
-        let entries = t.assert(&[], None);
+        let entries = t.assert(&[], None, 0);
         let ducks = entries
             .iter()
             .filter(|e| matches!(e, Entry::Duck { .. }))
@@ -1177,7 +1203,10 @@ mod tests {
             [(0, 1, 1), (0, 0, 0), (1, 0, 0), (1, 1, 0)]
         );
         let masked = [vec![0, 4], vec![2, 0]];
-        assert_eq!(masks(&t.assert(&[], Some(&masked))), [(0, 1, 1), (1, 0, 0)]);
+        assert_eq!(
+            masks(&t.assert(&[], Some(&masked), 0)),
+            [(0, 1, 1), (1, 0, 0)]
+        );
     }
 
     /// A diff names a mask only where it changes: a row new to the
@@ -1188,7 +1217,7 @@ mod tests {
         let mut next = targets();
         next.masks = vec![vec![0, 3], vec![0, 0]];
         assert_eq!(
-            targets().diff(&next),
+            targets().diff(&next, 0),
             vec![Entry::DuckMask {
                 input: 0,
                 output: 1,
@@ -1198,7 +1227,7 @@ mod tests {
         let mut cleared = next.clone();
         cleared.masks[0][1] = 0;
         assert_eq!(
-            next.diff(&cleared),
+            next.diff(&cleared, 0),
             vec![Entry::DuckMask {
                 input: 0,
                 output: 1,
@@ -1207,37 +1236,40 @@ mod tests {
         );
     }
 
-    /// A diff names the fade of `next` with each gain that differs, and
-    /// only those: a fade of a coefficient whose gain is unchanged goes
-    /// with no entry, and `assert` states every gain with its fade.
+    /// A diff turns an absolute fade into the entry fade for its index:
+    /// the delay left before the start (an engine renders it as the
+    /// absolute function, bit for bit), the remaining ramp during it, a
+    /// jump after it. `assert` does the same for every gain.
     #[test]
-    fn diff_and_assert_carry_the_fade_of_each_gain() {
-        let fade = Fade {
-            delay: 480,
-            len: 2_880_000,
+    fn diff_and_assert_give_the_entry_fade_for_their_index() {
+        let f = Fading {
+            from: 1.0,
+            start: 1000,
+            len: 400,
         };
         let mut next = targets();
         next.gains[1][0] = 0.125;
-        next.gains[0][0] = 0.5;
-        next.fades = vec![
-            vec![Some(Fade { delay: 1, len: 2 }), None],
-            vec![Some(fade), None],
-        ];
-        let gain = |input, output, gain, fade| Entry::Gain {
-            input,
-            output,
-            gain,
+        next.fading = vec![vec![None, None], vec![Some(f), None]];
+        let gain = |fade| Entry::Gain {
+            input: 1,
+            output: 0,
+            gain: 0.125,
             fade,
         };
-        // Coefficient (0, 0) holds its bits: its fade alone is no entry.
-        assert_eq!(targets().diff(&next), vec![gain(1, 0, 0.125, Some(fade))]);
-        let asserted = next.assert(&[], None);
-        let gains: Vec<&Entry> = asserted
-            .iter()
-            .filter(|e| matches!(e, Entry::Gain { .. }))
-            .collect();
-        assert!(gains.contains(&&gain(1, 0, 0.125, Some(fade))));
-        assert!(gains.contains(&&gain(0, 0, 0.5, Some(Fade { delay: 1, len: 2 }))));
-        assert!(gains.contains(&&gain(0, 1, 0.0, None)));
+        let fade = |delay, len| Some(Fade { delay, len });
+        for (at, want) in [
+            (0, fade(1000, 400)),
+            (1000, fade(0, 400)),
+            (1100, fade(0, 300)),
+            (1400, fade(0, 0)),
+            (5000, fade(0, 0)),
+        ] {
+            assert_eq!(targets().diff(&next, at), vec![gain(want)], "at {at}");
+            assert!(next.assert(&[], None, at).contains(&gain(want)), "at {at}");
+        }
+        // No fading at all: the entry takes the ramp length.
+        let mut plain = next.clone();
+        plain.fading = Vec::new();
+        assert_eq!(targets().diff(&plain, 0), vec![gain(None)]);
     }
 }

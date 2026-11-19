@@ -291,10 +291,14 @@ the entry's index: the coefficient holds the value it has there for
 fade, `delay` is 0 and `len` the configured `rampSamples`. Both are at
 most `samplez_dsp::MAX_EXACT_RAMP_LEN` (2^23, about 174 s), and a fade
 beyond it is refused. `Engine::set_gain_fade` takes the fade,
-`Entry::Gain` carries it as `fade`, and `Targets::fades`, shaped as
-`gains`, holds one per gain: `Targets::diff` and `Targets::assert` give
-each emitted gain the fade of `next`, so a fade of a gain whose value
-does not change is no entry.
+and `Entry::Gain` carries it as `fade`. `Targets::fading`, shaped as
+`gains`, holds the one source of the fades in absolute sample indices
+(`from`, `start`, `len`). `Targets::diff` and `Targets::assert` take the
+index `at` their entries apply at and give each emitted gain the entry
+fade for it: the delay left (`start - at`) before the start, which an
+engine renders as the absolute function bit for bit; the remaining ramp
+during it, which ends on the target at the same index; a jump after it.
+A fade of a gain whose value does not change is no entry.
 
 The coefficient's value at a sample is a function of the sample index
 and the ordered entries alone: position `n` from the start `S = index +
@@ -312,11 +316,11 @@ core built from a product state does not know the fades running: the
 state names each as `ProductState::fading`, in absolute indices (`from`,
 `start`, `len`) beside the target in `gains`, and the install continues
 the fade at its value for the install index, bit for bit as a replica
-that ran through computes it, instead of jumping to the target. A gain
+that ran through computes it, instead of jumping to the target.
+`Targets::fading` is that list for a replica's product state. A gain
 entry the install passed is folded in the same way, from the value its
 coefficient had at the entry's index. A product that leaves `fading`
-empty gets its coefficients at their targets. `Targets::fading` carries
-the same list for a replica's product state. A duck mask crossfade of a
+empty gets its coefficients at their targets. A duck mask crossfade of a
 coefficient that comes back from 0 runs over `len` from the entry's
 index, not from the end of the delay.
 

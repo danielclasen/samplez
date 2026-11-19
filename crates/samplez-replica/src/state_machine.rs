@@ -472,7 +472,7 @@ impl<P: Product> StateMachine<P> {
                     return;
                 };
                 let slots: Vec<usize> = slots.iter().map(|&s| s as usize).collect();
-                let entries = targets.assert(&slots, self.masked.as_deref());
+                let entries = targets.assert(&slots, self.masked.as_deref(), at);
                 self.mask(&targets);
                 self.image = Some(targets);
                 (entries, Vec::new())
@@ -503,8 +503,8 @@ impl<P: Product> StateMachine<P> {
                 };
                 self.silenced(Some(revision), silenced);
                 let entries = self.image.as_ref().map_or_else(
-                    || samplez::Targets::default().diff(&next),
-                    |image| image.diff(&next),
+                    || samplez::Targets::default().diff(&next, at),
+                    |image| image.diff(&next, at),
                 );
                 self.mask(&next);
                 self.image = Some(next);

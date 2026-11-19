@@ -3671,6 +3671,51 @@ mod tests {
         }
     }
 
+    /// The entry a diff derives from an absolute fade at an index before
+    /// the fade's start renders the absolute function bit for bit; at an
+    /// index inside it the ramp ends on the same target at the same
+    /// index.
+    #[test]
+    fn a_diff_of_an_absolute_fade_renders_the_absolute_function() {
+        use crate::targets::Targets;
+        use crate::transfer::Fading;
+        let f = Fading {
+            from: 1.0,
+            start: 6 * B + 10,
+            len: 200,
+        };
+        let next = Targets {
+            gains: vec![vec![0.25]],
+            fading: vec![vec![Some(f)]],
+            ..Targets::default()
+        };
+        let was = Targets {
+            gains: vec![vec![1.0]],
+            ..Targets::default()
+        };
+        for at in [2 * B, 6 * B, 7 * B] {
+            let crate::engine::Entry::Gain { fade, .. } = was.diff(&next, at)[0].clone() else {
+                panic!("no gain entry");
+            };
+            let fade = fade.unwrap();
+            let mut m = mix();
+            assert!(m.push(faded(0.25, at, fade.delay, fade.len)));
+            let gains = walk(&mut m, 14);
+            for (k, g) in gains.iter().enumerate() {
+                let n = k as u64 * B;
+                if n < at {
+                    continue;
+                }
+                let want = f.value_at(0.25, n);
+                if at <= f.start {
+                    assert_eq!(g.to_bits(), want.to_bits(), "at {at}, sample {n}");
+                } else if n >= f.start + u64::from(f.len) {
+                    assert_eq!(*g, 0.25, "at {at}, sample {n}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_batch_applies_each_gain_with_its_own_fade() {
         use crate::batch::{Item, fold};
