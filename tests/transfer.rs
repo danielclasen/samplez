@@ -239,6 +239,22 @@ impl Hashed {
         self.e.counters().overrun_skipped_samples.load(Relaxed)
     }
 
+    /// The pages a block the engine skipped after an overrun and the
+    /// samples after it touch, from the skips its status changes name.
+    /// A limiter restarts from silence at a skip and holds the same bits
+    /// as one that computed those samples again within a few dozen
+    /// samples, well inside the fade-in length.
+    fn skip_touched(&self) -> Vec<u64> {
+        let skipped: Vec<u64> = (self.statuses.try_iter())
+            .filter_map(|s| match s {
+                StatusChange::Skipped { from, to } => Some(from..to),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        touched(&skipped)
+    }
+
     /// The pages a silenced input block and the fade-in after it touch:
     /// their output depends on more than the input and the log.
     fn disturbed(&self) -> Vec<u64> {
@@ -1500,6 +1516,49 @@ fn assert_same_within(a: &Hashed, b: &Hashed, from: u64, to: u64) -> Result<(), 
     Ok(())
 }
 
+/// Collects `n` pages in `[from, end)` both engines hashed whole and no
+/// skipped or silenced block touched, as the engines compute them, and
+/// requires each to hash alike on both. The engines keep only recent
+/// pages and a loaded host skips blocks, so the pages are gathered poll
+/// by poll rather than read from a fixed window. Too few, because the
+/// engines skipped the stretch, is an error and not a mismatch.
+fn assert_same_untouched(
+    a: &Hashed,
+    b: &Hashed,
+    from: u64,
+    end: u64,
+    n: usize,
+) -> Result<(), String> {
+    let (mut pa, mut pb, mut touched) = (BTreeMap::new(), BTreeMap::new(), Vec::new());
+    let mut same = BTreeMap::new();
+    wait_for(Duration::from_secs(10), "comparable pages", || {
+        // Pages first: a skip a page follows is reported before it.
+        pa.extend(a.pages());
+        pb.extend(b.pages());
+        for h in [a, b] {
+            touched.extend(h.disturbed());
+            touched.extend(h.skip_touched());
+        }
+        same = (from..end)
+            .filter(|p| !touched.contains(p))
+            .filter_map(|p| {
+                let (x, y) = (pa.get(&p)?, pb.get(&p)?);
+                Some((p, (x.hash, x.fingerprint) == (y.hash, y.fingerprint)))
+            })
+            .collect();
+        same.len() >= n || processed(&a.e).min(processed(&b.e)) * B / PAGE >= end
+    });
+    if same.len() < n {
+        return Err(format!(
+            "{} comparable pages in {from}..{end}, {n} wanted",
+            same.len()
+        ));
+    }
+    let apart: Vec<u64> = same.iter().filter(|(_, s)| !**s).map(|(p, _)| *p).collect();
+    assert!(apart.is_empty(), "pages {apart:?} differ");
+    Ok(())
+}
+
 /// A strip entry a product state folds in, which reaches the RT thread
 /// only after the install, still sets the strip, as on the engines that
 /// applied it at its index.
@@ -1567,7 +1626,6 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
             hashed_of(&domain, &[(&src, 2)], limited),
             hashed_of(&domain, &[(&src, 2)], limited),
         );
-        let skipped = (a.skipped(), b.skipped());
         b.e.drop_core().unwrap();
         let at = (now_block() + 20) * B;
         let limiter = Entry::Limiter {
@@ -1609,14 +1667,12 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
         wait_for(Duration::from_secs(5), "past the release", || {
             processed(&a.e) > want && processed(&b.e) > want
         });
-        let end = (from + 4 * PAGE).div_ceil(B) + PAGE / B;
-        wait_for(Duration::from_secs(10), "pages computed", || {
-            processed(&a.e) > end && processed(&b.e) > end
-        });
-        if (a.skipped(), b.skipped()) != skipped {
-            return Err("an overrun skip".to_owned());
+        // A skip across the entry's index drops it as late on the engine
+        // that applied it at its index: the two then differ for good.
+        if a.e.counters().command_late.load(Relaxed) != 0 {
+            return Err("the limiter entry was late".to_owned());
         }
-        assert_same_within(&a, &b, from, from + 4 * PAGE)?;
+        assert_same_untouched(&a, &b, from.div_ceil(PAGE), from.div_ceil(PAGE) + 40, 3)?;
         assert_eq!(b.e.counters().command_late.load(Relaxed), 0);
         Ok(())
     });
