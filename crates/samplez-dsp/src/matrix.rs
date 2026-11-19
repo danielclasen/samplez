@@ -668,6 +668,24 @@ impl Matrix {
     /// [`MAX_GAIN`](crate::MAX_GAIN) in magnitude.
     #[must_use]
     pub fn set(&mut self, input: usize, output: usize, target: f32, len: u32) -> bool {
+        self.set_fade(input, output, target, 0, len)
+    }
+
+    /// [`Matrix::set`] after the coefficient held its value for `delay`
+    /// samples, per [`Ramp::set_fade`]. Its value at a sample is a
+    /// function of the sample's distance from the call and of the values
+    /// the call was given alone, whichever blocks the samples fall in. A
+    /// duck mask crossfade a coefficient back from 0 starts runs over
+    /// `len` from the call, not from the end of `delay`.
+    #[must_use]
+    pub fn set_fade(
+        &mut self,
+        input: usize,
+        output: usize,
+        target: f32,
+        delay: u32,
+        len: u32,
+    ) -> bool {
         if input >= self.inputs || output >= self.columns.len() || !valid_gain(target) {
             return false;
         }
@@ -675,7 +693,7 @@ impl Matrix {
         match col.binary_search_by_key(&input, |t| t.input) {
             Ok(k) => {
                 // `target` passed valid_gain, so set_target accepts it.
-                let _ = col[k].ramp.set_target(target, len);
+                let _ = col[k].ramp.set_fade(target, delay, len);
                 if !col[k].ramp.is_active() && target == 0.0 {
                     if col[k].ducked {
                         self.ducks[output].remove(duck_index(col, k));
@@ -685,7 +703,7 @@ impl Matrix {
             }
             Err(k) if target != 0.0 => {
                 let mut ramp = Ramp::new(0.0);
-                let _ = ramp.set_target(target, len);
+                let _ = ramp.set_fade(target, delay, len);
                 let term = Term {
                     input,
                     ramp,
@@ -945,6 +963,19 @@ impl Matrix {
     ///
     /// When `gains` does not hold one value per coefficient.
     pub fn fade_in(&mut self, gains: &[f32], len: u32) -> bool {
+        self.fade_in_resuming(gains, len, &[])
+    }
+
+    /// [`Matrix::fade_in`] where each `(coefficient, ramp)` of `resumed`,
+    /// ascending and unique by coefficient, takes `ramp` as it is, a
+    /// coefficient at 0 included, instead of a ramp from silence: the
+    /// coefficient continues a fade the matrix did not run itself.
+    /// Whether any coefficient ramps.
+    ///
+    /// # Panics
+    ///
+    /// When `gains` does not hold one value per coefficient.
+    pub fn fade_in_resuming(&mut self, gains: &[f32], len: u32, resumed: &[(usize, Ramp)]) -> bool {
         let outputs = self.columns.len();
         assert_eq!(
             gains.len(),
@@ -956,12 +987,17 @@ impl Matrix {
             ducks.clear();
         }
         let mut ramping = false;
+        let mut next = resumed.iter().peekable();
         for (c, &g) in gains.iter().enumerate() {
-            if g == 0.0 || !valid_gain(g) {
+            let ramp = if let Some(&(_, r)) = next.next_if(|e| e.0 == c) {
+                r
+            } else if g == 0.0 || !valid_gain(g) {
                 continue;
-            }
-            let mut ramp = Ramp::new(0.0);
-            let _ = ramp.set_target(g, len);
+            } else {
+                let mut ramp = Ramp::new(0.0);
+                let _ = ramp.set_target(g, len);
+                ramp
+            };
             ramping |= ramp.is_active();
             self.columns[c % outputs].push(Term {
                 input: c / outputs,
@@ -1006,9 +1042,22 @@ impl Matrix {
         depths: &[f32],
         len: u32,
     ) -> bool {
+        self.fade_in_ducked_resuming(gains, masks, depths, len, &[])
+    }
+
+    /// [`Matrix::fade_in_ducked`] with the ramps of
+    /// [`Matrix::fade_in_resuming`].
+    pub fn fade_in_ducked_resuming(
+        &mut self,
+        gains: &[f32],
+        masks: &[u8],
+        depths: &[f32],
+        len: u32,
+        resumed: &[(usize, Ramp)],
+    ) -> bool {
         self.masks.clear();
         self.depths.clear();
-        let ramping = self.fade_in(gains, len);
+        let ramping = self.fade_in_resuming(gains, len, resumed);
         if masks.iter().any(|&k| k != 0) {
             assert_eq!(masks.len(), gains.len(), "one mask per coefficient");
             // Reserved at construction: nothing allocates.
@@ -2604,5 +2653,61 @@ mod tests {
         assert_eq!(m.columns[2][0].mask, 0b1000_0001);
         assert_eq!(m.ducks[2].len(), 1);
         assert_eq!((m.mask(2, 0), m.depth(0, MAX_DUCKS)), (0, 0.0));
+    }
+
+    /// A delayed fade mixes to the same bits on the best path and the
+    /// scalar one, and in any block sizes.
+    #[test]
+    fn a_delayed_fade_is_bit_exact_across_paths_and_block_sizes() {
+        let frames = 1100;
+        let mut rng = Rng::new(0x51de);
+        let mut input = PlanarBuffer::new(3, frames);
+        fill(&mut rng, &mut input, frames);
+        let setup = || {
+            let mut m = Matrix::new(3, 2);
+            for i in 0..3 {
+                for o in 0..2 {
+                    assert!(m.set(i, o, 0.5 + 0.25 * i as f32, 0));
+                }
+            }
+            assert!(m.set_fade(0, 0, 0.0, 150, 400));
+            assert!(m.set_fade(1, 0, 2.0, 301, 17));
+            assert!(m.set_fade(2, 1, 0.125, 37, 0));
+            m
+        };
+        let run = |path: Path, sizes: &[usize]| {
+            let mut m = setup();
+            let mut out = PlanarBuffer::new(2, frames);
+            let mut at = 0;
+            let mut per = vec![Vec::new(), Vec::new()];
+            for &n in sizes.iter().cycle() {
+                if at + n > frames {
+                    break;
+                }
+                let mut block = PlanarBuffer::new(3, n);
+                for c in 0..3 {
+                    block.channel_mut(c)[..n].copy_from_slice(&input.channel(c)[at..at + n]);
+                }
+                m.process_on(path, &block, &mut out, n);
+                for (c, p) in per.iter_mut().enumerate() {
+                    p.extend(out.channel(c)[..n].iter().map(|v| v.to_bits()));
+                }
+                at += n;
+            }
+            per
+        };
+        let want = run(Path::Scalar, &[1100]);
+        assert_eq!(want[0].len(), frames);
+        for path in [Path::Scalar, Path::Avx2] {
+            if !path.is_supported() {
+                continue;
+            }
+            for sizes in [&[1100][..], &[100, 100, 55], &[8, 13, 64], &[1]] {
+                let got = run(path, sizes);
+                for c in 0..2 {
+                    assert_eq!(got[c], want[c][..got[c].len()], "{path:?} {sizes:?}");
+                }
+            }
+        }
     }
 }

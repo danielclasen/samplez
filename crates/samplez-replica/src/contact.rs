@@ -4038,6 +4038,7 @@ mod tests {
                 ducks: Vec::new(),
                 masks: Vec::new(),
                 pending: Vec::new(),
+                fading: Vec::new(),
                 last_id: log.applied,
             };
             (log.applied, log.floor, state)
@@ -5894,6 +5895,7 @@ mod tests {
                         input: 0,
                         output: 0,
                         gain: 0.5,
+                        fade: None,
                     }],
                     generation: false,
                 };

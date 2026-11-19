@@ -72,6 +72,34 @@ fn setup_matrix(path: Path) -> (Path, (Matrix, PlanarBuffer, PlanarBuffer)) {
     (path, ramping_matrix())
 }
 
+/// A full matrix whose every coefficient waits 480 samples, then ramps
+/// from 1 to 0.5 over 480: its block is the delayed-fade path, through
+/// the hold and across the start of the ramp.
+fn delayed_matrix() -> (Matrix, PlanarBuffer, PlanarBuffer) {
+    let mut m = Matrix::new(INPUTS, OUTPUTS);
+    for i in 0..INPUTS {
+        for j in 0..OUTPUTS {
+            assert!(m.set(i, j, 1.0, 0));
+            assert!(m.set_fade(i, j, 0.5, B as u32 / 2, 480));
+        }
+    }
+    (m, signal(INPUTS), PlanarBuffer::new(OUTPUTS, B))
+}
+
+#[library_benchmark]
+#[bench::scalar(args = (Path::Scalar,), setup = setup_delayed, config = limit(DELAYED_SCALAR))]
+#[bench::avx2(args = (Path::Avx2,), setup = setup_delayed, config = limit(DELAYED_AVX2))]
+fn matrix_delayed(
+    (path, (mut m, input, mut output)): (Path, (Matrix, PlanarBuffer, PlanarBuffer)),
+) -> (Matrix, PlanarBuffer, PlanarBuffer) {
+    m.process_on(path, black_box(&input), &mut output, B);
+    (m, input, output)
+}
+
+fn setup_delayed(path: Path) -> (Path, (Matrix, PlanarBuffer, PlanarBuffer)) {
+    (path, delayed_matrix())
+}
+
 /// The ramping matrix with every coefficient ducked, their depths
 /// ramping and every mask crossfading, with the detectors' envelopes
 /// moving: by all eight detectors, or, when `varied`, by a mask of its
@@ -465,13 +493,15 @@ fn setup_history() -> (Started, Vec<History>, PlanarBuffer) {
     (Started::new(), rings, signal(INPUTS))
 }
 
-const CORE_COPY: u64 = 26_000;
+const CORE_COPY: u64 = 31_700;
 const DUCK_METERED: u64 = 409_172;
 const DUCK_IDLE: u64 = 4_002;
 const DUCK_COPY: u64 = 22_310;
 const HISTORY_BLOCK: u64 = 45_000;
 const MATRIX_SCALAR: u64 = 8_306_000;
 const MATRIX_AVX2: u64 = 1_051_000;
+const DELAYED_SCALAR: u64 = 8_010_000;
+const DELAYED_AVX2: u64 = 1_228_000;
 const DUCKED_SCALAR: u64 = 17_217_000;
 const DUCKED_AVX2: u64 = 5_868_000;
 const VARIED_SCALAR: u64 = 17_204_000;
@@ -494,6 +524,7 @@ library_benchmark_group!(
     name = block,
     benchmarks = [
         matrix,
+        matrix_delayed,
         matrix_ducked,
         meters,
         input_meters,

@@ -83,7 +83,21 @@ fn the_rt_thread_passes_rtsan() {
     });
     let api = common::api();
     let index = samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
-    engine.set_gain(0, 0, 0.25, (index / B + 20) * B).unwrap();
+    // A delayed fade: held for three blocks, then ramped over 4800 samples,
+    // and a later change that replaces a fade still waiting.
+    let fade = samplez::Fade {
+        delay: 3 * B as u32,
+        len: 4800,
+    };
+    engine
+        .set_gain_fade(0, 0, 0.25, Some(fade), (index / B + 20) * B)
+        .unwrap();
+    engine
+        .set_gain_fade(0, 0, 0.125, Some(fade), (index / B + 21) * B)
+        .unwrap();
+    engine
+        .set_gain_fade(0, 0, 0.25, Some(fade), (index / B + 40) * B)
+        .unwrap();
     // The limiter on, below the output's level: it limits.
     let limiter = samplez_dsp::LimiterParams {
         enabled: true,

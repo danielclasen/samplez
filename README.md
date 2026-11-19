@@ -217,7 +217,8 @@ interpolated values computed from samples after them.
 ### Log entries
 
 Every change to what the engine computes is a log entry applied at a
-sample index: a gain change, `InputDown` (the input is silent from the
+sample index: a gain change (over the ramp length from the index, or as
+its `Fade` says, see Timed gain transitions), `InputDown` (the input is silent from the
 index on, whatever is readable), `InputUp` (it fades in from the index),
 `Route` (it crossfades to another flow over the ramp length from the
 index), `Detach` (it crossfades to silence over the ramp length from the
@@ -281,6 +282,43 @@ applies within a quarter of the block period: 7,200 at a `blockSize` of
 48, 153,600 at the largest, 1024. A larger matrix takes a larger
 `blockSize`; a configuration beyond the limit is refused, naming the
 `blockSize` its matrix needs.
+
+### Timed gain transitions
+
+A gain change takes an optional `Fade { delay, len }`, in samples from
+the entry's index: the coefficient holds the value it has there for
+`delay` samples, then ramps linearly to the target over `len`. With no
+fade, `delay` is 0 and `len` the configured `rampSamples`. Both are at
+most `samplez_dsp::MAX_EXACT_RAMP_LEN` (2^23, about 174 s), and a fade
+beyond it is refused. `Engine::set_gain_fade` takes the fade,
+`Entry::Gain` carries it as `fade`, and `Targets::fades`, shaped as
+`gains`, holds one per gain: `Targets::diff` and `Targets::assert` give
+each emitted gain the fade of `next`, so a fade of a gain whose value
+does not change is no entry.
+
+The coefficient's value at a sample is a function of the sample index
+and the ordered entries alone: position `n` from the start `S = index +
+delay` is `from + (n - S) * step`, `step = (target - from) / len`,
+`from` the value the coefficient has at the entry's index, a ramp still
+running then included. The same bits come out whatever the block size,
+the SIMD path or the blocks the delay and the ramp span. A later entry
+for the coefficient replaces a fade still waiting or running, starting
+from the value held at its index, so log order decides. A block counts as
+ramping in its verdict until `index + delay + len`.
+
+Nothing of a fade lives outside the matrix: its coefficient holds the
+start value, delay, length and position, so a copied core carries it. A
+core built from a product state does not know the fades running: the
+state names each as `ProductState::fading`, in absolute indices (`from`,
+`start`, `len`) beside the target in `gains`, and the install continues
+the fade at its value for the install index, bit for bit as a replica
+that ran through computes it, instead of jumping to the target. A gain
+entry the install passed is folded in the same way, from the value its
+coefficient had at the entry's index. A product that leaves `fading`
+empty gets its coefficients at their targets. `Targets::fading` carries
+the same list for a replica's product state. A duck mask crossfade of a
+coefficient that comes back from 0 runs over `len` from the entry's
+index, not from the end of the delay.
 
 ### Channel strip
 
@@ -461,7 +499,8 @@ log entries applied in it and whether the page was committed whole.
 
 For a resync, `Engine::copy_core` has the RT thread copy the engine's
 core after the next block k0 into a buffer allocated off it: the matrix
-with its ramps, duck masks, depths and mask crossfades, the duck
+with its ramps, delayed fades included, duck masks, depths and mask
+crossfades, the duck
 detectors with their keys, filter, hold and envelope state, the pending
 entries and those applied in the page in progress, each input's log
 state and fades, each strip with its filter and dynamics state and

@@ -254,11 +254,13 @@ fn a_derived_entry_the_engine_refuses_is_left_out_and_counted() {
             input: 0,
             output: 0,
             gain: f32::INFINITY,
+            fade: None,
         },
         Entry::Gain {
             input: 0,
             output: 0,
             gain: 0.5,
+            fade: None,
         },
     ];
     audio.appended(3, at, &entries);
@@ -556,6 +558,7 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 0,
     };
     wait_for("a block processed", || {
@@ -640,6 +643,7 @@ fn mixer(at_index: u64, gain: f32, trim: f32) -> Record {
                 input: 0,
                 output: 0,
                 gain,
+                fade: None,
             },
             Entry::Strip {
                 slot: 0,
@@ -923,6 +927,7 @@ fn scene(scale: f32) -> Vec<Entry> {
                     input,
                     output,
                     gain: pass * scene_gain(scale, input, output),
+                    fade: None,
                 });
             }
         }
@@ -1203,6 +1208,7 @@ fn rebuild_after_a_route() -> Result<(), String> {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 1,
     };
     let processed = |e: &Engine| e.progress().and_then(|p| p.processed).unwrap_or(0);
@@ -1332,6 +1338,7 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 1,
     };
     rebuilt_audio.drop_engine();
@@ -1421,6 +1428,7 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 1,
     };
     audio.drop_engine();

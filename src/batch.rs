@@ -13,6 +13,7 @@ use samplez_dsp::{LimiterParams, MAX_DUCKS, StripParam, valid_gain};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ducks::{DuckChange, valid_depth};
+use crate::engine::Fade;
 use crate::rt_loop::Change;
 
 /// A log entry's values per matrix coefficient `input * columns +
@@ -48,6 +49,20 @@ impl<T: Copy + Default> Coefs<T> {
                         bits &= bits - 1;
                     }
                 }
+            }
+        }
+    }
+
+    /// The value of coefficient `c`, if set.
+    pub fn get(&self, c: usize) -> Option<T> {
+        match self {
+            Coefs::Sparse(list) => {
+                let k = list.binary_search_by_key(&(c as u32), |e| e.0).ok()?;
+                Some(list[k].1)
+            }
+            Coefs::Dense { values, set } => {
+                let word = set.get(c / 64)?;
+                (word >> (c % 64) & 1 == 1).then(|| values[c])
             }
         }
     }
@@ -149,6 +164,9 @@ pub(crate) enum Item {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Batch {
     pub gains: Gains,
+    /// The fades of the gains that have one, ascending by coefficient;
+    /// a gain not listed ramps over the ramp length.
+    pub fades: Coefs<Fade>,
     /// Strip parameters by slot, one per parameter key ([`strip_key`]),
     /// ascending by slot and key.
     pub strips: Vec<(u32, StripParam)>,
@@ -193,6 +211,7 @@ impl Batch {
         let gains = self.gains.list();
         gains.windows(2).all(|w| w[0].0 < w[1].0)
             && gains.iter().all(|&(_, g)| valid_gain(g))
+            && self.fades.sane(usize::MAX, |f| f.is_valid())
             && self.strips.iter().all(|(_, p)| p.check(usize::MAX).is_ok())
             && self
                 .strips
@@ -236,6 +255,7 @@ impl Batch {
         let coefficients = inputs * columns;
         let mut gains = true;
         self.gains.each(|c, _| gains &= c < coefficients);
+        self.fades.each(|c, _| gains &= c < coefficients);
         let strip = |&(s, p): &(u32, StripParam)| {
             legs.get(s as usize)
                 .is_some_and(|&l| l <= MAX_LEGS && p.check(l).is_ok())
@@ -299,6 +319,7 @@ pub(crate) fn fold(
     coefficients: usize,
 ) -> Result<Option<(Change, Option<Arc<Batch>>)>, String> {
     let mut gains = BTreeMap::new();
+    let mut fades = BTreeMap::new();
     let mut strips = BTreeMap::new();
     let mut slots: BTreeMap<usize, SlotFold> = BTreeMap::new();
     let mut ducks = BTreeMap::new();
@@ -332,8 +353,14 @@ pub(crate) fn fold(
                 input,
                 output,
                 gain,
+                fade,
             } => {
-                gains.insert((input * columns + output) as u32, gain);
+                let k = (input * columns + output) as u32;
+                gains.insert(k, gain);
+                match fade {
+                    Some(f) => fades.insert(k, f),
+                    None => fades.remove(&k),
+                };
             }
             Change::Strip { slot, param } => {
                 strips.insert((slot as u32, strip_key(&param)), param);
@@ -394,6 +421,7 @@ pub(crate) fn fold(
                 input: c / columns,
                 output: c % columns,
                 gain,
+                fade: fades.get(&(c as u32)).copied(),
             }
         } else if let Some((&(slot, _), &param)) = strips.first_key_value() {
             Change::Strip {
@@ -430,6 +458,7 @@ pub(crate) fn fold(
     }
     let batch = Batch {
         gains: Coefs::of(gains.into_iter().collect(), coefficients),
+        fades: Coefs::of(fades.into_iter().collect(), coefficients),
         strips: strips.into_iter().map(|((s, _), p)| (s, p)).collect(),
         limiters: limiters.into_iter().collect(),
         delays: delays.into_iter().collect(),
@@ -466,6 +495,7 @@ mod tests {
             input,
             output,
             gain,
+            fade: None,
         }
     }
 
@@ -682,6 +712,7 @@ mod tests {
                 },
                 Some(Arc::new(Batch {
                     gains: Gains::Sparse(Vec::new()),
+                    fades: Coefs::Sparse(Vec::new()),
                     strips: Vec::new(),
                     limiters: Vec::new(),
                     delays: Vec::new(),
@@ -825,5 +856,56 @@ mod tests {
             group: 8,
             db: 1.0
         })));
+    }
+
+    fn faded(input: usize, output: usize, gain: f32, delay: u32, len: u32) -> Change {
+        Change::Gain {
+            input,
+            output,
+            gain,
+            fade: Some(Fade { delay, len }),
+        }
+    }
+
+    /// Per coefficient the last gain counts with its own fade: a later
+    /// gain without one clears an earlier fade, and only the fades that
+    /// remain are kept.
+    #[test]
+    fn the_last_fade_of_a_coefficient_counts() {
+        let list = [
+            faded(0, 0, 0.5, 10, 20),
+            faded(0, 1, 0.25, 30, 40),
+            gain(0, 1, 0.75),
+            faded(1, 1, 0.125, 5, 7),
+            faded(1, 1, 0.0625, 6, 8),
+        ];
+        let (change, batch) = fold(&items(&list), 2, 4).unwrap().unwrap();
+        assert!(matches!(change, Change::Batch { .. }));
+        let batch = batch.unwrap();
+        assert_eq!(batch.gains.list(), [(0, 0.5), (1, 0.75), (3, 0.0625)]);
+        assert_eq!(
+            batch.fades.list(),
+            [
+                (0, Fade { delay: 10, len: 20 }),
+                (3, Fade { delay: 6, len: 8 })
+            ]
+        );
+        assert!(batch.sane() && batch.fits(2, 2, 2, &[], &[]));
+        // A fade beyond the bound is not sane; one past the matrix does
+        // not fit.
+        let long = Fade {
+            delay: 0,
+            len: samplez_dsp::MAX_EXACT_RAMP_LEN + 1,
+        };
+        let mut bad = (*batch).clone();
+        bad.fades = Coefs::Sparse(vec![(0, long)]);
+        assert!(!bad.sane());
+        bad.fades = Coefs::Sparse(vec![(9, Fade::default())]);
+        assert!(!bad.fits(2, 2, 2, &[], &[]));
+        // One gain alone stays a single change, fade kept.
+        let one = fold(&items(&[faded(0, 1, 0.5, 3, 4)]), 2, 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(one, (faded(0, 1, 0.5, 3, 4), None));
     }
 }

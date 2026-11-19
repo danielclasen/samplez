@@ -8,7 +8,8 @@ use samplez_dsp::{
 
 use crate::batch::strip_key;
 use crate::ducks::{DuckSetting, DuckTargets};
-use crate::engine::Entry;
+use crate::engine::{Entry, Fade};
+use crate::transfer::Fading;
 
 /// Every target an engine's log sets, as values.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -16,6 +17,14 @@ pub struct Targets {
     /// The gain targets: one row per input channel, one column per output
     /// or meter column.
     pub gains: Vec<Vec<f32>>,
+    /// The fade of each gain, shaped as `gains`, or empty for every gain
+    /// with no fade: over the ramp length from the entry's index.
+    pub fades: Vec<Vec<Option<Fade>>>,
+    /// The gain fades still running at the state `self` describes, shaped
+    /// as `gains`, or empty for none, in absolute sample indices: what an
+    /// install of the state continues ([`ProductState::fading`]). Entries
+    /// are not derived from it.
+    pub fading: Vec<Vec<Option<Fading>>>,
     /// Per input slot, the flow it reads; none for a detached slot.
     pub flows: Vec<Option<String>>,
     /// Per input slot, its strip parameters; of two with one key (one
@@ -72,6 +81,12 @@ impl Targets {
                         input,
                         output,
                         gain,
+                        fade: next
+                            .fades
+                            .get(input)
+                            .and_then(|r| r.get(output))
+                            .copied()
+                            .flatten(),
                     });
                 }
             }
@@ -417,12 +432,14 @@ mod tests {
                 Entry::Gain {
                     input: 0,
                     output: 1,
-                    gain: 0.75
+                    gain: 0.75,
+                    fade: None
                 },
                 Entry::Gain {
                     input: 1,
                     output: 0,
-                    gain: 0.125
+                    gain: 0.125,
+                    fade: None
                 },
                 Entry::Strip {
                     slot: 1,
@@ -447,7 +464,8 @@ mod tests {
             vec![Entry::Gain {
                 input: 0,
                 output: 1,
-                gain: -0.0
+                gain: -0.0,
+                fade: None
             }]
         );
     }
@@ -806,6 +824,7 @@ mod tests {
                         input,
                         output,
                         gain,
+                        fade: None,
                     });
                 }
             }
@@ -1186,5 +1205,39 @@ mod tests {
                 mask: 0
             }]
         );
+    }
+
+    /// A diff names the fade of `next` with each gain that differs, and
+    /// only those: a fade of a coefficient whose gain is unchanged goes
+    /// with no entry, and `assert` states every gain with its fade.
+    #[test]
+    fn diff_and_assert_carry_the_fade_of_each_gain() {
+        let fade = Fade {
+            delay: 480,
+            len: 2_880_000,
+        };
+        let mut next = targets();
+        next.gains[1][0] = 0.125;
+        next.gains[0][0] = 0.5;
+        next.fades = vec![
+            vec![Some(Fade { delay: 1, len: 2 }), None],
+            vec![Some(fade), None],
+        ];
+        let gain = |input, output, gain, fade| Entry::Gain {
+            input,
+            output,
+            gain,
+            fade,
+        };
+        // Coefficient (0, 0) holds its bits: its fade alone is no entry.
+        assert_eq!(targets().diff(&next), vec![gain(1, 0, 0.125, Some(fade))]);
+        let asserted = next.assert(&[], None);
+        let gains: Vec<&Entry> = asserted
+            .iter()
+            .filter(|e| matches!(e, Entry::Gain { .. }))
+            .collect();
+        assert!(gains.contains(&&gain(1, 0, 0.125, Some(fade))));
+        assert!(gains.contains(&&gain(0, 0, 0.5, Some(Fade { delay: 1, len: 2 }))));
+        assert!(gains.contains(&&gain(0, 1, 0.0, None)));
     }
 }

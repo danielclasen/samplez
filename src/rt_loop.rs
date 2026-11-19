@@ -478,11 +478,13 @@ pub type LogId = u64;
 /// one applied again once its ramp has ended changes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Change {
-    /// Ramps one matrix coefficient to `gain`.
+    /// Ramps one matrix coefficient to `gain`, over the ramp length from
+    /// the index or as `fade` says.
     Gain {
         input: usize,
         output: usize,
         gain: f32,
+        fade: Option<crate::engine::Fade>,
     },
     /// The input is silent from the index on, whatever is readable.
     InputDown { slot: usize },
@@ -1021,6 +1023,11 @@ pub(crate) fn plan(next: Option<u64>, newest: Option<u64>, max_catchup: u64, blo
     }
 }
 
+/// Samples from its index a fade ends at: the delay and the length.
+fn fade_end(f: crate::engine::Fade) -> u64 {
+    u64::from(f.delay) + u64::from(f.len)
+}
+
 /// The matrix, its position on the sample timeline and the gain changes
 /// waiting for their index.
 pub(crate) struct Mix {
@@ -1192,6 +1199,7 @@ impl Mix {
                 input,
                 output,
                 gain,
+                fade,
             } = c.change
             else {
                 self.due.push((c, c.at_index < pos));
@@ -1203,10 +1211,14 @@ impl Mix {
             }
             self.matrix.advance((c.at_index - pos) as usize);
             pos = c.at_index;
-            if self.matrix.set(input, output, gain, self.ramp) {
+            let f = fade.unwrap_or(crate::engine::Fade {
+                delay: 0,
+                len: self.ramp,
+            });
+            if self.matrix.set_fade(input, output, gain, f.delay, f.len) {
                 self.applied_entry(&c);
                 if self.matrix.is_ramping(input, output) {
-                    self.ramp_end = self.ramp_end.max(c.at_index + u64::from(self.ramp));
+                    self.ramp_end = self.ramp_end.max(c.at_index + fade_end(f));
                 }
             }
         }
@@ -1224,14 +1236,21 @@ impl Mix {
             ramp_end,
             ..
         } = self;
+        let ramp_len = *ramp;
         let Some((_, b)) = batches.iter().find(|b| b.0 == c.id) else {
             return;
         };
         let columns = matrix.outputs();
         b.gains.each(|k, gain| {
             let (input, output) = (k / columns, k % columns);
-            if matrix.set(input, output, gain, *ramp) && matrix.is_ramping(input, output) {
-                *ramp_end = (*ramp_end).max(c.at_index + u64::from(*ramp));
+            let f = b.fades.get(k).unwrap_or(crate::engine::Fade {
+                delay: 0,
+                len: ramp_len,
+            });
+            if matrix.set_fade(input, output, gain, f.delay, f.len)
+                && matrix.is_ramping(input, output)
+            {
+                *ramp_end = (*ramp_end).max(c.at_index + fade_end(f));
             }
         });
         if !b.ducks_matrix() {
@@ -3480,6 +3499,7 @@ mod tests {
             input: 0,
             output: 0,
             gain,
+            fade: None,
         };
         entry(change, at_index)
     }
@@ -3557,6 +3577,134 @@ mod tests {
         assert_eq!(m.ramp_end, 50 * B + 480);
         assert!(!m.ramping(100));
         assert_eq!(m.pos, Some(101 * B));
+    }
+
+    /// A gain change with a fade, at `at_index`.
+    fn faded(gain: f32, at_index: u64, delay: u32, len: u32) -> RtEntry {
+        let fade = Some(crate::engine::Fade { delay, len });
+        entry(
+            Change::Gain {
+                input: 0,
+                output: 0,
+                gain,
+                fade,
+            },
+            at_index,
+        )
+    }
+
+    /// The coefficient at the start of each of `blocks` blocks of `b`
+    /// samples, the matrix moved on over each block as the mix does.
+    fn walk(m: &mut Mix, blocks: u64) -> Vec<f32> {
+        let mut gains = Vec::new();
+        for k in 0..blocks {
+            to(m, k);
+            gains.push(m.matrix.gain(0, 0));
+            m.matrix.advance(m.block as usize);
+        }
+        gains
+    }
+
+    /// `1.0` to `target`: held below `start`, linear over `len` from it,
+    /// the target after.
+    fn expected(n: u64, start: u64, len: u64, target: f32) -> f32 {
+        if n < start {
+            1.0
+        } else if n < start + len {
+            1.0 + (n - start) as f32 * ((target - 1.0) / len as f32)
+        } else {
+            target
+        }
+    }
+
+    #[test]
+    fn a_delayed_fade_holds_then_ramps_exactly() {
+        let mut m = mix();
+        assert!(m.push(faded(0.25, 2 * B, 96, 192)));
+        let gains = walk(&mut m, 12);
+        for (k, g) in gains.iter().enumerate() {
+            let want = expected(k as u64 * B, 2 * B + 96, 192, 0.25);
+            assert_eq!(g.to_bits(), want.to_bits(), "block {k}");
+        }
+        assert_eq!((gains[4], gains[11]), (1.0, 0.25));
+        assert!(gains[5] < 1.0 && gains[5] > 0.25);
+        // Flagged as ramping through the delay and the ramp.
+        assert_eq!(m.ramp_end, 2 * B + 96 + 192);
+        assert!(m.ramping(2) && m.ramping(7) && !m.ramping(8));
+    }
+
+    #[test]
+    fn a_later_change_replaces_a_fade_still_waiting() {
+        let mut m = mix();
+        assert!(m.push(faded(0.25, 2 * B, 480, 96)));
+        assert!(m.push(change(0.5, 4 * B)));
+        let gains = walk(&mut m, 20);
+        // The coefficient never goes toward 0.25: it holds 1.0, then
+        // ramps to 0.5 over the ramp length from the later entry.
+        for (k, g) in gains.iter().enumerate() {
+            let want = expected(k as u64 * B, 4 * B, 480, 0.5);
+            assert_eq!(g.to_bits(), want.to_bits(), "block {k}");
+        }
+        assert_eq!(gains[19], 0.5);
+    }
+
+    #[test]
+    fn a_fade_does_not_depend_on_the_block_size() {
+        let walk_b = |b: u64| {
+            let mut m = Matrix::new(1, 1);
+            assert!(m.set(0, 0, 1.0, 0));
+            let mut m = Mix::new(m, b, 480);
+            assert!(m.push(faded(0.25, 96, 100, 250)));
+            let blocks = 720 / b;
+            let all = walk(&mut m, blocks);
+            // Every 48th sample, the index both block sizes start a block at.
+            all.chunks((48 / b) as usize)
+                .map(|c| c[0])
+                .collect::<Vec<_>>()
+        };
+        let reference = walk_b(48);
+        assert!(reference.iter().any(|&g| g != 1.0 && g != 0.25));
+        for b in [16, 24, 48] {
+            let got: Vec<u32> = walk_b(b).iter().map(|g| g.to_bits()).collect();
+            let want: Vec<u32> = reference.iter().map(|g| g.to_bits()).collect();
+            assert_eq!(got, want, "block size {b}");
+        }
+    }
+
+    #[test]
+    fn a_batch_applies_each_gain_with_its_own_fade() {
+        use crate::batch::{Item, fold};
+        let g = |output, gain, fade| {
+            Item::Change(Change::Gain {
+                input: 0,
+                output,
+                gain,
+                fade,
+            })
+        };
+        let fade = Some(crate::engine::Fade {
+            delay: 96,
+            len: 192,
+        });
+        let items = [g(0, 0.25, fade), g(1, 0.5, None)];
+        let Some((change, Some(batch))) = fold(&items, 2, 2).unwrap() else {
+            panic!("not a batch");
+        };
+        let mut matrix = Matrix::new(1, 2);
+        assert!(matrix.set(0, 0, 1.0, 0) && matrix.set(0, 1, 1.0, 0));
+        let mut m = Mix::new(matrix, B, 480);
+        assert!(m.push_with(entry(change, 2 * B), Some(batch)).is_ok());
+        let mut seen = Vec::new();
+        for k in 0..12 {
+            to(&mut m, k);
+            seen.push((m.matrix.gain(0, 0), m.matrix.gain(0, 1)));
+            m.matrix.advance(B as usize);
+        }
+        for (k, (a, b)) in seen.iter().enumerate() {
+            let n = k as u64 * B;
+            assert_eq!(a.to_bits(), expected(n, 2 * B + 96, 192, 0.25).to_bits());
+            assert_eq!(b.to_bits(), expected(n, 2 * B, 480, 0.5).to_bits());
+        }
     }
 
     #[test]
@@ -3908,11 +4056,13 @@ mod tests {
                 input: 0,
                 output: 1,
                 gain: 0.5,
+                fade: None,
             },
             Change::Gain {
                 input: 1,
                 output: 0,
                 gain: 0.25,
+                fade: None,
             },
         ];
         let items = changes.map(crate::batch::Item::Change);
@@ -4255,6 +4405,7 @@ mod tests {
             input,
             output,
             gain,
+            fade: None,
         };
         let duck = |setting| Entry::Duck { group: 0, setting };
         vec![

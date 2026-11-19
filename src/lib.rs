@@ -22,16 +22,17 @@ pub mod transfer;
 pub use config::Config;
 pub use ducks::{DuckMeter, DuckSetting, DuckTargets};
 pub use engine::{
-    ClockStatus, ControlError, DuckError, Engine, Entry, EntryError, GainError, GenerationStatus,
-    InputState, InputStatus, MeterStatus, OutputStatus, Progress, Replication, Report, ResetError,
-    Status,
+    ClockStatus, ControlError, DuckError, Engine, Entry, EntryError, Fade, GainError,
+    GenerationStatus, InputState, InputStatus, MeterStatus, OutputStatus, Progress, Replication,
+    Report, ResetError, Status,
 };
 pub use meters::{InputMeters, OutputMeters};
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};
 pub use samplez_dsp::MAX_COEFFICIENTS;
 pub use targets::Targets;
 pub use transfer::{
-    CopyError, Core, CoreCopy, DecodeError, ENGINE_VERSION, ProductState, Replay, ReplayError,
+    CopyError, Core, CoreCopy, DecodeError, ENGINE_VERSION, Fading, ProductState, Replay,
+    ReplayError,
 };
 
 /// The lint probe's lock on a static (CI): its users never name its type.

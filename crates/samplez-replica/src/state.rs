@@ -1061,6 +1061,7 @@ mod tests {
                     ducks: Vec::new(),
                     masks: Vec::new(),
                     pending: Vec::new(),
+                    fading: Vec::new(),
                     last_id: 0,
                 };
                 calls.rebuild_engine(&state, 0)

@@ -911,6 +911,7 @@ impl<P: Product> StateMachine<P> {
         samplez::ProductState {
             limiters: targets.limiters,
             gains: targets.gains,
+            fading: targets.fading,
             up,
             flows: targets.flows,
             outputs: targets.outputs,
@@ -1986,6 +1987,7 @@ mod derive_tests {
                     input,
                     output,
                     gain,
+                    ..
                 } => Some((input, output, gain.to_bits())),
                 _ => None,
             })
@@ -2151,7 +2153,8 @@ mod derive_tests {
         assert!(r.entries.contains(&Entry::Gain {
             input: 0,
             output: 0,
-            gain: 0.2
+            gain: 0.2,
+            fade: None
         }));
         assert!(r.entries.contains(&Entry::Route {
             slot: 0,
@@ -2414,7 +2417,8 @@ mod derive_tests {
         assert!(r.entries.contains(&Entry::Gain {
             input: 0,
             output: 0,
-            gain: 0.2
+            gain: 0.2,
+            fade: None
         }));
         assert!(void(10, 0, None).body.needs_generation());
 

@@ -256,17 +256,39 @@ impl std::error::Error for GainError {}
 /// setting [`Engine::admits`] refuses.
 pub type DuckError = GainError;
 
+/// The timing of a gain change, in samples from the entry's index: the
+/// coefficient holds its value for `delay` samples, then ramps linearly to
+/// its target over `len`. Both are at most
+/// [`samplez_dsp::MAX_EXACT_RAMP_LEN`]. A change with no fade has delay 0
+/// and the configured ramp length.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Fade {
+    pub delay: u32,
+    pub len: u32,
+}
+
+impl Fade {
+    /// Whether both `delay` and `len` are within
+    /// [`samplez_dsp::MAX_EXACT_RAMP_LEN`].
+    pub fn is_valid(&self) -> bool {
+        self.delay <= samplez_dsp::MAX_EXACT_RAMP_LEN && self.len <= samplez_dsp::MAX_EXACT_RAMP_LEN
+    }
+}
+
 /// A log entry for the engine. Each sets an absolute target, so one
 /// applied again once its ramp has ended changes nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     /// Ramps the gain from input channel `input` to matrix column
     /// `output`, an output channel or after them a meter channel, to
-    /// `gain` over the ramp length.
+    /// `gain`: over the ramp length from the entry's index, or as `fade`
+    /// says, whose ramp starts from the value the coefficient has at
+    /// `delay` samples after the index.
     Gain {
         input: usize,
         output: usize,
         gain: f32,
+        fade: Option<Fade>,
     },
     /// Input slot `slot` is silent from the entry's index on, whatever is
     /// readable.
@@ -1734,6 +1756,27 @@ impl Engine {
         gain: f32,
         at_index: u64,
     ) -> Result<(), GainError> {
+        self.set_gain_fade(input, output, gain, None, at_index)
+    }
+
+    /// [`Engine::set_gain`] with a [`Fade`]: the coefficient holds its
+    /// value for `fade.delay` samples from `at_index` and ramps over
+    /// `fade.len`. A fade beyond [`samplez_dsp::MAX_EXACT_RAMP_LEN`] in
+    /// either field is refused as invalid.
+    pub fn set_gain_fade(
+        &self,
+        input: usize,
+        output: usize,
+        gain: f32,
+        fade: Option<Fade>,
+        at_index: u64,
+    ) -> Result<(), GainError> {
+        if fade.is_some_and(|f| !f.is_valid()) {
+            return Err(GainError::Invalid(format!(
+                "a fade within {} samples",
+                samplez_dsp::MAX_EXACT_RAMP_LEN
+            )));
+        }
         if input >= self.shape.0 || output >= self.shape.1 {
             return Err(GainError::Invalid(format!(
                 "no matrix coefficient {input} -> {output}"
@@ -1748,6 +1791,7 @@ impl Engine {
             input,
             output,
             gain,
+            fade,
         };
         self.set_local(change, at_index, "gain changes")
     }
@@ -2175,7 +2219,14 @@ impl Engine {
                 input,
                 output,
                 gain,
+                fade,
             } => {
+                if fade.is_some_and(|f| !f.is_valid()) {
+                    return invalid(format!(
+                        "a fade beyond {} samples",
+                        samplez_dsp::MAX_EXACT_RAMP_LEN
+                    ));
+                }
                 if input >= self.shape.0 || output >= self.shape.1 {
                     return invalid(format!("no matrix coefficient {input} -> {output}"));
                 }
@@ -2186,6 +2237,7 @@ impl Engine {
                     input,
                     output,
                     gain,
+                    fade,
                 }
             }
             Entry::InputDown { slot }
@@ -2841,6 +2893,8 @@ impl Engine {
         let slots = self.config.inputs.len();
         if state.gains.len() != n
             || state.gains.iter().any(|row| row.len() != m)
+            || !(state.fading.is_empty()
+                || state.fading.len() == n && state.fading.iter().all(|row| row.len() == m))
             || state.up.len() != slots
             || state.flows.len() != slots
             || state.strips.len() != slots
@@ -2876,6 +2930,14 @@ impl Engine {
         if let Some(gain) = (state.gains.iter().flatten()).find(|g| !samplez_dsp::valid_gain(**g)) {
             return Err(ReplayError::Invalid(format!(
                 "gain {gain} is not finite within MAX_GAIN"
+            )));
+        }
+        if let Some(f) = (state.fading.iter().flatten().flatten())
+            .find(|f| !samplez_dsp::valid_gain(f.from) || f.len > samplez_dsp::MAX_EXACT_RAMP_LEN)
+        {
+            return Err(ReplayError::Invalid(format!(
+                "a fade from {} over {} samples is not within the fade bounds",
+                f.from, f.len
             )));
         }
         let strips = product_strips(&state.strips);
@@ -2942,6 +3004,15 @@ impl Engine {
         // buffers are allocated here, before the first.
         let targets: Vec<f32> = state.gains.iter().flatten().copied().collect();
         let mut gains = targets.clone();
+        // The fades still running, per coefficient, and the ramps the core
+        // continues: filled each attempt, the room allocated here.
+        let fading_targets: Vec<Option<crate::transfer::Fading>> = if state.fading.is_empty() {
+            vec![None; n * m]
+        } else {
+            state.fading.iter().flatten().copied().collect()
+        };
+        let mut fadings = fading_targets.clone();
+        let mut resumed: Vec<(usize, samplez_dsp::Ramp)> = Vec::with_capacity(n * m);
         let mut up = state.up.clone();
         // A bit per output disabled; one past the list is enabled.
         // An output past the state's list starts as configured.
@@ -2992,6 +3063,7 @@ impl Engine {
             &delays,
             |j, core| {
                 gains.copy_from_slice(&targets);
+                fadings.copy_from_slice(&fading_targets);
                 up.copy_from_slice(&state.up);
                 let mut disabled = disabled_targets;
                 masks.copy_from_slice(&mask_targets);
@@ -3010,7 +3082,15 @@ impl Engine {
                             input,
                             output,
                             gain,
-                        } => gains[input * m + output] = gain,
+                            fade,
+                        } => fold_passed(
+                            &mut gains,
+                            &mut fadings,
+                            input * m + output,
+                            (gain, fade),
+                            e.at_index,
+                            ramp,
+                        ),
                         Change::InputDown { slot } => up[slot] = false,
                         Change::InputUp { slot } => up[slot] = true,
                         Change::Output { output, enabled } => {
@@ -3026,7 +3106,16 @@ impl Engine {
                         | Change::Delay { .. } => {}
                         Change::Batch { up: raised, .. } => {
                             if let Some(b) = batch(e.id) {
-                                b.gains.each(|c, g| gains[c] = g);
+                                b.gains.each(|c, g| {
+                                    fold_passed(
+                                        &mut gains,
+                                        &mut fadings,
+                                        c,
+                                        (g, b.fades.get(c)),
+                                        e.at_index,
+                                        ramp,
+                                    );
+                                });
                                 for &slot in &b.downs {
                                     up[slot as usize] = false;
                                 }
@@ -3055,10 +3144,21 @@ impl Engine {
                 }
                 // At the targets from the first sample, whatever a spare
                 // core held, ducked as the masks and depths say.
-                let _ = core.matrix.fade_in_ducked(&gains, &masks, &depths, 0);
+                // Fades still running continue at their value for `next`.
+                resumed.clear();
+                let mut ramp_end = 0;
+                for (c, f) in fadings.iter().enumerate() {
+                    if let Some(r) = f.and_then(|f| f.ramp_at(gains[c], next)) {
+                        ramp_end = ramp_end.max(next + u64::from(r.end() - r.position()));
+                        resumed.push((c, r));
+                    }
+                }
+                let _ = core
+                    .matrix
+                    .fade_in_ducked_resuming(&gains, &masks, &depths, 0, &resumed);
                 core.matrix.align(next);
                 core.pos = Some(next);
-                core.ramp_end = 0;
+                core.ramp_end = ramp_end;
                 core.pending.clear();
                 core.pending.extend_from_slice(&pending[passed..]);
                 // Shared: nothing is allocated in the hand-over's window.
@@ -4684,6 +4784,31 @@ fn unsynchronised() -> Option<bool> {
 
 /// The outputs disabled, a bit per output, `disabled` with output
 /// `output` enabled or disabled.
+/// Folds a gain entry the install passed into the targets and the fades
+/// still running: the coefficient `c` goes to `to` by `fade`, or over
+/// `ramp` samples, from its value at the entry's index `at`, which the
+/// fade it was in counts into.
+fn fold_passed(
+    gains: &mut [f32],
+    fadings: &mut [Option<crate::transfer::Fading>],
+    c: usize,
+    (to, fade): (f32, Option<Fade>),
+    at: u64,
+    ramp: u32,
+) {
+    let from = fadings[c].map_or(gains[c], |f| f.value_at(gains[c], at));
+    let f = fade.unwrap_or(Fade {
+        delay: 0,
+        len: ramp,
+    });
+    gains[c] = to;
+    fadings[c] = (from != to && (f.delay != 0 || f.len != 0)).then_some(crate::transfer::Fading {
+        from,
+        start: at + u64::from(f.delay),
+        len: f.len,
+    });
+}
+
 fn output_disabled(disabled: u64, output: usize, enabled: bool) -> u64 {
     if enabled {
         disabled & !bit(output)
@@ -6565,6 +6690,7 @@ mod tests {
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),
+            fading: Vec::new(),
             last_id: 0,
         };
         let processed = || c.processed.load(Acquire);
@@ -6631,6 +6757,7 @@ mod tests {
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),
+            fading: Vec::new(),
             last_id: 0,
         };
         let processed = || c.processed.load(Acquire);
@@ -6960,6 +7087,7 @@ mod tests {
                 input: 0,
                 output: 0,
                 gain: 0.5,
+                fade: None,
             },
         };
         // The replayed core knew entries up to 3 and applied the strip
@@ -7029,6 +7157,7 @@ mod tests {
                 input: 0,
                 output: 0,
                 gain: 0.5,
+                fade: None,
             },
         };
         // Entry 2 pending here, entry 3 still in the ring: the replayed
@@ -7149,11 +7278,13 @@ mod tests {
                 input: 0,
                 output: 0,
                 gain: 0.5,
+                fade: None,
             },
             Change::Gain {
                 input: 1,
                 output: 0,
                 gain: 0.25,
+                fade: None,
             },
             Change::InputDown { slot: 0 },
             Change::Strip {

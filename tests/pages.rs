@@ -109,6 +109,7 @@ fn log(e: &Engine, entries: &[(u64, u64, usize, f32)]) {
             input,
             output: input,
             gain,
+            fade: None,
         };
         e.append(id, at, entry).unwrap();
     }
