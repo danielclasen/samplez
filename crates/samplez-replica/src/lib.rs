@@ -1953,6 +1953,26 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
             m.decision_lead as f64,
         ),
     ]);
+    // A name's samples stay together: the exposition states its help and
+    // type once, before the first.
+    for p in &m.peers {
+        out.push(ReplicaMetric {
+            name: "samplez_replica_peer_silent_transitions_total",
+            help: "Times this replica went from hearing a peer to holding it silent.",
+            kind: Counter,
+            labels: vec![("node", p.node.to_string())],
+            value: p.silent_transitions as f64,
+        });
+    }
+    for p in &m.peers {
+        out.push(ReplicaMetric {
+            name: "samplez_replica_peer_longest_silent_gap_seconds",
+            help: "The longest time from a peer's last report heard to its next, over the gaps in which it was held silent.",
+            kind: Gauge,
+            labels: vec![("node", p.node.to_string())],
+            value: p.silent_gap_max.as_secs_f64(),
+        });
+    }
     if let Some(node) = m.apply_lead_raised_by {
         out.push(ReplicaMetric {
             name: "samplez_replica_apply_lead_raised_by",

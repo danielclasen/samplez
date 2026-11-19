@@ -375,3 +375,111 @@ async fn a_with_state_closure_asks_for_readiness_while_contact_ticks() {
         std::process::exit(1);
     }
 }
+
+/// What `observer` counts of `peer`'s silences: transitions and the
+/// longest gap.
+fn silences(set: &Set, observer: NodeId, peer: NodeId) -> (u64, Duration) {
+    let m = set.replica(observer).contact_metrics().unwrap();
+    let p = m.peers.iter().find(|p| p.node == peer).unwrap();
+    (p.silent_transitions, p.silent_gap_max)
+}
+
+/// Cuts `peer` off for `pause`, then heals and lets reports flow again.
+async fn pause_reports(set: &Set, peer: NodeId, pause: Duration) {
+    set.net.isolate(peer, set.ids());
+    sleep(pause).await;
+    set.net.heal();
+    sleep(Duration::from_millis(50)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_past_the_window_counts_one_transition_and_the_gap() {
+    let set = start().await;
+    let leader = set.leader().await;
+    let cut = set.ids().find(|&id| id != leader).unwrap();
+    assert_eq!(silences(&set, leader, cut), (0, Duration::ZERO));
+
+    let pause = Duration::from_millis(30);
+    pause_reports(&set, cut, pause).await;
+
+    let (transitions, gap) = silences(&set, leader, cut);
+    assert_eq!(transitions, 1);
+    assert!(gap >= pause, "gap {gap:?} is shorter than the pause");
+    assert!(gap < pause + Duration::from_millis(10), "gap {gap:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_pauses_count_two_transitions_and_the_longer_gap() {
+    let set = start().await;
+    let leader = set.leader().await;
+    let cut = set.ids().find(|&id| id != leader).unwrap();
+
+    let long = Duration::from_millis(50);
+    pause_reports(&set, cut, long).await;
+    pause_reports(&set, cut, Duration::from_millis(30)).await;
+
+    let (transitions, gap) = silences(&set, leader, cut);
+    assert_eq!(transitions, 2);
+    assert!(gap >= long, "gap {gap:?} is shorter than the longer pause");
+    assert!(gap < long + Duration::from_millis(10), "gap {gap:?}");
+}
+
+/// A peer stays unheard while the observer is out of contact and after
+/// it regains contact through the third voter: its silence, and so its
+/// gap, counts from the contact regained, not from its last report
+/// heard before the observer lost contact.
+#[tokio::test(start_paused = true)]
+async fn a_silent_gap_counts_from_the_contact_regained() {
+    let set = start().await;
+    let observer = set.leader().await;
+    let mut others = set.ids().filter(|&id| id != observer);
+    let (unheard, third) = (others.next().unwrap(), others.next().unwrap());
+
+    // Out of contact for 100 ms: nobody is held silent meanwhile.
+    set.net.isolate(observer, set.ids());
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(silences(&set, observer, unheard), (0, Duration::ZERO));
+
+    // Contact regained through `third` alone; `unheard` stays cut off
+    // for 30 ms more, then reports again.
+    set.net.heal();
+    set.net.cut(observer, unheard);
+    let held = Duration::from_millis(30);
+    sleep(held).await;
+    set.net.heal();
+    sleep(Duration::from_millis(50)).await;
+
+    let (transitions, gap) = silences(&set, observer, unheard);
+    assert_eq!(transitions, 1);
+    assert!(gap >= held - Duration::from_millis(4), "gap {gap:?}");
+    assert!(
+        gap < held + Duration::from_millis(10),
+        "gap {gap:?} counts time out of contact"
+    );
+    assert_eq!(silences(&set, observer, third).0, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_exposition_carries_both_silence_metrics_per_peer() {
+    use samplez_service::ReplicatedState;
+    let set = start().await;
+    let leader = set.leader().await;
+    let cut = set.ids().find(|&id| id != leader).unwrap();
+    pause_reports(&set, cut, Duration::from_millis(30)).await;
+
+    let samples = set.replica(leader).replica_metrics();
+    let of = |name: &str, peer: NodeId| {
+        samples
+            .iter()
+            .find(|m| m.name == name && m.labels == [("node", peer.to_string())])
+            .unwrap_or_else(|| panic!("no {name} sample for node {peer}"))
+    };
+    let transitions = of("samplez_replica_peer_silent_transitions_total", cut);
+    assert_eq!(transitions.value, 1.0);
+    let gap = of("samplez_replica_peer_longest_silent_gap_seconds", cut);
+    assert!(gap.value >= 0.030, "{}", gap.value);
+    for peer in set.ids().filter(|&id| id != leader) {
+        of("samplez_replica_peer_silent_transitions_total", peer);
+        of("samplez_replica_peer_longest_silent_gap_seconds", peer);
+    }
+}

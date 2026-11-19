@@ -861,6 +861,20 @@ command appended while a decision is ahead takes effect no earlier than
 the decision, so at the cap a command takes effect up to `maxApplyLead`
 plus 64 ms after its stamp. `samplez_replica_decision_lead_samples`
 exports that lead.
+
+A peer this replica holds silent, with no report within `contactWindowMs`
+while it is in contact, is counted per peer, labelled `node`:
+`samplez_replica_peer_silent_transitions_total` counts each change from
+heard to held silent, and `samplez_replica_peer_longest_silent_gap_seconds`
+is the longest time from the peer's last report heard, or from contact
+regained if that is later, to its next report over the gaps in which it
+was held silent, on the monotonic clock. A silence that ends in a loss
+of contact, or before a first report, counts as a transition but adds
+no gap. Both start at 0 when the peer joins the voter set and are
+dropped with it when it leaves, so a peer removed and added again
+starts from 0. Both are also `silent_transitions` and `silent_gap_max`
+in each peer's contact metrics.
+
 A replica catching up, its log having taken no entry past the commit
 index the first voter report named before that entry's deadline since
 it started or installed a snapshot, as one restarted takes the entries
