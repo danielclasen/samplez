@@ -776,9 +776,37 @@ const FILL_BLOCK_1024: u64 = 9_631_507;
 const RECALL_BLOCK_48: u64 = 1_291_097;
 const RECALL_BLOCK_1024: u64 = 31_257_737;
 
+// The samples an overrun skipped before a block, metered: 64 entries
+// inside the skip, every other one taking down a slot that feeds no meter,
+// the others setting a gain of a slot that feeds every meter, 32 mono
+// inputs of 64 feeding 48 stereo outputs. A slot down that feeds nothing
+// is the most a meter's gap costs to decide.
+#[library_benchmark]
+#[bench::full(setup = skip_setup, config = limit(SKIP_FULL))]
+fn skip_meters(mut s: samplez::bench::Skip) -> samplez::bench::Skip {
+    s.run();
+    s
+}
+
+fn skip_setup() -> samplez::bench::Skip {
+    let libmxl =
+        std::env::var("SAMPLEZ_TEST_LIBMXL").unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".into());
+    samplez::bench::Skip::new(&libmxl, 64, 48, 64)
+}
+
+const SKIP_FULL: u64 = 3_438_134;
+
+library_benchmark_group!(name = skips, benchmarks = [skip_meters]);
+
 library_benchmark_group!(
     name = batches,
     benchmarks = [batch_recall, duck_batch, product_fill, targets_diff]
 );
 
-main!(library_benchmark_groups = hold, pages, strips, batches);
+main!(
+    library_benchmark_groups = hold,
+    pages,
+    strips,
+    batches,
+    skips
+);

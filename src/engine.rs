@@ -1049,7 +1049,7 @@ fn new_meters(config: &Config) -> (Vec<Metered>, Vec<Metered>) {
 /// A replay clone of `config`'s shape: an engine computing off the RT
 /// thread from `gens`, writing nothing and hashing every page it computes
 /// whole into `hashes`, its entries and controls handed in directly.
-fn replay_rt(
+pub(crate) fn replay_rt(
     config: &Config,
     api: &Arc<MxlApi>,
     gens: Vec<Option<Box<Gen>>>,
@@ -1098,6 +1098,7 @@ fn replay_rt(
             fence: AtomicU64::new(u64::MAX),
             ranks: AtomicU64::new(0),
             self_report: AtomicBool::new(false),
+            diverged: AtomicBool::new(false),
             steps_cleared: AtomicU64::new(0),
             statuses: Vec::new(),
             started: Started::new(),
@@ -1310,7 +1311,8 @@ impl Engine {
             true_peak: 0.0,
             sum_sq: 0.0,
             plain_sum_sq: 0.0,
-            reset: false,
+            reset_at: crate::rt_loop::NO_RESET,
+            flags: 0,
         };
         while meter_tx.push(blank).is_ok() {}
         while meter_rx.pop().is_ok() {}
@@ -1353,6 +1355,7 @@ impl Engine {
                 fence: AtomicU64::new(if alone { u64::MAX } else { 0 }),
                 ranks: AtomicU64::new(0),
                 self_report: AtomicBool::new(false),
+                diverged: AtomicBool::new(false),
                 steps_cleared: AtomicU64::new(0),
                 statuses: (0..config.outputs.len())
                     .map(|_| Statuses::new(slots, b))
@@ -2428,6 +2431,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Replicated mode: whether the replicated state finds this replica's
+    /// output apart from its peers' (diverged, or resyncing before the
+    /// hand-over). Each meter slice with a block computed while it is set
+    /// is lost to the loudness measurement and counted in
+    /// [`OutputMeters::lost`].
+    pub fn set_diverged(&self, diverged: bool) -> Result<(), ControlError> {
+        self.replica()?.0.diverged.store(diverged, Relaxed);
+        Ok(())
+    }
+
     /// Replicated mode: this replica's ranks, 0 the top, each fixed into
     /// a block's status when F passes it; at most
     /// [`crate::blocks::MAX_RANK`]. Set before the F that passes the
@@ -3426,8 +3439,9 @@ impl Engine {
     }
 
     /// Restarts the loudness measurement of `meter`, an output or, after
-    /// the outputs, a configured meter (the integrated loudness, the loudness range, the maxima and the
-    /// validity) at the first 100 ms window starting at or after
+    /// the outputs, a configured meter (the integrated loudness, the
+    /// loudness range, the maxima and the counts of gaps and lost slices)
+    /// at the first 100 ms window starting at or after
     /// `at_index`, a multiple of the block size; the K-weighting starts
     /// from silence there, and the true-peak interpolator keeps the 11
     /// output samples before it. From that index on the integrated
@@ -7366,6 +7380,301 @@ mod tests {
         (rt, ring)
     }
 
+    /// A loop for the skip oracle ([`slice_flags`]): its slots and their
+    /// channels, those starting detached, its outputs' and configured
+    /// meters' channels, the coefficients set at the start as (row,
+    /// column, gain), and its entries as (block, items), one item an
+    /// entry of its own and more a folded batch, with the block a late
+    /// one is pushed at, if any.
+    struct Scene {
+        slots: Vec<u32>,
+        detached: Vec<usize>,
+        outputs: Vec<u32>,
+        meters: Vec<u32>,
+        gains: Vec<(usize, usize, f32)>,
+        entries: Vec<(u64, Vec<Item>)>,
+        late: Option<(u64, u64, Change)>,
+        blocks: u64,
+    }
+
+    /// The flags of each slice of each meter, by (meter, slice), as `s`'s
+    /// loop sends them at a block of 64 samples, which does not divide a
+    /// slice, with the blocks of `skipped` not computed, and held
+    /// diverged as it computes the block after them when `diverged`.
+    fn slice_flags(
+        s: &Scene,
+        skipped: std::ops::Range<u64>,
+        diverged: bool,
+    ) -> std::collections::BTreeMap<(u32, u64), u8> {
+        use crate::rt_loop::{Metered, SPAN};
+        const B: u64 = 64;
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let rows: u32 = s.slots.iter().sum();
+        let columns: u32 = s.outputs.iter().chain(&s.meters).sum();
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "blockSize": B,
+            "domains": [{ "name": "d", "path": "/nonexistent" }],
+            "inputs": s.slots.iter().enumerate().map(|(i, &ch)| {
+                let mut v = serde_json::json!({ "name": format!("in{i}"), "domain": "d",
+                    "channels": ch });
+                if !s.detached.contains(&i) {
+                    v["flowId"] = format!("5fbec3b1-1b0f-417d-9059-00000000000{i}").into();
+                }
+                v
+            }).collect::<Vec<_>>(),
+            "outputs": s.outputs.iter().enumerate().map(|(o, &ch)| serde_json::json!({
+                "name": format!("out{o}"), "domain": "d",
+                "flowId": format!("6fbec3b1-1b0f-417d-9059-00000000000{o}"), "label": "o",
+                "group": "g", "role": "Audio", "channels": ch }))
+                .collect::<Vec<_>>(),
+            "meters": s.meters.iter().enumerate().map(|(m, &ch)| serde_json::json!({
+                "name": format!("m{m}"), "channels": ch }))
+                .collect::<Vec<_>>(),
+            "matrix": vec![vec![0.0; columns as usize]; rows as usize],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let api = samplez_mxl::load(std::path::Path::new(&libmxl)).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &api, vec![None], hashes, control);
+        // A replay loop meters its outputs only: the configured meters
+        // are added as an engine's loop holds them.
+        let mut first: usize = s.outputs.iter().map(|&c| c as usize).sum();
+        for &ch in &s.meters {
+            rt.buses.push(Metered {
+                first_channel: first,
+                meter: crate::rt_loop::OutMeter::new(ch as usize),
+            });
+            first += ch as usize;
+        }
+        for &(row, column, gain) in &s.gains {
+            assert!(rt.mix.matrix.set(row, column, gain, 0));
+        }
+        let (tx, mut rx) = rtrb::RingBuffer::new(1 << 14);
+        rt.meters = tx;
+        let coefficients = (rows * columns) as usize;
+        for (n, (k, items)) in s.entries.iter().enumerate() {
+            let entry = |change| RtEntry {
+                id: n as u64 + 1,
+                at_index: k * B,
+                change,
+            };
+            match items[..] {
+                [Item::Change(change)] => assert!(rt.mix.push(entry(change))),
+                _ => {
+                    let (change, batch) = batch::fold(items, columns as usize, coefficients)
+                        .unwrap()
+                        .unwrap();
+                    assert!(rt.mix.push_with(entry(change), batch).is_ok());
+                }
+            }
+        }
+        let shared = Arc::clone(&rt.replica.as_ref().unwrap().shared);
+        for k in 0..s.blocks {
+            if let Some((at, block, change)) = s.late.filter(|l| l.0 == k) {
+                let id = s.entries.len() as u64 + 1;
+                assert!(rt.mix.push(RtEntry {
+                    id,
+                    at_index: block * B,
+                    change,
+                }));
+                let _ = at;
+            }
+            if skipped.contains(&k) {
+                continue;
+            }
+            let held = diverged && k == skipped.end;
+            shared.diverged.store(held, Relaxed);
+            rt.process(k, u64::MAX);
+            shared.diverged.store(false, Relaxed);
+        }
+        let mut flags = std::collections::BTreeMap::new();
+        while let Ok(r) = rx.pop() {
+            if r.flags & SPAN != 0 {
+                for slice in r.slice..r.slice + u64::from(r.frames) {
+                    flags.insert((r.meter, slice), r.flags & !SPAN);
+                }
+            } else if r.channel == 0 {
+                flags.insert((r.meter, r.slice), r.flags);
+            }
+        }
+        flags
+    }
+
+    /// The gap flags of `flags`.
+    fn gaps_of(
+        flags: &std::collections::BTreeMap<(u32, u64), u8>,
+    ) -> std::collections::BTreeMap<(u32, u64), bool> {
+        use crate::rt_loop::GAP;
+        flags.iter().map(|(&k, &f)| (k, f & GAP != 0)).collect()
+    }
+
+    /// Three mono slots, slots 0 and 1 into output 0 and slot 2 into
+    /// output 1, over 80 blocks. Entries: slot 0 down at block 12, its
+    /// gain to output 0 to 0 at 25, a batch taking slot 2 down with a
+    /// gain at 35, slot 2 detached at 50; and, as block 70 is due, an
+    /// `InputDown` of slot 1 at block 4, an index already produced, which
+    /// is late and applies nowhere.
+    fn base_scene() -> Scene {
+        let gain = |input, output, gain| {
+            Item::Change(Change::Gain {
+                input,
+                output,
+                gain,
+                fade: None,
+            })
+        };
+        let down = |slot| Item::Change(Change::InputDown { slot });
+        Scene {
+            slots: vec![1, 1, 1],
+            detached: Vec::new(),
+            outputs: vec![1, 1],
+            meters: Vec::new(),
+            gains: vec![(0, 0, 1.0), (1, 0, 1.0), (2, 1, 1.0)],
+            entries: vec![
+                (12, vec![down(0)]),
+                (25, vec![gain(0, 0, 0.0)]),
+                (35, vec![down(2), gain(2, 1, 0.5)]),
+                (50, vec![Item::Change(Change::Detach { slot: 2 })]),
+            ],
+            late: Some((70, 4, Change::InputDown { slot: 1 })),
+            blocks: 80,
+        }
+    }
+
+    /// A stereo slot 0 and mono slots 1 to 3, slot 3 starting detached,
+    /// into a stereo output 0 (columns 0 and 1), a mono output 1 (column
+    /// 2) and a mono configured meter (column 3), over 90 blocks:
+    /// - block 3: slots 0 and 1 down, two entries at one index; slot 0
+    ///   feeds output 0, so a skip from here or later starts in a gap;
+    /// - 5: a gain of slot 0 into output 0, at the start of a skip there;
+    /// - 10: slot 1's gain to the meter from 0 to 0.5, while it is down;
+    /// - 20: slot 0 up;
+    /// - 30: a batch raising slot 1 with a gain;
+    /// - 40: slot 2 down, feeding output 1;
+    /// - 45: slot 2's gain to 0 by a fade delayed 300 samples;
+    /// - 52: slot 3 down, detached; 55: slot 3 re-attached by a `Route`;
+    /// - 58: slot 2's gain back to 0.7 by an absolute fade from 0;
+    /// - 60: slot 3 up and slot 0 down again, at one index;
+    /// - 70: slot 1 down, at the end of a skip there.
+    ///
+    /// Output 0 and output 1 are in a gap as a skip up to block 70 ends.
+    fn moving_scene() -> Scene {
+        let b = 64;
+        let gain = |input, output, gain, fade| {
+            Item::Change(Change::Gain {
+                input,
+                output,
+                gain,
+                fade,
+            })
+        };
+        let down = |slot| Item::Change(Change::InputDown { slot });
+        let up = |slot| Item::Change(Change::InputUp { slot });
+        Scene {
+            slots: vec![2, 1, 1, 1],
+            detached: vec![3],
+            outputs: vec![2, 1],
+            meters: vec![1],
+            gains: vec![(1, 1, 1.0), (3, 2, 1.0), (4, 3, 1.0)],
+            entries: vec![
+                (3, vec![down(0)]),
+                (3, vec![down(1)]),
+                (5, vec![gain(0, 0, 0.5, None)]),
+                (10, vec![gain(2, 3, 0.5, None)]),
+                (20, vec![up(0)]),
+                (30, vec![up(1), gain(2, 3, 0.25, None)]),
+                (40, vec![down(2)]),
+                (
+                    45,
+                    vec![gain(3, 2, 0.0, Some(Fade::after(1.0, 45 * b, 300, 200)))],
+                ),
+                (52, vec![down(3)]),
+                (55, vec![Item::Change(Change::Route { slot: 3 })]),
+                (
+                    58,
+                    vec![gain(3, 2, 0.7, Some(Fade::after(0.0, 58 * b, 0, 400)))],
+                ),
+                (60, vec![up(3)]),
+                (60, vec![down(0)]),
+                (70, vec![down(1)]),
+            ],
+            late: None,
+            blocks: 90,
+        }
+    }
+
+    /// Slices an overrun skipped carry the gap flags the same slices carry
+    /// on a loop that computed them: over an `InputDown`, a gain set to 0,
+    /// a batch taking a slot down and a `Detach` inside the skip, a late
+    /// entry that applies on neither, and a block size that does not
+    /// divide a slice.
+    #[test]
+    fn skipped_slices_carry_the_gaps_computed_ones_do() {
+        let s = base_scene();
+        let computed = gaps_of(&slice_flags(&s, 0..0, false));
+        let skipped = gaps_of(&slice_flags(&s, 5..70, false));
+        // The run up to block 80 covers slices 0 to 10.
+        assert!(computed.len() >= 20, "{computed:?}");
+        assert_eq!(skipped, computed);
+        let at = |m: u32, k: u64| computed[&(m, k * 64 / SLICE)];
+        assert!(
+            at(0, 15) && !at(0, 30),
+            "output 0: slot 0 down, then its gain 0"
+        );
+        assert!(
+            !at(1, 25) && at(1, 40) && !at(1, 60),
+            "output 1: slot 2 down, detached"
+        );
+    }
+
+    /// The same over gains from 0 to other than 0 on a slot down, an
+    /// `InputUp` and a batch raising a slot, a `Route` re-attaching a
+    /// detached slot, absolute fades, delayed and not, a configured meter
+    /// and a stereo slot and output, skips starting and ending in a gap,
+    /// entries at a skip's first and end index and two at one index.
+    #[test]
+    fn skipped_slices_carry_the_gaps_computed_ones_do_as_targets_move() {
+        let s = moving_scene();
+        let computed = gaps_of(&slice_flags(&s, 0..0, false));
+        let at = |m: u32, k: u64| computed[&(m, k * 64 / SLICE)];
+        assert!(at(0, 8) && !at(0, 25) && at(0, 65), "output 0");
+        assert!(
+            !at(1, 30) && at(1, 42) && !at(1, 47) && at(1, 65),
+            "output 1"
+        );
+        assert!(
+            !at(2, 5) && at(2, 15) && !at(2, 35) && at(2, 57) && !at(2, 65),
+            "meter"
+        );
+        for skip in [5..70, 3..70, 11..62, 1..89] {
+            assert_eq!(
+                gaps_of(&slice_flags(&s, skip.clone(), false)),
+                computed,
+                "{skip:?}"
+            );
+        }
+    }
+
+    /// A loop held diverged as it computes the block after a skip sends
+    /// the skipped slices diverged, spans included, with the gap flags of
+    /// the slices computed: diverged wins over gap in the meters.
+    #[test]
+    fn skipped_slices_carry_the_divergence_of_the_block_after() {
+        use crate::rt_loop::DIVERGED;
+        let s = moving_scene();
+        let computed = gaps_of(&slice_flags(&s, 0..0, false));
+        let flags = slice_flags(&s, 5..70, true);
+        assert_eq!(gaps_of(&flags), computed);
+        for (&(m, slice), &f) in &flags {
+            let within = (slice + 1) * SLICE > 5 * 64 && slice * SLICE < 71 * 64;
+            assert_eq!(f & DIVERGED != 0, within, "meter {m} slice {slice}");
+        }
+    }
+
     /// A batch of two gains, a trim and an `InputDown` of slot 0, and
     /// with `up` an `InputUp` of slot 0 after them.
     fn batch_of(up: bool) -> (Change, Option<Arc<Batch>>) {
@@ -7797,6 +8106,462 @@ mod tests {
         );
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// What [`lost_run`] does to replica a during the measurement.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Upset {
+        /// A stall that skips one block, two seconds in.
+        Skip,
+        /// A stall that skips blocks around the index the log takes the
+        /// input down at, a second in, for half a second.
+        SkipOverDown,
+        /// Marked diverged for about half a second, a second in.
+        Diverged,
+    }
+
+    /// What one [`lost_run`] measured on replica a and b.
+    struct Lost {
+        a: OutputMeters,
+        b: OutputMeters,
+        /// The blocks a skipped, one block a slice.
+        skipped: std::ops::Range<u64>,
+        /// The blocks a computed while marked diverged, at the least and
+        /// at the most.
+        diverged: (u64, u64),
+        /// The input down by the log over these blocks, on both.
+        down: std::ops::Range<u64>,
+        /// The measurement's reset and the end of its programme.
+        reset: u64,
+        end: u64,
+    }
+
+    /// Runs `lost_run` until a run is not disturbed, at most four times.
+    fn lost(upset: Upset) -> Lost {
+        use crate::rt_loop::{STALL_LOOP, STALL_MS};
+        struct Unstall;
+        impl Drop for Unstall {
+            fn drop(&mut self) {
+                STALL_MS.store(0, Relaxed);
+                STALL_LOOP.store(0, Relaxed);
+            }
+        }
+        let _unstall = Unstall;
+        let mut seen = Vec::new();
+        for run in 0..4 {
+            match lost_run(run, upset) {
+                Ok(l) => return l,
+                Err(why) => {
+                    eprintln!("run disturbed ({why}): running it again");
+                    seen.push(why);
+                }
+            }
+        }
+        panic!("every run was disturbed: {seen:?}");
+    }
+
+    /// Two sines on flow `id`, 1 kHz on channel 0 and 1.5 kHz on channel
+    /// 1 at half scale, written a block of `block` samples at a time as
+    /// libmxl's clock passes it, until `stop` is set. Both hold whole
+    /// periods in every 10 ms slice.
+    fn sines(
+        api: &Arc<samplez_mxl::MxlApi>,
+        domain: &std::path::Path,
+        id: &str,
+        block: u64,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        use samplez_mxl::output::{self, Creation, OutputConfig};
+        use samplez_mxl::time;
+        let instance = samplez_mxl::Instance::new(api, domain).unwrap();
+        let cfg = OutputConfig {
+            flow_id: id,
+            label: "sines",
+            group: "sines",
+            role: "Audio",
+            channels: 2,
+            block,
+            batch: block,
+        };
+        let Creation::Created { mut writer, .. } = output::create(&instance, &cfg).unwrap() else {
+            panic!("sine flow {id} not created");
+        };
+        let api = Arc::clone(api);
+        std::thread::spawn(move || {
+            let n = block as usize;
+            let mut data = vec![0.0f32; 2 * n];
+            let mut next: Option<u64> = None;
+            while !stop.load(Relaxed) {
+                let index = time::timestamp_to_index(&api, time::now(&api));
+                if let Some(due) = (index / block).checked_sub(1) {
+                    for k in next.unwrap_or(due)..=due {
+                        for (ch, out) in data.chunks_exact_mut(n).enumerate() {
+                            for (i, v) in out.iter_mut().enumerate() {
+                                *v = sine(ch, k * block + i as u64);
+                            }
+                        }
+                        writer.write_block(k, &data);
+                    }
+                    next = Some(due + 1);
+                }
+                let k = next.unwrap_or(0);
+                time::sleep_until(&api, time::index_to_timestamp(&api, (k + 1) * block));
+            }
+            drop(writer);
+            drop(instance);
+        })
+    }
+
+    /// Sample `index` of channel `ch` of [`sines`].
+    fn sine(ch: usize, index: u64) -> f32 {
+        let f = 1000 + 500 * ch as u64;
+        let phase = (f * (index % 48_000)) % 48_000;
+        0.5 * (std::f64::consts::TAU * phase as f64 / 48_000.0).sin() as f32
+    }
+
+    /// Two replicas of one stereo programme measured from one reset to
+    /// the end of the programme, its gains ramping to 0, and on past it,
+    /// replica a upset by `upset` on the way. A run in which a skip or a
+    /// silenced input read other than the one injected moved a counter
+    /// is disturbed: an error.
+    fn lost_run(run: u32, upset: Upset) -> Result<Lost, String> {
+        use crate::rt_loop::{STALL_LOOP, STALL_MS};
+        use samplez_dsp::WINDOW;
+        use samplez_mxl::time;
+        // One block a slice, so a skipped block is one slice.
+        const B: u64 = 480;
+        let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+            .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+        let shm = std::path::Path::new("/dev/shm");
+        let base = if shm.is_dir() {
+            shm.to_path_buf()
+        } else {
+            std::env::temp_dir()
+        };
+        let domain = base.join(format!("samplez-lost-{}-{run}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&domain);
+        std::fs::create_dir(&domain).unwrap();
+        let api = samplez_mxl::load(std::path::Path::new(&libmxl)).unwrap();
+        let src = "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1e01";
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = sines(&api, &domain, src, B, Arc::clone(&stop));
+        let start = |out: &str| {
+            let v = serde_json::json!({
+                "libmxl": libmxl,
+                "blockSize": B,
+                "readerMarginSamples": 3 * B,
+                // A stall of two and a half block periods, after a block,
+                // leaves the loop one block past the next one: it skips
+                // that one.
+                "maxCatchupBlocks": 1,
+                "domains": [{ "name": "d", "path": domain }],
+                "inputs": [{ "name": "in", "domain": "d", "flowId": src, "channels": 2 }],
+                "outputs": [{ "name": "out", "domain": "d", "flowId": out, "label": "lost",
+                              "group": "lost", "role": "Audio", "channels": 2 }],
+                "matrix": [[1.0, 0.0], [0.0, 1.0]],
+                "rt": { "enabled": false, "rtCpu": "none" },
+            });
+            let config = Config::parse(&v.to_string()).unwrap();
+            let process = rt::setup_process(&config.rt);
+            let (report_tx, reports) = mpsc::sync_channel(64);
+            let (status_tx, changes) = mpsc::sync_channel(1 << 20);
+            let replication = Replication {
+                voters: 2,
+                reports: report_tx,
+                statuses: Some(status_tx),
+                hashes: None,
+            };
+            let e = Engine::start_replicated(config, process, None, replication).unwrap();
+            wait(&|| {
+                let s = e.status();
+                s.outputs[0].realised && s.inputs[0].state == InputState::Attached
+            });
+            (e, changes, reports)
+        };
+        let (a, a_changes, _ra) = start("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1e02");
+        let (b, b_changes, _rb) = start("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1e03");
+        let now = || time::timestamp_to_index(&api, time::now(&api));
+        let reset = (now() + 24_000).next_multiple_of(WINDOW);
+        for e in [&a, &b] {
+            e.reset_loudness(0, reset).unwrap();
+        }
+        // The programme ends at `end`, its gains ramping to 0 over one
+        // slice; after it no block nor short-term value is above the
+        // gates.
+        let end = reset + 480_000;
+        let (down, up) = if upset == Upset::SkipOverDown {
+            (reset + 48_000, reset + 72_000)
+        } else {
+            (end, end)
+        };
+        for e in [&a, &b] {
+            let mut id = 0;
+            if down < up {
+                e.append(1, down, Entry::InputDown { slot: 0 }).unwrap();
+                e.append(2, up, Entry::InputUp { slot: 0 }).unwrap();
+                id = 2;
+            }
+            for c in 0..2 {
+                let gain = Entry::Gain {
+                    input: c,
+                    output: c,
+                    gain: 0.0,
+                    fade: None,
+                };
+                id += 1;
+                e.append(id, end, gain).unwrap();
+            }
+            e.commit(id);
+        }
+        let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Relaxed);
+        let skipped = |e: &Engine| e.counters().overrun_skipped_samples.load(Relaxed);
+        let (sa, sb) = (silenced(&a), silenced(&b));
+        let processed = || a.counters().processed.load(Acquire);
+        let at = |index: u64| {
+            while now() < index {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let stall = |ms: u64| {
+            STALL_LOOP.store(std::ptr::from_ref(&*a.counters) as usize, Relaxed);
+            STALL_MS.store(ms, Relaxed);
+            wait(&|| STALL_MS.load(Relaxed) == 0);
+            STALL_LOOP.store(0, Relaxed);
+        };
+        let mut diverged = (0, 0);
+        match upset {
+            Upset::Skip => {
+                at(reset + 96_000);
+                stall(B * 5 / 2 / 48);
+            }
+            Upset::SkipOverDown => {
+                // About four blocks. The loop computes a block about four
+                // block periods after its index (its read margin of three
+                // and the block itself), so a stall from a block after the
+                // input goes down skips blocks on both sides of it.
+                at(down + B);
+                stall(B * 11 / 2 / 48);
+            }
+            Upset::Diverged => {
+                at(reset + 48_000);
+                let first = processed();
+                a.set_diverged(true).unwrap();
+                let from = processed();
+                at(reset + 72_000);
+                let last = processed();
+                a.set_diverged(false).unwrap();
+                let to = processed();
+                // At the least the blocks processed between the two
+                // stores; at the most those up to the block after.
+                diverged = (last.saturating_sub(from), to + 1 - first);
+            }
+        }
+        let frozen = end + 3 * 48_000 + 4 * WINDOW;
+        let t = Instant::now();
+        while [&a, &b].iter().any(|e| {
+            let w = e.status().outputs[0].meters.window;
+            w.is_none_or(|w| w * WINDOW <= frozen)
+        }) {
+            assert!(
+                t.elapsed() < Duration::from_secs(30),
+                "measured past the end"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let skips = |changes: &mpsc::Receiver<StatusChange>| -> Vec<(u64, u64)> {
+            changes
+                .try_iter()
+                .filter_map(|c| match c {
+                    StatusChange::Skipped { from, to } if to * B > reset => Some((from, to)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (ka, kb) = (skips(&a_changes), skips(&b_changes));
+        let (ma, mb) = (
+            a.status().outputs[0].meters.clone(),
+            b.status().outputs[0].meters.clone(),
+        );
+        let downed = down / B..up / B;
+        let expected_silenced = downed.end - downed.start;
+        let injected = if upset == Upset::Diverged { 0 } else { 1 };
+        // A silenced block outside the input's down span, a skip on b, or
+        // other than the injected skip on a, is a measured disturbance.
+        let silenced_a = silenced(&a) - sa;
+        let silenced_b = silenced(&b) - sb;
+        let disturbed = (silenced_b != expected_silenced || silenced_a > expected_silenced)
+            .then(|| format!("input reads silenced: {silenced_a} and {silenced_b}"))
+            .or_else(|| (!kb.is_empty()).then(|| format!("b skipped {kb:?}")))
+            .or_else(|| (ka.len() != injected).then(|| format!("a skipped {ka:?}")))
+            .or_else(|| {
+                // The skip straddles the index the input goes down at, so
+                // the entry applies inside it and splits its runs.
+                let straddles = ka
+                    .first()
+                    .is_some_and(|k| k.0 < downed.start && downed.start < k.1);
+                (upset == Upset::SkipOverDown && !straddles)
+                    .then(|| format!("a skipped {ka:?}, not across {}", downed.start))
+            })
+            .or_else(|| {
+                (upset == Upset::Skip
+                    && skipped(&a) / B != ka.iter().map(|k| k.1 - k.0).sum::<u64>())
+                .then(|| "a skipped more than the stall".to_owned())
+            });
+        stop.store(true, Relaxed);
+        a.stop();
+        b.stop();
+        producer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&domain);
+        if let Some(why) = disturbed {
+            return Err(why);
+        }
+        let skipped = ka.first().map_or(0..0, |k| k.0..k.1);
+        Ok(Lost {
+            a: ma,
+            b: mb,
+            skipped,
+            diverged,
+            down: downed,
+            reset,
+            end,
+        })
+    }
+
+    /// Per 10 ms slice, the K-weighted power of [`sine`] relative to that
+    /// of slice `steady`, as a meter measures it from slice `from` on:
+    /// with the slice at `skip` left out, its filters running on over the
+    /// jump, and the gains ramping to 0 over one slice from slice `end`.
+    fn transient(from: u64, steady: u64, skip: Option<u64>, end: u64, slices: u64) -> Vec<f64> {
+        use samplez_dsp::{KWeighting, SLICE};
+        let mut kw = KWeighting::new(2);
+        let mut x = [vec![0.0f32; SLICE as usize], vec![0.0f32; SLICE as usize]];
+        let mut powers = Vec::new();
+        let mut jump = 0;
+        for slice in from..from + slices {
+            if Some(slice) == skip {
+                jump = 1;
+            }
+            let mut p = 0.0;
+            for (ch, x) in x.iter_mut().enumerate() {
+                for (n, v) in x.iter_mut().enumerate() {
+                    let s = slice + jump;
+                    let gain = match s.cmp(&end) {
+                        std::cmp::Ordering::Less => 1.0,
+                        std::cmp::Ordering::Equal => 1.0 - n as f32 / SLICE as f32,
+                        std::cmp::Ordering::Greater => 0.0,
+                    };
+                    *v = gain * sine(ch, s * SLICE + n as u64);
+                }
+                p += kw.process(ch, x) / SLICE as f64;
+            }
+            powers.push(p);
+        }
+        let steady = powers[(steady - from) as usize];
+        powers.iter().map(|p| p / steady).collect()
+    }
+
+    /// Two replicas of one stereo programme, one of them skipping a block
+    /// after an injected stall: the skipped slice is lost on that replica
+    /// alone, both measure on, they count the same gaps (none), and their
+    /// integrated loudness differs by no more than the bound below.
+    #[test]
+    fn a_skip_is_lost_on_its_replica_alone_and_both_measure_on() {
+        use samplez_dsp::{SLICE, WINDOW};
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let l = lost(Upset::Skip);
+        let (ma, mb) = (&l.a, &l.b);
+        let lost = l.skipped.end - l.skipped.start;
+        assert!(lost >= 1);
+        assert_eq!((ma.lost, mb.lost), (lost, 0), "{ma:?} {mb:?}");
+        assert_eq!((ma.gaps, mb.gaps), (0, 0));
+        assert!(ma.range.is_some() && mb.range.is_some(), "{ma:?} {mb:?}");
+        let (Some(ia), Some(ib)) = (ma.integrated, mb.integrated) else {
+            panic!("the integrated loudness did not carry on: {ma:?} {mb:?}");
+        };
+        // The bound. The programme holds whole periods in every slice, so
+        // every slice it fills has one power P. A gating block of 40 kept
+        // slices on the 100 ms grid has power P unless it holds a slice
+        // of another: on replica a, where the K-weighting runs on across
+        // the skipped slice, and on both at the end of the programme. The
+        // filters are run here once over each, as the meters run them:
+        // after the skip, S slices differ from P, by at most a factor h;
+        // at the end, E slices lie between P and 0. Each is asserted
+        // below the margin assumed for it.
+        let (skip, end) = (l.skipped.start, l.end / SLICE);
+        // Steady from 50 slices on, as the filters settle from silence.
+        let after_skip = transient(skip - 100, skip - 1, Some(skip), end, 150);
+        let tol = 1e-6;
+        let after_skip = &after_skip[100..];
+        let s = (after_skip.iter())
+            .filter(|p| (*p - 1.0).abs() > tol)
+            .count() as u64;
+        let h_skip = after_skip.iter().fold(1.0f64, |h, &p| h.max(p));
+        let at_end = transient(end - 100, end - 1, None, end, 150);
+        let e = at_end.iter().filter(|&&p| p > tol && p < 1.0 - tol).count() as u64;
+        let h_end = at_end.iter().fold(1.0f64, |h, &p| h.max(p));
+        eprintln!("transient: S {s} slices up to {h_skip} P after the skip, E {e} up to {h_end} P");
+        // The margin: twice the measured length and twice the measured
+        // peak, so a transient of either kind lasts at most S' = 2S and
+        // E' = 2E slices, each at most h = 2 max(h_skip, h_end) P.
+        let (s2, e2) = (2 * s, 2 * e);
+        let h = 2.0 * h_skip.max(h_end);
+        // A run of r slices on a 10-slice grid of 40-slice blocks lies in
+        // at most (r + 39) / 10 + 1 blocks, and the end, past which the
+        // slices are 0, in 4 more. So at most D of the N blocks of either
+        // replica differ from P, each in [0, h P], and its integrated
+        // loudness, the mean power of the blocks above the gates, lies in
+        //   [10 log10((N - D) P / N), 10 log10((N - D + D h) P / N)]:
+        // the two lie within the width of that interval. N is at least
+        // the slices kept before the end over 10, less the 3 windows
+        // before the first block.
+        let runs = |r: u64| if r == 0 { 0 } else { (r + 39) / 10 + 1 };
+        let d = (runs(s2) + runs(e2) + 4) as f64;
+        let kept = (l.end - l.reset) / SLICE - lost;
+        let n = (kept / (WINDOW / SLICE) - 3) as f64;
+        let tolerance = 10.0 * ((n - d + d * h) / (n - d)).log10();
+        assert!(
+            (ia - ib).abs() <= tolerance,
+            "{ia} {ib}, tolerance {tolerance} dB over {n} blocks"
+        );
+        eprintln!(
+            "lost {lost}: integrated {ia} and {ib}, {} dB apart, tolerance {tolerance} dB",
+            (ia - ib).abs()
+        );
+    }
+
+    /// A replica that skips blocks over a stretch the log takes an input
+    /// down for counts the same gaps there as its peer: the slices are
+    /// decided from the log, not left out as lost. Only those it skipped
+    /// outside that stretch are lost.
+    #[test]
+    fn a_skip_over_an_input_down_counts_the_peers_gaps() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let l = lost(Upset::SkipOverDown);
+        let (ma, mb) = (&l.a, &l.b);
+        let gaps = l.down.end - l.down.start;
+        let outside = (l.skipped.clone()).filter(|k| !l.down.contains(k)).count() as u64;
+        eprintln!("skipped {:?}, down {:?}", l.skipped, l.down);
+        assert_eq!((ma.gaps, mb.gaps), (gaps, gaps), "{ma:?} {mb:?}");
+        assert_eq!((ma.lost, mb.lost), (outside, 0), "{ma:?} {mb:?}");
+        assert!(ma.integrated.is_some() && mb.integrated.is_some());
+    }
+
+    /// A replica marked diverged loses the slices it computes meanwhile,
+    /// and its peer none; both count the same gaps (none) and measure on.
+    #[test]
+    fn a_diverged_replica_loses_its_slices_and_its_peer_none() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let l = lost(Upset::Diverged);
+        let (ma, mb) = (&l.a, &l.b);
+        let (least, most) = l.diverged;
+        assert!(least > 0, "{least}");
+        assert!(
+            (least..=most).contains(&ma.lost),
+            "{} not in {least}..={most}",
+            ma.lost
+        );
+        assert_eq!((mb.lost, ma.gaps, mb.gaps), (0, 0, 0), "{ma:?} {mb:?}");
+        assert!(ma.integrated.is_some() && mb.integrated.is_some());
     }
 
     fn wait(f: &dyn Fn() -> bool) {

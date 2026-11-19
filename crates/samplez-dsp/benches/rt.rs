@@ -5,7 +5,8 @@
 //! coefficient ramping, undocked and ducked; the strips, 64 mono ones, the meters of the 64
 //! input channels after them and eight duck detectors keyed by them have
 //! one path, metered as the RT loop runs them, and idle as an engine with
-//! no duck group in use runs them; so do limiters on 96 output
+//! no duck group in use runs them; so does the gap decision of the
+//! meters of 48 stereo outputs with half the inputs down, and so do limiters on 96 output
 //! channels as 48 stereo outputs, limiting and off, and 64 mono input
 //! delays, settled and crossfading. It also gates the RT parts of a resync
 //! at that shape: the matrix and detector copies of the core and one
@@ -197,6 +198,42 @@ fn setup_input_meters() -> (KWeighting, Vec<f32>, Vec<f64>, PlanarBuffer) {
         vec![0.0; INPUTS],
         signal(INPUTS),
     )
+}
+
+// The gap decision of one block, as the RT loop takes it for each output's
+// meter: whether an input slot down by the log feeds one of its columns.
+// The even ones of 64 mono slots are down and feed nothing, the odd ones
+// feed every one of 48 stereo outputs: no slice is a gap, and every slot
+// down is looked up in every column.
+#[library_benchmark]
+#[bench::half_down(setup = setup_meter_gaps, config = limit(METER_GAPS))]
+fn meter_gaps((m, down): (Matrix, u64)) -> (Matrix, u64) {
+    let mut gaps = 0;
+    for meter in 0..OUTPUTS / 2 {
+        let rows = || {
+            let mut rest = black_box(down);
+            std::iter::from_fn(move || {
+                (rest != 0).then(|| {
+                    let slot = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    slot..slot + 1
+                })
+            })
+        };
+        let feeds = (2 * meter..2 * meter + 2).any(|c| m.feeds(rows(), c));
+        gaps += u64::from(black_box(feeds));
+    }
+    (m, gaps)
+}
+
+fn setup_meter_gaps() -> (Matrix, u64) {
+    let mut m = Matrix::new(INPUTS, OUTPUTS);
+    for i in (1..INPUTS).step_by(2) {
+        for j in 0..OUTPUTS {
+            assert!(m.set(i, j, 0.5, 0));
+        }
+    }
+    (m, 0x5555_5555_5555_5555)
 }
 
 /// 64 mono strips with trim, high-pass, every band, gate and compressor
@@ -509,6 +546,7 @@ const VARIED_AVX2: u64 = 5_858_000;
 const METERS_SCALAR: u64 = 1_118_000;
 const METERS_AVX2: u64 = 303_000;
 const INPUT_METERS: u64 = 152_623;
+const METER_GAPS: u64 = 58_937;
 const STRIPS_RAMPING: u64 = 1_502_708;
 const STRIPS_SETTLED: u64 = 979_919;
 const STRIPS_RAMPING_FAST: u64 = 1_771_069;
@@ -528,6 +566,7 @@ library_benchmark_group!(
         matrix_ducked,
         meters,
         input_meters,
+        meter_gaps,
         strip,
         limiter,
         delay,

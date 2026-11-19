@@ -38,7 +38,7 @@ pub use duck::{Detector, DetectorParams, DuckMode, DuckParam, KeyFilter, MAX_DUC
 pub use history::{History, Started};
 pub use kweight::KWeighting;
 pub use limiter::{LIMITER_DELAY, Limiter, LimiterParams};
-pub use loudness::{Loudness, SLICE, WINDOW, lufs, weight};
+pub use loudness::{Loudness, SLICE, Slice, WINDOW, lufs, weight};
 pub use matrix::{MAX_COEFFICIENTS, Matrix, Path};
 pub use meter::{Meters, accumulate};
 pub use mxcsr::{DAZ, FTZ, SavedMxcsr, mxcsr, restore_mxcsr, set_ftz_daz};

@@ -647,6 +647,38 @@ impl Matrix {
             .map_or(0.0, |k| col[k].ramp.current())
     }
 
+    /// Whether an input of `inputs`, ascending ranges that do not
+    /// overlap, feeds `output`: the target of its coefficient, the value
+    /// the last change set, is other than 0. A target changes only with a
+    /// change, so this holds from one change to the next however the
+    /// coefficient ramps. False for an `output` out of range. It looks at
+    /// each coefficient of the output at most once.
+    pub fn feeds(
+        &self,
+        inputs: impl IntoIterator<Item = std::ops::Range<usize>>,
+        output: usize,
+    ) -> bool {
+        let Some(col) = self.columns.get(output) else {
+            return false;
+        };
+        let mut inputs = inputs.into_iter();
+        let Some(mut range) = inputs.next() else {
+            return false;
+        };
+        for t in col {
+            while t.input >= range.end {
+                match inputs.next() {
+                    Some(r) => range = r,
+                    None => return false,
+                }
+            }
+            if t.input >= range.start && t.ramp.target() != 0.0 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Whether the coefficient from `input` to `output` is ramping: its
     /// next sample differs from its target. False for a coefficient that
     /// holds its value, a removed one included.
@@ -1518,6 +1550,33 @@ mod tests {
         assert!(m.set(0, 0, 0.0, 0), "jump");
         assert!(!m.is_ramping(0, 0));
         assert!(!m.is_ramping(5, 5), "out of range");
+    }
+
+    /// An input range feeds an output through any coefficient of it whose
+    /// target is other than 0: from the change that sets it, through a
+    /// ramp up, and no longer from the change that sets it to 0, ramping
+    /// down or not.
+    #[test]
+    fn feeds_while_a_target_is_other_than_zero() {
+        use std::iter::once;
+        let mut m = Matrix::new(6, 2);
+        assert!(!m.feeds(once(0..6), 0), "no coefficient");
+        assert!(m.set(3, 1, 0.5, 10));
+        assert!(m.set(5, 1, 0.5, 0));
+        assert!(
+            m.feeds(once(2..4), 1) && m.feeds(once(3..4), 1),
+            "ramping up"
+        );
+        assert!(m.feeds([0..1, 5..6], 1));
+        assert!(!m.feeds(once(0..3), 1) && !m.feeds(once(4..5), 1));
+        assert!(!m.feeds([0..1, 4..5], 1));
+        assert!(!m.feeds(once(2..4), 0) && !m.feeds([], 1));
+        m.advance(10);
+        assert!(m.set(3, 1, 0.0, 10));
+        assert!(!m.feeds(once(3..4), 1), "ramping down to 0");
+        m.advance(10);
+        assert!(!m.feeds(once(3..4), 1), "at 0");
+        assert!(!m.feeds(once(0..6), 7), "out of range");
     }
 
     #[test]

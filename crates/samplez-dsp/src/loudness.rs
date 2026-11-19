@@ -121,7 +121,28 @@ fn edges() -> Vec<f64> {
     e
 }
 
+/// One slice as [`Loudness::push`] takes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Slice {
+    /// Every sample of the slice measured: its weighted mean square
+    /// `sum_i G_i z_i`. A power that is not finite, from an infinite or
+    /// NaN sample, counts as a [`Slice::Gap`].
+    Power(f64),
+    /// Measured, but left out of the measurement by the caller.
+    Gap,
+    /// Not all of its samples were measured.
+    Lost,
+}
+
 /// Loudness measurement of one programme, fed one slice at a time.
+///
+/// A slice that is a gap, lost, missing or out of order is left out of
+/// the integrated loudness and the loudness range, which carry on over
+/// the slices kept as if it had never been there: their gating blocks
+/// and short-term values are taken over consecutive kept slices, on the
+/// 100 ms grid of the kept slices counted from the start of the
+/// measurement. Without such a slice that grid is the 100 ms grid of the
+/// slice index. The momentary and short-term loudness restart after it.
 pub struct Loudness {
     edges: Vec<f64>,
     /// Weighted powers of the last [`SHORT`] slices, a ring indexed by the
@@ -129,10 +150,21 @@ pub struct Loudness {
     recent: Vec<f64>,
     /// Slices in `recent` without a gap before them.
     contiguous: usize,
-    /// Slices since the start of the measurement.
-    measured: usize,
     last: Option<u64>,
-    valid: bool,
+    /// Weighted powers of the last [`SHORT`] slices the measurement kept,
+    /// a ring indexed by `kept`.
+    kept_powers: Vec<f64>,
+    /// Slices the measurement kept.
+    kept: u64,
+    /// The slice index the measurement started at, and that slice's
+    /// position in its 100 ms window.
+    start: Option<u64>,
+    offset: u64,
+    /// The slice index the measurement expects next; none past
+    /// `u64::MAX`.
+    next: Option<u64>,
+    gaps: u64,
+    lost: u64,
     blocks: Histogram,
     short_terms: Histogram,
     max_momentary: Option<f64>,
@@ -151,9 +183,14 @@ impl Loudness {
             edges: edges(),
             recent: vec![0.0; SHORT],
             contiguous: 0,
-            measured: 0,
             last: None,
-            valid: true,
+            kept_powers: vec![0.0; SHORT],
+            kept: 0,
+            start: None,
+            offset: 0,
+            next: None,
+            gaps: 0,
+            lost: 0,
             blocks: Histogram::new(),
             short_terms: Histogram::new(),
             max_momentary: None,
@@ -162,47 +199,120 @@ impl Loudness {
     }
 
     /// Adds slice `index`, the samples `[index * SLICE, (index + 1) *
-    /// SLICE)`, with its weighted mean square `sum_i G_i z_i`; `None`
-    /// when not all of its samples were measured. A missing slice, one
-    /// out of order, an incomplete one or one whose power is not finite
-    /// (an infinite or NaN sample) is a gap: the momentary and
-    /// short-term loudness restart after it, and the integrated loudness
-    /// and the loudness range are invalid until [`Loudness::reset`].
-    pub fn push(&mut self, index: u64, power: Option<f64>) {
+    /// SLICE)`. Returns whether it ended a 100 ms window of the kept
+    /// slices, the only point a kept slice changes the integrated
+    /// loudness or the loudness range.
+    ///
+    /// A [`Slice::Gap`] or a power that is not finite counts in
+    /// [`Loudness::gaps`]; a [`Slice::Lost`], each slice index skipped
+    /// before `index` and a slice out of order count in
+    /// [`Loudness::lost`]. Without a [`Loudness::reset`] the measurement
+    /// starts at the first slice that is not lost, so lost slices before
+    /// it, such as the incomplete first slice of a stream, count nowhere.
+    pub fn push(&mut self, index: u64, slice: Slice) -> bool {
         if self.last.is_some_and(|l| l.checked_add(1) != Some(index)) {
-            self.gap();
+            self.contiguous = 0;
         }
         self.last = Some(index);
-        let Some(power) = power.filter(|p| p.is_finite()) else {
-            self.gap();
-            return;
+        let power = match slice {
+            Slice::Power(p) if p.is_finite() => Some(p),
+            _ => None,
         };
-        self.recent[index as usize % SHORT] = power;
-        self.contiguous = (self.contiguous + 1).min(SHORT);
-        self.measured += 1;
-        let window_end = index % PER_WINDOW == PER_WINDOW - 1;
-        if let Some(m) = self.mean(index, BLOCK).filter(|_| self.measured >= BLOCK) {
+        match power {
+            Some(p) => {
+                self.recent[index as usize % SHORT] = p;
+                self.contiguous = (self.contiguous + 1).min(SHORT);
+            }
+            None => self.contiguous = 0,
+        }
+        let start = match self.start {
+            Some(s) => s,
+            None if slice == Slice::Lost => return false,
+            None => {
+                self.begin(index);
+                index
+            }
+        };
+        match self.next {
+            Some(n) if index >= n => self.lost += index - n,
+            _ => {
+                self.lost += 1;
+                return false;
+            }
+        }
+        self.next = index.checked_add(1);
+        let Some(p) = power else {
+            match slice {
+                Slice::Lost => self.lost += 1,
+                _ => self.gaps += 1,
+            }
+            return false;
+        };
+        // The maxima follow the momentary and short-term loudness, over
+        // slices of the measurement only.
+        let since = index - start + 1;
+        if let Some(m) = self.mean(index, BLOCK).filter(|_| since >= BLOCK as u64) {
             self.max_momentary = Some(self.max_momentary.map_or(m, |x| x.max(m)));
-            if window_end && m > P_ABS {
+        }
+        if let Some(s) = self.mean(index, SHORT).filter(|_| since >= SHORT as u64) {
+            self.max_short_term = Some(self.max_short_term.map_or(s, |x| x.max(s)));
+        }
+        let position = self.offset + self.kept;
+        self.kept_powers[(self.kept % SHORT as u64) as usize] = p;
+        self.kept += 1;
+        if position % PER_WINDOW != PER_WINDOW - 1 {
+            return false;
+        }
+        if self.kept >= BLOCK as u64 {
+            let m = self.kept_mean(BLOCK);
+            if m > P_ABS {
                 self.blocks.add(&self.edges, m);
             }
         }
-        if let Some(s) = self.mean(index, SHORT).filter(|_| self.measured >= SHORT) {
-            self.max_short_term = Some(self.max_short_term.map_or(s, |x| x.max(s)));
-            if window_end && s >= P_ABS {
+        if self.kept >= SHORT as u64 {
+            let s = self.kept_mean(SHORT);
+            if s >= P_ABS {
                 self.short_terms.add(&self.edges, s);
             }
         }
+        true
     }
 
-    /// A gap before the next window. Before the first complete window of
-    /// a measurement, nothing has been measured, so the measurement
-    /// starts after the gap instead.
-    pub fn gap(&mut self) {
+    /// Adds `count` slices from `index` on that were not measured, all
+    /// [`Slice::Gap`] or all [`Slice::Lost`], as [`Loudness::push`] adds
+    /// each, in one step however many they are.
+    pub fn skip(&mut self, index: u64, count: u64, slice: Slice) {
+        let Some(last) = count.checked_sub(1).and_then(|c| index.checked_add(c)) else {
+            return;
+        };
         self.contiguous = 0;
-        if self.measured > 0 {
-            self.valid = false;
+        self.last = Some(last);
+        let gap = slice != Slice::Lost;
+        if self.start.is_none() {
+            if !gap {
+                return;
+            }
+            self.begin(index);
         }
+        match self.next {
+            Some(n) if index >= n => self.lost += index - n,
+            _ => {
+                self.lost += count;
+                return;
+            }
+        }
+        self.next = last.checked_add(1);
+        if gap {
+            self.gaps += count;
+        } else {
+            self.lost += count;
+        }
+    }
+
+    fn begin(&mut self, index: u64) {
+        self.start = Some(index);
+        self.offset = index % PER_WINDOW;
+        self.next = Some(index);
     }
 
     fn mean(&self, index: u64, windows: usize) -> Option<f64> {
@@ -219,26 +329,54 @@ impl Loudness {
         Some(sum / windows as f64)
     }
 
+    /// Mean of the last `windows` kept slices, oldest first as
+    /// [`Loudness::mean`] adds them, so without a gap they are the same
+    /// bits.
+    fn kept_mean(&self, windows: usize) -> f64 {
+        let short = SHORT as u64;
+        let at = (self.kept - 1) % short;
+        let mut sum = 0.0;
+        for i in (0..windows as u64).rev() {
+            sum += self.kept_powers[((at + short - i) % short) as usize];
+        }
+        sum / windows as f64
+    }
+
     fn last_mean(&self, windows: usize) -> Option<f64> {
         self.last.and_then(|l| self.mean(l, windows))
     }
 
-    /// Restarts the integrated loudness, the loudness range and the
-    /// maxima at the next slice; a caller resetting on a window boundary
-    /// keeps the gating blocks on the 100 ms grid. The momentary and
-    /// short-term loudness keep running.
-    pub fn reset(&mut self) {
-        self.measured = 0;
-        self.valid = true;
+    /// Restarts the integrated loudness, the loudness range, the maxima
+    /// and the counts at slice `index`; a slice index before it that is
+    /// pushed after the reset is out of order. A caller resetting on a
+    /// window boundary keeps the gating blocks on the 100 ms grid. The
+    /// momentary and short-term loudness keep running.
+    pub fn reset(&mut self, index: u64) {
+        self.begin(index);
+        self.kept = 0;
+        self.gaps = 0;
+        self.lost = 0;
         self.blocks.clear();
         self.short_terms.clear();
         self.max_momentary = None;
         self.max_short_term = None;
     }
 
-    /// Whether no slice went missing since the measurement started.
-    pub fn valid(&self) -> bool {
-        self.valid
+    /// The slice index the measurement started at.
+    pub fn start(&self) -> Option<u64> {
+        self.start
+    }
+
+    /// Slices of the measurement left out as gaps: [`Slice::Gap`] and
+    /// powers that are not finite.
+    pub fn gaps(&self) -> u64 {
+        self.gaps
+    }
+
+    /// Slices of the measurement lost: [`Slice::Lost`], slice indices
+    /// skipped and slices out of order.
+    pub fn lost(&self) -> u64 {
+        self.lost
     }
 
     /// Momentary loudness of the last 400 ms, LUFS, once 40 contiguous
@@ -261,10 +399,10 @@ impl Loudness {
         self.max_short_term.map(lufs)
     }
 
-    /// Integrated loudness, LUFS: `None` while invalid or before a gating
-    /// block above the absolute gate; `-inf` never.
+    /// Integrated loudness, LUFS: `None` before a gating block above the
+    /// absolute gate; `-inf` never.
     pub fn integrated(&self) -> Option<f64> {
-        if !self.valid || self.blocks.total == 0 {
+        if self.blocks.total == 0 {
             return None;
         }
         // Equation (6): the relative gate 10 LU below the absolute-gated
@@ -280,10 +418,10 @@ impl Loudness {
     /// above -70 LUFS and at or above 20 LU below their mean power; the
     /// 95th minus the 10th percentile, each the element at
     /// `round((n - 1) * p / 100 + 1)` of the sorted values as in the
-    /// Tech 3342 reference code. `None` while invalid or before a
-    /// short-term value above the absolute gate.
+    /// Tech 3342 reference code. `None` before a short-term value above
+    /// the absolute gate.
     pub fn range(&self) -> Option<f64> {
-        if !self.valid || self.short_terms.total == 0 {
+        if self.short_terms.total == 0 {
             return None;
         }
         let h = &self.short_terms;
@@ -337,7 +475,7 @@ mod tests {
     fn constant_power_reads_its_level_everywhere() {
         let mut l = Loudness::new();
         for w in 0..1000 {
-            l.push(w, Some(power(-23.0)));
+            l.push(w, Slice::Power(power(-23.0)));
         }
         for v in [
             l.momentary(),
@@ -351,20 +489,25 @@ mod tests {
     }
 
     /// Every slice index is accepted: the last ones before `u64::MAX`
-    /// measure like any others, and one after `u64::MAX` is a gap.
+    /// measure like any others, and one after `u64::MAX` is out of order:
+    /// lost, and left out.
     #[test]
     fn indices_up_to_the_largest_do_not_overflow() {
         let mut l = Loudness::new();
         let first = u64::MAX - 999;
         for w in first..=u64::MAX {
-            l.push(w, Some(power(-23.0)));
+            l.push(w, Slice::Power(power(-23.0)));
         }
         for v in [l.momentary(), l.short_term(), l.max_short_term()] {
             assert!((v.unwrap() + 23.0).abs() < 1e-9, "{v:?}");
         }
-        assert!((l.integrated().unwrap() + 23.0).abs() < 1e-9);
-        l.push(0, Some(power(-23.0)));
-        assert!(!l.valid());
+        let integrated = l.integrated().unwrap();
+        assert!((integrated + 23.0).abs() < 1e-9);
+        l.push(0, Slice::Power(power(-10.0)));
+        assert_eq!(
+            (l.lost(), l.gaps(), l.integrated()),
+            (1, 0, Some(integrated))
+        );
     }
 
     /// Blocks below -70 LUFS and those 10 LU below the absolute-gated
@@ -375,7 +518,7 @@ mod tests {
         let mut w = 0;
         for (level, windows) in [(-80.0, 2000), (-23.0, 2000), (-40.0, 2000)] {
             for _ in 0..windows {
-                l.push(w, Some(power(level)));
+                l.push(w, Slice::Power(power(level)));
                 w += 1;
             }
         }
@@ -392,7 +535,7 @@ mod tests {
     fn loudness_above_the_top_bin_is_measured() {
         let mut l = Loudness::new();
         for w in 0..1000 {
-            l.push(w, Some(power(21.0)));
+            l.push(w, Slice::Power(power(21.0)));
         }
         assert!((l.integrated().unwrap() - 21.0).abs() < 1e-9);
         assert!((l.max_short_term().unwrap() - 21.0).abs() < 1e-9);
@@ -400,34 +543,31 @@ mod tests {
     }
 
     /// A slice whose power is not finite, from an infinite or NaN sample,
-    /// is a gap: it invalidates the measurement rather than poisoning the
-    /// sums.
+    /// is a gap: it is left out rather than poisoning the sums, and the
+    /// integrated loudness and the range carry on over the rest.
     #[test]
     fn a_non_finite_slice_is_a_gap() {
         for bad in [f64::INFINITY, f64::NAN] {
             let mut l = Loudness::new();
             for w in 0..500 {
-                l.push(w, Some(power(-23.0)));
+                l.push(w, Slice::Power(power(-23.0)));
             }
-            l.push(500, Some(bad));
-            assert!(!l.valid(), "{bad}");
-            assert_eq!(
-                (l.integrated(), l.range(), l.momentary()),
-                (None, None, None)
-            );
-            l.reset();
+            l.push(500, Slice::Power(bad));
+            assert_eq!((l.gaps(), l.lost()), (1, 0), "{bad}");
+            assert!((l.integrated().unwrap() + 23.0).abs() < 1e-9);
+            assert_eq!((l.range(), l.momentary()), (Some(0.0), None));
             for w in 501..900 {
-                l.push(w, Some(power(-23.0)));
+                l.push(w, Slice::Power(power(-23.0)));
             }
-            assert!(l.valid());
             assert!((l.integrated().unwrap() + 23.0).abs() < 1e-9);
             assert!((l.short_term().unwrap() + 23.0).abs() < 1e-9);
+            assert_eq!(l.range(), Some(0.0));
         }
     }
 
     fn constant(l: &mut Loudness, from: u64, slices: u64, level: f64) -> u64 {
         for i in from..from + slices {
-            l.push(i, Some(power(level)));
+            l.push(i, Slice::Power(power(level)));
         }
         from + slices
     }
@@ -487,33 +627,144 @@ mod tests {
         assert_eq!((l.blocks.total, l.short_terms.total), (97, 71));
     }
 
+    /// A gap, a lost slice and a missing slice index no longer blank the
+    /// integrated loudness and the range: they carry on, each slice left
+    /// out counted, gaps apart from lost slices. The momentary loudness
+    /// restarts after each. Lost slices before the first slice measured
+    /// are the start, and a reset restarts the counts.
     #[test]
-    fn a_gap_invalidates_until_reset() {
+    fn a_gap_is_left_out_and_the_measurement_carries_on() {
         let mut l = Loudness::new();
-        // Incomplete slices before the first complete one are the start.
-        l.push(3, None);
+        l.push(3, Slice::Lost);
         for w in 4..500 {
-            l.push(w, Some(power(-20.0)));
+            l.push(w, Slice::Power(power(-20.0)));
         }
-        assert!(l.valid());
-        l.push(501, Some(power(-20.0)));
-        assert!(!l.valid());
-        assert_eq!(
-            (l.integrated(), l.range(), l.momentary()),
-            (None, None, None)
-        );
-        for w in 502..560 {
-            l.push(w, Some(power(-20.0)));
+        assert_eq!((l.start(), l.gaps(), l.lost()), (Some(4), 0, 0));
+        let (i, r) = (l.integrated(), l.range());
+        assert!((i.unwrap() + 20.0).abs() < 1e-9);
+        l.push(500, Slice::Gap);
+        assert_eq!((l.gaps(), l.lost(), l.momentary()), (1, 0, None));
+        assert_eq!((l.integrated(), l.range()), (i, r));
+        l.push(501, Slice::Lost);
+        // 502 and 503 never arrive.
+        l.push(504, Slice::Power(power(-20.0)));
+        assert_eq!((l.gaps(), l.lost()), (1, 3));
+        for w in 505..600 {
+            l.push(w, Slice::Power(power(-20.0)));
         }
         assert!(l.momentary().is_some());
-        l.reset();
-        assert!(l.valid() && l.integrated().is_none());
-        for w in 560..600 {
-            l.push(w, Some(power(-30.0)));
+        assert!((l.integrated().unwrap() + 20.0).abs() < 1e-9);
+        assert_eq!(l.range(), Some(0.0));
+        l.reset(600);
+        assert_eq!((l.gaps(), l.lost(), l.integrated()), (0, 0, None));
+        for w in 600..640 {
+            l.push(w, Slice::Power(power(-30.0)));
         }
         assert!((l.integrated().unwrap() + 30.0).abs() < 1e-9);
         assert!((l.max_momentary().unwrap() + 30.0).abs() < 1e-9);
-        l.push(600, None);
-        assert!(!l.valid());
+        // A reset counts the slices after its index that never arrive.
+        l.reset(700);
+        l.push(702, Slice::Power(power(-30.0)));
+        assert_eq!((l.start(), l.lost()), (Some(700), 2));
+    }
+
+    /// The integrated loudness and the range over slices with gaps, lost
+    /// and missing ones among them are the same bits as a measurement of
+    /// the kept slices alone, fed one after the other from the same start:
+    /// a gap is taken out of the programme, not measured as silence.
+    #[test]
+    fn the_measurement_over_the_rest_is_the_one_without_the_gaps() {
+        // A level that moves, so every block and short-term value differs.
+        let level = |w: u64| -30.0 + ((w * 7919) % 211) as f64 / 10.0;
+        let gapped = |w: u64| match w % 997 {
+            13 => Some(Slice::Gap),
+            400 => Some(Slice::Lost),
+            555 => Some(Slice::Power(f64::NAN)),
+            _ => None,
+        };
+        let (mut l, mut kept) = (Loudness::new(), Loudness::new());
+        let (start, end) = (20, 20 + 40_000);
+        let (mut k, mut gaps, mut lost) = (start, 0, 0);
+        for w in start..end {
+            if w % 997 == 700 {
+                lost += 1; // missing
+                continue;
+            }
+            match gapped(w) {
+                Some(s) => {
+                    if s == Slice::Lost {
+                        lost += 1;
+                    } else {
+                        gaps += 1;
+                    }
+                    l.push(w, s);
+                }
+                None => {
+                    l.push(w, Slice::Power(power(level(w))));
+                    kept.push(k, Slice::Power(power(level(w))));
+                    k += 1;
+                }
+            }
+        }
+        assert_eq!((l.gaps(), l.lost()), (gaps, lost));
+        assert!(gaps > 50 && lost > 50);
+        assert!(l.integrated().is_some() && l.range().is_some());
+        assert_eq!(
+            l.integrated().map(f64::to_bits),
+            kept.integrated().map(f64::to_bits)
+        );
+        assert_eq!(l.range().map(f64::to_bits), kept.range().map(f64::to_bits));
+        assert_eq!((kept.gaps(), kept.lost()), (0, 0));
+    }
+
+    /// Without a gap the kept slices' grid is the slice index's: a
+    /// measurement starting mid-window takes its blocks at the ends of
+    /// the windows of the slice index.
+    #[test]
+    fn the_grid_follows_the_slice_index_without_a_gap() {
+        let mut l = Loudness::new();
+        constant(&mut l, 7, 993, -23.0);
+        // Windows 4 to 99 end at least 40 slices after slice 7.
+        assert_eq!((l.blocks.total, l.short_terms.total), (96, 70));
+    }
+
+    /// Skipping slices counts them all at once, as pushing each would:
+    /// gaps start a measurement, lost slices before one do not, and slices
+    /// skipped past the next expected count as lost.
+    #[test]
+    fn skipped_slices_count_as_pushed_ones() {
+        let (mut l, mut each) = (Loudness::new(), Loudness::new());
+        l.skip(0, 5, Slice::Lost);
+        l.skip(5, 3, Slice::Gap);
+        for w in 0..5 {
+            each.push(w, Slice::Lost);
+        }
+        for w in 5..8 {
+            each.push(w, Slice::Gap);
+        }
+        for m in [&mut l, &mut each] {
+            constant(m, 8, 500, -23.0);
+        }
+        l.skip(508, 4, Slice::Lost);
+        l.skip(514, 2, Slice::Gap);
+        for w in (508..512).chain(514..516) {
+            each.push(w, if w < 512 { Slice::Lost } else { Slice::Gap });
+        }
+        for m in [&mut l, &mut each] {
+            constant(m, 516, 300, -20.0);
+        }
+        assert_eq!((l.start(), l.gaps(), l.lost()), (Some(5), 5, 6));
+        assert_eq!(
+            (each.start(), each.gaps(), each.lost()),
+            (l.start(), l.gaps(), l.lost())
+        );
+        assert_eq!(
+            l.integrated().map(f64::to_bits),
+            each.integrated().map(f64::to_bits)
+        );
+        assert_eq!(l.range().map(f64::to_bits), each.range().map(f64::to_bits));
+        l.skip(0, 0, Slice::Gap);
+        l.skip(10, 2, Slice::Gap);
+        assert_eq!((l.gaps(), l.lost()), (5, 8), "out of order");
     }
 }

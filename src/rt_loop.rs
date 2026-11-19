@@ -177,6 +177,12 @@ pub(crate) static PANIC: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static STALL_MS: AtomicU64 = AtomicU64::new(0);
 
+/// The loop that takes [`STALL_MS`], by the address of its counters, or
+/// 0 for any loop, as [`CLOCK_STEP_LOOP`] for a clock step.
+#[cfg(test)]
+pub(crate) static STALL_LOOP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Shifts libmxl's clock as the RT loop reads it, for the clock-step
 /// tests: its waits and sleeps take the shift off again.
 #[cfg(test)]
@@ -433,6 +439,10 @@ pub(crate) struct Shared {
     pub ranks: AtomicU64,
     /// The kernel clock is unsynchronised: blocks carry no digest.
     pub self_report: AtomicBool,
+    /// The replicated state found this replica's output apart from its
+    /// peers': diverged, or resyncing before the hand-over. The slices
+    /// of each block computed while it is set are lost to the meters.
+    pub diverged: AtomicBool,
     /// The clock steps the replicated state checked: a detected step
     /// fences until this reaches the count of steps detected.
     pub steps_cleared: AtomicU64,
@@ -774,7 +784,8 @@ pub(crate) struct MeterRecord {
     pub channel: u32,
     pub slice: u64,
     /// Samples of the slice that were computed; fewer than [`SLICE`]
-    /// after a skipped block or at the start.
+    /// after a skipped block or at the start. For a [`SPAN`] record, the
+    /// slices it covers.
     pub frames: u32,
     pub peak: f32,
     /// 0 for an input, whose meter has no true peak.
@@ -783,9 +794,48 @@ pub(crate) struct MeterRecord {
     pub sum_sq: f64,
     /// Sum of squares of the samples, unweighted.
     pub plain_sum_sq: f64,
-    /// The loudness measurement restarts with this slice: the
-    /// K-weighting started from silence at its first sample.
-    pub reset: bool,
+    /// [`MeterRecord::reset`], or [`NO_RESET`].
+    pub reset_at: u64,
+    /// [`GAP`], [`DIVERGED`] and [`SPAN`].
+    pub flags: u8,
+}
+
+const _: () = assert!(std::mem::size_of::<MeterRecord>() <= 64);
+
+/// [`MeterRecord::reset_at`] of a record that restarts nothing.
+pub(crate) const NO_RESET: u64 = u64::MAX;
+/// An input slot down by the log fed the meter's columns in a block of
+/// the slice: the slice is a gap in its loudness measurement.
+pub(crate) const GAP: u8 = 1;
+/// A block of the slice was computed while the replica was diverged: the
+/// slice is lost to its loudness measurement.
+pub(crate) const DIVERGED: u8 = 2;
+/// One record for the whole meter covering `frames` slices from `slice`
+/// on, none of them computed: an overrun or a forward clock step skipped
+/// them. They are lost with [`DIVERGED`], else gaps with [`GAP`], else
+/// lost.
+pub(crate) const SPAN: u8 = 4;
+
+impl MeterRecord {
+    /// The loudness measurement restarts at this index, a window boundary
+    /// at or before the slice: the K-weighting started from silence at
+    /// the slice's first sample. Slices between the index and this one
+    /// were not computed.
+    pub fn reset(&self) -> Option<u64> {
+        (self.reset_at != NO_RESET).then_some(self.reset_at)
+    }
+
+    pub fn gap(&self) -> bool {
+        self.flags & GAP != 0
+    }
+
+    pub fn diverged(&self) -> bool {
+        self.flags & DIVERGED != 0
+    }
+
+    pub fn span(&self) -> bool {
+        self.flags & SPAN != 0
+    }
 }
 
 /// Restarts the loudness measurement of `meter`, an output or a
@@ -807,8 +857,22 @@ pub(crate) struct OutMeter {
     pub slice: Option<u64>,
     /// The index the pending reset applies at, a window boundary.
     pub reset_at: Option<u64>,
-    /// The slice in progress started a new measurement.
-    pub reset: bool,
+    /// The slice in progress starts the measurement the reset at this
+    /// index restarts.
+    pub reset: Option<u64>,
+    /// An input slot down by the log feeds the meter's columns in the
+    /// block being metered.
+    pub block_gap: bool,
+    /// The slice in progress is a gap: `block_gap` was set in one of its
+    /// blocks.
+    pub gap: bool,
+    /// The replica is diverged in the block being metered.
+    pub block_diverged: bool,
+    /// The slice in progress was metered while diverged: `block_diverged`
+    /// was set in one of its blocks.
+    pub diverged: bool,
+    /// The first sample of a skip this meter has not sent yet.
+    pub skip_from: u64,
     /// The index after the last sample metered.
     pub next: Option<u64>,
     /// Samples whose interpolated outputs the true peak leaves out: those
@@ -836,7 +900,12 @@ impl OutMeter {
             kw: KWeighting::new(channels),
             slice: None,
             reset_at: None,
-            reset: false,
+            reset: None,
+            block_gap: false,
+            gap: false,
+            block_diverged: false,
+            diverged: false,
+            skip_from: 0,
             next: None,
             tp_skip: 0,
             frames: 0,
@@ -884,13 +953,15 @@ impl OutMeter {
                 // samples, so it does not overshoot on partial sums.
                 // Replicas that computed those samples measure the same,
                 // whenever they started.
-                if self.reset_at.is_some_and(|t| slice * SLICE >= t) {
+                if let Some(t) = self.reset_at.filter(|&t| slice * SLICE >= t) {
                     self.reset_at = None;
-                    self.reset = true;
+                    self.reset = Some(t);
                     self.kw.reset();
                 }
             }
             let len = ((slice + 1) * SLICE - index).min((frames - n) as u64) as usize;
+            self.gap |= self.block_gap;
+            self.diverged |= self.block_diverged;
             for c in 0..self.peak.len() {
                 let x = &buf.channel(first + c)[n..n + len];
                 accumulate(x, &mut self.peak[c], &mut self.plain_sum_sq[c]);
@@ -917,6 +988,90 @@ impl OutMeter {
         }
     }
 
+    /// Samples `[from, to)` were not computed: an overrun or a forward
+    /// clock step skipped them, `gap` telling whether an input slot down
+    /// by the log fed the meter there. A slice in progress takes the flag
+    /// and is sent once the samples reach its end; whole slices go out as
+    /// [`SPAN`] records, one per run; a slice the samples end inside is
+    /// started with the flag, for the block computed next to fill.
+    fn skip(&mut self, sink: &mut MeterSink<'_>, from: u64, to: u64, gap: bool, diverged: bool) {
+        let mut i = from;
+        while i < to {
+            let slice = i / SLICE;
+            let end = (slice + 1) * SLICE;
+            if self.slice == Some(slice) {
+                self.gap |= gap;
+                self.diverged |= diverged;
+                if end <= to {
+                    self.flush(sink);
+                }
+                i = end.min(to);
+                continue;
+            }
+            self.flush(sink);
+            // A reset whose window the skipped samples reach applies to
+            // the first slice at or after it, as when it is computed.
+            let mut reset = None;
+            if let Some(t) = self.reset_at.filter(|&t| t < to) {
+                if t > i {
+                    // The run up to the reset's slice goes out first.
+                    let first = t / SLICE;
+                    self.span(sink, slice, first - slice, (gap, diverged), None);
+                    i = first * SLICE;
+                    continue;
+                }
+                self.reset_at = None;
+                self.kw.reset();
+                reset = Some(t);
+            }
+            if end <= to && i == slice * SLICE {
+                let n = (to - i) / SLICE;
+                self.span(sink, slice, n, (gap, diverged), reset);
+                i += n * SLICE;
+            } else {
+                // Taken up again above, or by the block computed next.
+                self.slice = Some(slice);
+                self.reset = reset;
+                self.gap = gap;
+                self.diverged = diverged;
+            }
+        }
+    }
+
+    /// Sends `n` whole slices from `slice` on as [`SPAN`] records.
+    fn span(
+        &mut self,
+        sink: &mut MeterSink<'_>,
+        slice: u64,
+        n: u64,
+        (gap, diverged): (bool, bool),
+        reset: Option<u64>,
+    ) {
+        let (mut slice, mut n, mut reset) = (slice, n, reset);
+        while n > 0 {
+            let len = n.min(u64::from(u32::MAX));
+            let r = MeterRecord {
+                seq: *sink.seq,
+                meter: sink.meter,
+                channel: 0,
+                slice,
+                frames: len as u32,
+                peak: 0.0,
+                true_peak: 0.0,
+                sum_sq: 0.0,
+                plain_sum_sq: 0.0,
+                reset_at: reset.take().unwrap_or(NO_RESET),
+                flags: SPAN | flags(gap, diverged),
+            };
+            *sink.seq += 1;
+            if sink.ring.push(r).is_err() {
+                add(&sink.counters.meter_dropped, 1);
+            }
+            slice += len;
+            n -= len;
+        }
+    }
+
     /// Sends the slice in progress, if any, and clears it.
     fn flush(&mut self, sink: &mut MeterSink<'_>) {
         let Some(slice) = self.slice.take() else {
@@ -933,7 +1088,8 @@ impl OutMeter {
                 true_peak: self.true_peak[c],
                 sum_sq: self.sum_sq[c],
                 plain_sum_sq: self.plain_sum_sq[c],
-                reset: self.reset,
+                reset_at: self.reset.unwrap_or(NO_RESET),
+                flags: flags(self.gap, self.diverged),
             };
             *sink.seq += 1;
             if sink.ring.push(r).is_err() {
@@ -941,11 +1097,170 @@ impl OutMeter {
             }
         }
         self.frames = 0;
-        self.reset = false;
+        self.reset = None;
+        self.gap = false;
+        self.diverged = false;
         self.peak.fill(0.0);
         self.true_peak.fill(0.0);
         self.sum_sq.fill(0.0);
         self.plain_sum_sq.fill(0.0);
+    }
+}
+
+fn flags(gap: bool, diverged: bool) -> u8 {
+    (if gap { GAP } else { 0 }) | (if diverged { DIVERGED } else { 0 })
+}
+
+/// Whether an input channel of a slot in `down` feeds one of `columns`
+/// of `matrix`: at most one look at each of their coefficients.
+fn feeds(matrix: &Matrix, slots: &[Slot], down: u64, columns: Range<usize>) -> bool {
+    // Slots hold ascending channels, so their ranges ascend in bit order.
+    let rows = || {
+        let mut rest = down;
+        std::iter::from_fn(move || {
+            (rest != 0).then(|| {
+                let s = &slots[rest.trailing_zeros() as usize];
+                rest &= rest - 1;
+                s.first_channel..s.first_channel + s.channels
+            })
+        })
+    };
+    columns.into_iter().any(|c| matrix.feeds(rows(), c))
+}
+
+/// The meters a skip's masks hold by bit: every output and configured
+/// meter of the largest configuration.
+const METERS_IN_A_MASK: usize = u128::BITS as usize;
+const _: () = assert!(crate::config::MAX_OUTPUTS + crate::config::MAX_METERS <= METERS_IN_A_MASK);
+
+/// What the meters of a skip follow over its runs ([`Mix::bring_to`]):
+/// the slots' state and, per slot down, the meters it feeds, each looked
+/// up once and again only after an entry changes a target of its rows; a
+/// meter's skipped samples go out once its gap changes, and at the end.
+struct SkipState {
+    /// The slots up and the slots detached, from the first run on.
+    slots: Option<(u64, u64)>,
+    /// Per slot, the meters, by bit, its rows feed; valid for `known`.
+    feeds: [u128; 64],
+    known: u64,
+    /// The meters' gaps over the run before, none before the first.
+    gaps: Option<u128>,
+}
+
+impl SkipState {
+    fn new() -> SkipState {
+        SkipState {
+            slots: None,
+            feeds: [0; 64],
+            known: 0,
+            gaps: None,
+        }
+    }
+
+    /// The meters of `outs` then `buses` by bit that slot `s` feeds.
+    fn feeds_of(matrix: &Matrix, s: &Slot, outs: &[Out], buses: &[Metered]) -> u128 {
+        let rows = s.first_channel..s.first_channel + s.channels;
+        let meters = (outs.iter().map(|o| (o.first_channel, o.meter.peak.len())))
+            .chain(buses.iter().map(|m| (m.first_channel, m.meter.peak.len())));
+        meters.enumerate().fold(0, |f, (i, (first, n))| {
+            let fed = (first..first + n).any(|c| matrix.feeds(std::iter::once(rows.clone()), c));
+            f | u128::from(fed) << i
+        })
+    }
+
+    /// Run `[from, to)`, the samples up to the next entry applied, or up
+    /// to the block computed next when `last`: each meter whose gap
+    /// differs from the run before sends the samples it held since its
+    /// gap last changed; with `last` every meter sends the rest.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        sink: &mut MeterSink<'_>,
+        slots: &[Slot],
+        outs: &mut [Out],
+        buses: &mut [Metered],
+        matrix: &Matrix,
+        (from, to, last): (u64, u64, bool),
+        diverged: bool,
+    ) {
+        let (up, detached) = *self.slots.get_or_insert_with(|| {
+            let mask = |f: fn(&Slot) -> bool| {
+                (slots.iter().enumerate()).fold(0, |m, (i, s)| m | u64::from(f(s)) << i)
+            };
+            (mask(|s| s.up), mask(|s| s.detached))
+        });
+        let all = (0..slots.len()).fold(0u64, |a, s| a | bit(s));
+        let mut rest = !up & !detached & all;
+        let mut gaps = 0u128;
+        while rest != 0 {
+            let s = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            if self.known & bit(s) == 0 {
+                self.feeds[s] = Self::feeds_of(matrix, &slots[s], outs, buses);
+                self.known |= bit(s);
+            }
+            gaps |= self.feeds[s];
+        }
+        let n = outs.len() + buses.len();
+        // At most 128 meters (`METERS_IN_A_MASK`), and none past `n` set.
+        let every = (0..n).fold(0u128, |e, m| e | 1 << m);
+        let mut rest = self.gaps.map_or(every, |g| g ^ gaps);
+        while rest != 0 {
+            let m = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            let meter = meter_of(outs, buses, m);
+            if let Some(g) = self.gaps {
+                sink.meter = m as u32;
+                meter.skip(sink, meter.skip_from, from, g & 1 << m != 0, diverged);
+            }
+            meter.skip_from = from;
+        }
+        self.gaps = Some(gaps);
+        if last {
+            for m in 0..n {
+                let meter = meter_of(outs, buses, m);
+                sink.meter = m as u32;
+                meter.skip(sink, meter.skip_from, to, gaps & 1 << m != 0, diverged);
+            }
+        }
+    }
+
+    /// Entry `e` with its batch applies after the run before: the slots
+    /// it takes down, raises, re-routes or detaches, and the slots whose
+    /// rows' targets it sets, looked up again at the next run.
+    fn apply(&mut self, slots: &[Slot], matrix: &Matrix, e: &RtEntry, batch: Option<&Batch>) {
+        let Some((up, detached)) = self.slots.as_mut() else {
+            return;
+        };
+        let slot_of = |row: usize| {
+            slots
+                .partition_point(|s| s.first_channel <= row)
+                .saturating_sub(1)
+        };
+        match e.change {
+            Change::InputDown { slot } => *up &= !bit(slot),
+            Change::Gain { input, .. } => self.known &= !bit(slot_of(input)),
+            _ => {}
+        }
+        if let Some(b) = batch {
+            for &slot in &b.downs {
+                *up &= !bit(slot as usize);
+            }
+            let columns = matrix.outputs();
+            b.gains
+                .each(|k, _| self.known &= !bit(slot_of(k / columns)));
+        }
+        let (raised, routed) = e.change.generating();
+        *detached = (*detached & !routed) | (e.change.detaching() & routed);
+        *up |= raised;
+    }
+}
+
+/// Meter `m` of `outs` then `buses`.
+fn meter_of<'a>(outs: &'a mut [Out], buses: &'a mut [Metered], m: usize) -> &'a mut OutMeter {
+    match m.checked_sub(outs.len()) {
+        None => &mut outs[m].meter,
+        Some(b) => &mut buses[b].meter,
     }
 }
 
@@ -1176,7 +1491,24 @@ impl Mix {
     /// go to [`Mix::due`]. A block below the position follows a backward
     /// clock step: the position re-anchors to `kB` and the ramps hold
     /// where they are, never rewound.
-    pub fn to(&mut self, k: u64, mut late: impl FnMut(RtEntry, u64)) {
+    #[cfg(test)]
+    pub fn to(&mut self, k: u64, late: impl FnMut(RtEntry, u64)) {
+        self.bring_to(k, late, |_, _, _, _| {});
+    }
+
+    /// [`Mix::to`], handing `skipped` the samples between the position
+    /// and `kB` that were not mixed, an overrun or a forward clock step
+    /// having skipped them, in runs `[from, to)` over which neither the
+    /// coefficients' targets nor the entries applied change: each run with
+    /// the matrix holding the targets of its samples and the entry applied
+    /// at its end with its batch, if any, the last run with none. Runs may
+    /// be empty. Nothing is handed without a skip.
+    pub fn bring_to(
+        &mut self,
+        k: u64,
+        mut late: impl FnMut(RtEntry, u64),
+        mut skipped: impl FnMut(u64, u64, &Matrix, Option<(&RtEntry, Option<&Batch>)>),
+    ) {
         self.due.clear();
         let start = k * self.block;
         // A page's entries apply in blocks starting in it.
@@ -1194,11 +1526,19 @@ impl Mix {
             Some(p) => p,
             None => start,
         };
+        let mut run = (pos < start).then_some(pos);
         while let Some(&c) = self.pending.first()
             && c.at_index <= start
         {
             self.pending.remove(0);
             self.last_taken = self.last_taken.max(c.id);
+            // A late entry is not applied, so no run ends at it.
+            if let Some(from) = run.filter(|_| c.at_index >= pos) {
+                let to = c.at_index.clamp(from, start);
+                let batch = (self.batches.iter()).find(|b| b.0 == c.id).map(|b| &*b.1);
+                skipped(from, to, &self.matrix, Some((&c, batch)));
+                run = Some(to);
+            }
             if matches!(c.change, Change::Batch { .. }) {
                 // Its gains apply here, the rest with the other due
                 // entries; a late one is reported there.
@@ -1239,6 +1579,9 @@ impl Mix {
                     self.ramp_end = self.ramp_end.max(end);
                 }
             }
+        }
+        if let Some(from) = run {
+            skipped(from, start, &self.matrix, None);
         }
         self.matrix.advance((start - pos) as usize);
         self.pos = Some(start + self.block);
@@ -1715,8 +2058,15 @@ impl Rt {
                 panic!("the panic test hook");
             }
             #[cfg(test)]
+            let stall = match STALL_LOOP.load(Relaxed) {
+                only if only == 0 || only == Arc::as_ptr(&self.counters) as usize => {
+                    STALL_MS.swap(0, Relaxed)
+                }
+                _ => 0,
+            };
+            #[cfg(test)]
             #[allow(clippy::disallowed_methods, reason = "a test hook")]
-            match STALL_MS.swap(0, Relaxed) {
+            match stall {
                 0 => {}
                 ms => samplez_mxl::rtsan::allow(|| {
                     std::thread::sleep(std::time::Duration::from_millis(ms))
@@ -2639,6 +2989,51 @@ impl Rt {
         self.mix.due.clear();
     }
 
+    /// Brings the matrix to block `k` ([`Mix::bring_to`]), reporting the
+    /// late entries, and meters the samples skipped before it.
+    #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
+    pub(crate) fn bring_to_block(&mut self, k: u64) {
+        // Entries apply at the start of the block at their index, before
+        // its inputs are read. Samples skipped before the block are
+        // metered as skipped, gaps where a slot the log holds down fed a
+        // meter: the slots' state is followed over the entries applied in
+        // them, as the blocks computed there would have held it.
+        let (counters, tel) = (&self.counters, &mut self.tel);
+        let (slots, outs, buses) = (&self.slots, &mut self.outs, &mut self.buses);
+        let (ring, seq) = (&mut self.meters, &mut self.meter_seq);
+        let diverged = (self.replica.as_ref()).is_some_and(|r| r.shared.diverged.load(Relaxed));
+        let late = |entry, pos| {
+            add(&counters.command_late, 1);
+            if tel.push(Telemetry::LateEntry { entry, pos }).is_err() {
+                add(&counters.telemetry_dropped, 1);
+            }
+        };
+        let mut skip = SkipState::new();
+        let skipped =
+            |from: u64, to: u64, matrix: &Matrix, next: Option<(&RtEntry, Option<&Batch>)>| {
+                let mut sink = MeterSink {
+                    meter: 0,
+                    ring,
+                    seq,
+                    counters,
+                };
+                let last = next.is_none();
+                skip.run(
+                    &mut sink,
+                    slots,
+                    outs,
+                    buses,
+                    matrix,
+                    (from, to, last),
+                    diverged,
+                );
+                if let Some((e, batch)) = next {
+                    skip.apply(slots, matrix, e, batch);
+                }
+            };
+        self.mix.bring_to(k, late, skipped);
+    }
+
     /// Reads, mixes and writes block `k`, due at `deadline`.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn process(&mut self, k: u64, deadline: u64) {
@@ -2647,15 +3042,7 @@ impl Rt {
         if let Some(r) = &self.replica {
             r.shared.started.begin(k);
         }
-        // Entries apply at the start of the block at their index, before
-        // its inputs are read.
-        let (counters, tel) = (&self.counters, &mut self.tel);
-        self.mix.to(k, |entry, pos| {
-            add(&counters.command_late, 1);
-            if tel.push(Telemetry::LateEntry { entry, pos }).is_err() {
-                add(&counters.telemetry_dropped, 1);
-            }
-        });
+        self.bring_to_block(k);
         self.apply_due(k);
         self.counters.produced.store((k + 1) * self.block, Release);
         self.publish_consumed();
@@ -2668,7 +3055,13 @@ impl Rt {
         // degradations.
         let mut failed = 0u64;
         let mut failed_out = 0u64;
+        // Slots down by the log, which every replica holds alike: a read
+        // failed or held on this replica alone is not one of them.
+        let mut down = 0u64;
         for (i, slot) in self.slots.iter_mut().enumerate() {
+            if !slot.up && !slot.detached {
+                down |= 1 << i;
+            }
             let dst = &mut self.scratch[..slot.channels * b];
             let generation = self.gens[slot.domain].as_deref();
             let readable = slot.up && !slot.held;
@@ -2812,6 +3205,23 @@ impl Rt {
             }
         }
 
+        // Which meters a slot down feeds, on the coefficients' targets the
+        // block starts with: their slices of this block are gaps.
+        let matrix = &self.mix.matrix;
+        let diverged = (self.replica.as_ref()).is_some_and(|r| r.shared.diverged.load(Relaxed));
+        for (meter, first) in (self
+            .outs
+            .iter_mut()
+            .map(|o| (&mut o.meter, o.first_channel)))
+        .chain(
+            self.buses
+                .iter_mut()
+                .map(|m| (&mut m.meter, m.first_channel)),
+        ) {
+            let columns = first..first + meter.peak.len();
+            meter.block_gap = down != 0 && feeds(matrix, &self.slots, down, columns);
+            meter.block_diverged = diverged;
+        }
         let ramping = self.mix.ramping(k);
         let slots = &self.slots;
         let (counters, duck_meters) = (&self.counters, &mut self.duck_meters);
@@ -3302,6 +3712,57 @@ mod tests {
     use super::*;
     use crate::transfer::SlotCore;
 
+    /// Skipped samples go out as the slices they reach: a slice in
+    /// progress takes the gap flag and is sent at its end, incomplete;
+    /// whole slices go out as one span record per run; a slice a skip
+    /// ends inside is filled by the samples computed next and keeps the
+    /// flag; a pending reset splits a span at its window.
+    #[test]
+    fn skipped_samples_go_out_as_slices_and_spans() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(64);
+        let counters = Counters::default();
+        let mut seq = 0;
+        let mut m = OutMeter::new(1);
+        let buf = PlanarBuffer::new(1, 400);
+        let mut sink = MeterSink {
+            meter: 0,
+            ring: &mut tx,
+            seq: &mut seq,
+            counters: &counters,
+        };
+        m.add(&mut sink, 0, &buf, 0, 240);
+        m.skip(&mut sink, 240, 1200, true, false);
+        m.skip(&mut sink, 1200, 2000, false, false);
+        m.add(&mut sink, 0, &buf, 2000, 400);
+        m.reset_at = Some(WINDOW);
+        m.skip(&mut sink, 2400, WINDOW + 3 * SLICE, false, false);
+        m.skip(
+            &mut sink,
+            WINDOW + 3 * SLICE,
+            WINDOW + 5 * SLICE,
+            true,
+            true,
+        );
+        let mut got = Vec::new();
+        while let Ok(r) = rx.pop() {
+            got.push((r.slice, r.frames, r.flags, r.reset()));
+        }
+        assert_eq!(
+            got,
+            [
+                (0, 240, GAP, None),
+                (1, 1, SPAN | GAP, None),
+                (2, 0, GAP, None),
+                (3, 1, SPAN, None),
+                (4, 400, 0, None),
+                (5, 5, SPAN, None),
+                (10, 3, SPAN, Some(WINDOW)),
+                (13, 2, SPAN | GAP | DIVERGED, None),
+            ]
+        );
+        assert!(got.len() as u64 == seq);
+    }
+
     /// The meter records of one output channel pair from block `first`
     /// on, with a loudness reset at index `reset`, of a signal that is a
     /// function of the sample index.
@@ -3355,7 +3816,7 @@ mod tests {
                 r.peak.to_bits(),
                 r.true_peak.to_bits(),
                 r.sum_sq.to_bits(),
-                r.reset,
+                r.reset(),
             )
         };
         let after = |v: Vec<MeterRecord>| -> Vec<_> {
@@ -3370,7 +3831,7 @@ mod tests {
         let (a, b) = (after(a), after(b));
         assert_eq!(a.len(), 2 * (600 * B - reset).div_ceil(SLICE) as usize);
         assert!(
-            a[0].6 && a[1].6 && !a[2].6,
+            a[0].6 == Some(reset) && a[1].6 == Some(reset) && a[2].6.is_none(),
             "the reset flags the first slice"
         );
         assert!(a.iter().all(|r| r.2 == SLICE as u32));
@@ -3405,7 +3866,7 @@ mod tests {
             };
             m.add(&mut sink, 0, &buf, k * B, B as usize);
             while let Ok(r) = rx.pop() {
-                peaks.push((r.reset, r.true_peak.to_bits()));
+                peaks.push((r.reset().is_some(), r.true_peak.to_bits()));
             }
         }
         let reset = peaks.iter().position(|p| p.0).unwrap();
@@ -3961,6 +4422,7 @@ mod tests {
                 fence: AtomicU64::new(0),
                 ranks: AtomicU64::new(0),
                 self_report: AtomicBool::new(false),
+                diverged: AtomicBool::new(false),
                 steps_cleared: AtomicU64::new(0),
                 statuses: Vec::new(),
                 started: Started::new(),
