@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.0](https://github.com/danielclasen/samplez/compare/v0.9.1...v0.10.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** `Entry` gains `Limiter`; `Targets` and `ProductState` gain `limiters`; `config::Output` gains `limiter`.
+
+### Features
+
+* **engine:** add a true-peak limiter per output ([#112](https://github.com/danielclasen/samplez/issues/112)) ([4e7b791](https://github.com/danielclasen/samplez/commit/4e7b79180d6d5f5f744c73ad6453980a6008cdb1))
+
 ## [0.9.1](https://github.com/danielclasen/samplez/compare/v0.9.0...v0.9.1) (2026-11-19)
 
 
