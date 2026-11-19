@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.3](https://github.com/danielclasen/samplez/compare/v0.12.2...v0.12.3) (2026-11-19)
+
+
+### Bug Fixes
+
+* **replica:** ask the engine in order and skip resolves it never held ([#132](https://github.com/danielclasen/samplez/issues/132)) ([873c350](https://github.com/danielclasen/samplez/commit/873c35030824d080d182132e8f793adc945b2a90))
+
 ## [0.12.2](https://github.com/danielclasen/samplez/compare/v0.12.1...v0.12.2) (2026-11-19)
 
 
