@@ -217,7 +217,8 @@ interpolated values computed from samples after them.
 ### Log entries
 
 Every change to what the engine computes is a log entry applied at a
-sample index: a gain change, `InputDown` (the input is silent from the
+sample index: a gain change (over the ramp length from the index, or as
+its `Fade` says, see Timed gain transitions), `InputDown` (the input is silent from the
 index on, whatever is readable), `InputUp` (it fades in from the index),
 `Route` (it crossfades to another flow over the ramp length from the
 index), `Detach` (it crossfades to silence over the ramp length from the
@@ -281,6 +282,56 @@ applies within a quarter of the block period: 7,200 at a `blockSize` of
 48, 153,600 at the largest, 1024. A larger matrix takes a larger
 `blockSize`; a configuration beyond the limit is refused, naming the
 `blockSize` its matrix needs.
+
+### Timed gain transitions
+
+A gain change takes an optional `Fade { from, start, len }`, absolute:
+the coefficient holds `from` below the sample index `start`, ramps
+linearly to the target over `len` samples from it, and holds the target
+after. Its value at index `n` is `from + (n - start) * step`, `step =
+(target - from) / len`, computed from `n` directly as the matrix ramps
+are, so the same bits come out whatever the block size, the SIMD path or
+the blocks the ramp spans. `start` may lie ahead of the entry's index (a
+delay; `Fade::after(from, index, delay, len)` builds it), at it, or
+behind it (the fade resumed mid-ramp): the engine renders the function
+whatever the coefficient held before, so an entry that repeats a fade
+mid-ramp, as `Targets::assert` does, changes no bit. `from` must be a
+valid gain, `len` at most `samplez_dsp::MAX_EXACT_RAMP_LEN` (2^23, about
+174 s), and `start` at most that far past the entry's index;
+An entry with a fade beyond them is refused when it is appended or installed, and a decoded core holding one is refused, so every replica starts the ramp at the same index. With no fade a gain
+change ramps over `rampSamples` from the value held at its index.
+`Entry::Gain` carries the fade as `fade`.
+
+A later entry for the coefficient replaces a fade still waiting or
+running, so log order decides. A block counts as ramping in its verdict
+until `start + len`.
+
+`Targets::fading`, shaped as `gains`, holds the fade of each gain in
+this form, the one source: `Targets::diff` and `Targets::assert` copy it
+into the entries they emit, and a gain whose value keeps its bits but
+whose fade differs bitwise gets an entry too. Nothing of a fade lives outside the matrix: its
+coefficient holds the start value, delay, length and position, so a
+copied core carries it. A core built from a product state does not know
+the fades running: the state names each as `ProductState::fading` beside
+the target in `gains`, and the install continues the fade at its value
+for the install index, bit for bit as a replica that ran through
+computes it, instead of jumping to the target. A gain entry the install
+passed is folded in the same way. A product that leaves `fading` empty
+gets its coefficients at their targets. A masked coefficient that a gain change, with or without a fade, brings
+in from silence is ducked from the start, with no mask crossfade of its
+own: its ramp hides the step, and an install builds the same state.
+The replica tracks the ramp each derived gain entry leaves a coefficient
+on (`Limits::ramp_samples`, which must equal the engine's `rampSamples`)
+and carries them in its product state, so a rebuilt engine continues the
+ramps of plain gain entries too. The ramps are part of the snapshot
+data, pruned once they end below the floor. A snapshot written before they
+were kept loads with none, so an engine rebuilt within about two ramp
+lengths of an entry after the upgrade can differ from its peers, once.
+`Limits::ramp_samples` and `Limits::block` must equal the engine's
+`rampSamples` and `blockSize`: `Replica::contact` refuses audio whose
+engine reports others (`Audio::ramp_config`), with an error naming both.
+The tracker follows each entry at the block-aligned index the bridge
+applies it at.
 
 ### Channel strip
 
@@ -461,7 +512,8 @@ log entries applied in it and whether the page was committed whole.
 
 For a resync, `Engine::copy_core` has the RT thread copy the engine's
 core after the next block k0 into a buffer allocated off it: the matrix
-with its ramps, duck masks, depths and mask crossfades, the duck
+with its ramps, delayed fades included, duck masks, depths and mask
+crossfades, the duck
 detectors with their keys, filter, hold and envelope state, the pending
 entries and those applied in the page in progress, each input's log
 state and fades, each strip with its filter and dynamics state and
@@ -624,19 +676,20 @@ block-boundary hand-over as a replay, at the first block starting at or
 after the index its caller names; the first block committed after it
 follows the withdrawn rules. A state holding a gain, flow, strip
 parameter or duck value no entry could set is refused before anything
-changes. Its gains ramp from silence to their targets over the ramp
-length from the install, as the strips take their parameters, so an
-output fades in processed. Its duck groups start cold at the state's
-settings: key filters at rest, no hold, the envelope at 0 or, for a
-group its mode On or hold triggers, at full depth; masks and depths at
-their targets, so a coefficient fades in ducked. A replica that kept
-computing holds its own key filter, hold and envelope state, so their
-outputs differ after the install until the gains' ramp has run, each key
-filter's state has reached the same bits and each group's envelope has
-reached 0 or full depth in both; on a test desk with an Auto group
-mid-duck, a group releasing after its force ended and a key filter
-ringing they are equal from the ramp, 50 ms and the longest attack, hold
-and release of a group on. A rebuilt replica does not wait for that: the
+changes. Its gains are at their targets from the first sample of the
+install, with no ramp from silence, and an input that is up and attached
+continues with no fade-in, so a rebuilt replica computes the
+output of a peer that ran through from its first block, as far as the
+gains go. Its duck groups start cold at the state's settings: key
+filters at rest, no hold, the envelope at 0 or, for a group its mode On
+or hold triggers, at full depth; masks and depths at their targets, so a
+coefficient is ducked from the start. A replica that kept computing holds
+its own key filter, hold and envelope state, so their outputs differ
+after the install until each key filter's state has reached the same
+bits and each group's envelope has reached 0 or full depth in both; on a
+test desk with an Auto group mid-duck, a group releasing after its force
+ended and a key filter ringing they are equal after 50 ms and the
+longest attack, hold and release of a group on. A rebuilt replica does not wait for that: the
 first page it computes whole that differs from the one a committing
 replica committed diverges it, by Resume's comparison or by the leader's
 page verdict, and it resyncs from a donor's core, which carries every

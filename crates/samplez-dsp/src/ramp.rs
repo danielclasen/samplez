@@ -19,16 +19,20 @@ pub fn valid_gain(gain: f32) -> bool {
 
 /// A linear ramp in the gain domain.
 ///
-/// Sample `n` of a ramp of length `len` from `c0` has the value
-/// `c0 + n * step` with `step = (target - c0) / len`, computed from `n`
-/// directly rather than by accumulation. From sample `len` on the value is
-/// `target` exactly.
+/// Position `n` of a ramp of length `len` from `c0` that starts after
+/// `delay` positions has the value `c0` below `delay`, and from `delay`
+/// on `c0 + (n - delay) * step` with `step = (target - c0) / len`,
+/// computed from `n` directly rather than by accumulation. From position
+/// `delay + len` on the value is `target` exactly. The ramp is a pure
+/// function of `(c0, target, delay, len, n)`.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Ramp {
     pub(crate) c0: f32,
     pub(crate) step: f32,
     pub(crate) target: f32,
     pub(crate) len: u32,
+    /// Positions the ramp holds `c0` before it starts.
+    pub(crate) delay: u32,
     /// Ramp position of the next sample produced.
     pub(crate) pos: u32,
 }
@@ -53,17 +57,29 @@ impl Ramp {
             step: 0.0,
             target: value,
             len: 0,
+            delay: 0,
             pos: 0,
         }
+    }
+
+    /// Position the ramp ends at: `delay + len`.
+    #[inline]
+    pub fn end(&self) -> u32 {
+        self.delay + self.len
+    }
+
+    /// Ramp position of the next sample produced.
+    pub fn position(&self) -> u32 {
+        self.pos
     }
 
     /// Value at ramp position `k`.
     #[inline]
     pub(crate) fn value_at(&self, k: u32) -> f32 {
-        if k < self.len {
-            self.c0 + k as f32 * self.step
-        } else {
-            self.target
+        match k.checked_sub(self.delay) {
+            None => self.c0,
+            Some(j) if j < self.len => self.c0 + j as f32 * self.step,
+            Some(_) => self.target,
         }
     }
 
@@ -85,7 +101,8 @@ impl Ramp {
             && valid_gain(self.target)
             && self.step.is_finite()
             && self.len <= MAX_RAMP_LEN
-            && self.pos <= self.len
+            && self.delay <= MAX_EXACT_RAMP_LEN
+            && self.pos <= self.end()
     }
 
     /// Whether the ramp is valid and both its ends lie within `range`.
@@ -94,7 +111,7 @@ impl Ramp {
     }
 
     pub fn is_active(&self) -> bool {
-        self.pos < self.len
+        self.pos < self.end()
     }
 
     /// Ramps from the current value to `target` over `len` samples, clamped
@@ -105,34 +122,65 @@ impl Ramp {
     /// finite or exceeds [`MAX_GAIN`] in magnitude.
     #[must_use]
     pub fn set_target(&mut self, target: f32, len: u32) -> bool {
+        self.set_fade(target, 0, len)
+    }
+
+    /// [`Ramp::set_target`] after the ramp held its current value for
+    /// `delay` samples, clamped to [`MAX_EXACT_RAMP_LEN`]. A ramp that was
+    /// itself waiting or running is replaced: the new one starts from the
+    /// value it has now.
+    #[must_use]
+    pub fn set_fade(&mut self, target: f32, delay: u32, len: u32) -> bool {
         if !valid_gain(target) {
             return false;
         }
         let len = len.min(MAX_RAMP_LEN);
-        if len == 0 || (!self.is_active() && target == self.target) {
+        let delay = delay.min(MAX_EXACT_RAMP_LEN);
+        if (len == 0 && delay == 0) || (!self.is_active() && target == self.target) {
             *self = Self::hold(target);
             return true;
         }
         let c0 = self.current();
         *self = Self {
             c0,
-            step: (target - c0) / len as f32,
+            step: if len == 0 {
+                0.0
+            } else {
+                (target - c0) / len as f32
+            },
             target,
             len,
+            delay,
             pos: 0,
         };
         true
     }
 
+    /// The ramp from `c0` to `target` that waits `delay` samples, then
+    /// takes `len`, at position `pos` of its `delay + len`: what
+    /// [`Ramp::set_fade`] gives from `c0`, moved `pos` samples on. Its
+    /// value at a position is the same whichever way the ramp got there.
+    /// `delay`, `len` and `pos` are clamped as the ramp allows; `None`
+    /// when `c0` or `target` is not a valid gain.
+    pub fn resume(c0: f32, target: f32, delay: u32, len: u32, pos: u32) -> Option<Ramp> {
+        if !valid_gain(c0) || !valid_gain(target) {
+            return None;
+        }
+        let mut r = Ramp::new(c0);
+        let _ = r.set_fade(target, delay, len);
+        r.advance(pos as usize);
+        Some(r)
+    }
+
     /// Moves the ramp `frames` samples on.
     pub fn advance(&mut self, frames: usize) {
         let frames = u32::try_from(frames).unwrap_or(u32::MAX);
-        self.pos = self.pos.saturating_add(frames).min(self.len);
+        self.pos = self.pos.saturating_add(frames).min(self.end());
     }
 
     /// Multiplies `buf` by the ramp sample by sample and advances it.
     pub fn process(&mut self, buf: &mut [f32]) {
-        let remaining = (self.len - self.pos) as usize;
+        let remaining = (self.end() - self.pos) as usize;
         let (ramp, held) = buf.split_at_mut(remaining.min(buf.len()));
         for (n, s) in ramp.iter_mut().enumerate() {
             *s *= self.value_at(self.pos + n as u32);
@@ -325,5 +373,77 @@ mod tests {
     #[should_panic(expected = "not finite")]
     fn new_rejects_non_finite() {
         Ramp::new(f32::NAN);
+    }
+
+    /// A delayed ramp holds its start value for the delay, then follows
+    /// the formula from the end of it, and is the same whichever block
+    /// sizes it is processed in.
+    #[test]
+    fn a_delayed_ramp_holds_then_ramps_exactly() {
+        let (delay, len) = (100u32, 300u32);
+        let mut r = Ramp::new(1.0);
+        assert!(r.set_fade(0.25, delay, len));
+        let step = (0.25f32 - 1.0) / len as f32;
+        for k in 0..(delay + len + 20) {
+            let want = if k < delay {
+                1.0
+            } else if k < delay + len {
+                1.0 + (k - delay) as f32 * step
+            } else {
+                0.25
+            };
+            assert_eq!(r.value_at(k).to_bits(), want.to_bits(), "position {k}");
+        }
+        let whole = run(&mut r.clone(), &[delay as usize + len as usize + 20]);
+        for blocks in [vec![1; 420], vec![7; 60], vec![64, 1, 200, 155]] {
+            let got = run(&mut r.clone(), &blocks);
+            assert_eq!(
+                got.iter().map(|g| g.to_bits()).collect::<Vec<_>>(),
+                whole[..got.len()]
+                    .iter()
+                    .map(|g| g.to_bits())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert!(r.is_active());
+        r.advance(delay as usize + len as usize);
+        assert!(!r.is_active());
+    }
+
+    /// A change while an earlier fade still waits starts from the value
+    /// held, so the earlier one never takes effect.
+    #[test]
+    fn a_change_replaces_a_fade_still_waiting() {
+        let mut r = Ramp::new(1.0);
+        assert!(r.set_fade(0.0, 1000, 10));
+        r.advance(400);
+        assert!(r.set_target(0.5, 100));
+        assert_eq!(r.current(), 1.0);
+        r.advance(100);
+        assert_eq!(r.current(), 0.5);
+        assert!(!r.is_active());
+    }
+
+    /// A ramp resumed at a position gives, from there on, the bits the
+    /// ramp that ran to that position gives.
+    #[test]
+    fn a_resumed_ramp_continues_bit_for_bit() {
+        let mut full = Ramp::new(0.3);
+        assert!(full.set_fade(-1.7, 90, 777));
+        for pos in [0u32, 50, 89, 90, 91, 400, 866, 867] {
+            let mut cont =
+                Ramp::resume(0.3, -1.7, 90 - pos.min(90), 777, pos.saturating_sub(90)).unwrap();
+            let mut ran = full;
+            ran.advance(pos as usize);
+            for k in 0..40 {
+                assert_eq!(
+                    cont.current().to_bits(),
+                    ran.current().to_bits(),
+                    "position {pos} + {k}"
+                );
+                cont.advance(1);
+                ran.advance(1);
+            }
+        }
     }
 }

@@ -780,6 +780,7 @@ pub fn hold_scenario(e: &Engine) {
             input: 0,
             output: 0,
             gain,
+            fade: None,
         };
         e.append(id, at + page * PAGE / B * B, entry).unwrap();
     }
@@ -827,6 +828,7 @@ pub fn hold_scenario(e: &Engine) {
         masks: Vec::new(),
         pending: Vec::new(),
         // Folds in the entries applied before the drop.
+        fading: Vec::new(),
         last_id: id,
     };
     e.install_product(&state, 0, Duration::from_secs(5))

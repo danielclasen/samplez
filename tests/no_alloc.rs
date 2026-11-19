@@ -145,7 +145,28 @@ fn rt_thread_allocates_nothing() {
     wait_for(Duration::from_secs(5), "input pruned", || !attached());
     let api = common::api();
     let index = samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
-    engine.set_gain(0, 0, 0.25, (index / B + 20) * B).unwrap();
+    // A delayed fade: held for three blocks, then ramped over 4800 samples,
+    // and a later change that replaces a fade still waiting.
+    let at = |n: u64| (index / B + n) * B;
+    let fade = |n: u64| samplez::Fade::after(1.0, at(n), 3 * B as u32, 4800);
+    engine
+        .set_gain_fade(0, 0, 0.25, Some(fade(20)), at(20))
+        .unwrap();
+    engine
+        .set_gain_fade(0, 0, 0.125, Some(fade(21)), at(21))
+        .unwrap();
+    engine
+        .set_gain_fade(0, 0, 0.25, Some(fade(40)), at(40))
+        .unwrap();
+    // A resumed fade: its start lies behind the entry's index.
+    let resumed = samplez::Fade {
+        from: 0.5,
+        start: at(60) - 100,
+        len: 4800,
+    };
+    engine
+        .set_gain_fade(0, 0, 0.25, Some(resumed), at(60))
+        .unwrap();
     for param in common::strip_params(2) {
         engine.set_strip(0, param, (index / B + 20) * B).unwrap();
     }

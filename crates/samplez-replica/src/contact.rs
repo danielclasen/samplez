@@ -148,6 +148,12 @@ impl Clocks for SystemClocks {
 /// The engine of an audio replica as contact drives it; the witness has
 /// none.
 pub trait Audio: Send + Sync + 'static {
+    /// The `rampSamples` and `blockSize` of the engine behind this audio,
+    /// which the replica follows gain ramps at ([`crate::dedup::Limits`]);
+    /// none for audio with no engine.
+    fn ramp_config(&self) -> Option<(u32, u64)> {
+        None
+    }
     /// What the replica says of itself in its reports. Read after every
     /// timestamp a report carries, so no exchange timestamp taken after a
     /// detected clock step goes out under the flags from before it.
@@ -4038,6 +4044,7 @@ mod tests {
                 ducks: Vec::new(),
                 masks: Vec::new(),
                 pending: Vec::new(),
+                fading: Vec::new(),
                 last_id: log.applied,
             };
             (log.applied, log.floor, state)
@@ -5894,6 +5901,7 @@ mod tests {
                         input: 0,
                         output: 0,
                         gain: 0.5,
+                        fade: None,
                     }],
                     generation: false,
                 };

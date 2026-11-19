@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::batch::{self, Batch, DuckItem, Item};
 use crate::blocks::PageHash;
 use crate::ducks::{DuckChange, DuckCore, DuckSetting, DuckTargets, KeySet};
-use crate::engine::Entry;
+use crate::engine::{Entry, Fade};
 use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRESOLVED, slots_of};
 
 /// The engine version a core's encoding carries: a core is replayed only
@@ -471,8 +471,16 @@ impl Core {
             Some(strip) => strip.legs() == legs && strip.ramp() == ramp,
             None => legs > MAX_LEGS,
         };
-        let entry = |e: &RtEntry| fits(&e.change, inputs, columns, outputs, legs);
-        let batch = |(_, b): &(LogId, Arc<Batch>)| b.fits(inputs, columns, outputs, legs, ducked);
+        let entry = |e: &RtEntry| {
+            fits(&e.change, inputs, columns, outputs, legs)
+                && !matches!(e.change, Change::Gain { fade: Some(f), .. } if !f.within(e.at_index))
+        };
+        let batch = |(id, b): &(LogId, Arc<Batch>)| {
+            b.fits(inputs, columns, outputs, legs, ducked)
+                && (self.pending.iter().chain(&self.awaiting_gen))
+                    .filter(|e| e.id == *id)
+                    .all(|e| b.fades_within(e.at_index))
+        };
         // No duck on a column the configuration does not name: a ducked
         // term costs what Config::check counts only on those.
         let unducked = |m: &Matrix| {
@@ -539,7 +547,13 @@ pub(crate) fn fits(
             input,
             output,
             gain,
-        } => input < inputs && output < columns && samplez_dsp::valid_gain(gain),
+            fade,
+        } => {
+            input < inputs
+                && output < columns
+                && samplez_dsp::valid_gain(gain)
+                && fade.is_none_or(|f| f.is_valid())
+        }
         Change::Output { output, .. } => output < outputs,
         Change::InputDown { slot }
         | Change::InputUp { slot }
@@ -927,10 +941,12 @@ fn change_of(entry: &Entry) -> Change {
             input,
             output,
             gain,
+            fade,
         } => Change::Gain {
             input,
             output,
             gain,
+            fade,
         },
         Entry::InputDown { slot } => Change::InputDown { slot },
         Entry::InputUp { slot } => Change::InputUp { slot },
@@ -956,6 +972,12 @@ pub struct ProductState {
     /// The gain targets: one row per input channel, one column per output
     /// channel.
     pub gains: Vec<Vec<f32>>,
+    /// The gain fades not yet over at the install, shaped as `gains`, or
+    /// empty for none: per coefficient the fade in absolute indices, which
+    /// the matrix continues at its value for the install index, bit for
+    /// bit as a replica that ran through computes it. `gains` holds the
+    /// target the fade ends at.
+    pub fading: Vec<Vec<Option<Fade>>>,
     /// Per input slot whether it is up in the log.
     pub up: Vec<bool>,
     /// Per input slot the flow it reads in the log, its last `Route`'s
@@ -1346,6 +1368,7 @@ mod tests {
                     input: 0,
                     output: 0,
                     gain: 1.0e9,
+                    fade: None,
                 },
             })
         });

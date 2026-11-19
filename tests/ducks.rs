@@ -55,6 +55,7 @@ fn duck_entries_are_checked() {
         input: 0,
         output: 0,
         gain: 0.5,
+        fade: None,
     };
     refused(&[gain.clone(), duck(0, keys(&[0; 9]))], "at most 8");
     refused(&[duck(0, keys(&[3, 3]))], "keyed twice");

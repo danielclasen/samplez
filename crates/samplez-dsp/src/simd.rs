@@ -41,16 +41,10 @@ fn block_avx2<const U: usize>(terms: &[Term], input: &PlanarBuffer, out: &mut [f
         let x = &input.channel(t.input)[n..n + 8 * U];
         let r = &t.ramp;
         if r.is_active() {
-            let c0 = _mm256_set1_ps(r.c0);
-            let step = _mm256_set1_ps(r.step);
-            let target = _mm256_set1_ps(r.target);
-            let len = _mm256_set1_epi32(r.len as i32);
             let k0 = _mm256_add_epi32(_mm256_set1_epi32((r.pos as usize + n) as i32), lane);
             for (u, a) in acc.iter_mut().enumerate() {
                 let k = _mm256_add_epi32(k0, _mm256_set1_epi32(8 * u as i32));
-                let ramp = _mm256_add_ps(c0, _mm256_mul_ps(_mm256_cvtepi32_ps(k), step));
-                let inside = _mm256_castsi256_ps(_mm256_cmpgt_epi32(len, k));
-                let g = _mm256_blendv_ps(target, ramp, inside);
+                let g = ramp_at(r, k);
                 // SAFETY: `x` holds 8 * U samples.
                 let v = unsafe { _mm256_loadu_ps(x.as_ptr().add(8 * u)) };
                 *a = _mm256_add_ps(*a, _mm256_mul_ps(g, v));
@@ -71,6 +65,33 @@ fn block_avx2<const U: usize>(terms: &[Term], input: &PlanarBuffer, out: &mut [f
     }
 }
 
+/// The value of the active ramp `r` at the positions `k`, as
+/// [`Ramp::value_at`] gives it: `c0` before the delay, the ramp inside
+/// it, the target after.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn ramp_at(r: &Ramp, k: __m256i) -> __m256 {
+    let target = _mm256_set1_ps(r.target);
+    if r.delay == 0 {
+        let step = _mm256_set1_ps(r.step);
+        let ramp = _mm256_add_ps(
+            _mm256_set1_ps(r.c0),
+            _mm256_mul_ps(_mm256_cvtepi32_ps(k), step),
+        );
+        let inside = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(r.len as i32), k));
+        return _mm256_blendv_ps(target, ramp, inside);
+    }
+    let j = _mm256_sub_epi32(k, _mm256_set1_epi32(r.delay as i32));
+    let c0 = _mm256_set1_ps(r.c0);
+    let ramp = _mm256_add_ps(
+        c0,
+        _mm256_mul_ps(_mm256_cvtepi32_ps(j), _mm256_set1_ps(r.step)),
+    );
+    let inside = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(r.len as i32), j));
+    let held = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_setzero_si256(), j));
+    _mm256_blendv_ps(_mm256_blendv_ps(target, ramp, inside), c0, held)
+}
+
 /// The coefficient of `r` at samples `n..n + 8` of the block.
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -79,14 +100,10 @@ fn coefficient(r: &Ramp, n: usize) -> __m256 {
         return _mm256_set1_ps(r.target);
     }
     let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-    let k = _mm256_add_epi32(_mm256_set1_epi32((r.pos as usize + n) as i32), lane);
-    let step = _mm256_set1_ps(r.step);
-    let ramp = _mm256_add_ps(
-        _mm256_set1_ps(r.c0),
-        _mm256_mul_ps(_mm256_cvtepi32_ps(k), step),
-    );
-    let inside = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(r.len as i32), k));
-    _mm256_blendv_ps(_mm256_set1_ps(r.target), ramp, inside)
+    ramp_at(
+        r,
+        _mm256_add_epi32(_mm256_set1_epi32((r.pos as usize + n) as i32), lane),
+    )
 }
 
 /// The interval of samples `n..n + 8` of one output with ducks, `ducks`

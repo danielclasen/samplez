@@ -321,6 +321,12 @@ pub struct StateMachine<P> {
     /// Not replicated: the targets as last derived, a product that drives
     /// an engine only.
     image: Option<samplez::Targets>,
+    /// Per coefficient the ramp the derived gain entries leave it on, as
+    /// the engine renders it: an entry's own fade, or for a plain one a
+    /// ramp over `ramp_samples` from the value held at its index, block
+    /// aligned as the bridge applies it. A function of the log, carried
+    /// by snapshots; finished ramps are pruned below the floor.
+    ramps: Vec<Vec<Option<samplez::Fade>>>,
     /// The duck masks of the state the replica opened or installed a
     /// snapshot at, which its engine is rebuilt from, and every one
     /// derived since, ORed together: the coefficients an engine may hold
@@ -371,12 +377,59 @@ impl<P: Product> StateMachine<P> {
             derived: BTreeMap::new(),
             protocol: 0,
             image: None,
+            ramps: Vec::new(),
             masked: None,
             silenced: 0,
             records: BTreeMap::new(),
             records_from: 0,
         }
         .imaged()
+    }
+
+    /// Follows the ramps the gain entries of `entries`, applied at `at`,
+    /// put the coefficients on, against `held`, the targets before them.
+    /// The value a coefficient has at `at` is the engine's own function of
+    /// the ramp it was on, so a plain entry's ramp starts from the bits the
+    /// engine's coefficient holds there.
+    fn follow(&mut self, entries: &[samplez::Entry], held: Option<&samplez::Targets>, at: u64) {
+        // The index the bridge applies the entries at.
+        let at = at.next_multiple_of(self.limits.block);
+        for e in entries {
+            let samplez::Entry::Gain {
+                input,
+                output,
+                gain,
+                fade,
+            } = e
+            else {
+                continue;
+            };
+            if self.ramps.len() <= *input {
+                self.ramps.resize(*input + 1, Vec::new());
+            }
+            let row = &mut self.ramps[*input];
+            if row.len() <= *output {
+                row.resize(*output + 1, None);
+            }
+            let old = held
+                .and_then(|t| t.gains.get(*input))
+                .and_then(|r| r.get(*output))
+                .copied()
+                .unwrap_or(0.0);
+            let slot = &mut row[*output];
+            *slot = match fade {
+                Some(f) => Some(*f),
+                None => {
+                    let from = slot.map_or(old, |f| f.value_at(old, at));
+                    let len = self.limits.ramp_samples;
+                    (from != *gain && len != 0).then_some(samplez::Fade {
+                        from,
+                        start: at,
+                        len,
+                    })
+                }
+            };
+        }
     }
 
     /// ORs the duck masks of `targets` into [`StateMachine::masked`].
@@ -478,6 +531,8 @@ impl<P: Product> StateMachine<P> {
                 };
                 let slots: Vec<usize> = slots.iter().map(|&s| s as usize).collect();
                 let entries = targets.assert(&slots, self.masked.as_deref());
+                let held = self.image.take();
+                self.follow(&entries, held.as_ref(), at);
                 self.mask(&targets);
                 self.image = Some(targets);
                 (entries, Vec::new())
@@ -511,6 +566,8 @@ impl<P: Product> StateMachine<P> {
                     || samplez::Targets::default().diff(&next),
                     |image| image.diff(&next),
                 );
+                let held = self.image.take();
+                self.follow(&entries, held.as_ref(), at);
                 self.mask(&next);
                 self.image = Some(next);
                 let routed = entries
@@ -757,6 +814,12 @@ impl<P: Product> StateMachine<P> {
         self.decided.retain(|_, &mut (_, until)| until >= passed);
         let terms = &self.terms;
         self.derived.retain(|index, _| terms.contains_key(index));
+        let floor = self.floor;
+        for f in self.ramps.iter_mut().flatten() {
+            if f.is_some_and(|f| f.start.saturating_add(u64::from(f.len)) <= floor) {
+                *f = None;
+            }
+        }
         let kept = self.highest_stamp.saturating_sub(RECORDS_KEPT);
         while let Some(entry) = self.records.first_entry() {
             if entry.get().at_index >= kept {
@@ -896,6 +959,31 @@ impl<P: Product> StateMachine<P> {
         rerouted.chain(raised).max()
     }
 
+    /// The ramps a product state carries: those the derived entries left
+    /// running, over the product's own fades. Shaped as `gains` whenever
+    /// any is set, as an install requires, and empty otherwise.
+    fn fading_of(&self, targets: &samplez::Targets) -> Vec<Vec<Option<samplez::Fade>>> {
+        let mut fading = targets.fading.clone();
+        let running =
+            |i: usize, o: usize| self.ramps.get(i).and_then(|r| r.get(o)).copied().flatten();
+        let any = fading.iter().flatten().any(Option::is_some)
+            || (targets.gains.iter().enumerate())
+                .any(|(i, row)| (0..row.len()).any(|o| running(i, o).is_some()));
+        if !any {
+            return Vec::new();
+        }
+        fading.resize(targets.gains.len(), Vec::new());
+        for (i, row) in targets.gains.iter().enumerate() {
+            fading[i].resize(row.len(), None);
+            for (o, cell) in fading[i].iter_mut().enumerate() {
+                if let Some(f) = running(i, o) {
+                    *cell = Some(f);
+                }
+            }
+        }
+        fading
+    }
+
     /// The engine state of the applied log, the entry at log index `n`
     /// last, that an engine core is built from: the targets, and each
     /// slot up as its latest `InputDown` or `InputUp` held says, up where
@@ -913,8 +1001,10 @@ impl<P: Product> StateMachine<P> {
                 *u = matches!(body, Body::InputUp { .. });
             }
         }
+        let fading = self.fading_of(&targets);
         samplez::ProductState {
             limiters: targets.limiters,
+            fading,
             gains: targets.gains,
             up,
             flows: targets.flows,
@@ -947,6 +1037,13 @@ impl<P: Product> StateMachine<P> {
             floor: Some(self.floor),
             derived: self.derived.clone(),
             protocol: self.protocol,
+            ramps: (self.ramps.iter())
+                .map(|row| {
+                    (row.iter())
+                        .map(|f| f.map(|f| (f.from.to_bits(), f.start, f.len)))
+                        .collect()
+                })
+                .collect(),
         }
     }
 
@@ -988,6 +1085,19 @@ impl<P: Product> StateMachine<P> {
         });
         self.derived = saved.derived;
         self.protocol = saved.protocol;
+        self.ramps = (saved.ramps.iter())
+            .map(|row| {
+                (row.iter())
+                    .map(|f| {
+                        f.map(|(from, start, len)| samplez::Fade {
+                            from: f32::from_bits(from),
+                            start,
+                            len,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
         self.records.clear();
         self.image = if P::DRIVES_ENGINE {
             self.targets().map(|(targets, silenced)| {
@@ -1333,6 +1443,8 @@ pub(crate) mod tests {
             max_session_commands: 1024,
             max_dedup_entries: 65536,
             failover: 30,
+            ramp_samples: 480,
+            block: 48,
         };
         let mut sm = StateMachine::new(Paths::default(), limits);
         let (gone, back) = (origin("s").key(), origin("u").key());
@@ -1479,6 +1591,8 @@ pub(crate) mod tests {
                 max_session_commands: 1024,
                 max_dedup_entries: 65536,
                 failover: 0,
+                ramp_samples: 480,
+                block: 48,
             },
         );
         sm.apply(1, &commands(0, vec![command("s", "7", "gain=1@7")]));
@@ -1513,6 +1627,8 @@ pub(crate) mod tests {
                 max_session_commands: 1024,
                 max_dedup_entries: 65536,
                 failover: 0,
+                ramp_samples: 480,
+                block: 48,
             },
         );
         sm.apply(1, &commands(0, vec![command("s", "1", "a=1@1")]));
@@ -1991,10 +2107,62 @@ mod derive_tests {
                     input,
                     output,
                     gain,
+                    ..
                 } => Some((input, output, gain.to_bits())),
                 _ => None,
             })
             .collect()
+    }
+
+    /// The product state carries the ramp each plain gain entry left the
+    /// coefficient on, from the value the engine holds at the entry's
+    /// index, a ramp still running then included, so a rebuilt engine
+    /// continues them.
+    #[test]
+    fn the_product_state_carries_the_ramps_of_plain_gain_entries() {
+        let mut sm = machine();
+        let g0 = sm.product_state(0).gains[0][0];
+        let ramp = Limits::defaults(48_000).ramp_samples;
+        sm.apply_at(1, 1, &one("1", "fader 0 0.5", 0, 960, None));
+        let first = samplez::Fade {
+            from: g0,
+            start: 960,
+            len: ramp,
+        };
+        assert_eq!(sm.product_state(1).fading[0][0], Some(first));
+        // The second entry lands inside the first one's ramp.
+        sm.apply_at(2, 1, &one("2", "fader 0 0.75", 48, 1008, None));
+        let second = samplez::Fade {
+            from: first.value_at(0.5, 1008),
+            start: 1008,
+            len: ramp,
+        };
+        assert_ne!(second.from.to_bits(), 0.5f32.to_bits());
+        assert_eq!(sm.product_state(2).fading[0][0], Some(second));
+    }
+
+    /// With any ramp running, `fading` has the shape of `gains`, which an
+    /// install requires: a change of one cell of a matrix of several rows
+    /// must not leave the other rows out. With none it is empty.
+    #[test]
+    fn the_ramps_of_a_product_state_are_shaped_as_its_gains() {
+        let mut sm = machine();
+        assert!(sm.product_state(0).fading.is_empty());
+        // Only the second row changes.
+        sm.apply_at(1, 1, &one("1", "fader 1 0.5", 960, 960, None));
+        let state = sm.product_state(1);
+        assert!(state.fading[1][0].is_some() && state.fading[0][0].is_none());
+        assert_eq!(state.fading.len(), state.gains.len());
+        assert!(
+            state
+                .fading
+                .iter()
+                .zip(&state.gains)
+                .all(|(f, g)| f.len() == g.len())
+        );
+        // A ramp that has finished below the floor is pruned.
+        sm.apply_at(2, 1, &one("2", "noop", 960 + 100_000, 960 + 100_000, None));
+        assert!(sm.product_state(2).fading.is_empty());
     }
 
     /// A gain an engine refuses is derived as silence, and the product
@@ -2156,7 +2324,8 @@ mod derive_tests {
         assert!(r.entries.contains(&Entry::Gain {
             input: 0,
             output: 0,
-            gain: 0.2
+            gain: 0.2,
+            fade: None
         }));
         assert!(r.entries.contains(&Entry::Route {
             slot: 0,
@@ -2419,7 +2588,8 @@ mod derive_tests {
         assert!(r.entries.contains(&Entry::Gain {
             input: 0,
             output: 0,
-            gain: 0.2
+            gain: 0.2,
+            fade: None
         }));
         assert!(void(10, 0, None).body.needs_generation());
 
@@ -2608,6 +2778,33 @@ mod derive_tests {
             .load(legacy, Limits::defaults(48_000))
             .expect("loads");
         assert_eq!(loaded.protocol, 0);
+    }
+
+    /// The ramps the derived gain entries left running are replicated state
+    /// of the log: a replica that loads a snapshot carries the same
+    /// `fading` in its product state, and one written before they were
+    /// kept loads with none.
+    #[test]
+    fn a_snapshot_carries_the_ramps_of_plain_gain_entries() {
+        let mut sm = machine();
+        sm.apply_at(1, 1, &one("1", "fader 0 0.5", 0, 960, None));
+        sm.apply_at(2, 1, &one("2", "fader 0 0.75", 48, 1008, None));
+        let want = sm.product_state(2).fading;
+        assert!(want[0][0].is_some());
+        let mut loaded = machine();
+        loaded
+            .load(sm.save(), Limits::defaults(48_000))
+            .expect("loads");
+        assert_eq!(loaded.product_state(2).fading, want);
+        // Absent from a snapshot written before: the serde default.
+        let legacy = Replicated {
+            ramps: Vec::new(),
+            ..sm.save()
+        };
+        loaded
+            .load(legacy, Limits::defaults(48_000))
+            .expect("loads");
+        assert_ne!(loaded.product_state(2).fading, want);
     }
 
     /// A record is kept until its index lies [`RECORDS_KEPT`] below the
@@ -2820,5 +3017,219 @@ mod derive_tests {
         );
         assert_eq!(sm.records.keys().copied().collect::<Vec<_>>(), [2, 3]);
         assert_eq!(sm.records_from, 1);
+    }
+}
+
+/// The engine tests' helpers (flows, a pilot, configurations).
+#[cfg(test)]
+#[allow(unused)]
+#[path = "../../../tests/common/mod.rs"]
+mod ramp_common;
+
+/// The state machine and a real engine together: a plain gain change, twice
+/// in a chain, derived by the state machine and applied live by one
+/// engine, and a second rebuilt from the state machine's product state
+/// inside the ramp, compute the same pages.
+#[cfg(test)]
+mod ramp_tests {
+    use std::sync::mpsc::{Receiver, sync_channel};
+    use std::time::Duration;
+
+    use samplez::blocks::PageHash;
+    use samplez::{BlockVerdict, Config, Engine, InputState, Replication, Targets};
+    use serde::{Deserialize, Serialize};
+
+    use super::tests::command;
+    use super::*;
+
+    use super::ramp_common as common;
+    use common::{B, Domain, Pilot, config, new_id, wait_for};
+
+    /// The engine's `rampSamples`: about two pages, so a rebuild inside a
+    /// ramp leaves pages that depend on it.
+    const RAMP: u32 = 2048;
+
+    /// One mono input through one gain: `g <gain>`.
+    #[derive(Serialize, Deserialize)]
+    struct Gain1 {
+        gain: f64,
+        flow: String,
+    }
+
+    impl Product for Gain1 {
+        type Change = ();
+        const DRIVES_ENGINE: bool = true;
+
+        fn apply(&mut self, _: &Origin, command: &[u8], _: &Apply) -> Effect<()> {
+            let text = std::str::from_utf8(command).expect("utf-8");
+            match text.split(' ').collect::<Vec<_>>()[..] {
+                ["g", gain] => self.gain = gain.parse().unwrap(),
+                _ => return Effect::Stale,
+            }
+            Effect::Changed(())
+        }
+        fn expire(&mut self, _: &SessionKey) -> Effect<()> {
+            Effect::Unchanged
+        }
+        fn forget(&mut self, _: &SessionKey) {}
+        fn delta(&self, _: u64, _: &[Changed<'_, ()>]) -> String {
+            String::new()
+        }
+        fn text(&self) -> String {
+            String::new()
+        }
+        fn save(&self) -> Vec<u8> {
+            serde_json::to_vec(self).expect("encodes")
+        }
+        fn load(&mut self, saved: &[u8]) -> Result<(), String> {
+            *self = serde_json::from_slice(saved).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        fn config_hash(&self) -> u64 {
+            0
+        }
+        fn targets(&self) -> Option<Targets> {
+            Some(Targets {
+                gains: vec![vec![self.gain as f32]],
+                flows: vec![Some(self.flow.clone())],
+                strips: vec![Vec::new()],
+                ..Targets::default()
+            })
+        }
+    }
+
+    struct Hashed {
+        e: Engine,
+        hashes: Receiver<PageHash>,
+        verdicts: Receiver<BlockVerdict>,
+    }
+
+    fn engine(domain: &Domain, src: &str) -> Hashed {
+        let mut cfg: Config = config(
+            &domain.0,
+            &[(src, 1)],
+            &[(&new_id(), 1)],
+            vec![vec![1.0]],
+            960,
+        );
+        cfg.ramp_samples = RAMP;
+        let (reports, _r) = sync_channel(64);
+        let (hash_tx, hashes) = sync_channel(1 << 16);
+        let (verdict_tx, verdicts) = sync_channel(1 << 16);
+        let (status_tx, _s) = sync_channel(1 << 16);
+        let process = samplez::rt::setup_process(&cfg.rt);
+        let replication = Replication {
+            voters: 2,
+            reports,
+            statuses: Some(status_tx),
+            hashes: Some(hash_tx),
+        };
+        let e = Engine::start_replicated(cfg, process, Some(verdict_tx), replication).unwrap();
+        wait_for(Duration::from_secs(5), "attached and realised", || {
+            let s = e.status();
+            s.outputs[0].realised && s.inputs[0].state == InputState::Attached
+        });
+        Hashed {
+            e,
+            hashes,
+            verdicts,
+        }
+    }
+
+    fn processed(h: &Hashed) -> u64 {
+        h.e.counters()
+            .processed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_rebuild_inside_a_plain_ramp_matches_its_peers() {
+        const PAGE: u64 = samplez::blocks::PAGE;
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+        let (a, c) = (engine(&domain, &src), engine(&domain, &src));
+        let limits = Limits {
+            ramp_samples: RAMP,
+            ..Limits::defaults(48_000)
+        };
+        let mut sm = StateMachine::new(
+            Gain1 {
+                gain: 1.0,
+                flow: src.clone(),
+            },
+            limits,
+        );
+        let api = common::api();
+        let now = samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api)) / B;
+        let at = (now + 100) * B;
+        let ask = |id: &str, body: &str, stamp, at| {
+            let mut cmd = command("s", id, body);
+            cmd.at_index = Some(at);
+            Request {
+                stamp,
+                body: Body::Commands(vec![cmd]),
+            }
+        };
+        // Two plain changes, the second 10 blocks into the first one's ramp.
+        for (n, (body, at)) in [("g 0.25", at), ("g 0.75", at + 10 * B)]
+            .into_iter()
+            .enumerate()
+        {
+            let index = n as u64 + 1;
+            sm.apply_at(index, 1, &ask(&index.to_string(), body, at, at));
+            let record = sm.records[&index].clone();
+            a.e.append_batch(index, record.at_index, &record.entries)
+                .unwrap();
+            a.e.commit(index);
+        }
+        c.e.drop_core().unwrap();
+        let state = sm.product_state(2);
+        // Inside the second ramp, the index named so the install is exact.
+        let j =
+            c.e.install_product(&state, at + 10 * B + 96, Duration::from_secs(2))
+                .unwrap();
+        // The install lies inside the second ramp, or the test proves nothing.
+        let installed = (j + 1) * B;
+        assert!(
+            (at + 10 * B..at + 10 * B + u64::from(RAMP) - PAGE).contains(&installed),
+            "installed at {installed}, outside the ramp"
+        );
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        let (mut pa, mut pc) = (
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        );
+        let mut newest = [0u64; 2];
+        let mut silenced = Vec::new();
+        let mut agree = Vec::new();
+        wait_for(Duration::from_secs(10), "pages compared", || {
+            pa.extend(a.hashes.try_iter().map(|p| (p.page, p)));
+            pc.extend(c.hashes.try_iter().map(|p| (p.page, p)));
+            for (i, h) in [&a, &c].into_iter().enumerate() {
+                for v in h.verdicts.try_iter() {
+                    if v.silenced != 0 {
+                        silenced.push(v.k);
+                    }
+                    newest[i] = newest[i].max(v.k);
+                }
+            }
+            let confirmed = newest[0].min(newest[1]);
+            agree = (from..from + 3)
+                .filter(|p| (p + 1) * PAGE / B < confirmed)
+                .filter(|p| {
+                    !silenced.iter().any(|k| {
+                        (k * B / PAGE..(k * B + u64::from(RAMP)).div_ceil(PAGE) + 1).contains(p)
+                    })
+                })
+                .filter_map(|p| Some((p, pa.get(&p)?.hash == pc.get(&p)?.hash)))
+                .collect();
+            agree.len() >= 2 || processed(&a).min(processed(&c)) * B / PAGE > from + 6
+        });
+        assert!(agree.len() >= 2, "only {} comparable pages", agree.len());
+        assert!(
+            agree.iter().all(|&(_, same)| same),
+            "pages differ: {agree:?}"
+        );
     }
 }

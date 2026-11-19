@@ -8,7 +8,7 @@ use samplez_dsp::{
 
 use crate::batch::strip_key;
 use crate::ducks::{DuckSetting, DuckTargets};
-use crate::engine::Entry;
+use crate::engine::{Entry, Fade};
 
 /// Every target an engine's log sets, as values.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -16,6 +16,13 @@ pub struct Targets {
     /// The gain targets: one row per input channel, one column per output
     /// or meter column.
     pub gains: Vec<Vec<f32>>,
+    /// The gain fades not over yet, shaped as `gains`, or empty for none:
+    /// per coefficient the fade towards its gain in absolute sample
+    /// indices, as [`Fade`] defines it. The one source of the fades:
+    /// [`Targets::diff`] and [`Targets::assert`] turn it into entry fades
+    /// for the index they are given, and an install of a product state
+    /// resumes it (`ProductState::fading`).
+    pub fading: Vec<Vec<Option<Fade>>>,
     /// Per input slot, the flow it reads; none for a detached slot.
     pub flows: Vec<Option<String>>,
     /// Per input slot, its strip parameters; of two with one key (one
@@ -63,15 +70,26 @@ impl Targets {
     /// the engine keeps it.
     pub fn diff(&self, next: &Targets) -> Vec<Entry> {
         let mut entries = Vec::new();
+        let any_fade = !(self.fading.is_empty() && next.fading.is_empty());
         for (input, row) in next.gains.iter().enumerate() {
             let was = self.gains.get(input);
             for (output, &gain) in row.iter().enumerate() {
                 let held = was.and_then(|r| r.get(output));
-                if held.is_none_or(|g| g.to_bits() != gain.to_bits()) {
+                let fade = |t: &Targets| {
+                    t.fading
+                        .get(input)
+                        .and_then(|r| r.get(output))
+                        .copied()
+                        .flatten()
+                };
+                let bits = |f: Option<Fade>| f.map(|f| (f.from.to_bits(), f.start, f.len));
+                let fade_moved = any_fade && bits(fade(self)) != bits(fade(next));
+                if held.is_none_or(|g| g.to_bits() != gain.to_bits()) || fade_moved {
                     entries.push(Entry::Gain {
                         input,
                         output,
                         gain,
+                        fade: if any_fade { fade(next) } else { None },
                     });
                 }
             }
@@ -417,12 +435,14 @@ mod tests {
                 Entry::Gain {
                     input: 0,
                     output: 1,
-                    gain: 0.75
+                    gain: 0.75,
+                    fade: None
                 },
                 Entry::Gain {
                     input: 1,
                     output: 0,
-                    gain: 0.125
+                    gain: 0.125,
+                    fade: None
                 },
                 Entry::Strip {
                     slot: 1,
@@ -447,7 +467,8 @@ mod tests {
             vec![Entry::Gain {
                 input: 0,
                 output: 1,
-                gain: -0.0
+                gain: -0.0,
+                fade: None
             }]
         );
     }
@@ -806,6 +827,7 @@ mod tests {
                         input,
                         output,
                         gain,
+                        fade: None,
                     });
                 }
             }
@@ -1186,5 +1208,64 @@ mod tests {
                 mask: 0
             }]
         );
+    }
+
+    /// A diff and an assert give each gain the absolute fade of `next`,
+    /// unchanged: one source, whatever the index they apply at.
+    #[test]
+    fn diff_and_assert_carry_the_absolute_fade() {
+        let f = Fade {
+            from: 1.0,
+            start: 1000,
+            len: 400,
+        };
+        let mut next = targets();
+        next.gains[1][0] = 0.125;
+        next.fading = vec![vec![None, None], vec![Some(f), None]];
+        let want = Entry::Gain {
+            input: 1,
+            output: 0,
+            gain: 0.125,
+            fade: Some(f),
+        };
+        assert_eq!(targets().diff(&next), vec![want.clone()]);
+        assert!(next.assert(&[], None).contains(&want));
+        let mut plain = next.clone();
+        plain.fading = Vec::new();
+        let none = Entry::Gain {
+            input: 1,
+            output: 0,
+            gain: 0.125,
+            fade: None,
+        };
+        assert_eq!(targets().diff(&plain), vec![none]);
+    }
+
+    /// A fade changed, set or cleared while the gain keeps its bits is an
+    /// entry too: peers and a rebuild would otherwise hold different
+    /// ramps until the old one ended.
+    #[test]
+    fn a_changed_fade_alone_is_an_entry() {
+        let f = Fade {
+            from: 1.0,
+            start: 10,
+            len: 20,
+        };
+        let with = |fade| {
+            let mut t = targets();
+            t.fading = vec![vec![fade, None], vec![None, None]];
+            t
+        };
+        let entry = |fade| Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.5,
+            fade,
+        };
+        assert_eq!(with(None).diff(&with(Some(f))), vec![entry(Some(f))]);
+        assert_eq!(with(Some(f)).diff(&with(None)), vec![entry(None)]);
+        let g = Fade { len: 21, ..f };
+        assert_eq!(with(Some(f)).diff(&with(Some(g))), vec![entry(Some(g))]);
+        assert_eq!(with(Some(f)).diff(&with(Some(f))), Vec::new());
     }
 }

@@ -231,6 +231,7 @@ fn an_entry_applied_again_starts_no_fade_crossfade_or_ramp() {
             input: 0,
             output: 0,
             gain: 0.5,
+            fade: None,
         },
     )
     .unwrap();

@@ -31,6 +31,14 @@ pub struct Limits {
     /// this plus `retention` past its lifetime
     /// ([`crate::state_machine::Product::forget`]).
     pub failover: u64,
+    /// The engine's `rampSamples`: the length a gain change with no fade
+    /// ramps over, which the replica needs to track each coefficient's
+    /// ramp as the engine renders it. It must equal the engine's.
+    pub ramp_samples: u32,
+    /// The engine's `blockSize`: the bridge applies an entry at its index
+    /// raised to a multiple of it, which the replica follows ramps at.
+    /// It must equal the engine's.
+    pub block: u64,
 }
 
 impl Limits {
@@ -42,6 +50,8 @@ impl Limits {
             max_session_commands: 1024,
             max_dedup_entries: 65536,
             failover: 3 * rate,
+            ramp_samples: 480,
+            block: 48,
         }
     }
 }
@@ -278,6 +288,8 @@ mod tests {
             max_session_commands: 1024,
             max_dedup_entries: 65536,
             failover: 0,
+            ramp_samples: 480,
+            block: 48,
         }
     }
 
@@ -335,6 +347,8 @@ mod tests {
             max_session_commands: 4,
             max_dedup_entries: 6,
             failover: 0,
+            ramp_samples: 480,
+            block: 48,
         });
         for n in 0..6 {
             dedup.record(&key("a"), &n.to_string(), n, n);
@@ -360,6 +374,8 @@ mod tests {
             max_session_commands: 3,
             max_dedup_entries: 5,
             failover: 0,
+            ramp_samples: 480,
+            block: 48,
         });
         for n in 0..20u64 {
             dedup.record(&key(&(n % 3).to_string()), &n.to_string(), n, n * 10);

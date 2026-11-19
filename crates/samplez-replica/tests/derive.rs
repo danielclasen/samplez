@@ -965,7 +965,8 @@ async fn a_command_late_everywhere_is_restamped_and_reasserted() {
     assert!(first.1.contains(&samplez::Entry::Gain {
         input: 0,
         output: 0,
-        gain: 0.25
+        gain: 0.25,
+        fade: None
     }));
     for id in set.ids() {
         assert_eq!(handed(&set, id, late), None, "{id} handed the late entry");

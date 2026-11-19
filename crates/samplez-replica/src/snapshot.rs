@@ -61,6 +61,11 @@ pub struct Replicated {
     /// [`crate::state_machine::StateMachine::protocol`].
     #[serde(default)]
     pub protocol: u32,
+    /// [`crate::state_machine::StateMachine::ramps`] as `(from bits, start,
+    /// len)`, so the snapshot stays `Eq`; absent from snapshots written
+    /// before it was kept, which then carry no running ramps.
+    #[serde(default)]
+    pub ramps: Vec<Vec<Option<(u32, u64, u32)>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

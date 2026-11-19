@@ -443,6 +443,21 @@ impl Drop for Proposing<'_> {
     }
 }
 
+/// Refuses an engine whose `rampSamples` and `blockSize` are not the
+/// limits': the replica follows gain ramps at those.
+fn check_ramp_config(limits: &Limits, engine: Option<(u32, u64)>) -> Result<(), String> {
+    match engine {
+        Some((ramp, block)) if (ramp, block) != (limits.ramp_samples, limits.block) => {
+            Err(format!(
+                "the replica's ramp_samples {} and block {} are not the engine's rampSamples {ramp} \
+             and blockSize {block}: they must be equal",
+                limits.ramp_samples, limits.block
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// One replica of a product's state.
 pub struct Replica<P> {
     shared: Arc<Shared>,
@@ -678,6 +693,10 @@ impl<P: Product> Replica<P> {
         clocks: Arc<dyn contact::Clocks>,
         audio: Option<Arc<dyn contact::Audio>>,
     ) -> Result<(), String> {
+        check_ramp_config(
+            &self.shared.settings.limits,
+            audio.as_ref().and_then(|a| a.ramp_config()),
+        )?;
         let first_seq = bootstrap::random_id().map_err(|e| e.to_string())? >> 1;
         let contact = Arc::new(contact::Contact::new(
             self.id(),
@@ -2117,6 +2136,33 @@ mod tests {
         )
         .await
         .expect("starts")
+    }
+
+    /// The replica follows the ramps of plain gain entries at its limits'
+    /// ramp length and block size, so audio whose engine has others is
+    /// refused with an error naming both.
+    #[test]
+    fn audio_with_another_ramp_length_or_block_is_refused() {
+        let limits = Limits::defaults(48_000);
+        assert_eq!(
+            check_ramp_config(&limits, Some((limits.ramp_samples, limits.block))),
+            Ok(())
+        );
+        assert_eq!(check_ramp_config(&limits, None), Ok(()));
+        for engine in [
+            (limits.ramp_samples + 1, limits.block),
+            (limits.ramp_samples, 96),
+        ] {
+            let e = check_ramp_config(&limits, Some(engine)).unwrap_err();
+            assert!(
+                e.contains(&engine.0.to_string()) && e.contains(&engine.1.to_string()),
+                "{e}"
+            );
+            assert!(
+                e.contains("ramp_samples") && e.contains("rampSamples"),
+                "{e}"
+            );
+        }
     }
 
     /// A vote takes this long to save, longer than openraft's tick of

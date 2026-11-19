@@ -14,12 +14,11 @@ use common::{
 use common::{MARGIN, config, diagonal};
 use samplez::blocks::{PAGE, PageHash, StatusChange};
 use samplez::{
-    BlockVerdict, Config, CopyError, DuckSetting, DuckTargets, Engine, Entry, InputState,
+    BlockVerdict, Config, CopyError, DuckSetting, DuckTargets, Engine, Entry, Fade, InputState,
     ProductState, ReplayError, Replication,
 };
 use samplez_dsp::{
-    BandType, CompParams, DetectorParams, DuckMode, EqBand, GateParams, LimiterParams, Ramp,
-    StripParam,
+    BandType, CompParams, DetectorParams, DuckMode, EqBand, GateParams, LimiterParams, StripParam,
 };
 
 /// Flow ids whose lookup [`slow_look`] makes wait.
@@ -89,6 +88,7 @@ fn the_core_is_copied_after_a_block() {
         input: 0,
         output: 0,
         gain,
+        fade: None,
     };
     e.append(1, near, gain(0.25)).unwrap();
     e.append(2, near, Entry::InputDown { slot: 0 }).unwrap();
@@ -321,6 +321,7 @@ fn gain(e: &Engine, id: u64, at: u64, channel: usize, gain: f32) {
         input: channel,
         output: channel,
         gain,
+        fade: None,
     };
     e.append(id, at, entry).unwrap();
     e.commit(id);
@@ -374,6 +375,7 @@ fn a_replayed_core_computes_the_donors_pages() {
                     input: 1,
                     output: 1,
                     gain: 0.25,
+                    fade: None,
                 },
             )
             .unwrap();
@@ -543,6 +545,9 @@ fn a_replayed_core_carries_the_strips_mid_envelope() {
         wait_for(Duration::from_secs(5), "level dropped", || {
             processed(&a.e) > ramped && processed(&b.e) > ramped
         });
+        // Skips from before the copy on: the donor's state the copy
+        // holds, and the replay, must not be cut by one.
+        let skips = (a.skipped(), b.skipped());
         let copy = copy(&a.e);
         let k0 = copy.k0;
         let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
@@ -558,31 +563,32 @@ fn a_replayed_core_carries_the_strips_mid_envelope() {
         }
         // Before the hand-over the strips set apart differ; from it on
         // the joiner computes the donor's pages.
-        let before = (k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE;
-        let from = ((j + 1) * B).div_ceil(PAGE);
-        let end = (from + 8) * PAGE / B + PAGE / B;
-        wait_for(Duration::from_secs(10), "pages compared", || {
-            processed(&a.e) > end && processed(&b.e) > end
-        });
-        let (pa, pb) = (a.pages(), b.pages());
-        let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
-        let differ = before
-            .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
-            .count();
-        assert!(differ > 0, "the joiner never diverged");
-        for p in from..from + 8 {
-            if disturbed.contains(&p) {
-                return Err(format!("page {p} disturbed"));
-            }
-            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
-                return Err(format!("page {p} not hashed by both"));
-            };
-            assert_eq!(
-                (hb.hash, hb.fingerprint),
-                (ha.hash, ha.fingerprint),
-                "page {p}"
-            );
+        let mut pair = Pair::new(&a, &b);
+        let before = pair.comparable((k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE);
+        if !before.iter().any(|&(_, same)| !same) {
+            return Err("no page before the copy shows the joiner apart".to_owned());
         }
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        let end = (at6 + 48_000) / PAGE + 8;
+        // A skip restarts one engine's strip state (the engines' own
+        // counters say so): pages read while neither has skipped since
+        // the copy are the ones that must agree.
+        let mut pages = std::collections::BTreeMap::new();
+        wait_for(Duration::from_secs(10), "comparable pages", || {
+            let seen = pair.comparable(from..end);
+            if (a.skipped(), b.skipped()) == skips {
+                pages.extend(seen);
+            }
+            !pages.is_empty() || processed(&a.e).min(processed(&b.e)) * B / PAGE >= end + 2
+        });
+        if pages.is_empty() {
+            return Err(format!("{} comparable pages before a skip", pages.len()));
+        }
+        let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+        assert!(
+            apart.is_empty(),
+            "pages {apart:?} differ after the hand-over"
+        );
         Ok(())
     });
 }
@@ -632,6 +638,7 @@ fn a_replayed_core_carries_the_limiter_mid_release() {
                     input: channel,
                     output: channel,
                     gain: 0.25,
+                    fade: None,
                 };
                 e.append(2 + channel as u64, at2, entry).unwrap();
             }
@@ -796,6 +803,7 @@ fn a_product_state_sets_the_delay() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 1,
     };
     assert!(matches!(
@@ -846,6 +854,7 @@ fn an_entry_the_replay_applied_is_not_taken_again() {
             input: 0,
             output: 0,
             gain: 0.5,
+            fade: None,
         };
         replay.append(1, at, &entry).unwrap();
         let past = (at + u64::from(RAMP)) / B + PAGE / B;
@@ -960,6 +969,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
         input: 0,
         output: 0,
         gain: 0.5,
+        fade: None,
     };
     let at = (processed(&h.e) + 5) * B;
     for id in 1..=64 {
@@ -988,6 +998,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 0,
     };
     // A gain no entry could set is refused before the core is dropped.
@@ -1065,6 +1076,7 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 0,
     };
     let j =
@@ -1083,12 +1095,11 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
 
 /// A product core is installed at the first block at or after the index
 /// its caller names, not before, however soon the RT thread could take
-/// it; and its gains ramp from silence to their targets over the ramp
-/// length from there, as the strips take their parameters, so an output
-/// fades in processed. An index further ahead than the timeout is
-/// refused before the core the RT thread holds is dropped.
+/// it; its gains hold their targets from the first sample, with no ramp
+/// from silence. An index further ahead than the timeout is refused
+/// before the core the RT thread holds is dropped.
 #[test]
-fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
+fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -1106,6 +1117,7 @@ fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),
+            fading: Vec::new(),
             last_id: 0,
         };
         let far = processed(&h.e) * B + 10 * 48_000;
@@ -1120,7 +1132,6 @@ fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
         );
         // 40 blocks ahead, a block start plus a sample: the block after.
         let at_least = (processed(&h.e) + 40) * B + 1;
-        let passed = c.handovers_passed.load(Relaxed);
         let j =
             h.e.install_product(&state, at_least, Duration::from_secs(2))
                 .unwrap();
@@ -1131,30 +1142,10 @@ fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
         );
         // Never more than a second late, whatever the load.
         assert!(installed < at_least + 48_000, "installed at {installed}");
-        let retries = c.handovers_passed.load(Relaxed) - passed;
-        // The core after block k0 has the matrix at sample (k0 + 1) B: on
-        // the ramp from silence that started at the install.
-        let copy = common::copy_core(&h.e);
-        let at = (copy.k0 + 1) * B - installed;
-        if at >= u64::from(RAMP) {
-            return Err(format!(
-                "copied {at} samples after the install, past the ramp"
-            ));
-        }
-        for (i, target) in [(0, 0.25), (1, 0.5)] {
-            let mut ramp = Ramp::new(0.0);
-            assert!(ramp.set_target(target, RAMP));
-            ramp.advance(at as usize);
-            assert_eq!(
-                copy.core.gain(i, i).to_bits(),
-                ramp.current().to_bits(),
-                "gain {i} -> {i} {at} samples into the fade-in ({retries} retries)"
-            );
-        }
-        assert_eq!(copy.core.gain(0, 1), 0.0);
-        past_fade_in(&h.e, j);
+        // At the targets from the install on, not on a ramp from silence.
         let core = common::copy_core(&h.e).core;
         assert_eq!((core.gain(0, 0), core.gain(1, 1)), (0.25, 0.5));
+        assert_eq!(core.gain(0, 1), 0.0);
         h.e.stop();
         Ok(())
     });
@@ -1202,6 +1193,7 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 1,
     };
     let late = c.command_late.load(Relaxed);
@@ -1250,8 +1242,10 @@ fn a_product_entry_the_install_passed_is_folded_in() {
                 input: 0,
                 output: 0,
                 gain: 0.5,
+                fade: None,
             },
         )],
+        fading: Vec::new(),
         last_id: 1,
     };
     let late = c.command_late.load(Relaxed);
@@ -1347,14 +1341,16 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),
+            fading: Vec::new(),
             last_id: 1,
         };
         let j =
             c.e.install_product(&state, 0, Duration::from_secs(2))
                 .unwrap();
         assert_eq!(c.e.status().inputs[0].state, InputState::Detached);
-        // After the fade-in from silence the install starts with.
-        let from = ((processed(&c.e) + 2) * B).max((j + 1) * B + u64::from(RAMP));
+        // From the first page whole after the install: no ramp from
+        // silence in between.
+        let from = (j + 1) * B;
         assert_same_within(a, c, from, from + 4 * PAGE)?;
         for h in &hs {
             assert_eq!(h.e.status().diverged, None);
@@ -1388,6 +1384,7 @@ fn a_product_state_disables_and_enables_an_output() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending,
+        fading: Vec::new(),
         last_id: 1,
     };
     let install = |s: &ProductState| {
@@ -1449,6 +1446,7 @@ fn a_product_state_sets_the_limiter() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 1,
     };
     let on = LimiterParams {
@@ -1658,6 +1656,7 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: vec![(1, at, strip)],
+            fading: Vec::new(),
             last_id: 1,
         };
         let j =
@@ -1717,6 +1716,7 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: vec![(1, at, limiter)],
+            fading: Vec::new(),
             last_id: 1,
         };
         let j =
@@ -1782,6 +1782,7 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
+        fading: Vec::new(),
         last_id: 1,
     };
     h.e.install_product(&state, 0, Duration::from_secs(2))
@@ -1875,6 +1876,7 @@ fn a_route_the_core_carried_is_not_applied_again() {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: vec![(1, at, route)],
+        fading: Vec::new(),
         last_id: 1,
     };
     let j =
@@ -1915,11 +1917,13 @@ fn scene() -> Vec<Entry> {
             input: 0,
             output: 0,
             gain: 0.75,
+            fade: None,
         },
         Entry::Gain {
             input: 1,
             output: 1,
             gain: 0.25,
+            fade: None,
         },
         Entry::Strip {
             slot: 0,
@@ -2100,6 +2104,7 @@ fn a_replay_folds_and_checks_a_log_entry_as_the_engine_does() {
         input: 0,
         output: 2,
         gain: 0.5,
+        fade: None,
     };
     assert!(matches!(
         replay.append_batch(3, at, &[outside]),
@@ -2147,6 +2152,7 @@ fn committed_entries_past_the_wait_bound_drop_the_core() {
             input: 0,
             output: 0,
             gain: (id % 7) as f32 / 7.0,
+            fade: None,
         };
         h.e.append(id, at, gain).unwrap();
         h.e.commit(id);
@@ -2195,6 +2201,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
             input: 1,
             output: 1,
             gain: (id % 7) as f32 / 7.0,
+            fade: None,
         };
         for id in 1..=128 {
             b.e.append(id, far, filler(id)).unwrap();
@@ -2228,6 +2235,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),
+            fading: Vec::new(),
             last_id: last,
         };
         let j =
@@ -2350,6 +2358,7 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
         } else {
             Vec::new()
         },
+        fading: Vec::new(),
         last_id: if sent { 2 } else { 1 },
     };
     let j =
@@ -2435,6 +2444,7 @@ fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),
+            fading: Vec::new(),
             last_id: 2,
         };
         b.e.install_product(&state, 0, Duration::from_secs(2))
@@ -2605,6 +2615,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
         let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
         let h = hashed_of(&domain, &[(&src, 2)], |c| c.duck_columns = vec![0]);
         let state = ProductState {
+            fading: Vec::new(),
             limiters: Vec::new(),
             delays: Vec::new(),
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
@@ -2706,6 +2717,7 @@ fn an_install_leaving_an_output_out_starts_it_as_configured() {
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),
+            fading: Vec::new(),
             last_id: 0,
         };
         let j = e
@@ -2734,4 +2746,432 @@ fn an_install_leaving_an_output_out_starts_it_as_configured() {
     });
     assert!(e.status().outputs[0].realised);
     e.stop();
+}
+
+/// Both gains of a 2-channel diagonal to 0.25 over a fade, as entries
+/// `1` and `2` committed on `e` at `at`.
+fn fade_entries(e: &Engine, at: u64, fade: Fade) {
+    for channel in 0..2 {
+        let entry = Entry::Gain {
+            input: channel,
+            output: channel,
+            gain: 0.25,
+            fade: Some(fade),
+        };
+        e.append(1 + channel as u64, at, entry).unwrap();
+    }
+    e.commit(2);
+}
+
+/// A fade long enough to copy and rebuild inside, in samples, and where
+/// the cases look at it: waiting for its start, ramping.
+const FADE_DELAY: u64 = 30_000;
+const FADE_LEN: u32 = 120_000;
+
+/// The fade of the log's entries at `at`.
+fn fade_at(at: u64) -> Fade {
+    Fade::after(1.0, at, FADE_DELAY as u32, FADE_LEN)
+}
+
+/// Waits until sample index `n` is processed on every engine.
+fn wait_index(engines: &[&Engine], n: u64) {
+    wait_for(Duration::from_secs(10), "index reached", || {
+        engines.iter().all(|e| processed(e) > n.div_ceil(B))
+    });
+}
+
+/// Resync across a gain fade: a joiner whose fade was set apart replays a
+/// donor's core copied while the fade still waits for its start, or
+/// while it ramps, and computes the donor's pages bit for bit. The
+/// coefficient carries its start value, delay, length and position, so
+/// nothing of the fade lives apart from the matrix.
+fn replayed_core_carries_a_fade(wait: u64) -> Result<(), String> {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let plain = |c: &mut Config| c.matrix = diagonal(2, 1.0);
+    let (a, b) = (
+        hashed_of(&domain, &[(&src, 2)], plain),
+        hashed_of(&domain, &[(&src, 2)], plain),
+    );
+    let at = (now_block() + 20) * B;
+    fade_entries(&a.e, at, fade_at(at));
+    // Set apart: the joiner's fade is a short one, which has ended.
+    fade_entries(&b.e, at, Fade::after(1.0, at, 0, 100));
+    wait_index(&[&a.e, &b.e], at + wait);
+    let copy = copy(&a.e);
+    let k0 = copy.k0;
+    let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+    let mut replay = b.e.replay(copy).unwrap();
+    let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+    let passed = b.e.counters().handovers_passed.load(Relaxed);
+    if passed >= MAX_PASSED {
+        return Err(format!("{passed} hand-overs passed"));
+    }
+    // The fade is still running at the hand-over, or the case tests nothing.
+    if (j + 1) * B > at + (FADE_DELAY + u64::from(FADE_LEN)) - 3 * PAGE {
+        return Err(format!("handed over at block {j}, near the fade's end"));
+    }
+    // Before the copy the joiner's short fade and the donor's long one
+    // differ on every page the ramp touches.
+    let mut pair = Pair::new(&a, &b);
+    if wait > FADE_DELAY {
+        let before = pair.comparable((at / PAGE + 1)..k0 * B / PAGE);
+        if !before.iter().any(|&(_, same)| !same) {
+            return Err("no page before the copy shows the joiner apart".to_owned());
+        }
+    }
+    let from = ((j + 1) * B).div_ceil(PAGE);
+    let end = (at + FADE_DELAY + u64::from(FADE_LEN)) / PAGE;
+    let pages = wait_comparable(&mut pair, from, end, 3, (at + FADE_DELAY) / PAGE)?;
+    let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+    assert!(
+        apart.is_empty(),
+        "pages {apart:?} differ after the hand-over"
+    );
+    Ok(())
+}
+
+/// What two engines' page hashes and block verdicts have delivered so
+/// far, collected as they come: the channels are drained on every read.
+/// A page hash can reach its channel before the verdict of the page's
+/// last block, which the RT thread sends at the end of that block, so a
+/// page counts as comparable only once a verdict beyond its last block
+/// came from both engines: the verdicts are in block order, and every
+/// one before it came with it.
+struct Pair<'a> {
+    a: &'a Hashed,
+    b: &'a Hashed,
+    pages: [BTreeMap<u64, PageHash>; 2],
+    silenced: [Vec<u64>; 2],
+    newest: [u64; 2],
+}
+
+impl<'a> Pair<'a> {
+    fn new(a: &'a Hashed, b: &'a Hashed) -> Pair<'a> {
+        Pair {
+            a,
+            b,
+            pages: [BTreeMap::new(), BTreeMap::new()],
+            silenced: [Vec::new(), Vec::new()],
+            newest: [0, 0],
+        }
+    }
+
+    fn poll(&mut self) {
+        for (i, h) in [self.a, self.b].into_iter().enumerate() {
+            self.pages[i].extend(h.hashes.try_iter().map(|p| (p.page, p)));
+            for v in h.verdicts.try_iter() {
+                if v.silenced != 0 {
+                    self.silenced[i].push(v.k);
+                }
+                self.newest[i] = self.newest[i].max(v.k);
+            }
+        }
+    }
+
+    /// The pages in `range` both engines hashed whole, neither one's
+    /// silenced block or the fade-in after it touched, and a verdict past
+    /// them came for: each with whether the two hash alike. A loaded host
+    /// narrows the set, it never moves what the set holds.
+    fn comparable(&mut self, range: std::ops::Range<u64>) -> Vec<(u64, bool)> {
+        self.poll();
+        let confirmed = self.newest[0].min(self.newest[1]);
+        let disturbed: Vec<u64> = self.silenced.iter().flat_map(|s| touched(s)).collect();
+        range
+            .filter(|p| (p + 1) * PAGE / B < confirmed && !disturbed.contains(p))
+            .filter_map(|p| {
+                let (x, y) = (self.pages[0].get(&p)?, self.pages[1].get(&p)?);
+                Some((p, (x.hash, x.fingerprint) == (y.hash, y.fingerprint)))
+            })
+            .collect()
+    }
+}
+
+/// Collects `n` comparable pages at or after page `from` and before page
+/// `end`, as the engines compute them, with pages on both sides of page
+/// `split` when it lies past `from`, and returns each with whether the
+/// engines agree. Too few, because an engine skipped the stretch or the
+/// fade ended first, is an error and not a mismatch.
+fn wait_comparable(
+    pair: &mut Pair,
+    from: u64,
+    end: u64,
+    n: usize,
+    split: u64,
+) -> Result<BTreeMap<u64, bool>, String> {
+    let both = |f: &BTreeMap<u64, bool>| {
+        split <= from || (f.keys().any(|&p| p < split) && f.keys().any(|&p| p > split))
+    };
+    let mut found = BTreeMap::new();
+    let (ea, eb) = (&pair.a.e, &pair.b.e);
+    let over = || processed(ea).min(processed(eb)) * B / PAGE >= end + 2;
+    let mut done = false;
+    wait_for(Duration::from_secs(10), "comparable pages", || {
+        found.extend(pair.comparable(from..end));
+        done = found.len() >= n && both(&found);
+        done || over()
+    });
+    if !done {
+        return Err(format!(
+            "{} comparable pages in {from}..{end}, {n} wanted, on both sides of {split}",
+            found.len()
+        ));
+    }
+    Ok(found)
+}
+
+#[test]
+fn a_replayed_core_carries_a_fade_still_waiting() {
+    common::undisturbed(|| replayed_core_carries_a_fade(5_000));
+}
+
+#[test]
+fn a_replayed_core_carries_a_fade_mid_ramp() {
+    common::undisturbed(|| replayed_core_carries_a_fade(FADE_DELAY + 20_000));
+}
+
+/// A replica rebuilt from a product state mid-fade, the state naming the
+/// fade's start value and absolute start, computes its peers' pages from
+/// the first page after the install, bit for bit: the coefficient
+/// continues the fade where the peers are, it does not jump to the
+/// target. The same with the fade not started yet.
+fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), String> {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let plain = |c: &mut Config| c.matrix = diagonal(2, 1.0);
+    let hs = [0; 3].map(|_| hashed_of(&domain, &[(&src, 2)], plain));
+    let [a, b, c] = &hs;
+    let at = (now_block() + 20) * B;
+    for h in [a, b] {
+        fade_entries(&h.e, at, fade_at(at));
+        if assert_mid {
+            // The same fades asserted again inside the ramp, as a
+            // restamp re-asserts every target.
+            let again = (at + FADE_DELAY + 5_000).next_multiple_of(B);
+            for channel in 0..2 {
+                let entry = Entry::Gain {
+                    input: channel,
+                    output: channel,
+                    gain: 0.25,
+                    fade: Some(fade_at(at)),
+                };
+                h.e.append(3 + channel as u64, again, entry).unwrap();
+            }
+            h.e.commit(4);
+        }
+    }
+    wait_index(&[&a.e, &b.e, &c.e], at + wait);
+    c.e.drop_core().unwrap();
+    let fading = Some(fade_at(at));
+    let state = ProductState {
+        fading: vec![vec![fading, None], vec![None, fading]],
+        limiters: Vec::new(),
+        delays: Vec::new(),
+        gains: vec![vec![0.25, 0.0], vec![0.0, 0.25]],
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        outputs: Vec::new(),
+        strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
+        pending: Vec::new(),
+        last_id: if assert_mid { 4 } else { 2 },
+    };
+    let j =
+        c.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
+    if (j + 1) * B > at + (FADE_DELAY + u64::from(FADE_LEN)) - 5 * PAGE {
+        return Err(format!("installed at block {j}, near the fade's end"));
+    }
+    let from = ((j + 1) * B).div_ceil(PAGE);
+    let mut pair = Pair::new(a, c);
+    let end = (at + FADE_DELAY + u64::from(FADE_LEN)) / PAGE;
+    let pages = wait_comparable(&mut pair, from, end, 3, (at + FADE_DELAY) / PAGE)?;
+    let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+    assert!(apart.is_empty(), "pages {apart:?} differ after the install");
+    Ok(())
+}
+
+#[test]
+fn a_rebuilt_replica_continues_a_fade_still_waiting() {
+    common::undisturbed(|| rebuilt_replica_continues_a_fade(2_000, false));
+}
+
+#[test]
+fn a_rebuilt_replica_continues_a_fade_mid_ramp() {
+    common::undisturbed(|| rebuilt_replica_continues_a_fade(FADE_DELAY + 20_000, false));
+}
+
+#[test]
+fn a_rebuilt_replica_matches_its_peers_after_a_mid_fade_assert() {
+    common::undisturbed(|| rebuilt_replica_continues_a_fade(FADE_DELAY + 20_000, true));
+}
+
+/// A replica rebuilt mid-fade, in a matrix with a duck, from a product
+/// state that holds the fade, computes its peers' pages: the fade brings
+/// a masked coefficient in from silence, and the peers' duck on it is
+/// the one the install builds, with no crossfade of its own. The group is
+/// forced on from entries long before the fade, so the detectors agree.
+fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let ducked = |c: &mut Config| {
+        c.duck_columns = vec![0];
+        c.matrix = vec![vec![0.0, 0.0], vec![0.0, 1.0]];
+    };
+    let hs = [0; 3].map(|_| hashed_of(&domain, &[(&src, 2)], ducked));
+    let [a, b, c] = &hs;
+    let at1 = (now_block() + 20) * B;
+    let at = at1 + 400 * B;
+    let fade = Fade::after(0.0, at, delay, FADE_LEN);
+    for h in [a, b] {
+        let duck = |setting| Entry::Duck { group: 0, setting };
+        let setup = [
+            duck(DuckSetting::Mode(samplez_dsp::DuckMode::On)),
+            duck(DuckSetting::Depth { slot: 0, db: 20.0 }),
+            Entry::DuckMask {
+                input: 0,
+                output: 0,
+                mask: 1,
+            },
+        ];
+        h.e.append_batch(1, at1, &setup).unwrap();
+        h.e.commit(1);
+        let entry = Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.25,
+            fade: Some(fade),
+        };
+        h.e.append(2, at, entry).unwrap();
+        h.e.commit(2);
+    }
+    wait_index(&[&a.e, &b.e, &c.e], at + u64::from(delay) + 20_000);
+    c.e.drop_core().unwrap();
+    let state = ProductState {
+        fading: vec![vec![Some(fade), None], vec![None, None]],
+        limiters: Vec::new(),
+        delays: Vec::new(),
+        gains: vec![vec![0.25, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        outputs: Vec::new(),
+        strips: vec![Vec::new()],
+        ducks: vec![DuckTargets {
+            mode: samplez_dsp::DuckMode::On,
+            depths: vec![20.0],
+            ..DuckTargets::default()
+        }],
+        masks: vec![vec![1, 0], vec![0, 0]],
+        pending: Vec::new(),
+        last_id: 2,
+    };
+    let j =
+        c.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
+    if (j + 1) * B > at + FADE_DELAY + u64::from(FADE_LEN) - 5 * PAGE {
+        return Err(format!("installed at block {j}, near the fade's end"));
+    }
+    let from = ((j + 1) * B).div_ceil(PAGE);
+    let mut pair = Pair::new(a, c);
+    let end = (at + u64::from(delay) + u64::from(FADE_LEN)) / PAGE;
+    let pages = wait_comparable(&mut pair, from, end, 3, 0)?;
+    let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+    assert!(apart.is_empty(), "pages {apart:?} differ after the install");
+    Ok(())
+}
+
+#[test]
+fn a_rebuilt_replica_continues_a_masked_fade_that_starts_at_its_entry() {
+    common::undisturbed(|| rebuilt_replica_continues_a_masked_fade(0));
+}
+
+#[test]
+fn a_rebuilt_replica_continues_a_masked_fade_that_waits() {
+    common::undisturbed(|| rebuilt_replica_continues_a_masked_fade(FADE_DELAY as u32));
+}
+
+/// A replica rebuilt inside the ramp of plain gain entries, from a state
+/// that holds the ramps the entries left running, as a replica's product
+/// state does, computes its peers' pages from the first page after the
+/// install: the install index lies inside the last entry's ramp, and with
+/// `chained` the entry before it ramps on inside that one's.
+fn rebuilt_replica_continues_plain_ramps(chained: bool) -> Result<(), String> {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let plain = |c: &mut Config| c.matrix = diagonal(2, 1.0);
+    let hs = [0; 3].map(|_| hashed_of(&domain, &[(&src, 2)], plain));
+    let [a, b, c] = &hs;
+    let at = (now_block() + 100) * B;
+    let second = at + 10 * B;
+    let gain = |to| Entry::Gain {
+        input: 0,
+        output: 0,
+        gain: to,
+        fade: None,
+    };
+    let ramp = RAMP;
+    let first = Fade {
+        from: 1.0,
+        start: at,
+        len: ramp,
+    };
+    let (last, target, install) = if chained {
+        let from = first.value_at(0.25, second);
+        let f = Fade {
+            from,
+            start: second,
+            len: ramp,
+        };
+        (f, 0.75, second + 96)
+    } else {
+        (first, 0.25, at + 96)
+    };
+    for h in [a, b] {
+        h.e.append(1, at, gain(0.25)).unwrap();
+        h.e.commit(1);
+        if chained {
+            h.e.append(2, second, gain(0.75)).unwrap();
+            h.e.commit(2);
+        }
+    }
+    c.e.drop_core().unwrap();
+    let state = ProductState {
+        fading: vec![vec![Some(last), None], vec![None, None]],
+        limiters: Vec::new(),
+        delays: Vec::new(),
+        gains: vec![vec![target, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        outputs: Vec::new(),
+        strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
+        pending: Vec::new(),
+        last_id: if chained { 2 } else { 1 },
+    };
+    let j =
+        c.e.install_product(&state, install, Duration::from_secs(2))
+            .unwrap();
+    let from = ((j + 1) * B).div_ceil(PAGE);
+    let end = (last.start + u64::from(ramp)) / PAGE;
+    let mut pair = Pair::new(a, c);
+    let pages = wait_comparable(&mut pair, from, end, 1, 0)?;
+    let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+    assert!(apart.is_empty(), "pages {apart:?} differ after the install");
+    Ok(())
+}
+
+#[test]
+fn a_rebuilt_replica_continues_a_plain_ramp() {
+    common::undisturbed(|| rebuilt_replica_continues_plain_ramps(false));
+}
+
+#[test]
+fn a_rebuilt_replica_continues_chained_plain_ramps() {
+    common::undisturbed(|| rebuilt_replica_continues_plain_ramps(true));
 }

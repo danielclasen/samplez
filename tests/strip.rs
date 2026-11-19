@@ -110,7 +110,8 @@ fn inputs_and_meters_no_output_carries_are_metered() {
     let after = |w: Option<u64>| w.is_some_and(|w| w * 4800 >= at + 5 * 4800);
     wait_for(Duration::from_secs(10), "meters past the trim", || {
         let s = e.status();
-        after(s.inputs[0].meters.window) && after(s.meters[0].meters.window)
+        let (i, m) = (&s.inputs[0].meters, &s.meters[0].meters);
+        after(i.window) && after(m.window) && i.momentary.is_some() && m.momentary.is_some()
     });
     let s = e.status();
     let (input, meter) = (&s.inputs[0].meters, &s.meters[0].meters);

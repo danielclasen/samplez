@@ -458,6 +458,9 @@ impl EngineAudio {
 }
 
 impl Audio for EngineAudio {
+    fn ramp_config(&self) -> Option<(u32, u64)> {
+        Some((self.engine.ramp_samples(), self.block))
+    }
     fn sample(&self) -> Sample {
         let Some(progress) = self.engine.progress() else {
             return Sample::default();
