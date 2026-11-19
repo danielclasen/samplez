@@ -2978,7 +2978,7 @@ mod derive_tests {
 
 /// The engine tests' helpers (flows, a pilot, configurations).
 #[cfg(test)]
-#[allow(dead_code, unused)]
+#[allow(unused)]
 #[path = "../../../tests/common/mod.rs"]
 mod ramp_common;
 
