@@ -3758,6 +3758,7 @@ mod tests {
             let log = self.0.lock().unwrap();
             let state = ProductState {
                 limiters: Vec::new(),
+                delays: Vec::new(),
                 gains: Vec::new(),
                 up: Vec::new(),
                 flows: log.flows.clone(),

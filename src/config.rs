@@ -73,6 +73,11 @@ pub struct Config {
     /// beyond the read window.
     #[serde(default = "default_resync_budget_ms")]
     pub resync_budget_ms: u32,
+    /// The most delay-line history the inputs may hold together:
+    /// `maxDelaySamples` times `channels`, summed over the inputs, in
+    /// samples; a resync copies at most that much. 2^22 by default.
+    #[serde(default = "default_delay_budget")]
+    pub delay_budget_samples: u64,
     /// Path of the libmxl shared library.
     pub libmxl: PathBuf,
     pub domains: Vec<Domain>,
@@ -139,6 +144,12 @@ pub struct Input {
     /// momentary loudness of the input's meter.
     #[serde(default)]
     pub loudness_channels: Option<Vec<String>>,
+    /// The longest delay a `Delay` entry may set on the input, in
+    /// samples, at most `samplez_dsp::MAX_DELAY_SAMPLES` (5 s); 0, the
+    /// default, gives the input no delay line. Its rings, two per leg of
+    /// this length plus `historySlackMs`, are allocated at start.
+    #[serde(default)]
+    pub max_delay_samples: u32,
 }
 
 impl Input {
@@ -343,6 +354,10 @@ fn default_resync_budget_ms() -> u32 {
 fn default_ramp() -> u32 {
     480
 }
+fn default_delay_budget() -> u64 {
+    1 << 22
+}
+
 fn default_true() -> bool {
     true
 }
@@ -454,6 +469,16 @@ impl Config {
         if !(1..=99).contains(&self.rt.priority) {
             return fail(format!("rt.priority {} is not in 1..=99", self.rt.priority));
         }
+        let delays: u64 = (self.inputs.iter())
+            .map(|i| u64::from(i.max_delay_samples) * u64::from(i.channels))
+            .sum();
+        if delays > self.delay_budget_samples {
+            return fail(format!(
+                "maxDelaySamples times channels sums to {delays} samples over the inputs, above \
+                 delayBudgetSamples {}",
+                self.delay_budget_samples
+            ));
+        }
         if self.inputs.len() > MAX_INPUTS {
             return fail(format!(
                 "{} inputs, at most {MAX_INPUTS}",
@@ -524,6 +549,14 @@ impl Config {
             samplez_mxl::input::legs(&self.input_config(i, i.flow_id.as_deref().unwrap_or("none")))
                 .map_err(|e| Error(format!("input {}: {e}", i.name)))?;
             i.loudness_weights()?;
+            if i.max_delay_samples > samplez_dsp::MAX_DELAY_SAMPLES {
+                return fail(format!(
+                    "input {}: maxDelaySamples {} is above {}",
+                    i.name,
+                    i.max_delay_samples,
+                    samplez_dsp::MAX_DELAY_SAMPLES
+                ));
+            }
         }
         for m in &self.meters {
             if m.channels == 0 {
@@ -670,10 +703,6 @@ mod tests {
         assert_eq!(c.hold_blocks() as u64 * 48, 960);
     }
 
-    /// An input's flow is optional: absent or null starts it without one,
-    /// an empty id is refused as any invalid id is, and an input without
-    /// a flow skips the check against the outputs' flows. An output
-    /// starts enabled unless `enabled` is false.
     /// An output has no limiter unless `limiter` is true, and takes one
     /// only up to a strip's width.
     #[test]
@@ -690,6 +719,40 @@ mod tests {
         assert!(parse(&v).is_ok());
     }
 
+    /// The delay lines of every input together hold at most
+    /// `delayBudgetSamples` samples of history, 2^22 by default.
+    #[test]
+    fn delay_lines_stay_within_the_budget() {
+        let mut v = base();
+        assert_eq!(parse(&v).unwrap().delay_budget_samples, 1 << 22);
+        v["inputs"][0]["maxDelaySamples"] = serde_json::json!(240_000);
+        v["delayBudgetSamples"] = serde_json::json!(480_000);
+        assert!(parse(&v).is_ok(), "2 channels of 240000");
+        v["delayBudgetSamples"] = serde_json::json!(479_999);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(
+            e.contains("sums to 480000 samples") && e.contains("delayBudgetSamples 479999"),
+            "{e}"
+        );
+    }
+
+    /// An input has no delay line unless `maxDelaySamples` names one, at
+    /// most 5 s.
+    #[test]
+    fn a_delay_line_is_opt_in_and_at_most_five_seconds() {
+        assert_eq!(parse(&base()).unwrap().inputs[0].max_delay_samples, 0);
+        let mut v = base();
+        v["inputs"][0]["maxDelaySamples"] = serde_json::json!(240_000);
+        assert_eq!(parse(&v).unwrap().inputs[0].max_delay_samples, 240_000);
+        v["inputs"][0]["maxDelaySamples"] = serde_json::json!(240_001);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("maxDelaySamples 240001 is above 240000"), "{e}");
+    }
+
+    /// An input's flow is optional: absent or null starts it without one,
+    /// an empty id is refused as any invalid id is, and an input without
+    /// a flow skips the check against the outputs' flows. An output
+    /// starts enabled unless `enabled` is false.
     #[test]
     fn an_input_flow_is_optional_and_an_output_starts_enabled_by_default() {
         let c = parse(&base()).unwrap();

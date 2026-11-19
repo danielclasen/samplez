@@ -812,6 +812,7 @@ pub fn hold_scenario(e: &Engine) {
     });
     let state = samplez::ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![1.0]],
         up: vec![true],
         flows: e

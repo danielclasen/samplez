@@ -18,8 +18,8 @@ use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
 use rtrb::{Consumer, Producer};
 use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{
-    KWeighting, Limiter, LimiterParams, MAX_DUCKS, Matrix, PlanarBuffer, Ramp, Started, Strip,
-    StripParam, TruePeak, accumulate,
+    Delay, KWeighting, Limiter, LimiterParams, MAX_DUCKS, Matrix, PlanarBuffer, Ramp, Started,
+    Strip, StripParam, TruePeak, accumulate,
 };
 use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{FlowWriter, Write};
@@ -30,7 +30,7 @@ use crate::blocks::{
     Cause, Changes, Ctx, Hold, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
 use crate::ducks::{DuckRecord, Ducks};
-use crate::transfer::{Answer, Core, CoreCopy, Handover};
+use crate::transfer::{Answer, Core, CoreCopy, DelayCore, Handover};
 
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
@@ -503,6 +503,8 @@ pub(crate) enum Change {
         output: usize,
         params: LimiterParams,
     },
+    /// Sets the slot's delay from the index, in samples.
+    Delay { slot: usize, samples: u32 },
     /// The output is written from the index on, once it has a writer, or
     /// disabled: nothing is written from the index on and its writer is
     /// handed back.
@@ -569,7 +571,7 @@ impl Change {
     pub fn in_core(&self, strips: bool) -> bool {
         match *self {
             Change::Gain { .. } | Change::InputDown { .. } | Change::Output { .. } => true,
-            Change::Strip { .. } | Change::Limiter { .. } => strips,
+            Change::Strip { .. } | Change::Limiter { .. } | Change::Delay { .. } => strips,
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => false,
             Change::Batch {
                 strips: has,
@@ -646,6 +648,9 @@ pub(crate) struct Slot {
     pub strip: Option<Strip>,
     /// The index of the next sample the strip processes.
     pub strip_pos: Option<u64>,
+    /// The slot's delay line, run after the strip; none on a slot
+    /// configured without one.
+    pub delay: Option<Delay>,
 }
 
 impl Slot {
@@ -677,6 +682,7 @@ impl Slot {
             stats: EMPTY_STATS,
             strip: (channels <= MAX_LEGS).then(|| Strip::new(channels, ramp)),
             strip_pos: None,
+            delay: None,
         }
     }
 
@@ -1517,6 +1523,30 @@ fn capture_core(
         // A strip holds no heap memory: the copy allocates nothing.
         d.strip.clone_from(&s.strip);
         d.strip_pos = s.strip_pos;
+        // The delay's state; its rings are copied off the RT thread, into
+        // a span the buffer brought or that is allocated there.
+        match (&mut d.delay, &s.delay) {
+            (Some(c), Some(l)) => {
+                c.taps = l.taps();
+                c.pos = l.pos();
+                c.floor = l.floor();
+                c.set = l.rings().active() as u8;
+            }
+            (c, Some(l)) => {
+                *c = Some(DelayCore {
+                    taps: l.taps(),
+                    pos: l.pos(),
+                    floor: l.floor(),
+                    set: l.rings().active() as u8,
+                    span: Vec::new(),
+                });
+            }
+            (c, None) => {
+                if c.is_some() {
+                    debug_assert!(false, "a core buffer of another shape");
+                }
+            }
+        }
     }
     c.put_batches(&m.batches);
     c.awaiting_gen.clear();
@@ -1962,7 +1992,7 @@ impl Rt {
             // core brought, or on its pending list, applied here at its
             // index; taken through that core.
             match &mut entry.change {
-                Change::Strip { .. } | Change::Limiter { .. } => {
+                Change::Strip { .. } | Change::Limiter { .. } | Change::Delay { .. } => {
                     self.mix.last_taken = self.mix.last_taken.max(entry.id);
                     return;
                 }
@@ -2217,10 +2247,11 @@ impl Rt {
             match e.change {
                 Change::Strip { slot, param } => self.set_strip(e, slot, param),
                 Change::Limiter { output, params } => self.set_limiter(e, output, params),
+                Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
                 Change::Batch { strips, .. } => {
                     let b = self.mix.take_batch(e.id);
-                    // Without strips, its strip and limiter parameters are
-                    // in those the last replayed core brought.
+                    // Without strips, its strip and limiter parameters and
+                    // delays are in those the last replayed core brought.
                     if let Some(b) = b.as_ref().filter(|_| strips) {
                         self.set_params(e, b);
                     }
@@ -2350,13 +2381,34 @@ impl Rt {
         }
     }
 
-    /// Sets the strip and limiter parameters of batch `b`, of entry `e`.
+    /// Sets the delay of slot `slot` from the index of entry `e`, which
+    /// carries it; a delay of 0 on a slot without a delay line sets
+    /// nothing, any other refusal is counted and reported as a strip's.
+    fn set_delay(&mut self, e: RtEntry, slot: usize, samples: u32) {
+        let set = match &mut self.slots[slot].delay {
+            Some(d) => d.set(e.at_index, samples),
+            None => samples == 0,
+        };
+        if !set {
+            add(&self.counters.strip_refused, 1);
+            let entry = RtEntry {
+                change: Change::Delay { slot, samples },
+                ..e
+            };
+            self.send(Telemetry::StripRefused { entry });
+        }
+    }
+
+    /// Sets strip, limiter and delay parameters of batch `b`, entry `e`.
     fn set_params(&mut self, e: RtEntry, b: &Batch) {
         for &(slot, param) in &b.strips {
             self.set_strip(e, slot as usize, param);
         }
         for &(output, params) in &b.limiters {
             self.set_limiter(e, output as usize, params);
+        }
+        for &(slot, samples) in &b.delays {
+            self.set_delay(e, slot as usize, samples);
         }
     }
 
@@ -2426,6 +2478,7 @@ impl Rt {
             }
             Change::Strip { slot, param } => self.set_strip(e, slot, param),
             Change::Limiter { output, params } => self.set_limiter(e, output, params),
+            Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
             Change::Output { output, enabled } => self.set_output(output, enabled),
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => {
                 self.apply_generation(e)
@@ -2712,6 +2765,10 @@ impl Rt {
             // Silenced blocks too: the strip's filters and dynamics ring
             // out on silence.
             slot.run_strip(start, dst, b);
+            // Silenced blocks too: the delay plays what came before.
+            if let Some(d) = &mut slot.delay {
+                d.process(start, dst, b);
+            }
             for (c, ch) in dst.chunks_exact(b).enumerate() {
                 self.inbuf.channel_mut(slot.first_channel + c)[..b].copy_from_slice(ch);
             }
@@ -3027,6 +3084,11 @@ impl Rt {
                 // allocates nothing.
                 d.strip.clone_from(&s.strip);
                 d.strip_pos = s.strip_pos;
+                // The rings of the set it names hold the history: filled
+                // before the install.
+                if let (Some(l), Some(c)) = (&mut d.delay, &s.delay) {
+                    l.install(c.taps, c.pos, c.floor, usize::from(c.set));
+                }
             }
         }
         if strips {
@@ -3124,6 +3186,10 @@ impl Rt {
                 for n in 0..h.limiters.len() {
                     let (output, params) = h.limiters[n];
                     self.set_limiter(e, output, params);
+                }
+                for n in 0..h.delays.len() {
+                    let (slot, samples) = h.delays[n];
+                    self.set_delay(e, slot, samples);
                 }
                 // The page holding the boundary mixes both states: no
                 // record.
@@ -3650,6 +3716,7 @@ mod tests {
             stats: EMPTY_STATS,
             strip: None,
             strip_pos: None,
+            delay: None,
         }
     }
 
@@ -3740,6 +3807,7 @@ mod tests {
                     detached: false,
                     strip: Some(strip),
                     strip_pos: Some(20 * B),
+                    delay: None,
                 },
                 SlotCore {
                     up: false,
@@ -3750,6 +3818,7 @@ mod tests {
                     detached: true,
                     strip: None,
                     strip_pos: None,
+                    delay: None,
                 },
             ],
             limiters: vec![None, Some(limiter), None],

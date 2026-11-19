@@ -74,10 +74,11 @@ async fn handshake(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static) -> 
 }
 
 /// One request on `sender`: the status and the whole body, refused
-/// beyond [`crate::peer::MAX_RESPONSE`].
+/// beyond `limit` bytes.
 pub(crate) async fn send(
     sender: &mut Sender,
     request: Request<Full<Bytes>>,
+    limit: usize,
 ) -> io::Result<(StatusCode, Bytes)> {
     sender.ready().await.map_err(io::Error::other)?;
     let response = sender
@@ -85,7 +86,7 @@ pub(crate) async fn send(
         .await
         .map_err(io::Error::other)?;
     let status = response.status();
-    let body = Limited::new(response.into_body(), crate::peer::MAX_RESPONSE)
+    let body = Limited::new(response.into_body(), limit)
         .collect()
         .await
         .map_err(io::Error::other)?;
@@ -116,13 +117,18 @@ pub const MAX_IDLE: usize = 4;
 pub struct Pool {
     tls: Arc<PeerTls>,
     idle: Mutex<HashMap<String, Vec<Sender>>>,
+    max_response: usize,
 }
 
 impl Pool {
-    pub fn new(tls: Arc<PeerTls>) -> Arc<Pool> {
+    /// A pool reading answers of up to `max_response` bytes: at least
+    /// [`crate::peer::max_response`] of the engine's `delayBudgetSamples`,
+    /// so that a donor's core, its delay lines' history included, fits.
+    pub fn new(tls: Arc<PeerTls>, max_response: usize) -> Arc<Pool> {
         Arc::new(Pool {
             tls,
             idle: Mutex::default(),
+            max_response,
         })
     }
 
@@ -151,8 +157,12 @@ impl Pool {
                     connect(addr, Some(tls)).await?
                 }
             };
-            let (status, body) =
-                send(&mut sender, request(Method::POST, host(addr), path, body)).await?;
+            let (status, body) = send(
+                &mut sender,
+                request(Method::POST, host(addr), path, body),
+                self.max_response,
+            )
+            .await?;
             let mut idle = self.idle.lock().expect("pool lock poisoned");
             let idle = idle.entry(addr.to_owned()).or_default();
             if idle.len() < MAX_IDLE {
@@ -501,6 +511,7 @@ mod tests {
             let sent = send(
                 &mut sender,
                 request(Method::POST, "x", "/peer/any", Vec::new()),
+                crate::peer::MAX_RESPONSE,
             )
             .await;
             assert_eq!(sent.is_ok(), taken, "an answer of {len} bytes");

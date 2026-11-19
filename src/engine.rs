@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use samplez_dsp::duck::{DEPTH_DB, MAX_KEYS};
 use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{
-    DuckParam, Limiter, LimiterParams, MAX_DUCKS, Matrix, PlanarBuffer, Started, StripParam,
+    Delay, DelayRings, DuckParam, Limiter, LimiterParams, MAX_DUCKS, Matrix, PlanarBuffer, Started,
+    StripParam,
 };
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, RECOVERY_NS, Recovery,
@@ -299,6 +300,11 @@ pub enum Entry {
         output: usize,
         params: LimiterParams,
     },
+    /// Delays input slot `slot` by `samples` from the entry's index,
+    /// crossfading from the delay before over the ramp length, or after
+    /// a crossfade still running. At most the slot's `maxDelaySamples`;
+    /// 0 on a slot without a delay line sets nothing.
+    Delay { slot: usize, samples: u32 },
     /// Sets `setting` of duck group `group`, below [`MAX_DUCKS`], from the
     /// entry's index.
     Duck { group: usize, setting: DuckSetting },
@@ -687,6 +693,21 @@ fn check_limiter(config: &Config, output: usize, params: &LimiterParams) -> Resu
     params.check()
 }
 
+/// Whether input slot `slot` exists and its delay line takes a delay of
+/// `samples`; 0 any slot takes.
+fn check_delay(config: &Config, slot: usize, samples: u32) -> Result<(), String> {
+    let Some(input) = config.inputs.get(slot) else {
+        return Err(format!("no input slot {slot}"));
+    };
+    if samples > input.max_delay_samples {
+        return Err(format!(
+            "a delay of {samples} samples on input slot {slot}, its maxDelaySamples {}",
+            input.max_delay_samples
+        ));
+    }
+    Ok(())
+}
+
 /// Whether input slot `slot` exists and has a strip that takes `param`:
 /// one of 1 to [`MAX_LEGS`] channels.
 fn check_strip(config: &Config, slot: usize, param: &StripParam) -> Result<(), String> {
@@ -922,6 +943,15 @@ fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
         );
         // Without a flow it starts as a `Detach` leaves it.
         slot.detached = i.flow_id.is_none();
+        if i.max_delay_samples > 0 {
+            let rings = DelayRings::new(
+                i.channels as usize,
+                i.max_delay_samples,
+                config.history_slack_blocks() as usize,
+                config.block_size as usize,
+            );
+            slot.delay = Some(Delay::new(rings, config.ramp_samples));
+        }
         slots.push(slot);
         channel += i.channels as usize;
     }
@@ -1093,6 +1123,9 @@ fn replay_speed(config: &Config, api: &Arc<MxlApi>) -> f64 {
 /// A running engine. Dropping it stops the engine and releases its
 /// writers, which deletes their flows.
 pub struct Engine {
+    /// Per input slot the rings of its delay line, shared with the RT
+    /// thread: copied for a core, filled for a hand-over.
+    delays: Vec<Option<Arc<DelayRings>>>,
     stop: Arc<AtomicBool>,
     supervisor: Option<JoinHandle<()>>,
     counters: Arc<Counters>,
@@ -1342,6 +1375,9 @@ impl Engine {
         };
 
         let (slots, in_domains) = new_slots(&config);
+        let delays: Vec<Option<Arc<DelayRings>>> = (slots.iter())
+            .map(|s| s.delay.as_ref().map(|d| Arc::clone(d.rings())))
+            .collect();
         let mut outs = Vec::new();
         let mut channel = 0;
         for (n, o) in config.outputs.iter().enumerate() {
@@ -1661,6 +1697,7 @@ impl Engine {
             replica,
             transfer,
             replay_gate,
+            delays,
         })
     }
 
@@ -1745,6 +1782,16 @@ impl Engine {
         check_limiter(&self.config, output, &params).map_err(GainError::Invalid)?;
         let change = Change::Limiter { output, params };
         self.set_local(change, at_index, "limiter changes")
+    }
+
+    /// Delays input slot `slot` by `samples` from sample index
+    /// `at_index`, a multiple of the block size, as [`Entry::Delay`] does.
+    /// Refused as [`Engine::set_gain`] refuses a change, and as invalid
+    /// for a slot that does not exist or a delay above its
+    /// `maxDelaySamples`.
+    pub fn set_delay(&self, slot: usize, samples: u32, at_index: u64) -> Result<(), GainError> {
+        check_delay(&self.config, slot, samples).map_err(GainError::Invalid)?;
+        self.set_local(Change::Delay { slot, samples }, at_index, "delay changes")
     }
 
     /// Sets `setting` of duck group `group` from sample index `at_index`,
@@ -2173,6 +2220,10 @@ impl Engine {
                 check_limiter(&self.config, output, &params).map_err(EntryError::Invalid)?;
                 Change::Limiter { output, params }
             }
+            Entry::Delay { slot, samples } => {
+                check_delay(&self.config, slot, samples).map_err(EntryError::Invalid)?;
+                Change::Delay { slot, samples }
+            }
             Entry::Duck { .. } | Entry::DuckMask { .. } => {
                 return invalid("a duck entry is no single change".to_owned());
             }
@@ -2423,9 +2474,9 @@ impl Engine {
     /// after the next block the RT thread computes, `k0`, into a buffer
     /// allocated here, waiting up to `timeout` for it. The copy is kept
     /// only while the RT thread has not started the guard block of the
-    /// history after `k0` (`historySlackMs`), which a copy of history
-    /// rings needs; the engine keeps no delay line, so it holds the core
-    /// alone. A copy left behind by a timeout is returned by the next
+    /// history after `k0` (`historySlackMs`): the history of each delay
+    /// line its taps reach is copied from the rings after the core, while
+    /// the RT thread runs on. A copy left behind by a timeout is returned by the next
     /// call unless a control was sent or a hand-over installed after its
     /// buffer was. Calls serialise:
     /// one buffer is with the RT thread at a time. The copy holds every
@@ -2483,6 +2534,16 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(1));
         };
+        let mut copy = copy;
+        // The delays' history before the block after the core, kept only
+        // as long as the RT thread has not reached it, as checked below.
+        let end = (copy.k0 + 1) * self.block;
+        for (s, rings) in copy.core.slots.iter_mut().zip(&self.delays) {
+            if let (Some(d), Some(rings)) = (&mut s.delay, rings) {
+                let len = d.span_len(rings.max()) as u32;
+                d.span = rings.copy(usize::from(d.set), end, len);
+            }
+        }
         match history_kept(&shared.started, copy.k0, t.slack_blocks) {
             Ok(()) => Ok(copy),
             Err(started) => {
@@ -2524,8 +2585,14 @@ impl Engine {
         let limiters: Vec<Option<usize>> = (self.config.outputs.iter())
             .map(|o| o.limiter.then_some(o.channels as usize))
             .collect();
+        let delays: Vec<u32> = self
+            .config
+            .inputs
+            .iter()
+            .map(|i| i.max_delay_samples)
+            .collect();
         let ramp = self.config.ramp_samples;
-        if !c.fits(n, m, outputs, &legs, &limiters, ramp, page, ducked) {
+        if !c.fits(n, m, outputs, &legs, &limiters, &delays, ramp, page, ducked) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -2600,6 +2667,15 @@ impl Engine {
         let (hashes_tx, hashes) = rtrb::RingBuffer::new(4 * self.config.outputs.len().max(1));
         let (control, control_rx) = rtrb::RingBuffer::new(UNRESOLVED);
         let mut rt = replay_rt(&self.config, &self.api, gens, hashes_tx, control_rx);
+        // The delays' history before the core, into the replay's rings.
+        let end = next;
+        for (slot, s) in rt.slots.iter().zip(c.slots.iter_mut()) {
+            if let (Some(l), Some(d)) = (&slot.delay, &mut s.delay) {
+                let set = l.rings().active();
+                l.rings().fill(set, end, &d.span);
+                d.set = set as u8;
+            }
+        }
         rt.install_core(c, copy.last_id, true);
         Ok(Replay {
             rt: Box::new(rt),
@@ -2633,9 +2709,22 @@ impl Engine {
         // Up to the last block the RT thread computed, before the first
         // attempt.
         replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
-        self.offer(timeout, 0, true, &[], &[], |j, core| {
+        let rings = &self.delays;
+        self.offer(timeout, 0, true, &[], &[], &[], |j, core| {
             replay.run(j);
             replay.rt.capture(core);
+            // The replay's delay history up to the install, into the RT
+            // thread's other rings, which the core names: taken only by
+            // an install.
+            let end = replay.next * replay.rt.block;
+            for ((slot, s), rings) in (replay.rt.slots.iter()).zip(&mut core.slots).zip(rings) {
+                if let (Some(l), Some(d), Some(rings)) = (&slot.delay, &mut s.delay, rings) {
+                    let span = l.rings().copy(l.rings().active(), end, l.span(end));
+                    let set = rings.inactive();
+                    rings.fill(set, end, &span);
+                    d.set = set as u8;
+                }
+            }
             (replay.next - 1, replay.last_id)
         })
     }
@@ -2740,6 +2829,7 @@ impl Engine {
             || state.up.len() != slots
             || state.flows.len() != slots
             || state.strips.len() != slots
+            || state.delays.len() > slots
             || state.outputs.len() > self.config.outputs.len()
             || state.limiters.len() > self.config.outputs.len()
         {
@@ -2764,6 +2854,9 @@ impl Engine {
                 check_limiter(&self.config, output, params).map_err(ReplayError::Invalid)?;
             }
         }
+        for (slot, &samples) in state.delays.iter().enumerate() {
+            check_delay(&self.config, slot, samples).map_err(ReplayError::Invalid)?;
+        }
         check_product_ducks(&self.config, state).map_err(ReplayError::Invalid)?;
         if let Some(gain) = (state.gains.iter().flatten()).find(|g| !samplez_dsp::valid_gain(**g)) {
             return Err(ReplayError::Invalid(format!(
@@ -2774,6 +2867,7 @@ impl Engine {
         let limiters: Vec<(usize, LimiterParams)> = (state.limiters.iter().enumerate())
             .filter_map(|(o, p)| Some((o, (*p)?)))
             .collect();
+        let delays: Vec<(usize, u32)> = state.delays.iter().copied().enumerate().collect();
         // The entries of one log entry are adjacent and fold into one.
         let mut pending = Vec::with_capacity(state.pending.len());
         let mut batches = Vec::new();
@@ -2874,107 +2968,115 @@ impl Engine {
         let mut cold = crate::ducks::DuckCore::new(ramp);
         cold.cold(ramp, &state.ducks, legs);
         cold.settle(ramp, 0);
-        self.offer(left(), at_least, false, &strips, &limiters, |j, core| {
-            gains.copy_from_slice(&targets);
-            up.copy_from_slice(&state.up);
-            let mut disabled = disabled_targets;
-            masks.copy_from_slice(&mask_targets);
-            depths.copy_from_slice(&depth_targets);
-            // Whatever a spare core held.
-            core.ducks.copy_from(&cold);
-            let mut ducks_passed = false;
-            // The entries whose index the install passed are folded in
-            // like the rest of the state: reported late they would never
-            // apply.
-            let next = (j + 1) * self.block;
-            let passed = pending.partition_point(|e| e.at_index < next);
-            for e in &pending[..passed] {
-                match e.change {
-                    Change::Gain {
-                        input,
-                        output,
-                        gain,
-                    } => gains[input * m + output] = gain,
-                    Change::InputDown { slot } => up[slot] = false,
-                    Change::InputUp { slot } => up[slot] = true,
-                    Change::Output { output, enabled } => {
-                        disabled = output_disabled(disabled, output, enabled);
-                    }
-                    // The core holds neither a generation nor a strip or
-                    // limiter: the RT thread applies a passed re-route,
-                    // detach, strip or limiter entry itself, taken before
-                    // the install or after.
-                    Change::Route { .. }
-                    | Change::Detach { .. }
-                    | Change::Strip { .. }
-                    | Change::Limiter { .. } => {}
-                    Change::Batch { up: raised, .. } => {
-                        if let Some(b) = batch(e.id) {
-                            b.gains.each(|c, g| gains[c] = g);
-                            for &slot in &b.downs {
-                                up[slot as usize] = false;
-                            }
-                            for &(o, enabled) in &b.outputs {
-                                disabled = output_disabled(disabled, o as usize, enabled);
-                            }
-                            b.masks.each(|c, k| masks[c] = k);
-                            for &(row, g, db) in &b.depths {
-                                depths[row as usize * MAX_DUCKS + usize::from(g)] = db;
-                            }
-                            for &(g, change) in &b.ducks {
-                                let _ = core.ducks.apply(usize::from(g), change, legs);
-                                ducks_passed = true;
-                            }
+        self.offer(
+            left(),
+            at_least,
+            false,
+            &strips,
+            &limiters,
+            &delays,
+            |j, core| {
+                gains.copy_from_slice(&targets);
+                up.copy_from_slice(&state.up);
+                let mut disabled = disabled_targets;
+                masks.copy_from_slice(&mask_targets);
+                depths.copy_from_slice(&depth_targets);
+                // Whatever a spare core held.
+                core.ducks.copy_from(&cold);
+                let mut ducks_passed = false;
+                // The entries whose index the install passed are folded in
+                // like the rest of the state: reported late they would never
+                // apply.
+                let next = (j + 1) * self.block;
+                let passed = pending.partition_point(|e| e.at_index < next);
+                for e in &pending[..passed] {
+                    match e.change {
+                        Change::Gain {
+                            input,
+                            output,
+                            gain,
+                        } => gains[input * m + output] = gain,
+                        Change::InputDown { slot } => up[slot] = false,
+                        Change::InputUp { slot } => up[slot] = true,
+                        Change::Output { output, enabled } => {
+                            disabled = output_disabled(disabled, output, enabled);
                         }
-                        for slot in slots_of(raised) {
-                            up[slot] = true;
+                        // core holds neither generation nor a strip, limiter or delay:
+                        // RT thread applies a passed re-route, detach, strip, limiter or
+                        // delay entry itself, taken before install or after.
+                        Change::Route { .. }
+                        | Change::Detach { .. }
+                        | Change::Strip { .. }
+                        | Change::Limiter { .. }
+                        | Change::Delay { .. } => {}
+                        Change::Batch { up: raised, .. } => {
+                            if let Some(b) = batch(e.id) {
+                                b.gains.each(|c, g| gains[c] = g);
+                                for &slot in &b.downs {
+                                    up[slot as usize] = false;
+                                }
+                                for &(o, enabled) in &b.outputs {
+                                    disabled = output_disabled(disabled, o as usize, enabled);
+                                }
+                                b.masks.each(|c, k| masks[c] = k);
+                                for &(row, g, db) in &b.depths {
+                                    depths[row as usize * MAX_DUCKS + usize::from(g)] = db;
+                                }
+                                for &(g, change) in &b.ducks {
+                                    let _ = core.ducks.apply(usize::from(g), change, legs);
+                                    ducks_passed = true;
+                                }
+                            }
+                            for slot in slots_of(raised) {
+                                up[slot] = true;
+                            }
                         }
                     }
                 }
-            }
-            if ducks_passed {
-                core.ducks.settle(ramp, next);
-            } else {
-                core.ducks.align(next);
-            }
-            // From silence, whatever a spare core held, ducked as the
-            // masks and depths say from the start.
-            let ramping = core.matrix.fade_in_ducked(&gains, &masks, &depths, ramp);
-            core.matrix.align(next);
-            core.pos = Some(next);
-            core.ramp_end = if ramping { next + u64::from(ramp) } else { 0 };
-            core.pending.clear();
-            core.pending.extend_from_slice(&pending[passed..]);
-            // Shared: nothing is allocated in the hand-over's window.
-            core.batches.clear();
-            for e in &pending[passed..] {
-                if let Some(b) = batches.iter().find(|b| b.0 == e.id) {
-                    core.batches.push((e.id, Arc::clone(&b.1)));
+                if ducks_passed {
+                    core.ducks.settle(ramp, next);
+                } else {
+                    core.ducks.align(next);
                 }
-            }
-            core.page_entries.clear();
-            core.entries_page = None;
-            core.entries_lost = false;
-            core.outputs_disabled = disabled;
-            // The RT thread keeps its strips.
-            for ((c, &up), flow) in core.slots.iter_mut().zip(&up).zip(&state.flows) {
-                *c = SlotCore {
-                    up,
-                    silenced_last: true,
-                    detached: flow.is_none(),
-                    ..SlotCore::default()
-                };
-            }
-            core.awaiting_gen.clear();
-            // The RT thread keeps the generation it holds pending: the
-            // supervisor sends one only once its entry is committed, so
-            // the status can name one the RT thread does not hold yet.
-            core.pending_gen = None;
-            core.unresolved.clear();
-            core.late_routes.clear();
-            core.late_lost_until = 0;
-            (j, state.last_id)
-        })
+                // From silence, whatever a spare core held, ducked as the
+                // masks and depths say from the start.
+                let ramping = core.matrix.fade_in_ducked(&gains, &masks, &depths, ramp);
+                core.matrix.align(next);
+                core.pos = Some(next);
+                core.ramp_end = if ramping { next + u64::from(ramp) } else { 0 };
+                core.pending.clear();
+                core.pending.extend_from_slice(&pending[passed..]);
+                // Shared: nothing is allocated in the hand-over's window.
+                core.batches.clear();
+                for e in &pending[passed..] {
+                    if let Some(b) = batches.iter().find(|b| b.0 == e.id) {
+                        core.batches.push((e.id, Arc::clone(&b.1)));
+                    }
+                }
+                core.page_entries.clear();
+                core.entries_page = None;
+                core.entries_lost = false;
+                core.outputs_disabled = disabled;
+                // The RT thread keeps its strips.
+                for ((c, &up), flow) in core.slots.iter_mut().zip(&up).zip(&state.flows) {
+                    *c = SlotCore {
+                        up,
+                        silenced_last: true,
+                        detached: flow.is_none(),
+                        ..SlotCore::default()
+                    };
+                }
+                core.awaiting_gen.clear();
+                // The RT thread keeps the generation it holds pending: the
+                // supervisor sends one only once its entry is committed, so
+                // the status can name one the RT thread does not hold yet.
+                core.pending_gen = None;
+                core.unresolved.clear();
+                core.late_routes.clear();
+                core.late_lost_until = 0;
+                (j, state.last_id)
+            },
+        )
     }
 
     /// Passes the cores `make` fills to the RT thread until one is
@@ -2991,6 +3093,7 @@ impl Engine {
     /// holds, and its strips are installed.
     /// No core is installed before the first block starting at or after
     /// sample index `at_least`.
+    #[allow(clippy::too_many_arguments)]
     fn offer(
         &self,
         timeout: Duration,
@@ -2998,6 +3101,7 @@ impl Engine {
         replayed: bool,
         strips: &[(usize, StripParam)],
         limiters: &[(usize, LimiterParams)],
+        delays: &[(usize, u32)],
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
@@ -3095,6 +3199,7 @@ impl Engine {
                 replayed,
                 strips: strips.to_vec(),
                 limiters: limiters.to_vec(),
+                delays: delays.to_vec(),
                 answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
@@ -6336,6 +6441,7 @@ mod tests {
             replayed: true,
             strips: Vec::new(),
             limiters: Vec::new(),
+            delays: Vec::new(),
             answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
@@ -6396,9 +6502,15 @@ mod tests {
         let (e, _statuses, _verdicts, domain) = outputs_only("copy-handover", 1);
         copy_left_behind(&e);
         let j = e
-            .offer(Duration::from_secs(5), 0, false, &[], &[], |j, core| {
-                bare_core(&e, j, core)
-            })
+            .offer(
+                Duration::from_secs(5),
+                0,
+                false,
+                &[],
+                &[],
+                &[],
+                |j, core| bare_core(&e, j, core),
+            )
             .unwrap();
         let c = e.copy_core(Duration::from_secs(2)).unwrap();
         assert!(
@@ -6422,6 +6534,7 @@ mod tests {
         let c = &e.counters;
         let state = ProductState {
             limiters: Vec::new(),
+            delays: Vec::new(),
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
@@ -6487,6 +6600,7 @@ mod tests {
         CLOCK_STEP_LOOP.store(std::ptr::from_ref(&**c) as usize, Relaxed);
         let state = ProductState {
             limiters: Vec::new(),
+            delays: Vec::new(),
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
@@ -6552,10 +6666,18 @@ mod tests {
             let w = without();
             wait(&|| without() > w + 5);
             let before = installed();
-            let r = e.offer(Duration::from_secs(5), 0, false, &[], &[], |j, core| {
-                CLOCK_STEP_NS.store(-1_500_000_000, Relaxed);
-                bare_core(&e, j, core)
-            });
+            let r = e.offer(
+                Duration::from_secs(5),
+                0,
+                false,
+                &[],
+                &[],
+                &[],
+                |j, core| {
+                    CLOCK_STEP_NS.store(-1_500_000_000, Relaxed);
+                    bare_core(&e, j, core)
+                },
+            );
             assert_eq!(r, Err(ReplayError::Timeout { passed: 0 }));
             assert!(e.transfer.as_ref().unwrap().lock().unwrap().handing);
             e.drop_core_by(Instant::now() + Duration::from_secs(5))
@@ -7288,6 +7410,7 @@ mod tests {
                 replayed: true,
                 strips: Vec::new(),
                 limiters: Vec::new(),
+                delays: Vec::new(),
                 answer: Answer::Waiting,
             };
             assert!(t.handovers.push(h).is_ok());
@@ -7334,7 +7457,7 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5), "no stall");
         }
         let mut calls = Vec::new();
-        let _ = e.offer(Duration::from_secs(1), 0, true, &[], &[], |j, _| {
+        let _ = e.offer(Duration::from_secs(1), 0, true, &[], &[], &[], |j, _| {
             calls.push((j, processed()));
             (j, 0)
         });
@@ -7378,7 +7501,15 @@ mod tests {
             Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
         };
         let before = cpu();
-        let err = e.offer(Duration::from_millis(300), 0, true, &[], &[], |j, _| (j, 0));
+        let err = e.offer(
+            Duration::from_millis(300),
+            0,
+            true,
+            &[],
+            &[],
+            &[],
+            |j, _| (j, 0),
+        );
         let spent = cpu() - before;
         assert!(matches!(err, Err(ReplayError::Timeout { .. })), "{err:?}");
         assert!(spent < Duration::from_millis(100), "{spent:?} of CPU");
@@ -7396,9 +7527,15 @@ mod tests {
         let before = e.counters.handovers_passed.load(Relaxed);
         // Each core follows a block two behind the last one computed:
         // every attempt is refused.
-        let err = e.offer(Duration::from_millis(300), 0, true, &[], &[], |j, _| {
-            (j.saturating_sub(2), 0)
-        });
+        let err = e.offer(
+            Duration::from_millis(300),
+            0,
+            true,
+            &[],
+            &[],
+            &[],
+            |j, _| (j.saturating_sub(2), 0),
+        );
         let refused = e.counters.handovers_passed.load(Relaxed) - before;
         let Err(ReplayError::Timeout { passed }) = err else {
             panic!("{err:?}");

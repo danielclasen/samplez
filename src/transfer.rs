@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Limiter, LimiterParams, Matrix, Strip, StripParam};
+use samplez_dsp::{Limiter, LimiterParams, Matrix, Strip, StripParam, Taps};
 use samplez_mxl::time;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,131 @@ pub(crate) struct SlotCore {
     /// state holds none and leaves the RT thread's.
     pub strip: Option<Strip>,
     pub strip_pos: Option<u64>,
+    /// The slot's delay: its taps and position, the set of rings it
+    /// reads, and per leg the span of history its taps reach back over,
+    /// copied off the RT thread. None on a slot without a delay line.
+    pub delay: Option<DelayCore>,
+}
+
+/// A delay's state in a core.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DelayCore {
+    pub taps: Taps,
+    pub pos: Option<u64>,
+    /// The oldest index the delay may still read.
+    pub floor: u64,
+    pub set: u8,
+    /// Per leg, the samples from the floor to the position, at most the
+    /// line's longest delay ([`samplez_dsp::Delay::span`]); empty until
+    /// copied. Carried as the samples' bit patterns, little-endian, in
+    /// base64: about 5.3 bytes a sample.
+    #[serde(with = "span_bits")]
+    pub span: Vec<Vec<f32>>,
+}
+
+/// Serde of a delay span as one base64 string of f32 bit patterns per
+/// leg.
+mod span_bits {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn serialize<S: Serializer>(span: &[Vec<f32>], s: S) -> Result<S::Ok, S::Error> {
+        span.iter()
+            .map(|leg| encode(leg))
+            .collect::<Vec<_>>()
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {
+        Vec::<String>::deserialize(d)?
+            .iter()
+            .map(|leg| decode(leg).ok_or_else(|| serde::de::Error::custom("a malformed span")))
+            .collect()
+    }
+
+    pub(super) fn encode(leg: &[f32]) -> String {
+        let bytes: Vec<u8> = leg.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    pub(super) fn decode(text: &str) -> Option<Vec<f32>> {
+        let digit = |c: u8| ALPHABET.iter().position(|&a| a == c).map(|p| p as u32);
+        let text = text.as_bytes();
+        if !text.len().is_multiple_of(4) {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(text.len() / 4 * 3);
+        for quad in text.chunks(4) {
+            let pad = quad.iter().rev().take_while(|&&c| c == b'=').count();
+            if pad > 2 {
+                return None;
+            }
+            let mut n = 0;
+            for &c in &quad[..4 - pad] {
+                n = n << 6 | digit(c)?;
+            }
+            n <<= 6 * pad;
+            bytes.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+        }
+        if !bytes.len().is_multiple_of(4) {
+            return None;
+        }
+        let leg: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_bits(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            .collect();
+        // The canonical form only: one span has one encoding.
+        (encode(&leg) == std::str::from_utf8(text).ok()?).then_some(leg)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// Any span round-trips bit for bit, NaN payloads and signed
+        /// zeros included, and a malformed or non-canonical one is
+        /// refused.
+        #[test]
+        fn a_span_round_trips_and_only_canonical_text_decodes() {
+            for len in 0..12 {
+                let leg: Vec<f32> = (0..len)
+                    .map(|i| f32::from_bits(0x7fc0_0001_u32.wrapping_mul(i as u32 + 1)))
+                    .chain([-0.0, 0.0, 1.5])
+                    .collect();
+                let text = super::encode(&leg);
+                let back = super::decode(&text).unwrap();
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&back), bits(&leg), "{text}");
+            }
+            assert_eq!(super::encode(&[1.0]), "AACAPw==");
+            for bad in ["AACAPw=", "AACAP===", "AACAPx==", "AA#APw==", "AACA"] {
+                assert_eq!(super::decode(bad), None, "{bad}");
+            }
+        }
+    }
+}
+
+impl DelayCore {
+    /// The samples per leg a copy carries for a line of `max`.
+    pub(crate) fn span_len(&self, max: u32) -> usize {
+        let end = self.pos.unwrap_or(0);
+        end.saturating_sub(self.floor).min(u64::from(max)) as usize
+    }
 }
 
 /// The core of an engine after a block.
@@ -132,6 +257,11 @@ impl Core {
     /// it carries, so the RT thread drops none, and makes room for as
     /// many as it holds pending.
     pub(crate) fn prepare(&mut self) {
+        for s in &mut self.slots {
+            if let Some(d) = &mut s.delay {
+                d.span = Vec::new();
+            }
+        }
         self.batches.clear();
         self.batches.reserve_exact(PENDING_CHANGES);
         self.handed.0.clear();
@@ -195,6 +325,11 @@ impl Core {
         self.limiters.get(output)?.as_ref().map(Limiter::params)
     }
 
+    /// The taps of slot `slot`'s delay; none for a slot without one.
+    pub fn delay_taps(&self, slot: usize) -> Option<Taps> {
+        Some(self.slots.get(slot)?.delay.as_ref()?.taps)
+    }
+
     /// The `(log id, at_index)` of the entries pending before their index.
     pub fn pending(&self) -> impl Iterator<Item = (LogId, u64)> + '_ {
         self.pending.iter().map(|e| (e.id, e.at_index))
@@ -246,6 +381,7 @@ impl Core {
                     Change::Gain { gain, .. } => samplez_dsp::valid_gain(gain),
                     Change::Strip { param, .. } => param.check(usize::MAX).is_ok(),
                     Change::Limiter { params, .. } => params.check().is_ok(),
+                    Change::Delay { samples, .. } => samples <= samplez_dsp::MAX_DELAY_SAMPLES,
                     Change::Batch {
                         routed, detached, ..
                     } => detached & !routed == 0,
@@ -257,6 +393,13 @@ impl Core {
                 && s.fade_start.is_none_or(index)
                 && s.xfade.is_none_or(index)
                 && s.strip_pos.is_none_or(index)
+                && s.delay.as_ref().is_none_or(|d| {
+                    d.pos.is_none_or(index)
+                        && index(d.floor)
+                        && index(d.taps.start)
+                        && d.set < 2
+                        && d.taps.is_within(samplez_dsp::MAX_DELAY_SAMPLES)
+                })
         };
         let ats = |list: &[(LogId, u64)]| list.iter().all(|&(_, at)| index(at));
         self.pos.is_none_or(index)
@@ -290,7 +433,9 @@ impl Core {
             let (Some((_, b)), None) = (of.next(), of.next()) else {
                 return false;
             };
-            if !b.sane() || (strips && b.strips.is_empty() && b.limiters.is_empty()) {
+            if !b.sane()
+                || (strips && b.strips.is_empty() && b.limiters.is_empty() && b.delays.is_empty())
+            {
                 return false;
             }
         }
@@ -305,7 +450,9 @@ impl Core {
     /// within them, and ducks only on the duck columns `ducked`: checked
     /// before a replay installs it. A slot has a
     /// strip of its legs exactly when it is at most [`MAX_LEGS`] wide,
-    /// and an output a limiter of the legs `limiters` names for it.
+    /// and output limiter legs `limiters` names for it, and delay, with the
+    /// span its taps reach, exactly when `delays` names the longest delay for
+    /// it, taps within that.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fits(
         &self,
@@ -314,6 +461,7 @@ impl Core {
         outputs: usize,
         legs: &[usize],
         limiters: &[Option<usize>],
+        delays: &[u32],
         ramp: u32,
         page_entries: usize,
         ducked: &[usize],
@@ -353,6 +501,21 @@ impl Core {
                 let want = limiters.get(o).copied().flatten();
                 held.map(|l| (l.legs(), l.ramp())) == want.map(|legs| (legs, ramp))
             })
+            && (0..self.slots.len().max(delays.len())).all(|i| {
+                let max = delays.get(i).copied().unwrap_or(0);
+                match self.slots.get(i).and_then(|s| s.delay.as_ref()) {
+                    None => max == 0,
+                    Some(d) => {
+                        let len = d.span_len(max);
+                        max > 0
+                            && d.taps.is_within(max)
+                            && d.pos == self.pos
+                            && d.pos.is_some_and(|p| d.floor <= p)
+                            && d.span.len() == legs.get(i).copied().unwrap_or(0)
+                            && d.span.iter().all(|leg| leg.len() == len)
+                    }
+                }
+            })
             && self.ducks.fits(legs, ramp)
             && unducked(&self.matrix)
     }
@@ -386,6 +549,9 @@ pub(crate) fn fits(
             slot < slots && legs[slot] <= MAX_LEGS && param.check(legs[slot]).is_ok()
         }
         Change::Limiter { output, params } => output < outputs && params.check().is_ok(),
+        Change::Delay { slot, samples } => {
+            slot < slots && samples <= samplez_dsp::MAX_DELAY_SAMPLES
+        }
         Change::Batch { up, routed, .. } => slots_of(up | routed).all(|s| s < slots),
     }
 }
@@ -410,6 +576,8 @@ pub(crate) struct Handover {
     /// Limiter parameters set at the install index, by output, as
     /// `strips`.
     pub limiters: Vec<(usize, LimiterParams)>,
+    /// Delays set at the install index, by slot, as `strips`.
+    pub delays: Vec<(usize, u32)>,
     pub answer: Answer,
 }
 
@@ -774,6 +942,7 @@ fn change_of(entry: &Entry) -> Change {
         },
         Entry::Strip { slot, param } => Change::Strip { slot, param },
         Entry::Limiter { output, params } => Change::Limiter { output, params },
+        Entry::Delay { slot, samples } => Change::Delay { slot, samples },
         Entry::Duck { .. } | Entry::DuckMask { .. } => {
             unreachable!("duck entries are items of their own")
         }
@@ -804,6 +973,11 @@ pub struct ProductState {
     /// set again at the install, the limiter's own state kept. An output
     /// past the list keeps what its limiter holds.
     pub limiters: Vec<Option<LimiterParams>>,
+    /// Per input slot its delay in samples, set again at the install;
+    /// a slot past the list keeps its own. The delay lines keep their
+    /// history, so a slot delayed reads its own past until the delay
+    /// has passed.
+    pub delays: Vec<u32>,
     /// Per duck group, at most [`samplez_dsp::MAX_DUCKS`], its targets: a
     /// group past the list holds [`DuckTargets::default`]. The detectors
     /// start cold at the install: key filters at rest, no hold, the
@@ -978,6 +1152,7 @@ mod tests {
             detached: true,
             strip: Some(strip()),
             strip_pos: Some(4800),
+            delay: None,
         };
         core.unresolved.push((9, 1 << 40));
         CoreCopy {
@@ -1244,29 +1419,70 @@ mod tests {
     #[test]
     fn a_core_fits_only_its_own_shape() {
         let mut copy = copy();
-        assert!(copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 3, 1, &[1, 1], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 0, &[]));
+        assert!(copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 3, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 0, &[]));
         // Strips of other legs, another ramp, or none on a narrow slot;
         // a slot wider than a strip has none.
-        assert!(!copy.core.fits(2, 2, 1, &[1, 2], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 480, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 2], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 480, 8, &[]));
         copy.core.slots[0].strip = None;
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
-        assert!(copy.core.fits(2, 2, 1, &[MAX_LEGS + 1, 1], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(
+            copy.core
+                .fits(2, 2, 1, &[MAX_LEGS + 1, 1], &[], &[], 48, 8, &[])
+        );
         copy.core.slots[0].strip = Some(Strip::new(1, 48));
         copy.core.pending.push(RtEntry {
             id: 8,
             at_index: 9648,
             change: Change::InputDown { slot: 2 },
         });
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
         copy.core.pending.pop();
         // Output 1 disabled: a core of two outputs, not of one.
         copy.core.outputs_disabled = 0b10;
-        assert!(copy.core.fits(2, 2, 2, &[1, 1], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
+        assert!(copy.core.fits(2, 2, 2, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
         copy.core.outputs_disabled = 0;
+        // A delay on slot 0 of 1 leg and a line of 100: its span reaches
+        // from the floor to the core's position.
+        let fits = |c: &Core, delays: &[u32]| c.fits(2, 2, 1, &[1, 1], &[], delays, 48, 8, &[]);
+        let pos = copy.core.pos.unwrap();
+        copy.core.slots[0].delay = Some(DelayCore {
+            taps: Taps {
+                to: 30,
+                ..Taps::default()
+            },
+            pos: Some(pos),
+            floor: pos - 30,
+            set: 1,
+            span: vec![vec![0.5; 30]],
+        });
+        assert!(fits(&copy.core, &[100, 0]));
+        assert!(
+            !fits(&copy.core, &[]),
+            "a delay on a slot configured without"
+        );
+        assert!(!fits(&copy.core, &[20, 0]), "taps beyond the line");
+        assert!(
+            !fits(&copy.core, &[100, 100]),
+            "no delay on a slot with a line"
+        );
+        let mut c = CoreCopy::decode(&copy.encode()).unwrap();
+        c.core.slots[0].delay.as_mut().unwrap().span[0].pop();
+        assert!(!fits(&c.core, &[100, 0]), "a span short of the floor");
+        let mut c = CoreCopy::decode(&copy.encode()).unwrap();
+        c.core.slots[0].delay.as_mut().unwrap().pos = Some(pos + 48);
+        assert!(
+            !fits(&c.core, &[100, 0]),
+            "a position other than the core's"
+        );
+        let back = CoreCopy::decode(&copy.encode()).unwrap();
+        assert!(
+            fits(&back.core, &[100, 0]) && back.core.slots[0].delay == copy.core.slots[0].delay
+        );
+        copy.core.slots[0].delay = None;
         copy.core.pending.push(RtEntry {
             id: 8,
             at_index: 9648,
@@ -1275,8 +1491,8 @@ mod tests {
                 enabled: false,
             },
         });
-        assert!(copy.core.fits(2, 2, 2, &[1, 1], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
+        assert!(copy.core.fits(2, 2, 2, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
     }
 
     /// A copy whose detector 2 is keyed by slot 1, forced on and
@@ -1317,17 +1533,17 @@ mod tests {
         );
         assert_eq!(a.envelope().to_bits(), b.envelope().to_bits());
         assert_eq!(decoded.core.duck_mask(1, 0), 0b100);
-        assert!(decoded.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[0]));
+        assert!(decoded.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[0]));
         // Its mask is on column 0: refused on an engine whose duck
         // columns leave it out, or that has none.
-        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[1]));
-        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
+        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[1]));
+        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
         assert!(
-            !decoded.core.fits(2, 2, 1, &[1, 2], &[], 48, 8, &[0]),
+            !decoded.core.fits(2, 2, 1, &[1, 2], &[], &[], 48, 8, &[0]),
             "key 0 of another width"
         );
         assert!(
-            !decoded.core.fits(2, 2, 1, &[1, 1], &[], 480, 8, &[0]),
+            !decoded.core.fits(2, 2, 1, &[1, 1], &[], &[], 480, 8, &[0]),
             "another key filter ramp"
         );
     }

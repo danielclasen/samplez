@@ -154,6 +154,8 @@ pub(crate) struct Batch {
     pub strips: Vec<(u32, StripParam)>,
     /// Limiter parameters by output, ascending.
     pub limiters: Vec<(u32, LimiterParams)>,
+    /// Delays by slot, in samples, ascending.
+    pub delays: Vec<(u32, u32)>,
     /// The slots going down, ascending.
     pub downs: Vec<u32>,
     /// The outputs enabled (true) or disabled, ascending.
@@ -198,6 +200,8 @@ impl Batch {
                 .all(|w| (w[0].0, strip_key(&w[0].1)) < (w[1].0, strip_key(&w[1].1)))
             && self.limiters.iter().all(|(_, p)| p.check().is_ok())
             && self.limiters.windows(2).all(|w| w[0].0 < w[1].0)
+            && (self.delays.iter()).all(|&(_, d)| d <= samplez_dsp::MAX_DELAY_SAMPLES)
+            && self.delays.windows(2).all(|w| w[0].0 < w[1].0)
             && self.downs.windows(2).all(|w| w[0] < w[1])
             && self.outputs.windows(2).all(|w| w[0].0 < w[1].0)
             && self
@@ -238,6 +242,7 @@ impl Batch {
         };
         gains
             && self.strips.iter().all(strip)
+            && self.delays.iter().all(|&(s, _)| (s as usize) < legs.len())
             && self.downs.iter().all(|&s| (s as usize) < legs.len())
             && self.outputs.iter().all(|&(o, _)| (o as usize) < outputs)
             && self.limiters.iter().all(|&(o, _)| (o as usize) < outputs)
@@ -279,8 +284,8 @@ struct SlotFold {
 /// fold into: none for no change, a single change as itself, more, or
 /// any duck setting, depth or mask, as a [`Change::Batch`] with its
 /// batch. Per coefficient, strip parameter key, duck setting kind, depth
-/// and mask the last value counts, and per output its last `Output`
-/// and its last limiter parameters. Per
+/// and mask last value counts, per output its last `Output` and
+/// last limiter parameters, per slot its last delay. Per
 /// input slot a `Route` and its up or
 /// down state are kept apart ([`SlotFold`]): an `InputUp` and a `Route`
 /// raise the slot on the new flow, a `Route` and an `InputDown` leave it
@@ -301,6 +306,7 @@ pub(crate) fn fold(
     let mut masks = BTreeMap::new();
     let mut outputs = BTreeMap::new();
     let mut limiters = BTreeMap::new();
+    let mut delays = BTreeMap::new();
     for &item in items {
         let c = match item {
             Item::Change(c) => c,
@@ -335,6 +341,9 @@ pub(crate) fn fold(
             Change::Limiter { output, params } => {
                 limiters.insert(output as u32, params);
             }
+            Change::Delay { slot, samples } => {
+                delays.insert(slot as u32, samples);
+            }
             Change::Route { slot } | Change::Detach { slot } => {
                 let s = slots.entry(slot).or_default();
                 s.routed = true;
@@ -368,6 +377,7 @@ pub(crate) fn fold(
     let facts = gains.len()
         + strips.len()
         + limiters.len()
+        + delays.len()
         + downs.len()
         + outputs.len()
         + up.count_ones() as usize
@@ -395,6 +405,11 @@ pub(crate) fn fold(
                 output: output as usize,
                 params,
             }
+        } else if let Some((&slot, &samples)) = delays.first_key_value() {
+            Change::Delay {
+                slot: slot as usize,
+                samples,
+            }
         } else if let Some(&slot) = downs.first() {
             Change::InputDown {
                 slot: slot as usize,
@@ -417,6 +432,7 @@ pub(crate) fn fold(
         gains: Coefs::of(gains.into_iter().collect(), coefficients),
         strips: strips.into_iter().map(|((s, _), p)| (s, p)).collect(),
         limiters: limiters.into_iter().collect(),
+        delays: delays.into_iter().collect(),
         downs,
         outputs: outputs.into_iter().collect(),
         ducks: ducks.into_iter().map(|((g, _), c)| (g, c)).collect(),
@@ -426,7 +442,7 @@ pub(crate) fn fold(
         masks: Coefs::of(masks.into_iter().collect(), coefficients),
     };
     let change = Change::Batch {
-        strips: !batch.strips.is_empty() || !batch.limiters.is_empty(),
+        strips: !batch.strips.is_empty() || !batch.limiters.is_empty() || !batch.delays.is_empty(),
         up,
         routed,
         detached,
@@ -589,6 +605,29 @@ mod tests {
         assert!(!bad.sane());
     }
 
+    /// A slot's delays in one log entry: the last counts, a lone one is
+    /// itself, and a batch holding them says it sets parameters.
+    #[test]
+    fn a_slots_last_delay_wins() {
+        let set = |slot, samples| Change::Delay { slot, samples };
+        let one = |changes: &[Change]| fold(&items(changes), 2, 4).unwrap().unwrap();
+        assert_eq!(one(&[set(1, 10), set(1, 20)]), (set(1, 20), None));
+        let (change, batch) = one(&[set(1, 10), set(0, 5), set(1, 30)]);
+        assert!(
+            matches!(change, Change::Batch { strips: true, .. }),
+            "{change:?}"
+        );
+        let batch = batch.unwrap();
+        assert_eq!(batch.delays, [(0, 5), (1, 30)]);
+        assert!(batch.sane() && batch.fits(2, 2, 1, &[1, 1], &[]));
+        assert!(!batch.fits(2, 2, 1, &[1], &[]), "slot 1 of 1");
+        let mut bad = (*batch).clone();
+        bad.delays[0].1 = samplez_dsp::MAX_DELAY_SAMPLES + 1;
+        assert!(!bad.sane());
+        bad.delays = vec![batch.delays[1], batch.delays[0]];
+        assert!(!bad.sane());
+    }
+
     /// Of a slot's `Route`s and `Detach`es in one log entry the last
     /// counts: a `Detach` after a `Route` leaves the slot detached, a
     /// `Route` after a `Detach` re-routes it, and either is one change.
@@ -645,6 +684,7 @@ mod tests {
                     gains: Gains::Sparse(Vec::new()),
                     strips: Vec::new(),
                     limiters: Vec::new(),
+                    delays: Vec::new(),
                     downs: Vec::new(),
                     outputs: Vec::new(),
                     ducks: Vec::new(),

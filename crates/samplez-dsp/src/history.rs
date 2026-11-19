@@ -49,6 +49,35 @@ impl History {
         }
     }
 
+    /// RT side: fills `dst` with the samples at the indices from `start`
+    /// on, as stored; at most the ring's length.
+    pub fn read(&self, start: u64, dst: &mut [f32]) {
+        let len = self.ring.len();
+        assert!(dst.len() <= len, "a span longer than the ring");
+        let mut pos = (start % len as u64) as usize;
+        for d in dst {
+            *d = f32::from_bits(self.ring[pos].load(Relaxed));
+            pos += 1;
+            if pos == len {
+                pos = 0;
+            }
+        }
+    }
+
+    /// RT side: stores silence at the `count` indices from `start` on, at
+    /// most the ring's length.
+    pub fn clear(&self, start: u64, count: u64) {
+        let len = self.ring.len() as u64;
+        for i in start..start + count.min(len) {
+            self.ring[(i % len) as usize].store(0, Relaxed);
+        }
+    }
+
+    /// The longest span a copy takes.
+    pub fn max_delay(&self) -> usize {
+        self.max_delay
+    }
+
     /// Copy side: fills `dst`, at most `max_delay` samples, with the
     /// samples at the indices before `end`; an index below 0 reads
     /// silence. The copy is intact only if [`Started::confirms`] says so

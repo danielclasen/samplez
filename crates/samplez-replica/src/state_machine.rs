@@ -897,6 +897,7 @@ impl<P: Product> StateMachine<P> {
             flows: targets.flows,
             outputs: targets.outputs,
             strips: targets.strips,
+            delays: targets.delays,
             ducks: targets.ducks,
             masks: targets.masks,
             pending: Vec::new(),

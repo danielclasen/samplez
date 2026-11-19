@@ -5,8 +5,9 @@
 //! coefficient ramping, undocked and ducked; the strips, 64 mono ones, the meters of the 64
 //! input channels after them and eight duck detectors keyed by them have
 //! one path, metered as the RT loop runs them, and idle as an engine with
-//! no duck group in use runs them; so do limiters on the 96 output
-//! channels as 48 stereo outputs, limiting and off. It also gates the RT parts of a resync
+//! no duck group in use runs them; so do limiters on 96 output
+//! channels as 48 stereo outputs, limiting and off, and 64 mono input
+//! delays, settled and crossfading. It also gates the RT parts of a resync
 //! at that shape: the matrix and detector copies of the core and one
 //! block's history stores. The hard limits are the
 //! instruction counts measured in the builder image plus 10 %, rounded
@@ -19,9 +20,9 @@ use gungraun::{Callgrind, EventKind};
 use samplez_dsp::duck::MAX_KEYS;
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
-    CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams, History,
-    KWeighting, KeyFilter, Limiter, LimiterParams, MAX_DUCKS, Matrix, Path, PlanarBuffer, Started,
-    Strip, StripParam, TruePeak, accumulate,
+    CompParams, Delay, DelayRings, Detector, DetectorParams, DuckMode, DuckParam, EqBand,
+    GateParams, History, KWeighting, KeyFilter, Limiter, LimiterParams, MAX_DUCKS, Matrix, Path,
+    PlanarBuffer, Started, Strip, StripParam, TruePeak, accumulate,
 };
 
 const B: usize = 48;
@@ -273,6 +274,35 @@ fn limiter(
     (limiters, buf, scratch)
 }
 
+/// 64 mono delays of 100 ms, settled or crossfading to 50 ms.
+fn delays(fading: bool) -> (Vec<Delay>, PlanarBuffer) {
+    let mut v = Vec::new();
+    for _ in 0..INPUTS {
+        let mut d = Delay::new(DelayRings::new(1, 9600, 2, B), 480);
+        assert!(d.set(0, 4800));
+        let mut block = vec![0.0; B];
+        // Up to the block measured.
+        for k in 0..40 {
+            d.process(k * B as u64, &mut block, B);
+        }
+        if fading {
+            assert!(d.set(1920, 2400));
+        }
+        v.push(d);
+    }
+    (v, signal(INPUTS))
+}
+
+#[library_benchmark]
+#[bench::settled(args = (false,), setup = delays, config = limit(DELAYS_SETTLED))]
+#[bench::fading(args = (true,), setup = delays, config = limit(DELAYS_FADING))]
+fn delay((mut delays, mut buf): (Vec<Delay>, PlanarBuffer)) -> (Vec<Delay>, PlanarBuffer) {
+    for (c, d) in delays.iter_mut().enumerate() {
+        d.process(1920, black_box(buf.channel_mut(c)), B);
+    }
+    (delays, buf)
+}
+
 /// Eight detectors, each keyed by eight of the 64 mono inputs through
 /// both key filters, the low-pass ramping on, the signal around the
 /// threshold.
@@ -456,6 +486,8 @@ const STRIPS_SETTLED_FAST: u64 = 1_273_161;
 const DUCK: u64 = 407_817;
 const LIMITERS_ON: u64 = 655_232;
 const LIMITERS_OFF: u64 = 171_994;
+const DELAYS_SETTLED: u64 = 372_606;
+const DELAYS_FADING: u64 = 473_348;
 const DUCK_ADVANCE: u64 = 4_065;
 
 library_benchmark_group!(
@@ -467,6 +499,7 @@ library_benchmark_group!(
         input_meters,
         strip,
         limiter,
+        delay,
         duck,
         duck_metered,
         duck_idle,

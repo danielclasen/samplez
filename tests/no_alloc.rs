@@ -130,6 +130,7 @@ fn rt_thread_allocates_nothing() {
     let mut cfg = config(&domain.0, &[(&src, 2)], &[(&dst, 2)], matrix, MARGIN);
     common::add_meter(&mut cfg, "bus", 2, 0.5);
     cfg.outputs[0].limiter = true;
+    cfg.inputs[0].max_delay_samples = 4800;
     let (engine, rx) = start(cfg);
     RT_TID.store(engine.status().rt.thread.tid, Relaxed);
     let attached = || engine.status().inputs[0].state == InputState::Attached;
@@ -157,6 +158,9 @@ fn rt_thread_allocates_nothing() {
     engine
         .set_limiter(0, limiter, (index / B + 20) * B)
         .unwrap();
+    // A delay, crossfading in, then another while it does.
+    engine.set_delay(0, 2400, (index / B + 20) * B).unwrap();
+    engine.set_delay(0, 1200, (index / B + 21) * B).unwrap();
     let reset = (index / B + 40) * B;
     engine.reset_loudness(0, reset).unwrap();
     // The meter after the output.

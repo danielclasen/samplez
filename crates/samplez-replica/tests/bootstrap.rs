@@ -336,7 +336,7 @@ impl Set {
         let store = Store::open(&dir, Arc::new(Paths::default), limits).unwrap();
         let prepared = bootstrap::prepare(&volume, slot, store.pristine()).unwrap();
         let tls = Arc::new(PeerTls::new(&self.tls[&slot], &Metrics::default()).unwrap());
-        let pool = Pool::new(tls.clone());
+        let pool = Pool::new(tls.clone(), samplez_replica::peer::MAX_RESPONSE);
         let settings = Settings {
             id: prepared.id,
             epoch: prepared.epoch,
