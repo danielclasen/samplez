@@ -1898,7 +1898,9 @@ fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
         let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
         let ducked = || hashed_of(&domain, &[(&src, 2)], |c| c.duck_columns = vec![0, 1]);
         let (a, b, c) = (ducked(), ducked(), ducked());
-        let at1 = (now_block() + 20) * B;
+        // Past every replica's fade-in from its attach: a key that fades
+        // in on one replica only parts its detector from the others'.
+        let at1 = (now_block() + u64::from(RAMP).div_ceil(B) + 20) * B;
         let entries = |attack_ms: f32| {
             let duck = |setting| Entry::Duck { group: 0, setting };
             let p = DetectorParams {
@@ -1922,7 +1924,7 @@ fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
             ]
         };
         let skipped = |e: &Engine| e.counters().overrun_skipped_samples.load(Relaxed);
-        let skipped_before: Vec<u64> = [&a, &b, &c].iter().map(|h| skipped(&h.e)).collect();
+        let live_skipped = (skipped(&a.e), skipped(&c.e));
         // The joiner's attack sets its detector apart, and nothing else:
         // a joiner keeping its own detector would compute other pages.
         for (e, attack) in [(&a.e, 500.0), (&c.e, 500.0), (&b.e, 50.0)] {
@@ -1942,6 +1944,7 @@ fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
         let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
         let mut replay = b.e.replay(copy).unwrap();
         let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let joiner_skipped = skipped(&b.e);
         let passed = b.e.counters().handovers_passed.load(Relaxed);
         if passed >= MAX_PASSED {
             return Err(format!("{passed} hand-overs passed"));
@@ -1955,16 +1958,26 @@ fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
             [&a, &b, &c].iter().all(|h| processed(&h.e) > end)
         });
         let (pa, pb, pc) = (a.pages(), b.pages(), c.pages());
-        let disturbed: Vec<u64> = [&a, &b, &c].iter().flat_map(|h| h.disturbed()).collect();
-        let skips: Vec<u64> = ([&a, &b, &c].iter().zip(&skipped_before))
-            .map(|(h, before)| skipped(&h.e) - before)
-            .collect();
-        if skips.iter().any(|&n| n > 0) {
+        // The live replicas from the entries on, the joiner from its
+        // hand-over on, which its core and detectors start from.
+        let (da, db, dc) = (a.disturbed(), b.disturbed(), c.disturbed());
+        let skips = (
+            skipped(&a.e) - live_skipped.0,
+            skipped(&c.e) - live_skipped.1,
+            skipped(&b.e) - joiner_skipped,
+        );
+        if skips != (0, 0, 0) {
             return Err(format!("samples skipped after the entries: {skips:?}"));
         }
-        if let Some(p) = disturbed.iter().find(|&&p| p >= at1 / PAGE) {
-            return Err(format!("page {p} disturbed after the entries"));
+        // The joiner's pages are compared over eight pages after its
+        // hand-over, which the loop below checks.
+        for (name, d) in [("a", &da), ("c", &dc)] {
+            if let Some(p) = d.iter().find(|&&p| p >= at1 / PAGE) {
+                let past = p - at1 / PAGE;
+                return Err(format!("{name}: page {past} after the entries disturbed"));
+            }
         }
+        let disturbed: Vec<u64> = [da, db, dc].concat();
         let before = (at1 / PAGE + 1)..k0 * B / PAGE;
         let differ = before
             .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
