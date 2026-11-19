@@ -3256,11 +3256,19 @@ struct Supervisor {
     stop: Arc<AtomicBool>,
 }
 
-/// Samples an input's head may stay frozen before the slot is pruned:
-/// `pruneAfterBlocks` blocks, or twice the producer's
-/// `maxCommitBatchSizeHint` plus the margin when that is longer.
+/// Samples an input's blocks may stay late, its head frozen or not,
+/// before the slot is pruned: `pruneAfterBlocks` blocks, or twice the
+/// producer's `maxCommitBatchSizeHint` plus the margin when that is
+/// longer.
 fn prune_limit(config: &Config, timing: &Timing, hint: u64) -> u64 {
     (u64::from(config.prune_after_blocks) * timing.block).max(2 * hint + timing.margin)
+}
+
+/// Whether `head`, polled at clock index `at`, is near enough the clock
+/// for an input's blocks to be read on time: behind it by no more than the
+/// reader margin less the input's offset.
+fn within_reach(head: u64, at: u64, margin: u64, offset: i64) -> bool {
+    i128::from(head) + i128::from(margin) >= i128::from(at) + i128::from(offset)
 }
 
 fn log(message: std::fmt::Arguments) {
@@ -3556,7 +3564,7 @@ impl Supervisor {
         let why = if invalid {
             "flow invalid"
         } else {
-            "head frozen"
+            "blocks late for the prune limit"
         };
         log(format_args!(
             "input {name} pruned: {why} at head {head}, block end {end}"
@@ -3661,6 +3669,7 @@ impl Supervisor {
             }
         }
         let now = time::now(&self.api);
+        let at = time::timestamp_to_index(&self.api, now);
         // Each flow's head and prune limit.
         let mut heads: HashMap<(usize, String), Option<(u64, u64)>> = HashMap::new();
         for (d, p) in self.pollers.iter_mut().enumerate() {
@@ -3686,7 +3695,12 @@ impl Supervisor {
                 continue;
             };
             let (head, limit) = (polled.map(|p| p.0), polled.map_or(0, |p| p.1));
-            if !r.update(&self.api, head, now, limit) {
+            let offset = self.config.inputs[slot].offset_samples;
+            // An advancing head behind the reach of its blocks would be late
+            // on every one of them and pruned again.
+            if !r.update(&self.api, head, now, limit)
+                || !head.is_some_and(|h| within_reach(h, at, self.timing.margin, offset))
+            {
                 s.reported = false;
             } else if s.up {
                 // Up in the log, so it is read again at once: the blocks
@@ -4659,6 +4673,23 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// A head is in reach while it trails the clock by no more than the
+    /// margin less the offset: a positive offset reads later samples and
+    /// needs a head that far nearer, a negative one allows it that much
+    /// further behind.
+    #[test]
+    fn a_head_is_in_reach_within_the_margin_less_the_offset() {
+        let at = 86_162_973_537_635;
+        assert!(within_reach(at - 960, at, 960, 0));
+        assert!(!within_reach(at - 961, at, 960, 0));
+        assert!(within_reach(at - 860, at, 960, 100));
+        assert!(!within_reach(at - 861, at, 960, 100));
+        assert!(within_reach(at - 1060, at, 960, -100));
+        assert!(!within_reach(at - 1061, at, 960, -100));
+        // A head 36.96 s behind, stamped on UTC rather than TAI.
+        assert!(!within_reach(at - 1_774_242, at, 960, 0));
     }
 
     /// The margin warning names what the late blocks need, never an

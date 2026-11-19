@@ -237,7 +237,8 @@ are stamped; `Engine::progress` reports buildLead and the build time,
 the percentile and a supervisor tick without the engine's lead.
 `Engine::start` keeps the log itself, stamping `InputDown`
 when an input is pruned and `InputUp` once its head has advanced for a
-second, wherever it stands against the clock, each `InputUp`,
+second and trails the clock by no more than `readerMarginSamples` less
+the input's `offsetSamples`, each `InputUp`,
 `Route` (`Engine::route`) or `Detach` (`Engine::detach`) at least
 buildLead after the one before, and an `Output`
 (`Engine::set_output_enabled`) as a gain change;
@@ -718,14 +719,16 @@ instruction count of the hold ring's paths, the page hashes, the strip
 calls of the RT loop, a block's DSP, duck detectors and input meters,
 the matrix and detector copies of the core, a duck batch, a block's
 history stores or an output commit, gap zero-fill included, exceeds the
-limit in the benchmark. A late input is pruned after `pruneAfterBlocks`
-blocks of a frozen head, or twice the producer's
-`maxCommitBatchSizeHint` plus `readerMarginSamples` when that is longer,
-with no validity check on the RT thread: the supervisor's poll reader
-checks the pruned input's flow once a lookup found it. A producer that
-replaces its flow under the same id therefore leaves the input silent
-for the prune limit before the supervisor reads the new flow, as one
-that stops does. libmxl's read runs its validity check only when the
+limit in the benchmark. An input is pruned after `pruneAfterBlocks`
+consecutive late blocks, its head frozen or advancing, or twice the
+producer's `maxCommitBatchSizeHint` plus `readerMarginSamples` when that
+is longer, with no validity check on the RT thread: the supervisor's
+poll reader checks the pruned input's flow once a lookup found it. A
+producer that replaces its flow under the same id therefore leaves the
+input silent for the prune limit before the supervisor reads the new
+flow, as one that stops does. A producer stamping its indices on
+another clock advances behind every block and is pruned the same way;
+left up, its late reads would degrade every block's digest. libmxl's read runs its validity check only when the
 head moves back between the head read and the read, which reports the
 block `TooEarly`.
 

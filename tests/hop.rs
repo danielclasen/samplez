@@ -1,7 +1,8 @@
 //! The engine end to end on real libmxl flows: one hop, a gain change,
 //! two replicas, a chain of three, a killed and restarted producer, an
 //! input offset, two inputs with one pruned, a late producer, a flow
-//! whose first commit comes after its input was pruned, a vanished
+//! whose first commit comes after its input was pruned, a producer a
+//! second behind the clock, a vanished
 //! domain, a foreign writer on the output and the `samplez-hop` binary.
 //! Runs without the test harness, one scenario at a time so their timing
 //! does not interfere, and re-executes itself as a producer process that
@@ -60,6 +61,10 @@ fn main() {
         (
             "input_pruned_at_head_0_is_re_added_once_its_late_head_advances",
             head_zero_at_attach,
+        ),
+        (
+            "input_advancing_a_second_behind_the_clock_is_pruned_for_good",
+            behind_the_clock,
         ),
         (
             "input_whose_domain_vanished_is_re_added_once_it_is_back",
@@ -746,6 +751,42 @@ fn head_zero_at_attach() {
     wait_for(5 * SECOND, "blocks read after the re-add", || {
         copied() > before + 100
     });
+    common::stop(engine);
+}
+
+/// The producer commits at the nominal rate a second behind the clock, as
+/// one that stamps its indices on another clock does: every block is late
+/// and the head never freezes. The input is pruned, so that its late reads
+/// stop degrading every block, and is not re-added while its head stays
+/// out of reach, which would prune it again a prune limit later.
+fn behind_the_clock() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, 48_000);
+    let cfg = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&dst, 1)],
+        vec![vec![1.0]],
+        MARGIN,
+    );
+    let (engine, _rx) = start(cfg);
+    let state = || engine.status().inputs[0].state;
+    wait_for(5 * SECOND, "input attached", || {
+        state() == InputState::Attached
+    });
+    wait_for(5 * SECOND, "input pruned", || state() == InputState::Pruned);
+    // Twice the recovery period, and the prune limit after it.
+    let t = Instant::now();
+    while t.elapsed() < 3 * SECOND {
+        assert_eq!(
+            state(),
+            InputState::Pruned,
+            "re-added after {:?}",
+            t.elapsed()
+        );
+        std::thread::sleep(SECOND / 100);
+    }
     common::stop(engine);
 }
 

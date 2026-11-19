@@ -318,8 +318,8 @@ pub(crate) struct SlotStats {
 
 pub(crate) enum Telemetry {
     Block(BlockVerdict),
-    /// The slot is to be pruned: marked invalid, or its head has not moved
-    /// for the slot's prune limit.
+    /// The slot is to be pruned: marked invalid, or its blocks have been
+    /// late for the slot's prune limit, its head frozen or not.
     Prune {
         slot: usize,
         invalid: bool,
@@ -2040,6 +2040,7 @@ impl Rt {
                         s.last_end = None;
                         s.head = 0;
                         s.frozen_late_blocks = 0;
+                        s.late_blocks = 0;
                         s.invalid = false;
                         slot.xfade = None;
                     }
@@ -2238,6 +2239,7 @@ impl Rt {
             if is && !was {
                 slot.state.invalid = false;
                 slot.state.frozen_late_blocks = 0;
+                slot.state.late_blocks = 0;
             }
             if is != was {
                 slot.prune_requested = false;
@@ -2278,6 +2280,7 @@ impl Rt {
                 s.last_end = None;
                 s.head = 0;
                 s.frozen_late_blocks = 0;
+                s.late_blocks = 0;
                 s.invalid = false;
                 // Anchored at the index whatever the slot's last block
                 // was: an outgoing flow that is silent fades the new one
@@ -2569,8 +2572,11 @@ impl Rt {
                         }
                         _ => {}
                     }
-                    let frozen = u64::from(slot.state.frozen_late_blocks) * self.block;
-                    if !slot.prune_requested && (slot.state.invalid || frozen >= g.prune_after[i]) {
+                    // A head that advances behind its blocks for good, as one
+                    // stamped on another clock does, is as unreadable as a
+                    // frozen one, and keeps every block degraded.
+                    let late = u64::from(slot.state.late_blocks) * self.block;
+                    if !slot.prune_requested && (slot.state.invalid || late >= g.prune_after[i]) {
                         let t = Telemetry::Prune {
                             slot: i,
                             invalid: slot.state.invalid,
