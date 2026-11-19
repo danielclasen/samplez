@@ -299,6 +299,26 @@ pub trait LogView: Send + Sync + 'static {
     fn applied(&self) -> u64;
     fn log_id_at(&self, index: u64) -> Option<StoredLogId>;
     fn entries_after(&self, index: u64, f: &mut dyn FnMut(StoredLogId, &Request));
+    /// [`LogView::entries_after`] for the first `max` entries only, which
+    /// it stops after: true when more follow.
+    fn entries_after_max(
+        &self,
+        index: u64,
+        max: usize,
+        f: &mut dyn FnMut(StoredLogId, &Request),
+    ) -> bool {
+        let mut taken = 0;
+        let mut more = false;
+        self.entries_after(index, &mut |id, request| {
+            if taken < max {
+                taken += 1;
+                f(id, request);
+            } else {
+                more = true;
+            }
+        });
+        more
+    }
     fn pending(&self, f: &mut dyn FnMut(u64, &Body));
     /// The request of the entry at `index`, from the log, else, purged,
     /// the engine body the state machine holds pending under it.
@@ -397,6 +417,14 @@ impl<P: Product> LogView for Store<P> {
     fn entries_after(&self, index: u64, f: &mut dyn FnMut(StoredLogId, &Request)) {
         Store::entries_after(self, index, f)
     }
+    fn entries_after_max(
+        &self,
+        index: u64,
+        max: usize,
+        f: &mut dyn FnMut(StoredLogId, &Request),
+    ) -> bool {
+        Store::entries_after_max(self, index, max, f)
+    }
     fn pending(&self, f: &mut dyn FnMut(u64, &Body)) {
         Store::pending(self, f)
     }
@@ -478,6 +506,11 @@ const ECHOES_KEPT: usize = 64;
 /// one more is unresolved at once.
 const AWAITING_MAX: usize = 1024;
 
+/// Appended entries taken from the log under one hold of the contact
+/// lock, at most: a replica back from a long absence takes its catch-up
+/// in parts, each hold short of the lock watchdog's limit.
+const TAKEN_AT_ONCE: usize = 1024;
+
 /// Entries with an at_index kept for listings, at most; the lowest index
 /// is dropped first, counted.
 const SCHEDULED_MAX: usize = 4096;
@@ -549,8 +582,6 @@ struct Peer {
 #[derive(Debug, Clone, Copy)]
 struct Waiting {
     at_index: u64,
-    /// Past its apply deadline: given to the engine at once.
-    expired: bool,
 }
 
 #[derive(Debug, Default)]
@@ -677,9 +708,19 @@ struct State {
     /// engine, or it went unresolved.
     handed: u64,
     awaiting: BTreeMap<Key, Waiting>,
-    /// Entries given to the engine as unresolved, or refused by it, the
-    /// lowest index forgotten first.
+    /// Entries given to the engine as unresolved, or refused by it, past
+    /// `GIVEN_KEPT` a refused one forgotten first, the lowest first: one
+    /// the engine holds stays, so it is never handed as applied too.
     given: BTreeMap<Key, u64>,
+    /// The entries of `given` the engine does not hold, refused or not
+    /// asked yet, and maybe some no longer in it.
+    refused: BTreeSet<Key>,
+    /// The engine refused an unresolved entry, and is not told yet.
+    overwhelmed: bool,
+    /// The pending restart was begun by a rebuild past entries taken
+    /// late: until its rebuild starts, the later parts of the same
+    /// catch-up are rebuilt past by it too.
+    late_restart: bool,
     /// The lowest at_index of a listing overflow given as unresolved: a
     /// later overflow at or above it adds nothing, one below it is given.
     unlisted_low: Option<u64>,
@@ -1014,6 +1055,9 @@ impl Contact {
                     handed: applied,
                     awaiting: BTreeMap::new(),
                     given: BTreeMap::new(),
+                    refused: BTreeSet::new(),
+                    overwhelmed: false,
+                    late_restart: false,
                     unlisted_low: None,
                     unlisted: BTreeMap::new(),
                     decisions: Vec::new(),
@@ -1084,6 +1128,11 @@ impl Contact {
 
     /// Takes a report from another voter.
     pub fn receive(&self, report: Report) {
+        self.receive_held(report);
+        self.overwhelm();
+    }
+
+    fn receive_held(&self, report: Report) {
         let now = Instant::now();
         let tai = self.clocks.tai_ns();
         let w = self.timing.contact_window;
@@ -1248,13 +1297,15 @@ impl Contact {
             );
             st.catch_up_to = Some(committed_index);
         }
+        let mut unresolved = Vec::new();
         for l in &report.listed {
             if l.baseline {
                 st.baselines.listed(l.id, l.at_index);
             } else {
-                self.note(st, l.id, l.at_index, tai);
+                self.note(st, l.id, l.at_index, tai, &mut unresolved);
             }
         }
+        self.offer_unresolved(st, unresolved);
         if let Some(at) = report.unlisted
             && st.unlisted_low.is_none_or(|low| at < low)
         {
@@ -1274,27 +1325,51 @@ impl Contact {
                     (*held).max(covered)
                 };
             }
-            self.note(st, id, at, tai);
+            let mut unresolved = Vec::new();
+            self.note(st, id, at, tai, &mut unresolved);
+            self.offer_unresolved(st, unresolved);
         }
         self.fence(st, tai);
     }
 
     /// The log changed: appends and truncations are taken, what the
     /// entries openraft applied derived goes to the engine, and they are
-    /// known committed.
+    /// known committed. [`TAKEN_AT_ONCE`] entries at a time, the contact
+    /// lock released between them.
     pub fn log_changed(&self) {
-        let tai = self.clocks.tai_ns();
-        let mut st = self.lock();
-        let st = &mut *st;
-        self.expire(st, tai);
-        self.sync_log(st, tai);
-        let applied = self.log.applied();
-        self.learn(st, applied);
+        loop {
+            let tai = self.clocks.tai_ns();
+            let mut st = self.lock();
+            let st = &mut *st;
+            self.expire(st, tai);
+            let more = self.sync_log(st, tai);
+            let applied = self.log.applied();
+            self.learn(st, applied);
+            if !more {
+                break;
+            }
+        }
+        self.overwhelm();
+    }
+
+    /// The engine refused an unresolved entry since the last call: it is
+    /// told so, once, with the contact lock released.
+    fn overwhelm(&self) {
+        let overwhelmed = std::mem::take(&mut self.lock().overwhelmed);
+        if let (true, Some(audio)) = (overwhelmed, &self.audio) {
+            audio.overwhelmed();
+        }
     }
 
     /// One report period: the log, the deadlines, F, silence, and the
     /// reports to send, with each addressee's address.
     pub fn tick(&self, members: Members) -> Vec<(NodeId, String, Report)> {
+        let out = self.tick_held(members);
+        self.overwhelm();
+        out
+    }
+
+    fn tick_held(&self, members: Members) -> Vec<(NodeId, String, Report)> {
         let now = Instant::now();
         // Taken before the engine's sample: every timestamp a report
         // carries precedes the flags beside it.
@@ -1307,6 +1382,8 @@ impl Contact {
             .retain(|id, _| members.addrs.contains_key(id) && !voters.contains(id));
         st.members = members;
         self.expire(st, tai);
+        // One part of a catch-up: the next tick or log change takes the
+        // rest.
         self.sync_log(st, tai);
         // Alone, no voter names a commit to catch up to.
         if voters.len() == 1 && voters.contains(&self.id) {
@@ -1510,58 +1587,105 @@ impl Contact {
     /// learned after a deadline never counts as before it.
     fn expire(&self, st: &mut State, tai: u64) {
         let timing = self.timing;
-        for w in st.awaiting.values_mut() {
-            if tai >= timing.apply_deadline(w.at_index) {
-                w.expired = true;
+        let mut expired = Vec::new();
+        st.awaiting.retain(|&k, w| {
+            let due = tai >= timing.apply_deadline(w.at_index);
+            if due {
+                expired.push((k, w.at_index));
             }
-        }
-        self.offer_unresolved(st);
+            !due
+        });
+        self.offer_unresolved(st, expired);
     }
 
-    /// Gives the expired entries to the engine.
-    fn offer_unresolved(&self, st: &mut State) {
-        let expired: Vec<(Key, u64)> = st
-            .awaiting
-            .iter()
-            .filter(|(_, w)| w.expired)
-            .map(|(&k, w)| (k, w.at_index))
-            .collect();
-        for (k, _) in &expired {
-            st.awaiting.remove(k);
+    /// Gives `entries` to the engine as unresolved. Once it refused one,
+    /// the rest are taken as refused without asking it, and it is told it
+    /// is overwhelmed once the contact lock is released
+    /// ([`Contact::overwhelm`]): the engine holds
+    /// [`samplez::Engine::unresolved`]'s few, so each call stays short
+    /// however many come. A refusal can also follow a control ring full
+    /// for a moment, which a later entry might have found free; the
+    /// replica withdraws either way, and that is its own state, the same
+    /// on no other replica.
+    fn offer_unresolved(&self, st: &mut State, entries: Vec<(Key, u64)>) {
+        let given = self.give(st, entries);
+        self.ask(st, given);
+    }
+
+    /// Takes `entries` as given, the engine not asked yet, and returns
+    /// them for [`Contact::ask`]: listed again, an entry given once is not
+    /// given again, and one refused neither waits nor withdraws again.
+    fn give(&self, st: &mut State, entries: Vec<(Key, u64)>) -> Vec<Key> {
+        if self.audio.is_none() {
+            return Vec::new();
         }
+        let mut given = Vec::with_capacity(entries.len());
+        for (k, at) in entries {
+            st.given.insert(k, at);
+            st.refused.insert(k);
+            Self::forget_given(st);
+            given.push(k);
+        }
+        given
+    }
+
+    /// Asks the engine to hold the entries [`Contact::give`] took that are
+    /// still given: `hand` in between rebuilds past those a catch-up
+    /// applied late, which the engine is then never asked to hold.
+    fn ask(&self, st: &mut State, given: Vec<Key>) {
         let Some(audio) = &self.audio else {
             return;
         };
-        for (k, at) in expired {
-            let index = k.0;
-            if audio.unresolved(index, at) {
+        let mut room = true;
+        for k in given {
+            let Some(&at) = st.given.get(&k) else {
+                continue;
+            };
+            if !st.refused.contains(&k) {
+                continue;
+            }
+            room = room && audio.unresolved(k.0, at);
+            if room {
                 st.counts.unresolved += 1;
-                if index & UNLISTED_BIT != 0 {
+                if k.0 & UNLISTED_BIT != 0 {
                     st.unlisted_low = Some(st.unlisted_low.map_or(at, |l| l.min(at)));
                 }
-                // Listed again, an entry given once is not given again.
-                st.given.insert(k, at);
-                while st.given.len() > GIVEN_KEPT {
-                    st.given.pop_first();
-                }
+                st.refused.remove(&k);
             } else {
                 st.counts.unresolved_refused += 1;
-                audio.overwhelmed();
-                // Kept with the given ones: listed again, it neither
-                // waits nor withdraws again.
-                st.given.insert(k, at);
-                while st.given.len() > GIVEN_KEPT {
+            }
+        }
+        st.overwhelmed |= !room;
+    }
+
+    /// Past [`GIVEN_KEPT`], the lowest refused entry is forgotten first:
+    /// the engine holds none of them. One it holds is forgotten only
+    /// once none is left, which takes an engine holding more than
+    /// `GIVEN_KEPT`.
+    fn forget_given(st: &mut State) {
+        while st.given.len() > GIVEN_KEPT {
+            match st.refused.pop_first() {
+                Some(k) => {
+                    st.given.remove(&k);
+                }
+                None => {
                     st.given.pop_first();
                 }
             }
+        }
+        if st.refused.len() > GIVEN_KEPT {
+            let given = &st.given;
+            st.refused.retain(|k| given.contains_key(k));
         }
     }
 
     /// Takes new appends and truncations from the log: each entry with an
     /// index it takes effect at is listed and awaited there, the index the
     /// apply will derive at ([`crate::state_machine::floored`]); then
-    /// hands what the applied entries derived to the engine.
-    fn sync_log(&self, st: &mut State, tai: u64) {
+    /// hands what the applied entries derived to the engine. Takes at
+    /// most [`TAKEN_AT_ONCE`] appended entries: true when more are left,
+    /// as when openraft appended them later.
+    fn sync_log(&self, st: &mut State, tai: u64) -> bool {
         let cut = st
             .uncommitted
             .iter()
@@ -1585,9 +1709,11 @@ impl Contact {
         // Collected first: the log's view is not re-entered from inside
         // it.
         let mut appended: Vec<(StoredLogId, Request)> = Vec::new();
-        self.log.entries_after(st.told, &mut |id, request| {
-            appended.push((id, request.clone()));
-        });
+        let more = self
+            .log
+            .entries_after_max(st.told, TAKEN_AT_ONCE, &mut |id, request| {
+                appended.push((id, request.clone()));
+            });
         // A snapshot was installed: the state jumped past entries this
         // replica may never have held. A purge of its own log after its
         // own snapshot is none: it applied every entry purged.
@@ -1638,6 +1764,7 @@ impl Contact {
             };
             new.push((id, at, baseline, request.stamp));
         }
+        let mut unresolved = Vec::new();
         for (id, at, baseline, stamp) in new {
             st.told = id.index;
             if id.index > st.known_committed {
@@ -1659,7 +1786,7 @@ impl Contact {
                 if st.catching_up && late {
                     st.taken_late.insert(id.index);
                 }
-                self.note(st, id, at, tai);
+                self.note(st, id, at, tai, &mut unresolved);
             }
             // Listed, never unresolved: it changes no engine state.
             if let Some(at) = baseline {
@@ -1670,7 +1797,10 @@ impl Contact {
             st.scheduled.pop_first();
             st.counts.scheduled_dropped += 1;
         }
+        let given = self.give(st, unresolved);
         self.hand(st);
+        self.ask(st, given);
+        more
     }
 
     /// The entry behind the restamps ending at `index`, with its own log
@@ -1736,6 +1866,7 @@ impl Contact {
         st.rebuilt_past.clear();
         st.awaiting.clear();
         st.given.clear();
+        st.refused.clear();
         st.unlisted.clear();
         st.unlisted_low = None;
         st.verdicts.retain(|&(index, _)| index > applied);
@@ -1749,6 +1880,7 @@ impl Contact {
     /// Returns the replica to `starting` until its applied index passed
     /// `after` and its engine was rebuilt from product state.
     fn begin_restart(&self, st: &mut State, after: u64) {
+        st.late_restart = false;
         st.restart = Some(st.restart.map_or(after, |a| a.max(after)));
         // A rebuild under way installs a state from before the restart.
         if let Rebuild::Running { stale, .. } = &mut st.rebuild {
@@ -1846,8 +1978,13 @@ impl Contact {
             st.late_given.remove(&k);
             Self::rebuild_past(st, k);
         }
-        for (&(index, _, _), &at) in &st.given {
-            let _ = audio.unresolved(index, at);
+        let given: Vec<(Key, u64)> = st.given.iter().map(|(&k, &at)| (k, at)).collect();
+        for (k, at) in given {
+            if audio.unresolved(k.0, at) {
+                st.refused.remove(&k);
+            } else {
+                st.refused.insert(k);
+            }
         }
         self.rebuilt(st, n);
         st.rebuild = Rebuild::Done;
@@ -1882,9 +2019,17 @@ impl Contact {
         }
     }
 
-    /// An entry this replica knows of: unresolved at once when its apply
-    /// deadline has passed, else awaited unless it is applied here.
-    fn note(&self, st: &mut State, id: StoredLogId, at_index: u64, tai: u64) {
+    /// An entry this replica knows of: added to `unresolved` when its
+    /// apply deadline has passed or no more are awaited, for the caller
+    /// to offer the engine, else awaited unless it is applied here.
+    fn note(
+        &self,
+        st: &mut State,
+        id: StoredLogId,
+        at_index: u64,
+        tai: u64,
+        unresolved: &mut Vec<(Key, u64)>,
+    ) {
         // At or below the applied index an entry is this log's own,
         // applied and handed, or one that can no longer commit.
         let k = key(id);
@@ -1896,15 +2041,10 @@ impl Contact {
         if full && !expired {
             st.counts.awaiting_overflow += 1;
         }
-        st.awaiting.insert(
-            k,
-            Waiting {
-                at_index,
-                expired: expired || full,
-            },
-        );
         if expired || full {
-            self.offer_unresolved(st);
+            unresolved.push((k, at_index));
+        } else {
+            st.awaiting.insert(k, Waiting { at_index });
         }
     }
 
@@ -2034,8 +2174,9 @@ impl Contact {
         // which the log never decides, so they are left out of the rebuild
         // that follows once it commits nothing.
         let rebuilds = Self::commits_nothing(st);
-        let at_once = rebuilds && st.restart.is_none();
+        let at_once = rebuilds && (st.restart.is_none() || Self::late_restart_pending(st));
         let mut late: Option<(u64, u64)> = None;
+        let mut unresolved = Vec::new();
         for (index, record) in records {
             let at = record.at_index;
             // Purged from the log since it applied: this log's own, which
@@ -2072,18 +2213,12 @@ impl Contact {
                 if taken {
                     st.late_given.insert(k);
                 }
-                st.awaiting.insert(
-                    k,
-                    Waiting {
-                        at_index: at,
-                        expired: true,
-                    },
-                );
+                unresolved.push((k, at));
                 continue;
             }
             audio.appended(index, at, &record.entries);
         }
-        self.offer_unresolved(st);
+        self.offer_unresolved(st, unresolved);
         audio.committed(up_to);
         // Slack against the apply deadline: the first index this replica
         // could still apply an entry at, as it applies.
@@ -2116,10 +2251,20 @@ impl Contact {
 
     /// Entries from `first` to `last` taken late were left out of the
     /// engine: it is rebuilt from the state after `after`.
+    /// While a restart begun so has not started its rebuild yet, as
+    /// through the parts of one catch-up, it is moved past `after`
+    /// instead: the core is dropped and rebuilt once.
     fn rebuild_past_late(&self, st: &mut State, first: u64, last: u64, after: u64) {
+        if Self::late_restart_pending(st)
+            && let Some(pending) = st.restart
+        {
+            st.restart = Some(pending.max(after));
+            return;
+        }
         st.counts.late_rebuilds += 1;
         tracing::debug!(first, last, after, "engine rebuilt past entries taken late");
         self.begin_restart(st, after);
+        st.late_restart = true;
     }
 
     /// Entries taken late that went unresolved while a restart was under
@@ -2153,6 +2298,12 @@ impl Contact {
         }
         self.rebuild_past_late(st, first, last, st.handed);
         true
+    }
+
+    /// A restart begun by a rebuild past entries taken late is pending
+    /// and its rebuild has not started.
+    fn late_restart_pending(st: &State) -> bool {
+        st.late_restart && st.restart.is_some() && matches!(st.rebuild, Rebuild::Idle)
     }
 
     fn rebuild_past(st: &mut State, k: Key) {
@@ -2340,6 +2491,7 @@ impl Contact {
                 let done = self.rebuild(st, audio);
                 if done {
                     st.restart = None;
+                    st.late_restart = false;
                 }
                 !done
             }
@@ -3355,6 +3507,8 @@ impl Contact {
         // log's decision on them reaches both alike.
         let inherited: BTreeMap<u64, u64> = r.unresolved.iter().copied().collect();
         st.given.retain(|k, _| inherited.contains_key(&k.0));
+        // The handed-over core holds every one of them.
+        st.refused.clear();
         for (&index, &at) in &inherited {
             if st.given.keys().any(|k| k.0 == index) {
                 continue;
@@ -3714,6 +3868,8 @@ mod tests {
         apply_after_read: Option<(u64, u64)>,
         /// [`LogView::baseline`].
         baseline: Option<Baseline>,
+        /// The most entries one read of the log went through.
+        visited_most: usize,
         /// The flows of [`LogView::product_state`].
         flows: Vec<Option<String>>,
     }
@@ -3761,16 +3917,24 @@ mod tests {
             self.0.lock().unwrap().log.get(&index).map(|(id, _)| *id)
         }
         fn entries_after(&self, index: u64, f: &mut dyn FnMut(StoredLogId, &Request)) {
-            for (id, r) in self
-                .0
-                .lock()
-                .unwrap()
-                .log
-                .range(index + 1..)
-                .map(|(_, e)| e)
-            {
+            self.entries_after_max(index, usize::MAX, f);
+        }
+        fn entries_after_max(
+            &self,
+            index: u64,
+            max: usize,
+            f: &mut dyn FnMut(StoredLogId, &Request),
+        ) -> bool {
+            let mut log = self.0.lock().unwrap();
+            let mut visited = 0;
+            let mut entries = log.log.range(index + 1..).map(|(_, e)| e);
+            for (id, r) in entries.by_ref().take(max) {
+                visited += 1;
                 f(*id, r);
             }
+            let more = entries.next().is_some();
+            log.visited_most = log.visited_most.max(visited);
+            more
         }
         fn pending(&self, f: &mut dyn FnMut(u64, &Body)) {
             for (index, body) in &self.0.lock().unwrap().pending {
@@ -6429,5 +6593,381 @@ mod tests {
         assert_eq!(st.lead.samples(), start);
         add_slack(&mut st, f.log.as_ref(), 2, &late(99), 0);
         assert!(st.lead.samples() > start, "no term known: counted");
+    }
+
+    /// The real replicated engine of three voters on an MXL domain under
+    /// `/dev/shm`, one input nobody writes and one output, behind the
+    /// bridge, with every call contact makes on it about entries
+    /// recorded.
+    struct Real {
+        audio: crate::bridge::EngineAudio,
+        calls: Mutex<Vec<(&'static str, u64)>>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Real {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl Real {
+        fn start(timing: &Timing) -> Arc<Real> {
+            let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".into());
+            let dir = std::path::PathBuf::from("/dev/shm").join(format!(
+                "samplez-contact-{}-{:016x}",
+                std::process::id(),
+                crate::bootstrap::random_id().expect("a random id")
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let v = serde_json::json!({
+                "blockSize": B,
+                "readerMarginSamples": 960,
+                "libmxl": libmxl,
+                "domains": [{ "name": "d", "path": dir }],
+                "inputs": [{ "name": "in0", "domain": "d",
+                             "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a", "channels": 1 }],
+                "outputs": [{ "name": "out0", "domain": "d",
+                              "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01", "label": "contact",
+                              "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+                "matrix": [[1.0]],
+                "rt": { "rtCpu": "none" },
+            });
+            let config = samplez::Config::parse(&v.to_string()).unwrap();
+            let (reports, _) = std::sync::mpsc::sync_channel(64);
+            let (status_tx, status_rx) = std::sync::mpsc::sync_channel(1 << 10);
+            let (hash_tx, hash_rx) = std::sync::mpsc::sync_channel(1 << 10);
+            let process = samplez::rt::setup_process(&config.rt);
+            let replication = samplez::Replication {
+                voters: 3,
+                reports,
+                statuses: Some(status_tx),
+                hashes: Some(hash_tx),
+            };
+            let engine = Arc::new(
+                samplez::Engine::start_replicated(config, process, None, replication).unwrap(),
+            );
+            let started = std::time::Instant::now();
+            while !engine.status().outputs.iter().all(|o| o.realised) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "outputs realised"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let audio = crate::bridge::EngineAudio::new(engine, status_rx, hash_rx, timing);
+            Arc::new(Real {
+                audio,
+                calls: Mutex::new(Vec::new()),
+                dir,
+            })
+        }
+
+        fn record(&self, call: &'static str, index: u64) {
+            self.calls.lock().unwrap().push((call, index));
+        }
+
+        fn calls(&self) -> Vec<(&'static str, u64)> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    impl Audio for Real {
+        fn sample(&self) -> Sample {
+            self.audio.sample()
+        }
+        fn fence(&self, end: u64) {
+            self.audio.fence(end)
+        }
+        fn settled(&self, k: u64) -> bool {
+            self.audio.settled(k)
+        }
+        fn appended(&self, index: u64, at_index: u64, entries: &[Entry]) {
+            self.record("appended", index);
+            self.audio.appended(index, at_index, entries)
+        }
+        fn committed(&self, up_to: u64) {
+            self.audio.committed(up_to)
+        }
+        fn unresolved(&self, index: u64, at_index: u64) -> bool {
+            let taken = self.audio.unresolved(index, at_index);
+            self.record(if taken { "unresolved" } else { "refused" }, index);
+            taken
+        }
+        fn overwhelmed(&self) {
+            self.record("overwhelmed", 0);
+            self.audio.overwhelmed()
+        }
+        fn status(&self, output: usize, k: u64) -> Option<BlockStatus> {
+            self.audio.status(output, k)
+        }
+        fn withhold(&self, output: usize, k: u64, cause: Cause) -> Option<BlockStatus> {
+            self.audio.withhold(output, k, cause)
+        }
+        fn commit_through(&self, output: usize, k: u64, on: u8, up_to: Option<u64>) -> bool {
+            self.audio.commit_through(output, k, on, up_to)
+        }
+        fn withdraw(&self) {
+            self.audio.withdraw()
+        }
+        fn ranks(&self, ranks: Ranks) {
+            self.audio.ranks(ranks)
+        }
+        fn commit_from(&self, output: usize, min_k: u64, seen: u64) {
+            self.audio.commit_from(output, min_k, seen)
+        }
+        fn cancel_commit_start(&self, output: usize) {
+            self.audio.cancel_commit_start(output)
+        }
+        fn stop_at(&self, output: usize, at: u64) {
+            self.audio.stop_at(output, at)
+        }
+        fn resolved(&self, index: u64) {
+            self.record("resolved", index);
+            self.audio.resolved(index)
+        }
+        fn drop_engine(&self) {
+            self.record("drop", 0);
+            self.audio.drop_engine()
+        }
+        fn rebuild_engine(&self, state: &ProductState, at_least: u64) -> bool {
+            self.audio.rebuild_engine(state, at_least)
+        }
+        fn follows(&self, state: &ProductState) -> bool {
+            self.audio.follows(state)
+        }
+    }
+
+    /// Contact of voter 1 of three on the real engine, its clock at the
+    /// engine's TAI time.
+    fn real() -> (Arc<Clock>, Arc<Log>, Arc<Real>, Contact) {
+        let tai = SystemClocks.tai_ns();
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(tai),
+            step: AtomicU64::new(0),
+        });
+        let log = Arc::new(Log::default());
+        let timing = Timing::defaults(B);
+        let engine = Real::start(&timing);
+        let contact = Contact::new(
+            1,
+            timing,
+            clock.clone(),
+            Some(engine.clone()),
+            log.clone(),
+            100,
+        );
+        contact.verified_always();
+        (clock, log, engine, contact)
+    }
+
+    /// The longest any one hold of `contact`'s lock lasted while `f`
+    /// ran, sampled every 200 us.
+    fn longest_hold(contact: &Contact, f: impl FnOnce()) -> Duration {
+        let record = contact.state.record();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let sampler = s.spawn(|| {
+                let mut longest = Duration::ZERO;
+                while !done.load(Ordering::SeqCst) {
+                    let now = std::time::Instant::now();
+                    longest = longest.max(record.held_for(now).unwrap_or_default());
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                longest
+            });
+            f();
+            done.store(true, Ordering::SeqCst);
+            sampler.join().unwrap()
+        })
+    }
+
+    /// Pushes entries `indices` to `log`, each stamped `stamp(index)` and
+    /// taking effect at `at(index)`.
+    fn push_all(log: &Log, indices: std::ops::RangeInclusive<u64>, at: impl Fn(u64) -> u64) {
+        for index in indices {
+            log.push(1, index, Some(at(index)));
+        }
+    }
+
+    /// A replica back after `away` blocks at the densest entry rate, one
+    /// entry a block, the newest stamped at the longest lead, takes the
+    /// catch-up in one log change on the real engine. The longest hold of
+    /// the contact lock and the most entries read of the log in one hold.
+    fn catch_up(away: u64) -> (Duration, usize) {
+        let (clock, log, engine, contact) = real();
+        let now = index_at(clock.get()) / B * B;
+        let lead = crate::state_machine::AHEAD_MAX;
+        let fresh = lead / B;
+        let at = |index: u64| {
+            let stamp = now - (away - index) * B;
+            if away - index < fresh {
+                stamp + lead
+            } else {
+                stamp + B
+            }
+        };
+        push_all(&log, 1..=away, at);
+        let timing = contact.timing();
+        let in_time = (1..=away)
+            .filter(|&i| clock.get() < timing.apply_deadline(at(i)))
+            .count();
+        f_apply(&log, away);
+        let started = std::time::Instant::now();
+        let longest = longest_hold(&contact, || contact.log_changed());
+        let calls = engine.calls();
+        let count = |c: &str| calls.iter().filter(|x| x.0 == c).count();
+        let visited = log.0.lock().unwrap().visited_most;
+        println!(
+            "{away} entries taken in {:?}, the contact lock held {longest:?} at most, \
+             {visited} entries read of the log at once; engine: {} unresolved, \
+             {} refused, {} overwhelmed, {} appended",
+            started.elapsed(),
+            count("unresolved"),
+            count("refused"),
+            count("overwhelmed"),
+            count("appended"),
+        );
+        assert!(in_time > 0, "some applied in time");
+        assert_eq!(count("appended"), in_time, "those applied in time handed");
+        assert!(count("overwhelmed") <= 1, "overwhelmed once at most");
+        assert!(
+            count("refused") as u64 <= away / TAKEN_AT_ONCE as u64 + 1,
+            "the engine not asked again after a refusal"
+        );
+        (longest, visited)
+    }
+
+    /// A replica back after a minute away, and one whose log still holds
+    /// five minutes of entries, take the catch-up with the contact lock
+    /// held briefly at a time, reading only the part of the log each hold
+    /// takes: the entries taken late are offered unresolved, which the
+    /// engine refuses past its few, and the newest are applied in time.
+    /// Taken in one hold, the minute held the lock about 0.8 s in a debug
+    /// build, growing with the time away towards the lock watchdog's
+    /// limit.
+    #[test]
+    fn a_catch_up_after_a_minute_away_holds_the_contact_lock_briefly() {
+        let limit = Duration::from_millis(250);
+        for away in [60_000, 300_000] {
+            let (longest, visited) = catch_up(away);
+            assert!(
+                longest < limit,
+                "the contact lock held {longest:?}, over {limit:?}"
+            );
+            assert!(
+                visited <= TAKEN_AT_ONCE,
+                "{visited} entries read of the log under the lock at once"
+            );
+        }
+    }
+
+    /// Entries up to `index` applied and committed.
+    fn f_apply(log: &Log, index: u64) {
+        let mut l = log.0.lock().unwrap();
+        l.applied = index;
+        l.committed = Some(id(1, index));
+    }
+
+    /// Past [`AWAITING_MAX`] awaited entries, more appended before any is
+    /// applied are offered unresolved: the engine takes its few and
+    /// refuses the rest, so contact gives more than [`GIVEN_KEPT`]. The
+    /// ones the engine holds stay given and are not handed when they
+    /// apply in time: handed, the engine would apply an entry it also
+    /// holds unresolved, degrading its blocks from there for good, and
+    /// the replica would no longer list it for the log to decide.
+    #[test]
+    fn an_entry_the_engine_holds_unresolved_is_not_handed_as_applied() {
+        let (clock, log, engine, contact) = real();
+        let now = index_at(clock.get()) / B * B;
+        let lead = crate::state_machine::AHEAD_MAX;
+        let entries = (AWAITING_MAX + GIVEN_KEPT + 100) as u64;
+        push_all(&log, 1..=entries, |index| now + lead + index);
+        contact.log_changed();
+        let calls = engine.calls();
+        let count = |c: &str| calls.iter().filter(|x| x.0 == c).count();
+        assert_eq!(count("overwhelmed"), 1, "overwhelmed once");
+        assert!(
+            count("refused") <= entries as usize / TAKEN_AT_ONCE + 1,
+            "the engine not asked again after a refusal: {} refusals",
+            count("refused")
+        );
+        let held: BTreeSet<u64> = (calls.iter())
+            .filter(|c| c.0 == "unresolved")
+            .map(|c| c.1)
+            .collect();
+        let refused = contact.lock().counts.unresolved_refused;
+        assert!(!held.is_empty(), "the engine held some");
+        assert!(
+            held.len() + refused as usize > GIVEN_KEPT,
+            "more given than kept: {} held, {refused} refused",
+            held.len()
+        );
+        f_apply(&log, entries);
+        contact.log_changed();
+        let calls = engine.calls();
+        let handed: BTreeSet<u64> = (calls.iter())
+            .filter(|c| c.0 == "appended")
+            .map(|c| c.1)
+            .collect();
+        let resolved = calls.iter().any(|c| c.0 == "resolved");
+        assert!(!resolved, "nothing decided");
+        let both: Vec<u64> = held.intersection(&handed).copied().collect();
+        println!(
+            "{} held unresolved, {refused} refused, {} handed as applied, {} of them held",
+            held.len(),
+            handed.len(),
+            both.len()
+        );
+        assert!(both.is_empty(), "held unresolved and handed: {both:?}");
+        assert!(
+            (1..=AWAITING_MAX as u64).all(|i| handed.contains(&i)),
+            "the awaited ones handed"
+        );
+        let st = contact.lock();
+        let given: BTreeSet<u64> = st.given.keys().map(|k| k.0).collect();
+        assert!(
+            held.is_subset(&given),
+            "every entry the engine holds still given, for the log to decide"
+        );
+    }
+
+    /// A replica committing nothing back after a minute away rebuilds its
+    /// engine past the entries it applied late once, whatever parts it
+    /// takes them in, and never asks the engine to hold one unresolved:
+    /// asked, the engine, which holds a few, would be overwhelmed.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_committing_nothing_rebuilds_past_a_minute_away_once() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.engine.room.store(64, Ordering::SeqCst);
+        f.tick();
+        assert!(f.contact.lock().catching_up);
+        f.engine.calls();
+        let now = index_at(f.clock.get()) / B * B;
+        let away = 60_000;
+        for index in 1..=away {
+            f.log.push(1, index, Some(now - (away - index + 100) * B));
+        }
+        f.apply(away);
+        f.contact.log_changed();
+        let calls = f.engine.calls();
+        let count = |p: &str| calls.iter().filter(|c| c.starts_with(p)).count();
+        println!(
+            "{} drops, {} unresolved, {} refused, {} overwhelmed, {} late rebuilds",
+            count("drop"),
+            count("unresolved"),
+            count("refused"),
+            count("overwhelmed"),
+            f.contact.metrics().late_rebuilds
+        );
+        assert_eq!(count("drop"), 1, "one restart");
+        assert_eq!(f.contact.metrics().late_rebuilds, 1);
+        assert_eq!(count("overwhelmed"), 0);
+        assert_eq!(count("unresolved") + count("refused"), 0, "nothing offered");
+        assert!(f.contact.lock().given.is_empty(), "rebuilt past, not held");
+        f.tick();
+        assert_eq!(f.contact.metrics().late_rebuilds, 1, "nothing left to fold");
     }
 }

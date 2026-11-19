@@ -141,6 +141,12 @@ impl Drop for Waiting<'_> {
 }
 
 impl Record {
+    /// How long the lock has been held at `now`; none while it is free.
+    #[cfg(test)]
+    pub(crate) fn held_for(&self, now: Instant) -> Option<Duration> {
+        (self.notes().held.as_ref()).map(|h| now.saturating_duration_since(h.since))
+    }
+
     fn notes(&self) -> MutexGuard<'_, Notes> {
         // The notes hold plain data: a poisoned lock still reads.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
