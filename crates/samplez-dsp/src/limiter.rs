@@ -439,6 +439,9 @@ impl Limiter {
             self.rest();
         }
         let path = Path::best();
+        if !off && self.rest {
+            self.prime(path, start);
+        }
         let mut n = 0;
         while n < frames {
             let len = CHUNK.min(frames - n);
@@ -447,6 +450,52 @@ impl Limiter {
         }
         self.pos = Some(start + frames as u64);
         self.wet.advance(frames);
+    }
+
+    /// Starts the sidechain at rest before sample index `start` from the
+    /// samples the ring holds: the required gains of the samples that
+    /// come out from `start` on, so the ceiling holds from the first one
+    /// even when the limiter switches on at once.
+    fn prime(&mut self, path: Path, start: u64) {
+        let len = LIMITER_DELAY - LAG + 1;
+        let first = start.wrapping_sub(len as u64);
+        let mut s = [0.0f32; CHUNK];
+        self.sidechain(path, first, len, &mut s);
+        for (i, &peak) in s[..len].iter().enumerate() {
+            let _ = self.gain(first.wrapping_add(i as u64), peak);
+        }
+    }
+
+    /// The sidechain peaks of the `len` samples from index `first` on,
+    /// which the ring holds, into `s`: per sample the largest absolute
+    /// value over `[m, m + 1]`, `m` the index less [`LAG`], of the samples
+    /// and the interpolator's phases, over every leg; left at 0 for a leg
+    /// whose samples cannot reach the ceiling.
+    fn sidechain(&mut self, path: Path, first: u64, len: usize, s: &mut [f32; CHUNK]) {
+        self.rest = false;
+        let at = |index: u64| (index & MASK) as usize;
+        for leg in 0..self.legs {
+            let mut w = [0.0f32; HISTORY + CHUNK];
+            let w = &mut w[..HISTORY + len];
+            let mut largest = 0.0f32;
+            for (i, v) in w.iter_mut().enumerate() {
+                *v = self.x[at(first.wrapping_add(i as u64).wrapping_sub(HISTORY as u64))][leg];
+                largest = largest.max(v.abs());
+            }
+            // Below the ceiling whatever the phases: none is needed.
+            if largest * PHASE_GAIN <= self.ceiling {
+                continue;
+            }
+            phase_peaks(path, w, &mut s[..len]);
+            for (i, p) in s[..len].iter_mut().enumerate() {
+                let a = w[HISTORY + i - LAG]
+                    .abs()
+                    .max(w[HISTORY + i - LAG + 1].abs());
+                if a > *p {
+                    *p = a;
+                }
+            }
+        }
     }
 
     /// Samples `n..n + len` of the block of `frames` from `start` in
@@ -472,31 +521,8 @@ impl Limiter {
         }
         let mut gains = [1.0f32; CHUNK];
         if !off {
-            self.rest = false;
-            // Per sample the peak over [m, m + 1], m = index - LAG.
             let mut s = [0.0f32; CHUNK];
-            for leg in 0..self.legs {
-                let mut w = [0.0f32; HISTORY + CHUNK];
-                let w = &mut w[..HISTORY + len];
-                let mut largest = 0.0f32;
-                for (i, v) in w.iter_mut().enumerate() {
-                    *v = self.x[at((first + i as u64).wrapping_sub(HISTORY as u64))][leg];
-                    largest = largest.max(v.abs());
-                }
-                // Below the ceiling whatever the phases: none is needed.
-                if largest * PHASE_GAIN <= self.ceiling {
-                    continue;
-                }
-                phase_peaks(path, w, &mut s[..len]);
-                for (i, p) in s[..len].iter_mut().enumerate() {
-                    let a = w[HISTORY + i - LAG]
-                        .abs()
-                        .max(w[HISTORY + i - LAG + 1].abs());
-                    if a > *p {
-                        *p = a;
-                    }
-                }
-            }
+            self.sidechain(path, first, len, &mut s);
             for i in 0..len {
                 gains[i] = self.gain(first + i as u64, s[i]);
             }
@@ -842,6 +868,24 @@ mod tests {
         let y = run(&mut l, 2000, &x[2000..], 48);
         assert!(y[RAMP as usize..].iter().all(|&v| v == 2.0));
         assert!(l.rest);
+    }
+
+    /// Switched on at once over a loud signal, the limiter holds the
+    /// ceiling from the first sample: the samples on their way out when
+    /// it switched on are taken into the sidechain first.
+    #[test]
+    fn switched_on_at_once_the_ceiling_holds_from_the_first_sample() {
+        let x: Vec<f32> = (0..2000)
+            .map(|n| if n % 2 == 0 { 2.0 } else { -2.0 })
+            .collect();
+        let mut l = Limiter::new(1, 0);
+        let y = run(&mut l, 0, &x[..1000], 48);
+        assert!(y[LIMITER_DELAY..].iter().all(|v| v.abs() == 2.0));
+        assert!(l.set(on(-6.0, 50.0)));
+        let y = run(&mut l, 1000, &x[1000..], 48);
+        let c = db_to_gain(-6.0);
+        let peak = y.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak <= c * (1.0 + 1e-6), "peak {peak}");
     }
 
     /// A jump of the index restarts the limiter from silence: the

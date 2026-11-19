@@ -309,6 +309,8 @@ the page hash and the output's meters, so they all see what leaves.
 Such an output is `samplez_dsp::LIMITER_DELAY` samples (53, 1.1 ms)
 later than one without, on or off; switching it on or off ramps over the
 ramp length, a new ceiling or release takes effect at the next sample.
+Switched on, it takes the samples already on their way out into its
+sidechain first, so the ceiling holds from the first sample.
 
 The limiter is a feed-forward look-ahead limiter linked over the
 output's channels. Its sidechain is the ITU-R BS.1770-5 Annex 2
