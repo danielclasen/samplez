@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.12.2](https://github.com/danielclasen/samplez/compare/v0.12.1...v0.12.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* **replica:** bound the contact lock hold of a catch-up ([#131](https://github.com/danielclasen/samplez/issues/131)) ([7613fb3](https://github.com/danielclasen/samplez/commit/7613fb3a382264033791ce5bab55bd6c2888c5f9))
+* **replica:** release the metrics guard before locking contact ([#129](https://github.com/danielclasen/samplez/issues/129)) ([2e953ff](https://github.com/danielclasen/samplez/commit/2e953ffb12d82ccb046f55c014ab017211f0209f))
+* **service:** keep /healthz answering when a replica lock is stuck ([#128](https://github.com/danielclasen/samplez/issues/128)) ([13dee4e](https://github.com/danielclasen/samplez/commit/13dee4ed77ef8d74ddc489a8a3576dd497ed2ba7))
+
 ## [0.12.1](https://github.com/danielclasen/samplez/compare/v0.12.0...v0.12.1) (2026-11-19)
 
 
