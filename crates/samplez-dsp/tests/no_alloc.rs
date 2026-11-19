@@ -8,8 +8,8 @@ use samplez_dsp::duck::MAX_KEYS;
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
     BandType, CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams,
-    KWeighting, KeyFilter, Loudness, MAX_DUCKS, Matrix, Meters, Path, PlanarBuffer, Ramp, Strip,
-    StripParam, TruePeak, duck_gain, restore_mxcsr, set_ftz_daz,
+    KWeighting, KeyFilter, Loudness, MAX_DUCKS, Matrix, Meters, Path, PlanarBuffer, Ramp, Slice,
+    Strip, StripParam, TruePeak, duck_gain, restore_mxcsr, set_ftz_daz,
 };
 
 #[path = "../src/require.rs"]
@@ -133,7 +133,7 @@ fn process_calls_do_not_allocate() {
                 assert!(true_peak.process_on(*path, ch, x).is_finite());
                 power += kweighting.process(ch, x);
             }
-            loudness.push(slice, Some(power / frames as f64));
+            loudness.push(slice, Slice::Power(power / frames as f64));
             slice += 1;
         }
         assert!(ramp.set_target(0.25 * round as f32, 100));

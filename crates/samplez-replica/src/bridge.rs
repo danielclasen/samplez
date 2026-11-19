@@ -635,6 +635,12 @@ impl Audio for EngineAudio {
         }
     }
 
+    fn diverged(&self, apart: bool) {
+        if let Err(e) = self.engine.set_diverged(apart) {
+            tracing::error!(error = ?e, "the engine refused the divergence flag");
+        }
+    }
+
     /// Waits for the floor, which lies up to the lead and a generation's
     /// build ahead of the engine under continuous writes, the lead at the
     /// cap up to [`crate::schedule::EXTRA_LEAD`] past it, and the RT

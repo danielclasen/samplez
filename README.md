@@ -207,10 +207,66 @@ strip, read or silenced; it has no true peak.
 RMS is referenced to a sine as in AES17: the root mean square times the
 square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
 `Engine::reset_loudness` restarts the measurement of an output or a
-meter at a sample index. A
-meter record lost on the way from the RT thread, samples not metered
-after an overrun, or an infinite or NaN sample mark integrated loudness
-and loudness range invalid until the next reset.
+meter at a sample index.
+
+Integrated loudness and loudness range leave out every 10 ms slice that
+is a gap or lost, and carry on over the rest: their gating blocks and
+short-term values are taken over the kept slices one after the other,
+as if the slices left out had not been there. This is a deliberate
+deviation from a strict reading of EBU Tech 3341 and 3342, which measure
+a programme without interruption: an input taken down or a slice lost
+neither blanks the measurement nor lowers it with the silence or the
+partial mix it leaves. Momentary and short-term loudness restart after
+such a slice. Each output's and meter's status counts both since the
+measurement started:
+
+- `gaps`: slices in which an input down by the log (an `InputDown`
+  applied; a `Detach` is not one) fed one of the meter's columns through
+  a coefficient whose target, the value the last gain change set, is
+  other than 0, and slices whose loudness power is not finite, from an
+  infinite or NaN sample. A gain change with a delayed fade sets its
+  target at its entry's index, so a gap follows the target, not the
+  level heard. A read that failed, or was held for its generation, on
+  one replica only is not a gap. Samples an overrun or a forward clock
+  step skipped are decided by the same rule, from the entries applied
+  in them, so a skip over an input taken down counts the gaps a replica
+  that computed them counts.
+- `lost`: slices this replica did not meter whole, or metered while
+  diverged: samples an overrun or a forward clock step skipped that are
+  not gaps, blocks not computed without a core (after `drop_core`, a
+  rebuild or an install), blocks computed while `samplez-replica` holds
+  the replica diverged or resyncing before its hand-over
+  (`Engine::set_diverged`), slices whose meter records were lost on the
+  way from the RT thread, a skip's slices among them when its span
+  records found the ring full, and after a reset the slices from its
+  window to the first one metered. A slice that never arrived is
+  counted once a later one is metered. A slice metered while diverged
+  is lost even where it would be a gap, since the entry that made it
+  one may be one the log voided; otherwise a slice with a block that
+  was a gap counts as a gap.
+
+`samplez-replica` sets the divergence flag on the contact tick after it
+detects a divergence and clears it on the tick after the hand-over, so
+it covers the blocks from detection to the hand-over and up to one tick
+around each; the blocks computed between the entry that put the
+replica apart and its detection are metered as computed. `gaps` is
+equal on all replicas whose `lost` is 0. A replica with `lost` above 0
+left out slices its peers measured, so its integrated loudness and
+range may differ slightly from theirs, and it may count fewer or more
+gaps over its lost and diverged spans: a slice whose records it lost,
+that it did not compute without a core, or that it metered while
+diverged is counted lost whatever the log held there, and one metered
+from a state the log later voided, before the flag was set, counts as
+that state made it.
+
+Meter state is per replica and lives in the engine: a core copy carries
+none of it. A resync, a rebuild from product state and a hand-over do
+not reset the measurement; the replica measures on from its own state,
+the slices it lost meanwhile counted in `lost`. The measurement restarts
+only with the process or at `Engine::reset_loudness`. `since` is the
+sample index the measurement started at, so a replica whose `since` is
+later than its peers' restarted its measurement and measures a shorter
+programme.
 After samples that were not metered, the true peak counts only
 interpolated values computed from samples after them.
 
@@ -521,7 +577,8 @@ position, each output's limiter with its rings and released gain, each
 delay line's taps and the history its taps reach, the
 entries waiting for a generation and the pending
 generation's entry id, and the unresolved entries.
-Meters, hold rings, statuses and readers stay with the replica.
+Meters, the loudness measurement with its gating histograms, `gaps` and
+`lost` included, hold rings, statuses and readers stay with the replica.
 History rings (`History` in samplez-dsp) hold a delay plus
 `historySlackMs` of slack as relaxed atomic bit patterns; the RT thread
 publishes the block it starts before it stores any history sample, and a
@@ -969,10 +1026,10 @@ primitives listed in `clippy.toml` in the RT modules. `cargo bench
 --bench rt` in samplez, samplez-dsp and samplez-mxl fails when the
 instruction count of the hold ring's paths, the page hashes, the strip
 calls of the RT loop, a block's DSP, limiters, delay lines, duck
-detectors and input meters, the matrix and detector copies of the core, a
-duck batch, a block's
-history stores or an output commit, gap zero-fill included, exceeds the
-limit in the benchmark. An input is pruned after `pruneAfterBlocks`
+detectors, input meters and the meters' gap decision, the metering of
+a skip with entries inside it, the matrix and detector copies of the
+core, a duck batch, a block's history stores or an output commit, gap
+zero-fill included, exceeds the limit in the benchmark. An input is pruned after `pruneAfterBlocks`
 consecutive late blocks with its head frozen, or twice the producer's
 `maxCommitBatchSizeHint` plus `readerMarginSamples` when that is longer,
 with no validity check on the RT thread: the supervisor's poll reader

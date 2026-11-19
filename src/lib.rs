@@ -9,6 +9,8 @@
 compile_error!("samplez supports x86_64 only");
 
 mod batch;
+#[doc(hidden)]
+pub mod bench;
 pub mod blocks;
 pub mod config;
 mod ducks;

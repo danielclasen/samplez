@@ -315,16 +315,15 @@ fn replicas() {
     );
     // A loudness reset at one index on both: from the window it lands on,
     // both measure the same samples from the same filter state, so the
-    // maxima since then are the same bits. Samples a replica skipped after
-    // an overrun are not metered and leave its measurement invalid until
-    // the next reset; the reset is then made again, up to five times.
+    // measurement since then is the same bits. Samples a replica skipped
+    // after an overrun are lost to its measurement, which carries on
+    // without them and counts them in `lost`. A run is disturbed only by
+    // a measured skip; slices lost without one fail the test.
     let skipped = || {
         let c = |e: &samplez::Engine| e.counters().overrun_skipped_samples.load(Relaxed);
         (c(&a), c(&b))
     };
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
+    common::undisturbed(|| {
         let before = skipped();
         // The channel was drained and verdicts arrive once per supervisor
         // tick, so wait for one.
@@ -342,20 +341,38 @@ fn replicas() {
         }
         let (sa, sb) = (a.status(), b.status());
         let (ma, mb) = (&sa.outputs[0].meters, &sb.outputs[0].meters);
-        if !(ma.valid && mb.valid) && skipped() != before && attempt < 5 {
-            println!(
-                "replicas: overrun skips after the loudness reset; {}",
+        assert_eq!((ma.gaps, mb.gaps), (0, 0), "{ma:?} {mb:?}");
+        assert!(
+            ma.integrated.is_some() && mb.integrated.is_some(),
+            "{ma:?} {mb:?}; {}",
+            timings()
+        );
+        if ma.lost + mb.lost > 0 && skipped() != before {
+            return Err(format!(
+                "{} and {} slices lost to overrun skips; {}",
+                ma.lost,
+                mb.lost,
                 timings()
-            );
-            continue;
+            ));
         }
-        assert!(ma.valid && mb.valid, "{ma:?} {mb:?}; {}", timings());
+        assert_eq!(
+            (ma.lost, mb.lost),
+            (0, 0),
+            "no skip measured; {}",
+            timings()
+        );
         assert_eq!(ma.max_true_peak, mb.max_true_peak, "{}", timings());
-        let max_m = |m: &samplez::OutputMeters| m.max_momentary.map(f64::to_bits);
-        assert_eq!(max_m(ma), max_m(mb), "{ma:?} {mb:?}; {}", timings());
+        let bits = |m: &samplez::OutputMeters| {
+            (
+                m.max_momentary.map(f64::to_bits),
+                m.integrated.map(f64::to_bits),
+                m.range.map(f64::to_bits),
+            )
+        };
+        assert_eq!(bits(ma), bits(mb), "{ma:?} {mb:?}; {}", timings());
         assert!(ma.max_momentary.is_some());
-        break;
-    }
+        Ok(())
+    });
     common::stop(b);
     common::stop(a);
 }

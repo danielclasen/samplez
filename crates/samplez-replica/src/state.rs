@@ -299,6 +299,13 @@ impl Life {
         self.state
     }
 
+    /// The output is apart from the peers': diverged, or resyncing before
+    /// the RT thread took the replayed state.
+    pub fn apart(&self) -> bool {
+        self.state == ReplicaState::Diverged
+            || (self.state == ReplicaState::Resync && self.handed.is_none())
+    }
+
     /// An old-key filler in a key hand-over (plan 2.11, Baseline).
     pub fn filler(&self) -> bool {
         self.filler.is_some()
@@ -1228,6 +1235,28 @@ mod tests {
         assert_eq!(life.state(), ReplicaState::Diverged);
         assert_eq!(calls.take(), ["withdraw"]);
         assert_eq!(life.metrics.divergences, 1);
+    }
+
+    /// A replica's output is apart from its peers' from its divergence
+    /// until the RT thread takes a replayed state, and again when the
+    /// resync fails; never while it starts or commits.
+    #[test]
+    fn a_replica_is_apart_from_divergence_to_hand_over() {
+        let idle = Standing::Idle { since: 0 };
+        let calls = Calls::default();
+        let mut life = Life::new();
+        assert!(!life.apart(), "starting");
+        step(&mut life, &own(K, idle), None, &calls);
+        assert!(!life.apart());
+        life.contradicted(&calls);
+        assert!(life.apart(), "diverged");
+        assert!(life.resyncing());
+        assert!(life.apart(), "replaying");
+        life.resync_failed();
+        assert!(life.apart(), "the resync failed");
+        assert!(life.resyncing());
+        life.handed_over(K + 2);
+        assert!(!life.apart(), "handed over");
     }
 
     /// A replica resyncing takes no commit start under a `Baseline`

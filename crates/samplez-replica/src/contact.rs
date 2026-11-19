@@ -208,6 +208,10 @@ pub trait Audio: Send + Sync + 'static {
     /// Drops the running engine's core: its state no longer follows the
     /// log (snapshot install, purge-point verdict).
     fn drop_engine(&self) {}
+    /// Whether the replica's output is apart from its peers': diverged,
+    /// or resyncing before the hand-over. The engine's meters lose what
+    /// it computes meanwhile. Set on every tick.
+    fn diverged(&self, _apart: bool) {}
     /// Builds the engine's core from `state`, the applied product state,
     /// and installs it at the first block at or after `at_least`, the
     /// floor of the applied log; false when that failed and is to be
@@ -1473,8 +1477,9 @@ impl Contact {
         self.decide(st, tai);
         self.live(st, now, tai);
         // After the decisions known committed were acted on.
-        if self.audio.is_some() {
+        if let Some(audio) = &self.audio {
             st.own.unresolved = Self::unresolved(st);
+            audio.diverged(st.life.as_ref().is_some_and(Life::apart));
         }
 
         // Reports.
@@ -4083,6 +4088,8 @@ mod tests {
         build_time: AtomicU64,
         /// [`Audio::follows`].
         follows: std::sync::atomic::AtomicBool,
+        /// The last [`Audio::diverged`].
+        apart: std::sync::atomic::AtomicBool,
     }
 
     impl Engine {
@@ -4159,6 +4166,9 @@ mod tests {
         }
         fn follows(&self, _state: &ProductState) -> bool {
             self.follows.load(Ordering::SeqCst)
+        }
+        fn diverged(&self, apart: bool) {
+            self.apart.store(apart, Ordering::SeqCst);
         }
         fn committed(&self, up_to: u64) {
             self.calls
@@ -4322,6 +4332,7 @@ mod tests {
             disabled: AtomicU64::new(0),
             build_time: AtomicU64::new(0),
             follows: std::sync::atomic::AtomicBool::new(true),
+            apart: std::sync::atomic::AtomicBool::new(false),
         });
         let contact = Contact::new(
             1,
@@ -5416,6 +5427,41 @@ mod tests {
         committing(&f);
         assert_eq!(f.contact.resync_due(), None, "rebuilt instead");
         assert_eq!(rebuilt(&f), 1);
+    }
+
+    /// Every tick tells the engine whether the replica's output is apart
+    /// from its peers': from a divergence until the hand-over of a
+    /// resync, so the engine's meters lose what it computes meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn the_engine_is_told_of_a_divergence_until_the_hand_over() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        assert!(!f.engine.apart.load(Ordering::SeqCst));
+        diverge(&f);
+        assert_eq!(f.state(), Some(ReplicaState::Diverged));
+        assert!(f.engine.apart.load(Ordering::SeqCst), "diverged");
+        f.contact.receive(state_report(
+            &f,
+            2,
+            ReplicaState::Committing,
+            Duration::ZERO,
+        ));
+        let (epoch, donor, _) = f.contact.resync_due().expect("a resync");
+        assert!(f.contact.resync_arrived(epoch));
+        f.tick();
+        assert!(f.engine.apart.load(Ordering::SeqCst), "replaying");
+        f.contact.resync_ended(
+            epoch,
+            donor,
+            Ok(Resynced {
+                j: 1,
+                pages: Vec::new(),
+                unresolved: Vec::new(),
+            }),
+        );
+        f.tick();
+        assert!(!f.engine.apart.load(Ordering::SeqCst), "handed over");
     }
 
     /// A diverged replica on another flow resyncs, hands over and

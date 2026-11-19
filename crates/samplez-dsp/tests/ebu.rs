@@ -3,7 +3,9 @@
 //! their definitions there. The authentic programme cases (3341 cases 7
 //! and 8, 3342 cases 5 and 6) are recordings and are not covered.
 
-use samplez_dsp::{KWeighting, Loudness, Path, TruePeak, restore_mxcsr, set_ftz_daz, weight};
+use samplez_dsp::{
+    KWeighting, Loudness, Path, Slice, TruePeak, restore_mxcsr, set_ftz_daz, weight,
+};
 use std::f64::consts::PI;
 
 const FS: f64 = 48_000.0;
@@ -48,7 +50,7 @@ impl Meter {
                 power += self.weights[ch] * (self.kw.process(ch, x) / SLICE as f64);
                 self.max_true_peak = self.max_true_peak.max(self.tp.process(ch, x));
             }
-            self.loudness.push(self.slice, Some(power));
+            self.loudness.push(self.slice, Slice::Power(power));
             self.slice += 1;
             each(&self.loudness);
         }

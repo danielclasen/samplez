@@ -9,11 +9,19 @@
 //! history of the true-peak interpolator; the momentary and short-term
 //! loudness are once 0.4 s and 3 s past it, and until then still include
 //! slices from before the reset. Within those bounds, replicas that
-//! compute the same output and lose no record report the same values.
+//! compute the same output and lose no slice report the same values.
 //! Before the first reset each measures from its own start. Levels in
 //! LUFS come from libm's `log10`, not the host C library's.
+//!
+//! A slice in which an input down by the log fed the meter, or whose
+//! power is not finite, is a gap; one this replica did not meter whole,
+//! or metered while diverged, is lost. Either is left out of the
+//! integrated loudness and the loudness range, which carry on over the
+//! rest. Gaps follow from the log and the output, so `gaps` is equal on
+//! all replicas whose `lost` is 0; a replica with `lost` above 0 may
+//! count fewer or more gaps over its lost and diverged spans.
 
-use samplez_dsp::{Loudness, WINDOW};
+use samplez_dsp::{Loudness, Slice, WINDOW};
 
 use crate::rt_loop::{MeterRecord, SLICE};
 
@@ -43,15 +51,33 @@ pub struct OutputMeters {
     pub short_term: Option<f64>,
     pub max_momentary: Option<f64>,
     pub max_short_term: Option<f64>,
-    /// Gated per ITU-R BS.1770-5; `None` while not `valid`.
+    /// Gated per ITU-R BS.1770-5, over the slices of the measurement
+    /// that are neither gaps nor lost.
     pub integrated: Option<f64>,
-    /// Loudness range per EBU Tech 3342, LU; `None` while not `valid`.
+    /// Loudness range per EBU Tech 3342, LU, over the same slices.
     pub range: Option<f64>,
-    /// No meter record lost, no samples left unmeasured and no infinite
-    /// or NaN loudness power since the measurement started.
-    pub valid: bool,
+    /// Slices of 10 ms since the measurement started that are gaps: an
+    /// input down by the log (`InputDown` applied, not detached) fed one
+    /// of the meter's columns through a coefficient whose target is other
+    /// than 0 in a block of the slice, computed or skipped, or its
+    /// loudness power is not finite. Equal on all replicas whose `lost` is
+    /// 0; one with `lost` above 0 may count fewer or more over its lost
+    /// and diverged spans.
+    pub gaps: u64,
+    /// Slices of 10 ms since the measurement started that this replica
+    /// did not meter whole, or metered while held diverged: samples an
+    /// overrun or a forward clock step skipped that are not gaps, blocks
+    /// not computed without a core, and slices whose meter records were
+    /// lost on the way from the RT thread. A slice metered while diverged
+    /// is lost even where it would be a gap. Other than 0, the integrated
+    /// loudness and range may differ from those of a replica that lost
+    /// none.
+    pub lost: u64,
     /// The sample index the measurement started at: the first slice
-    /// metered, or the window a reset applied at.
+    /// metered whole, or the window a reset applied at. The measurement
+    /// restarts only with the process or at a reset; a resync, a rebuild
+    /// and a hand-over keep it. A `since` later than the peers' marks a
+    /// replica whose measurement restarted.
     pub since: Option<u64>,
 }
 
@@ -84,16 +110,18 @@ pub(crate) struct OutputLoudness {
     weights: Vec<f64>,
     loudness: Loudness,
     /// The slice being assembled, the weighted power so far, whether all
-    /// of its samples were measured, and the next channel expected.
-    slice: Option<(u64, f64, bool, usize)>,
+    /// of its samples were measured, the next channel expected, and
+    /// whether it is a gap.
+    slice: Option<(u64, f64, bool, usize, bool)>,
     window_peak: Vec<f32>,
     window_true_peak: Vec<f32>,
     /// Per channel, the unweighted sum of squares of the window so far
     /// and the samples it covers.
     window_power: Vec<(f64, u64)>,
     /// The integrated loudness and the loudness range may have changed:
-    /// a window ended, or a reset cleared them. Evaluating them walks
-    /// every histogram bin, so they are evaluated only then.
+    /// a window of the measured slices ended, or a reset cleared them.
+    /// Evaluating them walks every histogram bin, so they are evaluated
+    /// only then.
     dirty: bool,
     /// Evaluations of the integrated loudness and the loudness range.
     #[cfg(test)]
@@ -123,18 +151,20 @@ impl OutputLoudness {
                 rms: vec![0.0; n],
                 true_peak: vec![0.0; n],
                 max_true_peak: vec![0.0; n],
-                valid: true,
                 ..OutputMeters::default()
             },
         }
     }
 
-    /// Records were lost: the slice being assembled is dropped and the
-    /// loudness has a gap.
+    /// Records were lost: the slice being assembled is lost, or a gap
+    /// when its first record said so, as it is on every replica. A slice
+    /// whose records were all lost counts when the next one arrives.
     pub fn gap(&mut self) {
-        self.slice = None;
-        self.loudness.gap();
-        self.publish();
+        if let Some((slice, .., gap)) = self.slice.take() {
+            let s = if gap { Slice::Gap } else { Slice::Lost };
+            self.loudness.push(slice, s);
+            self.publish();
+        }
     }
 
     pub fn record(&mut self, r: &MeterRecord) {
@@ -143,16 +173,23 @@ impl OutputLoudness {
             if self.slice.is_some() {
                 self.gap();
             }
-            if r.reset {
-                self.loudness.reset();
+            if let Some(at) = r.reset() {
+                self.loudness.reset(at / SLICE);
                 self.dirty = true;
                 self.meters.max_true_peak.fill(0.0);
-                self.meters.since = Some(r.slice * SLICE);
             }
-            self.meters.since.get_or_insert(r.slice * SLICE);
-            self.slice = Some((r.slice, 0.0, true, 0));
+            // A slice metered while diverged is lost, whatever else it is:
+            // what made it a gap there may be what the replica got wrong.
+            if r.span() {
+                let gap = r.gap() && !r.diverged();
+                let kind = if gap { Slice::Gap } else { Slice::Lost };
+                self.loudness.skip(r.slice, u64::from(r.frames), kind);
+                self.publish();
+                return;
+            }
+            self.slice = Some((r.slice, 0.0, !r.diverged(), 0, r.gap() && !r.diverged()));
         }
-        let Some((slice, power, complete, next)) = self.slice.as_mut() else {
+        let Some((slice, power, complete, next, _)) = self.slice.as_mut() else {
             return;
         };
         if *slice != r.slice || *next != c {
@@ -173,11 +210,18 @@ impl OutputLoudness {
         if *next < self.weights.len() {
             return;
         }
-        let (slice, power, complete) = (*slice, *power, *complete);
-        self.slice = None;
-        self.loudness.push(slice, complete.then_some(power));
+        let Some((slice, power, complete, _, gap)) = self.slice.take() else {
+            return;
+        };
+        let s = if gap {
+            Slice::Gap
+        } else if complete {
+            Slice::Power(power)
+        } else {
+            Slice::Lost
+        };
+        self.dirty |= self.loudness.push(slice, s);
         if ((slice + 1) * SLICE).is_multiple_of(WINDOW) {
-            self.dirty = true;
             self.meters.window = Some(slice * SLICE / WINDOW);
             self.meters.peak.copy_from_slice(&self.window_peak);
             self.meters
@@ -204,8 +248,10 @@ impl OutputLoudness {
         m.short_term = l.short_term();
         m.max_momentary = l.max_momentary();
         m.max_short_term = l.max_short_term();
-        // A gap changes them too: they turn None with the validity.
-        if self.dirty || m.valid != l.valid() {
+        m.gaps = l.gaps();
+        m.lost = l.lost();
+        m.since = l.start().map(|s| s * SLICE);
+        if self.dirty {
             m.integrated = l.integrated();
             m.range = l.range();
             self.dirty = false;
@@ -214,13 +260,19 @@ impl OutputLoudness {
                 self.evaluations += 1;
             }
         }
-        m.valid = l.valid();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rt_loop::{GAP, NO_RESET};
+
+    impl MeterRecord {
+        fn clone_with_slice(&self, slice: u64) -> MeterRecord {
+            MeterRecord { slice, ..*self }
+        }
+    }
 
     fn rec(seq: u64, channel: u32, slice: u64, sum_sq: f64) -> MeterRecord {
         MeterRecord {
@@ -233,7 +285,8 @@ mod tests {
             true_peak: 0.6,
             sum_sq,
             plain_sum_sq: 0.0,
-            reset: false,
+            reset_at: NO_RESET,
+            flags: 0,
         }
     }
 
@@ -255,33 +308,38 @@ mod tests {
         let m = &l.meters;
         assert!((m.integrated.unwrap() + 23.0).abs() < 1e-9);
         assert!((m.short_term.unwrap() + 23.0).abs() < 1e-9);
-        assert_eq!((m.window, m.since, m.valid), (Some(39), Some(0), true));
+        assert_eq!(
+            (m.window, m.since, m.gaps, m.lost),
+            (Some(39), Some(0), 0, 0)
+        );
         assert_eq!(
             (m.peak[1], m.true_peak[0], m.max_true_peak[1]),
             (0.5, 0.6, 0.6)
         );
     }
 
-    /// A channel record missing in a slice is a gap: integrated loudness
-    /// and range turn invalid; a reset record makes them valid again.
+    /// A channel record missing in a slice loses the slice: the
+    /// integrated loudness and range carry on without it and `lost`
+    /// counts it. A reset record restarts the counts from its index.
     #[test]
-    fn a_missing_record_invalidates_until_reset() {
+    fn a_missing_record_is_lost_and_the_measurement_carries_on() {
         let mut l = OutputLoudness::new(vec![1.0, 1.0]);
         feed(&mut l, 0..50);
         l.record(&rec(0, 0, 50, 1.0));
         feed(&mut l, 51..100);
-        assert!(!l.meters.valid);
-        assert_eq!((l.meters.integrated, l.meters.range), (None, None));
+        assert_eq!((l.meters.gaps, l.meters.lost), (0, 1));
+        assert!((l.meters.integrated.unwrap() + 23.0).abs() < 1e-9);
+        assert_eq!(l.meters.range, None, "less than 3 s measured");
         let mut r = rec(0, 0, 100, 0.0);
-        r.reset = true;
+        r.reset_at = 100 * SLICE;
         (r.peak, r.true_peak) = (0.1, 0.1);
         l.record(&r);
         l.record(&rec(0, 1, 100, 0.0));
-        assert!(l.meters.valid);
         assert_eq!(
-            (l.meters.since, l.meters.max_true_peak[0]),
-            (Some(48_000), 0.1)
+            (l.meters.since, l.meters.lost, l.meters.max_true_peak[0]),
+            (Some(48_000), 0, 0.1)
         );
+        assert_eq!(l.meters.integrated, None);
         feed(&mut l, 101..141);
         assert!(l.meters.integrated.is_some());
     }
@@ -326,43 +384,145 @@ mod tests {
     }
 
     /// Integrated loudness and loudness range are evaluated once per
-    /// 100 ms window, not per slice, and still follow a gap and a reset
-    /// within the slice that causes them.
+    /// 100 ms window, not per slice, and follow a reset within the slice
+    /// that causes it; a lost slice changes neither.
     #[test]
     fn integrated_loudness_is_evaluated_per_window() {
         let mut l = OutputLoudness::new(vec![1.0, 1.0]);
         feed(&mut l, 0..400);
         assert_eq!(l.evaluations, 40);
-        assert!(l.meters.integrated.is_some());
-        // An incomplete slice mid-window invalidates at once.
+        let integrated = l.meters.integrated;
+        assert!(integrated.is_some());
         let mut short = rec(0, 0, 405, 0.0);
         short.frames = 1;
         feed(&mut l, 400..405);
         l.record(&short);
         l.record(&rec(0, 1, 405, 0.0));
-        assert_eq!((l.meters.valid, l.meters.integrated), (false, None));
+        assert_eq!((l.meters.lost, l.meters.integrated), (1, integrated));
         // A reset mid-window clears them at once.
         let mut r = rec(0, 0, 406, 0.0);
-        r.reset = true;
+        r.reset_at = 406 * SLICE;
         l.record(&r);
         l.record(&rec(0, 1, 406, 0.0));
-        assert_eq!((l.meters.valid, l.meters.integrated), (true, None));
-        assert_eq!(l.evaluations, 42);
+        assert_eq!((l.meters.lost, l.meters.integrated), (0, None));
+        assert_eq!(l.evaluations, 41);
     }
 
-    /// A slice with fewer samples than its length is a gap once the
-    /// measurement has started, but not before.
+    /// A slice with fewer samples than its length is lost once the
+    /// measurement has started, but not before: the first slice of a
+    /// stream is the start.
     #[test]
-    fn an_incomplete_slice_is_a_gap_after_the_start() {
+    fn an_incomplete_slice_is_lost_after_the_start() {
         let mut l = OutputLoudness::new(vec![1.0]);
         let mut first = rec(0, 0, 7, 0.0);
         first.frames = 100;
         l.record(&first);
         l.record(&rec(0, 0, 8, 1.0));
-        assert!(l.meters.valid);
+        assert_eq!((l.meters.since, l.meters.lost), (Some(8 * SLICE), 0));
         let mut short = rec(0, 0, 9, 1.0);
         short.frames = 479;
         l.record(&short);
-        assert!(!l.meters.valid);
+        assert_eq!((l.meters.gaps, l.meters.lost), (0, 1));
+    }
+
+    /// A slice the RT thread flagged a gap counts in `gaps`, complete or
+    /// not, and is left out of the integrated loudness as a lost one is;
+    /// each slice index that never arrives and each slice whose records
+    /// a lost sequence cut counts in `lost`.
+    #[test]
+    fn gaps_and_lost_slices_count_per_slice() {
+        let mut l = OutputLoudness::new(vec![1.0, 1.0]);
+        feed(&mut l, 0..100);
+        let integrated = l.meters.integrated;
+        for s in 100..103 {
+            for c in 0..2 {
+                // Loud, which a slice kept would move the level by.
+                let mut r = rec(0, c, s, 100.0 * SLICE as f64);
+                r.flags = GAP;
+                r.frames = if s == 102 { 10 } else { SLICE as u32 };
+                l.record(&r);
+            }
+        }
+        assert_eq!((l.meters.gaps, l.meters.lost), (3, 0));
+        // Slices 103 to 105 never arrive; 106 is cut by lost records.
+        l.record(&rec(0, 0, 106, 1.0));
+        l.gap();
+        l.gap();
+        assert_eq!((l.meters.gaps, l.meters.lost), (3, 4));
+        feed(&mut l, 107..110);
+        assert_eq!(l.meters.integrated, integrated);
+        assert_eq!((l.meters.gaps, l.meters.lost), (3, 4));
+    }
+
+    /// A slice whose first record flags it a gap stays a gap when the
+    /// rest of its records are lost: its peers count it a gap whatever
+    /// this replica lost of it.
+    #[test]
+    fn a_gap_slice_cut_by_lost_records_is_a_gap() {
+        let mut l = OutputLoudness::new(vec![1.0, 1.0]);
+        feed(&mut l, 0..100);
+        let mut r = rec(0, 0, 100, 1.0);
+        r.flags = GAP;
+        l.record(&r);
+        l.gap();
+        assert_eq!((l.meters.gaps, l.meters.lost), (1, 0));
+        // Cut by the next slice's first record arriving instead.
+        l.record(&r.clone_with_slice(101));
+        l.record(&rec(0, 0, 102, 1.0));
+        assert_eq!((l.meters.gaps, l.meters.lost), (2, 0));
+    }
+
+    /// A span record counts every slice it covers at once, as gaps with
+    /// the gap flag and else as lost, and the measurement carries on after
+    /// it; one carrying a reset restarts the measurement at its index.
+    #[test]
+    fn a_span_counts_its_slices() {
+        let mut l = OutputLoudness::new(vec![1.0, 1.0]);
+        feed(&mut l, 0..100);
+        let integrated = l.meters.integrated;
+        let span = |slice, n, flags| MeterRecord {
+            frames: n,
+            flags: crate::rt_loop::SPAN | flags,
+            ..rec(0, 0, slice, 0.0)
+        };
+        l.record(&span(100, 7, GAP));
+        l.record(&span(107, 3, 0));
+        assert_eq!((l.meters.gaps, l.meters.lost), (7, 3));
+        feed(&mut l, 110..120);
+        assert_eq!((l.meters.gaps, l.meters.lost), (7, 3));
+        assert_eq!(l.meters.integrated, integrated);
+        let mut reset = span(120, 5, GAP);
+        reset.reset_at = 120 * SLICE;
+        l.record(&reset);
+        assert_eq!(
+            (l.meters.gaps, l.meters.lost, l.meters.since),
+            (5, 0, Some(120 * SLICE))
+        );
+    }
+
+    /// A slice metered while diverged is lost even when it is flagged a
+    /// gap, whole, cut by lost records or skipped: the entry that made it
+    /// a gap may be one the log voided, so it counts on this replica
+    /// alone and its peers may not count it.
+    #[test]
+    fn a_diverged_gap_slice_is_lost() {
+        use crate::rt_loop::{DIVERGED, SPAN};
+        let mut l = OutputLoudness::new(vec![1.0, 1.0]);
+        feed(&mut l, 0..100);
+        for c in 0..2 {
+            let mut r = rec(0, c, 100, 1.0);
+            r.flags = GAP | DIVERGED;
+            l.record(&r);
+        }
+        let mut r = rec(0, 0, 101, 1.0);
+        r.flags = GAP | DIVERGED;
+        l.record(&r);
+        l.gap();
+        l.record(&MeterRecord {
+            frames: 4,
+            flags: SPAN | GAP | DIVERGED,
+            ..rec(0, 0, 102, 0.0)
+        });
+        assert_eq!((l.meters.gaps, l.meters.lost), (0, 6));
     }
 }

@@ -3275,3 +3275,105 @@ fn a_rebuilt_replica_continues_a_plain_ramp() {
 fn a_rebuilt_replica_continues_chained_plain_ramps() {
     common::undisturbed(|| rebuilt_replica_continues_plain_ramps(true));
 }
+
+/// Replicas agree on the integrated loudness, the loudness range and the
+/// gaps of a measurement over an `InputDown` and the `InputUp` after it:
+/// the slices the log took the input down for are gaps on both, left out
+/// of both measurements, which carry on after the `InputUp`. The
+/// programme ends with its gains at 0, after which nothing changes the
+/// measurement; it is compared once both engines delivered a verdict past
+/// that point and metered it. A run that lost a slice, or silenced an
+/// input outside the `InputDown`, is disturbed and runs again.
+#[test]
+fn replicas_agree_on_the_loudness_and_its_gaps() {
+    use samplez_dsp::{SLICE, WINDOW};
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _p = Pilot::start(&domain.0, &src, 2, B, 0);
+        // A loaded host catches up rather than skipping: a skip loses
+        // slices, and the run would be disturbed.
+        let hs = [0; 2].map(|_| hashed_of(&domain, &[(&src, 2)], |c| c.max_catchup_blocks = 50));
+        // What loses slices to a measurement, counted from before it.
+        let losses = |h: &Hashed| {
+            let c = h.e.counters();
+            (
+                h.skipped(),
+                c.meter_dropped.load(Relaxed),
+                c.blocks_without_core.load(Relaxed),
+            )
+        };
+        let before = hs.each_ref().map(losses);
+        let reset = ((now_block() + 40) * B).next_multiple_of(WINDOW);
+        // 3.5 s of programme around half a second down, enough for a
+        // loudness range.
+        let down = reset + 72_000;
+        let up = down + 24_000;
+        let end = up + 96_000;
+        for h in &hs {
+            h.e.reset_loudness(0, reset).unwrap();
+            h.e.append(1, down, Entry::InputDown { slot: 0 }).unwrap();
+            h.e.append(2, up, Entry::InputUp { slot: 0 }).unwrap();
+            h.e.commit(2);
+            gain(&h.e, 3, end, 0, 0.0);
+            gain(&h.e, 4, end, 1, 0.0);
+        }
+        // Past the gains' ramp and the 3 s of short-term loudness after
+        // it, no gating block or short-term value is above the gates. The
+        // supervisor drains the meter records after the verdicts within a
+        // pass, so a verdict past that point does not show the records
+        // metered: the status's window has to be past it as well.
+        let frozen = end + u64::from(RAMP) + 3 * 48_000 + WINDOW;
+        let mut verdicts = [Vec::new(), Vec::new()];
+        try_wait(
+            Duration::from_secs(30),
+            "both measured past the end",
+            || {
+                for (v, h) in verdicts.iter_mut().zip(&hs) {
+                    v.extend(h.verdicts.try_iter());
+                }
+                let past = |v: &Vec<BlockVerdict>| v.iter().any(|v| v.k * B > frozen);
+                let metered = |h: &Hashed| {
+                    let w = h.e.status().outputs[0].meters.window;
+                    w.is_some_and(|w| w * WINDOW > frozen)
+                };
+                verdicts.iter().all(past) && hs.iter().all(metered)
+            },
+        )?;
+        let meters = hs
+            .each_ref()
+            .map(|h| h.e.status().outputs[0].meters.clone());
+        let [ma, mb] = &meters;
+        // A run is disturbed only by a measured cause: a skip, a dropped
+        // meter record or a block without a core since before the reset,
+        // or an input read silenced outside the down span. Slices lost
+        // without one fail the test.
+        let after = hs.each_ref().map(losses);
+        if after != before {
+            return Err(format!(
+                "skipped samples, meter records dropped, blocks without a core: \
+                 {before:?} to {after:?}; slices lost: {} and {}",
+                ma.lost, mb.lost
+            ));
+        }
+        let downed = down / B..up / B;
+        for v in verdicts.iter().flatten() {
+            if v.k * B >= reset && v.silenced != 0 && !downed.contains(&v.k) {
+                return Err(format!("block {} silenced", v.k));
+            }
+        }
+        assert_eq!((ma.lost, mb.lost), (0, 0), "slices lost, no cause measured");
+        let gaps = (up - down) / SLICE;
+        assert_eq!((ma.gaps, mb.gaps), (gaps, gaps), "{ma:?} {mb:?}");
+        assert!(ma.integrated.is_some() && ma.range.is_some(), "{ma:?}");
+        let bits = |m: &samplez::OutputMeters| {
+            (
+                m.integrated.map(f64::to_bits),
+                m.range.map(f64::to_bits),
+                m.since,
+            )
+        };
+        assert_eq!(bits(ma), bits(mb), "{ma:?} {mb:?}");
+        Ok(())
+    });
+}
