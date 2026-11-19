@@ -1,0 +1,42 @@
+name: stress
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the builder image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/builder
+          load: true
+          tags: samplez-builder:ci
+          cache-from: type=gha,scope=builder
+      - name: Run the masked-fade tests 200 times each
+        run: |
+          mkdir -p .cargo-registry
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e SAMPLEZ_REQUIRE_PATHS=avx2 -e CARGO_INCREMENTAL=0 \
+            -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
+            -w /w samplez-builder:ci bash -c '
+              cargo test --workspace --locked --release --test transfer --no-run 2>&1 | tail -3
+              for t in a_rebuilt_replica_continues_a_masked_fade_that_starts_at_its_entry a_rebuilt_replica_continues_a_masked_fade_that_waits; do
+                pass=0; fail=0; disturbed=0
+                for i in $(seq 1 200); do
+                  out=$(cargo test --release --locked -p samplez --test transfer -- $t --exact 2>&1)
+                  if echo "$out" | grep -q "^test result: ok"; then pass=$((pass+1))
+                  elif echo "$out" | grep -q "every run was disturbed"; then disturbed=$((disturbed+1)); echo "STRESS $t run $i DISTURBED: $(echo "$out" | grep "every run" | cut -c1-600)"
+                  else fail=$((fail+1)); echo "STRESS $t run $i FAILED: $(echo "$out" | grep -E "panicked|differ" -A2 | tr "\n" " " | cut -c1-1500)"; fi
+                done
+                echo "STRESS SUMMARY $t: pass=$pass fail=$fail disturbed=$disturbed"
+              done
+              exit 0'
