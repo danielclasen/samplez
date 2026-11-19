@@ -1586,3 +1586,58 @@ fn a_log_entry_across_input_domains_is_refused() {
     }
     e.stop();
 }
+
+/// A producer that commits each block after the RT thread began waiting
+/// for it, one block before the block's deadline, but before the
+/// deadline, is read within half a block period of its commit rather
+/// than at the deadline: the head wait sleeps half a period at most.
+#[test]
+fn a_block_committed_while_the_rt_thread_waits_is_read_within_half_a_period() {
+    const BLOCK: u64 = 1024;
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    // Committed 1.1 blocks after its end; the wait begins one block after
+    // the end, the deadline is two blocks after it (the margin).
+    let delay = BLOCK + BLOCK / 10;
+    let _pilot = Pilot::start(&domain.0, &src, 1, BLOCK, delay);
+    let mut c = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        2 * BLOCK,
+    );
+    c.block_size = BLOCK as u32;
+    let (e, _rx) = common::start(c);
+    running(&e);
+    let api = common::api();
+    let now = || samplez_mxl::time::now(&api);
+    let period = BLOCK * 1_000_000_000 / 48_000;
+    // Lag of each block's processing behind its commit, taken where one
+    // block was processed since the last look, so the time seen is its.
+    let mut lags = Vec::new();
+    let mut last = common::processed(&e);
+    let deadline = Instant::now() + 10 * SECOND;
+    while lags.len() < 50 {
+        assert!(Instant::now() < deadline, "{} blocks seen", lags.len());
+        let p = common::processed(&e);
+        if p == last + 1 {
+            // Block p - 1, committed once the clock passed its end plus
+            // the delay.
+            let committed = samplez_mxl::time::index_to_timestamp(&api, p * BLOCK + delay);
+            lags.push(now().saturating_sub(committed));
+        }
+        last = p;
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    lags.sort_unstable();
+    let median = lags[lags.len() / 2];
+    // Half a period, and slack for the producer's and the RT thread's
+    // wake-ups; read at the deadline instead it is 0.9 of a period.
+    assert!(
+        median <= period / 2 + 3_000_000,
+        "median lag {median} ns over a period of {period} ns: {lags:?}"
+    );
+    assert_eq!(e.counters().input_wait_timeout.load(Relaxed), 0);
+    common::stop(e);
+}
