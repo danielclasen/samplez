@@ -797,6 +797,41 @@ With no set running, an empty volume waits for a marker; one created by
 hand with `data.cluster` from a member volume's `cluster` file and
 `data.volume` 0 lets it join.
 
+### Raft timing
+
+`samplez_replica::RaftTiming` sets the timers of leader election, and
+`raft_config_with` turns it into openraft's configuration (`raft_config`
+is the defaults):
+
+| setting | default | meaning |
+| --- | --- | --- |
+| `election_min` | 300 ms | the least of the random part of a follower's election timeout |
+| `election_max` | 600 ms | the most of it, and the leader lease that precedes it |
+| `heartbeat` | 100 ms | how often a leader heartbeats, and how long one AppendEntries may take |
+
+`validate` refuses a timing unless `0 < heartbeat < election_min <
+election_max`. openraft 0.9.26 gives every AppendEntries the heartbeat
+interval to complete and has no separate timeout for it, so the
+heartbeat is also the AppendEntries timeout, below the election minimum
+whenever the timing is valid. A stall of the runtime, the network or
+name resolution that outlasts an AppendEntries fails the call and is
+retried.
+
+A follower campaigns after `election_max` (openraft's leader lease) plus
+a draw from `election_min` up to `election_max` of silence from its
+leader. A silence shorter than `election_max + election_min` starts no
+election, and one longer than `election_max + election_max` always does:
+900 to 1200 ms at the defaults, where the former 150 to 300 ms gave 450
+to 600 ms.
+
+The cost of the longer timeouts is a longer failover after a real loss
+of the leader: the set has no leader for that silence plus a vote round.
+Entries stamped in that gap miss their apply deadline and their audio
+blocks are withheld, as in any election.
+
+`Timing::lead_minute` is the length of the minute of slack the apply
+lead falls on, 60 s by default; shorter values are for tests.
+
 ## Real-time requirements
 
 The RT thread does not allocate once its loop runs (`tests/no_alloc.rs`

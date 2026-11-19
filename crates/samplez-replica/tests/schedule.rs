@@ -326,10 +326,21 @@ async fn a_late_commit_raises_the_lead_up_to_its_cap() {
 /// A lead pinned at its cap by replica load falls after a leader change
 /// once a minute of slack is clean, instead of after ten: the new term
 /// voids the cap flag at once and the lead falls a block a minute from
-/// the first clean minute.
+/// the first clean minute. A minute of slack lasts two seconds here, so
+/// the ten of the slow fall (twenty seconds) outlast the test.
 #[tokio::test(start_paused = true)]
 async fn a_leader_change_does_not_leave_the_lead_at_its_cap() {
-    let mut set = start(None).await;
+    const MINUTE: Duration = Duration::from_secs(2);
+    let timing = Timing {
+        lead_minute: MINUTE,
+        ..timing()
+    };
+    let mut set = Set::start(Options {
+        contact: Some(timing),
+        ..Options::default()
+    })
+    .await;
+    sleep(Duration::from_millis(50)).await;
     let first = set.leader().await;
     for id in set.ids().filter(|&id| id != first) {
         set.net.stall(id, Duration::from_millis(25));
@@ -341,7 +352,7 @@ async fn a_leader_change_does_not_leave_the_lead_at_its_cap() {
             .await;
     }
     sleep(Duration::from_millis(100)).await;
-    let cap = index_at(timing().max_apply_lead.as_nanos() as u64);
+    let cap = index_at(timing.max_apply_lead.as_nanos() as u64);
     let m = set.replica(first).contact_metrics().unwrap();
     assert_eq!((m.lead, m.apply_lead_capped), (cap, true));
     for id in set.ids().filter(|&id| id != first) {
@@ -358,7 +369,7 @@ async fn a_leader_change_does_not_leave_the_lead_at_its_cap() {
             .submit(&owner("s"), &n.to_string(), Bytes::from(format!("g=1@{n}")))
             .await
             .expect("committed");
-        sleep(Duration::from_secs(15)).await;
+        sleep(MINUTE / 4).await;
     }
     let m = set.replica(second).contact_metrics().unwrap();
     assert!(!m.apply_lead_capped);
