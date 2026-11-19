@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/danielclasen/samplez/compare/v0.12.0...v0.12.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* **replica:** rebuild past late entries applied while committing ([#126](https://github.com/danielclasen/samplez/issues/126)) ([d3efa49](https://github.com/danielclasen/samplez/commit/d3efa49c4d3dd4ac58c68a446c838231415cf54e))
+
 ## [0.12.0](https://github.com/danielclasen/samplez/compare/v0.11.0...v0.12.0) (2026-11-19)
 
 
