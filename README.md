@@ -323,7 +323,11 @@ own: its ramp hides the step, and an install builds the same state.
 The replica tracks the ramp each derived gain entry leaves a coefficient
 on (`Limits::ramp_samples`, which must equal the engine's `rampSamples`)
 and carries them in its product state, so a rebuilt engine continues the
-ramps of plain gain entries too.
+ramps of plain gain entries too. The ramps are part of the snapshot
+data (a snapshot written before they were kept loads with none), and
+`EngineAudio::new` takes the `Limits` and refuses a bridge whose
+`ramp_samples` is not the engine's `rampSamples`, with an error naming
+both.
 
 ### Channel strip
 
