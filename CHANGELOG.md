@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.0](https://github.com/danielclasen/samplez/compare/v0.13.1...v0.14.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** Engine::install_product no longer ramps gains from silence or fades inputs in; the first blocks after an install carry the targets at full level.
+
+### Bug Fixes
+
+* **engine:** install a product state with no fade-in ([1120aae](https://github.com/danielclasen/samplez/commit/1120aaef03ac3a5fdc4339bb89b151ccccd1fd26))
+* **engine:** start a rebuilt masked term's duck at the live gain ([#142](https://github.com/danielclasen/samplez/issues/142)) ([ff1a1ff](https://github.com/danielclasen/samplez/commit/ff1a1ffcfb2a9d56b850af234a516044e3375534))
+
 ## [0.13.1](https://github.com/danielclasen/samplez/compare/v0.13.0...v0.13.1) (2026-11-19)
 
 
