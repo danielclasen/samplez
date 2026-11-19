@@ -487,6 +487,9 @@ impl Bound {
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
+                    // A replica read that never returns holds its pool
+                    // thread: the cap bounds how many a probe loop strands.
+                    .max_blocking_threads(ops::MAX_BLOCKING_READS)
                     .build();
                 let served = runtime.and_then(|runtime| {
                     runtime.block_on(async move {

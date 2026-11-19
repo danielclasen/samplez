@@ -15,6 +15,12 @@ use crate::replica::{MetricKind, ReplicaInfo, ReplicaMetric, ReplicatedState};
 
 /// `/healthz` fails once the heartbeat has not advanced for this long.
 pub const HEARTBEAT_WINDOW: Duration = Duration::from_secs(1);
+/// `/readyz` and `/metrics` answer 503 when the replicated state's reads
+/// have not returned within this long.
+pub const REPLICA_READ_TIMEOUT: Duration = Duration::from_secs(1);
+/// Pool threads the ops listener lends to replicated-state reads; further
+/// reads wait for one and time out.
+pub(crate) const MAX_BLOCKING_READS: usize = 4;
 pub(crate) const SAMPLE_PERIOD: Duration = Duration::from_millis(100);
 
 /// Health, readiness and metrics state shared by the engine and the ops
@@ -109,6 +115,10 @@ impl Ops {
     /// readiness. `/healthz` reads the heartbeat alone and answers `{"ok":
     /// bool}`: it takes no lock of the replicated state, so a replica busy
     /// under its own locks cannot fail a liveness probe.
+    ///
+    /// The replicated state is read on the blocking pool, so a read stuck on
+    /// a lock holds neither the listener's thread nor `/healthz`: after
+    /// [`REPLICA_READ_TIMEOUT`] `/readyz` and `/metrics` answer 503.
     pub fn router(&self, state: Arc<dyn ReplicatedState>) -> Router {
         let health = self.clone();
         let ready = self.clone();
@@ -121,33 +131,80 @@ impl Ops {
             )
             .route(
                 "/readyz",
-                get(move || async move {
-                    let replica = s2.replica();
-                    status(ready.ready(&replica), replica)
+                get(move || {
+                    let (ready, state) = (ready.clone(), s2.clone());
+                    async move {
+                        match read(move || state.replica()).await {
+                            Ok(replica) => status(ready.ready(&replica), replica).into_response(),
+                            Err(timeout) => timed_out(timeout, true),
+                        }
+                    }
                 }),
             )
             .route(
                 "/metrics",
-                get(move || async move {
-                    let replica = s3.replica();
-                    let labels = [("replica", replica.id.as_str()), ("role", &replica.role)];
-                    let text = format!(
-                        "# HELP samplez_replica_info This replica's id and role.\n\
-                         # TYPE samplez_replica_info gauge\n\
-                         samplez_replica_info{} 1\n{}{}",
-                        label_set(labels),
-                        render_replica(&replica.id, &s3.replica_metrics()),
-                        metrics.render()
-                    );
-                    (
-                        [(
-                            header::CONTENT_TYPE,
-                            "text/plain; version=0.0.4; charset=utf-8",
-                        )],
-                        text,
-                    )
+                get(move || {
+                    let (metrics, state) = (metrics.clone(), s3.clone());
+                    async move {
+                        let read = read(move || (state.replica(), state.replica_metrics())).await;
+                        let (replica, samples) = match read {
+                            Ok(r) => r,
+                            Err(timeout) => return timed_out(timeout, false),
+                        };
+                        let labels = [("replica", replica.id.as_str()), ("role", &replica.role)];
+                        let text = format!(
+                            "# HELP samplez_replica_info This replica's id and role.\n\
+                             # TYPE samplez_replica_info gauge\n\
+                             samplez_replica_info{} 1\n{}{}",
+                            label_set(labels),
+                            render_replica(&replica.id, &samples),
+                            metrics.render()
+                        );
+                        (
+                            [(
+                                header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4; charset=utf-8",
+                            )],
+                            text,
+                        )
+                            .into_response()
+                    }
                 }),
             )
+    }
+}
+
+/// Why a read of the replicated state gave no answer.
+enum ReadFailed {
+    Timeout,
+    Panicked,
+}
+
+/// Runs `f` on the blocking pool for at most [`REPLICA_READ_TIMEOUT`]. A
+/// read that times out keeps its blocking thread until the lock it waits
+/// on frees. At most [`MAX_BLOCKING_READS`] are stranded so; later
+/// requests time out after 1 s and run once the lock frees.
+async fn read<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ReadFailed> {
+    match tokio::time::timeout(REPLICA_READ_TIMEOUT, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err(ReadFailed::Panicked),
+        Err(_) => Err(ReadFailed::Timeout),
+    }
+}
+
+fn timed_out(why: ReadFailed, json: bool) -> axum::response::Response {
+    let msg = match why {
+        ReadFailed::Timeout => format!(
+            "timeout: the replicated state did not answer within {} ms",
+            REPLICA_READ_TIMEOUT.as_millis()
+        ),
+        ReadFailed::Panicked => "the replicated state read panicked".to_owned(),
+    };
+    if json {
+        let body = serde_json::json!({ "ok": false, "error": msg });
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
     }
 }
 

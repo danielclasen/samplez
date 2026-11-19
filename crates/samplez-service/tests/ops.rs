@@ -126,6 +126,87 @@ async fn healthz_answers_while_every_worker_is_blocked() {
     beating.join().unwrap();
 }
 
+/// One blocking GET against the ops listener, answered or not within
+/// `within`.
+fn http_get(addr: std::net::SocketAddr, path: &str, within: Duration) -> std::io::Result<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(within))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: ops\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    Ok(reply)
+}
+
+/// A replicated state whose lock never frees must not take the ops
+/// listener with it: a `/readyz` stuck on it neither holds up `/healthz`
+/// nor hangs, it answers 503 naming the timeout. The ops listener serves
+/// on one thread, so a read that blocks it blocks every endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stuck_replicated_state_fails_readyz_and_leaves_healthz_answering() {
+    let ops = Ops::default();
+    let state = FakeState::new("r1", "leader");
+    let mut config = config("none", "stuck");
+    let loopback = serde_json::json!({ "bind": "127.0.0.1", "port": 0 });
+    config["listeners"] = serde_json::json!({ "api": loopback, "ops": loopback, "nmos": loopback });
+    let bound = service_from(config, ops.clone(), state.clone())
+        .bind()
+        .await
+        .unwrap();
+    let addr = bound.ops_addr().unwrap();
+    let heartbeat = ops.heartbeat();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let beating = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                heartbeat.beat();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let serving = tokio::spawn(bound.serve());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let held = state.replica.lock().unwrap();
+    let started = std::time::Instant::now();
+    let readyz = std::thread::spawn(move || http_get(addr, "/readyz", Duration::from_secs(5)));
+    let metrics = std::thread::spawn(move || http_get(addr, "/metrics", Duration::from_secs(5)));
+    // Both are pending on the lock.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let healthz = http_get(addr, "/healthz", Duration::from_secs(1))
+        .expect("/healthz waited behind a /readyz stuck on the replicated state");
+    assert!(healthz.starts_with("HTTP/1.1 200"), "{healthz}");
+    assert!(healthz.ends_with(r#"{"ok":true}"#), "{healthz}");
+
+    let readyz = readyz.join().unwrap().expect("/readyz hung");
+    let waited = started.elapsed();
+    assert!(readyz.starts_with("HTTP/1.1 503"), "{readyz}");
+    assert!(readyz.contains("timeout"), "{readyz}");
+    assert!(
+        (Duration::from_millis(900)..Duration::from_millis(2500)).contains(&waited),
+        "/readyz answered after {waited:?}, not after about 1 s"
+    );
+    let metrics = metrics.join().unwrap().expect("/metrics hung");
+    assert!(metrics.starts_with("HTTP/1.1 503"), "{metrics}");
+    assert!(metrics.contains("timeout"), "{metrics}");
+
+    drop(held);
+    let after = http_get(addr, "/readyz", Duration::from_secs(2)).unwrap();
+    assert!(
+        after.contains(r#""replica":{"#) && !after.contains("timeout"),
+        "the replica is read again once the lock frees: {after}"
+    );
+
+    serving.abort();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    beating.join().unwrap();
+}
+
 #[tokio::test]
 async fn readyz_is_api_serving_engine_started_and_the_replicated_term_whatever_the_role() {
     let ops = Ops::default();

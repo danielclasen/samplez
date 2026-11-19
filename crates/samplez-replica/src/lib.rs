@@ -19,6 +19,7 @@ pub mod decide;
 pub mod dedup;
 pub mod entry;
 pub mod horizon;
+pub mod lock_watch;
 pub mod log_store;
 pub mod membership;
 pub mod net;
@@ -496,6 +497,7 @@ impl<P: Product> Replica<P> {
     where
         N: RaftNetworkFactory<TypeConfig>,
     {
+        lock_watch::start_watchdog(lock_watch::HELD_LIMIT);
         let raft_config = Arc::new(raft.validate().map_err(|e| e.to_string())?);
         let (log, state_machine) = Adaptor::new(store.clone());
         let raft = Raft::new(
