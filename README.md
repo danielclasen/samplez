@@ -335,7 +335,9 @@ limiter is refused when appended or set.
 An input configured with `maxDelaySamples` above 0, at most 240000
 (5 s), has a delay line (`samplez_dsp::Delay`): two rings per leg of
 that length plus `historySlackMs`, allocated at start; an input without
-it has none and costs nothing. `delayBudgetSamples`, 2^22 by default,
+it has none and costs nothing. A replay builds rings of its own, so
+during a resync a replica holds the budget's rings twice more.
+`delayBudgetSamples`, 2^22 by default,
 caps `maxDelaySamples` times `channels` summed over the inputs: a
 resync copies at most that much history, about 6 bytes a sample, and a
 replica reads a donor's answer of up to
@@ -438,7 +440,8 @@ only from its commit start (`commit_from`, dropped again before it takes
 by `cancel_commit_start`), the first page boundary of
 1024 samples in a block it computes, and stops at `stop_at`; such a block
 is split and its status covers one range. `standing` reads whether an
-output commits, from which sample, or since which block it does not. A healthy block with F past it and nothing held before
+output commits, from which sample, or since which block it does not. A
+healthy block with F past it and nothing held before
 it commits at once; any other waits in the output's hold ring of
 `D + w + 2B` samples (`holdMs`, default 10, and `contactWindowMs`, default
 8) and is committed later in one write, or withheld and never written. A
@@ -476,7 +479,8 @@ copied that way, off the RT thread, after the core, as base64 of the
 samples' bit patterns. A replay fills its own rings from the copy; a
 hand-over writes the replay's history into the RT thread's other set
 of rings, which the RT thread takes only when it installs the core, so
-a refused hand-over leaves the set it reads as it was. With more than one voter every input flow must offer
+a refused hand-over leaves the set it reads as it was. With more than
+one voter every input flow must offer
 `resyncBudgetMs` of history beyond the read window; an input whose flow
 is shorter is refused with an error naming the `history_duration` it
 needs. A lone voter has no donor to resync from and needs none. A copy
@@ -640,7 +644,8 @@ stamps none, takes effect 3072 samples (64 ms) past its stamp. A target
 gain `valid_gain` refuses, which an engine refuses too, is read as 0.0,
 in the records and in the product state alike, so a live replica
 silences the cell as one rebuilt from the state does.
-`EngineAudio` hands an index off a block start at the next one. An `InputDown` or `InputUp` derives its
+`EngineAudio` hands an index off a block start at the next one. An
+`InputDown` or `InputUp` derives its
 input's state for any product, since the engine's input health writes
 them. A restamp, or a void the leader stamped, of an entry that derived
 records re-asserts every target at its own index, so it undoes no later
@@ -719,7 +724,9 @@ band at its default; `DuckSetting::neutral`: the default detector, no
 key, a depth of 0 dB): a trim at -20 dB set to NaN steps back to 0 dB,
 a closed gate opens and a ducked bed returns to full level, each over
 the strip's ramp; limiter parameters that are not finite give
-`LimiterParams::OFF`. A refused mask is 0, a refused delay none. It leaves
+`LimiterParams::OFF`. A refused mask is 0, a refused delay none: a delay
+beyond its line plays no delay rather than the line's longest, since
+the live filter cannot read the line's length. It leaves
 out of a record the
 other entries its engine refuses, and of the `InputUp`s and `Route`s of
 several input domains those not of the lowest slot's, before it

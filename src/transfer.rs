@@ -395,6 +395,7 @@ impl Core {
                 && s.strip_pos.is_none_or(index)
                 && s.delay.as_ref().is_none_or(|d| {
                     d.pos.is_none_or(index)
+                        && index(d.floor)
                         && index(d.taps.start)
                         && d.set < 2
                         && d.taps.is_within(samplez_dsp::MAX_DELAY_SAMPLES)
@@ -500,15 +501,19 @@ impl Core {
                 let want = limiters.get(o).copied().flatten();
                 held.map(|l| (l.legs(), l.ramp())) == want.map(|legs| (legs, ramp))
             })
-            && (self.slots.iter().zip(legs).zip(delays)).all(|((s, &legs), &max)| match &s.delay {
-                None => max == 0,
-                Some(d) => {
-                    let len = d.span_len(max);
-                    max > 0
-                        && d.taps.is_within(max)
-                        && d.pos.is_none_or(|p| d.floor <= p)
-                        && d.span.len() == legs
-                        && d.span.iter().all(|leg| leg.len() == len)
+            && (0..self.slots.len().max(delays.len())).all(|i| {
+                let max = delays.get(i).copied().unwrap_or(0);
+                match self.slots.get(i).and_then(|s| s.delay.as_ref()) {
+                    None => max == 0,
+                    Some(d) => {
+                        let len = d.span_len(max);
+                        max > 0
+                            && d.taps.is_within(max)
+                            && d.pos == self.pos
+                            && d.pos.is_some_and(|p| d.floor <= p)
+                            && d.span.len() == legs.get(i).copied().unwrap_or(0)
+                            && d.span.iter().all(|leg| leg.len() == len)
+                    }
                 }
             })
             && self.ducks.fits(legs, ramp)
@@ -1440,6 +1445,44 @@ mod tests {
         assert!(copy.core.fits(2, 2, 2, &[1, 1], &[], &[], 48, 8, &[]));
         assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
         copy.core.outputs_disabled = 0;
+        // A delay on slot 0 of 1 leg and a line of 100: its span reaches
+        // from the floor to the core's position.
+        let fits = |c: &Core, delays: &[u32]| c.fits(2, 2, 1, &[1, 1], &[], delays, 48, 8, &[]);
+        let pos = copy.core.pos.unwrap();
+        copy.core.slots[0].delay = Some(DelayCore {
+            taps: Taps {
+                to: 30,
+                ..Taps::default()
+            },
+            pos: Some(pos),
+            floor: pos - 30,
+            set: 1,
+            span: vec![vec![0.5; 30]],
+        });
+        assert!(fits(&copy.core, &[100, 0]));
+        assert!(
+            !fits(&copy.core, &[]),
+            "a delay on a slot configured without"
+        );
+        assert!(!fits(&copy.core, &[20, 0]), "taps beyond the line");
+        assert!(
+            !fits(&copy.core, &[100, 100]),
+            "no delay on a slot with a line"
+        );
+        let mut c = CoreCopy::decode(&copy.encode()).unwrap();
+        c.core.slots[0].delay.as_mut().unwrap().span[0].pop();
+        assert!(!fits(&c.core, &[100, 0]), "a span short of the floor");
+        let mut c = CoreCopy::decode(&copy.encode()).unwrap();
+        c.core.slots[0].delay.as_mut().unwrap().pos = Some(pos + 48);
+        assert!(
+            !fits(&c.core, &[100, 0]),
+            "a position other than the core's"
+        );
+        let back = CoreCopy::decode(&copy.encode()).unwrap();
+        assert!(
+            fits(&back.core, &[100, 0]) && back.core.slots[0].delay == copy.core.slots[0].delay
+        );
+        copy.core.slots[0].delay = None;
         copy.core.pending.push(RtEntry {
             id: 8,
             at_index: 9648,
