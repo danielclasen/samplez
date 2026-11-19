@@ -70,6 +70,7 @@ impl Targets {
     /// the engine keeps it.
     pub fn diff(&self, next: &Targets) -> Vec<Entry> {
         let mut entries = Vec::new();
+        let any_fade = !(self.fading.is_empty() && next.fading.is_empty());
         for (input, row) in next.gains.iter().enumerate() {
             let was = self.gains.get(input);
             for (output, &gain) in row.iter().enumerate() {
@@ -82,13 +83,13 @@ impl Targets {
                         .flatten()
                 };
                 let bits = |f: Option<Fade>| f.map(|f| (f.from.to_bits(), f.start, f.len));
-                let fade_moved = bits(fade(self)) != bits(fade(next));
+                let fade_moved = any_fade && bits(fade(self)) != bits(fade(next));
                 if held.is_none_or(|g| g.to_bits() != gain.to_bits()) || fade_moved {
                     entries.push(Entry::Gain {
                         input,
                         output,
                         gain,
-                        fade: fade(next),
+                        fade: if any_fade { fade(next) } else { None },
                     });
                 }
             }

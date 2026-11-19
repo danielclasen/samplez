@@ -3065,12 +3065,17 @@ impl Engine {
         let mut gains = targets.clone();
         // The fades still running, per coefficient, and the ramps the core
         // continues: filled each attempt, the room allocated here.
-        let fading_targets: Vec<Option<Fade>> = if state.fading.is_empty() {
-            vec![None; n * m]
-        } else {
+        // With none in the state only the cells passed entries touched
+        // (`dirty`) can hold one, so an attempt resets and scans those
+        // alone.
+        let state_fading = !state.fading.is_empty();
+        let fading_targets: Vec<Option<Fade>> = if state_fading {
             state.fading.iter().flatten().copied().collect()
+        } else {
+            vec![None; n * m]
         };
         let mut fadings = fading_targets.clone();
+        let mut dirty: Vec<usize> = Vec::with_capacity(n * m);
         let mut resumed: Vec<(usize, samplez_dsp::Ramp)> = Vec::with_capacity(n * m);
         let mut up = state.up.clone();
         // A bit per output disabled; one past the list is enabled.
@@ -3122,7 +3127,13 @@ impl Engine {
             &delays,
             |j, core| {
                 gains.copy_from_slice(&targets);
-                fadings.copy_from_slice(&fading_targets);
+                if state_fading {
+                    fadings.copy_from_slice(&fading_targets);
+                } else {
+                    for c in dirty.drain(..) {
+                        fadings[c] = None;
+                    }
+                }
                 up.copy_from_slice(&state.up);
                 let mut disabled = disabled_targets;
                 masks.copy_from_slice(&mask_targets);
@@ -3142,14 +3153,17 @@ impl Engine {
                             output,
                             gain,
                             fade,
-                        } => fold_passed(
-                            &mut gains,
-                            &mut fadings,
-                            input * m + output,
-                            (gain, fade),
-                            e.at_index,
-                            ramp,
-                        ),
+                        } => {
+                            dirty.push(input * m + output);
+                            fold_passed(
+                                &mut gains,
+                                &mut fadings,
+                                input * m + output,
+                                (gain, fade),
+                                e.at_index,
+                                ramp,
+                            );
+                        }
                         Change::InputDown { slot } => up[slot] = false,
                         Change::InputUp { slot } => up[slot] = true,
                         Change::Output { output, enabled } => {
@@ -3166,6 +3180,7 @@ impl Engine {
                         Change::Batch { up: raised, .. } => {
                             if let Some(b) = batch(e.id) {
                                 b.gains.each(|c, g| {
+                                    dirty.push(c);
                                     fold_passed(
                                         &mut gains,
                                         &mut fadings,
@@ -3206,11 +3221,18 @@ impl Engine {
                 // Fades still running continue at their value for `next`.
                 resumed.clear();
                 let mut ramp_end = 0;
-                for (c, f) in fadings.iter().enumerate() {
-                    if let Some(r) = f.and_then(|f| f.ramp_at(gains[c], next)) {
+                let mut resume = |c: usize| {
+                    if let Some(r) = fadings[c].and_then(|f| f.ramp_at(gains[c], next)) {
                         ramp_end = ramp_end.max(next + u64::from(r.end() - r.position()));
                         resumed.push((c, r));
                     }
+                };
+                if state_fading {
+                    (0..fadings.len()).for_each(&mut resume);
+                } else {
+                    dirty.sort_unstable();
+                    dirty.dedup();
+                    dirty.iter().copied().for_each(&mut resume);
                 }
                 let _ = core
                     .matrix

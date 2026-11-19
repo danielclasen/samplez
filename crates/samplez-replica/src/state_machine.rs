@@ -316,11 +316,11 @@ pub struct StateMachine<P> {
     /// Not replicated: the targets as last derived, a product that drives
     /// an engine only.
     image: Option<samplez::Targets>,
-    /// Not replicated: per coefficient the ramp the derived gain entries
-    /// leave it on, as the engine renders them: an entry's own fade, or
-    /// for a plain one the ramp over `ramp_samples` from the value held at
-    /// its index. Kept as derived, so a product state carries the ramps a
-    /// rebuilt engine has to continue; empty after open or snapshot load.
+    /// Per coefficient the ramp the derived gain entries leave it on, as
+    /// the engine renders it: an entry's own fade, or for a plain one a
+    /// ramp over `ramp_samples` from the value held at its index, block
+    /// aligned as the bridge applies it. A function of the log, carried
+    /// by snapshots; finished ramps are pruned below the floor.
     ramps: Vec<Vec<Option<samplez::Fade>>>,
     /// The duck masks of the state the replica opened or installed a
     /// snapshot at, which its engine is rebuilt from, and every one
@@ -387,6 +387,8 @@ impl<P: Product> StateMachine<P> {
     /// the ramp it was on, so a plain entry's ramp starts from the bits the
     /// engine's coefficient holds there.
     fn follow(&mut self, entries: &[samplez::Entry], held: Option<&samplez::Targets>, at: u64) {
+        // The index the bridge applies the entries at.
+        let at = at.next_multiple_of(self.limits.block);
         for e in entries {
             let samplez::Entry::Gain {
                 input,
@@ -807,6 +809,12 @@ impl<P: Product> StateMachine<P> {
         self.decided.retain(|_, &mut (_, until)| until >= passed);
         let terms = &self.terms;
         self.derived.retain(|index, _| terms.contains_key(index));
+        let floor = self.floor;
+        for f in self.ramps.iter_mut().flatten() {
+            if f.is_some_and(|f| f.start.saturating_add(u64::from(f.len)) <= floor) {
+                *f = None;
+            }
+        }
         let kept = self.highest_stamp.saturating_sub(RECORDS_KEPT);
         while let Some(entry) = self.records.first_entry() {
             if entry.get().at_index >= kept {
@@ -946,6 +954,31 @@ impl<P: Product> StateMachine<P> {
         rerouted.chain(raised).max()
     }
 
+    /// The ramps a product state carries: those the derived entries left
+    /// running, over the product's own fades. Shaped as `gains` whenever
+    /// any is set, as an install requires, and empty otherwise.
+    fn fading_of(&self, targets: &samplez::Targets) -> Vec<Vec<Option<samplez::Fade>>> {
+        let mut fading = targets.fading.clone();
+        let running =
+            |i: usize, o: usize| self.ramps.get(i).and_then(|r| r.get(o)).copied().flatten();
+        let any = fading.iter().flatten().any(Option::is_some)
+            || (targets.gains.iter().enumerate())
+                .any(|(i, row)| (0..row.len()).any(|o| running(i, o).is_some()));
+        if !any {
+            return Vec::new();
+        }
+        fading.resize(targets.gains.len(), Vec::new());
+        for (i, row) in targets.gains.iter().enumerate() {
+            fading[i].resize(row.len(), None);
+            for (o, cell) in fading[i].iter_mut().enumerate() {
+                if let Some(f) = running(i, o) {
+                    *cell = Some(f);
+                }
+            }
+        }
+        fading
+    }
+
     /// The engine state of the applied log, the entry at log index `n`
     /// last, that an engine core is built from: the targets, and each
     /// slot up as its latest `InputDown` or `InputUp` held says, up where
@@ -953,27 +986,6 @@ impl<P: Product> StateMachine<P> {
     /// [`StateMachine::floor`], every later one at or after it, so a core
     /// installed with it there and given the records after `n` holds what
     /// one given every record holds. Empty targets for a product without.
-    /// The ramps a product state carries: those the derived entries left
-    /// running, over the product's own fades.
-    fn fading_of(&self, targets: &samplez::Targets) -> Vec<Vec<Option<samplez::Fade>>> {
-        let mut fading = targets.fading.clone();
-        for (i, row) in self.ramps.iter().enumerate() {
-            for (o, f) in row.iter().enumerate().filter(|(_, f)| f.is_some()) {
-                if targets.gains.get(i).is_none_or(|r| o >= r.len()) {
-                    continue;
-                }
-                if fading.len() <= i {
-                    fading.resize(i + 1, Vec::new());
-                }
-                if fading[i].len() <= o {
-                    fading[i].resize(o + 1, None);
-                }
-                fading[i][o] = *f;
-            }
-        }
-        fading
-    }
-
     pub fn product_state(&self, n: u64) -> samplez::ProductState {
         let targets = self.targets().map_or_else(Default::default, |(t, _)| t);
         let mut up = vec![true; targets.flows.len()];
@@ -1427,6 +1439,7 @@ pub(crate) mod tests {
             max_dedup_entries: 65536,
             failover: 30,
             ramp_samples: 480,
+            block: 48,
         };
         let mut sm = StateMachine::new(Paths::default(), limits);
         let (gone, back) = (origin("s").key(), origin("u").key());
@@ -1574,6 +1587,7 @@ pub(crate) mod tests {
                 max_dedup_entries: 65536,
                 failover: 0,
                 ramp_samples: 480,
+                block: 48,
             },
         );
         sm.apply(1, &commands(0, vec![command("s", "7", "gain=1@7")]));
@@ -1609,6 +1623,7 @@ pub(crate) mod tests {
                 max_dedup_entries: 65536,
                 failover: 0,
                 ramp_samples: 480,
+                block: 48,
             },
         );
         sm.apply(1, &commands(0, vec![command("s", "1", "a=1@1")]));
@@ -2119,6 +2134,30 @@ mod derive_tests {
         };
         assert_ne!(second.from.to_bits(), 0.5f32.to_bits());
         assert_eq!(sm.product_state(2).fading[0][0], Some(second));
+    }
+
+    /// With any ramp running, `fading` has the shape of `gains`, which an
+    /// install requires: a change of one cell of a matrix of several rows
+    /// must not leave the other rows out. With none it is empty.
+    #[test]
+    fn the_ramps_of_a_product_state_are_shaped_as_its_gains() {
+        let mut sm = machine();
+        assert!(sm.product_state(0).fading.is_empty());
+        // Only the second row changes.
+        sm.apply_at(1, 1, &one("1", "fader 1 0.5", 960, 960, None));
+        let state = sm.product_state(1);
+        assert!(state.fading[1][0].is_some() && state.fading[0][0].is_none());
+        assert_eq!(state.fading.len(), state.gains.len());
+        assert!(
+            state
+                .fading
+                .iter()
+                .zip(&state.gains)
+                .all(|(f, g)| f.len() == g.len())
+        );
+        // A ramp that has finished below the floor is pruned.
+        sm.apply_at(2, 1, &one("2", "noop", 960 + 100_000, 960 + 100_000, None));
+        assert!(sm.product_state(2).fading.is_empty());
     }
 
     /// A gain an engine refuses is derived as silence, and the product
@@ -2982,9 +3021,9 @@ mod derive_tests {
 #[path = "../../../tests/common/mod.rs"]
 mod ramp_common;
 
-/// The state machine and real engines together: a plain gain change, twice
-/// in a chain, derived by the state machine and applied live by two
-/// engines, and a third rebuilt from the state machine's product state
+/// The state machine and a real engine together: a plain gain change, twice
+/// in a chain, derived by the state machine and applied live by one
+/// engine, and a second rebuilt from the state machine's product state
 /// inside the ramp, compute the same pages.
 #[cfg(test)]
 mod ramp_tests {
@@ -3145,6 +3184,12 @@ mod ramp_tests {
         let j =
             c.e.install_product(&state, at + 10 * B + 96, Duration::from_secs(2))
                 .unwrap();
+        // The install lies inside the second ramp, or the test proves nothing.
+        let installed = (j + 1) * B;
+        assert!(
+            (at + 10 * B..at + 10 * B + u64::from(RAMP) - PAGE).contains(&installed),
+            "installed at {installed}, outside the ramp"
+        );
         let from = ((j + 1) * B).div_ceil(PAGE);
         let (mut pa, mut pc) = (
             std::collections::BTreeMap::new(),

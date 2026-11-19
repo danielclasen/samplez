@@ -756,7 +756,7 @@ const DUCK_RECALL_BLOCK_1024: u64 = 6_158_561;
 const FILL_DUCKED_BLOCK_48: u64 = 353_003;
 const DIFF_MASKED_BLOCK_1024: u64 = 5_117_009;
 
-const DIFF_BLOCK_48: u64 = 397_843;
+const DIFF_BLOCK_48: u64 = 465_600;
 // Raised from 4,030,452 with the duck entries: an entry list now holds
 // two more variants with heap data, a duck group's keys and parameters,
 // and dropping the 153,600 entries of this diff checks them, 3

@@ -668,7 +668,7 @@ impl Matrix {
     /// [`MAX_GAIN`](crate::MAX_GAIN) in magnitude.
     #[must_use]
     pub fn set(&mut self, input: usize, output: usize, target: f32, len: u32) -> bool {
-        self.set_with(input, output, target, 0, len, 0)
+        self.set_fade(input, output, target, 0, len)
     }
 
     /// [`Matrix::set`] after the coefficient held its value for `delay`
@@ -685,20 +685,6 @@ impl Matrix {
         target: f32,
         delay: u32,
         len: u32,
-    ) -> bool {
-        self.set_with(input, output, target, delay, len, 0)
-    }
-
-    /// [`Matrix::set_fade`] with the length `duck` of the duck crossfade
-    /// of a masked term it inserts.
-    fn set_with(
-        &mut self,
-        input: usize,
-        output: usize,
-        target: f32,
-        delay: u32,
-        len: u32,
-        duck: u32,
     ) -> bool {
         if input >= self.inputs || output >= self.columns.len() || !valid_gain(target) {
             return false;
@@ -726,7 +712,7 @@ impl Matrix {
                 };
                 col.insert(k, term);
                 if !self.masks.is_empty() {
-                    self.duck_inserted(output, k, duck);
+                    self.duck_inserted(output, k);
                 }
             }
             Err(_) => {}
@@ -771,7 +757,7 @@ impl Matrix {
                     // The fade brings the term in from silence, so no
                     // duck crossfade is needed, and none is the state an
                     // install of the same fade builds.
-                    self.duck_inserted(output, k, 0);
+                    self.duck_inserted(output, k);
                 }
             }
         }
@@ -780,13 +766,13 @@ impl Matrix {
 
     /// Gives term `k` of `output`, just inserted, its mask, and a duck
     /// crossfading from no duck over `len` samples when it is not 0.
-    fn duck_inserted(&mut self, output: usize, k: usize, len: u32) {
+    fn duck_inserted(&mut self, output: usize, k: usize) {
         let col = &mut self.columns[output];
         let mask = self.masks[col[k].input * self.ducks.len() + output];
         if mask != 0 {
             col[k].mask = mask;
             col[k].ducked = true;
-            self.ducks[output].insert(duck_index(col, k), Duck::new(len));
+            self.ducks[output].insert(duck_index(col, k), Duck::new(0));
         }
     }
 
@@ -1047,14 +1033,15 @@ impl Matrix {
         let mut ramping = false;
         let mut next = resumed.iter().peekable();
         for (c, &g) in gains.iter().enumerate() {
-            let ramp = if let Some(&(_, r)) = next.next_if(|e| e.0 == c) {
-                r
-            } else if g == 0.0 || !valid_gain(g) {
-                continue;
-            } else {
+            let ramp = if resumed.is_empty() || next.peek().is_none_or(|e| e.0 != c) {
+                if g == 0.0 || !valid_gain(g) {
+                    continue;
+                }
                 let mut ramp = Ramp::new(0.0);
                 let _ = ramp.set_target(g, len);
                 ramp
+            } else {
+                next.next().expect("peeked").1
             };
             ramping |= ramp.is_active();
             self.columns[c % outputs].push(Term {

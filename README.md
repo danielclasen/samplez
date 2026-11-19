@@ -324,10 +324,14 @@ The replica tracks the ramp each derived gain entry leaves a coefficient
 on (`Limits::ramp_samples`, which must equal the engine's `rampSamples`)
 and carries them in its product state, so a rebuilt engine continues the
 ramps of plain gain entries too. The ramps are part of the snapshot
-data (a snapshot written before they were kept loads with none), and
-`EngineAudio::new` takes the `Limits` and refuses a bridge whose
-`ramp_samples` is not the engine's `rampSamples`, with an error naming
-both.
+data, pruned once they end below the floor. A snapshot written before they
+were kept loads with none, so an engine rebuilt within about two ramp
+lengths of an entry after the upgrade can differ from its peers, once.
+`Limits::ramp_samples` and `Limits::block` must equal the engine's
+`rampSamples` and `blockSize`: `Replica::contact` refuses audio whose
+engine reports others (`Audio::ramp_config`), with an error naming both.
+The tracker follows each entry at the block-aligned index the bridge
+applies it at.
 
 ### Channel strip
 
