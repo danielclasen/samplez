@@ -2122,7 +2122,9 @@ impl Contact {
     /// committing nothing, the engine is rebuilt past them. Whether a
     /// restart began. Not while a resync attempt runs: the restart would
     /// abandon the attempt and drop the engine's core in the middle of
-    /// its hand-over, so the rebuild waits for the attempt to end.
+    /// its hand-over, so the rebuild waits for the attempt to end. Every
+    /// attempt ends, in a hand-over, a failure or its timeout, so the
+    /// wait is bounded.
     fn fold_late(&self, st: &mut State) -> bool {
         if st.restart.is_some() || st.late_given.is_empty() || st.resync.running() {
             return false;

@@ -2325,6 +2325,15 @@ fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
             "entry 2's generation dropped",
             || b.e.status().generation.pending.is_none(),
         );
+        // A core replayed from a donor, which holds no pending
+        // generation, is taken: the dropped one would refuse it.
+        // The donor knows entry 2 as one needing none.
+        let a = hashed_with(&domain, &inputs);
+        gain(&a.e, 2, (now_block() + 20) * B, 0, 0.5);
+        let mut replay = b.e.replay(copy(&a.e)).unwrap();
+        replay.run_to(now_block() + 20);
+        b.e.hand_over(&mut replay, Duration::from_secs(5))
+            .map_err(|e| format!("no hand-over: {e}"))?;
         Ok(())
     });
 }
