@@ -1943,6 +1943,19 @@ impl Contact {
                     Self::rebuild_past(st, k);
                 }
                 st.late_given.clear();
+            } else {
+                // Committing, those taken late stay given until it commits
+                // nothing: the restart must not drop them, as below.
+                let late: Vec<Key> = (st.given.keys())
+                    .filter(|&&(index, term, node)| {
+                        index > from
+                            && index <= up_to
+                            && taken_late.contains(&index)
+                            && self.log.log_id_at(index) == Some(StoredLogId { term, node, index })
+                    })
+                    .copied()
+                    .collect();
+                st.late_given.extend(late);
             }
             self.begin_restart(st, up_to);
             return;

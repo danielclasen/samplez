@@ -1232,11 +1232,11 @@ async fn rebuilt_off_flows(hands_over: bool) -> samplez_replica::resync::Metrics
 /// One command through the leader of the moment: every seventh moves an
 /// input to a flow, the others are fader moves.
 async fn command(set: &Set<Desk>, n: u64) {
-    if n % 7 != 0 {
+    if !n.is_multiple_of(7) {
         return move_fader(set, n).await;
     }
     let replica = set.replica(set.leader().await).clone();
-    let flow = if n % 14 == 0 { "a" } else { "c" };
+    let flow = if n.is_multiple_of(14) { "a" } else { "c" };
     tokio::spawn(async move {
         let command = Bytes::from(format!("route {} {flow}", n % 2));
         let _ = replica.submit(&owner("s"), &n.to_string(), command).await;
@@ -1315,4 +1315,8 @@ async fn a_follower_that_applied_late_entries_while_committing_is_rebuilt_past_t
                 .and_then(|r| r.state)
         );
     }
+    // The scenario's premise: entries taken late went unresolved and the
+    // engine was rebuilt past them, rather than holding them.
+    let rebuilds = (set.replica(follower).contact_metrics()).map_or(0, |m| m.late_rebuilds);
+    assert!(rebuilds >= 1, "no rebuild past late entries: {rebuilds}");
 }

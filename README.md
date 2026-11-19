@@ -612,10 +612,10 @@ the entries taken late while one runs going into the next
 with one committing, and one taking entries late after it caught up,
 holds them unresolved. Those it took late while catching up and applied
 while it committed, as a restarted replica does for a moment before its
-log has caught up, are rebuilt past too, once it commits nothing again:
-the log never decides an entry that stands. An entry held
-unresolved that applies without deriving a record, such as a re-route
-to the flow an input reads already, changes no engine state and is
+log has caught up, are rebuilt past once it commits nothing again: the
+log never decides an entry that stands. An entry held unresolved that
+applies without deriving a record, such as a re-route to the flow an
+input reads already, changes no engine state and is
 released as it applies: the log decides an entry that stands only when
 the baseline held it unresolved as it committed its block, or every
 live replica withheld that block, so held it could stay unresolved for
