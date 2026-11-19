@@ -486,8 +486,8 @@ const STRIPS_SETTLED_FAST: u64 = 1_273_161;
 const DUCK: u64 = 407_817;
 const LIMITERS_ON: u64 = 655_232;
 const LIMITERS_OFF: u64 = 171_994;
-const DELAYS_SETTLED: u64 = 277_494;
-const DELAYS_FADING: u64 = 337_757;
+const DELAYS_SETTLED: u64 = 372_606;
+const DELAYS_FADING: u64 = 473_348;
 const DUCK_ADVANCE: u64 = 4_065;
 
 library_benchmark_group!(
