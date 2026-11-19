@@ -871,6 +871,33 @@ impl Matrix {
         }
     }
 
+    /// Starts the duck of every ducked term at the gain a running matrix
+    /// holds for it when the detectors sit at `envelopes`, one per
+    /// detector, steady: `from`, `to` and the live gain all that gain, as
+    /// they are after a few intervals at those envelopes, instead of at 1
+    /// moving to it over the two intervals after a fill. A term of mask 0
+    /// or with no depth set keeps gain 1.
+    pub fn settle_ducks(&mut self, envelopes: &[f32]) {
+        for (col, ducks) in self.columns.iter().zip(&mut self.ducks) {
+            for (k, t) in col.iter().filter(|t| t.ducked).enumerate() {
+                let mut memo = Memo::NONE;
+                if !self.depths.is_empty() {
+                    let depths = &self.depths[t.input * MAX_DUCKS..(t.input + 1) * MAX_DUCKS];
+                    for (g, (a, r)) in memo.atten.iter_mut().zip(depths).enumerate() {
+                        *a = r.current() * envelopes.get(g).copied().unwrap_or(0.0);
+                    }
+                    memo.order();
+                }
+                let gain = memo.gain(t.mask);
+                let d = &mut ducks[k];
+                d.from = gain;
+                d.to = gain;
+                d.live = gain;
+                d.live_mask = t.mask;
+            }
+        }
+    }
+
     /// Mixes the first `frames` frames of `input` into `output` on
     /// [`Matrix::path`], with every envelope at 0. A matrix whose terms
     /// have ducks is processed with [`Matrix::process_ducked`]: here,
@@ -2770,5 +2797,44 @@ mod tests {
         let mut built = Matrix::new(1, 1);
         assert!(built.fade_in_ducked_resuming(&[0.25], &[0b1], &[], 0, &[(0, ramp)]));
         assert!(live == built);
+    }
+
+    /// A matrix filled with its masked terms settled at steady envelopes
+    /// mixes from its first sample the bits of one that has run at those
+    /// envelopes for a while: the duck does not start at 1 and move to its
+    /// gain over two intervals.
+    #[test]
+    fn a_settled_fill_mixes_the_bits_of_a_running_matrix() {
+        for path in Path::ALL {
+            if !path_runs("a_settled_fill_mixes_the_bits_of_a_running_matrix", path) {
+                continue;
+            }
+            let mut rng = Rng::new(0x5e771e);
+            let mut input = PlanarBuffer::new(1, CAP);
+            let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
+            env.channel_mut(0).fill(1.0);
+            let mut out = PlanarBuffer::new(1, CAP);
+            let mut live = Matrix::new(1, 1);
+            assert!(live.set_depth(0, 0, 20.0, 0) && live.set_mask(0, 0, 1, 0));
+            assert!(live.set(0, 0, 0.5, 0));
+            fill(&mut rng, &mut input, 200);
+            live.process_ducked_on(path, &input, &env, &mut out, 200);
+            let mut depths = vec![0.0; MAX_DUCKS];
+            depths[0] = 20.0;
+            let mut built = Matrix::new(1, 1);
+            built.fade_in_ducked(&[0.5], &[1], &depths, 0);
+            built.settle_ducks(&[1.0]);
+            fill(&mut rng, &mut input, 64);
+            let mut want = PlanarBuffer::new(1, CAP);
+            live.process_ducked_on(path, &input, &env, &mut want, 64);
+            built.process_ducked_on(path, &input, &env, &mut out, 64);
+            for n in 0..64 {
+                assert_eq!(
+                    out.channel(0)[n].to_bits(),
+                    want.channel(0)[n].to_bits(),
+                    "{path:?} sample {n}"
+                );
+            }
+        }
     }
 }

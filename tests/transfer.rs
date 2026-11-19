@@ -2853,6 +2853,12 @@ struct Pair<'a> {
     /// test was built: pages count only while neither has moved. A skip
     /// restarts the detectors of one engine, so pages after it may differ.
     calm: Option<(u64, u64)>,
+    /// The domain to read the outputs from, when a mismatch should be
+    /// read back at once: the flows keep little history.
+    probe: Option<std::path::PathBuf>,
+    /// Per differing page, where its outputs first differ, read when the
+    /// page was first seen to differ.
+    diffs: BTreeMap<u64, String>,
 }
 
 impl<'a> Pair<'a> {
@@ -2864,6 +2870,8 @@ impl<'a> Pair<'a> {
             silenced: [Vec::new(), Vec::new()],
             newest: [0, 0],
             calm: None,
+            probe: None,
+            diffs: BTreeMap::new(),
         }
     }
 
@@ -2887,13 +2895,55 @@ impl<'a> Pair<'a> {
         self.poll();
         let confirmed = self.newest[0].min(self.newest[1]);
         let disturbed: Vec<u64> = self.silenced.iter().flat_map(|s| touched(s)).collect();
-        range
+        let pages: Vec<(u64, bool)> = range
             .filter(|p| (p + 1) * PAGE / B < confirmed && !disturbed.contains(p))
             .filter_map(|p| {
                 let (x, y) = (self.pages[0].get(&p)?, self.pages[1].get(&p)?);
                 Some((p, (x.hash, x.fingerprint) == (y.hash, y.fingerprint)))
             })
-            .collect()
+            .collect();
+        if let Some(domain) = &self.probe {
+            for &(p, _) in pages.iter().filter(|(_, same)| !same) {
+                if !self.diffs.contains_key(&p) {
+                    let d = first_difference(domain, &self.a.out, &self.b.out, p);
+                    self.diffs.insert(p, d);
+                }
+            }
+        }
+        pages
+    }
+}
+
+/// Where the outputs `a` and `b` first differ within page `p`, read back
+/// at once.
+fn first_difference(domain: &std::path::Path, a: &str, b: &str, p: u64) -> String {
+    let (first, last) = (p * PAGE / B, (p + 1) * PAGE / B - 1);
+    let read = |flow: &str| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            common::read_blocks(domain, flow, 2, first..last + 1)
+        }))
+    };
+    let (Ok(x), Ok(y)) = (read(a), read(b)) else {
+        return "the output could not be read back".to_owned();
+    };
+    let n = B as usize;
+    // Planar per block: channel c of block k at (k * 2 + c) * B.
+    match x
+        .iter()
+        .zip(&y)
+        .position(|(a, b)| a.to_bits() != b.to_bits())
+    {
+        Some(i) => {
+            let (k, c, s) = (i / (2 * n), i / n % 2, i % n);
+            format!(
+                "first differing sample {} (block {}, channel {c}): {} vs {}",
+                (first + k as u64) * B + s as u64,
+                first + k as u64,
+                x[i],
+                y[i]
+            )
+        }
+        None => "the samples read back are equal".to_owned(),
     }
 }
 
@@ -2901,7 +2951,7 @@ impl<'a> Pair<'a> {
 /// explain itself: the overrun-skip counters at the baseline and now,
 /// the install index, the page's blocks, how far the verdicts reached,
 /// and the first sample of the page where the two outputs differ.
-fn explain(pair: &Pair, domain: &Domain, p: u64, installed: u64) -> String {
+fn explain(pair: &Pair, p: u64, installed: u64) -> String {
     let (first, last) = (p * PAGE / B, (p + 1) * PAGE / B - 1);
     let now = (pair.a.skipped(), pair.b.skipped());
     let mut out = format!(
@@ -2911,35 +2961,12 @@ fn explain(pair: &Pair, domain: &Domain, p: u64, installed: u64) -> String {
         pair.newest,
         pair.newest[0].min(pair.newest[1]) > last,
     );
-    let read = |h: &Hashed| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            common::read_blocks(&domain.0, &h.out, 2, first..last + 1)
-        }))
-    };
-    match (read(pair.a), read(pair.b)) {
-        (Ok(x), Ok(y)) => {
-            let n = B as usize;
-            // Planar per block: channel c of block k at (k * 2 + c) * B.
-            let at = x
-                .iter()
-                .zip(&y)
-                .position(|(a, b)| a.to_bits() != b.to_bits());
-            match at {
-                Some(i) => {
-                    let (k, c, s) = (i / (2 * n), i / n % 2, i % n);
-                    out += &format!(
-                        ", first differing sample {} (block {}, channel {c}): {} vs {}",
-                        (first + k as u64) * B + s as u64,
-                        first + k as u64,
-                        x[i],
-                        y[i]
-                    );
-                }
-                None => out += ", the samples read back are equal",
-            }
-        }
-        _ => out += ", the output could not be read back",
-    }
+    out += &format!(
+        ", {}",
+        pair.diffs
+            .get(&p)
+            .map_or("no read-back was taken", String::as_str)
+    );
     out
 }
 
@@ -3141,17 +3168,17 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
     if (j + 1) * B > at + FADE_DELAY + u64::from(FADE_LEN) - 5 * PAGE {
         return Err(format!("installed at block {j}, near the fade's end"));
     }
-    // The page after the one holding the install: a masked term the install
-    // fills starts undocked and takes its duck gain over the two gain
-    // intervals (16 samples) after the fill, which a live engine already has,
-    // so an install at the first block of a page differs within that page.
-    let from = ((j + 1) * B) / PAGE + 1;
+    // From the install's own page: the duck of a masked term the install
+    // fills starts at the gain a live engine holds, so even an install at
+    // the first block of a page computes that page alike.
+    let from = ((j + 1) * B).div_ceil(PAGE);
     let mut pair = Pair::new(a, c);
     pair.calm = Some(calm);
+    pair.probe = Some(domain.0.clone());
     let end = (at + u64::from(delay) + u64::from(FADE_LEN)) / PAGE;
     let pages = wait_comparable(&mut pair, from, end, 3, 0)?;
     if let Some((&p, _)) = pages.iter().find(|(_, same)| !**same) {
-        let why = explain(&pair, &domain, p, (j + 1) * B);
+        let why = explain(&pair, p, (j + 1) * B);
         panic!("pages {pages:?} differ after the install: {why}");
     }
     Ok(())
