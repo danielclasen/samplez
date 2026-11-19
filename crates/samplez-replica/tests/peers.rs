@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use harness::{Paths, RATE, owner};
+use harness::{Paths, RATE, owner, raft_config};
 use openraft::ServerState;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use samplez_replica::bootstrap::{Bootstrap, Volume};
@@ -19,7 +19,7 @@ use samplez_replica::membership::slot_of;
 use samplez_replica::net::MAX_IDLE;
 use samplez_replica::net::{Network, Pool};
 use samplez_replica::peer::{self, PeerClient, PeerRequest, Refused};
-use samplez_replica::{MAX_COMMAND_BYTES, Replica, Settings, raft_config};
+use samplez_replica::{MAX_COMMAND_BYTES, Replica, Settings};
 use samplez_service::config::{Tls, TlsMode};
 use samplez_service::replica::{Reason, Resolution};
 use samplez_service::{Metrics, PeerTls, ReplicatedState};

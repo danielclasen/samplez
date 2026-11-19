@@ -25,6 +25,8 @@ pub struct Lead {
     /// Slack histograms per minute, the current one last.
     minutes: VecDeque<Slacks>,
     minute_start: Instant,
+    /// How long a minute of slack lasts.
+    minute: Duration,
     /// The lead wanted more than the cap since the last fall.
     pub capped: bool,
     /// The most lead an entry needed, by the slack of this minute and of
@@ -34,6 +36,9 @@ pub struct Lead {
     /// carry the lead from before it.
     raised_at: u64,
 }
+
+/// The minute the lead's slack is kept in.
+pub const MINUTE: Duration = Duration::from_secs(60);
 
 /// Minutes of slack the lead falls on.
 const MINUTES: usize = 10;
@@ -71,6 +76,12 @@ impl Lead {
     /// Starts at `start` samples, at most `max`; both multiples of
     /// `block` are kept.
     pub fn new(block: u64, start: u64, max: u64) -> Lead {
+        Lead::with_minute(block, start, max, MINUTE)
+    }
+
+    /// As [`Lead::new`] with a minute of slack `minute` long, not zero.
+    pub fn with_minute(block: u64, start: u64, max: u64, minute: Duration) -> Lead {
+        assert!(!minute.is_zero(), "a minute of slack takes time");
         Lead {
             block,
             max: max / block * block,
@@ -78,6 +89,7 @@ impl Lead {
             fast: false,
             minutes: VecDeque::from([Slacks::new()]),
             minute_start: Instant::now(),
+            minute,
             capped: false,
             needed: [0; 2],
             raised_at: 0,
@@ -192,8 +204,8 @@ impl Lead {
     /// commands with less than they need. Below the cap the slack alone
     /// decides.
     pub fn roll(&mut self) {
-        while self.minute_start.elapsed() >= Duration::from_secs(60) {
-            self.minute_start += Duration::from_secs(60);
+        while self.minute_start.elapsed() >= self.minute {
+            self.minute_start += self.minute;
             self.needed = [self.needed[1], 0];
             let held = self.capped && self.needed[0].max(self.needed[1]) > self.lead;
             let kept = if self.fast { FAST_MINUTES } else { MINUTES };
@@ -267,6 +279,33 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         lead.roll();
         assert_eq!(lead.samples(), 2400);
+    }
+
+    /// A shorter minute shortens the fall and the ten minutes of
+    /// slack it takes without a new term alike.
+    #[tokio::test(start_paused = true)]
+    async fn a_minute_of_slack_lasts_as_long_as_it_was_given() {
+        let second = Duration::from_secs(1);
+        let mut lead = Lead::with_minute(B, 2400, 2400, second);
+        for _ in 0..100 {
+            lead.add(5 * B as i64, 1, 1);
+        }
+        for _ in 0..9 {
+            tokio::time::advance(second).await;
+            lead.roll();
+        }
+        assert_eq!(lead.samples(), 2400, "nine minutes are not ten");
+        tokio::time::advance(second).await;
+        lead.roll();
+        assert_eq!(lead.samples(), 2400 - B, "the tenth lowers it");
+        let mut fast = Lead::with_minute(B, 2400, 2400, second);
+        fast.new_term();
+        for _ in 0..100 {
+            fast.add(5 * B as i64, 1, 1);
+        }
+        tokio::time::advance(second).await;
+        fast.roll();
+        assert_eq!(fast.samples(), 2400 - B, "one minute after a new term");
     }
 
     #[tokio::test(start_paused = true)]

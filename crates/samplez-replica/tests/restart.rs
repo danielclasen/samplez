@@ -7,11 +7,10 @@ mod harness;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use harness::{BLOCK, Options, Set};
+use harness::{BLOCK, Options, Set, raft_config};
 use samplez_replica::contact::Timing;
 use samplez_replica::entry::NodeId;
 use samplez_replica::membership::{Slot, Voters, node_id, slot_of};
-use samplez_replica::raft_config;
 use samplez_replica::state::ReplicaState;
 use tokio::time::{Instant, sleep};
 

@@ -11,6 +11,7 @@ use openraft::ChangeMembers;
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{Body, SessionKey};
 use samplez_replica::membership::Voters;
+use samplez_replica::{RaftTiming, raft_config_with};
 use samplez_service::replica::{Ack, NotApplied, Reason, Resolution};
 use samplez_service::{Position, ReadIndex, ReplicatedState};
 use tokio::time::Instant;
@@ -808,4 +809,65 @@ async fn a_leader_cut_off_from_a_set_of_three_is_not_commitable() {
     );
     assert!(!replica.replica().commitable);
     assert_eq!(refused(&**replica, "x").await.reason, Reason::NotCommitable);
+}
+
+/// The raft term before and after the leader's raft RPCs hung for
+/// `silence`, as when the leader's runtime stalls: each AppendEntries
+/// times out and is sent again, none arrives.
+async fn term_after_a_silence(timing: RaftTiming, silence: Duration) -> (u64, u64) {
+    let set = Set::start(Options {
+        raft: raft_config_with("test", &timing).expect("a valid timing"),
+        ..Options::default()
+    })
+    .await;
+    let leader = set.leader().await;
+    let term = |set: &Set| set.replica(leader).raft().metrics().borrow().current_term;
+    let before = term(&set);
+    set.net.hang(leader, set.ids());
+    tokio::time::sleep(silence).await;
+    set.net.heal();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    (before, term(&set))
+}
+
+/// A silence from the leader shorter than the defaults tolerate leaves
+/// the set in its term; the same silence elects under a short timing and
+/// under the former defaults, so the silence is long enough to count. A
+/// follower campaigns after `election_max` (the leader lease) plus a
+/// draw from `election_min` up to `election_max` of silence, noticed on a
+/// tick of 1.5 heartbeats; the silence it sees is that of the hang, up to
+/// a heartbeat older at its start and a heartbeat longer at its end.
+#[tokio::test(start_paused = true)]
+async fn a_stall_shorter_than_the_election_timeout_calls_no_election() {
+    let ms = Duration::from_millis;
+    let short = RaftTiming {
+        election_min: ms(100),
+        election_max: ms(200),
+        heartbeat: ms(20),
+    };
+    let former = RaftTiming {
+        election_min: ms(150),
+        election_max: ms(300),
+        heartbeat: ms(50),
+    };
+    let defaults = RaftTiming::default();
+    let elects = |t: RaftTiming| t.election_max * 2 + t.heartbeat * 3 / 2;
+    let tolerates = |t: RaftTiming| t.election_max + t.election_min - t.heartbeat * 2;
+    let (always, never) = (elects(short), tolerates(defaults));
+    assert!(always < never, "the timings leave room for a silence");
+    assert!(
+        tolerates(former) < always,
+        "the former defaults elect on it too"
+    );
+    let silence = (always + never) / 2;
+
+    let (before, after) = term_after_a_silence(defaults, silence).await;
+    assert_eq!(before, after, "no election within {silence:?} of silence");
+    for timing in [short, former] {
+        let (before, after) = term_after_a_silence(timing, silence).await;
+        assert!(
+            after > before,
+            "{timing:?} elects on {silence:?} of silence"
+        );
+    }
 }

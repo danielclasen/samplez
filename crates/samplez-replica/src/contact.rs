@@ -64,6 +64,9 @@ pub struct Timing {
     /// `resyncBudgetMs`: a resync handing over later than this from
     /// asking for the core warns.
     pub resync_budget: Duration,
+    /// How long the minute of slack the apply lead falls on lasts
+    /// ([`crate::schedule::MINUTE`]); shorter only in tests.
+    pub lead_minute: Duration,
 }
 
 impl Timing {
@@ -80,6 +83,7 @@ impl Timing {
             clock_guard: 288,
             max_apply_lead: Duration::from_millis(50),
             resync_budget: Duration::from_millis(50),
+            lead_minute: crate::schedule::MINUTE,
         }
     }
 
@@ -992,10 +996,11 @@ impl Contact {
                 judged: BTreeSet::new(),
                 learners: BTreeMap::new(),
                 slack: Vec::new(),
-                lead: Lead::new(
+                lead: Lead::with_minute(
                     timing.block,
                     index_at(START_LEAD.as_nanos() as u64),
                     index_at(timing.max_apply_lead.as_nanos() as u64),
+                    timing.lead_minute,
                 ),
                 office_term: 0,
                 leads: BTreeMap::new(),

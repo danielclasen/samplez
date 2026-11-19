@@ -177,16 +177,86 @@ pub const MAX_PAYLOAD_ENTRIES: u64 = 64;
 /// entries does not fall further behind with each of them.
 pub const MAX_APPEND_BYTES: usize = 4 * MAX_ENTRY_BYTES;
 
-/// openraft's timers as the chart pins them (`replica.raft`): its 0.9.21
-/// defaults, so the election figures do not move with a dependency
-/// update; and [`MAX_PAYLOAD_ENTRIES`], which [`MAX_APPEND_BYTES`]
-/// bounds further.
+/// The timers of raft's elections and heartbeats, as the chart sets them
+/// (`replica.raft`).
+///
+/// openraft 0.9.26 gives every AppendEntries the heartbeat interval to
+/// complete and has no timeout of its own for it, so `heartbeat` is also
+/// the AppendEntries timeout. A follower campaigns after `election_max`
+/// (openraft's leader lease) plus a draw from `election_min` up to
+/// `election_max` of silence from its leader, so the silence a set
+/// tolerates, and the time a real loss of the leader takes to show,
+/// before the vote round, is `election_max + [election_min,
+/// election_max)`: 900 to 1200 ms at the defaults, 450 to 600 ms at the
+/// former 150 to 300 ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaftTiming {
+    /// The least of the random part of a follower's election timeout.
+    pub election_min: Duration,
+    /// The most of it, and the leader lease that precedes it.
+    pub election_max: Duration,
+    /// How often a leader heartbeats, and how long an AppendEntries may
+    /// take.
+    pub heartbeat: Duration,
+}
+
+impl RaftTiming {
+    /// The defaults: election timeout 300 to 600 ms, heartbeat 100 ms.
+    pub const DEFAULT: RaftTiming = RaftTiming {
+        election_min: Duration::from_millis(300),
+        election_max: Duration::from_millis(600),
+        heartbeat: Duration::from_millis(100),
+    };
+}
+
+impl Default for RaftTiming {
+    fn default() -> RaftTiming {
+        RaftTiming::DEFAULT
+    }
+}
+
+impl RaftTiming {
+    /// Whether `heartbeat` is not zero and below `election_min`, which is
+    /// below `election_max` (openraft draws a timeout from a range of
+    /// more than one value).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.heartbeat.is_zero() {
+            return Err("raft heartbeat must not be zero".to_owned());
+        }
+        if self.heartbeat >= self.election_min {
+            return Err(format!(
+                "raft heartbeat ({:?}) must be below the election timeout minimum ({:?})",
+                self.heartbeat, self.election_min
+            ));
+        }
+        if self.election_min >= self.election_max {
+            return Err(format!(
+                "raft election timeout minimum ({:?}) must be below its maximum ({:?})",
+                self.election_min, self.election_max
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// [`raft_config_with`] at the default [`RaftTiming`].
 pub fn raft_config(cluster: &str) -> openraft::Config {
-    openraft::Config {
+    raft_config_with(cluster, &RaftTiming::default()).expect("the default timing is valid")
+}
+
+/// openraft's configuration with `timing` and the rest as the chart pins
+/// it: openraft's 0.9.26 defaults, so the figures do not move with a
+/// dependency update; and [`MAX_PAYLOAD_ENTRIES`], which
+/// [`MAX_APPEND_BYTES`] bounds further. An invalid `timing`
+/// ([`RaftTiming::validate`]) is an error.
+pub fn raft_config_with(cluster: &str, timing: &RaftTiming) -> Result<openraft::Config, String> {
+    timing.validate()?;
+    let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    Ok(openraft::Config {
         cluster_name: cluster.to_owned(),
-        election_timeout_min: 150,
-        election_timeout_max: 300,
-        heartbeat_interval: 50,
+        election_timeout_min: millis(timing.election_min),
+        election_timeout_max: millis(timing.election_max),
+        heartbeat_interval: millis(timing.heartbeat),
         max_payload_entries: MAX_PAYLOAD_ENTRIES,
         // Entries kept behind a snapshot when the log is purged, in
         // batches of one: a follower a little behind catches up from the
@@ -196,7 +266,7 @@ pub fn raft_config(cluster: &str) -> openraft::Config {
         max_in_snapshot_log_to_keep: 1000,
         purge_batch_size: 1,
         ..openraft::Config::default()
-    }
+    })
 }
 
 /// A replica's settings beside openraft's.
@@ -2097,6 +2167,49 @@ mod tests {
         leads(&replica, "a reopened set of one voter leads").await;
         replica.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_default_timing_is_valid_and_reaches_openraft() {
+        assert_eq!(RaftTiming::default(), RaftTiming::DEFAULT);
+        assert_eq!(RaftTiming::DEFAULT.validate(), Ok(()));
+        let config = raft_config("t");
+        let ms = |d: Duration| d.as_millis() as u64;
+        assert_eq!(
+            (
+                config.election_timeout_min,
+                config.election_timeout_max,
+                config.heartbeat_interval
+            ),
+            (
+                ms(RaftTiming::DEFAULT.election_min),
+                ms(RaftTiming::DEFAULT.election_max),
+                ms(RaftTiming::DEFAULT.heartbeat)
+            ),
+            "the heartbeat, which openraft also gives an AppendEntries, is the configured one"
+        );
+        assert!(config.validate().is_ok(), "openraft accepts it");
+    }
+
+    #[test]
+    fn a_timing_out_of_order_is_refused() {
+        let ms = Duration::from_millis;
+        let with = |election_min, election_max, heartbeat| {
+            raft_config_with(
+                "t",
+                &RaftTiming {
+                    election_min: ms(election_min),
+                    election_max: ms(election_max),
+                    heartbeat: ms(heartbeat),
+                },
+            )
+        };
+        assert!(with(500, 1000, 100).is_ok());
+        assert!(with(500, 1000, 0).is_err(), "no heartbeat");
+        assert!(with(500, 1000, 500).is_err(), "heartbeat at the minimum");
+        assert!(with(500, 1000, 600).is_err(), "heartbeat past the minimum");
+        assert!(with(500, 500, 100).is_err(), "no range to draw from");
+        assert!(with(500, 400, 100).is_err(), "maximum below minimum");
     }
 
     /// An accepted request counts for the leader and term of its committed

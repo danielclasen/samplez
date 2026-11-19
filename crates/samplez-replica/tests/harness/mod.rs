@@ -46,7 +46,7 @@ use samplez_replica::report::{ClockFlags, Own, Page, Report, Run, runs};
 use samplez_replica::resync::{CoreReply, Resynced, Source};
 use samplez_replica::state::ReplicaState;
 use samplez_replica::state_machine::{Apply, Changed, Effect, Product};
-use samplez_replica::{RaftRpcs, Replica, Settings, TypeConfig, raft_config};
+use samplez_replica::{RaftRpcs, RaftTiming, Replica, Settings, TypeConfig, raft_config_with};
 use samplez_service::{Owner, ReplicatedState, Role};
 use tokio::time::Instant;
 
@@ -1622,6 +1622,20 @@ pub struct Options {
     /// Nodes each of whose fsynced writes takes this much longer: a slow
     /// disk.
     pub sync_delays: Vec<(NodeId, Duration)>,
+}
+
+/// The raft timers of a test set: short, so a test that waits for a
+/// leader or lets one fall needs little of the paused clock, which costs
+/// time to run. The defaults of a product are several times longer.
+pub const RAFT_TIMING: RaftTiming = RaftTiming {
+    election_min: Duration::from_millis(150),
+    election_max: Duration::from_millis(300),
+    heartbeat: Duration::from_millis(50),
+};
+
+/// openraft's configuration at [`RAFT_TIMING`].
+pub fn raft_config(cluster: &str) -> openraft::Config {
+    raft_config_with(cluster, &RAFT_TIMING).expect("a valid timing")
 }
 
 impl Default for Options {
