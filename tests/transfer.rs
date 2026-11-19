@@ -3082,6 +3082,11 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
     };
     let hs = [0; 3].map(|_| hashed_of(&domain, &[(&src, 2)], ducked));
     let [a, b, c] = &hs;
+    // The overrun counters are the engines' own, kept across drop_core and
+    // install_product. Taken as soon as the engines exist, before the duck
+    // and mask entries: a skip anywhere from here on restarts a detector
+    // and disqualifies the run (no comparable page is left).
+    let calm = (a.skipped(), c.skipped());
     let at1 = (now_block() + 20) * B;
     let at = at1 + 400 * B;
     let fade = Fade::after(0.0, at, delay, FADE_LEN);
@@ -3108,7 +3113,6 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
         h.e.commit(2);
     }
     wait_index(&[&a.e, &b.e, &c.e], at + u64::from(delay) + 20_000);
-    let calm = (a.skipped(), c.skipped());
     c.e.drop_core().unwrap();
     let state = ProductState {
         fading: vec![vec![Some(fade), None], vec![None, None]],
