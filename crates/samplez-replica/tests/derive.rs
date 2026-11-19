@@ -1228,3 +1228,95 @@ async fn rebuilt_off_flows(hands_over: bool) -> samplez_replica::resync::Metrics
     }
     set.replica(follower).contact_metrics().unwrap().resync
 }
+
+/// One command through the leader of the moment: every seventh moves an
+/// input to a flow, the others are fader moves.
+async fn command(set: &Set<Desk>, n: u64) {
+    if !n.is_multiple_of(7) {
+        return move_fader(set, n).await;
+    }
+    let replica = set.replica(set.leader().await).clone();
+    let flow = if n.is_multiple_of(14) { "a" } else { "c" };
+    tokio::spawn(async move {
+        let command = Bytes::from(format!("route {} {flow}", n % 2));
+        let _ = replica.submit(&owner("s"), &n.to_string(), command).await;
+    });
+    sleep(Duration::from_millis(5)).await;
+}
+
+/// A follower restarted briefly, while commands keep coming, reports
+/// itself committing before its log holds the entries written while it
+/// was down. It applies them past their apply deadlines in that state,
+/// where they are held unresolved, and the log never decides them: they
+/// stand on the replicas that applied them in time. The follower then
+/// withdraws, its digest naming entries its peers' do not, and stays
+/// withdrawn. Once it commits nothing again it is rebuilt past them: it
+/// commits again, holding nothing unresolved, within a bound.
+#[tokio::test(start_paused = true)]
+async fn a_follower_that_applied_late_entries_while_committing_is_rebuilt_past_them() {
+    let mut set = Set::start_with(
+        Options {
+            contact: Some(Timing::defaults(BLOCK)),
+            outputs: 1,
+            ..Options::default()
+        },
+        Arc::new(|_| Desk::new()),
+    )
+    .await;
+    for id in set.ids().collect::<Vec<_>>() {
+        let mut fake = set.audio(id).lock();
+        fake.digest_unresolved = true;
+        fake.route_digests = true;
+        fake.resyncs = true;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !set.ids().all(|id| committing(&set, id)) {
+        assert!(Instant::now() < deadline, "every replica committing");
+        sleep(Duration::from_millis(10)).await;
+    }
+    let leader = set.leader().await;
+    let follower = set.ids().find(|&id| id != leader).unwrap();
+    set.crash(follower).await;
+    let mut n = 0;
+    let down = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < down {
+        n += 1;
+        command(&set, n).await;
+    }
+    set.restart(follower).await;
+    {
+        let mut fake = set.audio(follower).lock();
+        fake.digest_unresolved = true;
+        fake.route_digests = true;
+        fake.resyncs = true;
+    }
+    let held = |set: &Set<Desk>| set.audio(follower).lock().core_unresolved.len();
+    let start = Instant::now();
+    let mut since: Option<Instant> = None;
+    loop {
+        n += 1;
+        command(&set, n).await;
+        if committing(&set, follower) && held(&set) == 0 {
+            let from = *since.get_or_insert_with(Instant::now);
+            if from.elapsed() >= Duration::from_millis(500) {
+                break;
+            }
+        } else {
+            since = None;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the follower committing for 500 ms, holding nothing unresolved, within 5 s; \
+             {} unresolved, {:?}",
+            held(&set),
+            set.replica(follower)
+                .contact_metrics()
+                .and_then(|m| m.replica)
+                .and_then(|r| r.state)
+        );
+    }
+    // The scenario's premise: entries taken late went unresolved and the
+    // engine was rebuilt past them, rather than holding them.
+    let rebuilds = (set.replica(follower).contact_metrics()).map_or(0, |m| m.late_rebuilds);
+    assert!(rebuilds >= 1, "no rebuild past late entries: {rebuilds}");
+}
