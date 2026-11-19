@@ -2970,3 +2970,85 @@ fn a_rebuilt_replica_continues_a_masked_fade_that_starts_at_its_entry() {
 fn a_rebuilt_replica_continues_a_masked_fade_that_waits() {
     common::undisturbed(|| rebuilt_replica_continues_a_masked_fade(FADE_DELAY as u32));
 }
+
+/// A replica rebuilt inside the ramp of plain gain entries, from a state
+/// that holds the ramps the entries left running, as a replica's product
+/// state does, computes its peers' pages from the first page after the
+/// install: the install index lies inside the last entry's ramp, and with
+/// `chained` the entry before it ramps on inside that one's.
+fn rebuilt_replica_continues_plain_ramps(chained: bool) -> Result<(), String> {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let plain = |c: &mut Config| c.matrix = diagonal(2, 1.0);
+    let hs = [0; 3].map(|_| hashed_of(&domain, &[(&src, 2)], plain));
+    let [a, b, c] = &hs;
+    let at = (now_block() + 100) * B;
+    let second = at + 10 * B;
+    let gain = |to| Entry::Gain {
+        input: 0,
+        output: 0,
+        gain: to,
+        fade: None,
+    };
+    let ramp = RAMP;
+    let first = Fade {
+        from: 1.0,
+        start: at,
+        len: ramp,
+    };
+    let (last, target, install) = if chained {
+        let from = first.value_at(0.25, second);
+        let f = Fade {
+            from,
+            start: second,
+            len: ramp,
+        };
+        (f, 0.75, second + 96)
+    } else {
+        (first, 0.25, at + 96)
+    };
+    for h in [a, b] {
+        h.e.append(1, at, gain(0.25)).unwrap();
+        h.e.commit(1);
+        if chained {
+            h.e.append(2, second, gain(0.75)).unwrap();
+            h.e.commit(2);
+        }
+    }
+    c.e.drop_core().unwrap();
+    let state = ProductState {
+        fading: vec![vec![Some(last), None], vec![None, None]],
+        limiters: Vec::new(),
+        delays: Vec::new(),
+        gains: vec![vec![target, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        outputs: Vec::new(),
+        strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
+        pending: Vec::new(),
+        last_id: if chained { 2 } else { 1 },
+    };
+    let j =
+        c.e.install_product(&state, install, Duration::from_secs(2))
+            .unwrap();
+    let from = ((j + 1) * B).div_ceil(PAGE);
+    let end = (last.start + u64::from(ramp)) / PAGE;
+    let mut pair = Pair::new(a, c);
+    let pages = wait_comparable(&mut pair, from, end, 1, 0)?;
+    let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+    assert!(apart.is_empty(), "pages {apart:?} differ after the install");
+    Ok(())
+}
+
+#[test]
+fn a_rebuilt_replica_continues_a_plain_ramp() {
+    common::undisturbed(|| rebuilt_replica_continues_plain_ramps(false));
+}
+
+#[test]
+fn a_rebuilt_replica_continues_chained_plain_ramps() {
+    common::undisturbed(|| rebuilt_replica_continues_plain_ramps(true));
+}

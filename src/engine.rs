@@ -7852,4 +7852,43 @@ mod tests {
             Some(f(at + max + 1))
         );
     }
+
+    /// A plain gain change renders as the absolute fade a replica tracks
+    /// for it, `from` the value held at its index and the ramp length as
+    /// the length, bit for bit, mid-ramp and chained.
+    #[test]
+    fn a_plain_set_renders_as_its_absolute_fade() {
+        use samplez_dsp::Matrix;
+        let ramp = 480u32;
+        let mut plain = Matrix::new(1, 1);
+        let mut fades = Matrix::new(1, 1);
+        assert!(plain.set(0, 0, 1.0, 0) && fades.set(0, 0, 1.0, 0));
+        // (index, target): the second change lands mid-ramp, the third
+        // after the second has ended.
+        let changes = [(100u64, 0.25f32), (300, 0.75), (1500, 0.0)];
+        let mut held = 1.0f32;
+        let mut last: Option<Fade> = None;
+        let mut next = changes.iter().peekable();
+        for n in 0..2200u64 {
+            if let Some(&&(at, to)) = next.peek().filter(|c| c.0 == n) {
+                assert!(plain.set(0, 0, to, ramp));
+                let from = last.map_or(held, |f| f.value_at(held, at));
+                let f = Fade {
+                    from,
+                    start: at,
+                    len: ramp,
+                };
+                assert!(fades.set_resumed(0, 0, to, f.ramp_at(to, at)));
+                (held, last) = (to, Some(f));
+                next.next();
+            }
+            assert_eq!(
+                plain.gain(0, 0).to_bits(),
+                fades.gain(0, 0).to_bits(),
+                "sample {n}"
+            );
+            plain.advance(1);
+            fades.advance(1);
+        }
+    }
 }

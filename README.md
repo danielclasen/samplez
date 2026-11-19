@@ -317,9 +317,13 @@ the target in `gains`, and the install continues the fade at its value
 for the install index, bit for bit as a replica that ran through
 computes it, instead of jumping to the target. A gain entry the install
 passed is folded in the same way. A product that leaves `fading` empty
-gets its coefficients at their targets. A masked coefficient a fade brings in from silence is ducked from the
-start, with no mask crossfade of its own: the fade ramps it up, and an
-install builds the same state.
+gets its coefficients at their targets. A masked coefficient that a gain change, with or without a fade, brings
+in from silence is ducked from the start, with no mask crossfade of its
+own: its ramp hides the step, and an install builds the same state.
+The replica tracks the ramp each derived gain entry leaves a coefficient
+on (`Limits::ramp_samples`, which must equal the engine's `rampSamples`)
+and carries them in its product state, so a rebuilt engine continues the
+ramps of plain gain entries too.
 
 ### Channel strip
 

@@ -660,15 +660,15 @@ impl Matrix {
 
     /// Ramps the coefficient from `input` to `output` to `target` over
     /// `len` samples, per [`Ramp::set_target`]. A coefficient that comes
-    /// back from 0 with a mask set crossfades from no duck to its mask's
-    /// gain over the same length.
+    /// back from 0 with a mask set is ducked from the start, with no
+    /// crossfade: its ramp from silence hides the step.
     ///
     /// Returns false and changes nothing if `input` or `output` is out of
     /// range, or `target` is not finite or exceeds
     /// [`MAX_GAIN`](crate::MAX_GAIN) in magnitude.
     #[must_use]
     pub fn set(&mut self, input: usize, output: usize, target: f32, len: u32) -> bool {
-        self.set_with(input, output, target, 0, len, len)
+        self.set_with(input, output, target, 0, len, 0)
     }
 
     /// [`Matrix::set`] after the coefficient held its value for `delay`
@@ -2571,10 +2571,12 @@ mod tests {
         out.channel(0)[n] / coefficient
     }
 
-    /// A coefficient that comes back from 0 with its mask set crossfades
-    /// from no duck to the mask's gain with its own ramp.
+    /// A coefficient that comes back from 0 with its mask set is ducked
+    /// from the start, with no crossfade of the duck: its own ramp from
+    /// silence hides the duck gain stepping in, and an install builds the
+    /// same state.
     #[test]
-    fn a_coefficient_back_from_0_crossfades_its_duck() {
+    fn a_coefficient_back_from_0_is_ducked_from_the_start() {
         let mut m = Matrix::new(1, 1);
         assert!(m.set_depth(0, 0, 20.0, 0) && m.set_mask(0, 0, 1, 0));
         assert!(m.set(0, 0, 1.0, 0));
@@ -2591,8 +2593,7 @@ mod tests {
         assert!(m.set(0, 0, 1.0, 480));
         m.process_ducked(&input, &env, &mut out, 480);
         let mid = duck_of(&out, 240, 240.0 / 480.0);
-        let half = 0.5 * (1.0 + full);
-        assert!((mid - half).abs() < 0.02, "{mid}, want about {half}");
+        assert!((mid - full).abs() < 0.02, "{mid}, want about {full}");
     }
 
     /// A depth change while ducked ramps: the output does not step.
