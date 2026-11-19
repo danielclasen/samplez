@@ -317,9 +317,9 @@ the target in `gains`, and the install continues the fade at its value
 for the install index, bit for bit as a replica that ran through
 computes it, instead of jumping to the target. A gain entry the install
 passed is folded in the same way. A product that leaves `fading` empty
-gets its coefficients at their targets. A duck mask crossfade of a
-coefficient that comes back from 0 runs over `len` from the entry's
-index, not from the end of the delay.
+gets its coefficients at their targets. A masked coefficient a fade brings in from silence is ducked from the
+start, with no mask crossfade of its own: the fade ramps it up, and an
+install builds the same state.
 
 ### Channel strip
 

@@ -712,7 +712,7 @@ impl Matrix {
                 };
                 col.insert(k, term);
                 if !self.masks.is_empty() {
-                    self.duck_inserted(output, k, len);
+                    self.duck_inserted(output, k, if delay > 0 { 0 } else { len });
                 }
             }
             Err(_) => {}
@@ -754,7 +754,10 @@ impl Matrix {
                     },
                 );
                 if !self.masks.is_empty() {
-                    self.duck_inserted(output, k, ramp.len);
+                    // The fade brings the term in from silence, so no
+                    // duck crossfade is needed, and none is the state an
+                    // install of the same fade builds.
+                    self.duck_inserted(output, k, 0);
                 }
             }
         }
@@ -2750,5 +2753,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A masked coefficient a fade brings in is ducked as an install of
+    /// the same fade builds it, with no crossfade of its own: the fade
+    /// ramps it up from silence, so a replica rebuilt mid-fade holds the
+    /// bits of one that applied the entry.
+    #[test]
+    fn a_fade_inserted_masked_term_matches_an_install_of_it() {
+        let ramp = Ramp::resume(0.0, 0.25, 40, 400, 0).unwrap();
+        let mut live = Matrix::new(1, 1);
+        assert!(live.set_mask(0, 0, 0b1, 0));
+        assert!(live.set_resumed(0, 0, 0.25, Some(ramp)));
+        let mut built = Matrix::new(1, 1);
+        assert!(built.fade_in_ducked_resuming(&[0.25], &[0b1], &[], 0, &[(0, ramp)]));
+        assert!(live == built);
     }
 }
