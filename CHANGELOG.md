@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/danielclasen/samplez/compare/v0.9.0...v0.9.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* **engine:** prune an input whose blocks stay late while its head moves ([#110](https://github.com/danielclasen/samplez/issues/110)) ([78714cb](https://github.com/danielclasen/samplez/commit/78714cb5d5f51d12178a2ea8d0f7d112b460b38a))
+* **replica:** count a flow mismatch on across a resync hand-over ([#109](https://github.com/danielclasen/samplez/issues/109)) ([9acb7a1](https://github.com/danielclasen/samplez/commit/9acb7a11cc8a46e90b81c5487a6358e33328ce8f))
+
 ## [0.9.0](https://github.com/danielclasen/samplez/compare/v0.8.3...v0.9.0) (2026-11-19)
 
 
