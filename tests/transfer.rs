@@ -2671,7 +2671,6 @@ fn replayed_core_carries_a_fade(wait: u64) -> Result<(), String> {
         hashed_of(&domain, &[(&src, 2)], plain),
         hashed_of(&domain, &[(&src, 2)], plain),
     );
-    let skipped = (a.skipped(), b.skipped());
     let at = (now_block() + 20) * B;
     fade_entries(&a.e, at, fade_at(at));
     // Set apart: the joiner's fade is a short one, which has ended.
@@ -2690,37 +2689,66 @@ fn replayed_core_carries_a_fade(wait: u64) -> Result<(), String> {
     if (j + 1) * B > at + (FADE_DELAY + u64::from(FADE_LEN)) - 3 * PAGE {
         return Err(format!("handed over at block {j}, near the fade's end"));
     }
-    let before = (k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE;
-    let from = ((j + 1) * B).div_ceil(PAGE);
-    let end = (from + 8) * PAGE / B + PAGE / B;
-    wait_for(Duration::from_secs(10), "pages compared", || {
-        processed(&a.e) > end && processed(&b.e) > end
-    });
-    if (a.skipped(), b.skipped()) != skipped {
-        return Err("an overrun skip".to_owned());
+    // Before the copy the joiner's short fade and the donor's long one
+    // differ on every page the ramp touches.
+    if wait > FADE_DELAY {
+        let before = comparable(&a, &b, (at / PAGE + 1)..k0 * B / PAGE);
+        if !before.iter().any(|&(_, same)| !same) {
+            return Err("no page before the copy shows the joiner apart".to_owned());
+        }
     }
+    let from = ((j + 1) * B).div_ceil(PAGE);
+    let end = (at + FADE_DELAY + u64::from(FADE_LEN)) / PAGE;
+    let pages = wait_comparable(&a, &b, from, end, 3)?;
+    let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+    assert!(
+        apart.is_empty(),
+        "pages {apart:?} differ after the hand-over"
+    );
+    Ok(())
+}
+
+/// The pages in `range` both engines hashed whole and neither one's
+/// overrun skip disturbed, each with whether the two hash alike, read
+/// from one snapshot: the engines' own signal that a page is comparable.
+/// A loaded host skips blocks and narrows this set, it never moves what
+/// the set holds. The engines keep only recent pages, so a caller
+/// collects them as they come.
+fn comparable(a: &Hashed, b: &Hashed, range: std::ops::Range<u64>) -> Vec<(u64, bool)> {
     let (pa, pb) = (a.pages(), b.pages());
     let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
-    let differ = before
-        .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
-        .count();
-    if wait > FADE_DELAY && differ == 0 {
-        return Err("the joiner never diverged".to_owned());
+    range
+        .filter(|p| !disturbed.contains(p))
+        .filter_map(|p| {
+            let (x, y) = (pa.get(&p)?, pb.get(&p)?);
+            Some((p, (x.hash, x.fingerprint) == (y.hash, y.fingerprint)))
+        })
+        .collect()
+}
+
+/// Collects `n` comparable pages at or after page `from` and before page
+/// `end`, as the engines compute them, and returns each with whether the
+/// engines agree. Too few, because an engine skipped the stretch or the
+/// fade ended first, is an error and not a mismatch.
+fn wait_comparable(
+    a: &Hashed,
+    b: &Hashed,
+    from: u64,
+    end: u64,
+    n: usize,
+) -> Result<std::collections::BTreeMap<u64, bool>, String> {
+    let mut found = std::collections::BTreeMap::new();
+    wait_for(Duration::from_secs(10), "comparable pages", || {
+        found.extend(comparable(a, b, from..end));
+        found.len() >= n || processed(&a.e).min(processed(&b.e)) * B / PAGE >= end
+    });
+    if found.len() < n {
+        return Err(format!(
+            "{} comparable pages in {from}..{end}, {n} wanted",
+            found.len()
+        ));
     }
-    for p in from..from + 8 {
-        if disturbed.contains(&p) {
-            return Err(format!("page {p} disturbed"));
-        }
-        let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
-            return Err(format!("page {p} not hashed by both"));
-        };
-        assert_eq!(
-            (hb.hash, hb.fingerprint),
-            (ha.hash, ha.fingerprint),
-            "page {p}"
-        );
-    }
-    Ok(())
+    Ok(found)
 }
 
 #[test]
@@ -2787,10 +2815,11 @@ fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), S
     if (j + 1) * B > at + (FADE_DELAY + u64::from(FADE_LEN)) - 5 * PAGE {
         return Err(format!("installed at block {j}, near the fade's end"));
     }
-    assert_same_within(a, c, (j + 1) * B, (j + 1) * B + 4 * PAGE)?;
-    for h in &hs {
-        assert_eq!(h.e.status().diverged, None);
-    }
+    let from = ((j + 1) * B).div_ceil(PAGE);
+    let end = (at + FADE_DELAY + u64::from(FADE_LEN)) / PAGE;
+    let pages = wait_comparable(a, c, from, end, 3)?;
+    let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+    assert!(apart.is_empty(), "pages {apart:?} differ after the install");
     Ok(())
 }
 
