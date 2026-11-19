@@ -166,6 +166,8 @@ struct Hashed {
     hashes: Receiver<PageHash>,
     verdicts: Receiver<BlockVerdict>,
     statuses: Receiver<StatusChange>,
+    /// The flow id of output 0.
+    out: String,
 }
 
 /// Samples of a gain ramp: about two pages, so the pages a ramp runs
@@ -202,6 +204,7 @@ fn hashed_of(domain: &Domain, inputs: &[(&str, u32)], f: impl FnOnce(&mut Config
     );
     config.ramp_samples = RAMP;
     f(&mut config);
+    let out = config.outputs[0].flow_id.clone();
     let (report_tx, _reports) = sync_channel(64);
     let (hash_tx, hashes) = sync_channel(1 << 16);
     let (verdict_tx, verdicts) = sync_channel(1 << 16);
@@ -223,6 +226,7 @@ fn hashed_of(domain: &Domain, inputs: &[(&str, u32)], f: impl FnOnce(&mut Config
         hashes,
         verdicts,
         statuses,
+        out,
     }
 }
 
@@ -2845,6 +2849,16 @@ struct Pair<'a> {
     pages: [BTreeMap<u64, PageHash>; 2],
     silenced: [Vec<u64>; 2],
     newest: [u64; 2],
+    /// The engines' overrun-skip counters from before the state under
+    /// test was built: pages count only while neither has moved. A skip
+    /// restarts the detectors of one engine, so pages after it may differ.
+    calm: Option<(u64, u64)>,
+    /// The domain to read the outputs from, when a mismatch should be
+    /// read back at once: the flows keep little history.
+    probe: Option<std::path::PathBuf>,
+    /// Per differing page, where its outputs first differ, read when the
+    /// page was first seen to differ.
+    diffs: BTreeMap<u64, String>,
 }
 
 impl<'a> Pair<'a> {
@@ -2855,6 +2869,9 @@ impl<'a> Pair<'a> {
             pages: [BTreeMap::new(), BTreeMap::new()],
             silenced: [Vec::new(), Vec::new()],
             newest: [0, 0],
+            calm: None,
+            probe: None,
+            diffs: BTreeMap::new(),
         }
     }
 
@@ -2878,14 +2895,79 @@ impl<'a> Pair<'a> {
         self.poll();
         let confirmed = self.newest[0].min(self.newest[1]);
         let disturbed: Vec<u64> = self.silenced.iter().flat_map(|s| touched(s)).collect();
-        range
+        let pages: Vec<(u64, bool)> = range
             .filter(|p| (p + 1) * PAGE / B < confirmed && !disturbed.contains(p))
             .filter_map(|p| {
                 let (x, y) = (self.pages[0].get(&p)?, self.pages[1].get(&p)?);
                 Some((p, (x.hash, x.fingerprint) == (y.hash, y.fingerprint)))
             })
-            .collect()
+            .collect();
+        if let Some(domain) = &self.probe {
+            for &(p, _) in pages.iter().filter(|(_, same)| !same) {
+                if !self.diffs.contains_key(&p) {
+                    let d = first_difference(domain, &self.a.out, &self.b.out, p);
+                    self.diffs.insert(p, d);
+                }
+            }
+        }
+        pages
     }
+}
+
+/// Where the outputs `a` and `b` first differ within page `p`, read back
+/// at once.
+fn first_difference(domain: &std::path::Path, a: &str, b: &str, p: u64) -> String {
+    let (first, last) = (p * PAGE / B, (p + 1) * PAGE / B - 1);
+    let read = |flow: &str| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            common::read_blocks(domain, flow, 2, first..last + 1)
+        }))
+    };
+    let (Ok(x), Ok(y)) = (read(a), read(b)) else {
+        return "the output could not be read back".to_owned();
+    };
+    let n = B as usize;
+    // Planar per block: channel c of block k at (k * 2 + c) * B.
+    match x
+        .iter()
+        .zip(&y)
+        .position(|(a, b)| a.to_bits() != b.to_bits())
+    {
+        Some(i) => {
+            let (k, c, s) = (i / (2 * n), i / n % 2, i % n);
+            format!(
+                "first differing sample {} (block {}, channel {c}): {} vs {}",
+                (first + k as u64) * B + s as u64,
+                first + k as u64,
+                x[i],
+                y[i]
+            )
+        }
+        None => "the samples read back are equal".to_owned(),
+    }
+}
+
+/// Everything a mismatch between `pair`'s engines on page `p` needs to
+/// explain itself: the overrun-skip counters at the baseline and now,
+/// the install index, the page's blocks, how far the verdicts reached,
+/// and the first sample of the page where the two outputs differ.
+fn explain(pair: &Pair, p: u64, installed: u64) -> String {
+    let (first, last) = (p * PAGE / B, (p + 1) * PAGE / B - 1);
+    let now = (pair.a.skipped(), pair.b.skipped());
+    let mut out = format!(
+        "page {p} (blocks {first}..={last}), installed at index {installed}, skips at the \
+         baseline {:?} now {now:?}, newest verdicts {:?}, last block of the page confirmed {}",
+        pair.calm,
+        pair.newest,
+        pair.newest[0].min(pair.newest[1]) > last,
+    );
+    out += &format!(
+        ", {}",
+        pair.diffs
+            .get(&p)
+            .map_or("no read-back was taken", String::as_str)
+    );
+    out
 }
 
 /// Collects `n` comparable pages at or after page `from` and before page
@@ -2908,7 +2990,13 @@ fn wait_comparable(
     let over = || processed(ea).min(processed(eb)) * B / PAGE >= end + 2;
     let mut done = false;
     wait_for(Duration::from_secs(10), "comparable pages", || {
-        found.extend(pair.comparable(from..end));
+        let seen = pair.comparable(from..end);
+        if pair
+            .calm
+            .is_none_or(|base| (pair.a.skipped(), pair.b.skipped()) == base)
+        {
+            found.extend(seen);
+        }
         done = found.len() >= n && both(&found);
         done || over()
     });
@@ -3024,6 +3112,11 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
     };
     let hs = [0; 3].map(|_| hashed_of(&domain, &[(&src, 2)], ducked));
     let [a, b, c] = &hs;
+    // The overrun counters are the engines' own, kept across drop_core and
+    // install_product. Taken as soon as the engines exist, before the duck
+    // and mask entries: a skip anywhere from here on restarts a detector
+    // and disqualifies the run (no comparable page is left).
+    let calm = (a.skipped(), c.skipped());
     let at1 = (now_block() + 20) * B;
     let at = at1 + 400 * B;
     let fade = Fade::after(0.0, at, delay, FADE_LEN);
@@ -3075,12 +3168,19 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
     if (j + 1) * B > at + FADE_DELAY + u64::from(FADE_LEN) - 5 * PAGE {
         return Err(format!("installed at block {j}, near the fade's end"));
     }
+    // From the install's own page: the duck of a masked term the install
+    // fills starts at the gain a live engine holds, so even an install at
+    // the first block of a page computes that page alike.
     let from = ((j + 1) * B).div_ceil(PAGE);
     let mut pair = Pair::new(a, c);
+    pair.calm = Some(calm);
+    pair.probe = Some(domain.0.clone());
     let end = (at + u64::from(delay) + u64::from(FADE_LEN)) / PAGE;
     let pages = wait_comparable(&mut pair, from, end, 3, 0)?;
-    let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
-    assert!(apart.is_empty(), "pages {apart:?} differ after the install");
+    if let Some((&p, _)) = pages.iter().find(|(_, same)| !**same) {
+        let why = explain(&pair, p, (j + 1) * B);
+        panic!("pages {pages:?} differ after the install: {why}");
+    }
     Ok(())
 }
 

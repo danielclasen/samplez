@@ -3238,6 +3238,13 @@ impl Engine {
                     .matrix
                     .fade_in_ducked_resuming(&gains, &masks, &depths, 0, &resumed);
                 core.matrix.align(next);
+                // The duck of each masked term at the gain the live engines
+                // hold for the settled detectors, not 1 moving to it.
+                let mut envelopes = [0.0f32; MAX_DUCKS];
+                for (e, d) in envelopes.iter_mut().zip(&core.ducks.detectors) {
+                    *e = d.envelope();
+                }
+                core.matrix.settle_ducks(&envelopes);
                 core.pos = Some(next);
                 core.ramp_end = ramp_end;
                 core.pending.clear();
