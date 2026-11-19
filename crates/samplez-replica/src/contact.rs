@@ -652,6 +652,10 @@ struct State {
     /// Slack of the entries learned committed, for the next reports.
     slack: Vec<Slack>,
     lead: Lead,
+    /// The Raft term this voter is in, as [`Contact::in_term`] was given
+    /// it: slack of an entry stamped by an earlier term is not counted
+    /// ([`add_slack`]). Zero before the first.
+    office_term: u64,
     /// The lead each entry with an at_index was stamped with, by log
     /// index, the lowest forgotten past [`SCHEDULED_MAX`]: kept after
     /// `scheduled` drops an entry every voter reported committed, since a
@@ -761,7 +765,20 @@ pub struct Contact {
 /// it asked for more, and warning once as the lead reaches its cap; an
 /// entry whose stamp it knows counts the lead it needed too
 /// ([`Lead::needs`]).
-fn add_slack(st: &mut State, from: NodeId, slack: &Slack, current: u64) {
+///
+/// Slack of an entry the log holds from a term before the one this voter
+/// is in is not counted: such an entry was stamped by an earlier leader
+/// and its commit waited for an election, so its lateness is the
+/// election's, not the replica's. Entries of the current term count, one
+/// stamped before the term began included, and so do entries the log no
+/// longer holds.
+fn add_slack(st: &mut State, log: &dyn LogView, from: NodeId, slack: &Slack, current: u64) {
+    if log
+        .term_at(slack.index)
+        .is_some_and(|term| term < st.office_term)
+    {
+        return;
+    }
     if let Some(&lead) = st.leads.get(&slack.index) {
         st.lead.needs(lead, slack.samples);
     }
@@ -980,6 +997,7 @@ impl Contact {
                     index_at(START_LEAD.as_nanos() as u64),
                     index_at(timing.max_apply_lead.as_nanos() as u64),
                 ),
+                office_term: 0,
                 leads: BTreeMap::new(),
                 lead_raised_by: None,
                 e_spread: Histogram::default(),
@@ -1184,7 +1202,7 @@ impl Contact {
         if self.counted(st, now).contains(&report.from) {
             let current = self.current_stamp(st, now);
             for slack in &report.slack {
-                add_slack(st, report.from, slack, current);
+                add_slack(st, self.log.as_ref(), report.from, slack, current);
             }
         }
         // Commit knowledge: a committed id this log holds, or a listed
@@ -2055,7 +2073,7 @@ impl Contact {
             .collect();
         for s in handed {
             if counted {
-                add_slack(st, self.id, &s, current);
+                add_slack(st, self.log.as_ref(), self.id, &s, current);
             }
             if st.slack.len() < MAX_LISTED {
                 st.slack.push(s);
@@ -2527,6 +2545,19 @@ impl Contact {
             return false;
         }
         voters.len() == 1 || st.serving.unwrap_or(false)
+    }
+
+    /// The Raft term this voter is in, every tick, leading or not: slack
+    /// of an entry from an earlier term is not counted ([`add_slack`]),
+    /// and a new term voids the slack the lead was kept on
+    /// ([`Lead::new_term`]).
+    pub fn in_term(&self, term: u64) {
+        let mut st = self.lock();
+        if term != st.office_term {
+            st.office_term = term;
+            st.lead.new_term();
+            st.lead_raised_by = None;
+        }
     }
 
     /// This voter does not lead ([`crate::baseline::Leader::step_down`]).
@@ -3461,6 +3492,7 @@ pub(crate) async fn run(
         tokio::select! {
             _ = tick.tick() => {
                 let members = Members::of(&metrics.borrow());
+                contact.in_term(metrics.borrow().current_term);
                 let voters = members.voters();
                 senders.retain(|id, _| voters.contains(id));
                 for (to, addr, report) in contact.tick(members) {
@@ -6118,5 +6150,76 @@ mod tests {
         assert_eq!(scheduled, [(5, at), (6, at + B)]);
         let awaited: Vec<u64> = st.awaiting.keys().map(|k| k.0).collect();
         assert_eq!(awaited, [5, 6]);
+    }
+
+    /// Slack of an entry an earlier term stamped, committed once this
+    /// voter leads, is the election's lateness: it does not raise the
+    /// lead. The same lateness on an entry of the leader's own term does.
+    #[test]
+    fn slack_of_an_earlier_terms_entry_does_not_raise_the_lead() {
+        let f = fixture(&[&[1, 2]]);
+        f.log.push(1, 5, Some(index_at(T0) + 400 * B));
+        f.log.push(2, 6, Some(index_at(T0) + 401 * B));
+        f.contact.in_term(2);
+        let late = |index| Slack {
+            index,
+            samples: -(40 * B as i64),
+            stamp: 0,
+        };
+        let mut st = f.contact.lock();
+        let start = st.lead.samples();
+        add_slack(&mut st, f.log.as_ref(), 2, &late(5), 0);
+        assert_eq!(st.lead.samples(), start, "term 1 entry under term 2");
+        assert!(st.lead_raised_by.is_none());
+        add_slack(&mut st, f.log.as_ref(), 2, &late(6), 0);
+        assert!(st.lead.samples() > start, "term 2 entry raises it");
+        assert_eq!(st.lead_raised_by, Some(2));
+    }
+
+    /// A new term keeps the lead a voter holds and voids its cap flag and
+    /// slack; the same term again changes nothing.
+    #[test]
+    fn a_new_term_keeps_the_lead_and_voids_the_cap() {
+        let f = fixture(&[&[1, 2]]);
+        f.log.push(2, 6, Some(index_at(T0) + 401 * B));
+        f.contact.in_term(2);
+        {
+            let mut st = f.contact.lock();
+            let slack = Slack {
+                index: 6,
+                samples: -(4000 * B as i64),
+                stamp: 0,
+            };
+            add_slack(&mut st, f.log.as_ref(), 2, &slack, 0);
+            assert!(st.lead.capped);
+        }
+        let raised = f.contact.lock().lead.samples();
+        f.contact.in_term(2);
+        assert!(f.contact.lock().lead.capped, "the same term keeps it");
+        f.contact.in_term(3);
+        let st = f.contact.lock();
+        assert_eq!(st.lead.samples(), raised, "the lead is kept");
+        assert!(!st.lead.capped);
+        assert!(st.lead_raised_by.is_none());
+    }
+
+    /// A follower, the next leader, skips the slack of an earlier term's
+    /// entry too, and counts one it holds no term for.
+    #[test]
+    fn a_follower_skips_slack_of_an_earlier_terms_entry() {
+        let f = fixture(&[&[1, 2]]);
+        f.log.push(1, 5, Some(index_at(T0) + 400 * B));
+        f.contact.in_term(2);
+        let late = |index| Slack {
+            index,
+            samples: -(40 * B as i64),
+            stamp: 0,
+        };
+        let mut st = f.contact.lock();
+        let start = st.lead.samples();
+        add_slack(&mut st, f.log.as_ref(), 2, &late(5), 0);
+        assert_eq!(st.lead.samples(), start);
+        add_slack(&mut st, f.log.as_ref(), 2, &late(99), 0);
+        assert!(st.lead.samples() > start, "no term known: counted");
     }
 }

@@ -665,7 +665,18 @@ log decides it. The leader stamps entries the lead ahead, which it keeps
 on the slack every counted audio replica reports at its apply-hand, up
 to `maxApplyLead`; a replica that still applies past the deadline at the
 cap holds those entries unresolved, and the leader's contact metrics
-name it (`apply_lead_raised_by`). The leader also keeps the lead each
+name it (`apply_lead_raised_by`). Slack of an entry the log holds from a
+term before the one the voter is in does not count, for the lead or
+for what entries needed, on every voter: an earlier leader stamped it
+and its commit waited for the election, whose timeout, not the replica,
+made it late. Entries of the current term count as before, one stamped
+before the term began included, and so does an entry whose term the log
+no longer holds, purged or snapshotted. A new term also voids the slack
+the lead was kept on and the need kept, and clears the cap flag; the
+lead itself is kept, since a replica that needs it still needs it. Until
+the lead next rises it may start falling after one clean minute instead
+of ten, at a block a minute, so a lead that was high from need falls
+quickly once the evidence is clean. The leader also keeps the lead each
 entry applied on a counted audio replica needed, over the current minute
 and the last. It stamps every decision on an unresolved entry and every
 `Baseline` with that lead, and at the cap every command too, up to 64
