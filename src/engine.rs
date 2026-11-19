@@ -5175,6 +5175,10 @@ mod tests {
             "outputs": [output("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d11"),
                         output("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d12")],
             "matrix": [],
+            // A stall of a loaded host before the first commits is caught
+            // up, not skipped: a skip then would withdraw the replica, and it
+            // would commit only on evidence this test gives none of.
+            "maxCatchupBlocks": 200,
             "rt": { "enabled": false, "rtCpu": "none" },
         });
         let config = Config::parse(&v.to_string()).unwrap();
@@ -5204,7 +5208,8 @@ mod tests {
         };
         wait(&|| committed(0) && committed(1));
 
-        crate::rt_loop::STALL_MS.store(40, Relaxed);
+        // Longer than the catch-up: the loop skips.
+        crate::rt_loop::STALL_MS.store(400, Relaxed);
         // The stall's skip, past any overrun skip under load.
         let t = Instant::now();
         let (skip_from, skip_to) = loop {
