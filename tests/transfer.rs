@@ -3138,7 +3138,11 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
     if (j + 1) * B > at + FADE_DELAY + u64::from(FADE_LEN) - 5 * PAGE {
         return Err(format!("installed at block {j}, near the fade's end"));
     }
-    let from = ((j + 1) * B).div_ceil(PAGE);
+    // The page after the one holding the install: a masked term the install
+    // fills starts undocked and takes its duck gain over the two gain
+    // intervals (16 samples) after the fill, which a live engine already has,
+    // so an install at the first block of a page differs within that page.
+    let from = ((j + 1) * B) / PAGE + 1;
     let mut pair = Pair::new(a, c);
     pair.calm = Some(calm);
     let end = (at + u64::from(delay) + u64::from(FADE_LEN)) / PAGE;
