@@ -137,8 +137,9 @@ pub(crate) async fn run(inner: Arc<Inner>) {
         let mut served = false;
         for registry in &found {
             // A node that was registered asks a new registry whether it
-            // still holds it before registering again.
-            let joined = if registered_once {
+            // still holds it before registering again, and so does one
+            // that continues a held registration from its first.
+            let joined = if registered_once || inner.cfg.continue_held {
                 match client.heartbeat(&registry.base).await {
                     Answer::Status(StatusCode::OK, _) => Ok(true),
                     Answer::Status(StatusCode::NOT_FOUND, _) => Ok(false),
@@ -172,8 +173,14 @@ pub(crate) async fn run(inner: Arc<Inner>) {
             // taken: the change whose POST failed the last registry, any
             // made since, and on a registry the node left earlier, any made
             // while it was away.
+            // A registration continued from another process carries its
+            // versions: every resource gets a newer one first.
+            let continued = still_held && !registered_once;
+            if continued {
+                inner.restamp();
+            }
             let joined = if still_held {
-                post_changed(&inner, &client, &registry.base, posted, false).await
+                post_changed(&inner, &client, &registry.base, posted, false, continued).await
             } else {
                 register_all(&inner, &client, &registry.base, posted).await
             };
@@ -264,7 +271,7 @@ async fn register_all(
     posted: &mut BTreeMap<Uuid, String>,
 ) -> Result<(), Leave> {
     posted.clear();
-    post_changed(inner, client, base, posted, true).await
+    post_changed(inner, client, base, posted, true, false).await
 }
 
 async fn post_changed(
@@ -272,44 +279,63 @@ async fn post_changed(
     client: &Registrar,
     base: &str,
     posted: &mut BTreeMap<Uuid, String>,
-    fresh: bool,
+    mut fresh: bool,
+    mut continued: bool,
 ) -> Result<(), Leave> {
-    for (kind, doc) in documents(inner) {
-        let (id, version) = id_version(&doc);
-        if posted.get(&id) == Some(&version) {
-            continue;
-        }
-        let mut answer = client.post(base, kind, &doc).await;
-        if fresh && kind == "node" && matches!(answer, Answer::Status(StatusCode::OK, _)) {
-            client.delete(&format!("{base}/resource/nodes/{id}")).await;
-            answer = client.post(base, kind, &doc).await;
-        }
-        if let Answer::Status(StatusCode::CONFLICT, loc) = answer {
-            unregister_old(client, base, loc).await;
-            answer = client.post(base, kind, &doc).await;
-        }
-        match answer {
-            Answer::Status(s, _) if s.is_success() => {
-                posted.insert(id, version);
+    let failover = |a: &Answer| {
+        log_failover(
+            &Registry {
+                base: base.into(),
+                pri: 0,
+            },
+            a,
+        );
+        Err(Leave::Failover)
+    };
+    'pass: loop {
+        for (kind, doc) in documents(inner) {
+            let (id, version) = id_version(&doc);
+            if posted.get(&id) == Some(&version) {
+                continue;
             }
-            Answer::Status(s, _) if s.is_client_error() => {
-                // IS-04: a 400 is not retried as it was sent.
-                tracing::warn!(%kind, %id, status = %s, "nmos: the registry refused a resource");
-                posted.insert(id, version);
+            let mut answer = client.post(base, kind, &doc).await;
+            if fresh && kind == "node" && matches!(answer, Answer::Status(StatusCode::OK, _)) {
+                client.delete(&format!("{base}/resource/nodes/{id}")).await;
+                answer = client.post(base, kind, &doc).await;
             }
-            a => {
-                log_failover(
-                    &Registry {
-                        base: base.into(),
-                        pri: 0,
-                    },
-                    &a,
-                );
-                return Err(Leave::Failover);
+            // In a continued registration, a resource refused, as one
+            // whose new version is still not newer than the held one after
+            // a clock skew between hosts: the Node is deleted and every
+            // resource registered anew, so none of the predecessor's stays.
+            if continued && matches!(answer, Answer::Status(StatusCode::BAD_REQUEST, _)) {
+                tracing::warn!(%kind, %id, "nmos: the registry refused a continued resource; registering anew");
+                let node = format!("{base}/resource/nodes/{}", client.node);
+                match client.delete(&node).await {
+                    Answer::Status(s, _) if s.is_success() || s == StatusCode::NOT_FOUND => {}
+                    a => return failover(&a),
+                }
+                posted.clear();
+                (fresh, continued) = (true, false);
+                continue 'pass;
+            }
+            if let Answer::Status(StatusCode::CONFLICT, loc) = answer {
+                unregister_old(client, base, loc).await;
+                answer = client.post(base, kind, &doc).await;
+            }
+            match answer {
+                Answer::Status(s, _) if s.is_success() => {
+                    posted.insert(id, version);
+                }
+                Answer::Status(s, _) if s.is_client_error() => {
+                    // IS-04: a 400 is not retried as it was sent.
+                    tracing::warn!(%kind, %id, status = %s, "nmos: the registry refused a resource");
+                    posted.insert(id, version);
+                }
+                a => return failover(&a),
             }
         }
+        return Ok(());
     }
-    Ok(())
 }
 
 /// Heartbeats every interval and posts changed resources, until the
@@ -326,7 +352,7 @@ async fn maintain(
         tokio::select! {
             () = sleep_until(next) => {}
             () = inner.changed.notified() => {
-                post_changed(inner, client, base, posted, false).await?;
+                post_changed(inner, client, base, posted, false, false).await?;
                 continue;
             }
         }

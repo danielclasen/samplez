@@ -194,6 +194,7 @@ pub(crate) fn config() -> NmosConfig {
         heartbeat: Duration::from_secs(5),
         registries: Vec::new(),
         dns_sd_domain: None,
+        continue_held: false,
     }
 }
 

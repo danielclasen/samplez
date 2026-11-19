@@ -133,6 +133,25 @@ impl State {
 }
 
 impl Inner {
+    /// Gives every resource a new version, later than every one handed out
+    /// and not before the clock: a registration continued from another
+    /// process holds that process's versions, which a registry takes a
+    /// change over only when newer.
+    pub(crate) fn restamp(&self) {
+        let now = self.clock.now();
+        let mut st = self.lock();
+        st.node_version = st.bump(now);
+        st.device_version = st.bump(now);
+        for i in 0..st.senders.len() {
+            st.senders[i].source_version = st.bump(now);
+            st.senders[i].flow_version = st.bump(now);
+            st.senders[i].port.version = st.bump(now);
+        }
+        for i in 0..st.receivers.len() {
+            st.receivers[i].version = st.bump(now);
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }

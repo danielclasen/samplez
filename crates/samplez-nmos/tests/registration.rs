@@ -55,6 +55,9 @@ enum Mode {
 struct Mock {
     seen: Vec<Seen>,
     ids: BTreeSet<String>,
+    /// The document held per id, as nmos-cpp keeps it: a changed one is
+    /// taken only at a newer version.
+    docs: std::collections::BTreeMap<String, Value>,
     mode: Option<Mode>,
     /// Answers for the next heartbeats, before the mode applies.
     next_heartbeats: Vec<(StatusCode, Option<String>)>,
@@ -90,7 +93,22 @@ impl Registry {
     }
 
     fn forget(&self) {
-        self.state.lock().unwrap().ids.clear();
+        let mut m = self.state.lock().unwrap();
+        m.ids.clear();
+        m.docs.clear();
+    }
+
+    /// The version of the document held for `id`.
+    fn version(&self, id: &str) -> Option<String> {
+        self.versions().remove(id)
+    }
+
+    /// The version of every document held, by id.
+    fn versions(&self) -> std::collections::BTreeMap<String, String> {
+        let m = self.state.lock().unwrap();
+        (m.docs.iter())
+            .map(|(id, d)| (id.clone(), d["version"].as_str().unwrap().to_owned()))
+            .collect()
     }
 
     fn next_heartbeat(&self, status: StatusCode, location: Option<String>) {
@@ -165,6 +183,7 @@ async fn answer(
     }
     if method == Method::DELETE {
         m.ids.clear();
+        m.docs.clear();
         return StatusCode::NO_CONTENT.into_response();
     }
     if !m.next_posts.is_empty() {
@@ -176,6 +195,19 @@ async fn answer(
         return reply(StatusCode::BAD_REQUEST, None);
     }
     let id = v["data"]["id"].as_str().unwrap().to_owned();
+    // nmos-cpp: a changed document at a version not newer is refused.
+    let version = |d: &Value| d["version"].as_str().unwrap_or_default().to_owned();
+    let tai = |s: String| {
+        let (sec, nsec) = s.split_once(':').unwrap();
+        (sec.parse::<u64>().unwrap(), nsec.parse::<u32>().unwrap())
+    };
+    if let Some(held) = m.docs.get(&id)
+        && *held != v["data"]
+        && tai(version(&v["data"])) <= tai(version(held))
+    {
+        return reply(StatusCode::BAD_REQUEST, None);
+    }
+    m.docs.insert(id.clone(), v["data"].clone());
     let known = !m.ids.insert(id) || m.mode == Some(Mode::FirstRegistration);
     let status = if known {
         StatusCode::OK
@@ -212,6 +244,21 @@ impl Connections for Product {
 }
 
 fn node(registries: &[&Registry], apply: Duration) -> Nmos {
+    node_with(registries, apply, false)
+}
+
+/// [`node`] continuing a held registration when `continue_held`.
+fn node_with(registries: &[&Registry], apply: Duration, continue_held: bool) -> Nmos {
+    node_clocked(registries, apply, continue_held, SystemTai)
+}
+
+/// [`node_with`] reading `clock`.
+fn node_clocked(
+    registries: &[&Registry],
+    apply: Duration,
+    continue_held: bool,
+    clock: impl TaiClock,
+) -> Nmos {
     let domain = uuid!("11111111-2222-4333-8444-555555555555");
     let model = NodeModel {
         label: "mixer".into(),
@@ -252,15 +299,25 @@ fn node(registries: &[&Registry], apply: Duration) -> Nmos {
         heartbeat: HEARTBEAT,
         registries: registries.iter().map(|r| r.url.clone()).collect(),
         dns_sd_domain: None,
+        continue_held,
     };
     Nmos::new(
         model,
         cfg,
         Arc::new(Product { delay: apply }),
         &NoStore,
-        SystemTai,
+        clock,
     )
     .unwrap()
+}
+
+/// A TAI clock `behind` the system's.
+struct Behind(Duration);
+
+impl TaiClock for Behind {
+    fn now(&self) -> Tai {
+        Tai::from_nanos(SystemTai.now().as_nanos().saturating_sub(self.0.as_nanos()))
+    }
 }
 
 fn types(seen: &[Seen]) -> Vec<String> {
@@ -362,6 +419,199 @@ async fn a_200_on_first_registration_deletes_the_node_and_registers_again() {
         1
     );
     assert_eq!(types(&seen)[..2], ["node".to_owned(), "node".to_owned()]);
+}
+
+/// A node continuing a held registration, as a replica set's new leader
+/// does under the old leader's ids, heartbeats first and, held, posts every
+/// resource without deleting the Node; without the option the same start
+/// deletes the Node and registers it anew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_registration_is_continued_without_a_delete() {
+    let r = Registry::start(Mode::Up).await;
+    let first = node(&[&r], Duration::ZERO);
+    let task = tokio::spawn(first.registration());
+    until("registered", || types(&r.seen()).len() == 7).await;
+    task.abort();
+    r.clear();
+    let next = node_with(&[&r], Duration::ZERO, true);
+    let task = tokio::spawn(next.registration());
+    until("registered again", || types(&r.seen()).len() == 7).await;
+    until("a heartbeat after", || {
+        r.seen().iter().filter(|s| s.is_heartbeat()).count() >= 2
+    })
+    .await;
+    task.abort();
+    let seen = r.seen();
+    assert!(seen[0].is_heartbeat(), "{:?}", seen[0]);
+    assert!(
+        seen.iter().all(|s| s.method != Method::DELETE),
+        "the Node deleted"
+    );
+    assert_eq!(
+        types(&seen),
+        [
+            "node", "device", "source", "flow", "sender", "receiver", "receiver"
+        ]
+    );
+    r.clear();
+    let restarted = node(&[&r], Duration::ZERO);
+    let task = tokio::spawn(restarted.registration());
+    until("a delete", || {
+        r.seen().iter().any(|s| s.method == Method::DELETE)
+    })
+    .await;
+    task.abort();
+}
+
+/// A process that continues a registration and was built before its
+/// predecessor, its versions older, gives every resource a newer version:
+/// a registry that takes a changed document only at a newer version holds
+/// the continuing process's documents, and the Node was not deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_continued_registration_posts_newer_versions_than_the_held_ones() {
+    let r = Registry::start(Mode::Up).await;
+    let next = node_with(&[&r], Duration::ZERO, true);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let first = node(&[&r], Duration::ZERO);
+    let task = tokio::spawn(first.registration());
+    until("registered", || types(&r.seen()).len() == 7).await;
+    task.abort();
+    let held = r.versions();
+    assert_eq!(held.len(), 7);
+    r.clear();
+    let task = tokio::spawn(next.registration());
+    until(
+        "the registry holding a new version of every resource",
+        || {
+            let now = r.versions();
+            held.iter()
+                .all(|(id, v)| now.get(id).is_some_and(|n| n != v))
+        },
+    )
+    .await;
+    task.abort();
+    // Older versions are refused, and a refused continuation registered
+    // anew: a delete.
+    assert!(
+        r.seen().iter().all(|s| s.method != Method::DELETE),
+        "the Node deleted: {:?}",
+        r.seen()
+            .iter()
+            .map(|s| (&s.method, &s.path))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A continued Node whose new versions are still older than the held
+/// ones, as after clock skew between hosts, is refused; it is deleted and
+/// registered anew, so the registry holds this process's documents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_continued_node_is_registered_anew() {
+    let r = Registry::start(Mode::Up).await;
+    let first = node(&[&r], Duration::ZERO);
+    let task = tokio::spawn(first.registration());
+    until("registered", || types(&r.seen()).len() == 7).await;
+    task.abort();
+    let id = first.node_id().to_string();
+    let held = r.version(&id).unwrap();
+    r.clear();
+    let next = node_clocked(&[&r], Duration::ZERO, true, Behind(Duration::from_secs(60)));
+    let task = tokio::spawn(next.registration());
+    until("a delete", || {
+        r.seen().iter().any(|s| s.method == Method::DELETE)
+    })
+    .await;
+    until("registered anew", || {
+        r.version(&id).is_some_and(|v| v != held)
+    })
+    .await;
+    task.abort();
+}
+
+/// The id of the first receiver `n` lists.
+async fn receiver_id(n: &Nmos) -> String {
+    let req = Request::get("/x-nmos/node/v1.3/receivers")
+        .body(Body::empty())
+        .unwrap();
+    let body = to_bytes(
+        n.router().oneshot(req).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    serde_json::from_slice::<Value>(&body).unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A continued registration whose Node is taken but a resource refused,
+/// as a receiver the predecessor activated after the continuing clock's
+/// reading: the Node is deleted and every resource registered anew, so the
+/// registry keeps none of the predecessor's documents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_continued_resource_registers_the_node_anew() {
+    let r = Registry::start(Mode::Up).await;
+    let first = node(&[&r], Duration::ZERO);
+    let task = tokio::spawn(first.registration());
+    until("registered", || types(&r.seen()).len() == 7).await;
+    // Activated two seconds after the start: its version is newer than
+    // the Node's by that much.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let receiver = receiver_id(&first).await;
+    let before = r.version(&receiver).unwrap();
+    let patch = json!({
+        "master_enable": true,
+        "transport_params": [{ "mxl_flow_id": "cccccccc-0000-4000-8000-000000000001" }],
+        "activation": { "mode": "activate_immediate" },
+    });
+    let req = Request::patch(format!(
+        "/x-nmos/connection/v1.2/single/receivers/{receiver}/staged"
+    ))
+    .header(header::CONTENT_TYPE, "application/json")
+    .body(Body::from(patch.to_string()))
+    .unwrap();
+    assert_eq!(
+        first.router().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    until("the activation posted", || {
+        r.version(&receiver).is_some_and(|v| v != before)
+    })
+    .await;
+    task.abort();
+    let held = r.versions();
+    r.clear();
+    // A second behind: newer than the Node's version, older than the
+    // receiver's.
+    let next = node_clocked(&[&r], Duration::ZERO, true, Behind(Duration::from_secs(1)));
+    let task = tokio::spawn(next.registration());
+    until("a delete", || {
+        r.seen().iter().any(|s| s.method == Method::DELETE)
+    })
+    .await;
+    until("a new version of every resource", || {
+        let now = r.versions();
+        held.iter()
+            .all(|(id, v)| now.get(id).is_some_and(|n| n != v))
+    })
+    .await;
+    task.abort();
+}
+
+/// A process continuing registrations registers as any other where the
+/// registry does not hold its Node: a heartbeat answered 404, then every
+/// resource, and no delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_continuing_process_registers_where_the_node_is_not_held() {
+    let r = Registry::start(Mode::Up).await;
+    let n = node_with(&[&r], Duration::ZERO, true);
+    let task = tokio::spawn(n.registration());
+    until("registered", || types(&r.seen()).len() == 7).await;
+    task.abort();
+    let seen = r.seen();
+    assert!(seen[0].is_heartbeat(), "{:?}", seen[0]);
+    assert!(seen.iter().all(|s| s.method != Method::DELETE));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

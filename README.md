@@ -767,6 +767,16 @@ product's non-RT runtime.
   the registration client sends no credentials and uses registries
   advertising `api_proto=http` and `api_auth=false` only, so no TLS.
 - No peer-to-peer mode: without a registry the node is not advertised.
+- A 200 on a process's first Node POST deletes the Node and registers it
+  anew, as IS-04 asks of a restarted Node. With
+  `NmosConfig::continue_held` the process heartbeats first instead and,
+  when the registry still holds the Node, gives every resource a new
+  version and posts it without deleting the Node: for processes that
+  take turns under one Node id, one at a time and with the same resource
+  ids, such as a replica set's leaders. A resource the predecessor
+  registered and the process lacks stays registered. When the registry
+  refuses any continued resource (its version still older, after clock
+  skew), the Node is deleted and every resource registered anew.
 - `PUT /receivers/{id}/target` answers 501.
 
 CI runs the AMWA nmos-testing suites IS-04-01 (unicast and multicast

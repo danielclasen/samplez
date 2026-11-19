@@ -144,6 +144,7 @@ fn node() -> Nmos {
         heartbeat: Duration::from_secs(5),
         registries: Vec::new(),
         dns_sd_domain: None,
+        continue_held: false,
     };
     Nmos::new(model, cfg, std::sync::Arc::new(Absent), &NoStore, SystemTai).unwrap()
 }

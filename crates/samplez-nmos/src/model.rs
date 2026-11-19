@@ -99,4 +99,20 @@ pub struct NmosConfig {
     /// The unicast DNS-SD domain to browse; `None` browses each search
     /// domain of the system resolver.
     pub dns_sd_domain: Option<String>,
+    /// Whether this process continues a registration that a registry
+    /// still holds for its Node when it first registers. On, it heartbeats
+    /// first; when the registry holds the Node, every resource gets a new
+    /// version and is posted, and the Node is not deleted. Off, a 200 on
+    /// the first Node POST deletes the Node and registers it anew, as IS-04
+    /// asks of a restarted Node. On is for processes that take turns under
+    /// one Node id, such as a replica set's leaders, so a hand-over keeps
+    /// the Node registered. It assumes one process registers the Node at a
+    /// time, which the application ensures, and that each presents the
+    /// same resource ids: one the predecessor registered and this process
+    /// lacks stays in the registry, which offers no listing to find it.
+    /// When the registry refuses any resource of a continued registration,
+    /// as one whose new version is still older than the held one after a
+    /// clock skew between hosts, the Node is deleted and every resource
+    /// registered anew.
+    pub continue_held: bool,
 }

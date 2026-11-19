@@ -158,6 +158,7 @@ async fn main() {
         heartbeat: Duration::from_secs(5),
         registries: a.registries,
         dns_sd_domain: a.dns_sd_domain,
+        continue_held: false,
     };
     let nmos = Nmos::new(
         model(a.domain),
