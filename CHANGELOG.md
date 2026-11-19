@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.12.0](https://github.com/danielclasen/samplez/compare/v0.11.0...v0.12.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** Timing has a new field, lead_minute.
+
+### Features
+
+* **replica:** lengthen raft election timeouts and make them configurable ([#124](https://github.com/danielclasen/samplez/issues/124)) ([6795f22](https://github.com/danielclasen/samplez/commit/6795f2224ac8fe207e781c5d4c252c50327f112c))
+
+
+### Bug Fixes
+
+* **engine:** hand a delay line's history over in steps ([#122](https://github.com/danielclasen/samplez/issues/122)) ([cd67219](https://github.com/danielclasen/samplez/commit/cd67219419e8a40048513b321889dd59a473e35b))
+* **replica:** keep an election from pinning the apply lead at its cap ([#121](https://github.com/danielclasen/samplez/issues/121)) ([281760a](https://github.com/danielclasen/samplez/commit/281760a86d2340db5e0c38aa97d80cae1a7a13fc))
+
 ## [0.11.0](https://github.com/danielclasen/samplez/compare/v0.10.0...v0.11.0) (2026-11-19)
 
 
