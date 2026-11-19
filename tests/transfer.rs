@@ -239,20 +239,22 @@ impl Hashed {
         self.e.counters().overrun_skipped_samples.load(Relaxed)
     }
 
-    /// The pages a block the engine skipped after an overrun and the
-    /// samples after it touch, from the skips its status changes name.
-    /// A limiter restarts from silence at a skip and holds the same bits
-    /// as one that computed those samples again within a few dozen
-    /// samples, well inside the fade-in length.
-    fn skip_touched(&self) -> Vec<u64> {
-        let skipped: Vec<u64> = (self.statuses.try_iter())
-            .filter_map(|s| match s {
-                StatusChange::Skipped { from, to } => Some(from..to),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        touched(&skipped)
+    /// Takes what the engine reported since the last call into `seen`:
+    /// the blocks whose input was silenced, the newest block a verdict
+    /// named and the blocks an overrun skip cut.
+    fn observe(&self, seen: &mut Seen) {
+        for v in self.verdicts.try_iter() {
+            seen.newest = seen.newest.max(v.k);
+            if v.silenced != 0 {
+                seen.silenced.push(v.k);
+            }
+        }
+        for s in self.statuses.try_iter() {
+            if let StatusChange::Skipped { from, to } = s {
+                seen.skipped.push(from..to);
+                seen.skipped_samples += (to - from) * B;
+            }
+        }
     }
 
     /// The pages a silenced input block and the fade-in after it touch:
@@ -265,6 +267,38 @@ impl Hashed {
             .map(|v| v.k)
             .collect();
         touched(&silenced)
+    }
+}
+
+/// Samples a limiter with a 1 ms release takes after a restart to hold
+/// the bits of one that did not: 64 for its delay and window, and 14 time
+/// constants of 48 samples to snap its released gain onto the held one.
+/// Rounded up.
+const LIMITER_MEMORY: u64 = 1024;
+
+/// What an engine reported about its blocks, from [`Hashed::observe`].
+#[derive(Default)]
+struct Seen {
+    silenced: Vec<u64>,
+    /// Blocks the newest verdict named, 0 before the first.
+    newest: u64,
+    skipped: Vec<std::ops::Range<u64>>,
+    skipped_samples: u64,
+}
+
+impl Seen {
+    /// Whether a silenced or skipped block, or what follows it, touches
+    /// page `p`. A silenced input fades in over `RAMP` samples after it,
+    /// and a limiter restarted by a skip or fed the fade-in holds the
+    /// bits of one that was not once its released gain snaps onto the
+    /// held gain: `LIMITER_MEMORY` samples on.
+    fn touches(&self, p: u64) -> bool {
+        let reach =
+            |lo: u64, hi: u64, tail: u64| lo * B / PAGE <= p && p < (hi * B + tail).div_ceil(PAGE);
+        self.silenced
+            .iter()
+            .any(|&k| reach(k, k + 1, u64::from(RAMP) + LIMITER_MEMORY))
+            || (self.skipped.iter()).any(|r| reach(r.start, r.end, LIMITER_MEMORY))
     }
 }
 
@@ -1516,12 +1550,35 @@ fn assert_same_within(a: &Hashed, b: &Hashed, from: u64, to: u64) -> Result<(), 
     Ok(())
 }
 
+/// [`wait_for`] that returns an error on a stall instead of panicking, so
+/// a run starved of CPU is run again.
+fn try_wait(timeout: Duration, what: &str, mut f: impl FnMut() -> bool) -> Result<(), String> {
+    let t = std::time::Instant::now();
+    while !f() {
+        if t.elapsed() >= timeout {
+            return Err(format!("timed out waiting for {what}"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 /// Collects `n` pages in `[from, end)` both engines hashed whole and no
 /// skipped or silenced block touched, as the engines compute them, and
 /// requires each to hash alike on both. The engines keep only recent
 /// pages and a loaded host skips blocks, so the pages are gathered poll
 /// by poll rather than read from a fixed window. Too few, because the
 /// engines skipped the stretch, is an error and not a mismatch.
+///
+/// The supervisor forwards verdicts, status changes and page hashes from
+/// three rings, in that order within one pass, so a page can arrive before
+/// a report the RT thread pushed ahead of it. A page is therefore judged
+/// only once the reports that can touch it are known to have arrived:
+/// - the skips by their count: the samples the status changes name must
+///   reach the engine's `overrun_skipped_samples`, read after the pages;
+/// - the silenced blocks by order: verdicts of one ring arrive in order,
+///   so a verdict of the block after the page's last sample means every
+///   verdict before it has arrived.
 fn assert_same_untouched(
     a: &Hashed,
     b: &Hashed,
@@ -1529,25 +1586,31 @@ fn assert_same_untouched(
     end: u64,
     n: usize,
 ) -> Result<(), String> {
-    let (mut pa, mut pb, mut touched) = (BTreeMap::new(), BTreeMap::new(), Vec::new());
+    let (mut pa, mut pb) = (BTreeMap::new(), BTreeMap::new());
+    let mut seen = [Seen::default(), Seen::default()];
     let mut same = BTreeMap::new();
-    wait_for(Duration::from_secs(10), "comparable pages", || {
-        // Pages first: a skip a page follows is reported before it.
+    try_wait(Duration::from_secs(30), "comparable pages", || {
         pa.extend(a.pages());
         pb.extend(b.pages());
-        for h in [a, b] {
-            touched.extend(h.disturbed());
-            touched.extend(h.skip_touched());
-        }
+        let counted = [a.skipped(), b.skipped()];
+        a.observe(&mut seen[0]);
+        b.observe(&mut seen[1]);
+        let all_skips = seen
+            .iter()
+            .zip(counted)
+            .all(|(s, c)| s.skipped_samples >= c);
+        let newest = seen[0].newest.min(seen[1].newest);
         same = (from..end)
-            .filter(|p| !touched.contains(p))
+            .filter(|_| all_skips)
+            .filter(|p| ((p + 1) * PAGE).div_ceil(B) <= newest)
+            .filter(|p| !seen.iter().any(|s| s.touches(*p)))
             .filter_map(|p| {
                 let (x, y) = (pa.get(&p)?, pb.get(&p)?);
                 Some((p, (x.hash, x.fingerprint) == (y.hash, y.fingerprint)))
             })
             .collect();
         same.len() >= n || processed(&a.e).min(processed(&b.e)) * B / PAGE >= end
-    });
+    })?;
     if same.len() < n {
         return Err(format!(
             "{} comparable pages in {from}..{end}, {n} wanted",
@@ -1633,16 +1696,16 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
             params: LimiterParams {
                 enabled: true,
                 ceiling_db: -6.0,
-                release_ms: 50.0,
+                release_ms: 1.0,
             },
         };
         a.e.append(1, at, limiter.clone()).unwrap();
         a.e.commit(1);
         // Appended, committed only after the install.
         b.e.append(1, at, limiter.clone()).unwrap();
-        wait_for(Duration::from_secs(5), "index passed", || {
+        try_wait(Duration::from_secs(10), "index passed", || {
             processed(&b.e) > (at + u64::from(RAMP)) / B + 2
-        });
+        })?;
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
@@ -1664,15 +1727,15 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
         // the silence it restarted with.
         let from = ((processed(&b.e) + 2) * B).max((j + 1) * B + u64::from(RAMP)) + 48_000;
         let want = (from / B) + 2;
-        wait_for(Duration::from_secs(5), "past the release", || {
+        try_wait(Duration::from_secs(10), "past the release", || {
             processed(&a.e) > want && processed(&b.e) > want
-        });
+        })?;
         // A skip across the entry's index drops it as late on the engine
         // that applied it at its index: the two then differ for good.
         if a.e.counters().command_late.load(Relaxed) != 0 {
             return Err("the limiter entry was late".to_owned());
         }
-        assert_same_untouched(&a, &b, from.div_ceil(PAGE), from.div_ceil(PAGE) + 40, 3)?;
+        assert_same_untouched(&a, &b, from.div_ceil(PAGE), from.div_ceil(PAGE) + 600, 3)?;
         assert_eq!(b.e.counters().command_late.load(Relaxed), 0);
         Ok(())
     });
