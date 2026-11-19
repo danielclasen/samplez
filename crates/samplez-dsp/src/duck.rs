@@ -1376,6 +1376,42 @@ mod tests {
         }
     }
 
+    /// As above in the release: two detectors at full depth whose key falls
+    /// silent, one advancing over part of the hold and release, compute the
+    /// same bits once both are back at rest, a hold and a release after the
+    /// skip at most, with and without key filters.
+    #[test]
+    fn a_detector_that_skipped_mid_release_rejoins_one_that_processed() {
+        for p in [plain(DetectorParams::DEFAULT), DetectorParams::DEFAULT] {
+            let attack = samples(p.attack_ms);
+            let mut a = detector(p);
+            run_mono(&mut a, &tone(1000.0, 0.5, 3 * attack), 48);
+            assert_eq!(a.envelope(), 1.0, "at full depth");
+            let quiet = vec![0.0f32; samples(p.hold_ms + p.release_ms) * 3];
+            let lead = samples(p.hold_ms) + samples(p.release_ms) / 4;
+            run_mono(&mut a, &quiet[..lead], 48);
+            let mut b = a;
+            let skip = samples(p.release_ms) / 4;
+            run_mono(&mut a, &quiet[lead..lead + skip], 48);
+            b.advance(skip);
+            let rest = &quiet[lead + skip..];
+            let (ea, eb) = (run_mono(&mut a, rest, 48), run_mono(&mut b, rest, 48));
+            let bound = samples(p.hold_ms + p.release_ms) + TOL;
+            assert_ne!(
+                bits(&ea[..bound]),
+                bits(&eb[..bound]),
+                "the skip changed nothing"
+            );
+            assert_eq!(
+                bits(&ea[bound..]),
+                bits(&eb[bound..]),
+                "apart past a hold and release after the skip, filters {}",
+                p.hpf.enabled
+            );
+            assert!(a == b, "{a:?} {b:?}");
+        }
+    }
+
     /// Bursts of noise around the threshold on two keys, one of them
     /// stereo, through both key filters, with the momentary hold pressed
     /// and released and a new attack mid-way.
