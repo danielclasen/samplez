@@ -275,7 +275,8 @@ impl EngineAudio {
     /// rules of [`EngineAudio::kept`] and else left at the one read; a
     /// strip parameter, duck setting or duck mask the engine refuses is
     /// replaced as the live filter replaces it ([`EngineAudio::admitted`])
-    /// or left out; a gain it refuses is silenced, as the state machine
+    /// or left out, limiter parameters it refuses left out; a gain it
+    /// refuses is silenced, as the state machine
     /// derives it for every replica
     /// ([`crate::state_machine::StateMachine::product_state`] holds none).
     /// A replica rebuilt from it holds what a live one that read the same
@@ -318,6 +319,19 @@ impl EngineAudio {
                 }
             }
             *params = admitted;
+        }
+        // Limiter parameters the engine refuses, of an output without a
+        // limiter or out of range, are left out, as the live filter
+        // leaves out their entries.
+        for (output, params) in state.limiters.iter_mut().enumerate() {
+            if let Some(p) = *params
+                && (self.engine)
+                    .admits(&[Entry::Limiter { output, params: p }])
+                    .is_err()
+            {
+                *params = None;
+                dropped += 1;
+            }
         }
         for gain in state.gains.iter_mut().flatten() {
             if !samplez_dsp::valid_gain(*gain) {

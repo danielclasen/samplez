@@ -5,7 +5,8 @@
 //! coefficient ramping, undocked and ducked; the strips, 64 mono ones, the meters of the 64
 //! input channels after them and eight duck detectors keyed by them have
 //! one path, metered as the RT loop runs them, and idle as an engine with
-//! no duck group in use runs them. It also gates the RT parts of a resync
+//! no duck group in use runs them; so do limiters on the 96 output
+//! channels as 48 stereo outputs, limiting and off. It also gates the RT parts of a resync
 //! at that shape: the matrix and detector copies of the core and one
 //! block's history stores. The hard limits are the
 //! instruction counts measured in the builder image plus 10 %, rounded
@@ -19,8 +20,8 @@ use samplez_dsp::duck::MAX_KEYS;
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
     CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams, History,
-    KWeighting, KeyFilter, MAX_DUCKS, Matrix, Path, PlanarBuffer, Started, Strip, StripParam,
-    TruePeak, accumulate,
+    KWeighting, KeyFilter, Limiter, LimiterParams, MAX_DUCKS, Matrix, Path, PlanarBuffer, Started,
+    Strip, StripParam, TruePeak, accumulate,
 };
 
 const B: usize = 48;
@@ -225,6 +226,53 @@ fn strip((mut strips, mut buf): (Vec<Strip>, PlanarBuffer)) -> (Vec<Strip>, Plan
     (strips, buf)
 }
 
+/// 48 stereo limiters over the 96 output channels, on with the signal
+/// above their ceiling, or off, which only delays; each run on a block
+/// copied into a scratch buffer and back, as the RT loop runs them.
+fn limiters(on: bool) -> (Vec<Limiter>, PlanarBuffer, Vec<f32>) {
+    let mut v = Vec::new();
+    for _ in 0..OUTPUTS / 2 {
+        let mut l = Limiter::new(2, 0);
+        let params = LimiterParams {
+            enabled: on,
+            ceiling_db: -12.0,
+            release_ms: 50.0,
+        };
+        assert!(l.set(params));
+        v.push(l);
+    }
+    let mut buf = signal(OUTPUTS);
+    let mut scratch = vec![0.0; 2 * B];
+    // A block before, so the one measured is the next one.
+    for l in &mut v {
+        l.process(0, &mut scratch, B);
+    }
+    for c in 0..OUTPUTS {
+        for s in buf.channel_mut(c) {
+            *s *= 2.0;
+        }
+    }
+    (v, buf, scratch)
+}
+
+#[library_benchmark]
+#[bench::on(args = (true,), setup = limiters, config = limit(LIMITERS_ON))]
+#[bench::off(args = (false,), setup = limiters, config = limit(LIMITERS_OFF))]
+fn limiter(
+    (mut limiters, mut buf, mut scratch): (Vec<Limiter>, PlanarBuffer, Vec<f32>),
+) -> (Vec<Limiter>, PlanarBuffer, Vec<f32>) {
+    for (o, l) in limiters.iter_mut().enumerate() {
+        for (c, leg) in scratch.chunks_exact_mut(B).enumerate() {
+            leg.copy_from_slice(&buf.channel(2 * o + c)[..B]);
+        }
+        l.process(B as u64, black_box(&mut scratch), B);
+        for (c, leg) in scratch.chunks_exact(B).enumerate() {
+            buf.channel_mut(2 * o + c)[..B].copy_from_slice(leg);
+        }
+    }
+    (limiters, buf, scratch)
+}
+
 /// Eight detectors, each keyed by eight of the 64 mono inputs through
 /// both key filters, the low-pass ramping on, the signal around the
 /// threshold.
@@ -406,6 +454,8 @@ const STRIPS_SETTLED: u64 = 979_919;
 const STRIPS_RAMPING_FAST: u64 = 1_771_069;
 const STRIPS_SETTLED_FAST: u64 = 1_273_161;
 const DUCK: u64 = 407_817;
+const LIMITERS_ON: u64 = 655_232;
+const LIMITERS_OFF: u64 = 171_994;
 const DUCK_ADVANCE: u64 = 4_065;
 
 library_benchmark_group!(
@@ -416,6 +466,7 @@ library_benchmark_group!(
         meters,
         input_meters,
         strip,
+        limiter,
         duck,
         duck_metered,
         duck_idle,

@@ -891,6 +891,7 @@ impl<P: Product> StateMachine<P> {
             }
         }
         samplez::ProductState {
+            limiters: targets.limiters,
             gains: targets.gains,
             up,
             flows: targets.flows,

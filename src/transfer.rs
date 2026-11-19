@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Matrix, Strip, StripParam};
+use samplez_dsp::{Limiter, LimiterParams, Matrix, Strip, StripParam};
 use samplez_mxl::time;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +67,10 @@ pub struct Core {
     /// The outputs disabled by an `Output` entry, a bit per output.
     pub(crate) outputs_disabled: u64,
     pub(crate) slots: Vec<SlotCore>,
+    /// Per output its limiter, its state included; none where the
+    /// configuration has none. A core built from product state leaves the
+    /// RT thread's, as it leaves the strips.
+    pub(crate) limiters: Vec<Option<Limiter>>,
     pub(crate) awaiting_gen: Vec<RtEntry>,
     pub(crate) pending_gen: Option<LogId>,
     pub(crate) unresolved: Vec<(LogId, u64)>,
@@ -93,9 +97,15 @@ impl PartialEq for Handed {
 
 impl Core {
     /// A buffer for the core of an engine with `inputs` and `outputs`
-    /// channels, `slots` input slots and room for `page_entries` entries
-    /// of one page's fingerprint.
-    pub(crate) fn new(inputs: usize, outputs: usize, slots: usize, page_entries: usize) -> Core {
+    /// channels, `slots` input slots, room for `page_entries` entries
+    /// of one page's fingerprint and `outs` outputs.
+    pub(crate) fn new(
+        inputs: usize,
+        outputs: usize,
+        slots: usize,
+        page_entries: usize,
+        outs: usize,
+    ) -> Core {
         Core {
             matrix: Matrix::new(inputs, outputs),
             ducks: DuckCore::new(0),
@@ -107,6 +117,7 @@ impl Core {
             entries_lost: false,
             outputs_disabled: 0,
             slots: vec![SlotCore::default(); slots],
+            limiters: vec![None; outs],
             awaiting_gen: Vec::with_capacity(PENDING_CHANGES),
             pending_gen: None,
             unresolved: Vec::with_capacity(UNRESOLVED),
@@ -217,8 +228,9 @@ impl Core {
     /// the lists within their capacities, a batch detaching only slots it
     /// re-routes, and a detached slot's last block silenced, as a slot
     /// reading no flow leaves it after every block. A core from another
-    /// replica is checked when decoded; a strip, a detector and the matrix in it are
-    /// checked as they deserialize ([`Strip::is_valid`],
+    /// replica is checked when decoded; a strip, a limiter, a detector and
+    /// the matrix in it are checked as they deserialize
+    /// ([`Strip::is_valid`], [`Limiter::is_valid`],
     /// [`samplez_dsp::Detector::is_valid`]).
     fn sane(&self) -> bool {
         let index = |i: u64| i <= INDEX_MAX;
@@ -227,6 +239,7 @@ impl Core {
                 && match e.change {
                     Change::Gain { gain, .. } => samplez_dsp::valid_gain(gain),
                     Change::Strip { param, .. } => param.check(usize::MAX).is_ok(),
+                    Change::Limiter { params, .. } => params.check().is_ok(),
                     Change::Batch {
                         routed, detached, ..
                     } => detached & !routed == 0,
@@ -271,7 +284,7 @@ impl Core {
             let (Some((_, b)), None) = (of.next(), of.next()) else {
                 return false;
             };
-            if !b.sane() || (strips && b.strips.is_empty()) {
+            if !b.sane() || (strips && b.strips.is_empty() && b.limiters.is_empty()) {
                 return false;
             }
         }
@@ -285,7 +298,8 @@ impl Core {
     /// entries of one page's fingerprint, every entry and every duck key
     /// within them, and ducks only on the duck columns `ducked`: checked
     /// before a replay installs it. A slot has a
-    /// strip of its legs exactly when it is at most [`MAX_LEGS`] wide.
+    /// strip of its legs exactly when it is at most [`MAX_LEGS`] wide,
+    /// and an output a limiter of the legs `limiters` names for it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fits(
         &self,
@@ -293,6 +307,7 @@ impl Core {
         columns: usize,
         outputs: usize,
         legs: &[usize],
+        limiters: &[Option<usize>],
         ramp: u32,
         page_entries: usize,
         ducked: &[usize],
@@ -327,6 +342,11 @@ impl Core {
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
             && self.batches.iter().all(batch)
             && self.slots.iter().zip(legs).all(strip)
+            && (0..self.limiters.len().max(limiters.len())).all(|o| {
+                let held = self.limiters.get(o).and_then(Option::as_ref);
+                let want = limiters.get(o).copied().flatten();
+                held.map(|l| (l.legs(), l.ramp())) == want.map(|legs| (legs, ramp))
+            })
             && self.ducks.fits(legs, ramp)
             && unducked(&self.matrix)
     }
@@ -359,6 +379,7 @@ pub(crate) fn fits(
         Change::Strip { slot, param } => {
             slot < slots && legs[slot] <= MAX_LEGS && param.check(legs[slot]).is_ok()
         }
+        Change::Limiter { output, params } => output < outputs && params.check().is_ok(),
         Change::Batch { up, routed, .. } => slots_of(up | routed).all(|s| s < slots),
     }
 }
@@ -380,6 +401,9 @@ pub(crate) struct Handover {
     /// Strip parameters set at the install index, by slot: the product
     /// state's. Built off the RT thread and handed back with the core.
     pub strips: Vec<(usize, StripParam)>,
+    /// Limiter parameters set at the install index, by output, as
+    /// `strips`.
+    pub limiters: Vec<(usize, LimiterParams)>,
     pub answer: Answer,
 }
 
@@ -743,6 +767,7 @@ fn change_of(entry: &Entry) -> Change {
             enabled,
         },
         Entry::Strip { slot, param } => Change::Strip { slot, param },
+        Entry::Limiter { output, params } => Change::Limiter { output, params },
         Entry::Duck { .. } | Entry::DuckMask { .. } => {
             unreachable!("duck entries are items of their own")
         }
@@ -769,6 +794,10 @@ pub struct ProductState {
     /// Per input slot the strip parameters the log set, as values: each
     /// one set again at the install, the strip's own state kept.
     pub strips: Vec<Vec<StripParam>>,
+    /// Per output its limiter parameters, none for one the log never set:
+    /// set again at the install, the limiter's own state kept. An output
+    /// past the list keeps what its limiter holds.
+    pub limiters: Vec<Option<LimiterParams>>,
     /// Per duck group, at most [`samplez_dsp::MAX_DUCKS`], its targets: a
     /// group past the list holds [`DuckTargets::default`]. The detectors
     /// start cold at the install: key filters at rest, no hold, the
@@ -914,7 +943,7 @@ mod tests {
     }
 
     fn copy() -> CoreCopy {
-        let mut core = Core::new(2, 2, 2, 8);
+        let mut core = Core::new(2, 2, 2, 8, 1);
         core.ducks = DuckCore::new(48);
         assert!(core.matrix.set(1, 0, 0.5, 48));
         assert!(core.matrix.set(0, 1, 0.25, 0));
@@ -1209,28 +1238,28 @@ mod tests {
     #[test]
     fn a_core_fits_only_its_own_shape() {
         let mut copy = copy();
-        assert!(copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 3, 1, &[1, 1], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 0, &[]));
+        assert!(copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 3, 1, &[1, 1], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 0, &[]));
         // Strips of other legs, another ramp, or none on a narrow slot;
         // a slot wider than a strip has none.
-        assert!(!copy.core.fits(2, 2, 1, &[1, 2], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 480, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 2], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 480, 8, &[]));
         copy.core.slots[0].strip = None;
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
-        assert!(copy.core.fits(2, 2, 1, &[MAX_LEGS + 1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
+        assert!(copy.core.fits(2, 2, 1, &[MAX_LEGS + 1, 1], &[], 48, 8, &[]));
         copy.core.slots[0].strip = Some(Strip::new(1, 48));
         copy.core.pending.push(RtEntry {
             id: 8,
             at_index: 9648,
             change: Change::InputDown { slot: 2 },
         });
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
         copy.core.pending.pop();
         // Output 1 disabled: a core of two outputs, not of one.
         copy.core.outputs_disabled = 0b10;
-        assert!(copy.core.fits(2, 2, 2, &[1, 1], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
+        assert!(copy.core.fits(2, 2, 2, &[1, 1], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
         copy.core.outputs_disabled = 0;
         copy.core.pending.push(RtEntry {
             id: 8,
@@ -1240,8 +1269,8 @@ mod tests {
                 enabled: false,
             },
         });
-        assert!(copy.core.fits(2, 2, 2, &[1, 1], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
+        assert!(copy.core.fits(2, 2, 2, &[1, 1], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
     }
 
     /// A copy whose detector 2 is keyed by slot 1, forced on and
@@ -1282,17 +1311,17 @@ mod tests {
         );
         assert_eq!(a.envelope().to_bits(), b.envelope().to_bits());
         assert_eq!(decoded.core.duck_mask(1, 0), 0b100);
-        assert!(decoded.core.fits(2, 2, 1, &[1, 1], 48, 8, &[0]));
+        assert!(decoded.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[0]));
         // Its mask is on column 0: refused on an engine whose duck
         // columns leave it out, or that has none.
-        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], 48, 8, &[1]));
-        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], 48, 8, &[]));
+        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[1]));
+        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], &[], 48, 8, &[]));
         assert!(
-            !decoded.core.fits(2, 2, 1, &[1, 2], 48, 8, &[0]),
+            !decoded.core.fits(2, 2, 1, &[1, 2], &[], 48, 8, &[0]),
             "key 0 of another width"
         );
         assert!(
-            !decoded.core.fits(2, 2, 1, &[1, 1], 480, 8, &[0]),
+            !decoded.core.fits(2, 2, 1, &[1, 1], &[], 480, 8, &[0]),
             "another key filter ramp"
         );
     }

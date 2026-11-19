@@ -29,6 +29,8 @@ matrix, are built on it.
   equaliser, gate and compressor
 - A gain matrix with ramped coefficients; in replicated mode the engine
   entries of one log entry are folded and applied whole at its index
+- A true-peak limiter per output of up to 8 channels, configured per
+  output and set by limiter entries
 - Meters per output and meter: sample peak, RMS, true peak and EBU R 128
   loudness (momentary, short-term, integrated, loudness range); per
   input: sample peak, RMS and momentary loudness
@@ -114,7 +116,7 @@ it deletes its output flow on the way out.
 | Crate | |
 |---|---|
 | `samplez` | the engine: configuration, supervisor, RT loop, block statuses and hold rings, state transfer, and `samplez-hop` |
-| `samplez-dsp` | planar buffers, gain ramps, the mixing matrix with duck masks and depths, the channel strip, the duck detector, meters, true peak and loudness, history rings |
+| `samplez-dsp` | planar buffers, gain ramps, the mixing matrix with duck masks and depths, the channel strip, the output limiter, the duck detector, meters, true peak and loudness, history rings |
 | `samplez-mxl` | MXL flow input and output on libmxl v1.1.0, loaded with `mxl::load_api` |
 | `samplez-nmos` | NMOS for products: the IS-04 v1.3 Node API and the IS-05 v1.2 Connection API with MXL senders and receivers per BCP-007-03, BCP-004-01 receiver caps and BCP-002-01/02 tags |
 | `samplez-replica` | a product's state replicated over openraft: the log and snapshots on the replica's volume, the applied command ids, the bridge to a replicated engine, clock checks, resync and rollouts |
@@ -152,7 +154,8 @@ none (below),
 `offsetSamples` 0, `flowChannels` (below) and `flowId` none, per output
 `enabled` true, per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
-Table 3; without it every channel weighs 1), and `meters`, each with a
+Table 3; without it every channel weighs 1), per output `limiter` false
+(below), and `meters`, each with a
 `name`, `channels` and `loudnessChannels`: matrix columns after the
 outputs' that are computed and metered and written to no flow.
 
@@ -219,7 +222,8 @@ index on, whatever is readable), `InputUp` (it fades in from the index),
 index), `Detach` (it crossfades to silence over the ramp length from the
 index and reads no flow, is not polled and is not reported until a
 `Route` fades it in from silence; its up or down state is kept),
-`Output` (an output disabled: nothing is written to it from the index
+`Limiter` (an output's limiter parameters, below), `Output` (an
+output disabled: nothing is written to it from the index
 on and its writer is released, which deletes its flow unless another
 writer holds it; or enabled: its flow is created as at start-up and
 written from the first block due once the writer is in, another writer
@@ -247,7 +251,8 @@ buildLead after the one before, and an `Output`
 
 A replicated log entry may carry any number of engine entries
 (`append_batch`). They are folded off the RT thread: per matrix
-coefficient, strip parameter and output the last value; per input slot
+coefficient, strip parameter and output the last value, and per output
+its last limiter parameters; per input slot
 whether it is re-routed or detached, the last `Route` or `Detach`
 counting, goes down and comes up, an `InputUp` after an `InputDown`
 fading in from silence and a route kept whatever the state. The log
@@ -292,6 +297,34 @@ an input wider than 8 channels, or one its strip refuses, is refused
 when appended (`append`) or set (`set_strip`); one that a strip on the
 RT thread still refuses is counted in `strip_refused`, not applied, and
 marks the engine diverged.
+
+### Output limiter
+
+An output configured with `limiter: true`, of at most 8 channels, has a
+limiter (`samplez_dsp::Limiter`), off until a `Limiter` entry sets it
+(`Engine::set_limiter`, `samplez_dsp::LimiterParams`): on or off, a
+ceiling of -20 to 0 dBTP and a release time constant of 1 to 1000 ms.
+It runs on every block computed, after the matrix and before the write,
+the page hash and the output's meters, so they all see what leaves.
+Such an output is `samplez_dsp::LIMITER_DELAY` samples (53, 1.1 ms)
+later than one without, on or off; switching it on or off ramps over the
+ramp length, a new ceiling or release takes effect at the next sample.
+
+The limiter is a feed-forward look-ahead limiter linked over the
+output's channels. Its sidechain is the ITU-R BS.1770-5 Annex 2
+interpolator of the true-peak meter: per sample index, the largest of
+the two samples and the four phases between them over every channel.
+The gain each needs to stay at the ceiling is held over the 1 ms
+look-ahead, released by the release time and averaged over the
+look-ahead, so no output sample exceeds the ceiling and the true peak
+the output's meter reads stays within 0.05 dB of it on the tests'
+inter-sample-peak signals. Every value is computed per sample index in a
+fixed order, scalar or AVX2 with the same bits, so replicas compute the
+same output whatever the block size; a limiter started cold matches a
+running one from the first peak deeper than both are releasing from.
+A jump of the sample index restarts it from silence, and a sample that
+is not finite is taken as 0. A `Limiter` entry for an output without a
+limiter is refused when appended or set.
 
 ### Duck groups
 
@@ -400,7 +433,8 @@ with its ramps, duck masks, depths and mask crossfades, the duck
 detectors with their keys, filter, hold and envelope state, the pending
 entries and those applied in the page in progress, each input's log
 state and fades, each strip with its filter and dynamics state and
-position, the entries waiting for a generation and the pending
+position, each output's limiter with its rings and released gain, the
+entries waiting for a generation and the pending
 generation's entry id, and the unresolved entries.
 Meters, hold rings, statuses and readers stay with the replica.
 History rings (`History` in samplez-dsp) hold a delay plus
@@ -453,7 +487,8 @@ or one holding a value no engine holds (an index beyond 2^62, a gain or
 strip parameter out of range, a ramp past its length, a matrix beyond
 `MAX_COEFFICIENTS`, 2^18, which configurations are held to as well, a
 strip `Strip::is_valid` refuses: a parameter, gain, envelope, pole,
-ramp or state beyond any a strip reaches, a filter target other than
+ramp or state beyond any a strip reaches, a limiter `Limiter::is_valid`
+refuses, a filter target other than
 its parameters' or a filter ramp outside the box of every target, a
 detector `Detector::is_valid` refuses, a duck key without its slot or a
 slot without its key, a mask, depth or mask crossfade out of range, or a
@@ -479,10 +514,11 @@ the RT thread keeps its writers, flows, hold rings and statuses,
 computes no block and withholds each one, overrun skips included, cause
 `NoCore` (`StatusChange::NoCore` ranges), with the replica withdrawn.
 Entries needing no generation whose index passes meanwhile are taken off
-the pending list, strip entries applied to the strips the slots keep and
-the others, duck entries included, not, and the core installed next must
-know them; a batch holding an `InputUp` or `Route` stays pending whole.
-A replayed core replaces the strips; one built from product state leaves
+the pending list, strip and limiter entries applied to the strips the
+slots and the limiters the outputs keep and the others, duck entries
+included, not, and the core installed next must know them; a batch
+holding an `InputUp` or `Route` stays pending whole. A replayed core
+replaces the strips and limiters; one built from product state leaves
 them. `Engine::install_product` builds a core from product state off the
 RT thread (fades cold, the pending entries, no unresolved entry; the RT
 thread keeps its pending generation) and installs it through the same
@@ -509,12 +545,13 @@ page verdict, and it resyncs from a donor's core, which carries every
 group's detector state. A keyed group whose envelope never reaches 0 or
 full depth, which would keep the two apart for good, so costs one page,
 the reports that carry it and a resync. The product state also names
-each slot's flow and strip parameters: the supervisor hands over
-generations reading those flows before the core, a slot on another flow
-moving to it with no crossfade, and the strip parameters are set from
-the install's index, each strip keeping its own state. `Targets` holds
-every gain, flow, strip parameter, duck group setting and duck mask as
-values; `Targets::diff` gives the entries that move an engine from one
+each slot's flow and strip parameters and each output's limiter
+parameters: the supervisor hands over generations reading those flows
+before the core, a slot on another flow moving to it with no crossfade,
+and the strip and limiter parameters are set from the install's index,
+each strip and limiter keeping its own state. `Targets` holds every
+gain, flow, strip and limiter parameter, duck group setting and duck
+mask as values; `Targets::diff` gives the entries that move an engine from one
 set of targets to another, comparing every value by bit pattern, and
 `Targets::assert` the entries that set all of them.
 
@@ -719,7 +756,8 @@ makes no libc call, nor `std::thread::sleep`, which calls
 primitives listed in `clippy.toml` in the RT modules. `cargo bench
 --bench rt` in samplez, samplez-dsp and samplez-mxl fails when the
 instruction count of the hold ring's paths, the page hashes, the strip
-calls of the RT loop, a block's DSP, duck detectors and input meters,
+calls of the RT loop, a block's DSP, limiters, duck detectors and input
+meters,
 the matrix and detector copies of the core, a duck batch, a block's
 history stores or an output commit, gap zero-fill included, exceeds the
 limit in the benchmark. An input is pruned after `pruneAfterBlocks`

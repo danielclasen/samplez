@@ -73,6 +73,7 @@ fn the_rt_thread_passes_rtsan() {
     let matrix = vec![vec![0.5, 0.0], vec![0.0, 0.5]];
     let mut cfg = config(&domain.0, &[(&src, 2)], &[(&dst, 2)], matrix, MARGIN);
     common::add_meter(&mut cfg, "bus", 2, 0.5);
+    cfg.outputs[0].limiter = true;
     let (engine, rx) = start(cfg);
     let attached = || engine.status().inputs[0].state == InputState::Attached;
     wait_for(Duration::from_secs(5), "input attached", attached);
@@ -82,6 +83,15 @@ fn the_rt_thread_passes_rtsan() {
     let api = common::api();
     let index = samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
     engine.set_gain(0, 0, 0.25, (index / B + 20) * B).unwrap();
+    // The limiter on, below the output's level: it limits.
+    let limiter = samplez_dsp::LimiterParams {
+        enabled: true,
+        ceiling_db: -12.0,
+        release_ms: 50.0,
+    };
+    engine
+        .set_limiter(0, limiter, (index / B + 20) * B)
+        .unwrap();
     let reset = (index / B + 40) * B;
     engine.reset_loudness(0, reset).unwrap();
     // The meter after the output.

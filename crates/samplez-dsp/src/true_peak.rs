@@ -77,7 +77,7 @@ pub const COEFFICIENTS: [[f32; TAPS]; 4] = [
     ],
 ];
 
-const HISTORY: usize = TAPS - 1;
+pub(crate) const HISTORY: usize = TAPS - 1;
 
 /// True-peak detector for a fixed number of channels. Each channel keeps
 /// the last 11 input samples across calls.
@@ -167,6 +167,44 @@ pub(crate) fn peak_scalar(w: &[f32], from: usize) -> (f32, bool) {
     (peak, nan)
 }
 
+/// Per input sample `w[HISTORY + n]`, `n` from `from` on, the largest
+/// of `out[n]` and the absolute values of its four phase outputs, each
+/// computed as [`peak_scalar`] computes it. The inputs must be finite.
+pub(crate) fn phase_peaks_scalar(w: &[f32], from: usize, out: &mut [f32]) {
+    for n in from..w.len() - HISTORY {
+        let mut peak = out[n];
+        for h in &COEFFICIENTS {
+            let mut acc = 0.0f32;
+            for (j, &c) in h.iter().enumerate() {
+                acc += c * w[HISTORY + n - j];
+            }
+            let a = acc.abs();
+            if a > peak {
+                peak = a;
+            }
+        }
+        out[n] = peak;
+    }
+}
+
+/// [`phase_peaks_scalar`] on `path`, the same bits on every path.
+///
+/// # Panics
+///
+/// When the CPU does not support `path`, or `out` is shorter than the
+/// samples after the history.
+pub(crate) fn phase_peaks(path: Path, w: &[f32], out: &mut [f32]) {
+    assert!(out.len() >= w.len() - HISTORY, "phase peaks: room");
+    match path {
+        Path::Scalar => phase_peaks_scalar(w, 0, out),
+        Path::Avx2 => {
+            assert!(Path::Avx2.is_supported(), "AVX2 not supported");
+            // SAFETY: AVX2 support was checked.
+            unsafe { crate::simd::phase_peaks_avx2(w, out) }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +257,33 @@ mod tests {
             let table: Vec<f32> = t.iter().map(|&u| u as f32).collect();
             assert_eq!(units, table);
         }
+    }
+
+    /// The per-sample phase peaks are the same bits on every path, and
+    /// their largest is the block's true peak; no phase output exceeds
+    /// the limiter's bound on the largest input times its gain.
+    #[test]
+    fn phase_peaks_agree_on_every_path() {
+        let mut rng = Rng::new(5);
+        for _ in 0..200 {
+            let len = HISTORY + rng.below(100);
+            let w: Vec<f32> = (0..len).map(|_| rng.unit() * 3.0).collect();
+            let mut want = vec![0.0f32; len - HISTORY];
+            phase_peaks(Path::Scalar, &w, &mut want);
+            for path in paths("true_peak_bit_exact_vs_scalar") {
+                let mut got = vec![0.0f32; len - HISTORY];
+                phase_peaks(path, &w, &mut got);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(&want), "{path:?}");
+            }
+            let (peak, _) = peak_scalar(&w, 0);
+            assert_eq!(want.iter().fold(0.0f32, |m, &v| m.max(v)), peak);
+        }
+        let gain = COEFFICIENTS
+            .iter()
+            .map(|h| h.iter().map(|c| c.abs()).sum::<f32>())
+            .fold(0.0f32, f32::max);
+        assert!(gain < 2.03 && gain > 2.0, "{gain}");
     }
 
     /// Every path gives the same bits as the scalar one, for any split of
