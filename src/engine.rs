@@ -20,7 +20,8 @@ use samplez_dsp::duck::{DEPTH_DB, MAX_KEYS};
 use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{DuckParam, MAX_DUCKS, Matrix, PlanarBuffer, Started, StripParam};
 use samplez_mxl::input::{
-    Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, Recovery, Timing,
+    Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, RECOVERY_NS, Recovery,
+    Timing,
 };
 use samplez_mxl::lookup::{self, Found, Gate};
 use samplez_mxl::output::{self, Creation};
@@ -2542,6 +2543,7 @@ impl Engine {
             gens.push(Some(Box::new(Gen {
                 mxl: g,
                 prune_after: vec![u64::MAX; slots.len()],
+                prune_late: vec![u64::MAX; slots.len()],
                 rerouted: 0,
             })));
         }
@@ -3256,19 +3258,28 @@ struct Supervisor {
     stop: Arc<AtomicBool>,
 }
 
-/// Samples an input's blocks may stay late, its head frozen or not,
-/// before the slot is pruned: `pruneAfterBlocks` blocks, or twice the
-/// producer's `maxCommitBatchSizeHint` plus the margin when that is
-/// longer.
+/// Samples an input's blocks may stay late with its head frozen before
+/// the slot is pruned: `pruneAfterBlocks` blocks, or twice the producer's
+/// `maxCommitBatchSizeHint` plus the margin when that is longer.
 fn prune_limit(config: &Config, timing: &Timing, hint: u64) -> u64 {
     (u64::from(config.prune_after_blocks) * timing.block).max(2 * hint + timing.margin)
 }
 
-/// Whether `head`, polled at clock index `at`, is near enough the clock
-/// for an input's blocks to be read on time: behind it by no more than the
-/// reader margin less the input's offset.
-fn within_reach(head: u64, at: u64, margin: u64, offset: i64) -> bool {
-    i128::from(head) + i128::from(margin) >= i128::from(at) + i128::from(offset)
+/// Samples an input's blocks may stay late with its head moving before
+/// the slot is pruned: the frozen-head `limit`, and no less than the
+/// [`RECOVERY_NS`] a pruned input takes to come back: a lag shorter than
+/// that is silenced while it lasts rather than for a recovery on top.
+fn late_prune_limit(config: &Config, limit: u64) -> u64 {
+    limit.max(RECOVERY_NS * u64::from(config.sample_rate) / 1_000_000_000)
+}
+
+/// Whether `head`, polled at clock index `at`, holds the newest block of
+/// `block` samples due by then with reader margin `margin`, the block's
+/// range shifted by the input's `offset`: whether that block, read now,
+/// would have been on time.
+fn within_reach(head: u64, at: u64, block: u64, margin: u64, offset: i64) -> bool {
+    let due = at.saturating_sub(margin) / block * block;
+    i128::from(head) >= i128::from(due) + i128::from(offset)
 }
 
 fn log(message: std::fmt::Arguments) {
@@ -3475,9 +3486,10 @@ impl Supervisor {
                 Telemetry::Prune {
                     slot,
                     invalid,
+                    frozen,
                     head,
                     end,
-                } => self.prune(slot, invalid, head, end),
+                } => self.prune(slot, invalid, frozen, head, end),
                 Telemetry::Stats { slot, stats } => self.stats(slot, stats),
                 Telemetry::ClockStep {
                     delta_ns,
@@ -3556,15 +3568,17 @@ impl Supervisor {
             .expect("every input's domain is an input domain")
     }
 
-    fn prune(&mut self, slot: usize, invalid: bool, head: u64, end: u64) {
+    fn prune(&mut self, slot: usize, invalid: bool, frozen: bool, head: u64, end: u64) {
         if !matches!(self.slots[slot].state, SupState::Attached) {
             return;
         }
         let name = &self.config.inputs[slot].name;
         let why = if invalid {
             "flow invalid"
+        } else if frozen {
+            "head frozen"
         } else {
-            "blocks late for the prune limit"
+            "blocks late with the head moving"
         };
         log(format_args!(
             "input {name} pruned: {why} at head {head}, block end {end}"
@@ -3696,11 +3710,15 @@ impl Supervisor {
             };
             let (head, limit) = (polled.map(|p| p.0), polled.map_or(0, |p| p.1));
             let offset = self.config.inputs[slot].offset_samples;
-            // An advancing head behind the reach of its blocks would be late
-            // on every one of them and pruned again.
-            if !r.update(&self.api, head, now, limit)
-                || !head.is_some_and(|h| within_reach(h, at, self.timing.margin, offset))
-            {
+            // The head must be in reach at every poll of the recovery
+            // period, not only at its end: one that only touches it, as a
+            // head hovering at the margin does, would be late again and
+            // pruned again.
+            let reach = |h| within_reach(h, at, self.timing.block, self.timing.margin, offset);
+            if !head.is_some_and(reach) {
+                *r = Recovery::default();
+            }
+            if !head.is_some_and(reach) || !r.update(&self.api, head, now, limit) {
                 s.reported = false;
             } else if s.up {
                 // Up in the log, so it is read again at once: the blocks
@@ -3772,6 +3790,7 @@ impl Supervisor {
         self.rebuild_errors[d] = None;
         let produced = self.counters.produced.load(Acquire);
         let mut prune_after = vec![u64::MAX; n];
+        let mut prune_late = vec![u64::MAX; n];
         let mut held = 0u64;
         // The slots a product state moved to another flow, for the
         // domain's own generation only: a job's crossfades from its index.
@@ -3847,6 +3866,7 @@ impl Supervisor {
                         .and_then(|i| i.reader().config().ok())
                         .map_or(0, |c| u64::from(c.common.maxCommitBatchSizeHint));
                     prune_after[slot] = prune_limit(&self.config, &self.timing, hint);
+                    prune_late[slot] = late_prune_limit(&self.config, prune_after[slot]);
                     if let Some(needed) = short {
                         log(format_args!(
                             "input {}: readerMarginSamples {} is below the {needed} its \
@@ -3890,6 +3910,7 @@ impl Supervisor {
         let generation = Box::new(Gen {
             mxl: generation,
             prune_after,
+            prune_late,
             rerouted,
         });
         Some((generation, held))
@@ -4675,21 +4696,40 @@ mod tests {
             .collect()
     }
 
-    /// A head is in reach while it trails the clock by no more than the
-    /// margin less the offset: a positive offset reads later samples and
-    /// needs a head that far nearer, a negative one allows it that much
-    /// further behind.
+    /// A head is in reach when it holds the newest block due, whose end
+    /// lies the margin and up to a block short of it behind the clock: a
+    /// positive offset reads later samples and needs a head that far
+    /// further on, a negative one allows it that much less.
     #[test]
-    fn a_head_is_in_reach_within_the_margin_less_the_offset() {
-        let at = 86_162_973_537_635;
-        assert!(within_reach(at - 960, at, 960, 0));
-        assert!(!within_reach(at - 961, at, 960, 0));
-        assert!(within_reach(at - 860, at, 960, 100));
-        assert!(!within_reach(at - 861, at, 960, 100));
-        assert!(within_reach(at - 1060, at, 960, -100));
-        assert!(!within_reach(at - 1061, at, 960, -100));
+    fn a_head_is_in_reach_once_it_holds_the_newest_block_due() {
+        let (block, margin) = (48, 960);
+        // 20 samples past the deadline of the block ending at `due`.
+        let due = 1_795_061_948 * block;
+        let at = due + margin + 20;
+        assert!(within_reach(due, at, block, margin, 0));
+        assert!(!within_reach(due - 1, at, block, margin, 0));
+        // At its deadline the block is due; one sample before, it is not.
+        assert!(within_reach(due, due + margin, block, margin, 0));
+        assert!(within_reach(
+            due - block,
+            due + margin - 1,
+            block,
+            margin,
+            0
+        ));
+        assert!(!within_reach(
+            due - block - 1,
+            due + margin - 1,
+            block,
+            margin,
+            0
+        ));
+        assert!(within_reach(due + 100, at, block, margin, 100));
+        assert!(!within_reach(due + 99, at, block, margin, 100));
+        assert!(within_reach(due - 100, at, block, margin, -100));
+        assert!(!within_reach(due - 101, at, block, margin, -100));
         // A head 36.96 s behind, stamped on UTC rather than TAI.
-        assert!(!within_reach(at - 1_774_242, at, 960, 0));
+        assert!(!within_reach(at - 1_774_242, at, block, margin, 0));
     }
 
     /// The margin warning names what the late blocks need, never an
@@ -7075,6 +7115,7 @@ mod tests {
             Box::new(Gen {
                 mxl: Generation::new(&e.api, &domain, 1).unwrap(),
                 prune_after: vec![u64::MAX],
+                prune_late: vec![u64::MAX],
                 rerouted: Default::default(),
             })
         };

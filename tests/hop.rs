@@ -2,7 +2,7 @@
 //! two replicas, a chain of three, a killed and restarted producer, an
 //! input offset, two inputs with one pruned, a late producer, a flow
 //! whose first commit comes after its input was pruned, a producer a
-//! second behind the clock, a vanished
+//! second behind the clock and one half a block past the margin, a vanished
 //! domain, a foreign writer on the output and the `samplez-hop` binary.
 //! Runs without the test harness, one scenario at a time so their timing
 //! does not interfere, and re-executes itself as a producer process that
@@ -65,6 +65,10 @@ fn main() {
         (
             "input_advancing_a_second_behind_the_clock_is_pruned_for_good",
             behind_the_clock,
+        ),
+        (
+            "input_half_a_block_past_the_margin_is_pruned_once",
+            past_the_margin,
         ),
         (
             "input_whose_domain_vanished_is_re_added_once_it_is_back",
@@ -756,14 +760,27 @@ fn head_zero_at_attach() {
 
 /// The producer commits at the nominal rate a second behind the clock, as
 /// one that stamps its indices on another clock does: every block is late
-/// and the head never freezes. The input is pruned and goes down, so that
-/// its late reads stop degrading every block, and is not re-added or
-/// raised while its head stays out of reach, which would prune it again a
-/// prune limit later.
+/// and the head never freezes.
 fn behind_the_clock() {
+    pruned_for_good(48_000);
+}
+
+/// The producer commits half a block past the margin: every block is late
+/// at its deadline, while a poll finds the newest block due held about
+/// half the time. The input is pruned once and not re-added, which would
+/// have it late again and pruned again a second later.
+fn past_the_margin() {
+    pruned_for_good(MARGIN + B / 2);
+}
+
+/// A producer committing `delay` samples behind the clock: the input is
+/// pruned with its head moving and goes down, so that its late reads stop
+/// degrading every block, and is neither re-added nor raised for twice
+/// the recovery period and the prune limit after it.
+fn pruned_for_good(delay: u64) {
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
-    let _pilot = Pilot::start(&domain.0, &src, 1, B, 48_000);
+    let _pilot = Pilot::start(&domain.0, &src, 1, B, delay);
     let cfg = config(
         &domain.0,
         &[(&src, 1)],
@@ -780,7 +797,6 @@ fn behind_the_clock() {
     // Down in the log: a down slot's unread blocks degrade no digest.
     let up = || engine.status().inputs[0].up;
     wait_for(SECOND, "input down", || !up());
-    // Twice the recovery period, and the prune limit after it.
     let t = Instant::now();
     while t.elapsed() < 3 * SECOND {
         assert_eq!(

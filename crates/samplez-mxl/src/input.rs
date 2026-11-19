@@ -817,7 +817,7 @@ impl Input {
     /// waits for a missing name blocks for that wait once the flow is
     /// deleted.
     #[deprecated(
-        note = "the engine prunes a frozen input and checks its flow on the supervisor side"
+        note = "the engine prunes a late input and checks its flow on the supervisor side"
     )]
     #[allow(deprecated, reason = "FROZEN_PROBE_BLOCKS goes with this probe")]
     pub fn identify(&self, state: &mut SlotState, group: &GroupWait, outcome: Outcome) -> bool {

@@ -14,12 +14,23 @@ use common::{B, Domain, MARGIN, Pilot, new_id, pilot, read_blocks, wait_for};
 use samplez::blocks::{
     BlockStatus, Cause, HEALTHY, Kind, PAGE, Range, StatusChange, degraded_digest,
 };
-use samplez::{Config, Engine, Entry, InputState, Replication};
+use samplez::{Config, Engine, Entry, InputState, Replication, Report};
 use samplez_mxl::input::{Generation, InputConfig, Timing};
 
 /// A replicated engine of two voters, one input through gain 1 to one
 /// output, with its status changes.
 fn start(domain: &Domain, src: &str, out: &str, hold_ms: u32) -> (Engine, Receiver<StatusChange>) {
+    let (e, statuses, _reports) = start_reporting(domain, src, out, hold_ms);
+    (e, statuses)
+}
+
+/// [`start`], with the reports the engine makes for the log.
+fn start_reporting(
+    domain: &Domain,
+    src: &str,
+    out: &str,
+    hold_ms: u32,
+) -> (Engine, Receiver<StatusChange>, Receiver<Report>) {
     // `hold_ms` 0: the default, and the input is not waited for.
     let attached = hold_ms > 0;
     let hold_ms = if attached { hold_ms } else { 10 };
@@ -36,7 +47,7 @@ fn start(domain: &Domain, src: &str, out: &str, hold_ms: u32) -> (Engine, Receiv
         "rt": { "rtCpu": "none" },
     });
     let config = Config::parse(&v.to_string()).unwrap();
-    let (report_tx, _reports) = std::sync::mpsc::sync_channel(64);
+    let (report_tx, reports) = std::sync::mpsc::sync_channel(64);
     let (status_tx, statuses) = std::sync::mpsc::sync_channel(1 << 20);
     let process = samplez::rt::setup_process(&config.rt);
     let replication = Replication {
@@ -54,7 +65,7 @@ fn start(domain: &Domain, src: &str, out: &str, hold_ms: u32) -> (Engine, Receiv
     wait_for(Duration::from_secs(5), "output realised", || {
         e.status().outputs[0].realised
     });
-    (e, statuses)
+    (e, statuses, reports)
 }
 
 /// What disturbed one run of a scenario, read from its engine when the
@@ -426,6 +437,54 @@ fn an_input_not_read_degrades_its_blocks() {
             assert_eq!(st.digest, Some(degraded_digest(&[], 1, 0)));
         }
         assert_eq!(head(&domain, &out), 0);
+    });
+}
+
+/// An input whose head advances a second behind the clock is late on
+/// every block, so every block is degraded and held. The engine reports it
+/// pruned after a second, and once the log takes it down the blocks are
+/// healthy again.
+#[test]
+fn a_late_input_taken_down_degrades_no_block_after_it() {
+    undisturbed(|w| {
+        let domain = Domain::new();
+        let (src, out) = (new_id(), new_id());
+        let _pilot = Pilot::start(&domain.0, &src, 1, B, 48_000);
+        let started = Instant::now();
+        let (e, _changes, reports) = start_reporting(&domain, &src, &out, 10);
+        let _guard = w.guard(&e, false);
+        e.set_fence(u64::MAX).unwrap();
+        let from = processed(&e) + 2;
+        e.commit_from(0, from).unwrap();
+        // Evidence for every held block, so none overflows the ring.
+        let through = |e: &Engine| commit_through(e, from..processed(e), &[]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let late = loop {
+            through(&e);
+            if let Ok(Report::InputPruned { slot: 0 }) = reports.try_recv() {
+                // A moving head is given a second, not the frozen limit.
+                assert!(started.elapsed() >= Duration::from_secs(1));
+                break processed(&e) - 2;
+            }
+            assert!(Instant::now() < deadline, "the late input not pruned");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let degraded = Some(degraded_digest(&[], 1, 0));
+        assert_eq!(e.block_status(0, late).and_then(|s| s.digest), degraded);
+
+        let down = (processed(&e) + 50) * B;
+        e.append(1, down, Entry::InputDown { slot: 0 }).unwrap();
+        e.commit(1);
+        while processed(&e) <= down / B + 20 {
+            through(&e);
+            assert!(Instant::now() < deadline, "the input not taken down");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!e.status().inputs[0].up);
+        for k in down / B..down / B + 20 {
+            let st = e.block_status(0, k).unwrap();
+            assert_eq!(st.digest, Some(HEALTHY), "block {k}: {st:?}");
+        }
     });
 }
 
