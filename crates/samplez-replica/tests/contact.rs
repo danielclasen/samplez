@@ -339,3 +339,36 @@ async fn a_quiescing_leader_waits_for_every_voter_heard_to_report_the_commit() {
     set.replica(leader).quiesce(bound).await;
     assert!(started.elapsed() < bound);
 }
+
+/// A product reading its state through `with_state` and asking for the
+/// replica's readiness from inside the closure, while the contact loop
+/// ticks: each tick holds the contact lock and reads the store. With the
+/// closure under the lock the tick waits for, the two wait for each
+/// other for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_with_state_closure_asks_for_readiness_while_contact_ticks() {
+    use samplez_service::ReplicatedState;
+    let set = start().await;
+    let replica = set.replica(0).clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !replica.replica().ready {
+        assert!(std::time::Instant::now() < deadline, "never ready");
+        sleep(Duration::from_millis(10)).await;
+    }
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for _ in 0..20 {
+            let ready = replica.store().with_state(|_| {
+                // Long enough for a tick to wait for the store while it
+                // holds the contact lock.
+                std::thread::sleep(Duration::from_millis(20));
+                replica.replica().ready
+            });
+            assert!(ready);
+        }
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the closure and the contact loop deadlocked");
+}

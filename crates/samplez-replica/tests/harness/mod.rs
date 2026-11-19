@@ -1180,7 +1180,7 @@ trait Handles: Send + Sync {
     fn handle(&self, to: Option<NodeId>, request: PeerRequest) -> BoxFuture<'_, PeerReply>;
 }
 
-impl<P: Product + Sync> Handles for Replica<P> {
+impl<P: Product> Handles for Replica<P> {
     fn handle(&self, to: Option<NodeId>, request: PeerRequest) -> BoxFuture<'_, PeerReply> {
         Box::pin(Replica::handle(self, to, request))
     }
@@ -1659,7 +1659,7 @@ impl Default for Options {
     }
 }
 
-pub struct Set<P: Product + Sync = Paths> {
+pub struct Set<P: Product = Paths> {
     options: Options,
     /// Builds a replica's product from its configuration hash.
     product: Arc<dyn Fn(u64) -> P + Send + Sync>,
@@ -1693,7 +1693,7 @@ impl Set {
     }
 }
 
-impl<P: Product + Sync> Set<P> {
+impl<P: Product> Set<P> {
     /// Starts `options.voters` replicas of the products `product` builds
     /// from a configuration hash and initializes them as one set.
     pub async fn start_with(
@@ -2074,7 +2074,7 @@ pub async fn until_wall(deadline: std::time::Instant, what: &str, mut check: imp
     }
 }
 
-impl<P: Product + Sync> Drop for Set<P> {
+impl<P: Product> Drop for Set<P> {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }

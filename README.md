@@ -545,8 +545,8 @@ state on the runtime's blocking pool (at most 4 threads) and answer 503
 with a body naming the timeout when the read has not returned within 1 s,
 so neither can hold up `/healthz`.
 
-The replica's `Contact` and log `Store` locks record their holder; no
-other lock is watched. A watchdog thread, started with the first replica,
+The replica's `Contact` lock, the log `Store` lock and the store's
+state gate record their holder; no other lock is watched. A watchdog thread, started with the first replica,
 checks them every second. When one has been held for more than 10 s, it
 writes the lock's name, the holder's thread, how long it has held it and
 the call site (file, line, column) where it took it, and every thread
@@ -566,6 +566,19 @@ the store's lock exists, so a restart over a long log with no snapshot
 is not watched. What runs under the locks is in-memory work: applying a
 batch of entries, encoding a snapshot's state and the contact's report
 handling, each bounded by the state or batch size.
+
+The contact loop holds the `Contact` lock while it reads the store, so
+no code may hold a store lock and wait for `Contact`. The applied state
+has a read-write lock of its own beside the log's. `Store::with_state`
+and `Store::view` take the state gate before it, as every apply and
+snapshot install does, so while a product's closure runs no apply waits
+for the state and the contact loop's reads of it go on: the closure may
+call `Replica` methods, `ReplicatedState::replica` included, and read
+the store again. `Product` is `Sync` because those reads run beside it.
+`Product` methods run under the store's locks, as do the closures the
+store's other reads (`pending`, `records`, `entries_after`) take; there
+a call into the `Replica` or the `Store` panics, naming the lock, rather
+than deadlock.
 
 ### Starting a replica
 

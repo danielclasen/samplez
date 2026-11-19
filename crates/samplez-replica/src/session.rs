@@ -72,7 +72,7 @@ pub(crate) async fn expire<P: Product>(
             continue;
         };
         let now = crate::entry::stamping_index(e, shared.settings.block);
-        let due = store.with_state(|sm| expired(&sm.leases, now));
+        let due = store.read_state(|_, sm| expired(&sm.leases, now));
         let at = Instant::now();
         let timeout = shared.settings.write_timeout;
         sent.retain(|session, (renewed, appended)| {

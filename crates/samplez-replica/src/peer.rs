@@ -154,7 +154,7 @@ pub trait PeerClient: Send + Sync + 'static {
 /// The peer listener's routes: `POST /raft/<node id>/{append,vote,snapshot}`
 /// and `POST /peer/<node id or any>`. A request for another node id gets
 /// 404, which the sender takes as unreachable.
-pub fn router<P: Product + Sync>(replica: Arc<Replica<P>>) -> Router {
+pub fn router<P: Product>(replica: Arc<Replica<P>>) -> Router {
     Router::new()
         .route("/raft/{to}/{rpc}", post(raft::<P>))
         .route("/peer/{to}", post(peer::<P>))
@@ -165,7 +165,7 @@ pub fn router<P: Product + Sync>(replica: Arc<Replica<P>>) -> Router {
 /// Serves [`router`] on `tcp` with mutual TLS, re-reading the certificate,
 /// key and CA every [`SECRET_RELOAD_PERIOD`], until `shutdown` resolves;
 /// then closes every connection once its request in progress is answered.
-pub async fn serve<P: Product + Sync>(
+pub async fn serve<P: Product>(
     tls: Arc<PeerTls>,
     tcp: TcpListener,
     replica: Arc<Replica<P>>,
@@ -192,7 +192,7 @@ fn json<T: Serialize>(value: &T) -> Response {
     (StatusCode::OK, serde_json::to_vec(value).expect("encodes")).into_response()
 }
 
-async fn raft<P: Product + Sync>(
+async fn raft<P: Product>(
     State(replica): State<Arc<Replica<P>>>,
     Path((to, rpc)): Path<(NodeId, String)>,
     body: Bytes,
@@ -257,7 +257,7 @@ async fn raft<P: Product + Sync>(
     }
 }
 
-async fn peer<P: Product + Sync>(
+async fn peer<P: Product>(
     State(replica): State<Arc<Replica<P>>>,
     Path(to): Path<String>,
     body: Bytes,

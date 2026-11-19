@@ -29,7 +29,7 @@ use crate::resync::{CoreReply, Missed, Resynced, Source};
 use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
 use crate::state::{Life, PageBook, ReplicaState, Seen, View};
-use crate::state_machine::{Product, Record, StateMachine};
+use crate::state_machine::{Product, Record};
 use crate::withhold::Withhold;
 
 /// The engine's sample rate (plan 2.3).
@@ -453,7 +453,7 @@ impl<P: Product> LogView for Store<P> {
         Store::floor_before(self, index)
     }
     fn applied_floor(&self) -> (u64, u64) {
-        self.view(|n, sm| (n, sm.floor))
+        self.read_state(|n, sm| (n, sm.floor))
     }
     fn pending_above(&self, floor: u64) -> usize {
         Store::pending_above(self, floor)
@@ -465,10 +465,10 @@ impl<P: Product> LogView for Store<P> {
         Store::restamps(self, index)
     }
     fn pending_generation(&self) -> Option<u64> {
-        self.with_state(StateMachine::pending_generation)
+        self.read_state(|_, sm| sm.pending_generation())
     }
     fn judged(&self) -> BTreeSet<NodeId> {
-        self.with_state(|sm| {
+        self.read_state(|_, sm| {
             sm.verdicts
                 .iter()
                 .filter(|&(_, &judged)| judged)
@@ -477,13 +477,13 @@ impl<P: Product> LogView for Store<P> {
         })
     }
     fn latest_judged(&self) -> Option<NodeId> {
-        self.with_state(|sm| sm.latest_judged)
+        self.read_state(|_, sm| sm.latest_judged)
     }
     fn baseline(&self) -> Option<Baseline> {
-        self.with_state(|sm| sm.baseline.clone())
+        self.read_state(|_, sm| sm.baseline.clone())
     }
     fn disrupting(&self) -> Option<NodeId> {
-        self.with_state(|sm| sm.slot.as_ref().map(|d| d.node))
+        self.read_state(|_, sm| sm.slot.as_ref().map(|d| d.node))
     }
 }
 
@@ -1123,6 +1123,7 @@ impl Contact {
 
     #[track_caller]
     fn lock(&self) -> WatchedGuard<'_, State> {
+        crate::lock_watch::assert_no_product_code("contact");
         self.state.lock()
     }
 
@@ -1417,6 +1418,7 @@ impl Contact {
                 self.begin_restart(st, applied);
             }
             if let Some(r) = &st.rollout {
+                let _product = crate::lock_watch::ProductCode::enter();
                 st.own.key = Some(r.key());
                 st.own.revision = r.revision();
             }
@@ -2794,7 +2796,10 @@ impl Contact {
             .collect();
         let counted = self.counted(st, now);
         let baseline = self.log.baseline();
-        let target = st.rollout.as_ref().and_then(|r| r.target());
+        let target = st.rollout.as_ref().and_then(|r| {
+            let _product = crate::lock_watch::ProductCode::enter();
+            r.target()
+        });
         let ms = Duration::from_millis(1).as_nanos() as u64;
         let q = |h: &Histogram| h.quantile(0.9999);
         let delta = st

@@ -13,7 +13,15 @@ use crate::snapshot::Replicated;
 /// The product's state, applied in log order on every replica. A
 /// snapshot install loads into an empty one its [`Factory`] builds, with
 /// the replica's configuration, before it replaces the state.
-pub trait Product: Send + 'static {
+///
+/// The store calls these methods under its own locks, as it applies an
+/// entry, builds a snapshot or reads the state for the replica's contact
+/// loop, which holds the contact lock meanwhile. None of them may call
+/// back into the [`crate::Replica`] or its [`crate::log_store::Store`]:
+/// the call panics rather than deadlock. Code the product runs inside
+/// [`crate::log_store::Store::with_state`] may. `Sync`, because the
+/// contact loop reads the state beside such a closure.
+pub trait Product: Send + Sync + 'static {
     /// What one command or expiry changed, as [`Product::delta`] gets it
     /// back.
     type Change;

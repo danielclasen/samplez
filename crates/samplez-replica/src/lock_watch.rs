@@ -266,6 +266,45 @@ pub fn start_watchdog(limit: Duration) {
     );
 }
 
+/// Marks the current thread as running product code under a replica
+/// lock ([`crate::state_machine::Product`] calls, and the closures
+/// [`crate::log_store::Store`] runs under its locks) while it lives.
+/// Taking the store or contact lock then panics
+/// ([`assert_no_product_code`]): a product that calls back into the
+/// replica from there would deadlock against the contact loop, which
+/// holds the contact lock and waits for the store.
+pub(crate) struct ProductCode(());
+
+thread_local! {
+    static PRODUCT_CODE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+impl ProductCode {
+    pub(crate) fn enter() -> ProductCode {
+        PRODUCT_CODE.with(|n| n.set(n.get() + 1));
+        ProductCode(())
+    }
+}
+
+impl Drop for ProductCode {
+    fn drop(&mut self) {
+        PRODUCT_CODE.with(|n| n.set(n.get() - 1));
+    }
+}
+
+/// Panics when the current thread runs product code under a replica lock
+/// ([`ProductCode`]): taking the `name` lock from there could deadlock.
+#[track_caller]
+pub(crate) fn assert_no_product_code(name: &str) {
+    if PRODUCT_CODE.with(std::cell::Cell::get) > 0 {
+        panic!(
+            "the {name} lock taken from product code the replica runs under its own \
+             lock: a Product method, or a closure given to a Store read other than \
+             with_state or view, must not call back into the Replica or its Store"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

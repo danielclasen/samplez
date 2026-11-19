@@ -518,7 +518,7 @@ impl<P: Product> Replica<P> {
                 let store = store.clone();
                 Box::new(move |command: &Command| {
                     P::DRIVES_ENGINE
-                        && store.with_state(|sm| {
+                        && store.read_state(|_, sm| {
                             !sm.product
                                 .reroutes(&command.origin, &command.body)
                                 .is_empty()
@@ -528,7 +528,7 @@ impl<P: Product> Replica<P> {
             rerouted: {
                 let store = store.clone();
                 Box::new(move |index, pending| {
-                    store.with_state(|sm| {
+                    store.read_state(|_, sm| {
                         sm.derived
                             .get(&index)
                             .is_some_and(|slots| !slots.is_empty())
@@ -539,7 +539,7 @@ impl<P: Product> Replica<P> {
             },
             protocol: {
                 let store = store.clone();
-                Box::new(move || store.with_state(|sm| sm.protocol))
+                Box::new(move || store.read_state(|_, sm| sm.protocol))
             },
             raft,
             peers,
@@ -550,7 +550,7 @@ impl<P: Product> Replica<P> {
             marking: AtomicBool::new(false),
             revision: {
                 let store = store.clone();
-                Box::new(move || store.with_state(|sm| sm.revision))
+                Box::new(move || store.read_state(|_, sm| sm.revision))
             },
             epoch: AtomicU64::new(settings_epoch),
             counted: AtomicBool::new(false),
@@ -1554,7 +1554,7 @@ fn resolution_of(resolution: entry::Resolution) -> Resolution {
     }
 }
 
-impl<P: Product + Sync> ReplicatedState for Replica<P> {
+impl<P: Product> ReplicatedState for Replica<P> {
     /// `ready` once the replica has joined a set, a committed id saved on
     /// its volume, and applied the log up to that id, which after a
     /// restart is the saved one; it stays set. An empty volume is not
