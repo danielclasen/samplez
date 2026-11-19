@@ -3131,6 +3131,18 @@ impl Rt {
             self.retire(b);
         }
         self.mix.due.clear();
+        // A generation held for an entry the core folded in is dropped
+        // once the entries due at the install applied: nothing would
+        // apply it, and while it stayed it refused every later replayed
+        // core and held the supervisor's job.
+        if let Some((id, _, _)) = self.pending_gen.as_ref()
+            && *id <= last_id
+            && c.pending_gen != Some(*id)
+            && !self.mix.holds(*id)
+            && let Some((id, _, g)) = self.pending_gen.take()
+        {
+            self.gen_unused(id, g);
+        }
     }
 
     /// Installs a replayed core whose last block is the one before
