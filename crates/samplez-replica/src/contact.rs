@@ -721,6 +721,9 @@ struct State {
     /// The audio `/readyz` term, as of the last period in contact; none
     /// before the first.
     serving: Option<bool>,
+    /// Since when a resync check found an input on another flow than the
+    /// applied state names ([`Audio::follows`]).
+    off_flows_since: Option<Instant>,
     /// `Diverged` verdicts naming this replica, by log index and page,
     /// until their commit is known.
     verdicts: Vec<(u64, u64)>,
@@ -1006,6 +1009,7 @@ impl Contact {
                 verified_always: false,
                 decider: crate::decide::Decider::default(),
                 serving: None,
+                off_flows_since: None,
                 verdicts: Vec::new(),
                 realised: Vec::new(),
                 enabled: Vec::new(),
@@ -1788,8 +1792,9 @@ impl Contact {
         // On a replica committing nothing, an entry held unresolved that
         // the state the core was built from applied is in the core:
         // rebuilt past, as one taken late while catching up. Held again it
-        // could stay unresolved for good, as the log decides only an entry
-        // that does not stand. A replica about to commit, such as one retargeted
+        // could stay unresolved for good: the log decides an entry that
+        // stands only when the baseline or every live replica held it
+        // unresolved. A replica about to commit, such as one retargeted
         // from `version_mismatch`, holds it again, as its peers do.
         let rebuilds = Self::commits_nothing(st);
         let past: Vec<Key> = (st.given.keys())
@@ -1936,9 +1941,10 @@ impl Contact {
         // An entry held unresolved that applied and derived no record
         // changes no engine state: it is released, here as on a replica
         // that applied it in time, rather than held until a decision the
-        // log appends only for an entry that does not stand. Should one
-        // come after all, the entry is rebuilt past, so the decision
-        // neither resolves nor contradicts this replica.
+        // log appends for an entry that stands only when the baseline or
+        // every live replica held it unresolved. Should one come, the entry
+        // is rebuilt past, so the decision neither resolves nor
+        // contradicts this replica.
         let derived: BTreeSet<u64> = records.iter().map(|(index, _)| *index).collect();
         let empty: Vec<Key> = (st.given.keys())
             .filter(|&&(index, term, node)| {
@@ -3135,11 +3141,29 @@ impl Contact {
         // inputs. The engine is rebuilt from product state instead, which
         // moves the input; a page that still differs then resyncs.
         // Checked as often as an attempt would start.
+        // A route committed with its index still inside the lead reads as
+        // another flow until its block is computed: rebuilt only once the
+        // mismatch outlasts the longest lead an entry is stamped with.
         let state = st.resync.due(now).then(|| self.log.product_state().2);
-        if let (Some(audio), Some(state)) = (&self.audio, &state)
-            && !state.flows.is_empty()
-            && !audio.follows(state)
+        let off = match (&self.audio, &state) {
+            (Some(audio), Some(state)) if !state.flows.is_empty() => !audio.follows(state),
+            (_, Some(_)) => false,
+            (_, None) => st.off_flows_since.is_some(),
+        };
+        let lead = self.timing.max_apply_lead + crate::schedule::EXTRA_LEAD;
+        let since = if off {
+            *st.off_flows_since.get_or_insert(now)
+        } else {
+            now
+        };
+        if !off {
+            st.off_flows_since = None;
+        }
+        if let Some(state) = &state
+            && off
+            && since + lead <= now
         {
+            st.off_flows_since = None;
             st.resync.rebuilt(now);
             tracing::warn!(
                 flows = ?state.flows,
@@ -3587,6 +3611,8 @@ mod tests {
         apply_after_read: Option<(u64, u64)>,
         /// [`LogView::baseline`].
         baseline: Option<Baseline>,
+        /// The flows of [`LogView::product_state`].
+        flows: Vec<Option<String>>,
     }
 
     #[derive(Default)]
@@ -3713,7 +3739,7 @@ mod tests {
             let state = ProductState {
                 gains: Vec::new(),
                 up: Vec::new(),
-                flows: Vec::new(),
+                flows: log.flows.clone(),
                 outputs: Vec::new(),
                 strips: Vec::new(),
                 ducks: Vec::new(),
@@ -3755,6 +3781,8 @@ mod tests {
         disabled: AtomicU64,
         /// The build time it reports, in samples; none at 0.
         build_time: AtomicU64,
+        /// [`Audio::follows`].
+        follows: std::sync::atomic::AtomicBool,
     }
 
     impl Engine {
@@ -3828,6 +3856,9 @@ mod tests {
                 self.rebuilt_with.lock().unwrap().push(call);
             }
             ok
+        }
+        fn follows(&self, _state: &ProductState) -> bool {
+            self.follows.load(Ordering::SeqCst)
         }
         fn committed(&self, up_to: u64) {
             self.calls
@@ -3909,6 +3940,7 @@ mod tests {
             second: std::sync::atomic::AtomicBool::new(false),
             disabled: AtomicU64::new(0),
             build_time: AtomicU64::new(0),
+            follows: std::sync::atomic::AtomicBool::new(true),
         });
         let contact = Contact::new(
             1,
@@ -4854,6 +4886,49 @@ mod tests {
             "given to the new core again: {calls:?}"
         );
         assert_eq!(f.contact.lock().given.len(), 1);
+    }
+
+    /// A diverged replica whose input reads another flow than its applied
+    /// state names, as one does while a committed re-route waits for its
+    /// block inside the lead, resyncs as usual; it is rebuilt from product
+    /// state instead only once the mismatch outlasts the longest lead.
+    #[tokio::test(start_paused = true)]
+    async fn a_flow_mismatch_rebuilds_only_once_it_outlasts_the_lead() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.log.0.lock().unwrap().flows = vec![Some("a".to_owned())];
+        diverge(&f);
+        f.engine.follows.store(false, Ordering::SeqCst);
+        let committing = |f: &Fixture| {
+            f.contact
+                .receive(state_report(f, 2, ReplicaState::Committing, Duration::ZERO));
+        };
+        committing(&f);
+        let rebuilt = |f: &Fixture| f.contact.metrics().resync.rebuilt_for_flows;
+        assert!(f.contact.resync_due().is_some(), "resynced at first");
+        assert_eq!(rebuilt(&f), 0);
+        let lead = Timing::defaults(B).max_apply_lead + crate::schedule::EXTRA_LEAD;
+        let wait = |f: &Fixture| f.contact.metrics().resync.backoff;
+        let failed = |f: &Fixture, epoch| {
+            f.contact
+                .resync_ended(epoch, 2, Err("a replayed page differs".into()));
+        };
+        failed(&f, 1);
+        let first = wait(&f);
+        assert!(first < lead, "{first:?}");
+        tokio::time::advance(first).await;
+        f.clock.add(first);
+        committing(&f);
+        assert!(f.contact.resync_due().is_some(), "within the lead");
+        assert_eq!(rebuilt(&f), 0);
+        failed(&f, 2);
+        let second = wait(&f);
+        assert!(first + second >= lead);
+        tokio::time::advance(second).await;
+        f.clock.add(second);
+        committing(&f);
+        assert_eq!(f.contact.resync_due(), None, "rebuilt instead");
+        assert_eq!(rebuilt(&f), 1);
     }
 
     /// A replica catching up past entries' deadlines is rebuilt past them

@@ -281,8 +281,12 @@ impl EngineAudio {
     /// A replica rebuilt from it holds what a live one that read the same
     /// flows holds, flows, strips, gains and ducks alike.
     fn sanitised(&self, state: &ProductState) -> ProductState {
+        self.sanitised_with(state, &self.reading())
+    }
+
+    /// [`EngineAudio::sanitised`] against inputs reading `reading`.
+    fn sanitised_with(&self, state: &ProductState, reading: &[Option<String>]) -> ProductState {
         let mut state = state.clone();
-        let reading = self.reading();
         let routes: Vec<Entry> = (state.flows.iter().enumerate())
             .filter(|&(slot, flow)| reading.get(slot).is_some_and(|r| r != flow))
             .map(|(slot, flow)| match flow {
@@ -601,7 +605,8 @@ impl Audio for EngineAudio {
     }
 
     fn follows(&self, state: &ProductState) -> bool {
-        self.sanitised(state).flows == self.reading()
+        let reading = self.reading();
+        self.sanitised_with(state, &reading).flows == reading
     }
 
     fn copy_core(&self) -> Option<CoreReply> {
