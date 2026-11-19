@@ -495,6 +495,9 @@ fn a_replayed_core_carries_the_strips_mid_envelope() {
         wait_for(Duration::from_secs(5), "level dropped", || {
             processed(&a.e) > ramped && processed(&b.e) > ramped
         });
+        // Skips from before the copy on: the donor's state the copy
+        // holds, and the replay, must not be cut by one.
+        let skips = (a.skipped(), b.skipped());
         let copy = copy(&a.e);
         let k0 = copy.k0;
         let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
@@ -510,31 +513,32 @@ fn a_replayed_core_carries_the_strips_mid_envelope() {
         }
         // Before the hand-over the strips set apart differ; from it on
         // the joiner computes the donor's pages.
-        let before = (k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE;
-        let from = ((j + 1) * B).div_ceil(PAGE);
-        let end = (from + 8) * PAGE / B + PAGE / B;
-        wait_for(Duration::from_secs(10), "pages compared", || {
-            processed(&a.e) > end && processed(&b.e) > end
-        });
-        let (pa, pb) = (a.pages(), b.pages());
-        let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
-        let differ = before
-            .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
-            .count();
-        assert!(differ > 0, "the joiner never diverged");
-        for p in from..from + 8 {
-            if disturbed.contains(&p) {
-                return Err(format!("page {p} disturbed"));
-            }
-            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
-                return Err(format!("page {p} not hashed by both"));
-            };
-            assert_eq!(
-                (hb.hash, hb.fingerprint),
-                (ha.hash, ha.fingerprint),
-                "page {p}"
-            );
+        let mut pair = Pair::new(&a, &b);
+        let before = pair.comparable((k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE);
+        if !before.iter().any(|&(_, same)| !same) {
+            return Err("no page before the copy shows the joiner apart".to_owned());
         }
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        let end = (at6 + 48_000) / PAGE + 8;
+        // A skip restarts one engine's strip state (the engines' own
+        // counters say so): pages read while neither has skipped since
+        // the copy are the ones that must agree.
+        let mut pages = std::collections::BTreeMap::new();
+        wait_for(Duration::from_secs(10), "comparable pages", || {
+            let seen = pair.comparable(from..end);
+            if (a.skipped(), b.skipped()) == skips {
+                pages.extend(seen);
+            }
+            !pages.is_empty() || processed(&a.e).min(processed(&b.e)) * B / PAGE >= end + 2
+        });
+        if pages.is_empty() {
+            return Err(format!("{} comparable pages before a skip", pages.len()));
+        }
+        let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+        assert!(
+            apart.is_empty(),
+            "pages {apart:?} differ after the hand-over"
+        );
         Ok(())
     });
 }
