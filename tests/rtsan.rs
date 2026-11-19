@@ -12,9 +12,8 @@
 //! pages hashed and strip entries applied. The lib test
 //! `the_failure_paths_run_on_the_rt_thread`, run under the same flags,
 //! covers catch-up with strips advanced over the skip, clock steps and a
-//! late input. libmxl's sync-group
-//! wait, `mxlSleepUntil`, the commit's `FUTEX_WAKE` and the failure
-//! path's probe are allowed by call site. Other builds compile this file
+//! late input. `mxlSleepUntil` and the commit's `FUTEX_WAKE` are allowed
+//! by call site. Other builds compile this file
 //! to nothing.
 
 #![cfg(samplez_rtsan)]

@@ -440,6 +440,59 @@ fn a_build_leaves_out_a_flow_its_lookup_has_not_found() {
     common::stop(e);
 }
 
+/// An input whose flow is deleted while it is attached holds up nothing:
+/// the RT thread waits for it on its head alone, never asking libmxl to
+/// check the flow, which on a file system that waits for a missing name
+/// looks the deleted flow's files up and waits; the input is pruned for
+/// its frozen head, and its flow looked up on the supervisor side, here
+/// with a lookup that waits. The other input is read throughout, and the
+/// frozen head, ever further behind, costs the wait a few wakes per block,
+/// not one per 100 us.
+#[test]
+fn a_deleted_input_flow_is_pruned_without_a_check_on_the_rt_thread() {
+    let domain = Domain::new();
+    let (kept, gone, out) = (new_id(), new_id(), new_id());
+    let _kept = Pilot::start(&domain.0, &kept, 1, B, 0);
+    let pilot = Pilot::start(&domain.0, &gone, 1, B, 0);
+    let mut cfg = config(
+        &domain.0,
+        &[(&kept, 1), (&gone, 1)],
+        &[(&out, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    );
+    cfg.look = slow_look;
+    let (e, rx, _reports) = start_replicated(cfg);
+    running(&e);
+    // From now on the flow's lookup waits.
+    SLOW.lock().unwrap().push(gone.clone());
+    let c = e.counters();
+    let sleeps = c.input_wait_sleeps.load(Relaxed);
+    let timeouts = c.input_wait_timeout.load(Relaxed);
+    let k0 = now(&rx);
+    drop(pilot);
+    assert!(!domain.0.join(format!("{gone}.mxl-flow")).exists());
+    wait_for(5 * SECOND, "the input pruned", || {
+        e.status().inputs[1].state == InputState::Pruned
+    });
+    let mut seen = Vec::new();
+    wait_past(&rx, now(&rx) + 200, &mut seen);
+    let sleeps = c.input_wait_sleeps.load(Relaxed) - sleeps;
+    let timeouts = c.input_wait_timeout.load(Relaxed) - timeouts;
+    assert!(timeouts > 0);
+    assert!(
+        sleeps <= 3 * timeouts,
+        "{sleeps} sleeps in {timeouts} late blocks"
+    );
+    // Every block after the deletion read the other input.
+    let read: Vec<_> = seen.iter().filter(|v| v.k > k0).collect();
+    assert!(read.len() > 150, "{} blocks", read.len());
+    for v in read {
+        assert_eq!(v.silenced & 1, 0, "{v:?}");
+    }
+    common::stop(e);
+}
+
 /// An output flow is created without libmxl's check for a live writer,
 /// which looks the flow's name up, while a lookup has not found its
 /// directory: a live writer's flow is then opened and reported raced,

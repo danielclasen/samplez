@@ -21,8 +21,9 @@ use crate::lookup::{Backoff, Look, Lookup, exists, flow_dir};
 use crate::time::{RATE, timestamp_to_index};
 use crate::{Error, Instance, MxlApi, Result, Status, check, id_cstring};
 
-/// Consecutive late blocks with a frozen head after which an input is
-/// probed for validity.
+/// Consecutive late blocks with a frozen head after which
+/// [`Input::identify`] probes an input for validity.
+#[deprecated(note = "only the deprecated `Input::identify` probes")]
 pub const FROZEN_PROBE_BLOCKS: u32 = 10;
 
 /// The x86_64 base page size. A larger page is touched more than once.
@@ -454,12 +455,33 @@ impl Generation {
             .sum()
     }
 
+    /// RT. How many samples the slowest reader's head, the outgoing ones'
+    /// included, is below `index`; 0 once every head reached it, the
+    /// condition the group wait waits for. Read from the flows' shared
+    /// memory alone. A head that cannot be read counts as reached; the
+    /// read reports it.
+    pub fn behind(&self, index: u64) -> u64 {
+        self.inputs
+            .iter()
+            .chain(&self.outgoing)
+            .flatten()
+            .map(|i| i.reader.head().map_or(0, |head| index.saturating_sub(head)))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// RT. `mxlFlowSynchronizationGroupWaitForDataAt` on the generation's
     /// group: [`GroupWait::Ok`] once every reader's head reached the index
     /// of `timestamp`. Otherwise it blocks on a futex until `timeout_ns`
     /// passed, then fails with `MXL_ERR_OUT_OF_RANGE_TOO_EARLY`, or with
     /// `MXL_ERR_FLOW_INVALID` when the first reader found behind is on a
     /// replaced flow: libmxl checks validity only once the timeout expired.
+    /// That check is a `stat()` of the flow's data file, which on a file
+    /// system that waits for a missing name blocks for that wait once the
+    /// flow is deleted.
+    #[deprecated(
+        note = "the engine waits on `Generation::reached`; the group wait's validity check can block"
+    )]
     pub fn wait(&self, timestamp: u64, timeout_ns: u64) -> GroupWait {
         match self.group.wait(timestamp, timeout_ns) {
             MXL_STATUS_OK => GroupWait::Ok,
@@ -785,7 +807,14 @@ impl Input {
     /// probes the flow once with `mxlFlowReaderGetSamplesNonBlocking(head +
     /// 1, 1)`, which runs libmxl's validity check, and marks the slot
     /// invalid on `MXL_ERR_FLOW_INVALID`. A slot already marked is not
-    /// probed. Returns true when it marked the slot.
+    /// probed. Returns true when it marked the slot. The validity check is
+    /// a `stat()` of the flow's data file, which on a file system that
+    /// waits for a missing name blocks for that wait once the flow is
+    /// deleted.
+    #[deprecated(
+        note = "the engine prunes a frozen input and checks its flow on the supervisor side"
+    )]
+    #[allow(deprecated, reason = "FROZEN_PROBE_BLOCKS goes with this probe")]
     pub fn identify(&self, state: &mut SlotState, group: &GroupWait, outcome: Outcome) -> bool {
         if state.invalid
             || outcome != Outcome::Late

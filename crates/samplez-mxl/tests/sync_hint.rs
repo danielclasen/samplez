@@ -3,6 +3,11 @@
 //! its own and by a range committed at once. libmxl signals waiters once
 //! per `maxSyncBatchSizeHint` window, so the hints stay at B.
 
+#![allow(
+    deprecated,
+    reason = "the group wait libmxl gives; the engine waits on heads"
+)]
+
 mod common;
 
 use std::time::{Duration, Instant};

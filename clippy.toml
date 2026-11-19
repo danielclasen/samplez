@@ -31,6 +31,8 @@ disallowed-methods = [
     { path = "std::sync::mpsc::Receiver::recv", reason = "a receive blocks the RT thread" },
     { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "a receive blocks the RT thread" },
     { path = "samplez_mxl::Instance::lock", reason = "the instance lock is the supervisor's" },
+    { path = "samplez_mxl::input::Generation::wait", reason = "libmxl's group wait stats the flow's data file once it times out" },
+    { path = "samplez_mxl::input::Input::identify", reason = "libmxl's validity probe stats the flow's data file" },
     { path = "libc::sleep", reason = "a sleep blocks the RT thread" },
     { path = "libc::usleep", reason = "a sleep blocks the RT thread" },
     { path = "libc::nanosleep", reason = "a sleep blocks the RT thread" },

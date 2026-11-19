@@ -5961,8 +5961,9 @@ mod tests {
     /// The RT loop's failure paths run, so that CI's RealtimeSanitizer
     /// run over the lib tests checks them: a stall's catch-up and skip, a
     /// forward and a backward clock step with the wakes behind the last
-    /// block after it, and a late input with its probe, with a strip
-    /// advanced over the skip. Engine `p` writes the flow,
+    /// block after it, and a late input whose flow is deleted, waited for
+    /// on its head and pruned without a probe, with a strip advanced over
+    /// the skip. Engine `p` writes the flow,
     /// engine `e` reads it.
     #[test]
     fn the_failure_paths_run_on_the_rt_thread() {
@@ -6063,10 +6064,13 @@ mod tests {
         until("backward step", &|| n(&c.clock_steps) > steps + 1);
         // Behind the last block computed, the loop wakes without computing.
         until("wake behind", &|| n(&c.clock_behind_wakes) > 0);
-        // The producer stops: the input is late, frozen and probed.
+        // The producer stops and its flow is deleted: the input is late,
+        // frozen and pruned, and the RT thread never checks the flow.
         p.stop();
         until("late block", &|| n(&c.input_late_blocks) > 0);
-        until("probe", &|| n(&c.input_probes) > 0);
+        until("prune", &|| {
+            e.status().inputs[0].state == InputState::Pruned
+        });
         assert_eq!(e.status().rt_panic, None);
         e.stop();
         std::fs::remove_dir_all(&domain).unwrap();
