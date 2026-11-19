@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/danielclasen/samplez/compare/v0.13.0...v0.13.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* **replica:** fail fast on an apply inside with_state ([#138](https://github.com/danielclasen/samplez/issues/138)) ([e52cd57](https://github.com/danielclasen/samplez/commit/e52cd5791c097dead5b8b2b802008e6b58a5058c))
+
 ## [0.13.0](https://github.com/danielclasen/samplez/compare/v0.12.3...v0.13.0) (2026-11-19)
 
 
