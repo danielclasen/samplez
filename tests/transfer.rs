@@ -2845,6 +2845,10 @@ struct Pair<'a> {
     pages: [BTreeMap<u64, PageHash>; 2],
     silenced: [Vec<u64>; 2],
     newest: [u64; 2],
+    /// The engines' overrun-skip counters from before the state under
+    /// test was built: pages count only while neither has moved. A skip
+    /// restarts the detectors of one engine, so pages after it may differ.
+    calm: Option<(u64, u64)>,
 }
 
 impl<'a> Pair<'a> {
@@ -2855,6 +2859,7 @@ impl<'a> Pair<'a> {
             pages: [BTreeMap::new(), BTreeMap::new()],
             silenced: [Vec::new(), Vec::new()],
             newest: [0, 0],
+            calm: None,
         }
     }
 
@@ -2908,7 +2913,13 @@ fn wait_comparable(
     let over = || processed(ea).min(processed(eb)) * B / PAGE >= end + 2;
     let mut done = false;
     wait_for(Duration::from_secs(10), "comparable pages", || {
-        found.extend(pair.comparable(from..end));
+        let seen = pair.comparable(from..end);
+        if pair
+            .calm
+            .is_none_or(|base| (pair.a.skipped(), pair.b.skipped()) == base)
+        {
+            found.extend(seen);
+        }
         done = found.len() >= n && both(&found);
         done || over()
     });
@@ -3050,6 +3061,7 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
         h.e.commit(2);
     }
     wait_index(&[&a.e, &b.e, &c.e], at + u64::from(delay) + 20_000);
+    let calm = (a.skipped(), c.skipped());
     c.e.drop_core().unwrap();
     let state = ProductState {
         fading: vec![vec![Some(fade), None], vec![None, None]],
@@ -3077,6 +3089,7 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
     }
     let from = ((j + 1) * B).div_ceil(PAGE);
     let mut pair = Pair::new(a, c);
+    pair.calm = Some(calm);
     let end = (at + u64::from(delay) + u64::from(FADE_LEN)) / PAGE;
     let pages = wait_comparable(&mut pair, from, end, 3, 0)?;
     let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
