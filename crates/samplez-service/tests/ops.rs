@@ -5,6 +5,7 @@ use std::time::Duration;
 use axum::http::{StatusCode, header};
 use common::*;
 use samplez_service::{MetricKind, Metrics, Ops, ReplicaMetric};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test(start_paused = true)]
 async fn healthz_follows_the_heartbeat_within_one_second() {
@@ -42,6 +43,82 @@ async fn healthz_follows_the_heartbeat_within_one_second() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(healthz().await, StatusCode::OK, "advancing for 3 s");
+}
+
+/// A liveness probe that waits on the replicated state's locks fails
+/// whenever the replica machinery holds them, though the process lives.
+#[allow(clippy::await_holding_lock, reason = "the held lock is the test")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healthz_takes_no_lock_of_the_replicated_state() {
+    let ops = Ops::default();
+    let state = FakeState::new("r1", "leader");
+    let router = ops.router(state.clone());
+    ops.heartbeat().beat();
+    tokio::spawn(ops.clone().watch_heartbeat());
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let held = state.replica.lock().unwrap();
+    let healthz = tokio::spawn(async move { send(&router, get_req("/healthz")).await });
+    let answered = tokio::time::timeout(Duration::from_secs(2), healthz).await;
+    drop(held);
+
+    let (code, _, body) = answered
+        .expect("/healthz waited on the replicated state")
+        .unwrap();
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body, r#"{"ok":true}"#);
+}
+
+/// The ops listener answers while the task that serves the others is held
+/// by a blocking call, as a product's replica or engine future holding its
+/// worker would hold it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healthz_answers_while_the_task_serving_the_listeners_is_blocked() {
+    let ops = Ops::default();
+    let state = FakeState::new("r1", "leader");
+    let mut config = config("none", "blocked");
+    let loopback = serde_json::json!({ "bind": "127.0.0.1", "port": 0 });
+    config["listeners"] = serde_json::json!({ "api": loopback, "ops": loopback, "nmos": loopback });
+    let bound = service_from(config, ops.clone(), state)
+        .bind()
+        .await
+        .unwrap();
+    let addr = bound.ops_addr().unwrap();
+    let heartbeat = ops.heartbeat();
+    let beating = tokio::spawn(async move {
+        loop {
+            heartbeat.beat();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    let serving = tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            r = bound.serve() => r,
+            () = async { std::thread::sleep(Duration::from_secs(2)) } => Ok(()),
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let get = async {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: ops\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.unwrap();
+        reply
+    };
+    let reply = tokio::time::timeout(Duration::from_secs(1), get)
+        .await
+        .expect("/healthz was not answered while the serving task was blocked");
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(reply.ends_with(r#"{"ok":true}"#), "{reply}");
+
+    serving.abort();
+    beating.abort();
 }
 
 #[tokio::test]

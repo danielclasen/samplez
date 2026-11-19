@@ -5,6 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
@@ -21,7 +22,7 @@ use tokio::net::TcpListener;
 use crate::auth::{self, Auth, Identity, Listener, Role, SessionEnd};
 use crate::config::{AuthMode, ServiceConfig};
 use crate::oidc;
-use crate::ops::Ops;
+use crate::ops::{self, Ops};
 use crate::replica::{Owner, ReplicatedState};
 use crate::tls::{ListenerTls, TlsListener, TlsStatus};
 use crate::ws::Sessions;
@@ -436,6 +437,13 @@ impl Bound {
     /// Serves every listener, watches the heartbeat and reloads the token
     /// and TLS files until a listener fails. A failed reload keeps the
     /// previous token or certificate. `/readyz` reports the API as serving while this runs.
+    ///
+    /// The ops listener and the heartbeat sampling do not run as futures
+    /// of the task that calls this. The sampling has a thread of its own,
+    /// which also spawns the ops listener, so that no worker's local queue
+    /// holds it: whatever else the calling task polls, such as a product's
+    /// replica and engine futures, cannot hold back `/healthz` by blocking
+    /// its worker. Both end when this returns or is dropped.
     pub async fn serve(self) -> io::Result<()> {
         let Bound {
             service,
@@ -451,11 +459,36 @@ impl Bound {
                 _ => std::future::pending().await,
             }
         };
+        service.ops.set_api_serving(true);
+        let _serving = Serving(service.ops.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop = StopSampling(stop.clone());
+        let (sent, spawned) = tokio::sync::oneshot::channel();
+        let (runtime, ops_serve, sampled) = (
+            tokio::runtime::Handle::current(),
+            ops.serve(routers.ops),
+            service.ops.clone(),
+        );
+        std::thread::Builder::new()
+            .name("samplez-ops".into())
+            .spawn(move || {
+                let _ = sent.send(Detached(runtime.spawn(ops_serve)));
+                let mut seen = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    sampled.sample_heartbeat(&mut seen);
+                    std::thread::sleep(ops::SAMPLE_PERIOD);
+                }
+            })?;
+        let mut ops = spawned.await.map_err(io::Error::other)?;
         let servers = async {
             tokio::try_join!(
                 api.serve(routers.api),
                 machine,
-                ops.serve(routers.ops),
+                async {
+                    (&mut ops.0)
+                        .await
+                        .unwrap_or_else(|e| Err(io::Error::other(e)))
+                },
                 nmos.serve(routers.nmos),
             )
         };
@@ -467,14 +500,29 @@ impl Bound {
             }
         };
         let renew = renew_sessions(&service.sessions, &*service.state);
-        service.ops.set_api_serving(true);
-        let _serving = Serving(service.ops.clone());
         tokio::select! {
             r = servers => r.map(|_| ()),
-            () = service.ops.clone().watch_heartbeat() => unreachable!("the watch never returns"),
             () = reload => unreachable!("the reload loop never returns"),
             () = renew => unreachable!("the renew loop never returns"),
         }
+    }
+}
+
+/// A task that ends with its owner.
+struct Detached<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Detached<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Ends the heartbeat sampling thread.
+struct StopSampling(Arc<AtomicBool>);
+
+impl Drop for StopSampling {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
