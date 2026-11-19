@@ -231,6 +231,14 @@ impl Hashed {
         self.hashes.try_iter().map(|h| (h.page, h)).collect()
     }
 
+    /// Samples the engine skipped after an overrun. A stateful unit such
+    /// as a limiter restarts after a skip, so its output differs from an
+    /// engine's that computed those samples: a run that skipped is
+    /// disturbed.
+    fn skipped(&self) -> u64 {
+        self.e.counters().overrun_skipped_samples.load(Relaxed)
+    }
+
     /// The pages a silenced input block and the fade-in after it touch:
     /// their output depends on more than the input and the log.
     fn disturbed(&self) -> Vec<u64> {
@@ -555,6 +563,7 @@ fn a_replayed_core_carries_the_limiter_mid_release() {
             ceiling_db: -6.0,
             release_ms,
         };
+        let skipped = (a.skipped(), b.skipped());
         // Entry 1 sets the limiters, apart on the joiner.
         let at1 = (now_block() + 20) * B;
         let set = |e: &Engine, params| {
@@ -602,6 +611,9 @@ fn a_replayed_core_carries_the_limiter_mid_release() {
         wait_for(Duration::from_secs(10), "pages compared", || {
             processed(&a.e) > end && processed(&b.e) > end
         });
+        if (a.skipped(), b.skipped()) != skipped {
+            return Err("an overrun skip".to_owned());
+        }
         let (pa, pb) = (a.pages(), b.pages());
         let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
         let differ = before
@@ -1416,6 +1428,7 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
             hashed_of(&domain, &[(&src, 2)], limited),
             hashed_of(&domain, &[(&src, 2)], limited),
         );
+        let skipped = (a.skipped(), b.skipped());
         b.e.drop_core().unwrap();
         let at = (now_block() + 20) * B;
         let limiter = Entry::Limiter {
@@ -1456,6 +1469,13 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
         wait_for(Duration::from_secs(5), "past the release", || {
             processed(&a.e) > want && processed(&b.e) > want
         });
+        let end = (from + 4 * PAGE).div_ceil(B) + PAGE / B;
+        wait_for(Duration::from_secs(10), "pages computed", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        if (a.skipped(), b.skipped()) != skipped {
+            return Err("an overrun skip".to_owned());
+        }
         assert_same_within(&a, &b, from, from + 4 * PAGE)?;
         assert_eq!(b.e.counters().command_late.load(Relaxed), 0);
         Ok(())
