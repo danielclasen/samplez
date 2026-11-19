@@ -668,15 +668,15 @@ impl Matrix {
     /// [`MAX_GAIN`](crate::MAX_GAIN) in magnitude.
     #[must_use]
     pub fn set(&mut self, input: usize, output: usize, target: f32, len: u32) -> bool {
-        self.set_fade(input, output, target, 0, len)
+        self.set_with(input, output, target, 0, len, len)
     }
 
     /// [`Matrix::set`] after the coefficient held its value for `delay`
     /// samples, per [`Ramp::set_fade`]. Its value at a sample is a
     /// function of the sample's distance from the call and of the values
     /// the call was given alone, whichever blocks the samples fall in. A
-    /// duck mask crossfade a coefficient back from 0 starts runs over
-    /// `len` from the call, not from the end of `delay`.
+    /// masked term the call inserts is ducked from the start, with no
+    /// crossfade: the fade ramps it up from silence.
     #[must_use]
     pub fn set_fade(
         &mut self,
@@ -685,6 +685,20 @@ impl Matrix {
         target: f32,
         delay: u32,
         len: u32,
+    ) -> bool {
+        self.set_with(input, output, target, delay, len, 0)
+    }
+
+    /// [`Matrix::set_fade`] with the length `duck` of the duck crossfade
+    /// of a masked term it inserts.
+    fn set_with(
+        &mut self,
+        input: usize,
+        output: usize,
+        target: f32,
+        delay: u32,
+        len: u32,
+        duck: u32,
     ) -> bool {
         if input >= self.inputs || output >= self.columns.len() || !valid_gain(target) {
             return false;
@@ -712,7 +726,7 @@ impl Matrix {
                 };
                 col.insert(k, term);
                 if !self.masks.is_empty() {
-                    self.duck_inserted(output, k, if delay > 0 { 0 } else { len });
+                    self.duck_inserted(output, k, duck);
                 }
             }
             Err(_) => {}

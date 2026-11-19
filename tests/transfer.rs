@@ -2843,3 +2843,87 @@ fn a_rebuilt_replica_continues_a_fade_mid_ramp() {
 fn a_rebuilt_replica_matches_its_peers_after_a_mid_fade_assert() {
     common::undisturbed(|| rebuilt_replica_continues_a_fade(FADE_DELAY + 20_000, true));
 }
+
+/// A replica rebuilt mid-fade, in a matrix with a duck, from a product
+/// state that holds the fade, computes its peers' pages: the fade brings
+/// a masked coefficient in from silence, and the peers' duck on it is
+/// the one the install builds, with no crossfade of its own. The group is
+/// forced on from entries long before the fade, so the detectors agree.
+fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let ducked = |c: &mut Config| {
+        c.duck_columns = vec![0];
+        c.matrix = vec![vec![0.0, 0.0], vec![0.0, 1.0]];
+    };
+    let hs = [0; 3].map(|_| hashed_of(&domain, &[(&src, 2)], ducked));
+    let [a, b, c] = &hs;
+    let at1 = (now_block() + 20) * B;
+    let at = at1 + 400 * B;
+    let fade = Fade::after(0.0, at, delay, FADE_LEN);
+    for h in [a, b] {
+        let duck = |setting| Entry::Duck { group: 0, setting };
+        let setup = [
+            duck(DuckSetting::Mode(samplez_dsp::DuckMode::On)),
+            duck(DuckSetting::Depth { slot: 0, db: 20.0 }),
+            Entry::DuckMask {
+                input: 0,
+                output: 0,
+                mask: 1,
+            },
+        ];
+        h.e.append_batch(1, at1, &setup).unwrap();
+        h.e.commit(1);
+        let entry = Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.25,
+            fade: Some(fade),
+        };
+        h.e.append(2, at, entry).unwrap();
+        h.e.commit(2);
+    }
+    wait_index(&[&a.e, &b.e, &c.e], at + u64::from(delay) + 20_000);
+    c.e.drop_core().unwrap();
+    let state = ProductState {
+        fading: vec![vec![Some(fade), None], vec![None, None]],
+        limiters: Vec::new(),
+        delays: Vec::new(),
+        gains: vec![vec![0.25, 0.0], vec![0.0, 1.0]],
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        outputs: Vec::new(),
+        strips: vec![Vec::new()],
+        ducks: vec![DuckTargets {
+            mode: samplez_dsp::DuckMode::On,
+            depths: vec![20.0],
+            ..DuckTargets::default()
+        }],
+        masks: vec![vec![1, 0], vec![0, 0]],
+        pending: Vec::new(),
+        last_id: 2,
+    };
+    let j =
+        c.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
+    if (j + 1) * B > at + FADE_DELAY + u64::from(FADE_LEN) - 5 * PAGE {
+        return Err(format!("installed at block {j}, near the fade's end"));
+    }
+    let from = ((j + 1) * B).div_ceil(PAGE);
+    let end = (at + u64::from(delay) + u64::from(FADE_LEN)) / PAGE;
+    let pages = wait_comparable(a, c, from, end, 3, 0)?;
+    let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+    assert!(apart.is_empty(), "pages {apart:?} differ after the install");
+    Ok(())
+}
+
+#[test]
+fn a_rebuilt_replica_continues_a_masked_fade_that_starts_at_its_entry() {
+    common::undisturbed(|| rebuilt_replica_continues_a_masked_fade(0));
+}
+
+#[test]
+fn a_rebuilt_replica_continues_a_masked_fade_that_waits() {
+    common::undisturbed(|| rebuilt_replica_continues_a_masked_fade(FADE_DELAY as u32));
+}
