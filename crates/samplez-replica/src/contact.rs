@@ -1793,8 +1793,9 @@ impl Contact {
         // the state the core was built from applied is in the core:
         // rebuilt past, as one taken late while catching up. Held again it
         // could stay unresolved for good: the log decides an entry that
-        // stands only when the baseline or every live replica held it
-        // unresolved. A replica about to commit, such as one retargeted
+        // stands only when the baseline held it unresolved as it committed
+        // its block, or every live replica withheld that block. A replica
+        // about to commit, such as one retargeted
         // from `version_mismatch`, holds it again, as its peers do.
         let rebuilds = Self::commits_nothing(st);
         let past: Vec<Key> = (st.given.keys())
@@ -1941,10 +1942,10 @@ impl Contact {
         // An entry held unresolved that applied and derived no record
         // changes no engine state: it is released, here as on a replica
         // that applied it in time, rather than held until a decision the
-        // log appends for an entry that stands only when the baseline or
-        // every live replica held it unresolved. Should one come, the entry
-        // is rebuilt past, so the decision neither resolves nor
-        // contradicts this replica.
+        // log appends for an entry that stands only when the baseline held
+        // it unresolved as it committed its block, or every live replica
+        // withheld that block. Should one come, the entry is rebuilt past,
+        // so the decision neither resolves nor contradicts this replica.
         let derived: BTreeSet<u64> = records.iter().map(|(index, _)| *index).collect();
         let empty: Vec<Key> = (st.given.keys())
             .filter(|&&(index, term, node)| {
@@ -3130,6 +3131,12 @@ impl Contact {
         let mut st = self.lock();
         let st = &mut *st;
         let diverged = st.life.as_ref()?.state() == ReplicaState::Diverged;
+        // A mismatch counts within one divergence, resync attempts
+        // included: once the replica no longer is diverged, a later
+        // divergence starts its own.
+        if !st.life.as_ref()?.state().diverged() {
+            st.off_flows_since = None;
+        }
         // A rebuild under way would install its core over the resync's.
         let rebuilding = matches!(st.rebuild, Rebuild::Running { .. });
         if !diverged || rebuilding || st.own.clock.unverified || st.judged.contains(&self.id) {
@@ -3266,6 +3273,8 @@ impl Contact {
             }
         };
         life.handed_over(r.j);
+        // Handed over: a divergence after it starts its own mismatch.
+        st.off_flows_since = None;
         // The donor's unresolved entries are this replica's now: the
         // log's decision on them reaches both alike.
         let inherited: BTreeMap<u64, u64> = r.unresolved.iter().copied().collect();
@@ -4929,6 +4938,51 @@ mod tests {
         committing(&f);
         assert_eq!(f.contact.resync_due(), None, "rebuilt instead");
         assert_eq!(rebuilt(&f), 1);
+    }
+
+    /// A mismatch counts within one divergence: after a resync handed
+    /// over, a later divergence resyncs at its first check, though the
+    /// earlier mismatch began more than the lead ago.
+    #[tokio::test(start_paused = true)]
+    async fn a_flow_mismatch_counts_anew_after_a_hand_over() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.log.0.lock().unwrap().flows = vec![Some("a".to_owned())];
+        diverge(&f);
+        f.engine.follows.store(false, Ordering::SeqCst);
+        let committing = |f: &Fixture| {
+            f.contact
+                .receive(state_report(f, 2, ReplicaState::Committing, Duration::ZERO));
+        };
+        committing(&f);
+        let (epoch, donor, _) = f.contact.resync_due().expect("resynced at first");
+        assert!(f.contact.resync_arrived(epoch));
+        f.contact.resync_ended(
+            epoch,
+            donor,
+            Ok(Resynced {
+                j: 1,
+                pages: Vec::new(),
+                unresolved: Vec::new(),
+            }),
+        );
+        assert_eq!(f.contact.metrics().resync.handovers, 1);
+        let lead = Timing::defaults(B).max_apply_lead + crate::schedule::EXTRA_LEAD;
+        let later = lead + f.contact.metrics().resync.backoff;
+        tokio::time::advance(later).await;
+        f.clock.add(later);
+        // Diverged again, its input still on another flow.
+        {
+            let mut st = f.contact.lock();
+            let audio: Arc<dyn Audio> = f.engine.clone();
+            st.life.as_mut().unwrap().contradicted(audio.as_ref());
+        }
+        committing(&f);
+        assert!(
+            f.contact.resync_due().is_some(),
+            "resynced at its first check"
+        );
+        assert_eq!(f.contact.metrics().resync.rebuilt_for_flows, 0);
     }
 
     /// A replica catching up past entries' deadlines is rebuilt past them

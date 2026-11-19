@@ -586,8 +586,9 @@ with one committing, and one taking entries late after it caught up,
 holds them unresolved. An entry held unresolved that applies without
 deriving a record, such as a re-route to the flow an input reads
 already, changes no engine state and is released as it applies: the
-log decides an entry that stands only when the baseline or every live
-replica held it unresolved, so held it could stay unresolved for good.
+log decides an entry that stands only when the baseline held it
+unresolved as it committed its block, or every live replica withheld
+that block, so held it could stay unresolved for good.
 A decision that comes for it neither resolves nor contradicts the
 replica: it is rebuilt past. For the same
 reason a rebuild from product state on a replica committing nothing
