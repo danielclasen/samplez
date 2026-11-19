@@ -408,7 +408,9 @@ carries no flows and a replay reads the inputs the joiner's engine
 reads, so a diverged replica whose input reads another flow than its
 applied state names, as one does after holding a `Route` unresolved
 that stands, is rebuilt from product state instead, which moves the
-input, in place of an attempt and on its backoff
+input, in place of an attempt and on its backoff, once the mismatch
+outlasts `maxApplyLead` and 64 ms, the longest lead a re-route still to
+take effect is stamped with
 (`samplez_replica_resync_rebuilt_for_flows_total`); a page that still
 differs then resyncs.
 
@@ -600,9 +602,11 @@ with one committing, and one taking entries late after it caught up,
 holds them unresolved. An entry held unresolved that applies without
 deriving a record, such as a re-route to the flow an input reads
 already, changes no engine state and is released as it applies: the
-log decides only an entry that does not stand, so held it could stay
-unresolved for good. A decision that comes for it after all neither
-resolves nor contradicts the replica: it is rebuilt past. For the same
+log decides an entry that stands only when the baseline held it
+unresolved as it committed its block, or every live replica withheld
+that block, so held it could stay unresolved for good.
+A decision that comes for it neither resolves nor contradicts the
+replica: it is rebuilt past. For the same
 reason a rebuild from product state on a replica committing nothing
 takes the entries held unresolved that its state applied: rebuilt past,
 as entries taken late, not given to the new core again. A replica about

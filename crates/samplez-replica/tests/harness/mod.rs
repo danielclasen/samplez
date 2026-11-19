@@ -1117,10 +1117,17 @@ impl Audio for FakeAudio {
             .filter(|g| g.0 <= k0 + 1 && g.1 > k0 + 1)
             .map(|g| g.2)
             .collect();
+        // With route digests, the flows its inputs read: a replay reads
+        // the joiner's inputs, so one on other flows computes other pages.
+        let reads = if st.route_digests {
+            st.reads(k0)
+        } else {
+            Vec::new()
+        };
         Some(CoreReply {
             k0,
             last_id: 0,
-            core: serde_json::to_string(&open).expect("encodes"),
+            core: serde_json::to_string(&(open, reads)).expect("encodes"),
         })
     }
     /// The replay catches up within `catch_up` blocks and hands over.
@@ -1141,7 +1148,11 @@ impl Audio for FakeAudio {
         if !go {
             return Err("given up".to_owned());
         }
-        let donor: Vec<f32> = serde_json::from_str(&core.core).map_err(|e| e.to_string())?;
+        let (donor, reads): (Vec<f32>, Vec<Option<String>>) =
+            serde_json::from_str(&core.core).map_err(|e| e.to_string())?;
+        if st.route_digests && reads != st.reads(st.computed.unwrap_or(0)) {
+            return Err("a replayed page differs from the donor's".to_owned());
+        }
         let j = st.computed.unwrap_or(0) + st.catch_up;
         st.pending_handover = Some((j, donor));
         st.handovers.push((core.k0, j));

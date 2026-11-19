@@ -409,7 +409,7 @@ fn the_fake_replay_reads_its_source_without_its_lock() {
     let core = CoreReply {
         k0: 0,
         last_id: 0,
-        core: "[]".to_owned(),
+        core: "[[], []]".to_owned(),
     };
     audio
         .resync(&core, &Probe(audio.clone()))
