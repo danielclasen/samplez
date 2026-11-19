@@ -323,6 +323,48 @@ async fn a_late_commit_raises_the_lead_up_to_its_cap() {
     assert!(m.apply_lead_capped);
 }
 
+/// A lead pinned at its cap by replica load falls after a leader change
+/// once a minute of slack is clean, instead of after ten: the new term
+/// voids the cap flag at once and the lead falls a block a minute from
+/// the first clean minute.
+#[tokio::test(start_paused = true)]
+async fn a_leader_change_does_not_leave_the_lead_at_its_cap() {
+    let mut set = start(None).await;
+    let first = set.leader().await;
+    for id in set.ids().filter(|&id| id != first) {
+        set.net.stall(id, Duration::from_millis(25));
+    }
+    for n in 0..3 {
+        let _ = set
+            .replica(first)
+            .submit(&owner("s"), &n.to_string(), Bytes::from(format!("g=1@{n}")))
+            .await;
+    }
+    sleep(Duration::from_millis(100)).await;
+    let cap = index_at(timing().max_apply_lead.as_nanos() as u64);
+    let m = set.replica(first).contact_metrics().unwrap();
+    assert_eq!((m.lead, m.apply_lead_capped), (cap, true));
+    for id in set.ids().filter(|&id| id != first) {
+        set.net.unstall(id);
+    }
+    set.crash(first).await;
+    let second = set.leader().await;
+    assert_ne!(second, first);
+    let m = set.replica(second).contact_metrics().unwrap();
+    assert!(!m.apply_lead_capped, "the new term voids the cap flag");
+    assert_eq!(m.lead, cap, "the lead itself is kept");
+    for n in 3..9 {
+        set.replica(second)
+            .submit(&owner("s"), &n.to_string(), Bytes::from(format!("g=1@{n}")))
+            .await
+            .expect("committed");
+        sleep(Duration::from_secs(15)).await;
+    }
+    let m = set.replica(second).contact_metrics().unwrap();
+    assert!(!m.apply_lead_capped);
+    assert!(m.lead < cap, "lead {} still at the cap {cap}", m.lead);
+}
+
 /// The 64-entry limit counts entries the engines still hold pending, not
 /// only those some voter has not reported committed yet.
 #[tokio::test(start_paused = true)]

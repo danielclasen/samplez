@@ -12,12 +12,16 @@ use crate::state_machine::AHEAD_MAX;
 /// The lead an entry is stamped ahead of `ceil(E / B) * B` with, kept on
 /// the slack the counted audio replicas report: it rises at once to keep
 /// the 0.01 % slack quantile at or above 2B, and falls by B a minute while
-/// that quantile held at 3B or more for ten minutes; at most the cap.
+/// that quantile held at 3B or more for ten minutes; at most the cap. A
+/// new Raft term voids the slack kept and falls faster ([`Lead::new_term`]).
 #[derive(Debug, Clone)]
 pub struct Lead {
     block: u64,
     max: u64,
     lead: u64,
+    /// A term began since the lead last rose: it may fall on
+    /// [`FAST_MINUTES`] ([`Lead::new_term`]).
+    fast: bool,
     /// Slack histograms per minute, the current one last.
     minutes: VecDeque<Slacks>,
     minute_start: Instant,
@@ -33,6 +37,10 @@ pub struct Lead {
 
 /// Minutes of slack the lead falls on.
 const MINUTES: usize = 10;
+
+/// Minutes of slack the lead falls on after a new term, until it next
+/// rises ([`Lead::new_term`]).
+pub const FAST_MINUTES: usize = 1;
 
 /// How far past the cap [`Lead::wanted`] goes at most.
 pub const EXTRA_LEAD: Duration = Duration::from_millis(64);
@@ -67,12 +75,30 @@ impl Lead {
             block,
             max: max / block * block,
             lead: start.next_multiple_of(block).min(max / block * block),
+            fast: false,
             minutes: VecDeque::from([Slacks::new()]),
             minute_start: Instant::now(),
             capped: false,
             needed: [0; 2],
             raised_at: 0,
         }
+    }
+
+    /// A new Raft term began: what the last term's slack and need said is
+    /// void, the lead is kept. The slack windows, the kept need, the cap
+    /// flag and the raise mark start again, and until the lead next rises
+    /// it may start falling after [`FAST_MINUTES`] clean minutes instead
+    /// of ten: an election raises the lead on no voter
+    /// ([`Lead::add`] is not fed its slack), so what is left is need the
+    /// replicas showed, which a minute of clean slack at 3B or more
+    /// already answers.
+    pub fn new_term(&mut self) {
+        self.capped = false;
+        self.needed = [0; 2];
+        self.raised_at = 0;
+        self.fast = true;
+        self.minutes = VecDeque::from([Slacks::new()]);
+        self.minute_start = Instant::now();
     }
 
     pub fn samples(&self) -> u64 {
@@ -148,6 +174,7 @@ impl Lead {
             self.capped |= want > self.max;
             self.lead = want.min(self.max);
             self.raised_at = now.max(stamp + 1);
+            self.fast = false;
             // The slack measured was at the old lead: entries stamped from
             // now on carry the raise, so the window starts again.
             self.minutes = VecDeque::from([Slacks::new()]);
@@ -169,7 +196,8 @@ impl Lead {
             self.minute_start += Duration::from_secs(60);
             self.needed = [self.needed[1], 0];
             let held = self.capped && self.needed[0].max(self.needed[1]) > self.lead;
-            if self.minutes.len() == MINUTES
+            let kept = if self.fast { FAST_MINUTES } else { MINUTES };
+            if self.minutes.len() >= kept
                 && self.quantile().is_some_and(|q| q >= 3)
                 && self.lead > self.block
                 && !held
@@ -196,6 +224,50 @@ mod tests {
     use super::*;
 
     const B: u64 = 48;
+
+    /// A new term keeps the lead, voids the cap flag and the slack kept,
+    /// and lets the lead fall after one clean minute instead of ten.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_term_keeps_the_lead_and_lets_it_fall_after_a_minute() {
+        let mut lead = Lead::new(B, 1440, 2400);
+        lead.add(-(40 * B as i64), 0, 0);
+        assert!(lead.capped);
+        lead.needs(2400, -(20 * B as i64));
+        lead.new_term();
+        assert_eq!(lead.samples(), 2400, "the lead is kept");
+        assert!(!lead.capped);
+        assert_eq!(lead.wanted(), 2400, "what was needed is forgotten");
+        for _ in 0..100 {
+            lead.add(5 * B as i64, 1, 1);
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        lead.roll();
+        assert_eq!(lead.samples(), 2400 - B, "one clean minute is enough");
+        tokio::time::advance(Duration::from_secs(60)).await;
+        lead.roll();
+        assert_eq!(lead.samples(), 2400 - 2 * B, "and a block a minute after");
+        // A raise ends the fast fall.
+        lead.add(0, 2, 2);
+        let raised = lead.samples();
+        for _ in 0..100 {
+            lead.add(5 * B as i64, 3, 3);
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        lead.roll();
+        assert_eq!(lead.samples(), raised, "ten minutes again");
+    }
+
+    /// Without a new term one clean minute moves nothing.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_new_term_one_clean_minute_does_not_lower_the_lead() {
+        let mut lead = Lead::new(B, 2400, 2400);
+        for _ in 0..100 {
+            lead.add(5 * B as i64, 1, 1);
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        lead.roll();
+        assert_eq!(lead.samples(), 2400);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn the_lead_rises_at_once_and_falls_by_a_block_a_minute() {
