@@ -585,6 +585,14 @@ store's other reads (`pending`, `records`, `entries_after`) take; there
 a call into the `Replica` or the `Store` panics, naming the lock, rather
 than deadlock.
 
+A client snapshot builds the product's whole text, which for a large
+state holds off applies for milliseconds. `Product::text_later` lets a
+product hand out a closure that builds the text after the gate is
+released, over state fixed at that call, such as a clone of an `Arc`
+the product replaces or copies on apply. The closure must read nothing
+an apply changes: entries may be applied before it runs, and the text
+would then be of a later revision than the snapshot names.
+
 ### Starting a replica
 
 A replica that joins a set is a learner until the leader promotes it,

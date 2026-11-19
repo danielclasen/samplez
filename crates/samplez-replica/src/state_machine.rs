@@ -98,6 +98,11 @@ pub trait Product: Send + Sync + 'static {
     /// returns one holding a clone of that `Arc`, so the snapshot holds
     /// the state, and holds off applies, only for the clone. None, the
     /// default, builds the text under the state.
+    ///
+    /// The closure must read only state fixed at this call. Entries may
+    /// be applied before it runs: one that reads anything an apply
+    /// changes reports the text of a later revision than the snapshot
+    /// names.
     fn text_later(&self) -> Option<Box<dyn FnOnce() -> String + Send>> {
         None
     }

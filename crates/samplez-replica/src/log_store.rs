@@ -694,6 +694,10 @@ impl<P> Store<P> {
         assert_no_product_code("store");
         let key = Arc::as_ptr(&self.gate) as usize;
         if GATES.with(|g| g.borrow().contains(&key)) {
+            debug_assert!(
+                !write,
+                "an apply or install on a thread inside with_state would wait for itself"
+            );
             return None;
         }
         let held = if write {
@@ -1266,8 +1270,11 @@ mod tests {
         let _ = fs::remove_dir_all(&later_dir);
     }
 
-    /// Two `with_state` closures run side by side: the second starts
-    /// while the first waits for it.
+    /// Two `with_state` closures share the gate: the second starts while
+    /// the first runs. This holds only while no apply is pending, which
+    /// would hold the second off; a closure waiting for another thread's
+    /// read, as here, is the pattern `with_state` forbids, and the test
+    /// shows no more than that readers share the gate.
     #[test]
     fn with_state_closures_run_side_by_side() {
         let dir = dir("with-state-side-by-side");
@@ -1281,6 +1288,38 @@ mod tests {
                 .expect("the second closure waited for the first");
         });
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An apply on a thread inside `with_state` panics rather than wait
+    /// for the state its own closure holds.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "an apply or install on a thread inside with_state")]
+    fn an_apply_inside_with_state_panics() {
+        let dir = dir("apply-inside-with-state");
+        let store = open(&dir);
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            store.with_state(|_| {
+                let mut store = store.clone();
+                runtime
+                    .block_on(store.apply_to_state_machine(&[entry(1)]))
+                    .is_ok()
+            })
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the apply deadlocked on its own thread"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// A closure the store runs under its lock, as it runs product code,
