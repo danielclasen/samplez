@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.13.0](https://github.com/danielclasen/samplez/compare/v0.12.3...v0.13.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** Product requires Sync.
+
+### Bug Fixes
+
+* **replica:** stop with_state closures deadlocking the contact loop ([#135](https://github.com/danielclasen/samplez/issues/135)) ([c90052f](https://github.com/danielclasen/samplez/commit/c90052fbd69406cd8998327cd0a886968473a683))
+
 ## [0.12.3](https://github.com/danielclasen/samplez/compare/v0.12.2...v0.12.3) (2026-11-19)
 
 
