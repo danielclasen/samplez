@@ -18,8 +18,8 @@ use mxl_sys::MXL_ERR_OUT_OF_RANGE_TOO_EARLY;
 use rtrb::{Consumer, Producer};
 use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{
-    KWeighting, MAX_DUCKS, Matrix, PlanarBuffer, Ramp, Started, Strip, StripParam, TruePeak,
-    accumulate,
+    KWeighting, Limiter, LimiterParams, MAX_DUCKS, Matrix, PlanarBuffer, Ramp, Started, Strip,
+    StripParam, TruePeak, accumulate,
 };
 use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{FlowWriter, Write};
@@ -89,7 +89,8 @@ pub struct Counters {
     /// arrived: applied, with the slot silent until it arrives.
     pub generation_late: AtomicU64,
     /// Strip entries the slot's strip refused, or for a slot without a
-    /// strip: not applied, and each one marks the engine diverged.
+    /// strip, and limiter entries for an output without a limiter: not
+    /// applied, and each one marks the engine diverged.
     pub strip_refused: AtomicU64,
     /// Duck settings a detector refused: not applied. The engine checks
     /// them against its configuration when they are appended, so none is
@@ -497,12 +498,18 @@ pub(crate) enum Change {
     Detach { slot: usize },
     /// Sets one parameter of the slot's strip from the index.
     Strip { slot: usize, param: StripParam },
+    /// Sets the output's limiter from the index.
+    Limiter {
+        output: usize,
+        params: LimiterParams,
+    },
     /// The output is written from the index on, once it has a writer, or
     /// disabled: nothing is written from the index on and its writer is
     /// handed back.
     Output { output: usize, enabled: bool },
     /// The engine entries of one log entry, folded: its gains, strip
-    /// parameters (`strips` says whether it has any), `InputDown`s and
+    /// and limiter parameters (`strips` says whether it has any),
+    /// `InputDown`s and
     /// `Output`s in
     /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
     /// slots it raises after them and those it re-routes, all of one
@@ -562,7 +569,7 @@ impl Change {
     pub fn in_core(&self, strips: bool) -> bool {
         match *self {
             Change::Gain { .. } | Change::InputDown { .. } | Change::Output { .. } => true,
-            Change::Strip { .. } => strips,
+            Change::Strip { .. } | Change::Limiter { .. } => strips,
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => false,
             Change::Batch {
                 strips: has,
@@ -730,6 +737,9 @@ pub(crate) struct Out {
     pub hold: Hold,
     /// The page hashes, in replicated mode with more than one voter.
     pub pages: Option<Pages>,
+    /// The output's limiter, when configured: run on every block
+    /// computed, before the write, the page hash and the meters.
+    pub limiter: Option<Limiter>,
 }
 
 /// The shortest sleep between two reads of the input heads while the RT
@@ -1493,6 +1503,10 @@ fn capture_core(
     c.outputs_disabled = (outs.iter().enumerate())
         .filter(|(_, o)| !o.enabled)
         .fold(0, |m, (o, _)| m | bit(o));
+    for (d, o) in c.limiters.iter_mut().zip(outs) {
+        // A limiter holds no heap memory: the copy allocates nothing.
+        d.clone_from(&o.limiter);
+    }
     for (d, s) in c.slots.iter_mut().zip(slots) {
         d.up = s.up;
         d.held = s.held;
@@ -1948,7 +1962,7 @@ impl Rt {
             // core brought, or on its pending list, applied here at its
             // index; taken through that core.
             match &mut entry.change {
-                Change::Strip { .. } => {
+                Change::Strip { .. } | Change::Limiter { .. } => {
                     self.mix.last_taken = self.mix.last_taken.max(entry.id);
                     return;
                 }
@@ -2202,14 +2216,13 @@ impl Rt {
             add(&self.counters.entries_without_core, 1);
             match e.change {
                 Change::Strip { slot, param } => self.set_strip(e, slot, param),
+                Change::Limiter { output, params } => self.set_limiter(e, output, params),
                 Change::Batch { strips, .. } => {
                     let b = self.mix.take_batch(e.id);
-                    // Without strips, its strip parameters are in the
-                    // strips the last replayed core brought.
+                    // Without strips, its strip and limiter parameters are
+                    // in those the last replayed core brought.
                     if let Some(b) = b.as_ref().filter(|_| strips) {
-                        for &(slot, param) in &b.strips {
-                            self.set_strip(e, slot as usize, param);
-                        }
+                        self.set_params(e, b);
                     }
                     self.retire(b);
                 }
@@ -2322,6 +2335,31 @@ impl Rt {
         }
     }
 
+    /// Sets the limiter of output `output` from the index of entry `e`,
+    /// which carries it; a refusal is counted and reported as a strip's.
+    fn set_limiter(&mut self, e: RtEntry, output: usize, params: LimiterParams) {
+        let set =
+            (self.outs[output].limiter.as_mut()).is_some_and(|l| l.set_at(e.at_index, params));
+        if !set {
+            add(&self.counters.strip_refused, 1);
+            let entry = RtEntry {
+                change: Change::Limiter { output, params },
+                ..e
+            };
+            self.send(Telemetry::StripRefused { entry });
+        }
+    }
+
+    /// Sets the strip and limiter parameters of batch `b`, of entry `e`.
+    fn set_params(&mut self, e: RtEntry, b: &Batch) {
+        for &(slot, param) in &b.strips {
+            self.set_strip(e, slot as usize, param);
+        }
+        for &(output, params) in &b.limiters {
+            self.set_limiter(e, output as usize, params);
+        }
+    }
+
     /// Applies entry `e`, other than a gain change, at the start of the
     /// block at its index: a batch's `InputDown`s, duck settings, strip
     /// parameters and generation-needing entry, its gains, duck masks and
@@ -2369,9 +2407,7 @@ impl Rt {
             return;
         };
         if let Some(b) = b.filter(|_| strips && has) {
-            for &(slot, param) in &b.strips {
-                self.set_strip(e, slot as usize, param);
-            }
+            self.set_params(e, b);
         }
         self.apply_generation(e);
     }
@@ -2389,6 +2425,7 @@ impl Rt {
                 }
             }
             Change::Strip { slot, param } => self.set_strip(e, slot, param),
+            Change::Limiter { output, params } => self.set_limiter(e, output, params),
             Change::Output { output, enabled } => self.set_output(output, enabled),
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => {
                 self.apply_generation(e)
@@ -2700,6 +2737,21 @@ impl Rt {
             &mut self.outbuf,
             sink,
         );
+        // Each limiter on its output's channels, before anything reads
+        // them.
+        for out in &mut self.outs {
+            let Some(limiter) = &mut out.limiter else {
+                continue;
+            };
+            let legs = &mut self.scratch[..out.channels * b];
+            for (c, leg) in legs.chunks_exact_mut(b).enumerate() {
+                leg.copy_from_slice(&self.outbuf.channel(out.first_channel + c)[..b]);
+            }
+            limiter.process(start, legs, b);
+            for (c, leg) in legs.chunks_exact(b).enumerate() {
+                self.outbuf.channel_mut(out.first_channel + c)[..b].copy_from_slice(leg);
+            }
+        }
 
         let digest = self
             .replica
@@ -2977,6 +3029,11 @@ impl Rt {
                 d.strip_pos = s.strip_pos;
             }
         }
+        if strips {
+            for (d, l) in self.outs.iter_mut().zip(&c.limiters) {
+                d.limiter.clone_from(l);
+            }
+        }
         // An entry applied here before its generation arrived keeps
         // waiting for it: the core knew the entry, a refusal as Missed says
         // so otherwise, but holds no generation, and the one this thread
@@ -3048,7 +3105,8 @@ impl Rt {
         let counter = match h.answer {
             Answer::Installed => {
                 self.install_core(&mut h.core, h.last_id, h.replayed);
-                // A product state's strip parameters, from the install on.
+                // A product state's strip and limiter parameters, from the
+                // install on.
                 let e = RtEntry {
                     id: h.last_id,
                     at_index: first * self.block,
@@ -3062,6 +3120,10 @@ impl Rt {
                 for n in 0..h.strips.len() {
                     let (slot, param) = h.strips[n];
                     self.set_strip(e, slot, param);
+                }
+                for n in 0..h.limiters.len() {
+                    let (output, params) = h.limiters[n];
+                    self.set_limiter(e, output, params);
                 }
                 // The page holding the boundary mixes both states: no
                 // record.
@@ -3643,10 +3705,20 @@ mod tests {
             meter: OutMeter::new(1),
             hold: crate::blocks::Hold::new(1, B, 0, true),
             pages: None,
+            limiter: None,
         };
-        let outs = [out(true), out(false), out(true)];
+        let mut outs = [out(true), out(false), out(true)];
+        // A limiter mid-reduction: its rings and released gain are core.
+        let mut limiter = Limiter::new(1, 480);
+        assert!(limiter.set(LimiterParams {
+            enabled: true,
+            ceiling_db: -6.0,
+            release_ms: 50.0,
+        }));
+        limiter.process(0, &mut [0.9; 96], 96);
+        outs[1].limiter = Some(limiter.clone());
 
-        let mut c = Core::new(1, 1, 2, 4);
+        let mut c = Core::new(1, 1, 2, 4, 3);
         capture_core(&mut c, &m, &slots, &outs, &awaiting, Some(11), &r);
         let want = Core {
             matrix: m.matrix.clone(),
@@ -3680,6 +3752,7 @@ mod tests {
                     strip_pos: None,
                 },
             ],
+            limiters: vec![None, Some(limiter), None],
             awaiting_gen: awaiting.to_vec(),
             pending_gen: Some(11),
             unresolved: vec![(8, 21 * B), (9, 30 * B)],
@@ -4049,7 +4122,7 @@ mod tests {
                 slot(true, false, None, false, None),
                 slot(true, false, None, false, None),
             ];
-            let mut c = Core::new(2, 2, 2, 0);
+            let mut c = Core::new(2, 2, 2, 0, 1);
             capture_core(&mut c, &self.mix, &slots, &[], &[], None, &replica());
             let copy = CoreCopy {
                 k0,

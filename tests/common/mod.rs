@@ -811,6 +811,7 @@ pub fn hold_scenario(e: &Engine) {
         e.counters().blocks_without_core.load(Ordering::Relaxed) > 5
     });
     let state = samplez::ProductState {
+        limiters: Vec::new(),
         gains: vec![vec![1.0]],
         up: vec![true],
         flows: e

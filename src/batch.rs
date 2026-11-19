@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{MAX_DUCKS, StripParam, valid_gain};
+use samplez_dsp::{LimiterParams, MAX_DUCKS, StripParam, valid_gain};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ducks::{DuckChange, valid_depth};
@@ -152,6 +152,8 @@ pub(crate) struct Batch {
     /// Strip parameters by slot, one per parameter key ([`strip_key`]),
     /// ascending by slot and key.
     pub strips: Vec<(u32, StripParam)>,
+    /// Limiter parameters by output, ascending.
+    pub limiters: Vec<(u32, LimiterParams)>,
     /// The slots going down, ascending.
     pub downs: Vec<u32>,
     /// The outputs enabled (true) or disabled, ascending.
@@ -194,6 +196,8 @@ impl Batch {
                 .strips
                 .windows(2)
                 .all(|w| (w[0].0, strip_key(&w[0].1)) < (w[1].0, strip_key(&w[1].1)))
+            && self.limiters.iter().all(|(_, p)| p.check().is_ok())
+            && self.limiters.windows(2).all(|w| w[0].0 < w[1].0)
             && self.downs.windows(2).all(|w| w[0] < w[1])
             && self.outputs.windows(2).all(|w| w[0].0 < w[1].0)
             && self
@@ -215,6 +219,8 @@ impl Batch {
     /// Whether every value fits an engine of `inputs` input and `columns`
     /// matrix channels, `outputs` outputs, input slots of `legs` legs and
     /// the duck columns `ducked`: a mask other than 0 only on those.
+    /// Limiter parameters fit any output: one without a limiter refuses
+    /// them on the RT thread, as a slot without a strip does.
     pub fn fits(
         &self,
         inputs: usize,
@@ -234,6 +240,7 @@ impl Batch {
             && self.strips.iter().all(strip)
             && self.downs.iter().all(|&s| (s as usize) < legs.len())
             && self.outputs.iter().all(|&(o, _)| (o as usize) < outputs)
+            && self.limiters.iter().all(|&(o, _)| (o as usize) < outputs)
             && self.ducks.iter().all(|(_, c)| c.fits(legs))
             && self
                 .depths
@@ -272,7 +279,8 @@ struct SlotFold {
 /// fold into: none for no change, a single change as itself, more, or
 /// any duck setting, depth or mask, as a [`Change::Batch`] with its
 /// batch. Per coefficient, strip parameter key, duck setting kind, depth
-/// and mask the last value counts, and per output its last `Output`. Per
+/// and mask the last value counts, and per output its last `Output`
+/// and its last limiter parameters. Per
 /// input slot a `Route` and its up or
 /// down state are kept apart ([`SlotFold`]): an `InputUp` and a `Route`
 /// raise the slot on the new flow, a `Route` and an `InputDown` leave it
@@ -292,6 +300,7 @@ pub(crate) fn fold(
     let mut depths = BTreeMap::new();
     let mut masks = BTreeMap::new();
     let mut outputs = BTreeMap::new();
+    let mut limiters = BTreeMap::new();
     for &item in items {
         let c = match item {
             Item::Change(c) => c,
@@ -322,6 +331,9 @@ pub(crate) fn fold(
             }
             Change::Strip { slot, param } => {
                 strips.insert((slot as u32, strip_key(&param)), param);
+            }
+            Change::Limiter { output, params } => {
+                limiters.insert(output as u32, params);
             }
             Change::Route { slot } | Change::Detach { slot } => {
                 let s = slots.entry(slot).or_default();
@@ -355,6 +367,7 @@ pub(crate) fn fold(
     let detached = mask(|s| s.detached);
     let facts = gains.len()
         + strips.len()
+        + limiters.len()
         + downs.len()
         + outputs.len()
         + up.count_ones() as usize
@@ -377,6 +390,11 @@ pub(crate) fn fold(
                 slot: slot as usize,
                 param,
             }
+        } else if let Some((&output, &params)) = limiters.first_key_value() {
+            Change::Limiter {
+                output: output as usize,
+                params,
+            }
         } else if let Some(&slot) = downs.first() {
             Change::InputDown {
                 slot: slot as usize,
@@ -398,6 +416,7 @@ pub(crate) fn fold(
     let batch = Batch {
         gains: Coefs::of(gains.into_iter().collect(), coefficients),
         strips: strips.into_iter().map(|((s, _), p)| (s, p)).collect(),
+        limiters: limiters.into_iter().collect(),
         downs,
         outputs: outputs.into_iter().collect(),
         ducks: ducks.into_iter().map(|((g, _), c)| (g, c)).collect(),
@@ -407,7 +426,7 @@ pub(crate) fn fold(
         masks: Coefs::of(masks.into_iter().collect(), coefficients),
     };
     let change = Change::Batch {
-        strips: !batch.strips.is_empty(),
+        strips: !batch.strips.is_empty() || !batch.limiters.is_empty(),
         up,
         routed,
         detached,
@@ -532,6 +551,44 @@ mod tests {
         assert!(!unordered.sane());
     }
 
+    /// An output's limiter parameters in one log entry: the last counts,
+    /// a lone one is itself, and a batch holding them says it sets
+    /// parameters, as one holding strip parameters does.
+    #[test]
+    fn an_outputs_last_limiter_parameters_win() {
+        let set = |output, ceiling_db| Change::Limiter {
+            output,
+            params: samplez_dsp::LimiterParams {
+                enabled: true,
+                ceiling_db,
+                release_ms: 50.0,
+            },
+        };
+        let one = |changes: &[Change]| fold(&items(changes), 2, 4).unwrap().unwrap();
+        assert_eq!(one(&[set(1, -1.0), set(1, -2.0)]), (set(1, -2.0), None));
+        let (change, batch) = one(&[set(3, -1.0), set(0, -1.0), set(3, -3.0)]);
+        assert!(
+            matches!(change, Change::Batch { strips: true, .. }),
+            "{change:?}"
+        );
+        let batch = batch.unwrap();
+        let params = |c: Change| match c {
+            Change::Limiter { params, .. } => params,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            batch.limiters,
+            [(0, params(set(0, -1.0))), (3, params(set(3, -3.0)))]
+        );
+        assert!(batch.sane() && batch.fits(2, 2, 4, &[1, 1], &[]));
+        assert!(!batch.fits(2, 2, 3, &[1, 1], &[]), "output 3 of 3");
+        let mut bad = (*batch).clone();
+        bad.limiters[0].1.ceiling_db = 3.0;
+        assert!(!bad.sane());
+        bad.limiters = vec![batch.limiters[1], batch.limiters[0]];
+        assert!(!bad.sane());
+    }
+
     /// Of a slot's `Route`s and `Detach`es in one log entry the last
     /// counts: a `Detach` after a `Route` leaves the slot detached, a
     /// `Route` after a `Detach` re-routes it, and either is one change.
@@ -587,6 +644,7 @@ mod tests {
                 Some(Arc::new(Batch {
                     gains: Gains::Sparse(Vec::new()),
                     strips: Vec::new(),
+                    limiters: Vec::new(),
                     downs: Vec::new(),
                     outputs: Vec::new(),
                     ducks: Vec::new(),

@@ -2,7 +2,9 @@
 //! that holds its engine's targets as values gives the engine only the
 //! entries that move it from one set of targets to the next.
 
-use samplez_dsp::{CompParams, DetectorParams, EqBand, GateParams, KeyFilter, StripParam};
+use samplez_dsp::{
+    CompParams, DetectorParams, EqBand, GateParams, KeyFilter, LimiterParams, StripParam,
+};
 
 use crate::batch::strip_key;
 use crate::ducks::{DuckSetting, DuckTargets};
@@ -19,6 +21,10 @@ pub struct Targets {
     /// Per input slot, its strip parameters; of two with one key (one
     /// band, one leg, the gate), the later counts.
     pub strips: Vec<Vec<StripParam>>,
+    /// Per output, its limiter parameters, for an output configured with
+    /// `limiter`; none, or an output past the list, leaves the limiter as
+    /// the engine holds it.
+    pub limiters: Vec<Option<LimiterParams>>,
     /// Per duck group, its settings.
     pub ducks: Vec<DuckTargets>,
     /// The duck mask of each coefficient, shaped as `gains`.
@@ -37,7 +43,9 @@ impl Targets {
     /// The entries that move an engine holding `self` to `next`: a `Gain`
     /// for each coefficient whose bit pattern differs, row by row; a
     /// `Strip` for each parameter that differs in any field's bit
-    /// pattern, by slot and parameter; a `Duck` for each setting of a
+    /// pattern, by slot and parameter; a `Limiter` for each output's
+    /// parameters that differ in any field's bit pattern; a `Duck` for
+    /// each setting of a
     /// group that differs in any field's bit pattern, by group, its
     /// parameters, keys, mode and hold, then its depths by slot; a
     /// `DuckMask` for each coefficient whose mask differs, row by row, a
@@ -66,6 +74,14 @@ impl Targets {
             }
         }
         strip_entries(&self.strips, &next.strips, &mut entries);
+        for (output, params) in next.limiters.iter().enumerate() {
+            let held = self.limiters.get(output).copied().flatten();
+            if let Some(params) = *params
+                && held.is_none_or(|h| !same_limiter(&h, &params))
+            {
+                entries.push(Entry::Limiter { output, params });
+            }
+        }
         duck_entries(self, next, &mut entries);
         for (slot, flow) in next.flows.iter().enumerate() {
             if self.flows.get(slot) != Some(flow) {
@@ -82,8 +98,8 @@ impl Targets {
         entries
     }
 
-    /// The entries that set every gain, strip parameter and duck setting
-    /// of `self`, whatever an engine holds, in the order of
+    /// The entries that set every gain, strip and limiter parameter and
+    /// duck setting of `self`, whatever an engine holds, in the order of
     /// [`Targets::diff`], a `Route`, or a `Detach` for a slot without a
     /// flow, for each of `slots` in ascending order, and an `Output` for
     /// each output `self` holds. Of the duck masks,
@@ -158,6 +174,13 @@ fn strip_entries(was: &[Vec<StripParam>], next: &[Vec<StripParam>], entries: &mu
             }
         }
     }
+}
+
+/// Whether two limiter settings agree in every field's bit pattern.
+fn same_limiter(a: &LimiterParams, b: &LimiterParams) -> bool {
+    a.enabled == b.enabled
+        && a.ceiling_db.to_bits() == b.ceiling_db.to_bits()
+        && a.release_ms.to_bits() == b.release_ms.to_bits()
 }
 
 /// The `Duck` and `DuckMask` entries of [`Targets::diff`], appended to
@@ -787,6 +810,14 @@ mod tests {
                 }
             }
         }
+        for (output, params) in next.limiters.iter().enumerate() {
+            let held = was.limiters.get(output).copied().flatten();
+            if let Some(params) = *params
+                && held.is_none_or(|h| format!("{h:?}") != format!("{params:?}"))
+            {
+                entries.push(Entry::Limiter { output, params });
+            }
+        }
         for (slot, flow) in next.flows.iter().enumerate() {
             if was.flows.get(slot) != Some(flow) {
                 entries.push(match flow {
@@ -799,6 +830,52 @@ mod tests {
             }
         }
         entries
+    }
+
+    /// A limiter's parameters get an entry when they differ in any
+    /// field's bits, none when equal or not given, and every given one
+    /// from `assert`.
+    #[test]
+    fn limiter_parameters_differ_by_bits() {
+        let p = |enabled, ceiling_db| LimiterParams {
+            enabled,
+            ceiling_db,
+            release_ms: 50.0,
+        };
+        let was = Targets {
+            limiters: vec![Some(p(true, -1.0)), None, Some(p(true, -0.0))],
+            ..Targets::default()
+        };
+        let next = Targets {
+            limiters: vec![
+                Some(p(true, -1.0)),
+                Some(p(false, -1.0)),
+                Some(p(true, 0.0)),
+            ],
+            ..Targets::default()
+        };
+        assert_eq!(
+            was.diff(&next),
+            [
+                Entry::Limiter {
+                    output: 1,
+                    params: p(false, -1.0)
+                },
+                Entry::Limiter {
+                    output: 2,
+                    params: p(true, 0.0)
+                },
+            ]
+        );
+        assert_eq!(next.diff(&was).len(), 1, "output 1 none keeps the engine's");
+        assert!(was.diff(&was).is_empty());
+        let all = next.assert(&[], None);
+        assert_eq!(
+            all.iter()
+                .filter(|e| matches!(e, Entry::Limiter { .. }))
+                .count(),
+            3
+        );
     }
 
     /// A xorshift generator, so a failing case reproduces.
@@ -879,6 +956,15 @@ mod tests {
                     .map(|_| [Some("a"), Some("b"), None][self.below(3)].map(Into::into))
                     .collect(),
                 strips,
+                limiters: (0..self.below(3))
+                    .map(|_| {
+                        (self.below(3) > 0).then(|| LimiterParams {
+                            enabled: self.below(2) == 1,
+                            ceiling_db: self.value(),
+                            release_ms: self.value(),
+                        })
+                    })
+                    .collect(),
                 ..Targets::default()
             }
         }

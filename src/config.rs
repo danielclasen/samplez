@@ -199,6 +199,12 @@ pub struct Output {
     /// measured). Without it every channel is weighted 1.
     #[serde(default)]
     pub loudness_channels: Option<Vec<String>>,
+    /// Whether the output has a limiter ([`samplez_dsp::Limiter`]), off
+    /// until a `Limiter` entry sets it; false by default. An output with
+    /// one is [`samplez_dsp::LIMITER_DELAY`] samples late, the limiter on
+    /// or off. At most [`samplez_dsp::strip::MAX_LEGS`] channels wide.
+    #[serde(default)]
+    pub limiter: bool,
 }
 
 impl Output {
@@ -532,6 +538,13 @@ impl Config {
             samplez_mxl::output::flow_definition(&self.output_config(o))
                 .map_err(|e| Error(format!("output {}: {e}", o.name)))?;
             o.loudness_weights()?;
+            let max = samplez_dsp::strip::MAX_LEGS;
+            if o.limiter && o.channels as usize > max {
+                return fail(format!(
+                    "output {}: {} channels, a limiter takes at most {max}",
+                    o.name, o.channels
+                ));
+            }
         }
         for (slot, i) in self.inputs.iter().enumerate() {
             if let Some(flow_id) = &i.flow_id {
@@ -661,6 +674,22 @@ mod tests {
     /// an empty id is refused as any invalid id is, and an input without
     /// a flow skips the check against the outputs' flows. An output
     /// starts enabled unless `enabled` is false.
+    /// An output has no limiter unless `limiter` is true, and takes one
+    /// only up to a strip's width.
+    #[test]
+    fn a_limiter_is_opt_in_and_at_most_eight_channels_wide() {
+        assert!(!parse(&base()).unwrap().outputs[0].limiter);
+        let mut v = base();
+        v["outputs"][0]["limiter"] = serde_json::json!(true);
+        assert!(parse(&v).unwrap().outputs[0].limiter);
+        v["outputs"][0]["channels"] = serde_json::json!(9);
+        v["matrix"] = serde_json::json!(vec![vec![0.5; 9]; 2]);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("a limiter takes at most 8"), "{e}");
+        v["outputs"][0]["limiter"] = serde_json::json!(false);
+        assert!(parse(&v).is_ok());
+    }
+
     #[test]
     fn an_input_flow_is_optional_and_an_output_starts_enabled_by_default() {
         let c = parse(&base()).unwrap();

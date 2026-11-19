@@ -3757,6 +3757,7 @@ mod tests {
         fn product_state(&self) -> (u64, u64, ProductState) {
             let log = self.0.lock().unwrap();
             let state = ProductState {
+                limiters: Vec::new(),
                 gains: Vec::new(),
                 up: Vec::new(),
                 flows: log.flows.clone(),

@@ -1,6 +1,6 @@
 //! DSP core of samplez: planar buffers, gain ramps, the mixing matrix,
-//! the input channel strip, the duck detector, meters, true peak and
-//! loudness, and history rings.
+//! the input channel strip, the output limiter, the duck detector,
+//! meters, true peak and loudness, and history rings.
 //!
 //! Every `process` function works on state and scratch allocated at
 //! construction and does not allocate.
@@ -16,6 +16,7 @@ mod dynamics;
 mod history;
 mod kweight;
 mod level;
+pub mod limiter;
 mod loudness;
 mod matrix;
 mod meter;
@@ -34,6 +35,7 @@ pub use buffer::{MAX_FRAMES, PlanarBuffer};
 pub use duck::{Detector, DetectorParams, DuckMode, DuckParam, KeyFilter, MAX_DUCKS, duck_gain};
 pub use history::{History, Started};
 pub use kweight::KWeighting;
+pub use limiter::{LIMITER_DELAY, Limiter, LimiterParams};
 pub use loudness::{Loudness, SLICE, WINDOW, lufs, weight};
 pub use matrix::{MAX_COEFFICIENTS, Matrix, Path};
 pub use meter::{Meters, accumulate};

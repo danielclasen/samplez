@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use samplez_dsp::duck::{DEPTH_DB, MAX_KEYS};
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{DuckParam, MAX_DUCKS, Matrix, PlanarBuffer, Started, StripParam};
+use samplez_dsp::{
+    DuckParam, Limiter, LimiterParams, MAX_DUCKS, Matrix, PlanarBuffer, Started, StripParam,
+};
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, RECOVERY_NS, Recovery,
     Timing,
@@ -290,6 +292,13 @@ pub enum Entry {
     /// Sets parameter `param` of input slot `slot`'s strip from the
     /// entry's index, ramping over the ramp length.
     Strip { slot: usize, param: StripParam },
+    /// Sets the limiter of output `output`, one configured with
+    /// `limiter`, from the entry's index: switching it on or off ramps
+    /// over the ramp length.
+    Limiter {
+        output: usize,
+        params: LimiterParams,
+    },
     /// Sets `setting` of duck group `group`, below [`MAX_DUCKS`], from the
     /// entry's index.
     Duck { group: usize, setting: DuckSetting },
@@ -666,6 +675,18 @@ fn product_strips(strips: &[Vec<StripParam>]) -> Vec<(usize, StripParam)> {
     folded.into_iter().map(|((slot, _), p)| (slot, p)).collect()
 }
 
+/// Whether output `output` exists, has a limiter and the limiter takes
+/// `params`.
+fn check_limiter(config: &Config, output: usize, params: &LimiterParams) -> Result<(), String> {
+    let Some(o) = config.outputs.get(output) else {
+        return Err(format!("no output {output}"));
+    };
+    if !o.limiter {
+        return Err(format!("output {output} has no limiter"));
+    }
+    params.check()
+}
+
 /// Whether input slot `slot` exists and has a strip that takes `param`:
 /// one of 1 to [`MAX_LEGS`] channels.
 fn check_strip(config: &Config, slot: usize, param: &StripParam) -> Result<(), String> {
@@ -878,9 +899,9 @@ fn history_kept(started: &Started, k0: u64, slack: u64) -> Result<(), u64> {
 /// its entry ring at most ([`Engine::commit`]).
 pub const WAITING: usize = 4 * PENDING_CHANGES;
 
-/// A core buffer's shape: input and output channels, input slots and the
-/// room for one page's entries.
-type Shape = (usize, usize, usize, usize);
+/// A core buffer's shape: input and output channels, input slots, the
+/// room for one page's entries and outputs.
+type Shape = (usize, usize, usize, usize, usize);
 
 fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
     let mut in_domains: Vec<usize> = Vec::new();
@@ -961,6 +982,7 @@ fn replay_rt(
                 meter: OutMeter::new(ch),
                 hold: Hold::new(ch, b, 0, true),
                 pages: Some(Pages::new(o as u32, ch, b, 0)),
+                limiter: out.limiter.then(|| Limiter::new(ch, config.ramp_samples)),
             }
         })
         .collect();
@@ -1284,6 +1306,7 @@ impl Engine {
                         config.columns(),
                         config.inputs.len(),
                         page_entries,
+                        config.outputs.len(),
                     ),
                     slack_blocks: config.history_slack_blocks(),
                 })
@@ -1337,6 +1360,9 @@ impl Engine {
                 pages: hash_tx
                     .is_some()
                     .then(|| Pages::new(n as u32, o.channels as usize, b, hold_blocks)),
+                limiter: o
+                    .limiter
+                    .then(|| Limiter::new(o.channels as usize, config.ramp_samples)),
             });
             channel += o.channels as usize;
         }
@@ -1703,6 +1729,22 @@ impl Engine {
     ) -> Result<(), GainError> {
         check_strip(&self.config, slot, &param).map_err(GainError::Invalid)?;
         self.set_local(Change::Strip { slot, param }, at_index, "strip changes")
+    }
+
+    /// Sets the limiter of output `output` to `params` from sample index
+    /// `at_index`, a multiple of the block size. Refused as
+    /// [`Engine::set_gain`] refuses a change, and as invalid for an output
+    /// that does not exist or is configured without `limiter`, and for
+    /// parameters a limiter refuses ([`LimiterParams::check`]).
+    pub fn set_limiter(
+        &self,
+        output: usize,
+        params: LimiterParams,
+        at_index: u64,
+    ) -> Result<(), GainError> {
+        check_limiter(&self.config, output, &params).map_err(GainError::Invalid)?;
+        let change = Change::Limiter { output, params };
+        self.set_local(change, at_index, "limiter changes")
     }
 
     /// Sets `setting` of duck group `group` from sample index `at_index`,
@@ -2127,6 +2169,10 @@ impl Engine {
                 check_strip(&self.config, slot, &param).map_err(EntryError::Invalid)?;
                 Change::Strip { slot, param }
             }
+            Entry::Limiter { output, params } => {
+                check_limiter(&self.config, output, &params).map_err(EntryError::Invalid)?;
+                Change::Limiter { output, params }
+            }
             Entry::Duck { .. } | Entry::DuckMask { .. } => {
                 return invalid("a duck entry is no single change".to_owned());
             }
@@ -2410,11 +2456,11 @@ impl Engine {
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 };
-                let (n, m, slots, page) = t.shape;
+                let (n, m, slots, page, outs) = t.shape;
                 let mut core = t
                     .spare
                     .take()
-                    .unwrap_or_else(|| Box::new(Core::new(n, m, slots, page)));
+                    .unwrap_or_else(|| Box::new(Core::new(n, m, slots, page, outs)));
                 core.prepare();
                 if t.cores.push(core).is_err() {
                     unreachable!("one buffer is with the RT thread at most");
@@ -2466,7 +2512,7 @@ impl Engine {
             ));
         }
         let c = &mut copy.core;
-        let (n, m, _, page) = self
+        let (n, m, _, page, _) = self
             .transfer
             .as_ref()
             .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).shape)
@@ -2475,7 +2521,11 @@ impl Engine {
         let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
         let ducked = &self.config.duck_columns;
         let outputs = self.config.outputs.len();
-        if !c.fits(n, m, outputs, &legs, self.config.ramp_samples, page, ducked) {
+        let limiters: Vec<Option<usize>> = (self.config.outputs.iter())
+            .map(|o| o.limiter.then_some(o.channels as usize))
+            .collect();
+        let ramp = self.config.ramp_samples;
+        if !c.fits(n, m, outputs, &legs, &limiters, ramp, page, ducked) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -2583,7 +2633,7 @@ impl Engine {
         // Up to the last block the RT thread computed, before the first
         // attempt.
         replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
-        self.offer(timeout, 0, true, &[], |j, core| {
+        self.offer(timeout, 0, true, &[], &[], |j, core| {
             replay.run(j);
             replay.rt.capture(core);
             (replay.next - 1, replay.last_id)
@@ -2691,6 +2741,7 @@ impl Engine {
             || state.flows.len() != slots
             || state.strips.len() != slots
             || state.outputs.len() > self.config.outputs.len()
+            || state.limiters.len() > self.config.outputs.len()
         {
             return Err(ReplayError::Invalid(format!(
                 "a product state of the shape {n} x {m} with {slots} inputs and at most {} \
@@ -2708,6 +2759,11 @@ impl Engine {
                 check_strip(&self.config, slot, param).map_err(ReplayError::Invalid)?;
             }
         }
+        for (output, params) in state.limiters.iter().enumerate() {
+            if let Some(params) = params {
+                check_limiter(&self.config, output, params).map_err(ReplayError::Invalid)?;
+            }
+        }
         check_product_ducks(&self.config, state).map_err(ReplayError::Invalid)?;
         if let Some(gain) = (state.gains.iter().flatten()).find(|g| !samplez_dsp::valid_gain(**g)) {
             return Err(ReplayError::Invalid(format!(
@@ -2715,6 +2771,9 @@ impl Engine {
             )));
         }
         let strips = product_strips(&state.strips);
+        let limiters: Vec<(usize, LimiterParams)> = (state.limiters.iter().enumerate())
+            .filter_map(|(o, p)| Some((o, (*p)?)))
+            .collect();
         // The entries of one log entry are adjacent and fold into one.
         let mut pending = Vec::with_capacity(state.pending.len());
         let mut batches = Vec::new();
@@ -2815,7 +2874,7 @@ impl Engine {
         let mut cold = crate::ducks::DuckCore::new(ramp);
         cold.cold(ramp, &state.ducks, legs);
         cold.settle(ramp, 0);
-        self.offer(left(), at_least, false, &strips, |j, core| {
+        self.offer(left(), at_least, false, &strips, &limiters, |j, core| {
             gains.copy_from_slice(&targets);
             up.copy_from_slice(&state.up);
             let mut disabled = disabled_targets;
@@ -2841,11 +2900,14 @@ impl Engine {
                     Change::Output { output, enabled } => {
                         disabled = output_disabled(disabled, output, enabled);
                     }
-                    // The core holds neither a generation nor a strip:
-                    // the RT thread applies a passed re-route, detach or
-                    // strip entry itself, taken before the install or
-                    // after.
-                    Change::Route { .. } | Change::Detach { .. } | Change::Strip { .. } => {}
+                    // The core holds neither a generation nor a strip or
+                    // limiter: the RT thread applies a passed re-route,
+                    // detach, strip or limiter entry itself, taken before
+                    // the install or after.
+                    Change::Route { .. }
+                    | Change::Detach { .. }
+                    | Change::Strip { .. }
+                    | Change::Limiter { .. } => {}
                     Change::Batch { up: raised, .. } => {
                         if let Some(b) = batch(e.id) {
                             b.gains.each(|c, g| gains[c] = g);
@@ -2935,6 +2997,7 @@ impl Engine {
         at_least: u64,
         replayed: bool,
         strips: &[(usize, StripParam)],
+        limiters: &[(usize, LimiterParams)],
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
@@ -2944,8 +3007,8 @@ impl Engine {
         };
         let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + timeout;
-        let (n, m, slots, page) = t.shape;
-        let new = || Box::new(Core::new(n, m, slots, page));
+        let (n, m, slots, page, outs) = t.shape;
+        let new = || Box::new(Core::new(n, m, slots, page, outs));
         let mut core = t.spare.take().unwrap_or_else(new);
         // Hand-overs before this one were sent by earlier calls.
         let first = t.seq + 1;
@@ -3031,6 +3094,7 @@ impl Engine {
                 core,
                 replayed,
                 strips: strips.to_vec(),
+                limiters: limiters.to_vec(),
                 answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
@@ -6271,6 +6335,7 @@ mod tests {
             core: copy.core,
             replayed: true,
             strips: Vec::new(),
+            limiters: Vec::new(),
             answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
@@ -6331,7 +6396,7 @@ mod tests {
         let (e, _statuses, _verdicts, domain) = outputs_only("copy-handover", 1);
         copy_left_behind(&e);
         let j = e
-            .offer(Duration::from_secs(5), 0, false, &[], |j, core| {
+            .offer(Duration::from_secs(5), 0, false, &[], &[], |j, core| {
                 bare_core(&e, j, core)
             })
             .unwrap();
@@ -6356,6 +6421,7 @@ mod tests {
         let (e, _statuses, _verdicts, domain) = outputs_only("drop-full", 1);
         let c = &e.counters;
         let state = ProductState {
+            limiters: Vec::new(),
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
@@ -6420,6 +6486,7 @@ mod tests {
         let c = &e.counters;
         CLOCK_STEP_LOOP.store(std::ptr::from_ref(&**c) as usize, Relaxed);
         let state = ProductState {
+            limiters: Vec::new(),
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
@@ -6485,7 +6552,7 @@ mod tests {
             let w = without();
             wait(&|| without() > w + 5);
             let before = installed();
-            let r = e.offer(Duration::from_secs(5), 0, false, &[], |j, core| {
+            let r = e.offer(Duration::from_secs(5), 0, false, &[], &[], |j, core| {
                 CLOCK_STEP_NS.store(-1_500_000_000, Relaxed);
                 bare_core(&e, j, core)
             });
@@ -6614,7 +6681,7 @@ mod tests {
         let (_, control) = rtrb::RingBuffer::new(1);
         let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64, 1));
         rt.capture(&mut core);
         core.pos = Some(480);
         let route = RtEntry {
@@ -6687,7 +6754,7 @@ mod tests {
             }
         )));
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64, 1));
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
@@ -6757,7 +6824,7 @@ mod tests {
         assert!(replayed.set(hpf));
         replayed.advance(480 - 48);
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64, 1));
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
@@ -6824,7 +6891,7 @@ mod tests {
         // core knew both and applied them.
         assert!(rt.mix.push(gain(2, 48)));
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64, 1));
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
@@ -6875,7 +6942,7 @@ mod tests {
         let (mut ring, entries) = rtrb::RingBuffer::new(4);
         rt.entries = entries;
         let (inputs, outputs) = (config.input_channels(), config.output_channels());
-        let mut core = Box::new(Core::new(inputs, outputs, 1, 64));
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64, 1));
         rt.capture(&mut core);
         core.pos = Some(480);
         core.pending.clear();
@@ -7008,7 +7075,7 @@ mod tests {
         let theirs = Arc::new((*mine).clone());
         let (mine_at, theirs_at) = (Arc::as_ptr(&mine), Arc::as_ptr(&theirs));
         assert!(rt.mix.push_with(entry(3), Some(mine)).is_ok());
-        let mut core = Box::new(Core::new(2, 1, 1, 64));
+        let mut core = Box::new(Core::new(2, 1, 1, 64, 1));
         rt.capture(&mut core);
         assert!(
             std::ptr::eq(Arc::as_ptr(&core.batches[0].1), mine_at),
@@ -7203,8 +7270,8 @@ mod tests {
         while n(&e.counters.handovers_installed) == 0 {
             let mut replay = e.replay(copy()).unwrap();
             let mut t = e.transfer.as_ref().unwrap().lock().unwrap();
-            let (inputs, outputs, slots, page) = t.shape;
-            let mut core = Box::new(Core::new(inputs, outputs, slots, page));
+            let (inputs, outputs, slots, page, outs) = t.shape;
+            let mut core = Box::new(Core::new(inputs, outputs, slots, page, outs));
             let p = processed();
             while processed() == p {
                 std::thread::sleep(Duration::from_micros(50));
@@ -7220,6 +7287,7 @@ mod tests {
                 core,
                 replayed: true,
                 strips: Vec::new(),
+                limiters: Vec::new(),
                 answer: Answer::Waiting,
             };
             assert!(t.handovers.push(h).is_ok());
@@ -7266,7 +7334,7 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5), "no stall");
         }
         let mut calls = Vec::new();
-        let _ = e.offer(Duration::from_secs(1), 0, true, &[], |j, _| {
+        let _ = e.offer(Duration::from_secs(1), 0, true, &[], &[], |j, _| {
             calls.push((j, processed()));
             (j, 0)
         });
@@ -7310,7 +7378,7 @@ mod tests {
             Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
         };
         let before = cpu();
-        let err = e.offer(Duration::from_millis(300), 0, true, &[], |j, _| (j, 0));
+        let err = e.offer(Duration::from_millis(300), 0, true, &[], &[], |j, _| (j, 0));
         let spent = cpu() - before;
         assert!(matches!(err, Err(ReplayError::Timeout { .. })), "{err:?}");
         assert!(spent < Duration::from_millis(100), "{spent:?} of CPU");
@@ -7328,7 +7396,7 @@ mod tests {
         let before = e.counters.handovers_passed.load(Relaxed);
         // Each core follows a block two behind the last one computed:
         // every attempt is refused.
-        let err = e.offer(Duration::from_millis(300), 0, true, &[], |j, _| {
+        let err = e.offer(Duration::from_millis(300), 0, true, &[], &[], |j, _| {
             (j.saturating_sub(2), 0)
         });
         let refused = e.counters.handovers_passed.load(Relaxed) - before;

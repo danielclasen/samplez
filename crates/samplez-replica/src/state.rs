@@ -1051,6 +1051,7 @@ mod tests {
             key: None,
             retarget: &|| {
                 let state = samplez::ProductState {
+                    limiters: Vec::new(),
                     gains: Vec::new(),
                     up: Vec::new(),
                     flows: Vec::new(),

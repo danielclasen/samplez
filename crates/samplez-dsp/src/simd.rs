@@ -1,4 +1,5 @@
-//! AVX2 kernels of the matrix and the true-peak filter. The matrix kernel
+//! AVX2 kernels of the matrix and the true-peak filter, the latter whole
+//! and per sample. The matrix kernel
 //! computes, per sample, the operations of [`mix_scalar`] in the same
 //! order: acc = +0.0, then acc = acc + g * x per term in ascending input
 //! order, with the gain g = c0 + k * step inside a ramp and g = target
@@ -156,4 +157,34 @@ pub(crate) fn true_peak_avx2(w: &[f32]) -> (f32, bool) {
     let (tail, tail_nan) = peak_scalar(w, n);
     let peak = lanes.iter().fold(tail, |p, &a| if a > p { a } else { p });
     (peak, tail_nan || _mm256_movemask_ps(nan) != 0)
+}
+
+/// [`crate::true_peak::phase_peaks_scalar`] with AVX2: 8 consecutive
+/// samples per register, the same operations per lane; finite inputs, so
+/// the maximum is the scalar one whatever the order.
+#[target_feature(enable = "avx2")]
+pub(crate) fn phase_peaks_avx2(w: &[f32], out: &mut [f32]) {
+    use crate::true_peak::{COEFFICIENTS, TAPS, phase_peaks_scalar};
+    let history = TAPS - 1;
+    let frames = w.len() - history;
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(i32::MAX));
+    let mut n = 0;
+    while n + 8 <= frames {
+        // SAFETY: n + 8 <= frames <= out.len().
+        let mut peak = unsafe { _mm256_loadu_ps(out.as_ptr().add(n)) };
+        for h in &COEFFICIENTS {
+            let mut acc = _mm256_setzero_ps();
+            for (j, &c) in h.iter().enumerate() {
+                // SAFETY: history + n - j >= 0 and history + n - j + 8 <=
+                // w.len(), since n + 8 <= frames and j <= history.
+                let x = unsafe { _mm256_loadu_ps(w.as_ptr().add(history + n - j)) };
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_set1_ps(c), x));
+            }
+            peak = _mm256_max_ps(_mm256_and_ps(acc, abs_mask), peak);
+        }
+        // SAFETY: as the load.
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(n), peak) };
+        n += 8;
+    }
+    phase_peaks_scalar(w, n, out);
 }
