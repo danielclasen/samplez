@@ -8,7 +8,7 @@
 //! clock) for receipt ages and silence.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::{BasicNode, RaftMetrics};
@@ -20,6 +20,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::Shared;
 use crate::baseline::{Leader, LeaderView, Voter};
 use crate::entry::{Baseline, Body, NodeId, PROTOCOL, Request};
+use crate::lock_watch::{WatchedGuard, WatchedMutex};
 use crate::log_store::Store;
 use crate::peer::{PeerRequest, PeerResponse};
 use crate::rank::Baselines;
@@ -763,7 +764,7 @@ pub struct Contact {
     clocks: Arc<dyn Clocks>,
     audio: Option<Arc<dyn Audio>>,
     log: Arc<dyn LogView>,
-    state: Mutex<State>,
+    state: WatchedMutex<State>,
 }
 
 /// Adds a counted replica's slack to the lead, naming the replica when
@@ -973,85 +974,88 @@ impl Contact {
             clocks,
             audio,
             log,
-            state: Mutex::new(State {
-                members: Members::default(),
-                seq: first_seq,
-                sent: VecDeque::with_capacity(SENT_KEPT),
-                peers: BTreeMap::new(),
-                in_contact: false,
-                regained: Instant::now(),
-                // The engine is built from the state applied; entries after
-                // it are handed as they come.
-                told: applied,
-                floor_told,
-                uncommitted: BTreeMap::new(),
-                scheduled,
-                reserved: None,
-                generations: BTreeMap::new(),
-                catching_up: true,
-                catch_up_to: None,
-                taken_late: BTreeSet::new(),
-                late_given: BTreeSet::new(),
-                rebuilt_past: BTreeSet::new(),
-                own_at: Instant::now(),
-                judged: BTreeSet::new(),
-                learners: BTreeMap::new(),
-                slack: Vec::new(),
-                lead: Lead::with_minute(
-                    timing.block,
-                    index_at(START_LEAD.as_nanos() as u64),
-                    index_at(timing.max_apply_lead.as_nanos() as u64),
-                    timing.lead_minute,
-                ),
-                office_term: 0,
-                leads: BTreeMap::new(),
-                lead_raised_by: None,
-                e_spread: Histogram::default(),
-                known_committed: applied,
-                handed: applied,
-                awaiting: BTreeMap::new(),
-                given: BTreeMap::new(),
-                unlisted_low: None,
-                unlisted: BTreeMap::new(),
-                decisions: Vec::new(),
-                purge_points: Vec::new(),
-                restart: None,
-                rebuild: Rebuild::Idle,
-                resync: crate::resync::Tracker::default(),
-                installs_seen,
-                fence: None,
-                ranks: None,
-                baselines,
-                withhold: Withhold::default(),
-                life,
-                pages: PageBook::default(),
-                leader: Leader::default(),
-                clock: crate::clock::Judge::default(),
-                verifier: crate::verify::Verifier::default(),
-                horizon: crate::horizon::Horizon::default(),
-                held: false,
-                clock_steps: 0,
-                unverified: Vec::new(),
-                unverified_since: None,
-                offset_zero: Vec::new(),
-                #[cfg(test)]
-                verified_always: false,
-                decider: crate::decide::Decider::default(),
-                serving: None,
-                off_flows_since: None,
-                flows_at: 0,
-                verdicts: Vec::new(),
-                realised: Vec::new(),
-                enabled: Vec::new(),
-                generation_ready: true,
-                rollout: None,
-                own: Own::default(),
-                status_changes_lost: 0,
-                entries_refused: 0,
-                entries_filtered: 0,
-                log_overflows: 0,
-                counts: Counts::default(),
-            }),
+            state: WatchedMutex::new(
+                "contact",
+                State {
+                    members: Members::default(),
+                    seq: first_seq,
+                    sent: VecDeque::with_capacity(SENT_KEPT),
+                    peers: BTreeMap::new(),
+                    in_contact: false,
+                    regained: Instant::now(),
+                    // The engine is built from the state applied; entries after
+                    // it are handed as they come.
+                    told: applied,
+                    floor_told,
+                    uncommitted: BTreeMap::new(),
+                    scheduled,
+                    reserved: None,
+                    generations: BTreeMap::new(),
+                    catching_up: true,
+                    catch_up_to: None,
+                    taken_late: BTreeSet::new(),
+                    late_given: BTreeSet::new(),
+                    rebuilt_past: BTreeSet::new(),
+                    own_at: Instant::now(),
+                    judged: BTreeSet::new(),
+                    learners: BTreeMap::new(),
+                    slack: Vec::new(),
+                    lead: Lead::with_minute(
+                        timing.block,
+                        index_at(START_LEAD.as_nanos() as u64),
+                        index_at(timing.max_apply_lead.as_nanos() as u64),
+                        timing.lead_minute,
+                    ),
+                    office_term: 0,
+                    leads: BTreeMap::new(),
+                    lead_raised_by: None,
+                    e_spread: Histogram::default(),
+                    known_committed: applied,
+                    handed: applied,
+                    awaiting: BTreeMap::new(),
+                    given: BTreeMap::new(),
+                    unlisted_low: None,
+                    unlisted: BTreeMap::new(),
+                    decisions: Vec::new(),
+                    purge_points: Vec::new(),
+                    restart: None,
+                    rebuild: Rebuild::Idle,
+                    resync: crate::resync::Tracker::default(),
+                    installs_seen,
+                    fence: None,
+                    ranks: None,
+                    baselines,
+                    withhold: Withhold::default(),
+                    life,
+                    pages: PageBook::default(),
+                    leader: Leader::default(),
+                    clock: crate::clock::Judge::default(),
+                    verifier: crate::verify::Verifier::default(),
+                    horizon: crate::horizon::Horizon::default(),
+                    held: false,
+                    clock_steps: 0,
+                    unverified: Vec::new(),
+                    unverified_since: None,
+                    offset_zero: Vec::new(),
+                    #[cfg(test)]
+                    verified_always: false,
+                    decider: crate::decide::Decider::default(),
+                    serving: None,
+                    off_flows_since: None,
+                    flows_at: 0,
+                    verdicts: Vec::new(),
+                    realised: Vec::new(),
+                    enabled: Vec::new(),
+                    generation_ready: true,
+                    rollout: None,
+                    own: Own::default(),
+                    status_changes_lost: 0,
+                    entries_refused: 0,
+                    entries_filtered: 0,
+                    log_overflows: 0,
+                    counts: Counts::default(),
+                },
+            ),
         }
     }
 
@@ -1073,8 +1077,9 @@ impl Contact {
         self.lock().rollout = Some(rollout);
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().expect("contact lock poisoned")
+    #[track_caller]
+    fn lock(&self) -> WatchedGuard<'_, State> {
+        self.state.lock()
     }
 
     /// Takes a report from another voter.
@@ -3639,6 +3644,8 @@ fn send(
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use std::sync::Mutex;
+
     use super::*;
     use crate::report::ClockFlags;
 
@@ -5284,6 +5291,50 @@ mod tests {
         f.tick();
         assert!(f.engine.calls().contains(&"rebuild".to_owned()));
         assert_eq!(*f.engine.rebuilt_with.lock().unwrap(), [(1, 0)]);
+    }
+
+    /// The most one `hand` call takes under the contact lock: every
+    /// record the state machine still holds, [`RECORDS_KEPT`] samples of
+    /// entries stamped one sample apart, the densest the entry rate
+    /// goes. Older records are gone, and an entry range reaching into
+    /// them takes the rebuild path instead of the loop
+    /// (`a_record_gone_before_it_was_handed_rebuilds_the_engine`). The
+    /// hold stays far under the lock watchdog's limit. The engine here is
+    /// the test fake, which records each call; the real one's calls are
+    /// non-blocking and in memory (see the pull request).
+    #[tokio::test(start_paused = true)]
+    async fn handing_every_record_still_held_stays_far_under_the_watchdog_limit() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        let at = index_at(T0) + 400 * B;
+        let entries = crate::state_machine::RECORDS_KEPT;
+        for index in 1..=entries {
+            f.log.push(1, index, Some(at + index));
+        }
+        // Contact was told of the entries as they came, at most
+        // AWAITING_MAX unapplied at a time: past that `note` offers an
+        // entry unresolved, and one given so is not handed again. Told
+        // already, they all reach the engine as entries in this one call.
+        f.contact.lock().told = entries;
+        f.apply(entries);
+        let started = std::time::Instant::now();
+        f.contact.log_changed();
+        let held = started.elapsed();
+        let calls = f.engine.calls();
+        println!(
+            "handing {entries} records took {held:?} ({} engine calls)",
+            calls.len()
+        );
+        let expected: Vec<String> = (1..=entries)
+            .map(|i| format!("appended {i}"))
+            .chain(["committed 48000".to_owned()])
+            .collect();
+        assert_eq!(calls, expected, "every record, then the commit");
+        assert!(
+            held < Duration::from_secs(2),
+            "{held:?} under the contact lock, limit {:?}",
+            crate::lock_watch::HELD_LIMIT
+        );
     }
 
     /// A resync's replay reads the records of the entries applied after

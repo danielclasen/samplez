@@ -536,6 +536,37 @@ duck setting no group takes), and `Engine::replay` one of another shape,
 with strips or duck keys of other legs or ramp length, or with an entry
 outside the engine.
 
+### Ops endpoints and the lock watchdog
+
+The ops listener serves `/healthz`, `/readyz` and `/metrics` on its own
+thread and runtime. `/healthz` reads the RT heartbeat alone and takes no
+lock of the replicated state. `/readyz` and `/metrics` read the replicated
+state on the runtime's blocking pool (at most 4 threads) and answer 503
+with a body naming the timeout when the read has not returned within 1 s,
+so neither can hold up `/healthz`.
+
+The replica's `Contact` and log `Store` locks record their holder; no
+other lock is watched. A watchdog thread, started with the first replica,
+checks them every second. When one has been held for more than 10 s, it
+writes the lock's name, the holder's thread, how long it has held it and
+the call site (file, line, column) where it took it, and every thread
+waiting for it with its call site, to stderr, and aborts the process. A
+lock-order deadlock thus ends the process at once with a report, not at a
+liveness probe's failure. Any process that starts a replica, a test
+included, is subject to the 10 s limit. The locks are not on the RT
+thread's code paths; an acquisition notes its call site, the thread and
+the time.
+
+No path holds either lock across disk or network I/O or a wait. The
+store's file writes, fsyncs, snapshot writes and log compaction run on
+the blocking pool outside its lock, and the contact's engine rebuild,
+core copy and resync run outside the contact lock, so a slow disk or a
+long transfer does not count. `Store::open` replays the whole log before
+the store's lock exists, so a restart over a long log with no snapshot
+is not watched. What runs under the locks is in-memory work: applying a
+batch of entries, encoding a snapshot's state and the contact's report
+handling, each bounded by the state or batch size.
+
 ### Starting a replica
 
 A replica that joins a set is a learner until the leader promotes it,

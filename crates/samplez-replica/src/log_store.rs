@@ -18,7 +18,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openraft::storage::{LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot};
@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dedup::Limits;
 use crate::entry::{Body, NodeId, Request, Response};
+use crate::lock_watch::{WatchedGuard, WatchedMutex};
 use crate::snapshot::{
     StoredEntry, StoredLogId, StoredMembershipConfig, StoredPayload, StoredSnapshot, StoredVote,
 };
@@ -74,7 +75,7 @@ struct Inner<P> {
 /// time; a snapshot build runs beside them and `snapshots` orders it
 /// with an install.
 pub struct Store<P> {
-    inner: Arc<Mutex<Inner<P>>>,
+    inner: Arc<WatchedMutex<Inner<P>>>,
     /// Builds the empty product a snapshot install loads into.
     factory: Factory<P>,
     /// The product's configuration hash, fixed when the store opened.
@@ -345,7 +346,7 @@ impl<P: Product> Store<P> {
             tracing::warn!("{warning}");
         }
         Ok(Store {
-            inner: Arc::new(Mutex::new(inner)),
+            inner: Arc::new(WatchedMutex::new("store", inner)),
             factory,
             config,
             on_mismatch: Arc::new(exit_on_mismatch),
@@ -552,8 +553,9 @@ impl<P> Store<P> {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner<P>> {
-        self.inner.lock().expect("store lock poisoned")
+    #[track_caller]
+    fn lock(&self) -> WatchedGuard<'_, Inner<P>> {
+        self.inner.lock()
     }
 }
 
@@ -913,6 +915,9 @@ impl<P: Product> RaftStorage<TypeConfig> for Store<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::entry::{Body, Request};
     use crate::state_machine::tests::{Paths, command};
@@ -945,6 +950,62 @@ mod tests {
 
     fn id(index: u64) -> LogId<NodeId> {
         LogId::new(CommittedLeaderId::new(1, 0), index)
+    }
+
+    /// Replaying a long log with no snapshot holds no watched lock: the
+    /// state is built and replayed before the store's lock exists, so the
+    /// watchdog cannot fire on a restart however long the log is. A lock
+    /// held for as long as the open took does exceed a limit set under it.
+    #[tokio::test]
+    async fn opening_a_long_log_holds_no_watched_lock() {
+        let dir = dir("long-log");
+        let mut store = open(&dir);
+        let entries: Vec<_> = (1..=6000).map(entry).collect();
+        store.append_to_log(entries).await.expect("append");
+        drop(store);
+
+        let before: Vec<_> = crate::lock_watch::live();
+        let known = |r: &Arc<crate::lock_watch::Record>| before.iter().any(|b| Arc::ptr_eq(b, r));
+        // Other tests hold their own locks meanwhile: only this thread's count.
+        let opener = std::thread::current().name().expect("named").to_owned();
+        let opened = std::sync::atomic::AtomicBool::new(false);
+        let sampled_held = std::sync::atomic::AtomicBool::new(false);
+        let took = std::thread::scope(|scope| {
+            // Any watched lock held by the opening thread.
+            scope.spawn(|| {
+                while !opened.load(std::sync::atomic::Ordering::Relaxed) {
+                    let new: Vec<_> = crate::lock_watch::live()
+                        .into_iter()
+                        .filter(|r| !known(r))
+                        .collect();
+                    if crate::lock_watch::overdue(
+                        &new,
+                        Duration::ZERO,
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                    .is_some_and(|r| r.contains(&opener))
+                    {
+                        sampled_held.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+            let started = Instant::now();
+            let store = open(&dir);
+            let took = started.elapsed();
+            opened.store(true, std::sync::atomic::Ordering::Relaxed);
+            drop(store);
+            took
+        });
+        assert!(!sampled_held.load(std::sync::atomic::Ordering::Relaxed));
+
+        // The control: the same duration under a watched lock trips a
+        // limit set below it.
+        let control = crate::lock_watch::WatchedMutex::new("control", ());
+        let _held = control.lock();
+        let report =
+            crate::lock_watch::overdue(&[control.record()], took / 2, Instant::now() + took);
+        assert!(report.is_some_and(|r| r.contains("control")));
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Contact's floor at append is the one the apply reaches: the
