@@ -1610,6 +1610,7 @@ impl Contact {
     fn offer_unresolved(&self, st: &mut State, entries: Vec<(Key, u64)>) {
         let given = self.give(st, entries);
         self.ask(st, given);
+        Self::forget_given(st);
     }
 
     /// Takes `entries` as given, the engine not asked yet, and returns
@@ -1623,7 +1624,6 @@ impl Contact {
         for (k, at) in entries {
             st.given.insert(k, at);
             st.refused.insert(k);
-            Self::forget_given(st);
             given.push(k);
         }
         given
@@ -1631,7 +1631,9 @@ impl Contact {
 
     /// Asks the engine to hold the entries [`Contact::give`] took that are
     /// still given: `hand` in between rebuilds past those a catch-up
-    /// applied late, which the engine is then never asked to hold.
+    /// applied late, which the engine is then never asked to hold. Leaves
+    /// the cap to the caller ([`Contact::forget_given`]), which applies it
+    /// once the last entry of its part is asked.
     fn ask(&self, st: &mut State, given: Vec<Key>) {
         let Some(audio) = &self.audio else {
             return;
@@ -1800,6 +1802,12 @@ impl Contact {
         let given = self.give(st, unresolved);
         self.hand(st);
         self.ask(st, given);
+        // Trimmed only now, the engine asked in order: `give` marks every
+        // entry refused before it is asked, so a trim in between, such as
+        // the one `hand` ends with, would evict the lowest entries of
+        // this very part, which are the ones the engine must be asked
+        // about first.
+        Self::forget_given(st);
         more
     }
 
@@ -2154,7 +2162,11 @@ impl Contact {
         for k in empty {
             st.given.remove(&k);
             st.late_given.remove(&k);
-            audio.resolved(k.0);
+            // Still marked refused: given, but the engine was never asked
+            // to hold it.
+            if !st.refused.remove(&k) {
+                audio.resolved(k.0);
+            }
             Self::rebuild_past(st, k);
         }
         let tai = self.clocks.tai_ns();
@@ -2196,7 +2208,12 @@ impl Contact {
             if st.given.contains_key(&k) {
                 if rebuilt && at_once {
                     st.given.remove(&k);
-                    audio.resolved(index);
+                    // Still marked refused: `give` took it but the engine
+                    // was never asked to hold it, so it has nothing to
+                    // resolve.
+                    if !st.refused.remove(&k) {
+                        audio.resolved(index);
+                    }
                     Self::rebuild_past(st, k);
                     late = Some(late.map_or((index, index), |(first, _)| (first, index)));
                 } else if taken {
@@ -2218,7 +2235,9 @@ impl Contact {
             }
             audio.appended(index, at, &record.entries);
         }
-        self.offer_unresolved(st, unresolved);
+        // The cap is `sync_log`'s to apply, after its own part is asked.
+        let given = self.give(st, unresolved);
+        self.ask(st, given);
         audio.committed(up_to);
         // Slack against the apply deadline: the first index this replica
         // could still apply an entry at, as it applies.
@@ -5097,6 +5116,35 @@ mod tests {
         assert!(f.contact.lock().given.is_empty(), "rebuilt past, not held");
     }
 
+    /// An entry a catch-up taken late is rebuilt past was given but never
+    /// asked of the engine, so the engine holds nothing to resolve: no
+    /// `resolved` call is sent into a core that was dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_catch_up_rebuilt_past_an_entry_resolves_none_the_engine_never_held() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        diverge(&f);
+        assert!(f.contact.lock().catching_up);
+        f.clock.add(Duration::from_secs(1));
+        f.engine.calls();
+        // Appended and applied before the contact takes either: given and
+        // rebuilt past in one pass, the engine asked in between by no one.
+        f.clock.add(Duration::from_millis(5));
+        let at = index_at(f.clock.get()) - 10 * B;
+        f.log.push(1, 3, Some(at));
+        f.apply(3);
+        f.contact.log_changed();
+        f.tick();
+        let calls = f.engine.calls();
+        assert!(f.contact.lock().given.is_empty(), "rebuilt past");
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("resolved") || c.starts_with("unresolved")),
+            "{calls:?}"
+        );
+    }
+
     /// A rebuild, on a replica committing nothing, from the state an
     /// entry held unresolved applied in holds it: the entry is rebuilt
     /// past rather than given to the new core again, where it would stay
@@ -5141,6 +5189,83 @@ mod tests {
         let calls = f.engine.calls();
         assert!(
             !calls.iter().any(|c| c.starts_with("unresolved 3")),
+            "{calls:?}"
+        );
+    }
+
+    /// A full part taken by `sync_log` while `hand` gives an expired entry
+    /// of its own is asked about from the part's lowest entry: `hand`
+    /// trims no entry the part's own `ask` has not reached.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_part_with_a_hand_over_asks_the_engine_about_its_lowest_entries() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        take(&f, 1, false);
+        committed_at(&f, 1);
+        take(&f, 2, false);
+        f.tick();
+        // Entry 3 is awaited, in time when taken.
+        f.clock.add(Duration::from_millis(5));
+        let guard = Timing::defaults(B).apply_guard_ns();
+        f.log.push(1, 3, Some(index_at(f.clock.get() + guard) + B));
+        f.contact.log_changed();
+        f.tick();
+        // It applies past its deadline, with a part of late entries
+        // beyond it taken in the same pass.
+        f.clock.add(Duration::from_secs(1));
+        let late = index_at(f.clock.get()) - 10 * B;
+        f.apply(3);
+        for index in 4..4 + GIVEN_KEPT as u64 {
+            f.log.push(1, index, Some(late));
+        }
+        f.engine.calls();
+        f.contact.log_changed();
+        f.tick();
+        let asked = f.engine.calls();
+        assert!(
+            asked.iter().any(|c| c.starts_with("unresolved 3 ")),
+            "hand gave entry 3: {asked:?}"
+        );
+        assert!(
+            asked.iter().any(|c| c.starts_with("unresolved 4 ")),
+            "the part's lowest asked: {} calls, first {:?}",
+            asked.len(),
+            asked.iter().take(4).collect::<Vec<_>>()
+        );
+    }
+
+    /// An entry given and applied without a record before the engine was
+    /// asked about it is released without a `resolved` call: the engine
+    /// never held it.
+    #[tokio::test(start_paused = true)]
+    async fn an_entry_applied_without_a_record_before_it_was_asked_resolves_none() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        take(&f, 1, false);
+        committed_at(&f, 1);
+        take(&f, 2, false);
+        f.tick();
+        f.clock.add(Duration::from_millis(5));
+        let at = index_at(f.clock.get()) - 10 * B;
+        f.insert(
+            3,
+            Body::InputDown {
+                slot: 0,
+                at_index: at,
+            },
+        );
+        f.apply(3);
+        f.engine.calls();
+        f.contact.log_changed();
+        f.tick();
+        assert!(f.contact.lock().given.is_empty(), "released");
+        let calls = f.engine.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("resolved") || c.starts_with("unresolved")),
             "{calls:?}"
         );
     }
@@ -6213,6 +6338,37 @@ mod tests {
         }
         assert!(f.engine.calls().is_empty(), "offered again");
         assert_eq!(f.contact.metrics().unresolved_refused, 1);
+    }
+
+    /// A part filling the given entries to the cap, with entries given
+    /// before, is asked about from its lowest entry: the cap trims after
+    /// the engine was asked, the oldest given first, rather than evicting
+    /// the part's own lowest entries as each is taken.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_part_over_the_cap_asks_the_engine_about_its_lowest_entries() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.tick();
+        f.engine.calls();
+        let at = index_at(T0) + 40 * 48;
+        let first = 100u64;
+        let part = (first..first + GIVEN_KEPT as u64).map(|i| ((i, 1, 1), at));
+        {
+            let mut st = f.contact.lock();
+            let before = (1..=10u64).map(|i| ((i, 1, 1), at)).collect();
+            f.contact.offer_unresolved(&mut st, before);
+            f.engine.calls();
+            f.contact.offer_unresolved(&mut st, part.collect());
+        }
+        let asked: Vec<String> = f.engine.calls();
+        assert_eq!(asked.len(), GIVEN_KEPT, "the whole part asked");
+        assert!(
+            asked[0].starts_with(&format!("unresolved {first} ")),
+            "lowest first: {:?}",
+            asked[0]
+        );
+        let st = f.contact.lock();
+        assert_eq!(st.given.len(), GIVEN_KEPT);
+        assert!(st.given.keys().all(|k| k.0 >= first), "oldest forgotten");
     }
 
     #[tokio::test(start_paused = true)]
