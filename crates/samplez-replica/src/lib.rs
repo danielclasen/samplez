@@ -1818,6 +1818,12 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
             r.no_donor as f64,
         ),
         one(
+            "samplez_replica_resync_rebuilt_for_flows_total",
+            "Diverged replicas rebuilt from product state, not resynced: an input read another flow.",
+            Counter,
+            r.rebuilt_for_flows as f64,
+        ),
+        one(
             "samplez_replica_resync_backoff_seconds",
             "How long the next resync waits after the last one ended.",
             Gauge,

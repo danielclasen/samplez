@@ -86,6 +86,10 @@ pub struct Metrics {
     /// asked for, and whether the latest one was.
     pub over_budget: u64,
     pub budget_exceeded: bool,
+    /// Diverged replicas rebuilt from product state rather than resynced:
+    /// an input read another flow than the applied state names
+    /// ([`crate::contact::Audio::follows`]).
+    pub rebuilt_for_flows: u64,
     /// From asking for the core to the hand-over, the latest.
     pub last: Option<Duration>,
     /// How long the next attempt waits after the last one ended.
@@ -110,11 +114,16 @@ pub(crate) struct Tracker {
 }
 
 impl Tracker {
+    /// No attempt runs and the last ended at least the backoff ago.
+    pub fn due(&self, now: Instant) -> bool {
+        let wait = self.metrics.backoff;
+        self.running.is_none() && self.ended.is_none_or(|e| now >= e + wait)
+    }
+
     /// A new attempt, unless one runs or the last ended less than the
     /// backoff ago.
     pub fn start(&mut self, now: Instant) -> Option<u64> {
-        let wait = self.metrics.backoff;
-        if self.running.is_some() || self.ended.is_some_and(|e| now < e + wait) {
+        if !self.due(now) {
             return None;
         }
         self.epoch += 1;
@@ -152,6 +161,14 @@ impl Tracker {
         if self.running.take().is_some() {
             self.ended(now);
         }
+    }
+
+    /// A rebuild from product state took the place of an attempt at
+    /// `now`: the next attempt, or rebuild, waits the backoff, which
+    /// doubles as after a failed attempt.
+    pub fn rebuilt(&mut self, now: Instant) {
+        self.metrics.rebuilt_for_flows += 1;
+        self.ended(now);
     }
 
     /// The replica commits again: the next resync waits [`RETRY`] only.

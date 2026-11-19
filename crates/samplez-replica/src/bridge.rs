@@ -262,6 +262,13 @@ impl EngineAudio {
         [clamped, Some(neutral)].into_iter().flatten().find(takes)
     }
 
+    /// Per input slot, the flow it reads; none for a detached one.
+    fn reading(&self) -> Vec<Option<String>> {
+        (self.engine.status().inputs.into_iter())
+            .map(|i| (i.state != InputState::Detached).then_some(i.flow_id))
+            .collect()
+    }
+
     /// `state` as the records the bridge filters leave an engine: a flow
     /// differing from the one its input reads is a re-route, a detached
     /// input reading none and a slot without a flow detached, kept by the
@@ -275,9 +282,7 @@ impl EngineAudio {
     /// flows holds, flows, strips, gains and ducks alike.
     fn sanitised(&self, state: &ProductState) -> ProductState {
         let mut state = state.clone();
-        let reading: Vec<Option<String>> = (self.engine.status().inputs.into_iter())
-            .map(|i| (i.state != InputState::Detached).then_some(i.flow_id))
-            .collect();
+        let reading = self.reading();
         let routes: Vec<Entry> = (state.flows.iter().enumerate())
             .filter(|&(slot, flow)| reading.get(slot).is_some_and(|r| r != flow))
             .map(|(slot, flow)| match flow {
@@ -593,6 +598,10 @@ impl Audio for EngineAudio {
                 false
             }
         }
+    }
+
+    fn follows(&self, state: &ProductState) -> bool {
+        self.sanitised(state).flows == self.reading()
     }
 
     fn copy_core(&self) -> Option<CoreReply> {

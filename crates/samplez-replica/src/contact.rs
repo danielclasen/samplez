@@ -219,6 +219,13 @@ pub trait Audio: Send + Sync + 'static {
     fn resync(&self, _core: &CoreReply, _source: &dyn Source) -> Result<Resynced, String> {
         Err("no engine to resync".to_owned())
     }
+    /// Whether the engine's inputs read the flows a rebuild from `state`
+    /// would have them read. A replay reads the inputs the engine reads,
+    /// and a core copy carries no flows, so a resync cannot move an
+    /// input that reads another flow.
+    fn follows(&self, _state: &ProductState) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1778,6 +1785,26 @@ impl Contact {
             audio.drop_engine();
             return;
         }
+        // On a replica committing nothing, an entry held unresolved that
+        // the state the core was built from applied is in the core:
+        // rebuilt past, as one taken late while catching up. Held again it
+        // could stay unresolved for good, as the log decides only an entry
+        // that does not stand. A replica about to commit, such as one retargeted
+        // from `version_mismatch`, holds it again, as its peers do.
+        let rebuilds = Self::commits_nothing(st);
+        let past: Vec<Key> = (st.given.keys())
+            .filter(|&&(index, term, node)| {
+                rebuilds
+                    && index <= n
+                    && self.log.log_id_at(index) == Some(StoredLogId { term, node, index })
+            })
+            .copied()
+            .collect();
+        for k in past {
+            st.given.remove(&k);
+            st.late_given.remove(&k);
+            Self::rebuild_past(st, k);
+        }
         for (&(index, _, _), &at) in &st.given {
             let _ = audio.unresolved(index, at);
         }
@@ -1905,6 +1932,28 @@ impl Contact {
             }
             self.begin_restart(st, up_to);
             return;
+        }
+        // An entry held unresolved that applied and derived no record
+        // changes no engine state: it is released, here as on a replica
+        // that applied it in time, rather than held until a decision the
+        // log appends only for an entry that does not stand. Should one
+        // come after all, the entry is rebuilt past, so the decision
+        // neither resolves nor contradicts this replica.
+        let derived: BTreeSet<u64> = records.iter().map(|(index, _)| *index).collect();
+        let empty: Vec<Key> = (st.given.keys())
+            .filter(|&&(index, term, node)| {
+                index > from
+                    && index <= up_to
+                    && !derived.contains(&index)
+                    && self.log.log_id_at(index) == Some(StoredLogId { term, node, index })
+            })
+            .copied()
+            .collect();
+        for k in empty {
+            st.given.remove(&k);
+            st.late_given.remove(&k);
+            audio.resolved(k.0);
+            Self::rebuild_past(st, k);
         }
         let tai = self.clocks.tai_ns();
         let first = index_at(tai + self.timing.apply_guard_ns());
@@ -2041,14 +2090,14 @@ impl Contact {
         }
     }
 
-    /// Whether this audio replica is starting or withdrawn with outputs
-    /// none of which commits, as of its last sample.
+    /// Whether this audio replica is starting, withdrawn or diverged with
+    /// outputs none of which commits, as of its last sample.
     fn commits_nothing(st: &State) -> bool {
         let state = st.life.as_ref().map(Life::state);
         let standing = &st.own.standing;
         matches!(
             state,
-            Some(ReplicaState::Starting | ReplicaState::Withdrawn)
+            Some(ReplicaState::Starting | ReplicaState::Withdrawn | ReplicaState::Diverged)
         ) && !standing.is_empty()
             && !standing
                 .iter()
@@ -3078,6 +3127,25 @@ impl Contact {
         // A rebuild under way would install its core over the resync's.
         let rebuilding = matches!(st.rebuild, Rebuild::Running { .. });
         if !diverged || rebuilding || st.own.clock.unverified || st.judged.contains(&self.id) {
+            return None;
+        }
+        // An input reading another flow than the applied state names, as
+        // one does after holding a re-routing entry unresolved that
+        // stands, makes every replay differ: a replay reads the engine's
+        // inputs. The engine is rebuilt from product state instead, which
+        // moves the input; a page that still differs then resyncs.
+        // Checked as often as an attempt would start.
+        let state = st.resync.due(now).then(|| self.log.product_state().2);
+        if let (Some(audio), Some(state)) = (&self.audio, &state)
+            && !state.flows.is_empty()
+            && !audio.follows(state)
+        {
+            st.resync.rebuilt(now);
+            tracing::warn!(
+                flows = ?state.flows,
+                "diverged with an input on another flow than the log names: rebuilt, not resynced"
+            );
+            self.begin_restart(st, self.log.applied());
             return None;
         }
         let audio_voters = crate::rank::audio_voters(&st.members);
@@ -4624,6 +4692,168 @@ mod tests {
         f.tick();
         assert!(f.engine.calls().contains(&"appended 22".to_owned()));
         assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+    }
+
+    /// A diverged replica commits nothing either: one that takes an entry
+    /// past its deadline while catching up, as a restarted one diverged
+    /// before it applied what was written while it was away, is rebuilt
+    /// past it. Held unresolved, an entry that stands is never decided,
+    /// and a `Route` held so leaves an input on a flow the log no longer
+    /// names, which a resync's replay reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_diverged_replica_catching_up_is_rebuilt_past_a_late_entry() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        diverge(&f);
+        assert!(f.contact.lock().catching_up);
+        // Past the floor the diverging entries left.
+        f.clock.add(Duration::from_secs(1));
+        take(&f, 3, true);
+        f.tick();
+        assert_eq!(f.contact.metrics().late_rebuilds, 1);
+        assert_ne!(f.state(), Some(ReplicaState::Diverged), "restarted");
+        assert!(f.contact.lock().given.is_empty(), "rebuilt past, not held");
+    }
+
+    /// A rebuild, on a replica committing nothing, from the state an
+    /// entry held unresolved applied in holds it: the entry is rebuilt
+    /// past rather than given to the new core again, where it would stay
+    /// unresolved for good once it stands. One the state does not hold
+    /// yet is given again.
+    #[tokio::test(start_paused = true)]
+    async fn a_rebuild_takes_the_held_entries_its_state_applied() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        take(&f, 1, false);
+        committed_at(&f, 1);
+        take(&f, 2, false);
+        f.tick();
+        assert!(!f.contact.lock().catching_up);
+        for index in 3..=6 {
+            take(&f, index, true);
+            f.tick();
+        }
+        assert_eq!(f.contact.lock().given.len(), 4, "held unresolved");
+        // Entry 7 is held unresolved before it applies.
+        f.clock.add(Duration::from_millis(5));
+        let at = index_at(f.clock.get()) - 10 * B;
+        f.log.push(1, 7, Some(at));
+        f.contact.log_changed();
+        f.tick();
+        assert_eq!(f.contact.lock().given.len(), 5);
+        // A rebuild from the state applied up to 6, as a diverged replica
+        // on another flow than its state names starts.
+        {
+            let mut st = f.contact.lock();
+            f.contact.begin_restart(&mut st, 6);
+        }
+        f.tick();
+        f.contact.await_rebuild();
+        f.engine.calls();
+        f.tick();
+        let st = f.contact.lock();
+        let given: Vec<u64> = st.given.keys().map(|k| k.0).collect();
+        assert_eq!(given, [7], "the applied ones rebuilt past");
+        drop(st);
+        let calls = f.engine.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("unresolved 3")),
+            "{calls:?}"
+        );
+    }
+
+    /// An entry held unresolved that applies without a record is released,
+    /// and a decision the log appends on it after all, as for an entry
+    /// every replica took late, neither resolves nor contradicts the
+    /// replica: it is rebuilt past.
+    #[tokio::test(start_paused = true)]
+    async fn a_decision_on_a_released_entry_without_a_record_contradicts_nothing() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.tick();
+        take(&f, 1, false);
+        committed_at(&f, 1);
+        take(&f, 2, false);
+        f.tick();
+        assert!(!f.contact.lock().catching_up);
+        // Entry 3 late, deriving no record.
+        f.clock.add(Duration::from_millis(5));
+        let at = index_at(f.clock.get()) - 10 * B;
+        f.insert(
+            3,
+            Body::InputDown {
+                slot: 0,
+                at_index: at,
+            },
+        );
+        f.contact.log_changed();
+        f.tick();
+        assert_eq!(f.contact.lock().given.len(), 1, "held unresolved");
+        f.apply(3);
+        f.contact.log_changed();
+        f.tick();
+        assert!(f.contact.lock().given.is_empty(), "released");
+        assert!(f.engine.calls().contains(&"resolved 3".to_owned()));
+        // The log restamps it after all.
+        f.insert(
+            4,
+            Body::Restamp {
+                revision: 3,
+                term: 1,
+                at_index: at + 960,
+                paths: Vec::new(),
+                generation: None,
+            },
+        );
+        f.apply(4);
+        f.contact.log_changed();
+        f.tick();
+        f.tick();
+        assert_eq!(f.contact.metrics().contradicted, 0);
+        assert_ne!(f.state(), Some(ReplicaState::Diverged));
+    }
+
+    /// A replica about to commit, retargeted from `version_mismatch`, gives
+    /// its rebuilt core the entries it holds unresolved again, those its
+    /// state applied included, as its peers hold them: the log may still
+    /// decide them. Only a replica committing nothing rebuilds past them.
+    #[tokio::test(start_paused = true)]
+    async fn a_retargeted_core_holds_the_entries_its_state_applied() {
+        let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
+        f.contact.set_rollout(crate::rollout::Fixed::new(1, None));
+        let baseline = |key| Baseline {
+            replica: 2,
+            order: vec![2, 1, 3],
+            at_index: index_at(T0),
+            key: Some(key),
+        };
+        f.log.0.lock().unwrap().baseline = Some(baseline(2));
+        f.tick();
+        take(&f, 1, false);
+        committed_at(&f, 1);
+        take(&f, 2, false);
+        f.tick();
+        assert_eq!(f.state(), Some(ReplicaState::VersionMismatch));
+        take(&f, 3, true);
+        f.tick();
+        assert_eq!(f.contact.lock().given.len(), 1, "held unresolved");
+        f.engine.calls();
+        // The baseline's key is its own again: retargeted from the state
+        // applied up to 3.
+        f.log.0.lock().unwrap().baseline = Some(baseline(1));
+        f.tick();
+        f.contact.await_rebuild();
+        f.tick();
+        f.tick();
+        let calls = f.engine.calls();
+        assert!(calls.contains(&"rebuild".to_owned()), "{calls:?}");
+        assert!(
+            calls.iter().any(|c| c.starts_with("unresolved 3 ")),
+            "given to the new core again: {calls:?}"
+        );
+        assert_eq!(f.contact.lock().given.len(), 1);
     }
 
     /// A replica catching up past entries' deadlines is rebuilt past them
