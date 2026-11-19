@@ -120,6 +120,11 @@ impl Tracker {
         self.running.is_none() && self.ended.is_none_or(|e| now >= e + wait)
     }
 
+    /// Whether an attempt is in progress.
+    pub fn running(&self) -> bool {
+        self.running.is_some()
+    }
+
     /// A new attempt, unless one runs or the last ended less than the
     /// backoff ago.
     pub fn start(&mut self, now: Instant) -> Option<u64> {
