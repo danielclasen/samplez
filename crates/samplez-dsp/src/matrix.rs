@@ -720,6 +720,47 @@ impl Matrix {
         true
     }
 
+    /// Sets the coefficient from `input` to `output` to the ramp `ramp`
+    /// as it is, whatever the coefficient held: its value at a sample is
+    /// then the ramp's alone ([`Ramp::resume`]). A `None`, or a ramp that
+    /// is over, jumps to `target`. Returns false and changes nothing for
+    /// an input or output out of range, or a target that is not a valid
+    /// gain.
+    #[must_use]
+    pub fn set_resumed(
+        &mut self,
+        input: usize,
+        output: usize,
+        target: f32,
+        ramp: Option<Ramp>,
+    ) -> bool {
+        let Some(ramp) = ramp.filter(Ramp::is_active) else {
+            return self.set(input, output, target, 0);
+        };
+        if input >= self.inputs || output >= self.columns.len() || !valid_gain(target) {
+            return false;
+        }
+        let col = &mut self.columns[output];
+        match col.binary_search_by_key(&input, |t| t.input) {
+            Ok(k) => col[k].ramp = ramp,
+            Err(k) => {
+                col.insert(
+                    k,
+                    Term {
+                        input,
+                        ramp,
+                        mask: 0,
+                        ducked: false,
+                    },
+                );
+                if !self.masks.is_empty() {
+                    self.duck_inserted(output, k, ramp.len);
+                }
+            }
+        }
+        true
+    }
+
     /// Gives term `k` of `output`, just inserted, its mask, and a duck
     /// crossfading from no duck over `len` samples when it is not 0.
     fn duck_inserted(&mut self, output: usize, k: usize, len: u32) {

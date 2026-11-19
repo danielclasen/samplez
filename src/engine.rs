@@ -256,22 +256,56 @@ impl std::error::Error for GainError {}
 /// setting [`Engine::admits`] refuses.
 pub type DuckError = GainError;
 
-/// The timing of a gain change, in samples from the entry's index: the
-/// coefficient holds its value for `delay` samples, then ramps linearly to
-/// its target over `len`. Both are at most
-/// [`samplez_dsp::MAX_EXACT_RAMP_LEN`]. A change with no fade has delay 0
-/// and the configured ramp length.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// A gain fade as a function of the sample index alone: the coefficient
+/// holds `from` below `start`, ramps linearly to its target over `len`
+/// samples from `start` (value `from + (n - start) * step`, `step =
+/// (target - from) / len`, as [`samplez_dsp::Ramp`] computes it), and
+/// holds the target after. `start` is an absolute sample index, ahead of
+/// the entry's index (a delay), at it, or behind it (a fade resumed
+/// mid-ramp); `from` is the value the coefficient had at `start`. An
+/// engine applying the entry renders this function whatever the value it
+/// held before. With no fade a gain change ramps over the ramp length
+/// from the value held at the entry's index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Fade {
-    pub delay: u32,
+    pub from: f32,
+    pub start: u64,
     pub len: u32,
 }
 
 impl Fade {
-    /// Whether both `delay` and `len` are within
+    /// A fade of `len` samples after `delay` samples from index `at`,
+    /// starting from `from`.
+    pub fn after(from: f32, at: u64, delay: u32, len: u32) -> Fade {
+        Fade {
+            from,
+            start: at + u64::from(delay),
+            len,
+        }
+    }
+
+    /// Whether `from` is a valid gain and `len` is within
     /// [`samplez_dsp::MAX_EXACT_RAMP_LEN`].
     pub fn is_valid(&self) -> bool {
-        self.delay <= samplez_dsp::MAX_EXACT_RAMP_LEN && self.len <= samplez_dsp::MAX_EXACT_RAMP_LEN
+        samplez_dsp::valid_gain(self.from) && self.len <= samplez_dsp::MAX_EXACT_RAMP_LEN
+    }
+
+    /// The ramp of this fade towards `to`, positioned at sample index
+    /// `at`; none once it is over, or when an end is not a valid gain. A
+    /// `start` more than [`samplez_dsp::MAX_EXACT_RAMP_LEN`] samples past
+    /// `at` waits that long instead.
+    pub fn ramp_at(&self, to: f32, at: u64) -> Option<samplez_dsp::Ramp> {
+        let ahead = u32::try_from(self.start.saturating_sub(at))
+            .unwrap_or(u32::MAX)
+            .min(samplez_dsp::MAX_EXACT_RAMP_LEN);
+        let done = u32::try_from(at.saturating_sub(self.start)).unwrap_or(u32::MAX);
+        let r = samplez_dsp::Ramp::resume(self.from, to, ahead, self.len, done)?;
+        r.is_active().then_some(r)
+    }
+
+    /// The value at sample index `at` of the fade towards `to`.
+    pub fn value_at(&self, to: f32, at: u64) -> f32 {
+        self.ramp_at(to, at).map_or(to, |r| r.current())
     }
 }
 
@@ -1771,9 +1805,13 @@ impl Engine {
         fade: Option<Fade>,
         at_index: u64,
     ) -> Result<(), GainError> {
-        if fade.is_some_and(|f| !f.is_valid()) {
+        if fade.is_some_and(|f| {
+            !f.is_valid()
+                || f.start > at_index.saturating_add(u64::from(samplez_dsp::MAX_EXACT_RAMP_LEN))
+        }) {
             return Err(GainError::Invalid(format!(
-                "a fade within {} samples",
+                "a fade of a valid start gain, within {} samples, starting within the same \
+                 distance of the entry",
                 samplez_dsp::MAX_EXACT_RAMP_LEN
             )));
         }
@@ -2223,7 +2261,7 @@ impl Engine {
             } => {
                 if fade.is_some_and(|f| !f.is_valid()) {
                     return invalid(format!(
-                        "a fade beyond {} samples",
+                        "a fade of a valid start gain within {} samples",
                         samplez_dsp::MAX_EXACT_RAMP_LEN
                     ));
                 }
@@ -3006,7 +3044,7 @@ impl Engine {
         let mut gains = targets.clone();
         // The fades still running, per coefficient, and the ramps the core
         // continues: filled each attempt, the room allocated here.
-        let fading_targets: Vec<Option<crate::transfer::Fading>> = if state.fading.is_empty() {
+        let fading_targets: Vec<Option<Fade>> = if state.fading.is_empty() {
             vec![None; n * m]
         } else {
             state.fading.iter().flatten().copied().collect()
@@ -4790,23 +4828,22 @@ fn unsynchronised() -> Option<bool> {
 /// fade it was in counts into.
 fn fold_passed(
     gains: &mut [f32],
-    fadings: &mut [Option<crate::transfer::Fading>],
+    fadings: &mut [Option<Fade>],
     c: usize,
     (to, fade): (f32, Option<Fade>),
     at: u64,
     ramp: u32,
 ) {
-    let from = fadings[c].map_or(gains[c], |f| f.value_at(gains[c], at));
-    let f = fade.unwrap_or(Fade {
-        delay: 0,
-        len: ramp,
+    let f = fade.or_else(|| {
+        let from = fadings[c].map_or(gains[c], |f| f.value_at(gains[c], at));
+        (from != to && ramp != 0).then_some(Fade {
+            from,
+            start: at,
+            len: ramp,
+        })
     });
     gains[c] = to;
-    fadings[c] = (from != to && (f.delay != 0 || f.len != 0)).then_some(crate::transfer::Fading {
-        from,
-        start: at + u64::from(f.delay),
-        len: f.len,
-    });
+    fadings[c] = f;
 }
 
 fn output_disabled(disabled: u64, output: usize, enabled: bool) -> u64 {

@@ -863,7 +863,11 @@ mod tests {
             input,
             output,
             gain,
-            fade: Some(Fade { delay, len }),
+            fade: Some(Fade {
+                from: 1.0,
+                start: u64::from(delay),
+                len,
+            }),
         }
     }
 
@@ -886,15 +890,30 @@ mod tests {
         assert_eq!(
             batch.fades.list(),
             [
-                (0, Fade { delay: 10, len: 20 }),
-                (3, Fade { delay: 6, len: 8 })
+                (
+                    0,
+                    Fade {
+                        from: 1.0,
+                        start: 10,
+                        len: 20
+                    }
+                ),
+                (
+                    3,
+                    Fade {
+                        from: 1.0,
+                        start: 6,
+                        len: 8
+                    }
+                )
             ]
         );
         assert!(batch.sane() && batch.fits(2, 2, 2, &[], &[]));
         // A fade beyond the bound is not sane; one past the matrix does
         // not fit.
         let long = Fade {
-            delay: 0,
+            from: 1.0,
+            start: 0,
             len: samplez_dsp::MAX_EXACT_RAMP_LEN + 1,
         };
         let mut bad = (*batch).clone();

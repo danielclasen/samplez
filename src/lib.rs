@@ -31,8 +31,7 @@ pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};
 pub use samplez_dsp::MAX_COEFFICIENTS;
 pub use targets::Targets;
 pub use transfer::{
-    CopyError, Core, CoreCopy, DecodeError, ENGINE_VERSION, Fading, ProductState, Replay,
-    ReplayError,
+    CopyError, Core, CoreCopy, DecodeError, ENGINE_VERSION, ProductState, Replay, ReplayError,
 };
 
 /// The lint probe's lock on a static (CI): its users never name its type.

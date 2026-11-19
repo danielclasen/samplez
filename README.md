@@ -285,42 +285,39 @@ applies within a quarter of the block period: 7,200 at a `blockSize` of
 
 ### Timed gain transitions
 
-A gain change takes an optional `Fade { delay, len }`, in samples from
-the entry's index: the coefficient holds the value it has there for
-`delay` samples, then ramps linearly to the target over `len`. With no
-fade, `delay` is 0 and `len` the configured `rampSamples`. Both are at
-most `samplez_dsp::MAX_EXACT_RAMP_LEN` (2^23, about 174 s), and a fade
-beyond it is refused. `Engine::set_gain_fade` takes the fade,
-and `Entry::Gain` carries it as `fade`. `Targets::fading`, shaped as
-`gains`, holds the one source of the fades in absolute sample indices
-(`from`, `start`, `len`). `Targets::diff` and `Targets::assert` take the
-index `at` their entries apply at and give each emitted gain the entry
-fade for it: the delay left (`start - at`) before the start, which an
-engine renders as the absolute function bit for bit; the remaining ramp
-during it, which ends on the target at the same index; a jump after it.
-A fade of a gain whose value does not change is no entry.
+A gain change takes an optional `Fade { from, start, len }`, absolute:
+the coefficient holds `from` below the sample index `start`, ramps
+linearly to the target over `len` samples from it, and holds the target
+after. Its value at index `n` is `from + (n - start) * step`, `step =
+(target - from) / len`, computed from `n` directly as the matrix ramps
+are, so the same bits come out whatever the block size, the SIMD path or
+the blocks the ramp spans. `start` may lie ahead of the entry's index (a
+delay; `Fade::after(from, index, delay, len)` builds it), at it, or
+behind it (the fade resumed mid-ramp): the engine renders the function
+whatever the coefficient held before, so an entry that repeats a fade
+mid-ramp, as `Targets::assert` does, changes no bit. `from` must be a
+valid gain, `len` at most `samplez_dsp::MAX_EXACT_RAMP_LEN` (2^23, about
+174 s), and `start` at most that far past the entry's index;
+`Engine::set_gain_fade` refuses a fade beyond them. With no fade a gain
+change ramps over `rampSamples` from the value held at its index.
+`Entry::Gain` carries the fade as `fade`.
 
-The coefficient's value at a sample is a function of the sample index
-and the ordered entries alone: position `n` from the start `S = index +
-delay` is `from + (n - S) * step`, `step = (target - from) / len`,
-`from` the value the coefficient has at the entry's index, a ramp still
-running then included. The same bits come out whatever the block size,
-the SIMD path or the blocks the delay and the ramp span. A later entry
-for the coefficient replaces a fade still waiting or running, starting
-from the value held at its index, so log order decides. A block counts as
-ramping in its verdict until `index + delay + len`.
+A later entry for the coefficient replaces a fade still waiting or
+running, so log order decides. A block counts as ramping in its verdict
+until `start + len`.
 
-Nothing of a fade lives outside the matrix: its coefficient holds the
-start value, delay, length and position, so a copied core carries it. A
-core built from a product state does not know the fades running: the
-state names each as `ProductState::fading`, in absolute indices (`from`,
-`start`, `len`) beside the target in `gains`, and the install continues
-the fade at its value for the install index, bit for bit as a replica
-that ran through computes it, instead of jumping to the target.
-`Targets::fading` is that list for a replica's product state. A gain
-entry the install passed is folded in the same way, from the value its
-coefficient had at the entry's index. A product that leaves `fading`
-empty gets its coefficients at their targets. A duck mask crossfade of a
+`Targets::fading`, shaped as `gains`, holds the fade of each gain in
+this form, the one source: `Targets::diff` and `Targets::assert` copy it
+into the entries they emit, and a fade of a gain whose value does not
+change is no entry. Nothing of a fade lives outside the matrix: its
+coefficient holds the start value, delay, length and position, so a
+copied core carries it. A core built from a product state does not know
+the fades running: the state names each as `ProductState::fading` beside
+the target in `gains`, and the install continues the fade at its value
+for the install index, bit for bit as a replica that ran through
+computes it, instead of jumping to the target. A gain entry the install
+passed is folded in the same way. A product that leaves `fading` empty
+gets its coefficients at their targets. A duck mask crossfade of a
 coefficient that comes back from 0 runs over `len` from the entry's
 index, not from the end of the delay.
 

@@ -697,7 +697,7 @@ fn targets_at_stereo_64x56() -> (samplez::Targets, samplez::Targets) {
 #[bench::stereo_64x56(setup = targets_at_stereo_64x56, config = limit(DIFF_STEREO_64X56))]
 #[bench::masked_block_1024(setup = masked_targets_at_block_1024, config = limit(DIFF_MASKED_BLOCK_1024))]
 fn targets_diff((from, to): (samplez::Targets, samplez::Targets)) -> Vec<samplez::Entry> {
-    black_box(from.diff(&to, 0))
+    black_box(from.diff(&to))
 }
 
 /// A matrix of `inputs` by `outputs` with every coefficient set and

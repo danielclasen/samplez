@@ -53,8 +53,8 @@ fn a_fade_holds_then_ramps_exactly() {
         s.outputs.iter().all(|o| o.realised) && s.inputs[0].state == InputState::Attached
     });
     let (delay, len) = (3 * B as u32 + 10, 5 * B as u32 + 7);
-    let fade = Some(Fade { delay, len });
     let at = (now(&rx) + 100) * B;
+    let fade = Some(Fade::after(1.0, at, delay, len));
     e.set_gain_fade(0, 0, 0.25, fade, at).unwrap();
     e.set_gain_fade(1, 1, 0.25, fade, at).unwrap();
     let end = at + u64::from(delay) + u64::from(len);
@@ -120,31 +120,34 @@ fn a_fade_beyond_the_bound_is_refused() {
     let (e, rx) = common::start(cfg);
     let at = (now(&rx) + 100) * B;
     let max = samplez_dsp::MAX_EXACT_RAMP_LEN;
-    for fade in [
+    let (long, far, nan) = (
         Fade {
-            delay: 0,
+            from: 1.0,
+            start: at,
             len: max + 1,
         },
         Fade {
-            delay: max + 1,
+            from: 1.0,
+            start: at + u64::from(max) + 1,
             len: 10,
         },
-    ] {
+        Fade {
+            from: f32::NAN,
+            start: at,
+            len: 10,
+        },
+    );
+    for fade in [long, far, nan] {
         match e.set_gain_fade(0, 0, 0.5, Some(fade), at) {
             Err(GainError::Invalid(m)) => assert!(m.contains("fade"), "{m}"),
             r => panic!("{r:?}"),
         }
     }
-    e.set_gain_fade(
-        0,
-        0,
-        0.5,
-        Some(Fade {
-            delay: max,
-            len: max,
-        }),
-        at,
-    )
-    .unwrap();
+    let ok = Fade {
+        from: 1.0,
+        start: at + u64::from(max),
+        len: max,
+    };
+    e.set_gain_fade(0, 0, 0.5, Some(ok), at).unwrap();
     common::stop(e);
 }

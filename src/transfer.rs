@@ -17,14 +17,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Limiter, LimiterParams, Matrix, Ramp, Strip, StripParam, Taps};
+use samplez_dsp::{Limiter, LimiterParams, Matrix, Strip, StripParam, Taps};
 use samplez_mxl::time;
 use serde::{Deserialize, Serialize};
 
 use crate::batch::{self, Batch, DuckItem, Item};
 use crate::blocks::PageHash;
 use crate::ducks::{DuckChange, DuckCore, DuckSetting, DuckTargets, KeySet};
-use crate::engine::Entry;
+use crate::engine::{Entry, Fade};
 use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRESOLVED, slots_of};
 
 /// The engine version a core's encoding carries: a core is replayed only
@@ -957,37 +957,6 @@ fn change_of(entry: &Entry) -> Change {
     }
 }
 
-/// A gain fade as a function of the sample index alone: the coefficient
-/// holds `from` below `start`, ramps linearly to its target over `len`
-/// samples from `start`, and holds the target after. `start` is the index
-/// of the log entry that began the fade plus its delay, `from` the value
-/// the coefficient had there, which an earlier ramp still running at the
-/// entry's index counts into.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Fading {
-    pub from: f32,
-    pub start: u64,
-    pub len: u32,
-}
-
-impl Fading {
-    /// The ramp of this fade towards `to`, positioned at sample index
-    /// `at`; none once it is over, or when an end is not a valid gain.
-    /// A `start` more than [`samplez_dsp::MAX_EXACT_RAMP_LEN`] samples
-    /// past `at` waits that long instead.
-    pub fn ramp_at(&self, to: f32, at: u64) -> Option<Ramp> {
-        let ahead = u32::try_from(self.start.saturating_sub(at)).unwrap_or(u32::MAX);
-        let done = u32::try_from(at.saturating_sub(self.start)).unwrap_or(u32::MAX);
-        let r = Ramp::resume(self.from, to, ahead, self.len, done)?;
-        r.is_active().then_some(r)
-    }
-
-    /// The value at sample index `at` of the fade towards `to`.
-    pub fn value_at(&self, to: f32, at: u64) -> f32 {
-        self.ramp_at(to, at).map_or(to, |r| r.current())
-    }
-}
-
 /// The product state an engine core is built from
 /// ([`Engine::install_product`](crate::Engine::install_product)).
 #[derive(Clone, Debug, PartialEq)]
@@ -1000,7 +969,7 @@ pub struct ProductState {
     /// the matrix continues at its value for the install index, bit for
     /// bit as a replica that ran through computes it. `gains` holds the
     /// target the fade ends at.
-    pub fading: Vec<Vec<Option<Fading>>>,
+    pub fading: Vec<Vec<Option<Fade>>>,
     /// Per input slot whether it is up in the log.
     pub up: Vec<bool>,
     /// Per input slot the flow it reads in the log, its last `Route`'s

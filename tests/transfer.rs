@@ -14,8 +14,8 @@ use common::{
 use common::{MARGIN, config, diagonal};
 use samplez::blocks::{PAGE, PageHash, StatusChange};
 use samplez::{
-    BlockVerdict, Config, CopyError, DuckSetting, DuckTargets, Engine, Entry, Fade, Fading,
-    InputState, ProductState, ReplayError, Replication,
+    BlockVerdict, Config, CopyError, DuckSetting, DuckTargets, Engine, Entry, Fade, InputState,
+    ProductState, ReplayError, Replication,
 };
 use samplez_dsp::{
     BandType, CompParams, DetectorParams, DuckMode, EqBand, GateParams, LimiterParams, StripParam,
@@ -2642,10 +2642,13 @@ fn fade_entries(e: &Engine, at: u64, fade: Fade) {
 
 /// A fade long enough to copy and rebuild inside, in samples, and where
 /// the cases look at it: waiting for its start, ramping.
-const FADE: Fade = Fade {
-    delay: 30_000,
-    len: 120_000,
-};
+const FADE_DELAY: u64 = 30_000;
+const FADE_LEN: u32 = 120_000;
+
+/// The fade of the log's entries at `at`.
+fn fade_at(at: u64) -> Fade {
+    Fade::after(1.0, at, FADE_DELAY as u32, FADE_LEN)
+}
 
 /// Waits until sample index `n` is processed on every engine.
 fn wait_index(engines: &[&Engine], n: u64) {
@@ -2670,9 +2673,9 @@ fn replayed_core_carries_a_fade(wait: u64) -> Result<(), String> {
     );
     let skipped = (a.skipped(), b.skipped());
     let at = (now_block() + 20) * B;
-    fade_entries(&a.e, at, FADE);
+    fade_entries(&a.e, at, fade_at(at));
     // Set apart: the joiner's fade is a short one, which has ended.
-    fade_entries(&b.e, at, Fade { delay: 0, len: 100 });
+    fade_entries(&b.e, at, Fade::after(1.0, at, 0, 100));
     wait_index(&[&a.e, &b.e], at + wait);
     let copy = copy(&a.e);
     let k0 = copy.k0;
@@ -2684,7 +2687,7 @@ fn replayed_core_carries_a_fade(wait: u64) -> Result<(), String> {
         return Err(format!("{passed} hand-overs passed"));
     }
     // The fade is still running at the hand-over, or the case tests nothing.
-    if (j + 1) * B > at + u64::from(FADE.delay + FADE.len) - 3 * PAGE {
+    if (j + 1) * B > at + (FADE_DELAY + u64::from(FADE_LEN)) - 3 * PAGE {
         return Err(format!("handed over at block {j}, near the fade's end"));
     }
     let before = (k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE;
@@ -2701,7 +2704,7 @@ fn replayed_core_carries_a_fade(wait: u64) -> Result<(), String> {
     let differ = before
         .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
         .count();
-    if wait > u64::from(FADE.delay) && differ == 0 {
+    if wait > FADE_DELAY && differ == 0 {
         return Err("the joiner never diverged".to_owned());
     }
     for p in from..from + 8 {
@@ -2727,7 +2730,7 @@ fn a_replayed_core_carries_a_fade_still_waiting() {
 
 #[test]
 fn a_replayed_core_carries_a_fade_mid_ramp() {
-    common::undisturbed(|| replayed_core_carries_a_fade(u64::from(FADE.delay) + 20_000));
+    common::undisturbed(|| replayed_core_carries_a_fade(FADE_DELAY + 20_000));
 }
 
 /// A replica rebuilt from a product state mid-fade, the state naming the
@@ -2735,7 +2738,7 @@ fn a_replayed_core_carries_a_fade_mid_ramp() {
 /// the first page after the install, bit for bit: the coefficient
 /// continues the fade where the peers are, it does not jump to the
 /// target. The same with the fade not started yet.
-fn rebuilt_replica_continues_a_fade(wait: u64) -> Result<(), String> {
+fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), String> {
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -2744,15 +2747,26 @@ fn rebuilt_replica_continues_a_fade(wait: u64) -> Result<(), String> {
     let [a, b, c] = &hs;
     let at = (now_block() + 20) * B;
     for h in [a, b] {
-        fade_entries(&h.e, at, FADE);
+        fade_entries(&h.e, at, fade_at(at));
+        if assert_mid {
+            // The same fades asserted again inside the ramp, as a
+            // restamp re-asserts every target.
+            let again = (at + FADE_DELAY + 5_000).next_multiple_of(B);
+            for channel in 0..2 {
+                let entry = Entry::Gain {
+                    input: channel,
+                    output: channel,
+                    gain: 0.25,
+                    fade: Some(fade_at(at)),
+                };
+                h.e.append(3 + channel as u64, again, entry).unwrap();
+            }
+            h.e.commit(4);
+        }
     }
     wait_index(&[&a.e, &b.e, &c.e], at + wait);
     c.e.drop_core().unwrap();
-    let fading = Some(Fading {
-        from: 1.0,
-        start: at + u64::from(FADE.delay),
-        len: FADE.len,
-    });
+    let fading = Some(fade_at(at));
     let state = ProductState {
         fading: vec![vec![fading, None], vec![None, fading]],
         limiters: Vec::new(),
@@ -2765,12 +2779,12 @@ fn rebuilt_replica_continues_a_fade(wait: u64) -> Result<(), String> {
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
-        last_id: 2,
+        last_id: if assert_mid { 4 } else { 2 },
     };
     let j =
         c.e.install_product(&state, 0, Duration::from_secs(2))
             .unwrap();
-    if (j + 1) * B > at + u64::from(FADE.delay + FADE.len) - 5 * PAGE {
+    if (j + 1) * B > at + (FADE_DELAY + u64::from(FADE_LEN)) - 5 * PAGE {
         return Err(format!("installed at block {j}, near the fade's end"));
     }
     assert_same_within(a, c, (j + 1) * B, (j + 1) * B + 4 * PAGE)?;
@@ -2782,10 +2796,15 @@ fn rebuilt_replica_continues_a_fade(wait: u64) -> Result<(), String> {
 
 #[test]
 fn a_rebuilt_replica_continues_a_fade_still_waiting() {
-    common::undisturbed(|| rebuilt_replica_continues_a_fade(2_000));
+    common::undisturbed(|| rebuilt_replica_continues_a_fade(2_000, false));
 }
 
 #[test]
 fn a_rebuilt_replica_continues_a_fade_mid_ramp() {
-    common::undisturbed(|| rebuilt_replica_continues_a_fade(u64::from(FADE.delay) + 20_000));
+    common::undisturbed(|| rebuilt_replica_continues_a_fade(FADE_DELAY + 20_000, false));
+}
+
+#[test]
+fn a_rebuilt_replica_matches_its_peers_after_a_mid_fade_assert() {
+    common::undisturbed(|| rebuilt_replica_continues_a_fade(FADE_DELAY + 20_000, true));
 }
