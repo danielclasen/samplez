@@ -298,7 +298,7 @@ whatever the coefficient held before, so an entry that repeats a fade
 mid-ramp, as `Targets::assert` does, changes no bit. `from` must be a
 valid gain, `len` at most `samplez_dsp::MAX_EXACT_RAMP_LEN` (2^23, about
 174 s), and `start` at most that far past the entry's index;
-`Engine::set_gain_fade` refuses a fade beyond them. With no fade a gain
+An entry with a fade beyond them is refused when it is appended or installed, and a decoded core holding one is refused, so every replica starts the ramp at the same index. With no fade a gain
 change ramps over `rampSamples` from the value held at its index.
 `Entry::Gain` carries the fade as `fade`.
 
@@ -308,8 +308,8 @@ until `start + len`.
 
 `Targets::fading`, shaped as `gains`, holds the fade of each gain in
 this form, the one source: `Targets::diff` and `Targets::assert` copy it
-into the entries they emit, and a fade of a gain whose value does not
-change is no entry. Nothing of a fade lives outside the matrix: its
+into the entries they emit, and a gain whose value keeps its bits but
+whose fade differs bitwise gets an entry too. Nothing of a fade lives outside the matrix: its
 coefficient holds the start value, delay, length and position, so a
 copied core carries it. A core built from a product state does not know
 the fades running: the state names each as `ProductState::fading` beside

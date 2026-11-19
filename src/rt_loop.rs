@@ -1037,7 +1037,7 @@ fn set_gain(
     match fade {
         Some(f) => (
             matrix.set_resumed(input, output, gain, f.ramp_at(gain, at)),
-            f.start + u64::from(f.len),
+            f.start.saturating_add(u64::from(f.len)),
         ),
         None => (matrix.set(input, output, gain, ramp), at + u64::from(ramp)),
     }
@@ -3767,6 +3767,30 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(run(true), run(false));
+    }
+
+    /// A fade starting at the end of the index range neither panics nor
+    /// wraps the ramp end.
+    #[test]
+    fn a_fade_near_the_index_limit_does_not_overflow() {
+        let mut m = mix();
+        let f = crate::engine::Fade {
+            from: 1.0,
+            start: u64::MAX - 5,
+            len: 100,
+        };
+        assert!(m.push(entry(
+            Change::Gain {
+                input: 0,
+                output: 0,
+                gain: 0.5,
+                fade: Some(f)
+            },
+            2 * B,
+        )));
+        to(&mut m, 2);
+        assert_eq!(m.ramp_end, u64::MAX);
+        assert!(!f.within(2 * B));
     }
 
     #[test]

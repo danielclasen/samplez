@@ -96,6 +96,15 @@ fn the_rt_thread_passes_rtsan() {
     engine
         .set_gain_fade(0, 0, 0.25, Some(fade(40)), at(40))
         .unwrap();
+    // A resumed fade: its start lies behind the entry's index.
+    let resumed = samplez::Fade {
+        from: 0.5,
+        start: at(60) - 100,
+        len: 4800,
+    };
+    engine
+        .set_gain_fade(0, 0, 0.25, Some(resumed), at(60))
+        .unwrap();
     // The limiter on, below the output's level: it limits.
     let limiter = samplez_dsp::LimiterParams {
         enabled: true,

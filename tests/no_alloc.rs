@@ -158,6 +158,15 @@ fn rt_thread_allocates_nothing() {
     engine
         .set_gain_fade(0, 0, 0.25, Some(fade(40)), at(40))
         .unwrap();
+    // A resumed fade: its start lies behind the entry's index.
+    let resumed = samplez::Fade {
+        from: 0.5,
+        start: at(60) - 100,
+        len: 4800,
+    };
+    engine
+        .set_gain_fade(0, 0, 0.25, Some(resumed), at(60))
+        .unwrap();
     for param in common::strip_params(2) {
         engine.set_strip(0, param, (index / B + 20) * B).unwrap();
     }

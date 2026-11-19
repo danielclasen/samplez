@@ -74,17 +74,21 @@ impl Targets {
             let was = self.gains.get(input);
             for (output, &gain) in row.iter().enumerate() {
                 let held = was.and_then(|r| r.get(output));
-                if held.is_none_or(|g| g.to_bits() != gain.to_bits()) {
+                let fade = |t: &Targets| {
+                    t.fading
+                        .get(input)
+                        .and_then(|r| r.get(output))
+                        .copied()
+                        .flatten()
+                };
+                let bits = |f: Option<Fade>| f.map(|f| (f.from.to_bits(), f.start, f.len));
+                let fade_moved = bits(fade(self)) != bits(fade(next));
+                if held.is_none_or(|g| g.to_bits() != gain.to_bits()) || fade_moved {
                     entries.push(Entry::Gain {
                         input,
                         output,
                         gain,
-                        fade: next
-                            .fading
-                            .get(input)
-                            .and_then(|r| r.get(output))
-                            .copied()
-                            .flatten(),
+                        fade: fade(next),
                     });
                 }
             }
@@ -1234,5 +1238,33 @@ mod tests {
             fade: None,
         };
         assert_eq!(targets().diff(&plain), vec![none]);
+    }
+
+    /// A fade changed, set or cleared while the gain keeps its bits is an
+    /// entry too: peers and a rebuild would otherwise hold different
+    /// ramps until the old one ended.
+    #[test]
+    fn a_changed_fade_alone_is_an_entry() {
+        let f = Fade {
+            from: 1.0,
+            start: 10,
+            len: 20,
+        };
+        let with = |fade| {
+            let mut t = targets();
+            t.fading = vec![vec![fade, None], vec![None, None]];
+            t
+        };
+        let entry = |fade| Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 0.5,
+            fade,
+        };
+        assert_eq!(with(None).diff(&with(Some(f))), vec![entry(Some(f))]);
+        assert_eq!(with(Some(f)).diff(&with(None)), vec![entry(None)]);
+        let g = Fade { len: 21, ..f };
+        assert_eq!(with(Some(f)).diff(&with(Some(g))), vec![entry(Some(g))]);
+        assert_eq!(with(Some(f)).diff(&with(Some(f))), Vec::new());
     }
 }

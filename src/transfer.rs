@@ -471,8 +471,16 @@ impl Core {
             Some(strip) => strip.legs() == legs && strip.ramp() == ramp,
             None => legs > MAX_LEGS,
         };
-        let entry = |e: &RtEntry| fits(&e.change, inputs, columns, outputs, legs);
-        let batch = |(_, b): &(LogId, Arc<Batch>)| b.fits(inputs, columns, outputs, legs, ducked);
+        let entry = |e: &RtEntry| {
+            fits(&e.change, inputs, columns, outputs, legs)
+                && !matches!(e.change, Change::Gain { fade: Some(f), .. } if !f.within(e.at_index))
+        };
+        let batch = |(id, b): &(LogId, Arc<Batch>)| {
+            b.fits(inputs, columns, outputs, legs, ducked)
+                && (self.pending.iter().chain(&self.awaiting_gen))
+                    .filter(|e| e.id == *id)
+                    .all(|e| b.fades_within(e.at_index))
+        };
         // No duck on a column the configuration does not name: a ducked
         // term costs what Config::check counts only on those.
         let unducked = |m: &Matrix| {

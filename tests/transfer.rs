@@ -2699,7 +2699,7 @@ fn replayed_core_carries_a_fade(wait: u64) -> Result<(), String> {
     }
     let from = ((j + 1) * B).div_ceil(PAGE);
     let end = (at + FADE_DELAY + u64::from(FADE_LEN)) / PAGE;
-    let pages = wait_comparable(&a, &b, from, end, 3)?;
+    let pages = wait_comparable(&a, &b, from, end, 3, (at + FADE_DELAY) / PAGE)?;
     let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
     assert!(
         apart.is_empty(),
@@ -2727,7 +2727,8 @@ fn comparable(a: &Hashed, b: &Hashed, range: std::ops::Range<u64>) -> Vec<(u64, 
 }
 
 /// Collects `n` comparable pages at or after page `from` and before page
-/// `end`, as the engines compute them, and returns each with whether the
+/// `end`, as the engines compute them, with pages on both sides of page
+/// `split` when it lies past `from`, and returns each with whether the
 /// engines agree. Too few, because an engine skipped the stretch or the
 /// fade ended first, is an error and not a mismatch.
 fn wait_comparable(
@@ -2736,15 +2737,20 @@ fn wait_comparable(
     from: u64,
     end: u64,
     n: usize,
+    split: u64,
 ) -> Result<std::collections::BTreeMap<u64, bool>, String> {
     let mut found = std::collections::BTreeMap::new();
     wait_for(Duration::from_secs(10), "comparable pages", || {
         found.extend(comparable(a, b, from..end));
-        found.len() >= n || processed(&a.e).min(processed(&b.e)) * B / PAGE >= end
+        let sides =
+            split <= from || (found.keys().any(|&p| p < split) && found.keys().any(|&p| p > split));
+        (found.len() >= n && sides) || processed(&a.e).min(processed(&b.e)) * B / PAGE >= end
     });
-    if found.len() < n {
+    let sides =
+        split <= from || (found.keys().any(|&p| p < split) && found.keys().any(|&p| p > split));
+    if found.len() < n || !sides {
         return Err(format!(
-            "{} comparable pages in {from}..{end}, {n} wanted",
+            "{} comparable pages in {from}..{end}, {n} wanted, on both sides of {split}",
             found.len()
         ));
     }
@@ -2817,7 +2823,7 @@ fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), S
     }
     let from = ((j + 1) * B).div_ceil(PAGE);
     let end = (at + FADE_DELAY + u64::from(FADE_LEN)) / PAGE;
-    let pages = wait_comparable(a, c, from, end, 3)?;
+    let pages = wait_comparable(a, c, from, end, 3, (at + FADE_DELAY) / PAGE)?;
     let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
     assert!(apart.is_empty(), "pages {apart:?} differ after the install");
     Ok(())

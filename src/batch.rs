@@ -280,6 +280,13 @@ impl Batch {
             }
     }
 
+    /// Whether every fade starts within the bound of the entry index `at`.
+    pub fn fades_within(&self, at: u64) -> bool {
+        let mut ok = true;
+        self.fades.each(|_, f| ok &= f.within(at));
+        ok
+    }
+
     /// Whether it sets anything of the matrix's ducks.
     pub fn ducks_matrix(&self) -> bool {
         !self.depths.is_empty() || !self.masks.is_empty()
