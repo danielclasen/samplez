@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.3](https://github.com/danielclasen/samplez/compare/v0.8.2...v0.8.3) (2026-11-19)
+
+
+### Bug Fixes
+
+* **engine:** wake a head wait at least twice per block period ([#102](https://github.com/danielclasen/samplez/issues/102)) ([d657096](https://github.com/danielclasen/samplez/commit/d657096939ccfd8ed28f6f905896a501470f47e3))
+* **replica:** release entries a restarted replica held unresolved ([#105](https://github.com/danielclasen/samplez/issues/105)) ([414511a](https://github.com/danielclasen/samplez/commit/414511a2db1d508d9fa5d90108cf73ecd42064b2))
+
 ## [0.8.2](https://github.com/danielclasen/samplez/compare/v0.8.1...v0.8.2) (2026-11-19)
 
 
