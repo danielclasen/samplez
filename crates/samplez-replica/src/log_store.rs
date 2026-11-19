@@ -443,7 +443,8 @@ impl<P: Product> Store<P> {
     /// `with_state` or `view`: an apply arriving meanwhile waits for `f`
     /// and holds the other thread off, and neither ever returns. Not from
     /// a [`Product`] method: one the store calls panics here rather than
-    /// deadlock.
+    /// deadlock. An apply or snapshot install on a thread inside `f`
+    /// panics as well.
     pub fn with_state<T>(&self, f: impl FnOnce(&StateMachine<P>) -> T) -> T {
         self.view(|_, sm| f(sm))
     }
@@ -688,13 +689,15 @@ impl<P> Store<P> {
     /// Takes the gate, for writing when `write`, or nothing when this
     /// thread holds it already: a `with_state` closure reading the store
     /// again, which a writer waiting for the gate would otherwise hold
-    /// off.
+    /// off. A writer on such a thread, an apply or install inside
+    /// `with_state`, panics: it would wait for the state its own closure
+    /// holds.
     #[track_caller]
     fn gate(&self, write: bool) -> Option<Gate<'_>> {
         assert_no_product_code("store");
         let key = Arc::as_ptr(&self.gate) as usize;
         if GATES.with(|g| g.borrow().contains(&key)) {
-            debug_assert!(
+            assert!(
                 !write,
                 "an apply or install on a thread inside with_state would wait for itself"
             );
@@ -1292,7 +1295,6 @@ mod tests {
 
     /// An apply on a thread inside `with_state` panics rather than wait
     /// for the state its own closure holds.
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "an apply or install on a thread inside with_state")]
     fn an_apply_inside_with_state_panics() {

@@ -585,8 +585,9 @@ store's other reads (`pending`, `records`, `entries_after`) take; there
 a call into the `Replica` or the `Store` panics, naming the lock, rather
 than deadlock.
 
-A client snapshot builds the product's whole text, which for a large
-state holds off applies for milliseconds. `Product::text_later` lets a
+A client snapshot builds the product's whole text, and holds the gate,
+and with it every apply, while the text is built: tens of milliseconds
+for a large state in a debug build. `Product::text_later` lets a
 product hand out a closure that builds the text after the gate is
 released, over state fixed at that call, such as a clone of an `Arc`
 the product replaces or copies on apply. The closure must read nothing
