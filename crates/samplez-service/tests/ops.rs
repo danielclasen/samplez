@@ -5,7 +5,6 @@ use std::time::Duration;
 use axum::http::{StatusCode, header};
 use common::*;
 use samplez_service::{MetricKind, Metrics, Ops, ReplicaMetric};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test(start_paused = true)]
 async fn healthz_follows_the_heartbeat_within_one_second() {
@@ -69,11 +68,12 @@ async fn healthz_takes_no_lock_of_the_replicated_state() {
     assert_eq!(body, r#"{"ok":true}"#);
 }
 
-/// The ops listener answers while the task that serves the others is held
-/// by a blocking call, as a product's replica or engine future holding its
-/// worker would hold it.
+/// The ops listener answers while every worker of the runtime that
+/// serves the others is held by a blocking call, as a product's replica
+/// or engine futures holding their workers would hold them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn healthz_answers_while_the_task_serving_the_listeners_is_blocked() {
+async fn healthz_answers_while_every_worker_is_blocked() {
+    use std::io::{Read, Write};
     let ops = Ops::default();
     let state = FakeState::new("r1", "leader");
     let mut config = config("none", "blocked");
@@ -84,41 +84,46 @@ async fn healthz_answers_while_the_task_serving_the_listeners_is_blocked() {
         .await
         .unwrap();
     let addr = bound.ops_addr().unwrap();
+    // Beats off the runtime, as an engine's RT thread does.
     let heartbeat = ops.heartbeat();
-    let beating = tokio::spawn(async move {
-        loop {
-            heartbeat.beat();
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    });
-
-    let serving = tokio::spawn(async move {
-        tokio::select! {
-            biased;
-            r = bound.serve() => r,
-            () = async { std::thread::sleep(Duration::from_secs(2)) } => Ok(()),
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let get = async {
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        stream
-            .write_all(b"GET /healthz HTTP/1.1\r\nHost: ops\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply).await.unwrap();
-        reply
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let beating = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                heartbeat.beat();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
     };
-    let reply = tokio::time::timeout(Duration::from_secs(1), get)
-        .await
-        .expect("/healthz was not answered while the serving task was blocked");
+    let serving = tokio::spawn(bound.serve());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Both workers held for 3 s.
+    let blocked: Vec<_> = (0..2)
+        .map(|_| tokio::spawn(async { std::thread::sleep(Duration::from_secs(3)) }))
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: ops\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .expect("/healthz was not answered while every worker was blocked");
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     assert!(reply.ends_with(r#"{"ok":true}"#), "{reply}");
 
+    for b in blocked {
+        b.await.unwrap();
+    }
     serving.abort();
-    beating.abort();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    beating.join().unwrap();
 }
 
 #[tokio::test]

@@ -61,8 +61,8 @@ impl Ops {
     }
 
     /// Samples the heartbeat every 100 ms; never returns. [`Bound::serve`]
-    /// samples on a thread of its own instead, so that a busy runtime does
-    /// not stall the sampling.
+    /// samples on the ops listener's thread instead, so that a busy runtime
+    /// does not stall the sampling.
     ///
     /// [`Bound::serve`]: crate::Bound::serve
     pub async fn watch_heartbeat(self) {
@@ -79,7 +79,12 @@ impl Ops {
         let value = self.0.heartbeat.load(Ordering::Relaxed);
         if value != *seen {
             *seen = value;
-            *self.0.advanced.lock().expect("ops lock poisoned") = Some(Instant::now());
+            // A poisoned lock still holds an instant: the sampling goes on.
+            let mut advanced = self.0.advanced.lock().unwrap_or_else(|e| {
+                tracing::error!("the heartbeat sampling took a poisoned lock");
+                e.into_inner()
+            });
+            *advanced = Some(Instant::now());
         }
     }
 

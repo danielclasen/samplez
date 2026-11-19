@@ -5,7 +5,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
@@ -374,7 +373,19 @@ impl Service {
             Some(l) => Some(bind("machine", l).await?),
             None => None,
         };
-        let ops = bind("ops", &listeners.ops).await?;
+        // The ops listener is registered with a runtime of its own when it
+        // serves ([`Bound::serve`]): bound here without one.
+        let ops = {
+            let std = std::net::TcpListener::bind(SocketAddr::new(
+                listeners.ops.bind,
+                listeners.ops.port,
+            ))?;
+            std.set_nonblocking(true)?;
+            OpsSocket {
+                std,
+                tls: self.tls.iter().position(|t| t.listener() == "ops"),
+            }
+        };
         let nmos = bind("nmos", &listeners.nmos).await?;
         Ok(Bound {
             routers: self.routers(),
@@ -408,12 +419,19 @@ impl Socket {
     }
 }
 
+/// The ops listener before it serves: a bound socket on no runtime, and
+/// the TLS of the service's list it runs, if any.
+struct OpsSocket {
+    std: std::net::TcpListener,
+    tls: Option<usize>,
+}
+
 pub struct Bound {
     service: Service,
     routers: Routers,
     api: Socket,
     machine: Option<Socket>,
-    ops: Socket,
+    ops: OpsSocket,
     nmos: Socket,
 }
 
@@ -427,7 +445,7 @@ impl Bound {
     }
 
     pub fn ops_addr(&self) -> io::Result<SocketAddr> {
-        self.ops.local_addr()
+        self.ops.std.local_addr()
     }
 
     pub fn nmos_addr(&self) -> io::Result<SocketAddr> {
@@ -438,12 +456,12 @@ impl Bound {
     /// and TLS files until a listener fails. A failed reload keeps the
     /// previous token or certificate. `/readyz` reports the API as serving while this runs.
     ///
-    /// The ops listener and the heartbeat sampling do not run as futures
-    /// of the task that calls this. The sampling has a thread of its own,
-    /// which also spawns the ops listener, so that no worker's local queue
-    /// holds it: whatever else the calling task polls, such as a product's
-    /// replica and engine futures, cannot hold back `/healthz` by blocking
-    /// its worker. Both end when this returns or is dropped.
+    /// The ops listener and the heartbeat sampling run on a thread of their
+    /// own with a runtime of its own, the listener's socket and TLS
+    /// handshakes registered there: whatever blocks the calling runtime's
+    /// workers, such as a product's replica and engine futures, cannot hold
+    /// back `/healthz`. The thread is stopped and joined when this returns
+    /// or is dropped.
     pub async fn serve(self) -> io::Result<()> {
         let Bound {
             service,
@@ -461,33 +479,51 @@ impl Bound {
         };
         service.ops.set_api_serving(true);
         let _serving = Serving(service.ops.clone());
-        let stop = Arc::new(AtomicBool::new(false));
-        let _stop = StopSampling(stop.clone());
-        let (sent, spawned) = tokio::sync::oneshot::channel();
-        let (runtime, ops_serve, sampled) = (
-            tokio::runtime::Handle::current(),
-            ops.serve(routers.ops),
-            service.ops.clone(),
-        );
-        std::thread::Builder::new()
+        let (done, ops_done) = tokio::sync::oneshot::channel::<io::Result<()>>();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (tls, router, sampled) = (service.tls.clone(), routers.ops, service.ops.clone());
+        let thread = std::thread::Builder::new()
             .name("samplez-ops".into())
             .spawn(move || {
-                let _ = sent.send(Detached(runtime.spawn(ops_serve)));
-                let mut seen = 0;
-                while !stop.load(Ordering::Relaxed) {
-                    sampled.sample_heartbeat(&mut seen);
-                    std::thread::sleep(ops::SAMPLE_PERIOD);
-                }
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let served = runtime.and_then(|runtime| {
+                    runtime.block_on(async move {
+                        let tcp = TcpListener::from_std(ops.std)?;
+                        let socket = match ops.tls {
+                            Some(i) => Socket::Tls(tls[i].bind(tcp)?),
+                            None => Socket::Plain(tcp),
+                        };
+                        let sampling = async {
+                            let mut seen = 0;
+                            let mut ticks = tokio::time::interval(ops::SAMPLE_PERIOD);
+                            loop {
+                                ticks.tick().await;
+                                sampled.sample_heartbeat(&mut seen);
+                            }
+                        };
+                        tokio::select! {
+                            r = socket.serve(router) => r,
+                            () = sampling => unreachable!("the sampling never returns"),
+                            _ = stopped => Ok(()),
+                        }
+                    })
+                });
+                let _ = done.send(served);
             })?;
-        let mut ops = spawned.await.map_err(io::Error::other)?;
+        let _ops = OpsThread {
+            stop: Some(stop),
+            thread: Some(thread),
+        };
         let servers = async {
             tokio::try_join!(
                 api.serve(routers.api),
                 machine,
                 async {
-                    (&mut ops.0)
-                        .await
-                        .unwrap_or_else(|e| Err(io::Error::other(e)))
+                    ops_done.await.unwrap_or_else(|_| {
+                        Err(io::Error::other("the ops listener's thread ended"))
+                    })
                 },
                 nmos.serve(routers.nmos),
             )
@@ -508,21 +544,21 @@ impl Bound {
     }
 }
 
-/// A task that ends with its owner.
-struct Detached<T>(tokio::task::JoinHandle<T>);
-
-impl<T> Drop for Detached<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+/// The thread of the ops listener and the heartbeat sampling, on a
+/// runtime of its own: stopped and joined when dropped.
+struct OpsThread {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Ends the heartbeat sampling thread.
-struct StopSampling(Arc<AtomicBool>);
-
-impl Drop for StopSampling {
+impl Drop for OpsThread {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
