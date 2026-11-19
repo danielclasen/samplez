@@ -446,6 +446,26 @@ impl<P> Store<P> {
         }
     }
 
+    /// [`Store::entries_after`] for the first `max` application entries
+    /// only, the rest of the log not read: true when more follow.
+    pub fn entries_after_max(
+        &self,
+        index: u64,
+        max: usize,
+        mut f: impl FnMut(StoredLogId, &Request),
+    ) -> bool {
+        let inner = self.lock();
+        let mut requests =
+            (inner.log.range(index.saturating_add(1)..)).filter_map(|(_, e)| match &e.payload {
+                StoredPayload::Normal(request) => Some((e.log_id, request)),
+                _ => None,
+            });
+        for (id, request) in requests.by_ref().take(max) {
+            f(id, request);
+        }
+        requests.next().is_some()
+    }
+
     /// The first decision applied on (`index`, `term`), by its log
     /// index.
     pub fn decided(&self, index: u64, term: u64) -> Option<u64> {
