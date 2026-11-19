@@ -2275,6 +2275,69 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// A product state that folds in an entry whose generation the RT thread
+/// holds pending, as a replica rebuilt past a re-route it took late
+/// does: the generation goes with the entry, so the supervisor's job
+/// ends and a core replayed from a donor, which holds none, is not
+/// refused for it.
+#[test]
+fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let (src0, src1, next0) = (new_id(), new_id(), new_id());
+        let _p0 = Pilot::start(&domain.0, &src0, 1, B, 0);
+        let _p1 = Pilot::start(&domain.0, &src1, 1, B, 0);
+        let _n0 = Pilot::start(&domain.0, &next0, 1, B, 0);
+        let inputs = [(src0.as_str(), 1), (src1.as_str(), 1)];
+        let b = hashed_with(&domain, &inputs);
+        let at = (now_block() + 400) * B;
+        b.e.drop_core().unwrap();
+        b.e.append(
+            2,
+            at,
+            Entry::Route {
+                slot: 0,
+                flow_id: next0.clone(),
+            },
+        )
+        .unwrap();
+        b.e.commit(2);
+        wait_for(Duration::from_secs(5), "entry 2's generation sent", || {
+            b.e.status().generation.pending == Some(2)
+        });
+        let state = ProductState {
+            limiters: Vec::new(),
+            delays: Vec::new(),
+            gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            up: vec![true, true],
+            flows: vec![Some(next0.clone()), Some(src1.clone())],
+            outputs: Vec::new(),
+            strips: vec![Vec::new(), Vec::new()],
+            ducks: Vec::new(),
+            masks: Vec::new(),
+            pending: Vec::new(),
+            last_id: 2,
+        };
+        b.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
+        wait_for(
+            Duration::from_secs(5),
+            "entry 2's generation dropped",
+            || b.e.status().generation.pending.is_none(),
+        );
+        // A core replayed from a donor, which holds no pending
+        // generation, is taken: the dropped one would refuse it.
+        // The donor knows entry 2 as one needing none.
+        let a = hashed_with(&domain, &inputs);
+        gain(&a.e, 2, (now_block() + 20) * B, 0, 0.5);
+        let mut replay = b.e.replay(copy(&a.e)).unwrap();
+        replay.run_to(now_block() + 20);
+        b.e.hand_over(&mut replay, Duration::from_secs(5))
+            .map_err(|e| format!("no hand-over: {e}"))?;
+        Ok(())
+    });
+}
+
 /// The determinism rows of the ducks: replicas given the same entries
 /// compute the same pages while a group ducks by its key; a joiner whose
 /// ducks were set apart replays a donor's core copied 100 ms into a
