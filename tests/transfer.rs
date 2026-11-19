@@ -1886,6 +1886,10 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
 /// ducks were set apart replays a donor's core copied 100 ms into a
 /// 500 ms attack and from the hand-over on computes the donor's pages.
 /// The core carries the detectors' key filter, hold and envelope state.
+/// A detector follows the samples it processed: a skipped or silenced
+/// block on one replica leaves its envelope apart for as long as the
+/// attack, hold and release take, beyond the pages such a block touches,
+/// so a run with one after the entries is disturbed.
 #[test]
 fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
     common::undisturbed(|| {
@@ -1917,6 +1921,8 @@ fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
                 },
             ]
         };
+        let skipped = |e: &Engine| e.counters().overrun_skipped_samples.load(Relaxed);
+        let skipped_before: Vec<u64> = [&a, &b, &c].iter().map(|h| skipped(&h.e)).collect();
         // The joiner's attack sets its detector apart, and nothing else:
         // a joiner keeping its own detector would compute other pages.
         for (e, attack) in [(&a.e, 500.0), (&c.e, 500.0), (&b.e, 50.0)] {
@@ -1950,6 +1956,15 @@ fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
         });
         let (pa, pb, pc) = (a.pages(), b.pages(), c.pages());
         let disturbed: Vec<u64> = [&a, &b, &c].iter().flat_map(|h| h.disturbed()).collect();
+        let skips: Vec<u64> = ([&a, &b, &c].iter().zip(&skipped_before))
+            .map(|(h, before)| skipped(&h.e) - before)
+            .collect();
+        if skips.iter().any(|&n| n > 0) {
+            return Err(format!("samples skipped after the entries: {skips:?}"));
+        }
+        if let Some(p) = disturbed.iter().find(|&&p| p >= at1 / PAGE) {
+            return Err(format!("page {p} disturbed after the entries"));
+        }
         let before = (at1 / PAGE + 1)..k0 * B / PAGE;
         let differ = before
             .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
