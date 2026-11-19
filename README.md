@@ -321,8 +321,10 @@ mixes, so the output depends on neither the block size nor where a core
 was copied. Like a strip's, a detector's filter, hold and envelope state
 follows the samples it processed: over skipped samples it holds, and a
 silenced read keys nothing, so after either its envelope differs from an
-engine that computed them for as long as the attack, hold and release
-take, or until a resync copies a donor's. A group with no key, not on and at rest is advanced rather
+engine that computed them while the envelope is in transit. Once both
+are at rest they compute the same bits again: an attack after the skip
+under a key that stays above the threshold, the hold and release after
+it under one that falls silent; a resync ends it at once. A group with no key, not on and at rest is advanced rather
 than run, which computes the same envelope, 0. A coefficient of a column
 in `duckColumns` counts 6 times against the 150 coefficients per sample
 of the block (`DUCKED_TERM_COST`): a ducked term mixes at 5.5 times the

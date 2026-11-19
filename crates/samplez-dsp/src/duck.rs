@@ -1340,6 +1340,42 @@ mod tests {
         }
     }
 
+    /// A detector that advanced over samples while its envelope moved, as
+    /// a replica's does over an overrun skip, holds its envelope and key
+    /// filter state there and computes other envelopes than one that
+    /// processed them; once both reached rest, full depth here under a
+    /// key that stays loud, they compute the same bits. The skip leaves
+    /// the advanced one at most its own length behind, so both are at
+    /// rest an attack after it.
+    #[test]
+    fn a_detector_that_skipped_mid_attack_rejoins_one_that_processed() {
+        for p in [plain(DetectorParams::DEFAULT), DetectorParams::DEFAULT] {
+            let attack = samples(p.attack_ms);
+            let key = tone(1000.0, 0.5, 3 * attack);
+            let mut a = detector(p);
+            run_mono(&mut a, &key[..attack / 4], 48);
+            let mut b = a;
+            let skip = attack / 4;
+            run_mono(&mut a, &key[attack / 4..attack / 4 + skip], 48);
+            b.advance(skip);
+            let rest = &key[attack / 4 + skip..];
+            let (ea, eb) = (run_mono(&mut a, rest, 48), run_mono(&mut b, rest, 48));
+            let bound = attack + TOL;
+            assert_ne!(
+                bits(&ea[..bound]),
+                bits(&eb[..bound]),
+                "the skip changed nothing"
+            );
+            assert_eq!(
+                bits(&ea[bound..]),
+                bits(&eb[bound..]),
+                "apart past an attack after the skip, filters {}",
+                p.hpf.enabled
+            );
+            assert!(a == b, "{a:?} {b:?}");
+        }
+    }
+
     /// Bursts of noise around the threshold on two keys, one of them
     /// stereo, through both key filters, with the momentary hold pressed
     /// and released and a new attack mid-way.
