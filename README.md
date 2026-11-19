@@ -610,12 +610,16 @@ applied past them, as after a snapshot install, one rebuild at a time,
 the entries taken late while one runs going into the next
 (`late_rebuilds` in the contact metrics). A replica with no outputs or
 with one committing, and one taking entries late after it caught up,
-holds them unresolved. An entry held unresolved that applies without
-deriving a record, such as a re-route to the flow an input reads
-already, changes no engine state and is released as it applies: the
-log decides an entry that stands only when the baseline held it
-unresolved as it committed its block, or every live replica withheld
-that block, so held it could stay unresolved for good.
+holds them unresolved. Those it took late while catching up and applied
+while it committed, as a restarted replica does for a moment before its
+log has caught up, are rebuilt past too, once it commits nothing again:
+the log never decides an entry that stands. An entry held
+unresolved that applies without deriving a record, such as a re-route
+to the flow an input reads already, changes no engine state and is
+released as it applies: the log decides an entry that stands only when
+the baseline held it unresolved as it committed its block, or every
+live replica withheld that block, so held it could stay unresolved for
+good.
 A decision that comes for it neither resolves nor contradicts the
 replica: it is rebuilt past. For the same
 reason a rebuild from product state on a replica committing nothing
