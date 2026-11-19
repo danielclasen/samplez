@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/danielclasen/samplez/compare/v0.8.1...v0.8.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* **engine:** wait for input on heads, no flow check on the RT thread ([#100](https://github.com/danielclasen/samplez/issues/100)) ([23a09c2](https://github.com/danielclasen/samplez/commit/23a09c27d9710f8e68e6846a0f9021f233d0b031))
+
 ## [0.8.1](https://github.com/danielclasen/samplez/compare/v0.8.0...v0.8.1) (2026-11-18)
 
 
