@@ -913,10 +913,13 @@ CI runs the AMWA nmos-testing suites IS-04-01 (unicast and multicast
 DNS-SD), IS-05-01 and BCP-007-03-01 against the example node
 (`cargo run -p samplez-nmos --example nmos-node`), restarting it between
 suites and failing when a resource id changes across a restart. The tool
-validates against the AMWA specification commits pinned in
-`tests/nmos/specs.txt`, not against their latest state. Results other
-than Pass are accepted only as listed, with their reason from the
-tool's source, in `tests/nmos/expected.json`, and each suite has to run
+runs from the published image `.github/nmos-testing.image` names by
+digest, built from the nmos-testing commit in `.github/nmos-testing.ref`,
+which its revision label must carry; no run builds it. It validates
+against the AMWA specification
+commits pinned in `tests/nmos/specs.txt`, not against their latest
+state. Results other than Pass are accepted only as listed, with their
+reason from the tool's source, in `tests/nmos/expected.json`, and each suite has to run
 at least the number of tests listed there. Of the Manual tests,
 IS-04-01 test_22 (ids persist over a restart) is the restart check;
 BCP-007-03-01 test_15 (MXL reads and writes start and stop on

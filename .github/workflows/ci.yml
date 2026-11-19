@@ -453,8 +453,6 @@ jobs:
   # list with its reason.
   nmos:
     runs-on: ubuntu-24.04
-    env:
-      NMOS_TESTING: b21639f3a187c0e027bb7894fbe0c21d22285dfb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -482,19 +480,17 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -e CARGO_INCREMENTAL=0 \
             -v "$PWD:/w" -v "$PWD/.cargo-registry:/usr/local/cargo/registry" \
             -w /w samplez-builder:ci cargo build --locked -p samplez-nmos --example nmos-node
-      - name: Check out nmos-testing
+      # The tool runs from a published image, pulled by the digest in
+      # .github/nmos-testing.image, so no run builds it: building it needs
+      # the Ubuntu archive. The image must carry the nmos-testing commit in
+      # .github/nmos-testing.ref as its revision.
+      - name: Pull the nmos-testing image
         run: |
-          git init -q nmos-testing
-          git -C nmos-testing fetch -q --depth 1 https://github.com/AMWA-TV/nmos-testing "$NMOS_TESTING"
-          git -C nmos-testing checkout -q FETCH_HEAD
-      - name: Build the nmos-testing image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: nmos-testing
-          load: true
-          tags: nmos-testing:ci
-          cache-from: type=gha,scope=nmos-testing
-          cache-to: ${{ github.event_name == 'push' && 'type=gha,scope=nmos-testing,mode=max' || '' }}
+          ref=$(cat .github/nmos-testing.ref)
+          image=$(cat .github/nmos-testing.image)
+          docker pull "$image"
+          test "$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$ref"
+          docker tag "$image" nmos-testing:ci
       # The node reads CLOCK_TAI, the tool computes TAI from UTC: absolute
       # activations meet only with the kernel's TAI offset set.
       - name: Set the kernel TAI offset
