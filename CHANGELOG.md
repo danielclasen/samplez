@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.9.0](https://github.com/danielclasen/samplez/compare/v0.8.3...v0.9.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **nmos:** `NmosConfig` has a new `continue_held` field.
+* **engine:** `config::Input::flow_id` is an `Option<String>`, and
+
+### Features
+
+* **engine:** start an output disabled and an input detached ([#93](https://github.com/danielclasen/samplez/issues/93)) ([efa0523](https://github.com/danielclasen/samplez/commit/efa0523fc989332b727ff2712b140e6ccb4eda4a))
+* **nmos:** continue a registration a registry still holds ([#99](https://github.com/danielclasen/samplez/issues/99)) ([7cf8781](https://github.com/danielclasen/samplez/commit/7cf87812d50a900099f234f2be6c3d04573c2f9b))
+
+
+### Bug Fixes
+
+* **replica:** rebuild for flows only once the mismatch outlasts the lead ([#106](https://github.com/danielclasen/samplez/issues/106)) ([c4d965a](https://github.com/danielclasen/samplez/commit/c4d965ae456c1d861dd92fceed7a89e5501f147c))
+
 ## [0.8.3](https://github.com/danielclasen/samplez/compare/v0.8.2...v0.8.3) (2026-11-19)
 
 
