@@ -489,6 +489,10 @@ pub struct Fake {
     pub catch_up: u64,
     /// The next this many resyncs fail.
     pub failing: u32,
+    /// With route digests, a replay on other flows than the donor's hands
+    /// over all the same, as one whose replayed pages the donor has not
+    /// reported yet: the pages after the hand-over differ until a rebuild.
+    pub hands_over_off_flows: bool,
     /// The state a hand-over installs after its block: the donor's open
     /// glitches.
     pending_handover: Option<(u64, Vec<f32>)>,
@@ -502,6 +506,10 @@ pub struct Fake {
 /// An open glitch: a state divergence that lasts until a resync or a
 /// rebuild replaces the state.
 pub const FOR_GOOD: u64 = u64::MAX;
+
+/// The glitch a hand-over on other flows than the donor's leaves
+/// ([`Fake::hands_over_off_flows`]).
+const OFF_FLOWS: f32 = 0.25;
 
 impl Fake {
     /// The flows the inputs read in block `k`: the last rebuild's, with
@@ -1148,10 +1156,13 @@ impl Audio for FakeAudio {
         if !go {
             return Err("given up".to_owned());
         }
-        let (donor, reads): (Vec<f32>, Vec<Option<String>>) =
+        let (mut donor, reads): (Vec<f32>, Vec<Option<String>>) =
             serde_json::from_str(&core.core).map_err(|e| e.to_string())?;
         if st.route_digests && reads != st.reads(st.computed.unwrap_or(0)) {
-            return Err("a replayed page differs from the donor's".to_owned());
+            if !st.hands_over_off_flows {
+                return Err("a replayed page differs from the donor's".to_owned());
+            }
+            donor.push(OFF_FLOWS);
         }
         let j = st.computed.unwrap_or(0) + st.catch_up;
         st.pending_handover = Some((j, donor));

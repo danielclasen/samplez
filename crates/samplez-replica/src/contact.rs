@@ -721,9 +721,14 @@ struct State {
     /// The audio `/readyz` term, as of the last period in contact; none
     /// before the first.
     serving: Option<bool>,
-    /// Since when a resync check found an input on another flow than the
-    /// applied state names ([`Audio::follows`]).
-    off_flows_since: Option<Instant>,
+    /// Since when resync checks found an input on another flow than the
+    /// applied state names ([`Audio::follows`]), and that state's
+    /// [`State::flows_at`].
+    off_flows_since: Option<(Instant, u64)>,
+    /// The log index of the last entry applied here that re-routed or
+    /// detached an input, or of the state a rebuild installed: the applied
+    /// flows have not changed since.
+    flows_at: u64,
     /// `Diverged` verdicts naming this replica, by log index and page,
     /// until their commit is known.
     verdicts: Vec<(u64, u64)>,
@@ -1010,6 +1015,7 @@ impl Contact {
                 decider: crate::decide::Decider::default(),
                 serving: None,
                 off_flows_since: None,
+                flows_at: 0,
                 verdicts: Vec::new(),
                 realised: Vec::new(),
                 enabled: Vec::new(),
@@ -1838,6 +1844,7 @@ impl Contact {
     /// A core was rebuilt from the state the entries up to `n` left: what
     /// they derived is in it, not handed again.
     fn rebuilt(&self, st: &mut State, n: u64) {
+        st.flows_at = st.flows_at.max(n);
         if n > st.handed {
             st.handed = n;
             st.awaiting = st.awaiting.split_off(&(n + 1, 0, 0));
@@ -1946,6 +1953,12 @@ impl Contact {
         // it unresolved as it committed its block, or every live replica
         // withheld that block. Should one come, the entry is rebuilt past,
         // so the decision neither resolves nor contradicts this replica.
+        let rerouted = records.iter().rev().find(|(_, r)| {
+            (r.entries.iter()).any(|e| matches!(e, Entry::Route { .. } | Entry::Detach { .. }))
+        });
+        if let Some(&(index, _)) = rerouted {
+            st.flows_at = st.flows_at.max(index);
+        }
         let derived: BTreeSet<u64> = records.iter().map(|(index, _)| *index).collect();
         let empty: Vec<Key> = (st.given.keys())
             .filter(|&&(index, term, node)| {
@@ -3131,9 +3144,9 @@ impl Contact {
         let mut st = self.lock();
         let st = &mut *st;
         let diverged = st.life.as_ref()?.state() == ReplicaState::Diverged;
-        // A mismatch counts within one divergence, resync attempts
-        // included: once the replica no longer is diverged, a later
-        // divergence starts its own.
+        // A mismatch counts while the replica stays diverged or
+        // resyncing, attempts and hand-overs included: once it is neither,
+        // a later divergence starts its own.
         if !st.life.as_ref()?.state().diverged() {
             st.off_flows_since = None;
         }
@@ -3150,34 +3163,34 @@ impl Contact {
         // Checked as often as an attempt would start.
         // A route committed with its index still inside the lead reads as
         // another flow until its block is computed: rebuilt only once the
-        // mismatch outlasts the longest lead an entry is stamped with.
-        let state = st.resync.due(now).then(|| self.log.product_state().2);
-        let off = match (&self.audio, &state) {
-            (Some(audio), Some(state)) if !state.flows.is_empty() => !audio.follows(state),
-            (_, Some(_)) => false,
-            (_, None) => st.off_flows_since.is_some(),
-        };
+        // mismatch outlasts the longest lead an entry is stamped with. A
+        // hand-over moves no input, so the mismatch counts on across one;
+        // once an entry re-routed or detached an input since, it counts
+        // anew, though the flows it left may equal those it began with.
         let lead = self.timing.max_apply_lead + crate::schedule::EXTRA_LEAD;
-        let since = if off {
-            *st.off_flows_since.get_or_insert(now)
-        } else {
-            now
-        };
-        if !off {
-            st.off_flows_since = None;
-        }
-        if let Some(state) = &state
-            && off
-            && since + lead <= now
-        {
-            st.off_flows_since = None;
-            st.resync.rebuilt(now);
-            tracing::warn!(
-                flows = ?state.flows,
-                "diverged with an input on another flow than the log names: rebuilt, not resynced"
-            );
-            self.begin_restart(st, self.log.applied());
-            return None;
+        if st.resync.due(now) {
+            let state = self.log.product_state().2;
+            let off = (self.audio.as_ref())
+                .is_some_and(|audio| !state.flows.is_empty() && !audio.follows(&state));
+            st.off_flows_since = match st.off_flows_since.take() {
+                Some((since, at)) if off && at == st.flows_at => Some((since, at)),
+                _ if off => Some((now, st.flows_at)),
+                _ => None,
+            };
+            if st
+                .off_flows_since
+                .as_ref()
+                .is_some_and(|(since, _)| *since + lead <= now)
+            {
+                st.off_flows_since = None;
+                st.resync.rebuilt(now);
+                tracing::warn!(
+                    flows = ?state.flows,
+                    "diverged with an input on another flow than the log names: rebuilt, not resynced"
+                );
+                self.begin_restart(st, self.log.applied());
+                return None;
+            }
         }
         let audio_voters = crate::rank::audio_voters(&st.members);
         let baseline = self.log.baseline().map(|b| b.replica);
@@ -3273,8 +3286,6 @@ impl Contact {
             }
         };
         life.handed_over(r.j);
-        // Handed over: a divergence after it starts its own mismatch.
-        st.off_flows_since = None;
         // The donor's unresolved entries are this replica's now: the
         // log's decision on them reaches both alike.
         let inherited: BTreeMap<u64, u64> = r.unresolved.iter().copied().collect();
@@ -4940,11 +4951,13 @@ mod tests {
         assert_eq!(rebuilt(&f), 1);
     }
 
-    /// A mismatch counts within one divergence: after a resync handed
-    /// over, a later divergence resyncs at its first check, though the
-    /// earlier mismatch began more than the lead ago.
-    #[tokio::test(start_paused = true)]
-    async fn a_flow_mismatch_counts_anew_after_a_hand_over() {
+    /// A diverged replica on another flow resyncs, hands over and
+    /// diverges again `lead` plus the backoff later, its input still on
+    /// another flow; whether its next check rebuilds it from product state.
+    /// In between it leaves `diverged` and `resync` for `withdrawn` once
+    /// when `recovered`, and entries re-route its input to each of
+    /// `reroutes` in turn.
+    async fn rebuilt_after_a_hand_over(recovered: bool, reroutes: &[&str]) -> bool {
         let f = fixture(&[&[1, 2, 3]]);
         f.engine.outputs.store(true, Ordering::SeqCst);
         f.log.0.lock().unwrap().flows = vec![Some("a".to_owned())];
@@ -4967,22 +4980,81 @@ mod tests {
             }),
         );
         assert_eq!(f.contact.metrics().resync.handovers, 1);
+        let audio: Arc<dyn Audio> = f.engine.clone();
+        if recovered {
+            f.contact
+                .lock()
+                .life
+                .as_mut()
+                .unwrap()
+                .restart(audio.as_ref());
+            f.tick();
+            assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+            assert_eq!(f.contact.resync_due(), None);
+        }
+        let guard = Timing::defaults(B).apply_guard_ns();
+        for (n, flow) in reroutes.iter().enumerate() {
+            let index = 3 + n as u64;
+            let at = index_at(f.clock.get() + guard) + B;
+            f.log.push(1, index, Some(at));
+            let record = Record {
+                at_index: at,
+                entries: vec![Entry::Route {
+                    slot: 0,
+                    flow_id: (*flow).to_owned(),
+                }],
+                generation: true,
+            };
+            (f.log.0.lock().unwrap().records).insert(index, Arc::new(record));
+            f.log.0.lock().unwrap().flows = vec![Some((*flow).to_owned())];
+            f.apply(index);
+            f.contact.log_changed();
+            f.tick();
+        }
         let lead = Timing::defaults(B).max_apply_lead + crate::schedule::EXTRA_LEAD;
         let later = lead + f.contact.metrics().resync.backoff;
         tokio::time::advance(later).await;
         f.clock.add(later);
-        // Diverged again, its input still on another flow.
+        // Diverged again on the first page after the hand-over.
         {
             let mut st = f.contact.lock();
-            let audio: Arc<dyn Audio> = f.engine.clone();
-            st.life.as_mut().unwrap().contradicted(audio.as_ref());
+            let life = st.life.as_mut().unwrap();
+            life.contradicted(audio.as_ref());
+            assert_eq!(life.state(), ReplicaState::Diverged);
         }
         committing(&f);
-        assert!(
-            f.contact.resync_due().is_some(),
-            "resynced at its first check"
-        );
-        assert_eq!(f.contact.metrics().resync.rebuilt_for_flows, 0);
+        let resynced = f.contact.resync_due().is_some();
+        let rebuilt = f.contact.metrics().resync.rebuilt_for_flows;
+        assert_eq!(resynced, rebuilt == 0);
+        rebuilt == 1
+    }
+
+    /// A hand-over moves no input: a replay reads the engine's inputs. A
+    /// replica on another flow before it is still on it after it, so the
+    /// mismatch counts on and the replica is rebuilt once it outlasts the
+    /// lead. Counted anew at each hand-over, every check would find a
+    /// fresh mismatch and resync, which hands over and diverges again.
+    #[tokio::test(start_paused = true)]
+    async fn a_flow_mismatch_counts_on_across_a_hand_over() {
+        assert!(rebuilt_after_a_hand_over(false, &[]).await);
+    }
+
+    /// Once an entry re-routed the input since, as one committed with its
+    /// block still inside the lead, the mismatch counts anew: the replica
+    /// resyncs at its first check. So it does after a re-route away and
+    /// back, though the flows the log names are those it began with.
+    #[tokio::test(start_paused = true)]
+    async fn a_flow_mismatch_counts_anew_after_a_re_route() {
+        assert!(!rebuilt_after_a_hand_over(false, &["b"]).await);
+        assert!(!rebuilt_after_a_hand_over(false, &["b", "a"]).await);
+    }
+
+    /// A replica that left `diverged` and `resync` in between counts a
+    /// later divergence's mismatch anew, on the same flows: it resyncs at
+    /// its first check.
+    #[tokio::test(start_paused = true)]
+    async fn a_flow_mismatch_counts_anew_after_the_replica_recovered() {
+        assert!(!rebuilt_after_a_hand_over(true, &[]).await);
     }
 
     /// A replica catching up past entries' deadlines is rebuilt past them
