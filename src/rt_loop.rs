@@ -728,11 +728,11 @@ pub(crate) struct Out {
     pub pages: Option<Pages>,
 }
 
-/// Samples of a meter slice: 10 ms at 48 kHz.
 /// The shortest sleep between two reads of the input heads while the RT
 /// thread waits for a block's input.
 const HEAD_POLL_NS: u64 = 100_000;
 
+/// Samples of a meter slice: 10 ms at 48 kHz.
 pub(crate) const SLICE: u64 = samplez_dsp::SLICE;
 const WINDOW: u64 = samplez_dsp::WINDOW;
 /// Input samples before the current one in the true-peak interpolation
@@ -1866,9 +1866,11 @@ impl Rt {
     /// Waits for each input domain's readers to reach block `k`'s group
     /// index, until `deadline`: reads their heads, which are in the flows'
     /// shared memory, and sleeps until the slowest one can have reached it
-    /// at the sample rate, [`HEAD_POLL_NS`] at least, the deadline at most:
-    /// a producer that lags is read when its samples are due, and a frozen
-    /// head, falling further behind, costs a wake or two per block. No
+    /// at the sample rate, [`HEAD_POLL_NS`] at least, half a block period
+    /// and the deadline at most: a producer that lags is read when its
+    /// samples are due, one that commits in batches or bursts to catch up
+    /// within half a period of its commit, and a frozen head, falling
+    /// further behind, costs two or three wakes per block. No
     /// libmxl call that looks a flow's files up, as the group wait's and the
     /// read's validity checks do once they time out, runs here: on a file
     /// system that waits for a missing name, a deleted flow would hold the
@@ -1895,7 +1897,8 @@ impl Rt {
                         let due =
                             behind.saturating_mul(1_000_000_000) / samplez_mxl::SAMPLE_RATE as u64;
                         add(&self.counters.input_wait_sleeps, 1);
-                        self.sleep_until(now.saturating_add(due.max(HEAD_POLL_NS)).min(deadline));
+                        let sleep = due.min(self.period_ns() / 2).max(HEAD_POLL_NS);
+                        self.sleep_until(now.saturating_add(sleep).min(deadline));
                     }
                 }
                 _ => GroupWait::Skipped,
@@ -3088,10 +3091,13 @@ impl Rt {
 }
 
 /// The lint probe (CI): built with `--cfg samplez_lint_probe="samplez"`,
-/// clippy must refuse this lock and this sleep, and the lock on a static
-/// whose type it does not name.
+/// clippy must refuse this lock and this sleep, the lock on a static
+/// whose type it does not name, and libmxl's group wait, which stats a
+/// flow's data file once it times out.
 #[cfg(samplez_lint_probe = "samplez")]
-pub fn lint_probe(m: &std::sync::Mutex<()>) {
+pub fn lint_probe(m: &std::sync::Mutex<()>, g: &Generation) {
+    #[allow(deprecated, reason = "the probe is of the disallowed-methods entry")]
+    let _ = g.wait(0, 0);
     let _guard = m.lock();
     let _held = crate::PROBE_LOCK.lock();
     std::thread::sleep(std::time::Duration::from_millis(1));

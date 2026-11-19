@@ -65,8 +65,13 @@ jobs:
                   echo "the lint probe in ${probe#*:} passed clippy" >&2
                   exit 1
                 fi
-                for what in "disallowed type" "disallowed method .std::thread::sleep" \
-                  "disallowed method .std::sync::Mutex::lock"; do
+                whats=("disallowed type" "disallowed method .std::thread::sleep"
+                  "disallowed method .std::sync::Mutex::lock")
+                # The RT loop must not call the libmxl group wait.
+                if [ "${probe%%:*}" = samplez ]; then
+                  whats+=("disallowed method .samplez_mxl::input::Generation::wait")
+                fi
+                for what in "${whats[@]}"; do
                   grep -A1 "$what" lint-probe.log | grep -q -- "--> ${probe#*:}" \
                     || { cat lint-probe.log >&2; echo "no $what in ${probe#*:}" >&2; exit 1; }
                 done

@@ -661,28 +661,29 @@ block by design: `mxlSleepUntil` and the `FUTEX_WAKE` of the output
 commit. The RT thread waits for a block's input by reading the readers'
 heads, which are in the flows' shared memory, and sleeping until the
 slowest can have reached the block at the sample rate, 100 us at least
-and the block's deadline at most, not with libmxl's sync-group wait: once that wait
-times out, libmxl checks the flow's validity with a `stat()` of its data
-file, which on a file system that waits for a missing name blocks for
-that wait once the flow is deleted. RealtimeSanitizer does not see an
-uncontended std lock, which makes no libc call, nor
-`std::thread::sleep`, which calls `clock_nanosleep`; clippy denies those
-and the other blocking std primitives listed in `clippy.toml` in the RT
-modules. `cargo bench --bench rt` in samplez, samplez-dsp and
-samplez-mxl fails when the instruction count of the hold ring's paths,
-the page hashes, the strip calls of the RT loop, a block's DSP, duck
-detectors and input meters, the matrix and detector copies of the core,
-a duck batch, a block's history stores or an output commit,
-gap zero-fill included, exceeds the limit in the benchmark. A late
-input is pruned after `pruneAfterBlocks` blocks of a frozen head, or
-twice the producer's `maxCommitBatchSizeHint` plus `readerMarginSamples`
-when that is longer, with no validity check on the RT thread: the
-supervisor's poll reader checks the pruned input's flow once a lookup
-found it. A producer that replaces its flow under the same id therefore
-leaves the input silent for the prune limit before the supervisor reads
-the new flow, as one that stops does. libmxl's read runs its validity check only when the head moves
-back between the head read and the read, which reports the block
-`TooEarly`.
+and half a block period or the block's deadline at most, not with
+libmxl's sync-group wait: once that wait times out, libmxl checks the
+flow's validity with a `stat()` of its data file, which on a file system
+that waits for a missing name blocks for that wait once the flow is
+deleted. RealtimeSanitizer does not see an uncontended std lock, which
+makes no libc call, nor `std::thread::sleep`, which calls
+`clock_nanosleep`; clippy denies those and the other blocking std
+primitives listed in `clippy.toml` in the RT modules. `cargo bench
+--bench rt` in samplez, samplez-dsp and samplez-mxl fails when the
+instruction count of the hold ring's paths, the page hashes, the strip
+calls of the RT loop, a block's DSP, duck detectors and input meters,
+the matrix and detector copies of the core, a duck batch, a block's
+history stores or an output commit, gap zero-fill included, exceeds the
+limit in the benchmark. A late input is pruned after `pruneAfterBlocks`
+blocks of a frozen head, or twice the producer's
+`maxCommitBatchSizeHint` plus `readerMarginSamples` when that is longer,
+with no validity check on the RT thread: the supervisor's poll reader
+checks the pruned input's flow once a lookup found it. A producer that
+replaces its flow under the same id therefore leaves the input silent
+for the prune limit before the supervisor reads the new flow, as one
+that stops does. libmxl's read runs its validity check only when the
+head moves back between the head read and the read, which reports the
+block `TooEarly`.
 
 The host needs swap off and `vm.compact_unevictable_allowed=0`, so that
 neither swapping nor compaction moves the locked pages of the RT
