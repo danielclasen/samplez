@@ -27,6 +27,7 @@ matrix, are built on it.
 - A channel strip per input, set by strip entries for inputs of up to 8
   channels: trim, per-leg trim and polarity, high-pass, four-band
   equaliser, gate and compressor
+- A delay line per input, opt-in by configuration, up to 5 s
 - A gain matrix with ramped coefficients; in replicated mode the engine
   entries of one log entry are folded and applied whole at its index
 - A true-peak limiter per output of up to 8 channels, configured per
@@ -154,8 +155,8 @@ none (below),
 `offsetSamples` 0, `flowChannels` (below) and `flowId` none, per output
 `enabled` true, per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
-Table 3; without it every channel weighs 1), per output `limiter` false
-(below), and `meters`, each with a
+Table 3; without it every channel weighs 1), per input `maxDelaySamples`
+0 and per output `limiter` false (below), and `meters`, each with a
 `name`, `channels` and `loudnessChannels`: matrix columns after the
 outputs' that are computed and metered and written to no flow.
 
@@ -222,8 +223,9 @@ index on, whatever is readable), `InputUp` (it fades in from the index),
 index), `Detach` (it crossfades to silence over the ramp length from the
 index and reads no flow, is not polled and is not reported until a
 `Route` fades it in from silence; its up or down state is kept),
-`Limiter` (an output's limiter parameters, below), `Output` (an
-output disabled: nothing is written to it from the index
+`Limiter` (an output's limiter parameters, below), `Delay` (an input's
+delay, below), `Output` (an output
+disabled: nothing is written to it from the index
 on and its writer is released, which deletes its flow unless another
 writer holds it; or enabled: its flow is created as at start-up and
 written from the first block due once the writer is in, another writer
@@ -251,8 +253,8 @@ buildLead after the one before, and an `Output`
 
 A replicated log entry may carry any number of engine entries
 (`append_batch`). They are folded off the RT thread: per matrix
-coefficient, strip parameter and output the last value, and per output
-its last limiter parameters; per input slot
+coefficient, strip parameter and output the last value, per output
+its last limiter parameters and per input slot its last delay; per input slot
 whether it is re-routed or detached, the last `Route` or `Detach`
 counting, goes down and comes up, an `InputUp` after an `InputDown`
 fading in from silence and a route kept whatever the state. The log
@@ -327,6 +329,31 @@ running one from the first peak deeper than both are releasing from.
 A jump of the sample index restarts it from silence, and a sample that
 is not finite is taken as 0. A `Limiter` entry for an output without a
 limiter is refused when appended or set.
+
+### Input delay
+
+An input configured with `maxDelaySamples` above 0, at most 240000
+(5 s), has a delay line (`samplez_dsp::Delay`): two rings per leg of
+that length plus `historySlackMs`, allocated at start; an input without
+it has none and costs nothing. `delayBudgetSamples`, 2^22 by default,
+caps `maxDelaySamples` times `channels` summed over the inputs: a
+resync copies at most that much history, about 6 bytes a sample, and a
+replica reads a donor's answer of up to
+`samplez_replica::peer::max_response` of it, the limit it gives
+`samplez_replica::net::Pool::new`. A `Delay` entry (`Engine::set_delay`)
+sets the input's delay in samples, at most its `maxDelaySamples`; a
+delay of 0 any input takes. The line runs after the strip, on every
+block computed, read or silenced, so the matrix, the duck keys and the
+input's meter see the input late. Outside a change the output at index
+`n` is the strip's output at `n - d`, bit for bit; a change crossfades
+from the old tap to the new over the ramp length from its index, and
+one during a crossfade waits until it ends, the latest counting. A
+raised delay reads silence for the samples it reaches back over, which
+the line played already, rather than playing them again: the line
+reads nothing older than its taps reached without a break, so that is
+all the history a resync copies. The rings are indexed by sample index,
+so the output does not depend on the block size; samples an overrun
+skipped are stored as silence.
 
 ### Duck groups
 
@@ -435,7 +462,8 @@ with its ramps, duck masks, depths and mask crossfades, the duck
 detectors with their keys, filter, hold and envelope state, the pending
 entries and those applied in the page in progress, each input's log
 state and fades, each strip with its filter and dynamics state and
-position, each output's limiter with its rings and released gain, the
+position, each output's limiter with its rings and released gain, each
+delay line's taps and the history its taps reach, the
 entries waiting for a generation and the pending
 generation's entry id, and the unresolved entries.
 Meters, hold rings, statuses and readers stay with the replica.
@@ -443,8 +471,12 @@ History rings (`History` in samplez-dsp) hold a delay plus
 `historySlackMs` of slack as relaxed atomic bit patterns; the RT thread
 publishes the block it starts before it stores any history sample, and a
 copy is kept only while the RT thread has not started the last block of
-the slack after k0. The engine keeps no delay line yet, so a copy holds
-the core alone. With more than one voter every input flow must offer
+the slack after k0. A delay line's history its taps still reach is
+copied that way, off the RT thread, after the core, as base64 of the
+samples' bit patterns. A replay fills its own rings from the copy; a
+hand-over writes the replay's history into the RT thread's other set
+of rings, which the RT thread takes only when it installs the core, so
+a refused hand-over leaves the set it reads as it was. With more than one voter every input flow must offer
 `resyncBudgetMs` of history beyond the read window; an input whose flow
 is shorter is refused with an error naming the `history_duration` it
 needs. A lone voter has no donor to resync from and needs none. A copy
@@ -547,13 +579,15 @@ page verdict, and it resyncs from a donor's core, which carries every
 group's detector state. A keyed group whose envelope never reaches 0 or
 full depth, which would keep the two apart for good, so costs one page,
 the reports that carry it and a resync. The product state also names
-each slot's flow and strip parameters and each output's limiter
+each slot's flow, strip parameters and delay and each output's limiter
 parameters: the supervisor hands over generations reading those flows
 before the core, a slot on another flow moving to it with no crossfade,
-and the strip and limiter parameters are set from the install's index,
-each strip and limiter keeping its own state. `Targets` holds every
-gain, flow, strip and limiter parameter, duck group setting and duck
-mask as values; `Targets::diff` gives the entries that move an engine from one
+and the strip and limiter parameters and delays are set from the
+install's index, each strip, limiter and delay line keeping its own
+state, so a delayed input plays the line's own history until the delay
+has passed. `Targets` holds every gain, flow, strip parameter, limiter
+parameter, delay, duck group setting and duck mask as values;
+`Targets::diff` gives the entries that move an engine from one
 set of targets to another, comparing every value by bit pattern, and
 `Targets::assert` the entries that set all of them.
 
@@ -574,10 +608,10 @@ at the cap up to 64 ms past it (see below), and the rebuild waits that
 long and 100 ms more. `EngineAudio` installs the state as the records it filters
 leave an engine (below): a flow other than the one an input reads is a
 re-route kept by the same rules and else left as read, a strip
-parameter, limiter parameters, a duck setting or mask the engine refuses
-is replaced as the filter replaces it (below), limiter parameters of an
-output it lacks or that has no limiter left out, and a gain it refuses
-is silent. A
+parameter, limiter parameters, delay, a duck setting or mask the engine
+refuses is replaced as the filter replaces it (below), limiter parameters
+of an output it lacks or that has no limiter left out, and a gain it
+refuses is silent. A
 product without targets gives an empty
 state, which an engine refuses: its replicas stay in `starting`.
 
@@ -671,10 +705,10 @@ again, as its peers do. One AppendEntries carries up to
 `MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
 than the gap between entries takes every entry written meanwhile with
 one fsync rather than falling further behind. `EngineAudio` replaces a
-strip parameter, limiter parameters, a duck setting or duck mask its
-engine refuses, so a replica holding a value before the refused one and
-one rebuilt without it hold the same. A finite value out of range moves
-to the nearest one its range holds (`StripParam::clamped`,
+strip parameter, limiter parameters, delay, a duck setting or duck mask
+its engine refuses, so a replica holding a value before the refused one
+and one rebuilt without it hold the same. A finite value out of range
+moves to the nearest one its range holds (`StripParam::clamped`,
 `LimiterParams::clamped`, `DuckSetting::clamped`): a trim of -30 dB
 sounds as -20 dB, a duck depth of 99 dB as 40 dB, a ceiling of +3 dBTP
 as 0 dBTP. A value
@@ -685,7 +719,8 @@ band at its default; `DuckSetting::neutral`: the default detector, no
 key, a depth of 0 dB): a trim at -20 dB set to NaN steps back to 0 dB,
 a closed gate opens and a ducked bed returns to full level, each over
 the strip's ramp; limiter parameters that are not finite give
-`LimiterParams::OFF`. A refused mask is 0. It leaves out of a record the
+`LimiterParams::OFF`. A refused mask is 0, a refused delay none. It leaves
+out of a record the
 other entries its engine refuses, and of the `InputUp`s and `Route`s of
 several input domains those not of the lowest slot's, before it
 appends it: the engine's configuration decides that alike on every
@@ -767,8 +802,9 @@ makes no libc call, nor `std::thread::sleep`, which calls
 primitives listed in `clippy.toml` in the RT modules. `cargo bench
 --bench rt` in samplez, samplez-dsp and samplez-mxl fails when the
 instruction count of the hold ring's paths, the page hashes, the strip
-calls of the RT loop, a block's DSP, limiters, duck detectors and input
-meters, the matrix and detector copies of the core, a duck batch, a block's
+calls of the RT loop, a block's DSP, limiters, delay lines, duck
+detectors and input meters, the matrix and detector copies of the core, a
+duck batch, a block's
 history stores or an output commit, gap zero-fill included, exceeds the
 limit in the benchmark. An input is pruned after `pruneAfterBlocks`
 consecutive late blocks with its head frozen, or twice the producer's

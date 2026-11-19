@@ -1,5 +1,5 @@
 //! DSP core of samplez: planar buffers, gain ramps, the mixing matrix,
-//! the input channel strip, the output limiter, the duck detector,
+//! the input channel strip and delay, the output limiter, the duck detector,
 //! meters, true peak and loudness, and history rings.
 //!
 //! Every `process` function works on state and scratch allocated at
@@ -11,6 +11,7 @@
 compile_error!("samplez-dsp supports x86_64 only");
 
 mod buffer;
+pub mod delay;
 pub mod duck;
 mod dynamics;
 mod history;
@@ -32,6 +33,7 @@ mod test_util;
 mod true_peak;
 
 pub use buffer::{MAX_FRAMES, PlanarBuffer};
+pub use delay::{Delay, DelayRings, MAX_DELAY_SAMPLES, Taps};
 pub use duck::{Detector, DetectorParams, DuckMode, DuckParam, KeyFilter, MAX_DUCKS, duck_gain};
 pub use history::{History, Started};
 pub use kweight::KWeighting;

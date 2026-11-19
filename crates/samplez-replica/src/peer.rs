@@ -38,6 +38,19 @@ pub const MAX_BODY: usize = 8 << 20;
 /// bytes of JSON.
 pub const MAX_RESPONSE: usize = MAX_BODY + samplez::MAX_COEFFICIENTS * 128;
 
+/// Bytes a core spends on one sample of a delay line's history: base64
+/// of its four bytes, rounded up.
+const DELAY_BYTES_PER_SAMPLE: usize = 6;
+
+/// The largest answer a replica reads from a donor whose engine holds
+/// delay lines within `delay_budget_samples`
+/// ([`samplez::config::Config`]'s `delayBudgetSamples`): [`MAX_RESPONSE`]
+/// beside every sample of history the budget allows.
+pub fn max_response(delay_budget_samples: u64) -> usize {
+    let history = usize::try_from(delay_budget_samples).unwrap_or(usize::MAX);
+    MAX_RESPONSE.saturating_add(history.saturating_mul(DELAY_BYTES_PER_SAMPLE))
+}
+
 /// A client command as the replica that first received it forwards it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Forwarded {
@@ -260,4 +273,19 @@ async fn peer<P: Product + Sync>(
         return StatusCode::BAD_REQUEST.into_response();
     };
     json(&replica.handle(to, request).await)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    /// A larger delay budget raises the answer limit by every sample's
+    /// encoded bytes; none leaves it at the core's.
+    #[test]
+    fn the_answer_limit_grows_with_the_delay_budget() {
+        assert_eq!(super::max_response(0), super::MAX_RESPONSE);
+        assert_eq!(
+            super::max_response(1 << 22),
+            super::MAX_RESPONSE + (6 << 22)
+        );
+        assert_eq!(super::max_response(u64::MAX), usize::MAX);
+    }
 }

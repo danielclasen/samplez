@@ -122,7 +122,7 @@ impl Set {
     /// Starts `id` from what its volume holds.
     async fn restart(&mut self, id: NodeId) {
         let tls = Arc::new(PeerTls::new(&self.tls[&id], &Metrics::default()).unwrap());
-        let pool = Pool::new(tls.clone());
+        let pool = Pool::new(tls.clone(), samplez_replica::peer::MAX_RESPONSE);
         let settings = Settings {
             id,
             epoch: harness::CLUSTER,
@@ -280,9 +280,10 @@ async fn only_the_set_reaches_a_replica_and_only_under_its_own_id() {
     );
 
     let stranger = identity(&set.root, "stranger", &authority());
-    let stranger = Pool::new(Arc::new(
-        PeerTls::new(&stranger, &Metrics::default()).unwrap(),
-    ));
+    let stranger = Pool::new(
+        Arc::new(PeerTls::new(&stranger, &Metrics::default()).unwrap()),
+        samplez_replica::peer::MAX_RESPONSE,
+    );
     let refused = stranger
         .call(Some(1), addr, PeerRequest::ReadIndex, within)
         .await;

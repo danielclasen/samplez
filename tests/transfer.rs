@@ -637,6 +637,133 @@ fn a_replayed_core_carries_the_limiter_mid_release() {
     });
 }
 
+/// The resync row with a delay line: a joiner whose input was trimmed
+/// apart until shortly before the copy holds another history in its
+/// delay line, which its output plays for the delay after the trims met.
+/// The core copy carries the donor's history and the hand-over writes
+/// the replay's into the joiner's other rings, so from the hand-over on
+/// the joiner computes the donor's pages bit for bit; keeping its own
+/// history, it would differ for the rest of the delay.
+#[test]
+fn a_replayed_core_carries_the_delay_history() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let delayed = |c: &mut Config| c.inputs[0].max_delay_samples = 24_000;
+        let (a, b) = (
+            hashed_of(&domain, &[(&src, 2)], delayed),
+            hashed_of(&domain, &[(&src, 2)], delayed),
+        );
+        // Entry 1 delays both by 250 ms; entry 2 trims the joiner apart,
+        // entry 3 brings it back.
+        let at1 = (now_block() + 20) * B;
+        let delay = Entry::Delay {
+            slot: 0,
+            samples: 12_000,
+        };
+        for e in [&a.e, &b.e] {
+            e.append(1, at1, delay.clone()).unwrap();
+            e.commit(1);
+        }
+        strip(&a.e, 2, at1, StripParam::Trim { db: 0.0 });
+        strip(&b.e, 2, at1, StripParam::Trim { db: -6.0 });
+        let at3 = at1 + 400 * B;
+        for e in [&a.e, &b.e] {
+            strip(e, 3, at3, StripParam::Trim { db: 0.0 });
+        }
+        let met = at3 + u64::from(RAMP);
+        wait_for(Duration::from_secs(5), "trims met", || {
+            processed(&a.e) > met / B + 1 && processed(&b.e) > met / B + 1
+        });
+        let copy = copy(&a.e);
+        let k0 = copy.k0;
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+        let mut replay = b.e.replay(copy).unwrap();
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        // The pages compared lie before the trimmed history has played.
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        if (from + 8) * PAGE > met + 12_000 {
+            return Err(format!(
+                "handed over at block {j}, past the trimmed history"
+            ));
+        }
+        let before = (k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE;
+        let end = (from + 8) * PAGE / B + PAGE / B;
+        wait_for(Duration::from_secs(10), "pages compared", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        let (pa, pb) = (a.pages(), b.pages());
+        let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+        let differ = before
+            .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
+            .count();
+        assert!(differ > 0, "the joiner never diverged");
+        for p in from..from + 8 {
+            if disturbed.contains(&p) {
+                return Err(format!("page {p} disturbed"));
+            }
+            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+                return Err(format!("page {p} not hashed by both"));
+            };
+            assert_eq!(
+                (hb.hash, hb.fingerprint),
+                (ha.hash, ha.fingerprint),
+                "page {p}"
+            );
+        }
+        Ok(())
+    });
+}
+
+/// A product state's delays are set at the install, the delay lines
+/// keeping their history: an input delayed in the state plays late
+/// after the install. A delay beyond a slot's line is refused before
+/// anything changes.
+#[test]
+fn a_product_state_sets_the_delay() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed_of(&domain, &[(&src, 2)], |c| {
+        c.inputs[0].max_delay_samples = 4800;
+    });
+    let state = |delays| ProductState {
+        limiters: Vec::new(),
+        delays,
+        gains: common::diagonal(2, 1.0),
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        outputs: Vec::new(),
+        strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
+        pending: Vec::new(),
+        last_id: 1,
+    };
+    assert!(matches!(
+        h.e.install_product(&state(vec![4801]), 0, Duration::from_secs(2)),
+        Err(ReplayError::Invalid(_))
+    ));
+    h.e.drop_core().unwrap();
+    let j = (h.e)
+        .install_product(&state(vec![4800]), 0, Duration::from_secs(2))
+        .unwrap();
+    let k0 = loop {
+        let c = copy(&h.e);
+        if c.k0 > j {
+            break c;
+        }
+    };
+    let taps = k0.core.delay_taps(0).unwrap();
+    assert_eq!((taps.from, taps.to), (0, 4800), "{taps:?}");
+    assert_eq!(taps.start, (j + 1) * B);
+}
+
 /// An entry the replay applied before the hand-over, which reaches the
 /// joiner's RT thread only after it, is not taken again: its index
 /// passed, it would count late and degrade blocks the donor computed
@@ -797,6 +924,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
     // A core must know them.
     let mut state = ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
 
@@ -875,6 +1003,7 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
     let c = h.e.counters();
     let state = ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -915,6 +1044,7 @@ fn a_product_core_installs_at_the_index_named_and_fades_its_gains_in() {
         let c = h.e.counters();
         let state = ProductState {
             limiters: Vec::new(),
+            delays: Vec::new(),
             gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
             up: vec![true],
             flows: vec![Some(src.clone())],
@@ -1008,6 +1138,7 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
     });
     let state = ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
@@ -1049,6 +1180,7 @@ fn a_product_entry_the_install_passed_is_folded_in() {
     let at = (processed(&h.e) - 1) * B;
     let state = ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
@@ -1153,6 +1285,7 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
             .collect();
         let state = ProductState {
             limiters: Vec::new(),
+            delays: Vec::new(),
             gains: identity,
             up: vec![true, true],
             flows: vec![None, Some(other.clone())],
@@ -1193,6 +1326,7 @@ fn a_product_state_disables_and_enables_an_output() {
     });
     let state = |outputs: Vec<bool>, pending: Vec<(u64, u64, Entry)>| ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: common::diagonal(2, 1.0),
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -1253,6 +1387,7 @@ fn a_product_state_sets_the_limiter() {
     });
     let state = |limiters| ProductState {
         limiters,
+        delays: Vec::new(),
         gains: common::diagonal(2, 4.0),
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -1387,6 +1522,7 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
         });
         let state = ProductState {
             limiters: Vec::new(),
+            delays: Vec::new(),
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
 
@@ -1448,6 +1584,7 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
         });
         let state = ProductState {
             limiters: Vec::new(),
+            delays: Vec::new(),
             gains: diagonal(2, 4.0),
             up: vec![true],
             flows: vec![Some(src.clone())],
@@ -1512,6 +1649,7 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
     });
     let state = ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
@@ -1604,6 +1742,7 @@ fn a_route_the_core_carried_is_not_applied_again() {
     });
     let state = ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
@@ -1958,6 +2097,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
         });
         let state = ProductState {
             limiters: Vec::new(),
+            delays: Vec::new(),
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
             flows: vec![Some(next.clone())],
@@ -2075,6 +2215,7 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
     });
     let state = ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true, true],
         flows: vec![Some(src0.clone()), Some(next1.clone())],
@@ -2280,6 +2421,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
         let h = hashed_of(&domain, &[(&src, 2)], |c| c.duck_columns = vec![0]);
         let state = ProductState {
             limiters: Vec::new(),
+            delays: Vec::new(),
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
             flows: vec![Some(src.clone())],
@@ -2370,6 +2512,7 @@ fn an_install_leaving_an_output_out_starts_it_as_configured() {
         e.drop_core().unwrap();
         let state = ProductState {
             limiters: Vec::new(),
+            delays: Vec::new(),
             gains: vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 1.0]],
             up: vec![true],
             flows: vec![Some(src.clone())],

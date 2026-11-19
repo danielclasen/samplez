@@ -320,6 +320,57 @@ fn limiter_parameters_out_of_range_are_clamped() {
     assert_eq!(params.clamped().unwrap().ceiling_db, 0.0);
 }
 
+/// A delay beyond an input's delay line is replaced by none, as a
+/// rebuild replaces it in the product state; counted as replaced.
+#[test]
+fn a_delay_beyond_the_line_is_replaced_by_none() {
+    let domain = Domain::new();
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "in0", "domain": "d",
+                     "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a", "channels": 1,
+                     "maxDelaySamples": 480 }],
+        "outputs": [{ "name": "out0", "domain": "d",
+                      "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01", "label": "bridge",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (engine, audio) = bridge_of(&v, 1 << 16);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let at = (engine.progress().unwrap().processed.unwrap() + 100) * B;
+    audio.appended(
+        3,
+        at,
+        &[Entry::Delay {
+            slot: 0,
+            samples: 240,
+        }],
+    );
+    audio.committed(3);
+    let at2 = at + 10 * B;
+    audio.appended(
+        4,
+        at2,
+        &[Entry::Delay {
+            slot: 0,
+            samples: 481,
+        }],
+    );
+    audio.committed(4);
+    assert_eq!(audio.sample().entries_filtered, 1);
+    wait_for("its index passed", || {
+        engine.progress().unwrap().processed.unwrap() > at2 / B + 2
+    });
+    let copy = engine.copy_core(Duration::from_secs(2)).unwrap();
+    assert_eq!(copy.core.delay_taps(0).unwrap().to, 0);
+}
+
 /// Of the `InputUp`s and `Route`s of one record whose slots lie in two
 /// input domains, the engine builds one generation: those of the domain
 /// of the lowest slot stay, the others are left out.
@@ -496,6 +547,7 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
     let (_engine, audio) = bridge(&domain, 1 << 12);
     let state = samplez::ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![1.0]],
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
@@ -1142,6 +1194,7 @@ fn rebuild_after_a_route() -> Result<(), String> {
     );
     let state = samplez::ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![1.0]],
         up: vec![true],
         flows: vec![Some(ROUTED.to_owned())],
@@ -1270,6 +1323,7 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
     assert_eq!(live_audio.sample().entries_filtered, 1);
     let mut state = samplez::ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![1.0], vec![1.0]],
         up: vec![true, true],
         flows: routed.map(|f| Some(f.to_owned())).to_vec(),
@@ -1358,6 +1412,7 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
     });
     let state = samplez::ProductState {
         limiters: Vec::new(),
+        delays: Vec::new(),
         gains: vec![vec![0.5]],
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],

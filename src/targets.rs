@@ -25,6 +25,9 @@ pub struct Targets {
     /// `limiter`; none, or an output past the list, leaves the limiter as
     /// the engine holds it.
     pub limiters: Vec<Option<LimiterParams>>,
+    /// Per input slot, its delay in samples; a slot past the list keeps
+    /// the delay the engine holds.
+    pub delays: Vec<u32>,
     /// Per duck group, its settings.
     pub ducks: Vec<DuckTargets>,
     /// The duck mask of each coefficient, shaped as `gains`.
@@ -43,9 +46,9 @@ impl Targets {
     /// The entries that move an engine holding `self` to `next`: a `Gain`
     /// for each coefficient whose bit pattern differs, row by row; a
     /// `Strip` for each parameter that differs in any field's bit
-    /// pattern, by slot and parameter; a `Limiter` for each output's
-    /// parameters that differ in any field's bit pattern; a `Duck` for
-    /// each setting of a
+    /// pattern, by slot and parameter; a `Limiter` output's
+    /// parameters differ in any field's bit pattern; a `Delay` slot whose
+    /// delay differs; a `Duck` setting
     /// group that differs in any field's bit pattern, by group, its
     /// parameters, keys, mode and hold, then its depths by slot; a
     /// `DuckMask` for each coefficient whose mask differs, row by row, a
@@ -80,6 +83,11 @@ impl Targets {
                 && held.is_none_or(|h| !same_limiter(&h, &params))
             {
                 entries.push(Entry::Limiter { output, params });
+            }
+        }
+        for (slot, &samples) in next.delays.iter().enumerate() {
+            if self.delays.get(slot) != Some(&samples) {
+                entries.push(Entry::Delay { slot, samples });
             }
         }
         duck_entries(self, next, &mut entries);
@@ -818,6 +826,11 @@ mod tests {
                 entries.push(Entry::Limiter { output, params });
             }
         }
+        for (slot, &samples) in next.delays.iter().enumerate() {
+            if was.delays.get(slot) != Some(&samples) {
+                entries.push(Entry::Delay { slot, samples });
+            }
+        }
         for (slot, flow) in next.flows.iter().enumerate() {
             if was.flows.get(slot) != Some(flow) {
                 entries.push(match flow {
@@ -873,6 +886,35 @@ mod tests {
         assert_eq!(
             all.iter()
                 .filter(|e| matches!(e, Entry::Limiter { .. }))
+                .count(),
+            3
+        );
+    }
+
+    /// A slot's delay gets an entry when it differs, none when equal or
+    /// past the list, and every listed one from `assert`.
+    #[test]
+    fn delays_differ_by_value() {
+        let was = Targets {
+            delays: vec![0, 480, 7],
+            ..Targets::default()
+        };
+        let next = Targets {
+            delays: vec![0, 960],
+            ..Targets::default()
+        };
+        assert_eq!(
+            was.diff(&next),
+            [Entry::Delay {
+                slot: 1,
+                samples: 960
+            }]
+        );
+        assert!(was.diff(&was).is_empty());
+        let all = was.assert(&[], None);
+        assert_eq!(
+            all.iter()
+                .filter(|e| matches!(e, Entry::Delay { .. }))
                 .count(),
             3
         );
@@ -964,6 +1006,9 @@ mod tests {
                             release_ms: self.value(),
                         })
                     })
+                    .collect(),
+                delays: (0..self.below(3))
+                    .map(|_| self.below(3) as u32 * 100)
                     .collect(),
                 ..Targets::default()
             }

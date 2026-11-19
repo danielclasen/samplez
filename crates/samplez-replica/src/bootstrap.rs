@@ -358,7 +358,7 @@ impl Kube {
                     .headers_mut()
                     .insert(hyper::header::AUTHORIZATION, value);
             }
-            net::send(&mut sender, request).await
+            net::send(&mut sender, request, crate::peer::MAX_RESPONSE).await
         };
         match tokio::time::timeout(RETRY * 5, exchange).await {
             Ok(Ok((status, body))) => Ok((status, body.to_vec())),

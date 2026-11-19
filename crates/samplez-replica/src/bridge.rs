@@ -222,7 +222,7 @@ impl EngineAudio {
     /// [`samplez_dsp::LimiterParams::clamped`], [`DuckSetting::clamped`]),
     /// for a finite value out of range; its neutral form
     /// ([`samplez_dsp::StripParam::neutral`], [`DuckSetting::neutral`],
-    /// mask 0, [`samplez_dsp::LimiterParams::OFF`]), for a value that is not finite or a key the engine
+    /// mask 0, [`samplez_dsp::LimiterParams::OFF`], no delay), value not finite or key the engine
     /// cannot take, such as a slot or key it lacks. None when it takes
     /// neither. Every other entry as given. The live filter
     /// and the rebuild's state both go through it, so a replica that held
@@ -248,6 +248,7 @@ impl EngineAudio {
                 output,
                 params: samplez_dsp::LimiterParams::OFF,
             },
+            &Entry::Delay { slot, .. } => Entry::Delay { slot, samples: 0 },
             _ => return Some(entry.clone()),
         };
         let clamped = match entry {
@@ -346,6 +347,28 @@ impl EngineAudio {
                     None
                 }
             };
+        }
+        // A delay the engine refuses is replaced as the live filter
+        // replaces it: no delay; those of slots beyond the engine's left
+        // out.
+        let slots = state.flows.len();
+        dropped += state.delays.len().saturating_sub(slots);
+        state.delays.truncate(slots);
+        for (slot, samples) in state.delays.iter_mut().enumerate() {
+            match self.admitted(&Entry::Delay {
+                slot,
+                samples: *samples,
+            }) {
+                Some(Entry::Delay { samples: s, .. }) if s == *samples => {}
+                Some(Entry::Delay { samples: s, .. }) => {
+                    *samples = s;
+                    dropped += 1;
+                }
+                _ => {
+                    *samples = 0;
+                    dropped += 1;
+                }
+            }
         }
         for gain in state.gains.iter_mut().flatten() {
             if !samplez_dsp::valid_gain(*gain) {
