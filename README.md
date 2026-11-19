@@ -683,7 +683,7 @@ output of a peer that ran through from its first block, as far as the
 gains go. Its duck groups start cold at the state's settings: key
 filters at rest, no hold, the envelope at 0 or, for a group its mode On
 or hold triggers, at full depth; masks and depths at their targets, so a
-coefficient is ducked from the start. A replica that kept computing holds
+coefficient is ducked from the start. An install does not resume a mask crossfade or a depth ramp still in progress: it folds passed mask and depth entries as settled, so an install less than `rampSamples` after such an entry differs from its peers until the ramp ends. A replica that kept computing holds
 its own key filter, hold and envelope state, so their outputs differ
 after the install until each key filter's state has reached the same
 bits and each group's envelope has reached 0 or full depth in both; on a
