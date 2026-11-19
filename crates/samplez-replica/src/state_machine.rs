@@ -1020,6 +1020,13 @@ impl<P: Product> StateMachine<P> {
             floor: Some(self.floor),
             derived: self.derived.clone(),
             protocol: self.protocol,
+            ramps: (self.ramps.iter())
+                .map(|row| {
+                    (row.iter())
+                        .map(|f| f.map(|f| (f.from.to_bits(), f.start, f.len)))
+                        .collect()
+                })
+                .collect(),
         }
     }
 
@@ -1061,6 +1068,19 @@ impl<P: Product> StateMachine<P> {
         });
         self.derived = saved.derived;
         self.protocol = saved.protocol;
+        self.ramps = (saved.ramps.iter())
+            .map(|row| {
+                (row.iter())
+                    .map(|f| {
+                        f.map(|(from, start, len)| samplez::Fade {
+                            from: f32::from_bits(from),
+                            start,
+                            len,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
         self.records.clear();
         self.image = if P::DRIVES_ENGINE {
             self.targets().map(|(targets, silenced)| {
@@ -2714,6 +2734,33 @@ mod derive_tests {
             .load(legacy, Limits::defaults(48_000))
             .expect("loads");
         assert_eq!(loaded.protocol, 0);
+    }
+
+    /// The ramps the derived gain entries left running are replicated state
+    /// of the log: a replica that loads a snapshot carries the same
+    /// `fading` in its product state, and one written before they were
+    /// kept loads with none.
+    #[test]
+    fn a_snapshot_carries_the_ramps_of_plain_gain_entries() {
+        let mut sm = machine();
+        sm.apply_at(1, 1, &one("1", "fader 0 0.5", 0, 960, None));
+        sm.apply_at(2, 1, &one("2", "fader 0 0.75", 48, 1008, None));
+        let want = sm.product_state(2).fading;
+        assert!(want[0][0].is_some());
+        let mut loaded = machine();
+        loaded
+            .load(sm.save(), Limits::defaults(48_000))
+            .expect("loads");
+        assert_eq!(loaded.product_state(2).fading, want);
+        // Absent from a snapshot written before: the serde default.
+        let legacy = Replicated {
+            ramps: Vec::new(),
+            ..sm.save()
+        };
+        loaded
+            .load(legacy, Limits::defaults(48_000))
+            .expect("loads");
+        assert_ne!(loaded.product_state(2).fading, want);
     }
 
     /// A record is kept until its index lies [`RECORDS_KEPT`] below the

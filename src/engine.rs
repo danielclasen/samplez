@@ -1765,6 +1765,12 @@ impl Engine {
         })
     }
 
+    /// The configured `rampSamples`: the length a gain change with no
+    /// fade ramps over.
+    pub fn ramp_samples(&self) -> u32 {
+        self.config.ramp_samples
+    }
+
     pub fn status(&self) -> Status {
         self.status.lock().expect("status lock").clone()
     }

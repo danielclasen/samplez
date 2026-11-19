@@ -66,7 +66,11 @@ fn engine() -> (Domain, Arc<Engine>, EngineAudio) {
         margin: 960,
         ..Timing::defaults(B)
     };
-    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, &timing);
+    let limits = samplez_replica::dedup::Limits {
+        ramp_samples: engine.ramp_samples(),
+        ..samplez_replica::dedup::Limits::defaults(48_000)
+    };
+    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, &timing, &limits).unwrap();
     wait_for("a block processed", 10, || {
         audio.sample().own.processed.is_some()
     });

@@ -122,7 +122,11 @@ fn bridge_timed(
     wait_for("outputs realised", || {
         engine.status().outputs.iter().all(|o| o.realised)
     });
-    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, timing);
+    let limits = samplez_replica::dedup::Limits {
+        ramp_samples: engine.ramp_samples(),
+        ..samplez_replica::dedup::Limits::defaults(48_000)
+    };
+    let audio = EngineAudio::new(engine.clone(), status_rx, hash_rx, timing, &limits).unwrap();
     (engine, audio)
 }
 
@@ -1995,4 +1999,28 @@ fn a_sample_names_the_outputs_the_log_disabled() {
     );
     audio.committed(1);
     wait_for("output 0 disabled", || audio.sample().enabled == [false]);
+}
+
+/// The replica follows the ramps of plain gain entries at the length it is
+/// given, so a bridge refuses a `ramp_samples` that is not the engine's.
+#[test]
+fn a_bridge_refuses_a_ramp_length_the_engine_does_not_have() {
+    let domain = Domain::new();
+    let (engine, _audio) = bridge(&domain, 8);
+    let (_, status_rx) = std::sync::mpsc::sync_channel(8);
+    let (_, hash_rx) = std::sync::mpsc::sync_channel(8);
+    let limits = samplez_replica::dedup::Limits {
+        ramp_samples: engine.ramp_samples() + 1,
+        ..samplez_replica::dedup::Limits::defaults(48_000)
+    };
+    let Err(e) = EngineAudio::new(
+        engine.clone(),
+        status_rx,
+        hash_rx,
+        &Timing::defaults(B),
+        &limits,
+    ) else {
+        panic!("a mismatched ramp length was taken");
+    };
+    assert!(e.contains("ramp_samples"), "{e}");
 }

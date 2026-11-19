@@ -122,16 +122,29 @@ impl EngineAudio {
     /// statuses of the blocks a peer can still hold a decision on: those
     /// of the last `D + w + 2p`, and one more; and the latest
     /// [`PAGES_REPORTED`] page records per output.
+    ///
+    /// Refused when `limits.ramp_samples` is not the engine's
+    /// `rampSamples`: the replica follows the ramps of plain gain entries
+    /// at the length it is given, and an engine ramping over another
+    /// would be rebuilt onto ramps it does not have.
     pub fn new(
         engine: Arc<Engine>,
         changes: Receiver<StatusChange>,
         hashes: Receiver<PageHash>,
         timing: &Timing,
-    ) -> EngineAudio {
+        limits: &crate::dedup::Limits,
+    ) -> Result<EngineAudio, String> {
+        if limits.ramp_samples != engine.ramp_samples() {
+            return Err(format!(
+                "the replica's ramp_samples is {} and the engine's rampSamples {}: they must be equal",
+                limits.ramp_samples,
+                engine.ramp_samples()
+            ));
+        }
         let outputs = engine.status().outputs.len();
         let span = timing.hold + timing.contact_window + 2 * timing.report_period;
         let samples = (span.as_nanos() as u64 * crate::contact::RATE).div_ceil(1_000_000_000);
-        EngineAudio {
+        Ok(EngineAudio {
             outputs,
             engine,
             block: timing.block,
@@ -146,7 +159,7 @@ impl EngineAudio {
                 hashes,
                 pages: (0..outputs).map(|_| VecDeque::new()).collect(),
             }),
-        }
+        })
     }
 
     /// The entries of entry `index`'s record the engine takes

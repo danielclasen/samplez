@@ -6819,7 +6819,13 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let audio = crate::bridge::EngineAudio::new(engine, status_rx, hash_rx, timing);
+            let limits = crate::dedup::Limits {
+                ramp_samples: engine.ramp_samples(),
+                ..crate::dedup::Limits::defaults(48_000)
+            };
+            let audio =
+                crate::bridge::EngineAudio::new(engine, status_rx, hash_rx, timing, &limits)
+                    .unwrap();
             Arc::new(Real {
                 audio,
                 calls: Mutex::new(Vec::new()),
