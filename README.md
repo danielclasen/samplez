@@ -318,14 +318,21 @@ twice, beyond the inputs or wider than 8 channels, a value out of range.
 The detectors run on every block computed, after the strips, on the grid
 of the sample index, and the matrix is aligned to the index before it
 mixes, so the output depends on neither the block size nor where a core
-was copied. A group with no key, not on and at rest is advanced rather
-than run, which computes the same envelope, 0. A coefficient of a column
-in `duckColumns` counts 6 times against the 150 coefficients per sample
-of the block (`DUCKED_TERM_COST`): a ducked term mixes at 5.5 times the
-instructions of a plain one on the AVX2 path. Each group's readings over
-each meter slice of 10 ms it is in use in, its largest key, its largest
-envelope and whether it was engaged, are in the status (`Status::ducks`);
-they stay with the replica.
+was copied. Like a strip's, a detector's filter, hold and envelope state
+follows the samples it processed: over skipped samples it holds, and a
+silenced read keys nothing, so after either its envelope differs from an
+engine that computed them while the envelope is in transit. Once both
+are at rest they compute the same bits again: an attack after the skip
+under a key that stays above the threshold, a hold and a release after
+it under one that falls silent; a resync ends it at once. A group with
+no key, not on and at rest is advanced rather than run, which computes
+the same envelope, 0. A coefficient of a column in `duckColumns` counts
+6 times against the 150 coefficients per sample of the block
+(`DUCKED_TERM_COST`): a ducked term mixes at 5.5 times the instructions
+of a plain one on the AVX2 path. Each group's readings over each meter
+slice of 10 ms it is in use in, its largest key, its largest envelope
+and whether it was engaged, are in the status (`Status::ducks`); they
+stay with the replica.
 
 ### Clock
 
