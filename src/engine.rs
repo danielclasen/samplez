@@ -2711,29 +2711,30 @@ impl Engine {
         replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
         let rings = &self.delays;
         // The replay's delay history goes into the RT thread's other rings,
-        // which the core names and only an install switches to. All of it
-        // once, before the first attempt; then each attempt adds only the
-        // blocks the replay computed since, so that it fits between two
-        // blocks of the RT thread however long the delay.
-        let mut filled: Vec<Option<u64>> = vec![None; rings.len()];
-        let fill = |replay: &Replay, filled: &mut [Option<u64>]| {
+        // which the core names and only an install switches to. The first
+        // attempt copies all of it; each later one only the blocks the
+        // replay computed since, so that it fits between two blocks of the
+        // RT thread however long the delay. A copy is keyed to the set it
+        // went to: should an earlier call's core install meanwhile, the
+        // other set is copied whole. Each attempt runs after the answers
+        // to earlier calls are taken.
+        let mut filled: Vec<Option<(usize, u64)>> = vec![None; rings.len()];
+        self.offer(timeout, 0, true, &[], &[], &[], |j, core| {
+            replay.run(j);
+            replay.rt.capture(core);
             let end = replay.next * replay.rt.block;
             for ((slot, rings), done) in (replay.rt.slots.iter()).zip(rings).zip(filled.iter_mut())
             {
                 if let (Some(l), Some(rings)) = (&slot.delay, rings) {
-                    let from = end - u64::from(l.span(end));
-                    let from = done.map_or(from, |d| d.max(from));
-                    let span = l.rings().copy(l.rings().active(), end, (end - from) as u32);
-                    rings.fill(rings.inactive(), end, &span);
-                    *done = Some(end);
+                    *done = Some(samplez_dsp::copy_since(
+                        l.rings(),
+                        rings,
+                        end,
+                        l.span(end),
+                        *done,
+                    ));
                 }
             }
-        };
-        fill(replay, &mut filled);
-        self.offer(timeout, 0, true, &[], &[], &[], |j, core| {
-            replay.run(j);
-            replay.rt.capture(core);
-            fill(replay, &mut filled);
             for (s, rings) in core.slots.iter_mut().zip(rings) {
                 if let (Some(d), Some(rings)) = (&mut s.delay, rings) {
                     d.set = rings.inactive() as u8;
