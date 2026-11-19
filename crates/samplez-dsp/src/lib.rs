@@ -33,7 +33,7 @@ mod test_util;
 mod true_peak;
 
 pub use buffer::{MAX_FRAMES, PlanarBuffer};
-pub use delay::{Delay, DelayRings, MAX_DELAY_SAMPLES, Taps};
+pub use delay::{Delay, DelayRings, MAX_DELAY_SAMPLES, Taps, copy_since};
 pub use duck::{Detector, DetectorParams, DuckMode, DuckParam, KeyFilter, MAX_DUCKS, duck_gain};
 pub use history::{History, Started};
 pub use kweight::KWeighting;

@@ -146,6 +146,31 @@ impl DelayRings {
     }
 }
 
+/// Off the RT thread: copies into `dst`'s inactive set the `len` samples
+/// of each leg before index `end` that `src`'s active set holds, where
+/// `done` names a set and an index up to which an earlier call filled
+/// it: of the same set, only the samples from there on are copied,
+/// which [`DelayRings::fill`] places as a whole copy would. Returns the
+/// set filled and `end`, for the next call.
+pub fn copy_since(
+    src: &DelayRings,
+    dst: &DelayRings,
+    end: u64,
+    len: u32,
+    done: Option<(usize, u64)>,
+) -> (usize, u64) {
+    let set = dst.inactive();
+    let mut from = end.saturating_sub(u64::from(len));
+    if let Some((s, d)) = done
+        && s == set
+    {
+        from = from.max(d.min(end));
+    }
+    let span = src.copy(src.active(), end, (end - from) as u32);
+    dst.fill(set, end, &span);
+    (set, end)
+}
+
 /// One input's delay on the RT thread. Before any is set it passes its
 /// input on unchanged, still storing it.
 pub struct Delay {
@@ -436,6 +461,43 @@ mod tests {
             })
             .collect();
         assert_eq!(out[0], want);
+    }
+
+    /// Copied in steps, the history in the target set is that of one
+    /// whole copy bit for bit: a first call copies all of it, a later one
+    /// of the same set only the samples since, a raised floor between
+    /// them included; a call for another set copies all of it again.
+    #[test]
+    fn a_copy_in_steps_equals_one_whole_copy() {
+        let mut src = delay(2, 1000);
+        let _ = run(&mut src, 0, 1280, 64, &[(0, 300)]);
+        let dst = DelayRings::new(2, 1000, 2, 256);
+        let whole = |s: &Delay, end: u64| {
+            let rings = DelayRings::new(2, 1000, 2, 256);
+            let _ = copy_since(s.rings(), &rings, end, s.span(end), None);
+            rings.copy(rings.inactive(), end, s.span(end))
+        };
+        let done = copy_since(src.rings(), &dst, 1280, src.span(1280), None);
+        // On, then the delay raised: the floor moves, the span grows.
+        let _ = run(&mut src, 1280, 640, 64, &[(1600, 900)]);
+        let end = 1920;
+        let done = copy_since(src.rings(), &dst, end, src.span(end), Some(done));
+        assert_eq!(done, (dst.inactive(), end));
+        assert_eq!(
+            dst.copy(dst.inactive(), end, src.span(end)),
+            whole(&src, end)
+        );
+        // A fill of another set does not count: the target set, holding
+        // stale samples, is copied whole.
+        let _ = run(&mut src, 1920, 128, 64, &[]);
+        let stale = DelayRings::new(2, 1000, 2, 256);
+        stale.fill(stale.inactive(), 2048, &vec![vec![9.0f32; 1000]; 2]);
+        let other = Some((1 - stale.inactive(), 2040));
+        let _ = copy_since(src.rings(), &stale, 2048, src.span(2048), other);
+        assert_eq!(
+            stale.copy(stale.inactive(), 2048, src.span(2048)),
+            whole(&src, 2048)
+        );
     }
 
     /// A delay above the rings' longest is refused and changes nothing.

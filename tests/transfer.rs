@@ -650,17 +650,18 @@ fn a_replayed_core_carries_the_delay_history() {
         let domain = Domain::new();
         let src = new_id();
         let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
-        let delayed = |c: &mut Config| c.inputs[0].max_delay_samples = 24_000;
+        let delayed = |c: &mut Config| c.inputs[0].max_delay_samples = 96_000;
         let (a, b) = (
             hashed_of(&domain, &[(&src, 2)], delayed),
             hashed_of(&domain, &[(&src, 2)], delayed),
         );
-        // Entry 1 delays both by 250 ms; entry 2 trims the joiner apart,
+        // Entry 1 delays both by 2 s; entry 2 trims the joiner apart,
         // entry 3 brings it back.
         let at1 = (now_block() + 20) * B;
+        const D: u64 = 96_000;
         let delay = Entry::Delay {
             slot: 0,
-            samples: 12_000,
+            samples: D as u32,
         };
         for e in [&a.e, &b.e] {
             e.append(1, at1, delay.clone()).unwrap();
@@ -668,13 +669,15 @@ fn a_replayed_core_carries_the_delay_history() {
         }
         strip(&a.e, 2, at1, StripParam::Trim { db: 0.0 });
         strip(&b.e, 2, at1, StripParam::Trim { db: -6.0 });
-        let at3 = at1 + 400 * B;
+        // The trims meet a second after the trimmed history begins to play:
+        // the joiner's output differs from at1 + D to at3 + D.
+        let at3 = at1 + D + 48_000;
         for e in [&a.e, &b.e] {
             strip(e, 3, at3, StripParam::Trim { db: 0.0 });
         }
-        let met = at3 + u64::from(RAMP);
-        wait_for(Duration::from_secs(5), "trims met", || {
-            processed(&a.e) > met / B + 1 && processed(&b.e) > met / B + 1
+        let heard = at1 + D + 4_800;
+        wait_for(Duration::from_secs(10), "the trimmed history heard", || {
+            processed(&a.e) > heard / B && processed(&b.e) > heard / B
         });
         let copy = copy(&a.e);
         let k0 = copy.k0;
@@ -687,7 +690,7 @@ fn a_replayed_core_carries_the_delay_history() {
         }
         // The pages compared lie before the trimmed history has played.
         let from = ((j + 1) * B).div_ceil(PAGE);
-        if (from + 8) * PAGE > met + 12_000 {
+        if (from + 8) * PAGE > at3 + D {
             return Err(format!(
                 "handed over at block {j}, past the trimmed history"
             ));

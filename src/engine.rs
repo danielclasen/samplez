@@ -2710,19 +2710,34 @@ impl Engine {
         // attempt.
         replay.run(self.counters.processed.load(Acquire).saturating_sub(1));
         let rings = &self.delays;
+        // The replay's delay history goes into the RT thread's other rings,
+        // which the core names and only an install switches to. The first
+        // attempt copies all of it; each later one only the blocks the
+        // replay computed since, so that it fits between two blocks of the
+        // RT thread however long the delay. A copy is keyed to the set it
+        // went to: should an earlier call's core install meanwhile, the
+        // other set is copied whole. Each attempt runs after the answers
+        // to earlier calls are taken.
+        let mut filled: Vec<Option<(usize, u64)>> = vec![None; rings.len()];
         self.offer(timeout, 0, true, &[], &[], &[], |j, core| {
             replay.run(j);
             replay.rt.capture(core);
-            // The replay's delay history up to the install, into the RT
-            // thread's other rings, which the core names: taken only by
-            // an install.
             let end = replay.next * replay.rt.block;
-            for ((slot, s), rings) in (replay.rt.slots.iter()).zip(&mut core.slots).zip(rings) {
-                if let (Some(l), Some(d), Some(rings)) = (&slot.delay, &mut s.delay, rings) {
-                    let span = l.rings().copy(l.rings().active(), end, l.span(end));
-                    let set = rings.inactive();
-                    rings.fill(set, end, &span);
-                    d.set = set as u8;
+            for ((slot, rings), done) in (replay.rt.slots.iter()).zip(rings).zip(filled.iter_mut())
+            {
+                if let (Some(l), Some(rings)) = (&slot.delay, rings) {
+                    *done = Some(samplez_dsp::copy_since(
+                        l.rings(),
+                        rings,
+                        end,
+                        l.span(end),
+                        *done,
+                    ));
+                }
+            }
+            for (s, rings) in core.slots.iter_mut().zip(rings) {
+                if let (Some(d), Some(rings)) = (&mut s.delay, rings) {
+                    d.set = rings.inactive() as u8;
                 }
             }
             (replay.next - 1, replay.last_id)

@@ -476,10 +476,12 @@ publishes the block it starts before it stores any history sample, and a
 copy is kept only while the RT thread has not started the last block of
 the slack after k0. A delay line's history its taps still reach is
 copied that way, off the RT thread, after the core, as base64 of the
-samples' bit patterns. A replay fills its own rings from the copy; a
+samples' bit patterns. A replay fills its own rings from the copy. A
 hand-over writes the replay's history into the RT thread's other set
 of rings, which the RT thread takes only when it installs the core, so
-a refused hand-over leaves the set it reads as it was. With more than
+a refused hand-over leaves the set it reads as it was: the first
+attempt writes all of it, each later one only the blocks computed
+since, so an attempt fits between two blocks however long the delay. With more than
 one voter every input flow must offer
 `resyncBudgetMs` of history beyond the read window; an input whose flow
 is shorter is refused with an error naming the `history_duration` it
