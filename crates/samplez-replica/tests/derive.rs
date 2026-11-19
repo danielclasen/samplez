@@ -1141,6 +1141,26 @@ async fn a_follower_restarted_past_a_re_route_commits_on_its_flows() {
 /// state instead, which moves the input, and commits again.
 #[tokio::test(start_paused = true)]
 async fn a_diverged_replica_on_another_flow_is_rebuilt_rather_than_resynced() {
+    let m = rebuilt_off_flows(false).await;
+    assert!(m.rebuilt_for_flows >= 1, "{m:?}");
+}
+
+/// A replay on another flow can hand over, its replayed pages not yet
+/// reported by the donor; the first page after it differs and the replica
+/// diverges again. The hand-over moved no input, so the mismatch counts on
+/// across it: the replica is rebuilt rather than resynced for good.
+#[tokio::test(start_paused = true)]
+async fn a_replica_handed_over_on_another_flow_is_rebuilt() {
+    let m = rebuilt_off_flows(true).await;
+    assert!(m.handovers >= 1, "handed over first: {m:?}");
+    assert!(m.rebuilt_for_flows >= 1, "{m:?}");
+}
+
+/// A follower's input 0 moves to a flow the log never named and a glitch
+/// diverges it, every replay handing over on other flows when
+/// `hands_over`. Its resync counts once it committed on the log's flows
+/// for 500 ms.
+async fn rebuilt_off_flows(hands_over: bool) -> samplez_replica::resync::Metrics {
     let set = Set::start_with(
         Options {
             contact: Some(Timing::defaults(BLOCK)),
@@ -1154,6 +1174,7 @@ async fn a_diverged_replica_on_another_flow_is_rebuilt_rather_than_resynced() {
         let mut fake = set.audio(id).lock();
         fake.route_digests = true;
         fake.resyncs = true;
+        fake.hands_over_off_flows = hands_over;
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     while !set.ids().all(|id| committing(&set, id)) {
@@ -1205,6 +1226,5 @@ async fn a_diverged_replica_on_another_flow_is_rebuilt_rather_than_resynced() {
         );
         sleep(Duration::from_millis(10)).await;
     }
-    let m = set.replica(follower).contact_metrics().unwrap();
-    assert!(m.resync.rebuilt_for_flows >= 1, "{:?}", m.resync);
+    set.replica(follower).contact_metrics().unwrap().resync
 }
