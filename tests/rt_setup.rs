@@ -132,3 +132,129 @@ fn rt_setup_degrades_without_privileges_and_the_engine_runs() {
     );
     engine.stop();
 }
+
+/// The CPUs thread `tid` of this process may run on.
+fn cpus_of(tid: i32) -> Vec<usize> {
+    affinity_of(tid).unwrap_or_else(|| panic!("sched_getaffinity of {tid} failed"))
+}
+
+/// [`cpus_of`] of a thread that may have ended meanwhile: `None` then.
+fn affinity_of(tid: i32) -> Option<Vec<usize>> {
+    // SAFETY: an all-zero cpu_set_t is an empty set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is writable and its size is passed.
+    let rc = unsafe { libc::sched_getaffinity(tid, size_of::<libc::cpu_set_t>(), &mut set) };
+    (rc == 0).then(|| {
+        (0..libc::CPU_SETSIZE as usize)
+            // SAFETY: `cpu` is below CPU_SETSIZE.
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .collect()
+    })
+}
+
+/// The ids of this process's threads named `name`, as the kernel keeps
+/// it: its first 15 bytes.
+fn threads_named(name: &str) -> Vec<i32> {
+    let name = &name[..name.len().min(15)];
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|e| {
+            let tid: i32 = e.ok()?.file_name().to_str()?.parse().ok()?;
+            let comm = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).ok()?;
+            (comm.trim_end() == name).then_some(tid)
+        })
+        .collect()
+}
+
+/// With the RT thread pinned, the threads created after
+/// `setup_process` (the supervisor and any later one) run on every
+/// allowed CPU but the RT thread's, and the RT thread alone on it.
+#[test]
+fn threads_created_after_set_up_stay_off_the_rt_cpu() {
+    // A thread of its own: the isolation is that thread's affinity and
+    // the inherited affinity of the threads it creates, not the test
+    // harness's.
+    std::thread::spawn(|| {
+        // SAFETY: gettid has no preconditions.
+        let allowed = cpus_of(unsafe { libc::gettid() });
+        let domain = Domain::new();
+        let (src, dst) = (new_id(), new_id());
+        let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
+        let mut cfg = config(
+            &domain.0,
+            &[(&src, 1)],
+            &[(&dst, 1)],
+            vec![vec![1.0]],
+            MARGIN,
+        );
+        cfg.rt.rt_cpu = samplez::config::RtCpu::Last;
+        let process = rt::setup_process(&cfg.rt);
+        let cpu = *allowed.last().unwrap();
+        assert_eq!(process.rt_cpu, Ok(cpu));
+        let engine = Engine::start(cfg, process, None).unwrap();
+        let s = engine.status().rt;
+        assert_eq!(s.thread.affinity, Step::Active(format!("CPU {cpu}")));
+        assert_eq!(cpus_of(s.thread.tid), vec![cpu]);
+        if allowed.len() < 2 {
+            eprintln!("one allowed CPU: the isolation is checked as off only");
+            assert!(
+                matches!(&s.process.isolation, Step::Off(_)),
+                "{}",
+                s.process.isolation
+            );
+            engine.stop();
+            return;
+        }
+        assert!(
+            matches!(&s.process.isolation, Step::Active(_)),
+            "{}",
+            s.process.isolation
+        );
+        let others: Vec<usize> = allowed.iter().copied().filter(|&c| c != cpu).collect();
+        let supervisors = threads_named("samplez-supervisor");
+        assert!(!supervisors.is_empty(), "no supervisor thread");
+        // Other tests in this binary may run engines of their own, set up
+        // without pinning; this one's supervisor is among those off `cpu`.
+        assert!(
+            supervisors
+                .iter()
+                .any(|&t| affinity_of(t).as_ref() == Some(&others)),
+            "no supervisor off CPU {cpu}: {:?}",
+            supervisors
+                .iter()
+                .map(|&t| affinity_of(t))
+                .collect::<Vec<_>>()
+        );
+        // SAFETY: gettid has no preconditions.
+        let later = std::thread::spawn(|| cpus_of(unsafe { libc::gettid() }))
+            .join()
+            .unwrap();
+        assert_eq!(later, others);
+        engine.stop();
+    })
+    .join()
+    .unwrap();
+}
+
+/// `isolateRtCpu: false` leaves the other threads on every allowed CPU.
+#[test]
+fn isolation_can_be_turned_off() {
+    std::thread::spawn(|| {
+        // SAFETY: gettid has no preconditions.
+        let allowed = cpus_of(unsafe { libc::gettid() });
+        let rt = samplez::config::Rt {
+            rt_cpu: samplez::config::RtCpu::Last,
+            isolate_rt_cpu: false,
+            ..Default::default()
+        };
+        let process = rt::setup_process(&rt);
+        assert_eq!(
+            process.isolation,
+            Step::Off("rt.isolateRtCpu is false".into())
+        );
+        // SAFETY: gettid has no preconditions.
+        assert_eq!(cpus_of(unsafe { libc::gettid() }), allowed);
+    })
+    .join()
+    .unwrap();
+}

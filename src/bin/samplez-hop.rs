@@ -48,6 +48,7 @@ fn main() -> ExitCode {
         ("dumpable", &rt.process.dumpable),
         ("mlock", &rt.process.mlock),
         ("stack", &rt.process.stack),
+        ("isolation", &rt.process.isolation),
         ("sched", &rt.thread.sched),
         ("affinity", &rt.thread.affinity),
         ("ftz_daz", &rt.thread.ftz_daz),

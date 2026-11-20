@@ -57,6 +57,11 @@ pub struct ProcessStatus {
     pub mlock: Step,
     /// The default thread stack size cap.
     pub stack: Step,
+    /// The CPU the RT thread is to be pinned to, or why it is not pinned.
+    pub rt_cpu: Result<usize, Step>,
+    /// The calling thread, and every thread created after it, kept off
+    /// `rt_cpu`.
+    pub isolation: Step,
 }
 
 /// The RT thread's own steps.
@@ -85,6 +90,7 @@ impl RtStatus {
             &p.dumpable,
             &p.mlock,
             &p.stack,
+            &p.isolation,
             &t.sched,
             &t.affinity,
             &t.ftz_daz,
@@ -233,7 +239,13 @@ fn cap_default_stack() -> Step {
 }
 
 /// The process steps. Runs on the main thread before any other thread is
-/// created: capabilities, then memory locking, then the default stack cap.
+/// created, once: capabilities, then memory locking, then the default
+/// stack cap, then the RT thread's CPU and the isolation from it.
+///
+/// The isolation is the calling thread's affinity, inherited by the
+/// threads it creates afterwards; a thread that already exists, or the
+/// engine started from another thread, keeps its own. A second call on
+/// the same thread sees the reduced set and may choose another CPU.
 pub fn setup_process(rt: &Rt) -> ProcessStatus {
     let stack = cap_default_stack();
     if !rt.enabled {
@@ -243,6 +255,8 @@ pub fn setup_process(rt: &Rt) -> ProcessStatus {
             dumpable: off(),
             mlock: off(),
             stack,
+            rt_cpu: Err(off()),
+            isolation: off(),
         };
     }
     let capabilities = raise_permitted();
@@ -253,11 +267,50 @@ pub fn setup_process(rt: &Rt) -> ProcessStatus {
     } else {
         Step::Degraded(format!("PR_SET_DUMPABLE failed: {}", errno()))
     };
+    let (rt_cpu, isolation) = match allowed_cpus() {
+        Ok(set) if !set.is_empty() => {
+            let rt_cpu = choose_cpu(rt.rt_cpu, &set);
+            let isolation = isolate(&rt_cpu, &set, rt.isolate_rt_cpu);
+            (rt_cpu, isolation)
+        }
+        Ok(_) => {
+            let why = || Step::Degraded("sched_getaffinity returned no CPU".to_owned());
+            (Err(why()), why())
+        }
+        Err(e) => {
+            let why = || Step::Degraded(format!("sched_getaffinity failed: {e}"));
+            (Err(why()), why())
+        }
+    };
     ProcessStatus {
         capabilities,
         dumpable,
         mlock: lock_memory(),
         stack,
+        rt_cpu,
+        isolation,
+    }
+}
+
+/// Sets the calling thread's affinity to `set` without `rt_cpu`, so every
+/// thread it creates later inherits it and only the RT thread, pinning
+/// itself, runs on `rt_cpu`.
+fn isolate(rt_cpu: &Result<usize, Step>, set: &[usize], enabled: bool) -> Step {
+    let Ok(cpu) = *rt_cpu else {
+        return Step::Off("the RT thread is not pinned".to_owned());
+    };
+    if !enabled {
+        return Step::Off("rt.isolateRtCpu is false".to_owned());
+    }
+    let others: Vec<usize> = set.iter().copied().filter(|&c| c != cpu).collect();
+    if others.is_empty() {
+        return Step::Off(format!("CPU {cpu} is the only allowed CPU"));
+    }
+    match set_affinity(&others) {
+        Ok(()) => Step::Active(format!(
+            "other threads on CPUs {others:?}, CPU {cpu} left to the RT thread"
+        )),
+        Err(e) => Step::Degraded(format!("sched_setaffinity to {others:?} failed: {e}")),
     }
 }
 
@@ -275,12 +328,15 @@ fn allowed_cpus() -> std::io::Result<Vec<usize>> {
         .collect())
 }
 
-fn pin(cpu: usize) -> std::io::Result<()> {
-    // SAFETY: an all-zero cpu_set_t is an empty set; `cpu` comes from the
-    // allowed set, so it is below CPU_SETSIZE.
+/// Sets the calling thread's affinity to `cpus`, each from the allowed set.
+fn set_affinity(cpus: &[usize]) -> std::io::Result<()> {
+    // SAFETY: an all-zero cpu_set_t is an empty set; every CPU comes from
+    // the allowed set, so it is below CPU_SETSIZE.
     let rc = unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
+        for &cpu in cpus {
+            libc::CPU_SET(cpu, &mut set);
+        }
         libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set)
     };
     if rc == 0 { Ok(()) } else { Err(errno()) }
@@ -404,42 +460,42 @@ pub fn auto_pins(
     }
 }
 
-fn affinity(rt_cpu: RtCpu) -> Step {
-    let set = match allowed_cpus() {
-        Ok(s) if !s.is_empty() => s,
-        Ok(_) => return Step::Degraded("sched_getaffinity returned no CPU".to_owned()),
-        Err(e) => return Step::Degraded(format!("sched_getaffinity failed: {e}")),
-    };
-    let cpu = match rt_cpu {
-        RtCpu::None => return Step::Off("rtCpu none".to_owned()),
-        RtCpu::First => set[0],
-        RtCpu::Last => set[set.len() - 1],
-        RtCpu::Index(i) => match set.get(i) {
-            Some(&c) => c,
-            None => {
-                return Step::Degraded(format!(
-                    "rtCpu {i} is outside the allowed set of {} CPUs",
-                    set.len()
-                ));
-            }
-        },
+/// The CPU `rt_cpu` names in `set`, the allowed CPUs before any isolation,
+/// or why the RT thread is not pinned.
+fn choose_cpu(rt_cpu: RtCpu, set: &[usize]) -> Result<usize, Step> {
+    match rt_cpu {
+        RtCpu::None => Err(Step::Off("rtCpu none".to_owned())),
+        RtCpu::First => Ok(set[0]),
+        RtCpu::Last => Ok(set[set.len() - 1]),
+        RtCpu::Index(i) => set.get(i).copied().ok_or_else(|| {
+            Step::Degraded(format!(
+                "rtCpu {i} is outside the allowed set of {} CPUs",
+                set.len()
+            ))
+        }),
         RtCpu::Auto => {
             let env = |n| std::env::var(n).ok();
             let (request, limit) = (env(CPU_REQUEST_ENV), env(CPU_LIMIT_ENV));
-            if let Err(why) = auto_pins(
+            auto_pins(
                 request.as_deref(),
                 limit.as_deref(),
                 set.len(),
                 cgroup_quota(),
-            ) {
-                return Step::Off(format!("auto, not pinned: {why}"));
-            }
-            set[set.len() - 1]
+            )
+            .map(|()| set[set.len() - 1])
+            .map_err(|why| Step::Off(format!("auto, not pinned: {why}")))
         }
-    };
-    match pin(cpu) {
-        Ok(()) => Step::Active(format!("CPU {cpu}")),
-        Err(e) => Step::Degraded(format!("sched_setaffinity to CPU {cpu} failed: {e}")),
+    }
+}
+
+/// Pins the calling thread to the CPU [`setup_process`] chose.
+fn affinity(rt_cpu: &Result<usize, Step>) -> Step {
+    match rt_cpu {
+        Ok(cpu) => match set_affinity(&[*cpu]) {
+            Ok(()) => Step::Active(format!("CPU {cpu}")),
+            Err(e) => Step::Degraded(format!("sched_setaffinity to CPU {cpu} failed: {e}")),
+        },
+        Err(why) => why.clone(),
     }
 }
 
@@ -483,13 +539,13 @@ fn block_signals() -> Step {
 }
 
 /// The RT thread's steps, run on the RT thread itself: SCHED_FIFO,
-/// affinity, FTZ/DAZ and signal blocking. FTZ/DAZ stays set for the
-/// thread's life.
-pub fn setup_thread(rt: &Rt) -> ThreadStatus {
+/// affinity to the CPU `process` chose, FTZ/DAZ and signal blocking.
+/// FTZ/DAZ stays set for the thread's life.
+pub fn setup_thread(rt: &Rt, process: &ProcessStatus) -> ThreadStatus {
     // SAFETY: gettid has no preconditions.
     let tid = unsafe { libc::gettid() };
     let (sched, affinity) = if rt.enabled {
-        (sched_fifo(rt.priority), affinity(rt.rt_cpu))
+        (sched_fifo(rt.priority), affinity(&process.rt_cpu))
     } else {
         let off = || Step::Off("rt.enabled is false".to_owned());
         (off(), off())

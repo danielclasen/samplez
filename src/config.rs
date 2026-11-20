@@ -271,6 +271,9 @@ pub struct Rt {
     pub priority: i32,
     #[serde(default)]
     pub rt_cpu: RtCpu,
+    /// Keeps every other thread off the RT thread's CPU when it is pinned.
+    #[serde(default = "default_true")]
+    pub isolate_rt_cpu: bool,
 }
 
 impl Default for Rt {
@@ -279,6 +282,7 @@ impl Default for Rt {
             enabled: true,
             priority: default_priority(),
             rt_cpu: RtCpu::default(),
+            isolate_rt_cpu: true,
         }
     }
 }

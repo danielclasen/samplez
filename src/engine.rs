@@ -1530,11 +1530,12 @@ impl Engine {
 
         let (thread_tx, thread_rx) = mpsc::sync_channel::<ThreadStatus>(1);
         let rt_cfg = config.rt.clone();
+        let rt_process = process.clone();
         let rt_thread = std::thread::Builder::new()
             .name("samplez-rt".to_owned())
             .stack_size(rt::STACK_SIZE)
             .spawn(move || {
-                let _ = thread_tx.send(rt::setup_thread(&rt_cfg));
+                let _ = thread_tx.send(rt::setup_thread(&rt_cfg, &rt_process));
                 drop(thread_tx);
                 rt_state.run()
             })
