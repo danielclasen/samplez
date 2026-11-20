@@ -8351,9 +8351,13 @@ mod tests {
                 let last = processed();
                 a.set_diverged(false).unwrap();
                 let to = processed();
-                // At the least the blocks processed between the two
-                // stores; at the most those up to the block after.
-                diverged = (last.saturating_sub(from), to + 1 - first);
+                // The loop reads the flag while it meters a block and
+                // counts the block processed after it, so the block in
+                // flight at either store may have read the flag before
+                // it. At the least the blocks processed between the two
+                // stores but the first; at the most those up to the block
+                // after.
+                diverged = (last.saturating_sub(from + 1), to + 1 - first);
             }
         }
         let frozen = end + 3 * 48_000 + 4 * WINDOW;
