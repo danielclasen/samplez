@@ -287,10 +287,12 @@ replica rebuilt or handed over pauses the meters its peers pause. A
 resync, a rebuild from product state and a hand-over do not reset the
 measurement; the replica measures on from its own state, the slices it
 lost meanwhile counted in `lost`. A reset is an event, not state: no
-target or product state holds one. A reset entry a replica takes without
-a core, or after its window from a replayed or rebuilt core that knew
-it, restarts the measurement at its window all the same, the slices
-from there to the first one metered counted in `lost`.
+product state holds one, and a rebuild never resets a meter (a product
+asks for a reset through its targets' reset epochs, see Replicated mode).
+A reset entry a replica takes without a core, or after its window from
+a replayed or rebuilt core that knew it, restarts the measurement at its
+window all the same, the slices from there to the first one metered
+counted in `lost`.
 The measurement restarts only with the process or at a reset. `since`
 is the sample index the measurement started at, so a replica whose
 `since` is later than its peers' restarted its measurement and measures
@@ -813,8 +815,25 @@ parameter, delay, duck group setting, duck mask and meter's running
 state as values;
 `Targets::diff` gives the entries that move an engine from one
 set of targets to another, comparing every value by bit pattern, and
-`Targets::assert` the entries that set all of them. A loudness reset is
-an event no target holds, so neither gives a `ResetLoudness`.
+`Targets::assert` the entries that set all of them.
+
+A product resets a meter's loudness measurement by moving the meter's
+reset epoch forward (`Targets::loudness_resets`, one `u32` per meter,
+the outputs then the configured meters, a meter past the list at 0).
+The epoch counts forward only and wraps: one lies ahead of another when
+it is 1 to `i32::MAX` past it, so moving it back resets nothing. A diff
+gives one `ResetLoudness` per meter whose epoch moved forward, however
+far, since resets at one index are one reset; an assert gives none, so
+re-asserting the targets never resets a meter. The state machine keeps,
+in its replicated state and its snapshots, the meters each decidable
+entry's record reset. A restamp of such an entry gives the resets again
+in its own record, at the restamp's index, and the entry's own record
+never applies, so the reset applies exactly once, where the log decided
+it; a void drops them, so a voided reset applies nowhere, also when the
+void, stamped, re-asserts the state. A rebuild from product state
+leaves the measurement alone, and the targets the state machine diffs
+the next entry against hold the epochs already, after a snapshot load
+too, so a rebuild or a load gives no reset either.
 
 In `samplez-replica` every audio replica starts clock-unverified, which
 drops its engine's core until it verifies, and a snapshot install, a

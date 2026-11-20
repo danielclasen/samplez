@@ -315,6 +315,11 @@ pub struct StateMachine<P> {
     /// restamp of one re-asserts the targets, of one that derived nothing
     /// nothing.
     pub derived: BTreeMap<u64, Vec<u32>>,
+    /// Of `derived`, the entries whose records reset a meter's loudness
+    /// measurement, with those meters: a restamp of one resets them again
+    /// at its own index, which re-asserting the targets does not, as the
+    /// entry's own record never applied; a void drops them.
+    pub resets: BTreeMap<u64, Vec<u32>>,
     /// The highest [`Body::Protocol`] applied: the leader flags commands
     /// only once its own state holds [`crate::entry::PROTOCOL`].
     pub protocol: u32,
@@ -375,6 +380,7 @@ impl<P: Product> StateMachine<P> {
             deltas_after: 0,
             floor: 0,
             derived: BTreeMap::new(),
+            resets: BTreeMap::new(),
             protocol: 0,
             image: None,
             ramps: Vec::new(),
@@ -530,7 +536,13 @@ impl<P: Product> StateMachine<P> {
                     return;
                 };
                 let slots: Vec<usize> = slots.iter().map(|&s| s as usize).collect();
-                let entries = targets.assert(&slots, self.masked.as_deref());
+                let mut entries = targets.assert(&slots, self.masked.as_deref());
+                // A restamp carries the resets of the entry it moved; a
+                // void has dropped them.
+                for &meter in self.resets.get(&revision).into_iter().flatten() {
+                    let meter = meter as usize;
+                    entries.push(samplez::Entry::ResetLoudness { meter });
+                }
                 let held = self.image.take();
                 self.follow(&entries, held.as_ref(), at);
                 self.mask(&targets);
@@ -599,6 +611,15 @@ impl<P: Product> StateMachine<P> {
             && self.terms.contains_key(&revision)
         {
             self.derived.insert(revision, routed);
+            let resets: Vec<u32> = (entries.iter())
+                .filter_map(|e| match *e {
+                    samplez::Entry::ResetLoudness { meter } => Some(meter as u32),
+                    _ => None,
+                })
+                .collect();
+            if !resets.is_empty() {
+                self.resets.insert(revision, resets);
+            }
         }
         let record = Record {
             at_index: at,
@@ -681,6 +702,9 @@ impl<P: Product> StateMachine<P> {
                     if let Some(routed) = self.derived.remove(of) {
                         self.derived.insert(revision, routed);
                     }
+                    if let Some(resets) = self.resets.remove(of) {
+                        self.resets.insert(revision, resets);
+                    }
                 }
                 Response::default()
             }
@@ -695,6 +719,9 @@ impl<P: Product> StateMachine<P> {
                     let behind = self.restamps.remove(of);
                     self.terms.remove(of);
                     let derived = self.derived.remove(of);
+                    // Its resets never apply: the state re-asserted holds
+                    // no event.
+                    self.resets.remove(of);
                     // A void the leader stamped re-asserts the entry's
                     // effect at its own index: one that goes unresolved is
                     // decided like the entry, known under the void's id,
@@ -814,6 +841,7 @@ impl<P: Product> StateMachine<P> {
         self.decided.retain(|_, &mut (_, until)| until >= passed);
         let terms = &self.terms;
         self.derived.retain(|index, _| terms.contains_key(index));
+        self.resets.retain(|index, _| terms.contains_key(index));
         let floor = self.floor;
         for f in self.ramps.iter_mut().flatten() {
             if f.is_some_and(|f| f.start.saturating_add(u64::from(f.len)) <= floor) {
@@ -1037,6 +1065,7 @@ impl<P: Product> StateMachine<P> {
             revision: self.revision,
             floor: Some(self.floor),
             derived: self.derived.clone(),
+            resets: self.resets.clone(),
             protocol: self.protocol,
             ramps: (self.ramps.iter())
                 .map(|row| {
@@ -1085,6 +1114,7 @@ impl<P: Product> StateMachine<P> {
                 .unwrap_or(0)
         });
         self.derived = saved.derived;
+        self.resets = saved.resets;
         self.protocol = saved.protocol;
         self.ramps = (saved.ramps.iter())
             .map(|row| {
@@ -1970,7 +2000,8 @@ mod derive_tests {
     /// the slot's fader times the VCA, slot 1 silent while a session holds
     /// solo on slot 0. Commands: `fader <slot> <gain>`, `vca <gain>`,
     /// `trim <slot> <db>`, `route <slot> <flow>`, `pair <flow> <flow>`
-    /// (both slots), `pause <meter> <0|1>`, `solo`, `noop`, `stale`.
+    /// (both slots), `pause <meter> <0|1>`, `reset <meter>`, `solo`,
+    /// `noop`, `stale`.
     /// The input domain of each slot, as configured.
     const DOMAINS: [u8; 2] = [0, 1];
 
@@ -1987,6 +2018,9 @@ mod derive_tests {
         /// Per meter, its loudness measurement paused.
         #[serde(default)]
         paused: [bool; 2],
+        /// Per meter, its loudness reset epoch.
+        #[serde(default)]
+        resets: [u32; 2],
     }
 
     impl Desk {
@@ -1999,6 +2033,7 @@ mod derive_tests {
                 solo: None,
                 ducked: false,
                 paused: [false; 2],
+                resets: [0; 2],
             }
         }
     }
@@ -2017,6 +2052,10 @@ mod derive_tests {
                 ["vca", gain] => self.vca = gain.parse().unwrap(),
                 ["duck", on] => self.ducked = on == "1",
                 ["pause", meter, on] => self.paused[meter.parse::<usize>().unwrap()] = on == "1",
+                ["reset", meter] => {
+                    let epoch = &mut self.resets[meter.parse::<usize>().unwrap()];
+                    *epoch = epoch.wrapping_add(1);
+                }
                 ["trim", slot, db] => {
                     self.trims[slot.parse::<usize>().unwrap()] = db.parse().unwrap()
                 }
@@ -2082,6 +2121,7 @@ mod derive_tests {
                 } else {
                     Vec::new()
                 },
+                loudness_resets: self.resets.to_vec(),
                 ..Targets::default()
             })
         }
@@ -2140,6 +2180,105 @@ mod derive_tests {
         sm.apply_at(2, 1, &one("2", "pause 1 0", 48, 1008, None));
         assert_eq!(sm.records[&2].entries, [run(true)]);
         assert!(sm.product_state(2).loudness_running.is_empty());
+    }
+
+    /// A restamp of entry `of` to `at_index`, stamped 96.
+    fn restamp_of(of: u64, at_index: u64) -> Request {
+        Request {
+            stamp: 96,
+            body: Body::Restamp {
+                revision: of,
+                term: 1,
+                at_index,
+                paths: Vec::new(),
+                generation: None,
+            },
+        }
+    }
+
+    /// The loudness resets of `sm`'s records, as (log index, record
+    /// index, meter), but for the records of the entries `decided` names:
+    /// the log restamped or voided those, so their records never apply.
+    fn resets_applied(sm: &StateMachine<Desk>, decided: &[u64]) -> Vec<(u64, u64, usize)> {
+        (sm.records.iter())
+            .filter(|(i, _)| !decided.contains(i))
+            .flat_map(|(&i, r)| {
+                (r.entries.iter()).filter_map(move |e| match *e {
+                    Entry::ResetLoudness { meter } => Some((i, r.at_index, meter)),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    /// A command moving a meter's reset epoch derives one reset at its
+    /// index. Restamped, and the restamp restamped again, the reset
+    /// moves with it: exactly one applies, at the last restamp's index,
+    /// though the restamps re-assert the targets, which hold no reset. A
+    /// later command derives none.
+    #[test]
+    fn a_restamped_reset_applies_once_at_the_restamp() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "reset 1", 0, 3000, None));
+        assert_eq!(resets_applied(&sm, &[]), [(10, 3000, 1)]);
+        sm.apply_at(11, 1, &one("2", "fader 0 0.2", 0, 3000, None));
+        sm.apply_at(12, 1, &restamp_of(10, 4000));
+        assert_eq!(resets_applied(&sm, &[10]), [(12, 4000, 1)]);
+        sm.apply_at(13, 1, &restamp_of(12, 5000));
+        assert_eq!(resets_applied(&sm, &[10, 12]), [(13, 5000, 1)]);
+        sm.apply_at(14, 1, &one("3", "fader 1 0.5", 96, 6000, None));
+        assert_eq!(resets_applied(&sm, &[10, 12]), [(13, 5000, 1)]);
+    }
+
+    /// A command moving a meter's reset epoch that the log voids resets
+    /// nothing: the void re-asserts the state, which holds no reset, and
+    /// so does a restamp of the stamped void.
+    #[test]
+    fn a_voided_reset_applies_nowhere() {
+        let mut sm = machine();
+        sm.apply_at(10, 1, &one("1", "reset 0", 0, 3000, None));
+        sm.apply_at(11, 1, &void(10, 96, Some(4800)));
+        assert!(
+            sm.records.contains_key(&11),
+            "the void re-asserts the state"
+        );
+        assert!(resets_applied(&sm, &[10]).is_empty());
+        sm.apply_at(12, 1, &restamp_of(11, 6000));
+        assert!(sm.records.contains_key(&12), "the restamp re-asserts it");
+        assert!(resets_applied(&sm, &[10, 11]).is_empty());
+    }
+
+    /// Two replicas applying one log derive the same resets at the same
+    /// indexes, one of them loaded from a snapshot taken after the reset
+    /// commands and before the log decided them: a restamped reset
+    /// applies at the restamp on both, a voided one on neither.
+    #[test]
+    fn replicas_derive_the_same_resets_from_one_log() {
+        let log = [
+            one("1", "reset 1", 0, 3000, None),
+            one("2", "reset 0", 48, 3000, None),
+            one("3", "fader 0 0.2", 96, 3000, None),
+            restamp_of(1, 4000),
+            void(2, 144, Some(4800)),
+            one("4", "reset 1", 192, 5000, None),
+        ];
+        let mut whole = machine();
+        for (n, r) in log.iter().enumerate().take(3) {
+            whole.apply_at(n as u64 + 1, 1, r);
+        }
+        let mut loaded = machine();
+        loaded.load(whole.save(), Limits::defaults(48_000)).unwrap();
+        for (n, r) in log.iter().enumerate().skip(3) {
+            whole.apply_at(n as u64 + 1, 1, r);
+            loaded.apply_at(n as u64 + 1, 1, r);
+        }
+        let applied = |sm: &StateMachine<Desk>| -> Vec<(u64, u64, usize)> {
+            (resets_applied(sm, &[1, 2]).into_iter())
+                .filter(|&(i, ..)| i > 3)
+                .collect()
+        };
+        assert_eq!(applied(&whole), [(4, 4000, 1), (6, 5000, 1)]);
+        assert_eq!(applied(&loaded), applied(&whole));
     }
 
     /// The product state carries the ramp each plain gain entry left the
