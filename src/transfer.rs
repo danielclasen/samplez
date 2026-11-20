@@ -5,7 +5,8 @@
 //! the matrix with its ramps, duck masks, depths and mask crossfades, the
 //! duck detectors with their keys, filter, hold and envelope state, the
 //! entries pending and applied in the page in progress, each input slot's
-//! log state, fades and strip with its position, the entries waiting for
+//! log state, fades and strip with its position, each tone generator's
+//! state, the entries waiting for
 //! their generation and the pending generation's entry id, the outputs
 //! disabled, the meters whose loudness measurement the log holds paused,
 //! and the
@@ -18,7 +19,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{Limiter, LimiterParams, Matrix, Strip, StripParam, Taps};
+use samplez_dsp::{
+    Limiter, LimiterParams, Matrix, Strip, StripParam, Taps, Tone, ToneParams, ToneRamps,
+};
 use samplez_mxl::time;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +65,11 @@ pub(crate) struct SlotCore {
     /// reads, and per leg the span of history its taps reach back over,
     /// copied off the RT thread. None on a slot without a delay line.
     pub delay: Option<DelayCore>,
+    /// The slot's tone generator, which a core built from product state
+    /// holds none of and leaves the RT thread's, as a strip. None on a
+    /// slot that reads flows, and then not encoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<Tone>,
 }
 
 /// A delay's state in a core.
@@ -357,6 +365,11 @@ impl Core {
         Some(self.slots.get(slot)?.delay.as_ref()?.taps)
     }
 
+    /// Slot `slot`'s tone generator; none for a slot without one.
+    pub fn tone(&self, slot: usize) -> Option<&Tone> {
+        self.slots.get(slot)?.tone.as_ref()
+    }
+
     /// The `(log id, at_index)` of the entries pending before their index.
     pub fn pending(&self) -> impl Iterator<Item = (LogId, u64)> + '_ {
         self.pending.iter().map(|e| (e.id, e.at_index))
@@ -415,6 +428,7 @@ impl Core {
                     Change::Strip { param, .. } => param.check(usize::MAX).is_ok(),
                     Change::Limiter { params, .. } => params.check().is_ok(),
                     Change::Delay { samples, .. } => samples <= samplez_dsp::MAX_DELAY_SAMPLES,
+                    Change::Tone { params, .. } => params.is_valid(),
                     Change::LoudnessRun { meter, .. } | Change::ResetLoudness { meter } => {
                         meter < MAX_OUTPUTS + MAX_METERS
                     }
@@ -469,10 +483,7 @@ impl Core {
             let (Some((_, b)), None) = (of.next(), of.next()) else {
                 return false;
             };
-            if !b.sane()
-                || (strips && b.strips.is_empty() && b.limiters.is_empty() && b.delays.is_empty())
-                || resets == b.resets.is_empty()
-            {
+            if !b.sane() || (strips && !b.has_params()) || resets == b.resets.is_empty() {
                 return false;
             }
         }
@@ -490,7 +501,9 @@ impl Core {
     /// strip of its legs exactly when it is at most [`MAX_LEGS`] wide,
     /// and output limiter legs `limiters` names for it, and delay, with the
     /// span its taps reach, exactly when `delays` names the longest delay for
-    /// it, taps within that.
+    /// it, taps within that; a slot has a tone generator of its legs at
+    /// the engine's rate exactly when `tones` names it one, a slot past
+    /// the list none.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fits(
         &self,
@@ -501,6 +514,7 @@ impl Core {
         legs: &[usize],
         limiters: &[Option<usize>],
         delays: &[u32],
+        tones: &[bool],
         ramp: u32,
         page_entries: usize,
         ducked: &[usize],
@@ -509,6 +523,15 @@ impl Core {
         let strip = |(s, &legs): (&SlotCore, &usize)| match &s.strip {
             Some(strip) => strip.legs() == legs && strip.ramp() == ramp,
             None => legs > MAX_LEGS,
+        };
+        let tone = |(i, (s, &legs)): (usize, (&SlotCore, &usize))| match &s.tone {
+            Some(t) => {
+                tones.get(i) == Some(&true)
+                    && t.legs() == legs
+                    && t.ramp() == ramp
+                    && i64::from(t.rate()) == samplez_mxl::SAMPLE_RATE
+            }
+            None => tones.get(i) != Some(&true),
         };
         let entry = |e: &RtEntry| {
             fits(&e.change, inputs, columns, outputs, meters, legs)
@@ -544,6 +567,7 @@ impl Core {
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
             && self.batches.iter().all(batch)
             && self.slots.iter().zip(legs).all(strip)
+            && self.slots.iter().zip(legs).enumerate().all(tone)
             && (0..self.limiters.len().max(limiters.len())).all(|o| {
                 let held = self.limiters.get(o).and_then(Option::as_ref);
                 let want = limiters.get(o).copied().flatten();
@@ -608,6 +632,7 @@ pub(crate) fn fits(
         Change::Delay { slot, samples } => {
             slot < slots && samples <= samplez_dsp::MAX_DELAY_SAMPLES
         }
+        Change::Tone { slot, params } => slot < slots && params.is_valid(),
         Change::Batch { up, routed, .. } => slots_of(up | routed).all(|s| s < slots),
     }
 }
@@ -634,6 +659,9 @@ pub(crate) struct Handover {
     pub limiters: Vec<(usize, LimiterParams)>,
     /// Delays set at the install index, by slot, as `strips`.
     pub delays: Vec<(usize, u32)>,
+    /// Tone generators' ramps installed at the install index, by slot:
+    /// the product state's, which replace the generator's own.
+    pub tones: Vec<(usize, ToneRamps)>,
     pub answer: Answer,
 }
 
@@ -1014,6 +1042,19 @@ fn change_of(entry: &Entry) -> Change {
         Entry::Strip { slot, param } => Change::Strip { slot, param },
         Entry::Limiter { output, params } => Change::Limiter { output, params },
         Entry::Delay { slot, samples } => Change::Delay { slot, samples },
+        Entry::Tone {
+            slot,
+            frequency_hz,
+            level_db,
+            ident,
+        } => Change::Tone {
+            slot,
+            params: ToneParams {
+                frequency_hz,
+                level_db,
+                ident,
+            },
+        },
         Entry::LoudnessRun { meter, running } => Change::LoudnessRun { meter, running },
         Entry::ResetLoudness { meter } => Change::ResetLoudness { meter },
         Entry::Duck { .. } | Entry::DuckMask { .. } => {
@@ -1062,6 +1103,19 @@ pub struct ProductState {
     /// history, so a slot delayed reads its own past until the delay
     /// has passed.
     pub delays: Vec<u32>,
+    /// Per input slot its tone parameters, for a tone generator's; none
+    /// for one the log never set. Without ramps in `tone_ramps` a
+    /// generator holds them from the install on, with no ramp. A slot
+    /// past both lists keeps what its generator holds.
+    pub tones: Vec<Option<ToneParams>>,
+    /// Per input slot the ramps of its tone generator as the log left
+    /// them, the target `tones` names included: level, frequency and
+    /// ident, each with its start index and the value it moves from, a
+    /// waiting frequency change too. The install replaces the
+    /// generator's ramps with them, so a rebuilt generator computes a
+    /// running one's bits from its first sample, mid-ramp as well. Empty,
+    /// or none for a slot, falls back to `tones`.
+    pub tone_ramps: Vec<Option<ToneRamps>>,
     /// Per duck group, at most [`samplez_dsp::MAX_DUCKS`], its targets: a
     /// group past the list holds [`DuckTargets::default`]. The detectors
     /// start cold at the install: key filters at rest, no hold, the
@@ -1237,6 +1291,7 @@ mod tests {
             strip: Some(strip()),
             strip_pos: Some(4800),
             delay: None,
+            tone: None,
         };
         core.unresolved.push((9, 1 << 40));
         CoreCopy {
@@ -1263,7 +1318,7 @@ mod tests {
     /// beyond any engine's is refused as it decodes.
     #[test]
     fn a_core_carries_the_meters_paused_within_the_engines_meters() {
-        let fits = |c: &Core, meters| c.fits(2, 2, 1, meters, &[1, 1], &[], &[], 48, 8, &[]);
+        let fits = |c: &Core, meters| c.fits(2, 2, 1, meters, &[1, 1], &[], &[], &[], 48, 8, &[]);
         let mut c = copy();
         c.core.loudness_paused = (1 << 1) | (1 << 70);
         let decoded = CoreCopy::decode(&c.encode()).unwrap();
@@ -1541,23 +1596,102 @@ mod tests {
         ));
     }
 
+    /// A slot's tone generator travels with the core: encoded only where
+    /// a slot has one, so a core without any encodes as before, decoded
+    /// bit for bit, and fitting only an engine whose configuration has a
+    /// generator of its legs, rate and ramp on that slot and on no other.
+    /// A tone entry pending outside the range is refused as it decodes.
+    /// Fails with the tone check dropped from `Core::fits`.
+    #[test]
+    fn a_core_carries_a_tone_generator_where_the_slot_has_one() {
+        let mut copy = copy();
+        assert!(!copy.encode().contains("tone"));
+        let fits = |c: &Core, tones: &[bool], ramp| {
+            c.fits(2, 2, 1, 1, &[1, 1], &[], &[], tones, ramp, 8, &[])
+        };
+        let mut tone = Tone::new(1, 48_000, 48);
+        let lineup = ToneParams {
+            frequency_hz: 997,
+            level_db: -12.0,
+            ident: true,
+        };
+        assert!(tone.set(4752, lineup));
+        copy.core.slots[1].tone = Some(tone);
+        let decoded = CoreCopy::decode(&copy.encode()).unwrap();
+        assert_eq!(decoded.core.tone(1), Some(&tone));
+        assert!(fits(&decoded.core, &[false, true], 48));
+        assert!(
+            !fits(&decoded.core, &[], 48),
+            "a generator on a slot without"
+        );
+        assert!(
+            !fits(&decoded.core, &[true, true], 48),
+            "none on a generator's slot"
+        );
+        assert!(!fits(&decoded.core, &[false, true], 480), "another ramp");
+        copy.core.slots[1].tone = Some(Tone::new(2, 48_000, 48));
+        assert!(!fits(&copy.core, &[false, true], 48), "another width");
+        copy.core.slots[1].tone = Some(Tone::new(1, 44_100, 48));
+        assert!(!fits(&copy.core, &[false, true], 48), "another rate");
+        copy.core.slots[1].tone = None;
+        let out_of_range = ToneParams {
+            frequency_hz: 19,
+            ..lineup
+        };
+        copy.core.pending.push(RtEntry {
+            id: 9,
+            at_index: 9600,
+            change: Change::Tone {
+                slot: 1,
+                params: out_of_range,
+            },
+        });
+        assert!(matches!(
+            CoreCopy::decode(&copy.encode()),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
     /// A core of another shape, or with an entry outside the engine,
     /// does not fit it.
     #[test]
     fn a_core_fits_only_its_own_shape() {
         let mut copy = copy();
-        assert!(copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 3, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 0, &[]));
-        // Strips of other legs, another ramp, or none on a narrow slot;
-        // a slot wider than a strip has none.
-        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 2], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 480, 8, &[]));
-        copy.core.slots[0].strip = None;
-        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
         assert!(
             copy.core
-                .fits(2, 2, 1, 1, &[MAX_LEGS + 1, 1], &[], &[], 48, 8, &[])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 48, 8, &[])
+        );
+        assert!(
+            !copy
+                .core
+                .fits(2, 3, 1, 1, &[1, 1], &[], &[], &[], 48, 8, &[])
+        );
+        assert!(
+            !copy
+                .core
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 48, 0, &[])
+        );
+        // Strips of other legs, another ramp, or none on a narrow slot;
+        // a slot wider than a strip has none.
+        assert!(
+            !copy
+                .core
+                .fits(2, 2, 1, 1, &[1, 2], &[], &[], &[], 48, 8, &[])
+        );
+        assert!(
+            !copy
+                .core
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 480, 8, &[])
+        );
+        copy.core.slots[0].strip = None;
+        assert!(
+            !copy
+                .core
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 48, 8, &[])
+        );
+        assert!(
+            copy.core
+                .fits(2, 2, 1, 1, &[MAX_LEGS + 1, 1], &[], &[], &[], 48, 8, &[])
         );
         copy.core.slots[0].strip = Some(Strip::new(1, 48));
         copy.core.pending.push(RtEntry {
@@ -1565,16 +1699,28 @@ mod tests {
             at_index: 9648,
             change: Change::InputDown { slot: 2 },
         });
-        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(
+            !copy
+                .core
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 48, 8, &[])
+        );
         copy.core.pending.pop();
         // Output 1 disabled: a core of two outputs, not of one.
         copy.core.outputs_disabled = 0b10;
-        assert!(copy.core.fits(2, 2, 2, 2, &[1, 1], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(
+            copy.core
+                .fits(2, 2, 2, 2, &[1, 1], &[], &[], &[], 48, 8, &[])
+        );
+        assert!(
+            !copy
+                .core
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 48, 8, &[])
+        );
         copy.core.outputs_disabled = 0;
         // A delay on slot 0 of 1 leg and a line of 100: its span reaches
         // from the floor to the core's position.
-        let fits = |c: &Core, delays: &[u32]| c.fits(2, 2, 1, 1, &[1, 1], &[], delays, 48, 8, &[]);
+        let fits =
+            |c: &Core, delays: &[u32]| c.fits(2, 2, 1, 1, &[1, 1], &[], delays, &[], 48, 8, &[]);
         let pos = copy.core.pos.unwrap();
         copy.core.slots[0].delay = Some(DelayCore {
             taps: Taps {
@@ -1618,8 +1764,15 @@ mod tests {
                 enabled: false,
             },
         });
-        assert!(copy.core.fits(2, 2, 2, 2, &[1, 1], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(
+            copy.core
+                .fits(2, 2, 2, 2, &[1, 1], &[], &[], &[], 48, 8, &[])
+        );
+        assert!(
+            !copy
+                .core
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 48, 8, &[])
+        );
     }
 
     /// A copy whose detector 2 is keyed by slot 1, forced on and
@@ -1663,26 +1816,30 @@ mod tests {
         assert!(
             decoded
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[0])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 48, 8, &[0])
         );
         // Its mask is on column 0: refused on an engine whose duck
         // columns leave it out, or that has none.
         assert!(
             !decoded
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[1])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 48, 8, &[1])
         );
-        assert!(!decoded.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
         assert!(
             !decoded
                 .core
-                .fits(2, 2, 1, 1, &[1, 2], &[], &[], 48, 8, &[0]),
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 48, 8, &[])
+        );
+        assert!(
+            !decoded
+                .core
+                .fits(2, 2, 1, 1, &[1, 2], &[], &[], &[], 48, 8, &[0]),
             "key 0 of another width"
         );
         assert!(
             !decoded
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], 480, 8, &[0]),
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], 480, 8, &[0]),
             "another key filter ramp"
         );
     }

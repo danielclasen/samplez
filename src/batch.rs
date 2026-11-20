@@ -1,6 +1,7 @@
 //! The engine entries of one log entry, folded into one change the RT
 //! thread applies at the log entry's index: per matrix coefficient, strip
-//! parameter, input slot, duck setting, depth, duck mask and meter's
+//! parameter, input slot, tone generator, duck setting, depth, duck mask
+//! and meter's
 //! loudness pause the last value the log entry sets, and each meter it
 //! resets once. A folded log entry holds at most one value of each, so
 //! the engine's shape bounds it, whatever the number of entries a command
@@ -10,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use samplez_dsp::strip::MAX_LEGS;
-use samplez_dsp::{LimiterParams, MAX_DUCKS, StripParam, valid_gain};
+use samplez_dsp::{LimiterParams, MAX_DUCKS, StripParam, ToneParams, valid_gain};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::{MAX_METERS, MAX_OUTPUTS};
@@ -176,6 +177,9 @@ pub(crate) struct Batch {
     pub limiters: Vec<(u32, LimiterParams)>,
     /// Delays by slot, in samples, ascending.
     pub delays: Vec<(u32, u32)>,
+    /// Tone parameters by slot, ascending; not encoded while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tones: Vec<(u32, ToneParams)>,
     /// The slots going down, ascending.
     pub downs: Vec<u32>,
     /// The outputs enabled (true) or disabled, ascending.
@@ -232,6 +236,8 @@ impl Batch {
             && self.limiters.windows(2).all(|w| w[0].0 < w[1].0)
             && (self.delays.iter()).all(|&(_, d)| d <= samplez_dsp::MAX_DELAY_SAMPLES)
             && self.delays.windows(2).all(|w| w[0].0 < w[1].0)
+            && self.tones.iter().all(|(_, p)| p.is_valid())
+            && self.tones.windows(2).all(|w| w[0].0 < w[1].0)
             && self.downs.windows(2).all(|w| w[0] < w[1])
             && self.outputs.windows(2).all(|w| w[0].0 < w[1].0)
             && self
@@ -258,8 +264,9 @@ impl Batch {
     /// matrix channels, `outputs` outputs, `meters` meters (the outputs
     /// and the configured meters), input slots of `legs` legs and
     /// the duck columns `ducked`: a mask other than 0 only on those.
-    /// Limiter parameters fit any output: one without a limiter refuses
-    /// them on the RT thread, as a slot without a strip does.
+    /// Limiter parameters fit any output and tone parameters any slot:
+    /// one without a limiter or generator refuses them on the RT thread,
+    /// as a slot without a strip does.
     pub fn fits(
         &self,
         inputs: usize,
@@ -280,6 +287,7 @@ impl Batch {
         gains
             && self.strips.iter().all(strip)
             && self.delays.iter().all(|&(s, _)| (s as usize) < legs.len())
+            && self.tones.iter().all(|&(s, _)| (s as usize) < legs.len())
             && self.downs.iter().all(|&s| (s as usize) < legs.len())
             && self.outputs.iter().all(|&(o, _)| (o as usize) < outputs)
             && self.limiters.iter().all(|&(o, _)| (o as usize) < outputs)
@@ -304,6 +312,15 @@ impl Batch {
         let mut ok = true;
         self.fades.each(|_, f| ok &= f.within(at));
         ok
+    }
+
+    /// Whether it sets strip, limiter, delay or tone parameters, which
+    /// stay with the RT thread's slots and outputs.
+    pub fn has_params(&self) -> bool {
+        !(self.strips.is_empty()
+            && self.limiters.is_empty()
+            && self.delays.is_empty()
+            && self.tones.is_empty())
     }
 
     /// Whether it sets anything of the matrix's ducks.
@@ -331,7 +348,8 @@ struct SlotFold {
 /// any duck setting, depth or mask, as a [`Change::Batch`] with its
 /// batch. Per coefficient, strip parameter key, duck setting kind, depth
 /// and mask last value counts, per output its last `Output` and
-/// last limiter parameters, per slot its last delay, per meter its last
+/// last limiter parameters, per slot its last delay and tone parameters,
+/// per meter its last
 /// `LoudnessRun`; each meter reset is kept once. Per
 /// input slot a `Route` and its up or
 /// down state are kept apart ([`SlotFold`]): an `InputUp` and a `Route`
@@ -355,6 +373,7 @@ pub(crate) fn fold(
     let mut outputs = BTreeMap::new();
     let mut limiters = BTreeMap::new();
     let mut delays = BTreeMap::new();
+    let mut tones = BTreeMap::new();
     let mut runs = BTreeMap::new();
     let mut resets = BTreeSet::new();
     for &item in items {
@@ -400,6 +419,9 @@ pub(crate) fn fold(
             Change::Delay { slot, samples } => {
                 delays.insert(slot as u32, samples);
             }
+            Change::Tone { slot, params } => {
+                tones.insert(slot as u32, params);
+            }
             Change::Route { slot } | Change::Detach { slot } => {
                 let s = slots.entry(slot).or_default();
                 s.routed = true;
@@ -440,6 +462,7 @@ pub(crate) fn fold(
         + strips.len()
         + limiters.len()
         + delays.len()
+        + tones.len()
         + downs.len()
         + outputs.len()
         + runs.len()
@@ -475,6 +498,11 @@ pub(crate) fn fold(
                 slot: slot as usize,
                 samples,
             }
+        } else if let Some((&slot, &params)) = tones.first_key_value() {
+            Change::Tone {
+                slot: slot as usize,
+                params,
+            }
         } else if let Some(&slot) = downs.first() {
             Change::InputDown {
                 slot: slot as usize,
@@ -508,6 +536,7 @@ pub(crate) fn fold(
         strips: strips.into_iter().map(|((s, _), p)| (s, p)).collect(),
         limiters: limiters.into_iter().collect(),
         delays: delays.into_iter().collect(),
+        tones: tones.into_iter().collect(),
         downs,
         outputs: outputs.into_iter().collect(),
         ducks: ducks.into_iter().map(|((g, _), c)| (g, c)).collect(),
@@ -519,7 +548,7 @@ pub(crate) fn fold(
         resets: resets.into_iter().collect(),
     };
     let change = Change::Batch {
-        strips: !batch.strips.is_empty() || !batch.limiters.is_empty() || !batch.delays.is_empty(),
+        strips: batch.has_params(),
         up,
         routed,
         detached,
@@ -757,6 +786,50 @@ mod tests {
         assert!(!bad.sane());
     }
 
+    /// A slot's tone parameters in one log entry: the last counts, a
+    /// lone one is itself, a batch holding them says it sets parameters,
+    /// and an empty list is not encoded, so a batch without them encodes
+    /// as one did before they existed. Fails with `tones` left out of
+    /// `has_params`.
+    #[test]
+    fn a_slots_last_tone_wins() {
+        let set = |slot, frequency_hz| Change::Tone {
+            slot,
+            params: ToneParams {
+                frequency_hz,
+                ..ToneParams::DEFAULT
+            },
+        };
+        let one = |changes: &[Change]| fold(&items(changes), 2, 4).unwrap().unwrap();
+        assert_eq!(one(&[set(1, 440), set(1, 997)]), (set(1, 997), None));
+        let (change, batch) = one(&[set(1, 440), set(0, 1000), set(1, 997)]);
+        assert!(
+            matches!(change, Change::Batch { strips: true, .. }),
+            "{change:?}"
+        );
+        let batch = batch.unwrap();
+        let params = |c: Change| match c {
+            Change::Tone { params, .. } => params,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            batch.tones,
+            [(0, params(set(0, 1000))), (1, params(set(1, 997)))]
+        );
+        assert!(batch.sane() && batch.fits(2, 2, 1, 1, &[1, 1], &[]));
+        assert!(!batch.fits(2, 2, 1, 1, &[1], &[]), "slot 1 of 1");
+        let mut bad = (*batch).clone();
+        bad.tones[0].1.frequency_hz = 19;
+        assert!(!bad.sane());
+        bad.tones = vec![batch.tones[1], batch.tones[0]];
+        assert!(!bad.sane());
+        let (_, gains) = one(&[gain(0, 0, 0.5), gain(1, 1, 0.5)]);
+        let encoded = serde_json::to_string(&*gains.unwrap()).unwrap();
+        assert!(!encoded.contains("tones"), "{encoded}");
+        let back: Batch = serde_json::from_str(&encoded).unwrap();
+        assert!(back.tones.is_empty());
+    }
+
     /// Of a slot's `Route`s and `Detach`es in one log entry the last
     /// counts: a `Detach` after a `Route` leaves the slot detached, a
     /// `Route` after a `Detach` re-routes it, and either is one change.
@@ -816,6 +889,7 @@ mod tests {
                     strips: Vec::new(),
                     limiters: Vec::new(),
                     delays: Vec::new(),
+                    tones: Vec::new(),
                     downs: Vec::new(),
                     outputs: Vec::new(),
                     ducks: Vec::new(),

@@ -19,7 +19,7 @@ use rtrb::{Consumer, Producer};
 use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{
     Delay, KWeighting, Limiter, LimiterParams, MAX_DUCKS, Matrix, PlanarBuffer, Ramp, Started,
-    Strip, StripParam, TruePeak, accumulate,
+    Strip, StripParam, Tone, ToneParams, TruePeak, accumulate,
 };
 use samplez_mxl::input::{Counters as InputCounters, Generation, GroupWait, Outcome, SlotState};
 use samplez_mxl::output::{FlowWriter, Write};
@@ -370,8 +370,8 @@ pub(crate) enum Telemetry {
     AwaitLost {
         entry: RtEntry,
     },
-    /// A strip entry the slot's strip refused, or for a slot without a
-    /// strip; not applied.
+    /// A strip, limiter, delay or tone entry its slot or output refused,
+    /// or one for a slot or output without what it sets; not applied.
     StripRefused {
         entry: RtEntry,
     },
@@ -517,6 +517,8 @@ pub(crate) enum Change {
     },
     /// Sets the slot's delay from the index, in samples.
     Delay { slot: usize, samples: u32 },
+    /// Sets the slot's tone generator from the index.
+    Tone { slot: usize, params: ToneParams },
     /// The output is written from the index on, once it has a writer, or
     /// disabled: nothing is written from the index on and its writer is
     /// handed back.
@@ -528,8 +530,9 @@ pub(crate) enum Change {
     /// The loudness measurement of `meter` restarts at the first 100 ms
     /// window starting at or after the index.
     ResetLoudness { meter: usize },
-    /// The engine entries of one log entry, folded: its gains, strip
-    /// and limiter parameters (`strips` says whether it has any),
+    /// The engine entries of one log entry, folded: its gains, strip,
+    /// limiter, delay and tone parameters (`strips` says whether it has
+    /// any),
     /// `InputDown`s, `Output`s, `LoudnessRun`s and loudness resets
     /// (`resets` says whether it has any) in
     /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
@@ -595,7 +598,10 @@ impl Change {
             | Change::InputDown { .. }
             | Change::Output { .. }
             | Change::LoudnessRun { .. } => true,
-            Change::Strip { .. } | Change::Limiter { .. } | Change::Delay { .. } => strips,
+            Change::Strip { .. }
+            | Change::Limiter { .. }
+            | Change::Delay { .. }
+            | Change::Tone { .. } => strips,
             Change::InputUp { .. }
             | Change::Route { .. }
             | Change::Detach { .. }
@@ -717,6 +723,9 @@ pub(crate) struct Slot {
     /// The slot's delay line, run after the strip; none on a slot
     /// configured without one.
     pub delay: Option<Delay>,
+    /// The slot's tone generator, which it computes in place of a read;
+    /// none on a slot that reads flows.
+    pub tone: Option<Tone>,
     /// The flow the slot reads from [`Rt::test_input`]: the re-routes
     /// swapped in so far. Its outgoing flow in a crossfade is the one
     /// before.
@@ -754,8 +763,25 @@ impl Slot {
             strip: (channels <= MAX_LEGS).then(|| Strip::new(channels, ramp)),
             strip_pos: None,
             delay: None,
+            tone: None,
             #[cfg(test)]
             flow: 0,
+        }
+    }
+
+    /// Runs the strip and the delay over block `dst` of `frames` samples
+    /// per channel starting at sample index `start`, read, generated or
+    /// silenced, and copies it into the slot's channels of `inbuf`.
+    fn finish(&mut self, start: u64, dst: &mut [f32], frames: usize, inbuf: &mut PlanarBuffer) {
+        // Silenced blocks too: the strip's filters and dynamics ring out
+        // on silence.
+        self.run_strip(start, dst, frames);
+        // Silenced blocks too: the delay plays what came before.
+        if let Some(d) = &mut self.delay {
+            d.process(start, dst, frames);
+        }
+        for (c, ch) in dst.chunks_exact(frames).enumerate() {
+            inbuf.channel_mut(self.first_channel + c)[..frames].copy_from_slice(ch);
         }
     }
 
@@ -2027,6 +2053,7 @@ fn capture_core(
         // A strip holds no heap memory: the copy allocates nothing.
         d.strip.clone_from(&s.strip);
         d.strip_pos = s.strip_pos;
+        d.tone = s.tone;
         // The delay's state; its rings are copied off the RT thread, into
         // a span the buffer brought or that is allocated there.
         match (&mut d.delay, &s.delay) {
@@ -2503,7 +2530,10 @@ impl Rt {
             // core brought, or on its pending list, applied here at its
             // index; taken through that core.
             match &mut entry.change {
-                Change::Strip { .. } | Change::Limiter { .. } | Change::Delay { .. } => {
+                Change::Strip { .. }
+                | Change::Limiter { .. }
+                | Change::Delay { .. }
+                | Change::Tone { .. } => {
                     self.mix.last_taken = self.mix.last_taken.max(entry.id);
                     return;
                 }
@@ -2760,6 +2790,7 @@ impl Rt {
                 Change::Strip { slot, param } => self.set_strip(e, slot, param),
                 Change::Limiter { output, params } => self.set_limiter(e, output, params),
                 Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
+                Change::Tone { slot, params } => self.set_tone(e, slot, params),
                 Change::ResetLoudness { .. } => self.reset_meters(&e, None),
                 Change::Batch { strips, .. } => {
                     let b = self.mix.take_batch(e.id);
@@ -2917,7 +2948,23 @@ impl Rt {
         }
     }
 
-    /// Sets strip, limiter and delay parameters of batch `b`, entry `e`.
+    /// Sets the tone generator of slot `slot` from the index of entry
+    /// `e`, which carries it; a refusal, or a slot without one, is
+    /// counted and reported as a strip's.
+    fn set_tone(&mut self, e: RtEntry, slot: usize, params: ToneParams) {
+        let set = (self.slots[slot].tone.as_mut()).is_some_and(|t| t.set(e.at_index, params));
+        if !set {
+            add(&self.counters.strip_refused, 1);
+            let entry = RtEntry {
+                change: Change::Tone { slot, params },
+                ..e
+            };
+            self.send(Telemetry::StripRefused { entry });
+        }
+    }
+
+    /// Sets strip, limiter, delay and tone parameters of batch `b`, entry
+    /// `e`.
     fn set_params(&mut self, e: RtEntry, b: &Batch) {
         for &(slot, param) in &b.strips {
             self.set_strip(e, slot as usize, param);
@@ -2927,6 +2974,9 @@ impl Rt {
         }
         for &(slot, samples) in &b.delays {
             self.set_delay(e, slot as usize, samples);
+        }
+        for &(slot, params) in &b.tones {
+            self.set_tone(e, slot as usize, params);
         }
     }
 
@@ -3033,6 +3083,7 @@ impl Rt {
             Change::Strip { slot, param } => self.set_strip(e, slot, param),
             Change::Limiter { output, params } => self.set_limiter(e, output, params),
             Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
+            Change::Tone { slot, params } => self.set_tone(e, slot, params),
             Change::Output { output, enabled } => self.set_output(output, enabled),
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => {
                 self.apply_generation(e)
@@ -3233,7 +3284,15 @@ impl Rt {
                 down |= 1 << i;
             }
             let dst = &mut self.scratch[..slot.channels * b];
-            let generation = self.gens[slot.domain].as_deref();
+            // A tone generator reads nothing: its samples are a function
+            // of the index, never late, silenced or failed.
+            if let Some(tone) = &mut slot.tone {
+                tone.process(start, dst, b);
+                slot.finish(start, dst, b, &mut self.inbuf);
+                continue;
+            }
+            // None for a slot in no input domain.
+            let generation = self.gens.get(slot.domain).and_then(|g| g.as_deref());
             let readable = slot.up && !slot.held;
             // A crossfade runs over the ramp from its index; a block below
             // it follows a backward clock step.
@@ -3381,16 +3440,7 @@ impl Rt {
                 }
                 slot.silenced_last = true;
             }
-            // Silenced blocks too: the strip's filters and dynamics ring
-            // out on silence.
-            slot.run_strip(start, dst, b);
-            // Silenced blocks too: the delay plays what came before.
-            if let Some(d) = &mut slot.delay {
-                d.process(start, dst, b);
-            }
-            for (c, ch) in dst.chunks_exact(b).enumerate() {
-                self.inbuf.channel_mut(slot.first_channel + c)[..b].copy_from_slice(ch);
-            }
+            slot.finish(start, dst, b, &mut self.inbuf);
         }
 
         // Which meters a slot down feeds, on the coefficients' targets the
@@ -3721,6 +3771,12 @@ impl Rt {
                 // allocates nothing.
                 d.strip.clone_from(&s.strip);
                 d.strip_pos = s.strip_pos;
+                // A slot keeps its generator, or its lack of one, for
+                // good: a tone generator's slot has no input domain to
+                // read from.
+                if let (Some(t), Some(c)) = (&mut d.tone, &s.tone) {
+                    *t = *c;
+                }
                 // The rings of the set it names hold the history: filled
                 // before the install.
                 if let (Some(l), Some(c)) = (&mut d.delay, &s.delay) {
@@ -3818,8 +3874,8 @@ impl Rt {
         let counter = match h.answer {
             Answer::Installed => {
                 self.install_core(&mut h.core, h.last_id, h.replayed);
-                // A product state's strip and limiter parameters, from the
-                // install on.
+                // A product state's strip, limiter and delay parameters,
+                // from the install on.
                 let e = RtEntry {
                     id: h.last_id,
                     at_index: first * self.block,
@@ -3842,6 +3898,15 @@ impl Rt {
                 for n in 0..h.delays.len() {
                     let (slot, samples) = h.delays[n];
                     self.set_delay(e, slot, samples);
+                }
+                // A product state's tone ramps replace the generators',
+                // checked off the RT thread.
+                for n in 0..h.tones.len() {
+                    let (slot, ramps) = h.tones[n];
+                    let resumed = (self.slots[slot].tone.as_mut()).is_some_and(|t| t.resume(ramps));
+                    if !resumed {
+                        add(&self.counters.strip_refused, 1);
+                    }
                 }
                 // The page holding the boundary mixes both states: no
                 // record.
@@ -3867,8 +3932,8 @@ impl Rt {
     fn publish_stats(&mut self, now: u64) {
         for i in 0..self.slots.len() {
             let slot = &self.slots[i];
-            let head = self.gens[slot.domain]
-                .as_deref()
+            let head = (self.gens.get(slot.domain))
+                .and_then(|g| g.as_deref())
                 .and_then(|g| g.mxl.input(i))
                 .and_then(|input| input.reader().head().ok());
             let stats = SlotStats {
@@ -4650,6 +4715,7 @@ mod tests {
             strip: None,
             strip_pos: None,
             delay: None,
+            tone: None,
         }
     }
 
@@ -4680,6 +4746,14 @@ mod tests {
         slots[0].strip = Some(strip.clone());
         slots[0].strip_pos = Some(20 * B);
         slots[1].detached = true;
+        // A tone generator mid-crossfade, its level ramping.
+        let mut tone = Tone::new(1, 48_000, 480);
+        let lineup = ToneParams {
+            frequency_hz: 997,
+            ..ToneParams::DEFAULT
+        };
+        assert!(tone.set(19 * B, lineup));
+        slots[1].tone = Some(tone);
         let awaiting = [entry(Change::InputUp { slot: 0 }, 19 * B)];
         // Detector 5 keyed by slot 1, mid-envelope after a burst.
         let keys = crate::ducks::KeySet::of(&[(1, 2.0)]).unwrap();
@@ -4744,6 +4818,7 @@ mod tests {
                     strip: Some(strip),
                     strip_pos: Some(20 * B),
                     delay: None,
+                    tone: None,
                 },
                 SlotCore {
                     up: false,
@@ -4755,6 +4830,7 @@ mod tests {
                     strip: None,
                     strip_pos: None,
                     delay: None,
+                    tone: Some(tone),
                 },
             ],
             limiters: vec![None, Some(limiter), None],

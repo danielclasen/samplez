@@ -9,7 +9,7 @@ use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
     BandType, CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams,
     KWeighting, KeyFilter, Loudness, MAX_DUCKS, Matrix, Meters, Path, PlanarBuffer, Ramp, Slice,
-    Strip, StripParam, TruePeak, duck_gain, restore_mxcsr, set_ftz_daz,
+    Strip, StripParam, Tone, ToneParams, TruePeak, duck_gain, restore_mxcsr, set_ftz_daz,
 };
 
 #[path = "../src/require.rs"]
@@ -95,6 +95,8 @@ fn process_calls_do_not_allocate() {
     let mut strip_buf = vec![0.0f32; 8 * cap];
     let mut detector = Detector::new(480);
     let mut envelope = vec![0.0f32; cap];
+    let mut tone = Tone::new(8, 48_000, 480);
+    let mut tone_at = 0u64;
 
     let before = allocations();
     let saved = set_ftz_daz(true);
@@ -243,6 +245,27 @@ fn process_calls_do_not_allocate() {
         detector.align(round as u64 * 1000);
         let copy = detector;
         assert!(copy == detector);
+        // The generator through a level, frequency and ident change, one
+        // refused, and a copy.
+        assert!(tone.set(
+            tone_at,
+            ToneParams {
+                frequency_hz: 997 + round as u32,
+                level_db: -6.0 * round as f32,
+                ident: on,
+            }
+        ));
+        assert!(!tone.set(
+            tone_at,
+            ToneParams {
+                level_db: f32::NAN,
+                ..ToneParams::DEFAULT
+            }
+        ));
+        tone.process(tone_at, &mut strip_buf[..8 * frames], frames);
+        tone_at += 12_000;
+        let copy = tone;
+        assert!(copy == tone);
     }
     restore_mxcsr(saved);
     let during = allocations() - before;

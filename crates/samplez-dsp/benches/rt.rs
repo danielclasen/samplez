@@ -7,8 +7,9 @@
 //! one path, metered as the RT loop runs them, and idle as an engine with
 //! no duck group in use runs them; so does the gap decision of the
 //! meters of 48 stereo outputs with half the inputs down, and so do limiters on 96 output
-//! channels as 48 stereo outputs, limiting and off, and 64 mono input
-//! delays, settled and crossfading. It also gates the RT parts of a resync
+//! channels as 48 stereo outputs, limiting and off, 64 mono input
+//! delays, settled and crossfading, and a tone generator of eight legs,
+//! settled, crossfading and in an ident cut's edge. It also gates the RT parts of a resync
 //! at that shape: the matrix and detector copies of the core and one
 //! block's history stores. The hard limits are the
 //! instruction counts measured in the builder image plus 10 %, rounded
@@ -23,7 +24,7 @@ use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
     CompParams, Delay, DelayRings, Detector, DetectorParams, DuckMode, DuckParam, EqBand,
     GateParams, History, KWeighting, KeyFilter, Limiter, LimiterParams, MAX_DUCKS, Matrix, Path,
-    PlanarBuffer, Started, Strip, StripParam, TruePeak, accumulate,
+    PlanarBuffer, Started, Strip, StripParam, Tone, ToneParams, TruePeak, accumulate,
 };
 
 const B: usize = 48;
@@ -368,6 +369,42 @@ fn delay((mut delays, mut buf): (Vec<Delay>, PlanarBuffer)) -> (Vec<Delay>, Plan
     (delays, buf)
 }
 
+/// The tone generator's block: the last 48 samples of ident window 9001
+/// of 12000 samples, in which leg 1 is cut while leg 2 fades out before
+/// its own cut.
+const TONE_AT: u64 = 9001 * 12_000 + 11_952;
+
+/// A generator of eight legs at 48 kHz, 997 Hz at -18 dBFS: settled
+/// (case 0); crossfading to 440 Hz with its level ramping to -6 dBFS
+/// (case 1); with the ident on, in a cut's fading edge (case 2).
+fn tones(case: u8) -> (Tone, Vec<f32>) {
+    let mut t = Tone::new(8, 48_000, 480);
+    let p = ToneParams {
+        frequency_hz: 997,
+        level_db: -18.0,
+        ident: case == 2,
+    };
+    assert!(t.set(0, p));
+    if case == 1 {
+        let moved = ToneParams {
+            frequency_hz: 440,
+            level_db: -6.0,
+            ..p
+        };
+        assert!(t.set(TONE_AT - 96, moved));
+    }
+    (t, vec![0.0; 8 * B])
+}
+
+#[library_benchmark]
+#[bench::settled(args = (0,), setup = tones, config = limit(TONE_SETTLED))]
+#[bench::crossfading(args = (1,), setup = tones, config = limit(TONE_CROSSFADING))]
+#[bench::ident(args = (2,), setup = tones, config = limit(TONE_IDENT))]
+fn tone((mut t, mut buf): (Tone, Vec<f32>)) -> (Tone, Vec<f32>) {
+    t.process(black_box(TONE_AT), &mut buf, B);
+    (t, buf)
+}
+
 /// Eight detectors, each keyed by eight of the 64 mono inputs through
 /// both key filters, the low-pass ramping on, the signal around the
 /// threshold.
@@ -557,6 +594,9 @@ const LIMITERS_OFF: u64 = 171_994;
 const DELAYS_SETTLED: u64 = 372_606;
 const DELAYS_FADING: u64 = 473_348;
 const DUCK_ADVANCE: u64 = 4_065;
+const TONE_SETTLED: u64 = 11_072;
+const TONE_CROSSFADING: u64 = 16_847;
+const TONE_IDENT: u64 = 29_499;
 
 library_benchmark_group!(
     name = block,
@@ -570,6 +610,7 @@ library_benchmark_group!(
         strip,
         limiter,
         delay,
+        tone,
         duck,
         duck_metered,
         duck_idle,

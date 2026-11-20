@@ -340,6 +340,13 @@ pub struct StateMachine<P> {
     /// aligned as the bridge applies it. A function of the log, carried
     /// by snapshots; finished ramps are pruned below the floor.
     ramps: Vec<Vec<Option<samplez::Fade>>>,
+    /// Per input slot the ramps the derived tone entries leave its
+    /// generator on, as the engine renders them: each entry's parameters
+    /// as the bridge admits them, set at the block-aligned index the
+    /// bridge applies it at, over `ramp_samples`. A function of the log,
+    /// carried by snapshots; none for a slot no tone entry was derived
+    /// for.
+    tone_ramps: Vec<Option<samplez_dsp::ToneRamps>>,
     /// The duck masks of the state the replica opened or installed a
     /// snapshot at, which its engine is rebuilt from, and every one
     /// derived since, ORed together: the coefficients an engine may hold
@@ -411,6 +418,7 @@ impl<P: Product> StateMachine<P> {
             protocol: 0,
             image: None,
             ramps: Vec::new(),
+            tone_ramps: Vec::new(),
             masked: None,
             silenced: 0,
             records: BTreeMap::new(),
@@ -429,6 +437,16 @@ impl<P: Product> StateMachine<P> {
         // The index the bridge applies the entries at.
         let at = at.next_multiple_of(self.limits.block);
         for e in entries {
+            if let samplez::Entry::Tone {
+                slot,
+                frequency_hz,
+                level_db,
+                ident,
+            } = *e
+            {
+                self.follow_tone(slot, frequency_hz, level_db, ident, at);
+                continue;
+            }
             let samplez::Entry::Gain {
                 input,
                 output,
@@ -464,6 +482,34 @@ impl<P: Product> StateMachine<P> {
                 }
             };
         }
+    }
+
+    /// Follows the ramps a tone entry for `slot`, applied at `at`, puts
+    /// its generator on. The parameters are taken as the bridge admits
+    /// them for a generator ([`samplez_dsp::ToneParams::admitted`]):
+    /// clamped into their ranges, the default where a value is not
+    /// finite.
+    fn follow_tone(&mut self, slot: usize, frequency_hz: u32, level_db: f32, ident: bool, at: u64) {
+        let p = samplez_dsp::ToneParams {
+            frequency_hz,
+            level_db,
+            ident,
+        }
+        .admitted();
+        if self.tone_ramps.len() <= slot {
+            self.tone_ramps.resize(slot + 1, None);
+        }
+        let ramps = self.tone_ramps[slot].get_or_insert_with(Default::default);
+        ramps.set(at, p, self.limits.ramp_samples);
+    }
+
+    /// The tone ramps a product state carries: those the derived entries
+    /// left, empty where there are none.
+    fn tone_ramps_of(&self) -> Vec<Option<samplez_dsp::ToneRamps>> {
+        if self.tone_ramps.iter().all(Option::is_none) {
+            return Vec::new();
+        }
+        self.tone_ramps.clone()
     }
 
     /// ORs the duck masks of `targets` into [`StateMachine::masked`].
@@ -1061,6 +1107,7 @@ impl<P: Product> StateMachine<P> {
             }
         }
         let fading = self.fading_of(&targets);
+        let tone_ramps = self.tone_ramps_of();
         samplez::ProductState {
             limiters: targets.limiters,
             fading,
@@ -1071,6 +1118,8 @@ impl<P: Product> StateMachine<P> {
             loudness_running: targets.loudness_running,
             strips: targets.strips,
             delays: targets.delays,
+            tones: targets.tones,
+            tone_ramps,
             ducks: targets.ducks,
             masks: targets.masks,
             pending: Vec::new(),
@@ -1110,6 +1159,9 @@ impl<P: Product> StateMachine<P> {
                         .map(|f| f.map(|f| (f.from.to_bits(), f.start, f.len)))
                         .collect()
                 })
+                .collect(),
+            tone_ramps: (self.tone_ramps.iter())
+                .map(|r| r.map(Into::into))
                 .collect(),
         }
     }
@@ -1153,6 +1205,11 @@ impl<P: Product> StateMachine<P> {
         self.derived = saved.derived;
         self.resets = saved.resets;
         self.protocol = saved.protocol;
+        // Ramps no generator holds are left out, as an install would
+        // refuse them.
+        self.tone_ramps = (saved.tone_ramps.iter())
+            .map(|r| r.map(samplez_dsp::ToneRamps::from).filter(|r| r.is_valid()))
+            .collect();
         self.ramps = (saved.ramps.iter())
             .map(|row| {
                 (row.iter())
@@ -2062,6 +2119,9 @@ mod derive_tests {
         /// Per meter, its loudness reset epoch.
         #[serde(default)]
         resets: [u32; 2],
+        /// Slot 0's tone parameters, once a command set them.
+        #[serde(default)]
+        tone: Option<(u32, f32, bool)>,
     }
 
     impl Desk {
@@ -2075,6 +2135,7 @@ mod derive_tests {
                 ducked: false,
                 paused: [false; 2],
                 resets: [0; 2],
+                tone: None,
             }
         }
     }
@@ -2097,6 +2158,9 @@ mod derive_tests {
                 ["reset", meter] => {
                     let epoch = &mut self.resets[meter.parse::<usize>().unwrap()];
                     *epoch = epoch.wrapping_add(1);
+                }
+                ["tone", hz, db, ident] => {
+                    self.tone = Some((hz.parse().unwrap(), db.parse().unwrap(), ident == "1"))
                 }
                 ["trim", slot, db] => {
                     self.trims[slot.parse::<usize>().unwrap()] = db.parse().unwrap()
@@ -2164,6 +2228,16 @@ mod derive_tests {
                     Vec::new()
                 },
                 loudness_resets: self.resets.to_vec(),
+                // Listed only once set.
+                tones: (self.tone.iter())
+                    .map(|&(frequency_hz, level_db, ident)| {
+                        Some(samplez_dsp::ToneParams {
+                            frequency_hz,
+                            level_db,
+                            ident,
+                        })
+                    })
+                    .collect(),
                 ..Targets::default()
             })
         }
@@ -2348,6 +2422,63 @@ mod derive_tests {
         };
         assert_ne!(second.from.to_bits(), 0.5f32.to_bits());
         assert_eq!(sm.product_state(2).fading[0][0], Some(second));
+    }
+
+    /// The product state carries the ramps the derived tone entries leave
+    /// slot 0's generator on, as a generator that took the same entries at
+    /// the block-aligned indices the bridge applies them at holds them: a
+    /// change inside the frequency crossfade waiting, and parameters out
+    /// of range taken as the bridge admits them, a level of +6 dBFS and a
+    /// frequency of 5 Hz clamped to 0 dBFS and 20 Hz, a NaN level the
+    /// default. A snapshot carries them, and one written before they were
+    /// kept loads with none. Fails with `.admitted()` dropped from
+    /// `follow_tone`, or with `tone_ramps: Vec::new()` in `save`.
+    #[test]
+    fn the_product_state_carries_the_tone_ramps() {
+        let mut sm = machine();
+        assert!(sm.product_state(0).tone_ramps.is_empty());
+        let limits = Limits::defaults(48_000);
+        let p = |frequency_hz, level_db, ident| samplez_dsp::ToneParams {
+            frequency_hz,
+            level_db,
+            ident,
+        };
+        // (command, index, what the bridge applies)
+        let log = [
+            ("tone 440 -6 0", 970, p(440, -6.0, false)),
+            ("tone 1000 -12 1", 1010, p(1000, -12.0, true)),
+            ("tone 5 6 1", 1700, p(20, 0.0, true)),
+            ("tone 440 NaN 0", 2500, samplez_dsp::ToneParams::DEFAULT),
+            // Finite again, so the product saves and loads.
+            ("tone 997 -3 1", 4000, p(997, -3.0, true)),
+        ];
+        let mut want = samplez_dsp::ToneRamps::default();
+        for (n, &(body, at, applied)) in log.iter().enumerate() {
+            let id = (n + 1).to_string();
+            sm.apply_at(n as u64 + 1, 1, &one(&id, body, 48 * n as u64, at, None));
+            let at = u64::next_multiple_of(at, limits.block);
+            assert!(want.set(at, applied, limits.ramp_samples));
+            if n == 2 {
+                // At 1728 the crossfade to 1 kHz runs from 1488, the end
+                // of the one to 440 Hz it waited for, and 20 Hz waits
+                // behind it.
+                let f = want.frequency;
+                assert_eq!((f.from, f.to, f.start, f.next), (440, 1000, 1488, Some(20)));
+            }
+            let state = sm.product_state(n as u64 + 1);
+            assert_eq!(state.tone_ramps, vec![Some(want)], "after {body}");
+        }
+        let state = sm.product_state(5);
+        assert_eq!(state.tones, vec![Some(p(997, -3.0, true))]);
+        let mut loaded = machine();
+        loaded.load(sm.save(), limits).expect("loads");
+        assert_eq!(loaded.product_state(5).tone_ramps, vec![Some(want)]);
+        let legacy = Replicated {
+            tone_ramps: Vec::new(),
+            ..sm.save()
+        };
+        loaded.load(legacy, limits).expect("loads");
+        assert!(loaded.product_state(5).tone_ramps.is_empty());
     }
 
     /// With any ramp running, `fading` has the shape of `gains`, which an

@@ -4,6 +4,7 @@
 
 use samplez_dsp::{
     CompParams, DetectorParams, EqBand, GateParams, KeyFilter, LimiterParams, StripParam,
+    ToneParams,
 };
 
 use crate::batch::strip_key;
@@ -35,6 +36,10 @@ pub struct Targets {
     /// Per input slot, its delay in samples; a slot past the list keeps
     /// the delay the engine holds.
     pub delays: Vec<u32>,
+    /// Per input slot, its tone parameters, for a slot configured with
+    /// `tone`; none, or a slot past the list, leaves the generator as the
+    /// engine holds it.
+    pub tones: Vec<Option<ToneParams>>,
     /// Per duck group, its settings.
     pub ducks: Vec<DuckTargets>,
     /// The duck mask of each coefficient, shaped as `gains`.
@@ -71,7 +76,8 @@ impl Targets {
     /// `Strip` for each parameter that differs in any field's bit
     /// pattern, by slot and parameter; a `Limiter` output's
     /// parameters differ in any field's bit pattern; a `Delay` slot whose
-    /// delay differs; a `Duck` setting
+    /// delay differs; a `Tone` for each slot whose tone parameters differ
+    /// in any field's bit pattern; a `Duck` setting
     /// group that differs in any field's bit pattern, by group, its
     /// parameters, keys, mode and hold, then its depths by slot; a
     /// `DuckMask` for each coefficient whose mask differs, row by row, a
@@ -128,6 +134,19 @@ impl Targets {
                 entries.push(Entry::Delay { slot, samples });
             }
         }
+        for (slot, params) in next.tones.iter().enumerate() {
+            let held = self.tones.get(slot).copied().flatten();
+            if let Some(p) = *params
+                && held.is_none_or(|h| !h.same(&p))
+            {
+                entries.push(Entry::Tone {
+                    slot,
+                    frequency_hz: p.frequency_hz,
+                    level_db: p.level_db,
+                    ident: p.ident,
+                });
+            }
+        }
         duck_entries(self, next, &mut entries);
         for (slot, flow) in next.flows.iter().enumerate() {
             if self.flows.get(slot) != Some(flow) {
@@ -157,8 +176,8 @@ impl Targets {
         entries
     }
 
-    /// The entries that set every gain, strip and limiter parameter and
-    /// duck setting of `self`, whatever an engine holds, in the order of
+    /// The entries that set every gain, strip, limiter and tone parameter
+    /// and duck setting of `self`, whatever an engine holds, in the order of
     /// [`Targets::diff`], a `Route`, or a `Detach` for a slot without a
     /// flow, for each of `slots` in ascending order, an `Output` for
     /// each output `self` holds and a `LoudnessRun` for each meter it
@@ -1017,6 +1036,53 @@ mod tests {
         assert_eq!(
             all.iter()
                 .filter(|e| matches!(e, Entry::Limiter { .. }))
+                .count(),
+            3
+        );
+    }
+
+    /// A tone generator's parameters get an entry when they differ in any
+    /// field's bits, none when equal or not given, and every given one
+    /// from `assert`. Fails with the tones left out of `diff`.
+    #[test]
+    fn tone_parameters_differ_by_bits() {
+        let p = |frequency_hz, level_db, ident| ToneParams {
+            frequency_hz,
+            level_db,
+            ident,
+        };
+        let was = Targets {
+            tones: vec![
+                Some(p(1000, -18.0, false)),
+                None,
+                Some(p(1000, -0.0, false)),
+            ],
+            ..Targets::default()
+        };
+        let next = Targets {
+            tones: vec![
+                Some(p(1000, -18.0, false)),
+                Some(p(997, -18.0, true)),
+                Some(p(1000, 0.0, false)),
+            ],
+            ..Targets::default()
+        };
+        let tone = |slot, t: ToneParams| Entry::Tone {
+            slot,
+            frequency_hz: t.frequency_hz,
+            level_db: t.level_db,
+            ident: t.ident,
+        };
+        assert_eq!(
+            was.diff(&next),
+            [tone(1, p(997, -18.0, true)), tone(2, p(1000, 0.0, false))]
+        );
+        assert_eq!(next.diff(&was).len(), 1, "slot 1 none keeps the engine's");
+        assert!(was.diff(&was).is_empty());
+        let all = next.assert(&[], None);
+        assert_eq!(
+            all.iter()
+                .filter(|e| matches!(e, Entry::Tone { .. }))
                 .count(),
             3
         );

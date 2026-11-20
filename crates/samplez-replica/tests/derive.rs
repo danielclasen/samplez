@@ -11,7 +11,7 @@ use harness::{BLOCK, Options, Set, owner};
 use samplez::Targets;
 use samplez_replica::contact::{Timing, index_at};
 use samplez_replica::dedup::Limits;
-use samplez_replica::entry::{Body, Command, NodeId, Origin, Request, SessionKey};
+use samplez_replica::entry::{Body, Command, NodeId, Origin, PROTOCOL, Request, SessionKey};
 use samplez_replica::membership::{Slot, node_id};
 use samplez_replica::peer::{Forwarded, PeerRequest, PeerResponse, Refused};
 use samplez_replica::state::ReplicaState;
@@ -173,7 +173,7 @@ async fn a_rerouting_command_is_ordered_alone_in_submission_order() {
     assert_eq!(flags, [flagged, flagged].concat());
     let log = entries(&set, leader);
     let markers: Vec<usize> = (log.iter().enumerate())
-        .filter(|(_, b)| matches!(b, Body::Protocol(2)))
+        .filter(|(_, b)| matches!(b, Body::Protocol(PROTOCOL)))
         .map(|(n, _)| n)
         .collect();
     let first = log

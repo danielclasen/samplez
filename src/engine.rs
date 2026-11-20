@@ -20,7 +20,7 @@ use samplez_dsp::duck::{DEPTH_DB, MAX_KEYS};
 use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{
     Delay, DelayRings, DuckParam, Limiter, LimiterParams, MAX_DUCKS, Matrix, PlanarBuffer, Started,
-    StripParam,
+    StripParam, Tone, ToneParams, ToneRamps,
 };
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, RECOVERY_NS, Recovery,
@@ -85,6 +85,9 @@ pub enum InputState {
     /// Detached by a `Detach` entry: reads no flow, is not polled and
     /// not reported until a `Route` attaches it again.
     Detached,
+    /// A tone generator: reads no flow, is not polled, never late, pruned
+    /// or down.
+    Tone,
 }
 
 #[derive(Clone, Debug)]
@@ -374,6 +377,20 @@ pub enum Entry {
     /// a crossfade still running. At most the slot's `maxDelaySamples`;
     /// 0 on a slot without a delay line sets nothing.
     Delay { slot: usize, samples: u32 },
+    /// Sets the tone generator of input slot `slot`, one configured with
+    /// `tone`, from the entry's index: `frequency_hz` within
+    /// [`samplez_dsp::TONE_FREQUENCY_HZ`], crossfading from the sine
+    /// before over the ramp length, or after a crossfade still running;
+    /// `level_db`, the sample peak in dBFS within
+    /// [`samplez_dsp::TONE_LEVEL_DB`], ramping over the ramp length; and
+    /// `ident`, which cuts the legs in turn, switched on or off over the
+    /// ramp length ([`samplez_dsp::tone`]).
+    Tone {
+        slot: usize,
+        frequency_hz: u32,
+        level_db: f32,
+        ident: bool,
+    },
     /// Sets `setting` of duck group `group`, below [`MAX_DUCKS`], from the
     /// entry's index.
     Duck { group: usize, setting: DuckSetting },
@@ -761,6 +778,17 @@ fn check_delay(config: &Config, slot: usize, samples: u32) -> Result<(), String>
     Ok(())
 }
 
+/// Whether input slot `slot` is a tone generator that takes `params`.
+fn check_tone(config: &Config, slot: usize, params: &ToneParams) -> Result<(), String> {
+    let Some(input) = config.inputs.get(slot) else {
+        return Err(format!("no input slot {slot}"));
+    };
+    if input.tone.is_none() {
+        return Err(format!("input slot {slot} is no tone generator"));
+    }
+    params.check()
+}
+
 /// Whether input slot `slot` exists and has a strip that takes `param`:
 /// one of 1 to [`MAX_LEGS`] channels.
 fn check_strip(config: &Config, slot: usize, param: &StripParam) -> Result<(), String> {
@@ -967,8 +995,6 @@ fn history_kept(started: &Started, k0: u64, slack: u64) -> Result<(), u64> {
     started.confirms(k0 + 1, slack)
 }
 
-/// The input slots of `config`'s shape, every one up, and the index in
-/// `config.domains` of each input domain they use.
 /// The committed entries a replicated engine keeps waiting for room in
 /// its entry ring at most ([`Engine::commit`]).
 pub const WAITING: usize = 4 * PENDING_CHANGES;
@@ -977,16 +1003,27 @@ pub const WAITING: usize = 4 * PENDING_CHANGES;
 /// room for one page's entries and outputs.
 type Shape = (usize, usize, usize, usize, usize);
 
+/// The input domain of a tone generator's slot: none.
+pub(crate) const NO_DOMAIN: usize = usize::MAX;
+
+/// The input slots of `config`'s shape, every one up, and the index in
+/// `config.domains` of each input domain they use; a tone generator's
+/// slot is in none.
 fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
     let mut in_domains: Vec<usize> = Vec::new();
     let mut slots = Vec::new();
     let mut channel = 0;
     for i in &config.inputs {
-        let d = config.domain(&i.domain).expect("validated");
-        let domain = in_domains.iter().position(|&x| x == d).unwrap_or_else(|| {
-            in_domains.push(d);
-            in_domains.len() - 1
-        });
+        let domain = match i.domain.as_deref().filter(|_| i.tone.is_none()) {
+            None => NO_DOMAIN,
+            Some(name) => {
+                let d = config.domain(name).expect("validated");
+                in_domains.iter().position(|&x| x == d).unwrap_or_else(|| {
+                    in_domains.push(d);
+                    in_domains.len() - 1
+                })
+            }
+        };
         let mut slot = Slot::new(
             domain,
             channel,
@@ -994,8 +1031,16 @@ fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
             i.offset_samples,
             config.ramp_samples,
         );
-        // Without a flow it starts as a `Detach` leaves it.
+        // Without a flow it starts as a `Detach` leaves it; a tone
+        // generator reads none for good.
         slot.detached = i.flow_id.is_none();
+        if i.tone.is_some() {
+            slot.tone = Some(Tone::new(
+                i.channels as usize,
+                config.sample_rate,
+                config.ramp_samples,
+            ));
+        }
         if i.max_delay_samples > 0 {
             let rings = DelayRings::new(
                 i.channels as usize,
@@ -1549,7 +1594,9 @@ impl Engine {
                 .iter()
                 .map(|i| InputStatus {
                     name: i.name.clone(),
-                    state: if i.flow_id.is_some() {
+                    state: if i.tone.is_some() {
+                        InputState::Tone
+                    } else if i.flow_id.is_some() {
                         InputState::Pruned
                     } else {
                         InputState::Detached
@@ -1877,6 +1924,22 @@ impl Engine {
         self.set_local(Change::Delay { slot, samples }, at_index, "delay changes")
     }
 
+    /// Sets the tone generator of input slot `slot` to `params` from
+    /// sample index `at_index`, a multiple of the block size, as
+    /// [`Entry::Tone`] does. Refused as [`Engine::set_gain`] refuses a
+    /// change, and as invalid for a slot that does not exist or is no
+    /// tone generator, and for parameters out of range
+    /// ([`ToneParams::check`]).
+    pub fn set_tone(
+        &self,
+        slot: usize,
+        params: ToneParams,
+        at_index: u64,
+    ) -> Result<(), GainError> {
+        check_tone(&self.config, slot, &params).map_err(GainError::Invalid)?;
+        self.set_local(Change::Tone { slot, params }, at_index, "tone changes")
+    }
+
     /// Sets `setting` of duck group `group` from sample index `at_index`,
     /// a multiple of the block size. Refused as [`Engine::set_gain`]
     /// refuses a change, and as invalid for a setting
@@ -1977,8 +2040,9 @@ impl Engine {
     /// gain change and past the engine's last `InputUp` or `Route`, so one
     /// generation is built at a time and each before its index. A flow
     /// that cannot be read is silent and reported as pruned. Refused as
-    /// invalid on an engine that follows a replicated log, and for an
-    /// `at_index` that is not a multiple of the block size.
+    /// invalid on an engine that follows a replicated log, for a tone
+    /// generator's slot, and for an `at_index` that is not a multiple of
+    /// the block size.
     pub fn route(&self, slot: usize, flow_id: &str, at_index: u64) -> Result<u64, EntryError> {
         if !at_index.is_multiple_of(self.block) {
             return Err(EntryError::Invalid(format!(
@@ -2026,8 +2090,8 @@ impl Engine {
     /// polled and is not reported, so its up or down state stays as it
     /// is, until a `Route` fades it in on a flow. Detaching a detached
     /// slot changes nothing audible. Refused as invalid on an engine that
-    /// follows a replicated log, for no such slot, and for an `at_index`
-    /// that is not a multiple of the block size.
+    /// follows a replicated log, for no such slot or a tone generator's,
+    /// and for an `at_index` that is not a multiple of the block size.
     pub fn detach(&self, slot: usize, at_index: u64) -> Result<u64, EntryError> {
         if !at_index.is_multiple_of(self.block) {
             return Err(EntryError::Invalid(format!(
@@ -2035,9 +2099,9 @@ impl Engine {
                 self.block
             )));
         }
-        if slot >= self.config.inputs.len() {
-            return Err(EntryError::Invalid(format!("no input slot {slot}")));
-        }
+        self.config
+            .check_flow_slot(slot)
+            .map_err(|e| EntryError::Invalid(e.0))?;
         let mut log = self.log.lock().expect("log lock");
         let (last_at, gen_at) = match &log.local {
             Some(l) => (l.last_at[slot], l.gen_at),
@@ -2292,6 +2356,13 @@ impl Engine {
             {
                 return invalid(format!("no input slot {slot}"));
             }
+            Entry::InputDown { slot } | Entry::InputUp { slot } | Entry::Detach { slot }
+                if self.config.inputs[slot].tone.is_some() =>
+            {
+                return Err(EntryError::Invalid(
+                    self.config.check_flow_slot(slot).unwrap_err().0,
+                ));
+            }
             Entry::Detach { slot } => Change::Detach { slot },
             Entry::Output { slot, .. } if slot >= self.config.outputs.len() => {
                 return invalid(format!("no output {slot}"));
@@ -2326,6 +2397,20 @@ impl Engine {
             Entry::Delay { slot, samples } => {
                 check_delay(&self.config, slot, samples).map_err(EntryError::Invalid)?;
                 Change::Delay { slot, samples }
+            }
+            Entry::Tone {
+                slot,
+                frequency_hz,
+                level_db,
+                ident,
+            } => {
+                let params = ToneParams {
+                    frequency_hz,
+                    level_db,
+                    ident,
+                };
+                check_tone(&self.config, slot, &params).map_err(EntryError::Invalid)?;
+                Change::Tone { slot, params }
             }
             Entry::Duck { .. } | Entry::DuckMask { .. } => {
                 return invalid("a duck entry is no single change".to_owned());
@@ -2704,10 +2789,16 @@ impl Engine {
             .iter()
             .map(|i| i.max_delay_samples)
             .collect();
+        let tones: Vec<bool> = self
+            .config
+            .inputs
+            .iter()
+            .map(|i| i.tone.is_some())
+            .collect();
         let ramp = self.config.ramp_samples;
         let meters = outputs + self.config.meters.len();
         if !c.fits(
-            n, m, outputs, meters, &legs, &limiters, &delays, ramp, page, ducked,
+            n, m, outputs, meters, &legs, &limiters, &delays, &tones, ramp, page, ducked,
         ) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
@@ -2730,7 +2821,7 @@ impl Engine {
             return Err(ReplayError::Generation);
         }
         let status = self.status();
-        let detached = |i: &InputStatus| i.state == InputState::Detached;
+        let detached = |i: &InputStatus| matches!(i.state, InputState::Detached | InputState::Tone);
         if (c.slots.iter().zip(&status.inputs)).any(|(s, i)| s.detached != detached(i)) {
             return Err(ReplayError::Invalid(
                 "the core's detached inputs are not this engine's".to_owned(),
@@ -2836,7 +2927,7 @@ impl Engine {
         // other set is copied whole. Each attempt runs after the answers
         // to earlier calls are taken.
         let mut filled: Vec<Option<(usize, u64)>> = vec![None; rings.len()];
-        self.offer(timeout, 0, true, &[], &[], &[], |j, core| {
+        self.offer(timeout, 0, true, &[], &[], &[], &[], |j, core| {
             replay.run(j);
             replay.rt.capture(core);
             let end = replay.next * replay.rt.block;
@@ -2935,12 +3026,12 @@ impl Engine {
     /// entries the install passed say; the measurement itself is the
     /// replica's own and carries on. Returns the block the core followed.
     /// An `at_least` further ahead than `timeout` is refused as invalid
-    /// before anything changes, as is a state holding a gain, flow or
-    /// strip parameter an entry could not set, or more meters than the
-    /// engine has. A slot whose flow is none
-    /// is detached: no reader is built for it. The core holds no
-    /// unresolved entry: the caller adds the ones still unresolved with
-    /// [`Engine::unresolved`] after the install. While no core is held the
+    /// before anything changes, as is a state holding a gain, flow,
+    /// strip or tone parameter an entry could not set, a tone generator
+    /// down or with a flow, or more meters than the engine has. A slot
+    /// whose flow is none is detached: no reader is built for it. The
+    /// core holds no unresolved entry: the caller adds the ones still
+    /// unresolved with [`Engine::unresolved`] after the install. While no core is held the
     /// RT thread takes the entries needing no generation whose index
     /// passed off its pending list, applying only strip entries, to the
     /// strips the slots keep; [`ReplayError::Missed`] when it took one
@@ -2968,6 +3059,8 @@ impl Engine {
             || state.flows.len() != slots
             || state.strips.len() != slots
             || state.delays.len() > slots
+            || state.tones.len() > slots
+            || state.tone_ramps.len() > slots
             || state.outputs.len() > self.config.outputs.len()
             || state.limiters.len() > self.config.outputs.len()
             || state.loudness_running.len() > self.config.outputs.len() + self.config.meters.len()
@@ -2997,6 +3090,30 @@ impl Engine {
         for (slot, &samples) in state.delays.iter().enumerate() {
             check_delay(&self.config, slot, samples).map_err(ReplayError::Invalid)?;
         }
+        for (slot, params) in state.tones.iter().enumerate() {
+            if let Some(params) = params {
+                check_tone(&self.config, slot, params).map_err(ReplayError::Invalid)?;
+            }
+        }
+        for (slot, ramps) in state.tone_ramps.iter().enumerate() {
+            if let Some(ramps) = ramps {
+                check_tone(&self.config, slot, &ToneParams::DEFAULT)
+                    .map_err(ReplayError::Invalid)?;
+                if !ramps.is_valid() {
+                    return Err(ReplayError::Invalid(format!(
+                        "tone ramps of input slot {slot} hold a value no generator holds"
+                    )));
+                }
+            }
+        }
+        // No entry takes a tone generator down.
+        if let Some(slot) =
+            (0..slots).find(|&s| !state.up[s] && self.config.inputs[s].tone.is_some())
+        {
+            return Err(ReplayError::Invalid(
+                self.config.check_flow_slot(slot).unwrap_err().0,
+            ));
+        }
         check_product_ducks(&self.config, state).map_err(ReplayError::Invalid)?;
         if let Some(gain) = (state.gains.iter().flatten()).find(|g| !samplez_dsp::valid_gain(**g)) {
             return Err(ReplayError::Invalid(format!(
@@ -3016,6 +3133,20 @@ impl Engine {
             .filter_map(|(o, p)| Some((o, (*p)?)))
             .collect();
         let delays: Vec<(usize, u32)> = state.delays.iter().copied().enumerate().collect();
+        // Per tone generator the ramps the state carries, or its target
+        // held where it carries none.
+        let tones: Vec<(usize, ToneRamps)> = (0..slots)
+            .filter_map(|slot| {
+                let ramps = state.tone_ramps.get(slot).copied().flatten();
+                let held = state
+                    .tones
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .map(ToneRamps::held);
+                Some((slot, ramps.or(held)?))
+            })
+            .collect();
         // The entries of one log entry are adjacent and fold into one.
         let mut pending = Vec::with_capacity(state.pending.len());
         let mut batches = Vec::new();
@@ -3147,6 +3278,7 @@ impl Engine {
             &strips,
             &limiters,
             &delays,
+            &tones,
             |j, core| {
                 gains.copy_from_slice(&targets);
                 if state_fading {
@@ -3195,15 +3327,16 @@ impl Engine {
                         }
                         // Folded into `paused` above.
                         Change::LoudnessRun { .. } => {}
-                        // core holds neither generation nor a strip, limiter or delay,
-                        // nor the meters: RT thread applies a passed re-route, detach,
-                        // strip, limiter, delay or loudness reset entry itself, taken
-                        // before install or after.
+                        // core holds neither generation nor a strip, limiter, delay or
+                        // tone generator, nor the meters: RT thread applies a passed
+                        // re-route, detach, strip, limiter, delay, tone or loudness
+                        // reset entry itself, taken before install or after.
                         Change::Route { .. }
                         | Change::Detach { .. }
                         | Change::Strip { .. }
                         | Change::Limiter { .. }
                         | Change::Delay { .. }
+                        | Change::Tone { .. }
                         | Change::ResetLoudness { .. } => {}
                         Change::Batch { up: raised, .. } => {
                             if let Some(b) = batch(e.id) {
@@ -3336,6 +3469,7 @@ impl Engine {
         strips: &[(usize, StripParam)],
         limiters: &[(usize, LimiterParams)],
         delays: &[(usize, u32)],
+        tones: &[(usize, ToneRamps)],
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
         let (Some((_, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
@@ -3434,6 +3568,7 @@ impl Engine {
                 strips: strips.to_vec(),
                 limiters: limiters.to_vec(),
                 delays: delays.to_vec(),
+                tones: tones.to_vec(),
                 answer: Answer::Waiting,
             };
             if t.handovers.push(h).is_err() {
@@ -3970,11 +4105,14 @@ impl Supervisor {
         }
     }
 
+    /// The input domain of slot `slot`, [`NO_DOMAIN`] for a tone
+    /// generator's.
     fn input_domain(&self, slot: usize) -> usize {
-        let d = self
-            .config
-            .domain(&self.config.inputs[slot].domain)
-            .expect("validated");
+        let input = &self.config.inputs[slot];
+        let Some(name) = input.domain.as_deref().filter(|_| input.tone.is_none()) else {
+            return NO_DOMAIN;
+        };
+        let d = self.config.domain(name).expect("validated");
         self.in_domains
             .iter()
             .position(|&x| x == d)
@@ -6757,6 +6895,7 @@ mod tests {
             strips: Vec::new(),
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
             answer: Answer::Waiting,
         };
         assert!(t.handovers.push(h).is_ok());
@@ -6824,6 +6963,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 |j, core| bare_core(&e, j, core),
             )
             .unwrap();
@@ -6850,6 +6990,8 @@ mod tests {
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
@@ -6918,6 +7060,8 @@ mod tests {
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: Vec::new(),
             up: Vec::new(),
             flows: Vec::new(),
@@ -6989,6 +7133,7 @@ mod tests {
                 Duration::from_secs(5),
                 0,
                 false,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -7137,6 +7282,149 @@ mod tests {
         assert!(rt.slots[0].held);
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// A config of a stereo tone generator on a stereo output.
+    fn tone_config() -> Config {
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": "/nonexistent" }],
+            "inputs": [{ "name": "tone", "tone": {}, "channels": 2 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d20", "label": "tone",
+                          "group": "tone", "role": "Audio", "channels": 2 }],
+            "matrix": [[1.0, 0.0], [0.0, 1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        Config::parse(&v.to_string()).unwrap()
+    }
+
+    /// A tone generator's slot through the RT loop, from a block near
+    /// index 2^40: settled, each leg is the formula, bit for bit, in no
+    /// input domain, never silenced, failed or late. A core copied at
+    /// block P and installed into a second loop continues it: both
+    /// compute the same bits through a level, frequency and ident change
+    /// pending at P, as a rebuilt replica computes a running one's. Fails
+    /// with `d.tone = s.tone;` dropped from `install_core`, or with the
+    /// generator bypassed in `process`.
+    #[test]
+    fn a_tone_slot_is_its_formula_and_a_copied_core_continues_it() {
+        let config = tone_config();
+        let api = samplez_mxl::load(&config.libmxl).unwrap();
+        let (slots, in_domains) = new_slots(&config);
+        assert!(in_domains.is_empty());
+        assert_eq!(slots[0].domain, NO_DOMAIN);
+        let rt = || {
+            let (hashes, _) = rtrb::RingBuffer::new(1);
+            let (_, control) = rtrb::RingBuffer::new(1);
+            replay_rt(&config, &api, Vec::new(), hashes, control)
+        };
+        let b = u64::from(config.block_size);
+        let first = (1u64 << 40) / b;
+        let tone = |id, k: u64, frequency_hz, level_db, ident| RtEntry {
+            id,
+            at_index: k * b,
+            change: Change::Tone {
+                slot: 0,
+                params: ToneParams {
+                    frequency_hz,
+                    level_db,
+                    ident,
+                },
+            },
+        };
+        let mut a = rt();
+        assert!(a.mix.matrix.set(0, 0, 1.0, 0) && a.mix.matrix.set(1, 1, 1.0, 0));
+        for e in [
+            tone(1, first + 2, 997, -6.0, false),
+            tone(2, first + 60, 1000, -12.0, true),
+            tone(3, first + 120, 440, 0.0, false),
+        ] {
+            assert!(a.mix.push(e));
+        }
+        let leg = |rt: &Rt, c: usize| rt.outbuf.channel(c)[..b as usize].to_vec();
+        let p = first + 110;
+        let settled = first + 2 + u64::from(config.ramp_samples).div_ceil(b);
+        let level = samplez_dsp::tone::level_gain(-6.0);
+        for k in first..=p {
+            a.process(k, u64::MAX);
+            if (settled..first + 60).contains(&k) {
+                for c in 0..2 {
+                    for (j, &y) in leg(&a, c).iter().enumerate() {
+                        let n = k * b + j as u64;
+                        let want = level * samplez_dsp::tone::sine(n, 997, 48_000);
+                        assert_eq!(y.to_bits(), want.to_bits(), "leg {c} at {n}");
+                    }
+                }
+            }
+        }
+        let counters = &a.counters;
+        assert_eq!(counters.input_silenced_blocks.load(Relaxed), 0);
+        assert_eq!(counters.input_late_blocks.load(Relaxed), 0);
+        assert_eq!(counters.strip_refused.load(Relaxed), 0);
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64, 1));
+        a.capture(&mut core);
+        assert!(core.tone(0).is_some());
+        let mut c = rt();
+        c.install_core(&mut core, 3, true);
+        for k in p + 1..p + 400 {
+            a.process(k, u64::MAX);
+            c.process(k, u64::MAX);
+            for ch in 0..2 {
+                let (x, y) = (leg(&a, ch), leg(&c, ch));
+                let same = x.iter().zip(&y).all(|(x, y)| x.to_bits() == y.to_bits());
+                assert!(same, "block {k} leg {ch}");
+            }
+        }
+    }
+
+    /// Tone parameters are checked against the configuration: a slot
+    /// that reads flows, no slot, and a frequency or level out of range
+    /// are refused, and a tone generator's slot reads no flow. Fails with
+    /// `params.check()` replaced by `Ok(())` in `check_tone`.
+    #[test]
+    fn tone_parameters_are_checked_against_the_configuration() {
+        let mut config = tone_config();
+        let flow: crate::config::Input = serde_json::from_value(serde_json::json!({
+            "name": "in", "domain": "d",
+            "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d21", "channels": 1
+        }))
+        .unwrap();
+        config.inputs.push(flow);
+        let ok = ToneParams::DEFAULT;
+        assert_eq!(check_tone(&config, 0, &ok), Ok(()));
+        let refused = |slot, p: ToneParams| check_tone(&config, slot, &p).unwrap_err();
+        assert!(refused(1, ok).contains("no tone generator"));
+        assert!(refused(2, ok).contains("no input slot 2"));
+        for p in [
+            ToneParams {
+                frequency_hz: 19,
+                ..ok
+            },
+            ToneParams {
+                frequency_hz: 20_001,
+                ..ok
+            },
+            ToneParams {
+                level_db: 0.5,
+                ..ok
+            },
+            ToneParams {
+                level_db: -60.5,
+                ..ok
+            },
+            ToneParams {
+                level_db: f32::NAN,
+                ..ok
+            },
+        ] {
+            assert!(refused(0, p).contains("outside"), "{p:?}");
+        }
+        let e = config.check_input_flow(0, "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d22");
+        assert!(e.unwrap_err().0.contains("tone generator"));
+        assert!(config.check_flow_slot(1).is_ok());
     }
 
     /// Without a core a strip entry whose index passed still reaches its
@@ -8135,6 +8423,7 @@ mod tests {
                 strips: Vec::new(),
                 limiters: Vec::new(),
                 delays: Vec::new(),
+                tones: Vec::new(),
                 answer: Answer::Waiting,
             };
             assert!(t.handovers.push(h).is_ok());
@@ -8181,10 +8470,19 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5), "no stall");
         }
         let mut calls = Vec::new();
-        let _ = e.offer(Duration::from_secs(1), 0, true, &[], &[], &[], |j, _| {
-            calls.push((j, processed()));
-            (j, 0)
-        });
+        let _ = e.offer(
+            Duration::from_secs(1),
+            0,
+            true,
+            &[],
+            &[],
+            &[],
+            &[],
+            |j, _| {
+                calls.push((j, processed()));
+                (j, 0)
+            },
+        );
         assert!(!calls.is_empty());
         for &(j, p) in &calls {
             assert!(j < p, "a core after block {j} with {p} computed");
@@ -8232,6 +8530,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             |j, _| (j, 0),
         );
         let spent = cpu() - before;
@@ -8255,6 +8554,7 @@ mod tests {
             Duration::from_millis(300),
             0,
             true,
+            &[],
             &[],
             &[],
             &[],

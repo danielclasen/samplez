@@ -41,6 +41,10 @@
 //! `samplez-replica`, which this crate cannot see, so their pins are
 //! replaced with that bump.
 //!
+//! A third scene, a tone generator through level, frequency and ident
+//! changes, pins the generator's samples and its state in a core copy
+//! apart, so the main scene's rows stay as they were before it.
+//!
 //! Left out: the output write and hold path, real MXL reads and clock
 //! steps. An offline loop has no flow writer, so blocks never reach a
 //! hold ring and nothing is committed or withheld; the hold ring's
@@ -104,6 +108,17 @@ const CORE_AT: u64 = 1650;
 /// The small scene's encoded core copy for each compute version:
 /// (version, XXH3-64 of [`CoreCopy::encode`]'s bytes).
 const PHASED_CORES: &[(u32, u64)] = &[(1, 0x9a09_eea1_eddb_5e87)];
+
+/// The tone scene's hashes for each compute version: (version, samples,
+/// XXH3-64 of the encoded core copy after [`TONE_CORE_AT`]). A scene of
+/// its own, so the main scene's rows stay as they are.
+const TONES: &[(u32, u64, u64)] = &[(1, 0x7325_ebfb_0d8e_41e4, 0xb8af_9c78_1774_6585)];
+
+/// The block after which the tone scene's core is copied: inside the
+/// crossfade to 440 Hz, the change to 1 kHz waiting behind it.
+const TONE_CORE_AT: u64 = 206;
+/// Two seconds: the ident's cycle of three windows twice and more.
+const TONE_BLOCKS: u64 = 2000;
 
 /// The small scene's block, which [`GAIN_INTERVAL`] does not divide.
 const PHASED_B: u64 = 20;
@@ -610,6 +625,103 @@ fn phased_core() -> u64 {
     xxhash_rust::xxh3::xxh3_64(encoded.as_bytes())
 }
 
+/// The tone scene: a stereo tone generator on a stereo output, through a
+/// level ramp, a frequency crossfade with a change waiting behind it,
+/// the ident on and off mid-cut, and a batch setting it to 20 kHz at -60
+/// dBFS with a trim in its strip. The hashes of every output sample and
+/// of the encoded core copy after block [`TONE_CORE_AT`].
+fn tone_scene() -> (u64, u64) {
+    let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+        .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+    let v = serde_json::json!({
+        "libmxl": libmxl,
+        "blockSize": B,
+        "rampSamples": RAMP,
+        "domains": [{ "name": "d", "path": "/nonexistent" }],
+        "inputs": [{ "name": "tone", "tone": {}, "channels": 2 }],
+        "outputs": [{ "name": "out", "domain": "d",
+            "flowId": "6fbec3b1-1b0f-417d-9059-000000000000", "label": "o",
+            "group": "g", "role": "Audio", "channels": 2 }],
+        "matrix": [[1.0, 0.0], [0.0, 1.0]],
+        "rt": { "enabled": false, "rtCpu": "none" },
+    });
+    let config = Config::parse(&v.to_string()).unwrap();
+    let api = samplez_mxl::load(&config.libmxl).unwrap();
+    let (hashes, _) = rtrb::RingBuffer::new(1);
+    let (_, control) = rtrb::RingBuffer::new(1);
+    let mut rt: Rt = replay_rt(&config, &api, Vec::new(), hashes, control);
+    let (mut core_tx, core_rx) = rtrb::RingBuffer::new(1);
+    let (copy_tx, mut copy_rx) = rtrb::RingBuffer::new(1);
+    let r = rt.replica.as_mut().unwrap();
+    (r.cores, r.copies) = (core_rx, copy_tx);
+    assert!(rt.mix.matrix.set(0, 0, 1.0, 0));
+    assert!(rt.mix.matrix.set(1, 1, 1.0, 0));
+    let tone = |frequency_hz, level_db, ident| Change::Tone {
+        slot: 0,
+        params: samplez_dsp::ToneParams {
+            frequency_hz,
+            level_db,
+            ident,
+        },
+    };
+    let entry = |id, at_index, change| RtEntry {
+        id,
+        at_index,
+        change,
+    };
+    let log = [
+        (0, tone(997, -12.0, false)),
+        (100 * B, tone(997, -6.0, false)),
+        (200 * B, tone(440, -6.0, false)),
+        // Inside the crossfade to 440 Hz: it waits for its end.
+        (205 * B, tone(1000, -6.0, false)),
+        (500 * B, tone(1000, -6.0, true)),
+        // Inside leg 0's second cut.
+        (1210 * B, tone(1000, -6.0, false)),
+    ];
+    for (id, &(at, change)) in log.iter().enumerate() {
+        assert!(rt.mix.push(entry(id as u64 + 1, at, change)));
+    }
+    let items = [
+        Item::Change(tone(20_000, -60.0, true)),
+        Item::Change(Change::Strip {
+            slot: 0,
+            param: StripParam::Trim { db: -3.0 },
+        }),
+    ];
+    let (change, batch) = batch::fold(&items, 2, 4).unwrap().unwrap();
+    assert!(rt.mix.push_with(entry(7, 1500 * B, change), batch).is_ok());
+    let mut samples = Xxh3Default::new();
+    let saved = samplez_dsp::set_ftz_daz(true);
+    for k in 0..TONE_BLOCKS {
+        if k == TONE_CORE_AT {
+            let page = PENDING_CHANGES * PAGE.div_ceil(B) as usize;
+            let mut buffer = Box::new(Core::new(2, 2, 1, page, 1));
+            buffer.prepare();
+            assert!(core_tx.push(buffer).is_ok());
+        }
+        rt.process(k, u64::MAX);
+        for c in 0..2 {
+            for v in &rt.outbuf.channel(c)[..B as usize] {
+                samples.update(&v.to_bits().to_le_bytes());
+            }
+        }
+    }
+    samplez_dsp::restore_mxcsr(saved);
+    let c = &rt.counters;
+    for counter in [&c.command_late, &c.strip_refused, &c.input_silenced_blocks] {
+        assert_eq!(counter.load(Relaxed), 0);
+    }
+    let copy = copy_rx.pop().expect("a core copied");
+    assert_eq!(copy.k0, TONE_CORE_AT);
+    let encoded = CoreCopy::encode(&copy);
+    assert!(encoded.contains("\"tone\""), "no tone generator encoded");
+    (
+        samples.digest(),
+        xxhash_rust::xxh3::xxh3_64(encoded.as_bytes()),
+    )
+}
+
 fn generation(api: &Arc<MxlApi>, domain: &Path, rerouted: u64) -> Box<Gen> {
     Box::new(Gen {
         mxl: Generation::new(api, domain, SLOTS).unwrap(),
@@ -962,6 +1074,15 @@ fn the_engine_computes_the_bits_pinned_for_this_compute_version() {
          it holds or how it encodes needs a COMPUTE_VERSION bump and its \
          hash here"
     );
+    let (s, c) = tone_scene();
+    let pinned = TONES.iter().find(|g| g.0 == crate::COMPUTE_VERSION);
+    assert_eq!(
+        Some((s, c)),
+        pinned.map(|g| (g.1, g.2)),
+        "the tone scene computes samples {s:#018x} and its core copy encodes \
+         to {c:#018x}: a change to either needs a COMPUTE_VERSION bump and its \
+         hashes here"
+    );
 }
 
 /// The run is a function of its scene and log alone: two runs agree.
@@ -969,4 +1090,5 @@ fn the_engine_computes_the_bits_pinned_for_this_compute_version() {
 fn the_engine_golden_run_is_deterministic() {
     assert_eq!(run("first"), run("second"));
     assert_eq!(phased_core(), phased_core());
+    assert_eq!(tone_scene(), tone_scene());
 }

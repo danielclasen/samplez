@@ -322,6 +322,82 @@ fn limiter_parameters_out_of_range_are_clamped() {
     assert_eq!(params.clamped().unwrap().ceiling_db, 0.0);
 }
 
+/// Tone parameters out of range are clamped into it, and a level that is
+/// not finite replaced by the default, as a rebuild replaces them in the
+/// product state, so a live replica and a rebuilt one hold the same;
+/// counted as replaced. The engine's generator computes the samples of
+/// one that took `ToneParams::admitted` of each entry at its index, which
+/// the state machine follows the tone ramps with: the bridge and the
+/// state machine cannot drift apart. Fails with the `Entry::Tone` arm
+/// dropped from `EngineAudio::admitted`'s clamped forms, or its neutral
+/// form other than the default.
+#[test]
+fn tone_parameters_out_of_range_are_clamped() {
+    let domain = Domain::new();
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "tone", "tone": {}, "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d",
+                      "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01", "label": "bridge",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (engine, audio) = bridge_of(&v, 1 << 16);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let at = (engine.progress().unwrap().processed.unwrap() + 100) * B;
+    let p = |frequency_hz, level_db, ident| samplez_dsp::ToneParams {
+        frequency_hz,
+        level_db,
+        ident,
+    };
+    // +6 dBFS at 5 Hz, then a NaN level.
+    let sent = [
+        (at, p(5, 6.0, true)),
+        (at + 10 * B, p(440, f32::NAN, false)),
+    ];
+    for (id, &(at, params)) in sent.iter().enumerate() {
+        let entry = Entry::Tone {
+            slot: 0,
+            frequency_hz: params.frequency_hz,
+            level_db: params.level_db,
+            ident: params.ident,
+        };
+        audio.appended(id as u64 + 3, at, &[entry]);
+        audio.committed(id as u64 + 3);
+    }
+    assert_eq!(audio.sample().entries_filtered, 2);
+    assert_eq!(sent[0].1.admitted(), p(20, 0.0, true));
+    assert_eq!(sent[1].1.admitted(), samplez_dsp::ToneParams::DEFAULT);
+    let last = sent[1].0;
+    wait_for("its index passed", || {
+        engine.progress().unwrap().processed.unwrap() > last / B + 2
+    });
+    let copy = engine.copy_core(Duration::from_secs(2)).unwrap();
+    let mut held = *copy.core.tone(0).expect("a tone generator");
+    let mut want = samplez_dsp::ToneRamps::default();
+    for &(at, params) in &sent {
+        assert!(want.set(at, params.admitted(), 480));
+    }
+    let mut followed = samplez_dsp::Tone::new(1, 48_000, 480);
+    assert!(followed.resume(want));
+    // Through the ramps the entries started and past them.
+    let from = (copy.k0 + 1) * B;
+    let frames = 960;
+    let (mut a, mut b) = (vec![0.0; frames], vec![0.0; frames]);
+    held.process(from, &mut a, frames);
+    followed.process(from, &mut b, frames);
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        let n = from + i as u64;
+        assert_eq!(x.to_bits(), y.to_bits(), "at {n}");
+    }
+}
+
 /// A delay beyond an input's delay line is replaced by none, as a
 /// rebuild replaces it in the product state; counted as replaced.
 #[test]
@@ -400,6 +476,8 @@ fn a_loudness_entry_of_a_meter_the_engine_lacks_is_left_out() {
     let state = samplez::ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0]],
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
@@ -613,6 +691,8 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
     let state = samplez::ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0]],
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
@@ -1266,6 +1346,8 @@ fn rebuild_after_a_route() -> Result<(), String> {
     let state = samplez::ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0]],
         up: vec![true],
         flows: vec![Some(ROUTED.to_owned())],
@@ -1397,6 +1479,8 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
     let mut state = samplez::ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0], vec![1.0]],
         up: vec![true, true],
         flows: routed.map(|f| Some(f.to_owned())).to_vec(),
@@ -1488,6 +1572,8 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
     let state = samplez::ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![0.5]],
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],

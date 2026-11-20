@@ -73,6 +73,7 @@ fn the_rt_thread_passes_rtsan() {
     let matrix = vec![vec![0.5, 0.0], vec![0.0, 0.5]];
     let mut cfg = config(&domain.0, &[(&src, 2)], &[(&dst, 2)], matrix, MARGIN);
     common::add_meter(&mut cfg, "bus", 2, 0.5);
+    common::add_tone(&mut cfg, "tone", 2, 0.25);
     cfg.outputs[0].limiter = true;
     cfg.inputs[0].max_delay_samples = 4800;
     let (engine, rx) = start(cfg);
@@ -116,6 +117,18 @@ fn the_rt_thread_passes_rtsan() {
         .unwrap();
     engine.set_delay(0, 2400, (index / B + 20) * B).unwrap();
     engine.set_delay(0, 1200, (index / B + 21) * B).unwrap();
+    // The tone generator through a level, frequency and ident change,
+    // and a frequency change while the first crossfades.
+    let tone = |frequency_hz, level_db, ident| samplez_dsp::ToneParams {
+        frequency_hz,
+        level_db,
+        ident,
+    };
+    let tone_at = (index / B + 20) * B;
+    engine.set_tone(1, tone(997, -12.0, true), tone_at).unwrap();
+    engine
+        .set_tone(1, tone(440, -6.0, false), tone_at + B)
+        .unwrap();
     let reset = (index / B + 40) * B;
     engine.reset_loudness(0, reset).unwrap();
     // The meter after the output.

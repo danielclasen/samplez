@@ -28,6 +28,9 @@ matrix, are built on it.
   channels: trim, per-leg trim and polarity, high-pass, four-band
   equaliser, gate and compressor
 - A delay line per input, opt-in by configuration, up to 5 s
+- Line-up tone generators: an input configured with `tone` reads no flow
+  and computes a sine of 20 Hz to 20 kHz at -60 to 0 dBFS on its legs,
+  with an ident that cuts the legs in turn, set by tone entries
 - A gain matrix with ramped coefficients; in replicated mode the engine
   entries of one log entry are folded and applied whole at its index
 - A true-peak limiter per output of up to 8 channels, configured per
@@ -152,7 +155,8 @@ Further keys and their defaults: `maxCatchupBlocks` 2, `pruneAfterBlocks`
 50, `rampSamples` 480, `holdMs` 10, `contactWindowMs` 8, `duckColumns`
 none (below),
 `historySlackMs` 50, `resyncBudgetMs` 50, per input
-`offsetSamples` 0, `flowChannels` (below) and `flowId` none, per output
+`offsetSamples` 0, `flowChannels` (below), `flowId` and `tone` (Tone
+generator) none, per output
 `enabled` true, per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
 Table 3; without it every channel weighs 1), per input `maxDelaySamples`
@@ -167,7 +171,13 @@ most 1000 and at least two blocks, `rampSamples` at most
 within `samplez_dsp::MAX_GAIN` (1e6), `rt.priority` 1 to 99 and
 `rt.rtCpu` `auto`, `none`, `first`, `last` or an index into the allowed
 CPUs. Unknown keys are refused. Output flow ids are unique,
-and no input reads a flow an output writes in the same domain.
+and no input reads a flow an output writes in the same domain. An input
+has a `domain`, or is a tone generator, `tone: {}`, with no `domain`,
+`flowId`, `flowChannels` or `offsetSamples`:
+
+```json
+{ "name": "lineup", "tone": {}, "channels": 2 }
+```
 
 An input without `flowId` starts as a `Detach` leaves it (below): it
 opens no reader, is not polled and is not reported until a `Route`. An
@@ -313,7 +323,8 @@ index), `Detach` (it crossfades to silence over the ramp length from the
 index and reads no flow, is not polled and is not reported until a
 `Route` fades it in from silence; its up or down state is kept),
 `Limiter` (an output's limiter parameters, below), `Delay` (an input's
-delay, below), `LoudnessRun` (a meter's loudness measurement paused or
+delay, below), `Tone` (a tone generator's frequency, level and ident,
+below), `LoudnessRun` (a meter's loudness measurement paused or
 run from the index, see Meters), `ResetLoudness` (a meter's loudness
 measurement restarted at the first window from the index, see Meters),
 `Output` (an output
@@ -326,7 +337,8 @@ retried) and `Strip` (one parameter of an input's channel strip, a
 `samplez_dsp::StripParam`, ramping over the ramp length). Each sets an
 absolute target, so an entry applied again once its ramp has ended
 changes nothing; applied again while it ramps, it starts the ramp over
-from where it is. `InputUp`, `Route` and `Detach` need a new input
+from where it is, but for a `Tone` entry, which leaves a running ramp
+alone (Tone generator). `InputUp`, `Route` and `Detach` need a new input
 generation:
 the engine builds it when the entry is appended, one at a time, and
 swaps it in at the entry's index. The status reports the 99.99th
@@ -346,7 +358,8 @@ buildLead after the one before, and an `Output`
 A replicated log entry may carry any number of engine entries
 (`append_batch`). They are folded off the RT thread: per matrix
 coefficient, strip parameter and output the last value, per output
-its last limiter parameters, per input slot its last delay, per meter
+its last limiter parameters, per input slot its last delay and tone
+parameters, per meter
 its last `LoudnessRun` and each meter reset once; per input slot
 whether it is re-routed or detached, the last `Route` or `Detach`
 counting, goes down and comes up, an `InputUp` after an `InputDown`
@@ -499,6 +512,51 @@ reads nothing older than its taps reached without a break, so that is
 all the history a resync copies. The rings are indexed by sample index,
 so the output does not depend on the block size; samples an overrun
 skipped are stored as silence.
+
+### Tone generator
+
+An input configured with `tone: {}` is a line-up tone generator
+(`samplez_dsp::Tone`) in place of a flow: it reads none, belongs to no
+input domain and is not polled, so it is never late, silenced, pruned or
+down, and its status reads `InputState::Tone`. Its legs are an input's:
+its matrix rows, strip, delay line, duck key and meter. `InputDown`,
+`InputUp`, `Route` and `Detach` are refused for it, as a `Tone` entry is
+for an input that reads flows. It starts at 1 kHz, -18 dBFS, no ident.
+Switching it on or off, or putting it in place of a mix, are matrix
+gains.
+
+A `Tone` entry (`Engine::set_tone`, `samplez_dsp::ToneParams`) sets its
+frequency in whole hertz, 20 to 20000, its sample-peak level, -60 to 0
+dBFS, and its ident. Every leg at sample index `n` carries `level *
+sin(2 pi ((n f) mod R) / R)`, `R` the sample rate, the phase reduced in
+integers and the sine taken by the pinned libm, so the value is a
+function of `n` alone: periodic without drift at any index, the same
+bits on every replica whatever the block size or the samples skipped. A
+level or ident change ramps over the ramp length from its index; a
+frequency change crossfades from the old sine to the new one over the
+ramp length, and one during a crossfade waits until it ends, the latest
+counting, as a delay change does. With the ident on, leg `l` is silent
+over every window `[k Q, (k + 1) Q)` with `k mod (legs + 1) = l`, `Q =
+R / 4` (250 ms, rounded down): the legs are cut in turn, in leg order,
+and the window after the last leg's sounds on all of them. Each cut
+fades out over the `R / 100` samples (10 ms) before its window and in
+over as many after it, so its edges step by no more than the level over
+that length at any frequency. The generator computes one sine per
+sample, two during a frequency crossfade, and copies it to its legs.
+
+A `Tone` entry that repeats the parameters a generator heads to, as a
+re-asserted target does, leaves its running ramps alone; a gain entry
+applied again mid-ramp starts its ramp over instead. The replica tracks
+the ramps the derived tone entries leave each generator on
+(`samplez_dsp::ToneRamps`: level, frequency and ident, each with its
+start index and the value it moves from, and a frequency change waiting
+behind a crossfade), at the block-aligned index the bridge applies each
+at, its parameters as the bridge admits them, and carries them in its
+product state (`ProductState::tone_ramps`) and its snapshots. An install
+replaces a generator's ramps with them, so a rebuilt replica computes a
+running one's samples from its first block, mid-ramp too. A state
+without them holds each generator at its target from the install on; a
+snapshot written before they were kept loads with none.
 
 ### Duck groups
 
@@ -771,12 +829,14 @@ the RT thread keeps its writers, flows, hold rings and statuses,
 computes no block and withholds each one, overrun skips included, cause
 `NoCore` (`StatusChange::NoCore` ranges), with the replica withdrawn.
 Entries needing no generation whose index passes meanwhile are taken off
-the pending list, strip and limiter entries applied to the strips the
-slots and the limiters the outputs keep and the others, duck entries
-included, not, and the core installed next must know them; a batch
-holding an `InputUp` or `Route` stays pending whole. A replayed core
-replaces the strips and limiters; one built from product state leaves
-them. `Engine::install_product` builds a core from product state off the
+the pending list, strip, limiter, delay and tone entries applied to the
+strips, delay lines and tone generators the slots and the limiters the
+outputs keep and the others, duck entries included, not, and the core
+installed next must know them; a batch holding an `InputUp` or `Route`
+stays pending whole. A replayed core replaces the strips, limiters,
+delays and tone generators; one built from product state leaves them,
+the generators' ramps aside, which it replaces with its own.
+`Engine::install_product` builds a core from product state off the
 RT thread (fades cold, the pending entries, no unresolved entry; the RT
 thread keeps its pending generation) and installs it through the same
 block-boundary hand-over as a replay, at the first block starting at or
@@ -803,17 +863,17 @@ page verdict, and it resyncs from a donor's core, which carries every
 group's detector state. A keyed group whose envelope never reaches 0 or
 full depth, which would keep the two apart for good, so costs one page,
 the reports that carry it and a resync. The product state also names
-each slot's flow, strip parameters and delay, each output's limiter
-parameters and each meter's loudness measurement running or paused,
-which the core takes at the install: the supervisor hands over
-generations reading those flows
-before the core, a slot on another flow moving to it with no crossfade,
-and the strip and limiter parameters and delays are set from the
-install's index, each strip, limiter and delay line keeping its own
-state, so a delayed input plays the line's own history until the delay
-has passed. `Targets` holds every gain, flow, strip parameter, limiter
-parameter, delay, duck group setting, duck mask and meter's running
-state as values;
+each slot's flow, strip parameters, delay and tone parameters, each
+output's limiter parameters and each meter's loudness measurement
+running or paused, which the core takes at the install: the supervisor
+hands over generations reading those flows before the core, a slot on
+another flow moving to it with no crossfade, and the strip and limiter
+parameters and delays are set from the install's index, each strip,
+limiter and delay line keeping its own state, so a delayed input plays
+the line's own history until the delay has passed; each tone generator
+takes the state's tone ramps (Tone generator). `Targets` holds every gain, flow, strip parameter, limiter
+parameter, delay, tone parameter, duck group setting, duck mask and
+meter's running state as values;
 `Targets::diff` gives the entries that move an engine from one
 set of targets to another, comparing every value by bit pattern, and
 `Targets::assert` the entries that set all of them.
@@ -1001,13 +1061,14 @@ again, as its peers do. One AppendEntries carries up to
 `MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
 than the gap between entries takes every entry written meanwhile with
 one fsync rather than falling further behind. `EngineAudio` replaces a
-strip parameter, limiter parameters, delay, a duck setting or duck mask
-its engine refuses, so a replica holding a value before the refused one
-and one rebuilt without it hold the same. A finite value out of range
-moves to the nearest one its range holds (`StripParam::clamped`,
-`LimiterParams::clamped`, `DuckSetting::clamped`): a trim of -30 dB
-sounds as -20 dB, a duck depth of 99 dB as 40 dB, a ceiling of +3 dBTP
-as 0 dBTP. A value
+strip parameter, limiter or tone parameters, delay, a duck setting or
+duck mask its engine refuses, so a replica holding a value before the
+refused one and one rebuilt without it hold the same. A finite value out
+of range moves to the nearest one its range holds
+(`StripParam::clamped`, `LimiterParams::clamped`, `ToneParams::clamped`,
+`DuckSetting::clamped`): a trim of -30 dB sounds as -20 dB, a duck depth
+of 99 dB as 40 dB, a ceiling of +3 dBTP as 0 dBTP, a tone at 5 Hz as
+20 Hz. A value
 that is not finite, or keys the engine cannot take, give the setting a
 strip or group holds before any is set (`StripParam::neutral`: trims
 at 0 dB, no inversion, high-pass, equaliser, gate and compressor off, a
@@ -1015,7 +1076,7 @@ band at its default; `DuckSetting::neutral`: the default detector, no
 key, a depth of 0 dB): a trim at -20 dB set to NaN steps back to 0 dB,
 a closed gate opens and a ducked bed returns to full level, each over
 the strip's ramp; limiter parameters that are not finite give
-`LimiterParams::OFF`. A refused mask is 0, a refused delay none: a delay
+`LimiterParams::OFF`, tone parameters `ToneParams::DEFAULT`. A refused mask is 0, a refused delay none: a delay
 beyond its line plays no delay rather than the line's longest, since
 the live filter cannot read the line's length. It leaves
 out of a record the
@@ -1083,13 +1144,16 @@ a running set as peers; a core copy is taken only at an equal
 and `src/engine/golden.rs` the bits the RT loop computes offline from a
 fixed scene, log and input source, its columns' samples apart from
 every value its meters send, its outputs' page hashes, and the encoded
-core copy of its state. Their hashes sit in tables with a row per
+core copy of its state, and from a scene of its own a tone generator's
+samples and core copy. Their hashes sit in tables with a row per
 `COMPUTE_VERSION`: a change that moves any of them fails until the
 version is bumped and a row added. The pages' entry fingerprints are a
 single pinned value: replicas compare page hashes and fingerprints, so
 a change to how either is computed bumps `PROTOCOL`, also where the
 samples stay the same, and the fingerprint value is replaced with that
-bump.
+bump. `PROTOCOL` itself is a pinned value too
+(`entry::tests::the_protocol_is_pinned`), which a bump replaces and
+gives its reason in.
 
 A rollout that changes the key hands the baseline over at a page and
 block boundary P to a replica at the StatefulSet's target revision,
