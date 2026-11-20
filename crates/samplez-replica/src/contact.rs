@@ -1424,6 +1424,7 @@ impl Contact {
         let st = &mut *st;
         let voters = members.voters();
         st.peers.retain(|id, _| voters.contains(id));
+        st.lead_raised_by = st.lead_raised_by.filter(|id| voters.contains(id));
         st.learners
             .retain(|id, _| members.addrs.contains_key(id) && !voters.contains(id));
         st.members = members;

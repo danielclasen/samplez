@@ -924,7 +924,9 @@ stamp: stamped with a lead the commits outlast, a decision would be late
 again and decided in turn, a `Baseline` would lapse for the replica it
 names, and each command would be late wherever its commit takes longer.
 One slow replica therefore raises the latency of every command by up to
-64 ms while the lead is capped, and `apply_lead_raised_by` names it.
+64 ms while the lead is capped, and `apply_lead_raised_by` names it,
+exported as `samplez_replica_apply_lead_raised_by` labelled `node`
+until that replica leaves the voters.
 The lead does not fall while the entries need more than it. After two
 minutes without entries the lead they needed is forgotten, so the first
 command after such a gap at the cap is stamped with the capped lead. A

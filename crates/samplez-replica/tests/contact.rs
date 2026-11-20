@@ -306,6 +306,66 @@ async fn a_witness_is_ready_only_while_in_contact() {
     assert!(set.replica(witness).replica().ready, "in contact again");
 }
 
+/// A voter whose slack raised the apply lead, then removed from the
+/// membership, leaves no series labelled with it once contact ticked:
+/// `samplez_replica_apply_lead_raised_by` goes with its peer series.
+#[tokio::test(start_paused = true)]
+async fn a_removed_voter_that_raised_the_lead_leaves_no_series() {
+    use openraft::ChangeMembers;
+    use samplez_service::ReplicatedState;
+    use std::collections::BTreeSet;
+    use tokio::time::Instant;
+    // Its fsyncs take 100 ms: it applies every entry past the deadline
+    // the lead can cover, as the slow-disk tests in `derive.rs` show.
+    let slow = 2;
+    let mut set = Set::start(Options {
+        contact: Some(timing()),
+        sync_delays: vec![(slow, Duration::from_millis(100))],
+        ..Options::default()
+    })
+    .await;
+    sleep(Duration::from_millis(50)).await;
+    let leader = set.leader().await;
+    assert_ne!(leader, slow, "the slow disk is a follower's");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while set
+        .replica(leader)
+        .contact_metrics()
+        .unwrap()
+        .apply_lead_raised_by
+        != Some(slow)
+    {
+        assert!(Instant::now() < deadline, "{slow} never raised the lead");
+        set.replica(leader)
+            .append(Body::InputDown {
+                slot: 0,
+                at_index: 0,
+            })
+            .unwrap();
+        sleep(Duration::from_millis(5)).await;
+    }
+    let named = |set: &Set| -> Vec<&'static str> {
+        (set.replica(leader).replica_metrics().into_iter())
+            .filter(|m| {
+                m.labels
+                    .iter()
+                    .any(|(k, v)| *k == "node" && *v == slow.to_string())
+            })
+            .map(|m| m.name)
+            .collect()
+    };
+    assert!(named(&set).contains(&"samplez_replica_apply_lead_raised_by"));
+    set.crash(slow).await;
+    let rest: BTreeSet<NodeId> = set.ids().filter(|&id| id != slow).collect();
+    set.replica(leader)
+        .raft()
+        .change_membership(ChangeMembers::ReplaceAllVoters(rest), false)
+        .await
+        .expect("the membership changes");
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(named(&set), Vec::<&str>::new());
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_quiescing_leader_waits_for_every_voter_heard_to_report_the_commit() {
     let set = start().await;
