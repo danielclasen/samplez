@@ -121,7 +121,18 @@ pub struct Domain {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Input {
     pub name: String,
-    pub domain: String,
+    /// The domain of the flows the input reads; none, and required to be
+    /// none, for a tone generator.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Makes the input a line-up tone generator
+    /// ([`samplez_dsp::Tone`]) in place of a flow: it reads no flow, has
+    /// no domain, `flowId`, `flowChannels` or `offsetSamples`, is never
+    /// late or pruned and takes no `InputDown`, `InputUp`, `Route` or
+    /// `Detach`. Its legs are routed as an input's: matrix rows, strip,
+    /// delay, duck key and meter. `Tone` entries set it.
+    #[serde(default)]
+    pub tone: Option<Tone>,
     /// The flow the input reads from the start; none starts it detached,
     /// as a `Detach` leaves it: no reader is opened until a `Route`. In
     /// replicated mode the product's targets set the flow from their
@@ -151,6 +162,11 @@ pub struct Input {
     #[serde(default)]
     pub max_delay_samples: u32,
 }
+
+/// A tone generator's configuration: none beyond its presence, `{}`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tone {}
 
 impl Input {
     /// The loudness weight of each channel.
@@ -544,14 +560,32 @@ impl Config {
             "output flow id",
         )?;
         for i in &self.inputs {
-            if self.domain(&i.domain).is_none() {
-                return fail(format!("input {}: no domain {}", i.name, i.domain));
-            }
             if i.channels == 0 {
                 return fail(format!("input {}: channels must be at least 1", i.name));
             }
-            samplez_mxl::input::legs(&self.input_config(i, i.flow_id.as_deref().unwrap_or("none")))
-                .map_err(|e| Error(format!("input {}: {e}", i.name)))?;
+            if i.tone.is_some() {
+                if i.domain.is_some()
+                    || i.flow_id.is_some()
+                    || i.flow_channels.is_some()
+                    || i.offset_samples != 0
+                {
+                    return fail(format!(
+                        "input {}: a tone generator takes no domain, flowId, flowChannels or \
+                         offsetSamples",
+                        i.name
+                    ));
+                }
+            } else {
+                let Some(domain) = &i.domain else {
+                    return fail(format!("input {}: no domain, and no tone", i.name));
+                };
+                if self.domain(domain).is_none() {
+                    return fail(format!("input {}: no domain {domain}", i.name));
+                }
+                let flow_id = i.flow_id.as_deref().unwrap_or("none");
+                samplez_mxl::input::legs(&self.input_config(i, flow_id))
+                    .map_err(|e| Error(format!("input {}: {e}", i.name)))?;
+            }
             i.loudness_weights()?;
             if i.max_delay_samples > samplez_dsp::MAX_DELAY_SAMPLES {
                 return fail(format!(
@@ -606,19 +640,34 @@ impl Config {
         Ok(())
     }
 
-    /// The samplez-mxl creation parameters of `o`.
-    /// Whether input `slot` may read flow `flow_id`: a valid id, and no
-    /// output's flow in the input's domain.
-    pub fn check_input_flow(&self, slot: usize, flow_id: &str) -> Result<(), Error> {
+    /// Whether input `slot` reads flows: it exists and is no tone
+    /// generator, so it takes `InputDown`, `InputUp`, `Route` and
+    /// `Detach`.
+    pub fn check_flow_slot(&self, slot: usize) -> Result<(), Error> {
         let i = self
             .inputs
             .get(slot)
             .ok_or_else(|| Error(format!("no input slot {slot}")))?;
+        if i.tone.is_some() {
+            return Err(Error(format!(
+                "input {} is a tone generator: it reads no flow and is never down",
+                i.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether input `slot` may read flow `flow_id`: no tone generator, a
+    /// valid id, and no output's flow in the input's domain.
+    pub fn check_input_flow(&self, slot: usize, flow_id: &str) -> Result<(), Error> {
+        self.check_flow_slot(slot)?;
+        let i = &self.inputs[slot];
         samplez_mxl::validate_id(flow_id).map_err(|e| Error(format!("input {}: {e}", i.name)))?;
+        let domain = i.domain.as_deref().and_then(|d| self.domain(d));
         if let Some(o) = self
             .outputs
             .iter()
-            .find(|o| o.flow_id == flow_id && self.domain(&i.domain) == self.domain(&o.domain))
+            .find(|o| o.flow_id == flow_id && domain == self.domain(&o.domain))
         {
             return Err(Error(format!(
                 "output {} writes flow {flow_id} in the domain of input {}",
@@ -642,6 +691,7 @@ impl Config {
         }
     }
 
+    /// The samplez-mxl creation parameters of `o`.
     pub fn output_config<'a>(&self, o: &'a Output) -> samplez_mxl::output::OutputConfig<'a> {
         samplez_mxl::output::OutputConfig {
             flow_id: &o.flow_id,
@@ -1040,6 +1090,45 @@ mod tests {
         c["inputs"][0]["flowChannels"] = serde_json::json!([7]);
         c["matrix"] = serde_json::json!([[0.5]]);
         assert!(parse(&c).is_ok());
+    }
+
+    /// A tone generator is an input with `tone: {}` and none of the keys
+    /// of a flow: a domain, a flow, flow channels or an offset with it is
+    /// refused, as an input with neither a domain nor a tone, and a
+    /// generator reads no flow. Fails with the check of the flow keys
+    /// dropped from `validate`.
+    #[test]
+    fn a_tone_input_takes_no_flow_keys() {
+        let mut v = base();
+        v["inputs"] = serde_json::json!([{ "name": "tone", "tone": {}, "channels": 2 }]);
+        let c = parse(&v).unwrap();
+        assert!(c.inputs[0].tone.is_some());
+        assert_eq!(c.inputs[0].domain, None);
+        let e = c.check_input_flow(0, IN).unwrap_err().to_string();
+        assert!(e.contains("tone generator"), "{e}");
+        assert!(c.check_flow_slot(0).is_err());
+        for (key, value) in [
+            ("domain", serde_json::json!("a")),
+            ("flowId", serde_json::json!(IN)),
+            ("flowChannels", serde_json::json!([0, 1])),
+            ("offsetSamples", serde_json::json!(48)),
+        ] {
+            let mut bad = v.clone();
+            bad["inputs"][0][key] = value;
+            let e = parse(&bad).unwrap_err().to_string();
+            assert!(e.contains("a tone generator takes no"), "{key}: {e}");
+        }
+        let mut bad = v.clone();
+        bad["inputs"][0]["tone"] = serde_json::json!({ "frequencyHz": 1000 });
+        assert!(parse(&bad).is_err(), "an unknown tone key taken");
+        let mut bad = v.clone();
+        bad["inputs"][0].as_object_mut().unwrap().remove("tone");
+        let e = parse(&bad).unwrap_err().to_string();
+        assert!(e.contains("no domain, and no tone"), "{e}");
+        // A delay line takes its legs as any input's.
+        let mut delayed = v.clone();
+        delayed["inputs"][0]["maxDelaySamples"] = serde_json::json!(480);
+        assert!(parse(&delayed).is_ok());
     }
 
     /// JSON has no NaN, so the gain is set on a parsed configuration.

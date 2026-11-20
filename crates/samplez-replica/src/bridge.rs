@@ -99,6 +99,16 @@ pub fn word_or_skip(word: Option<BlockStatus>, k: u64) -> BlockStatus {
     })
 }
 
+/// The entry setting slot `slot`'s tone generator to `p`.
+fn tone_entry(slot: usize, p: samplez_dsp::ToneParams) -> Entry {
+    Entry::Tone {
+        slot,
+        frequency_hz: p.frequency_hz,
+        level_db: p.level_db,
+        ident: p.ident,
+    }
+}
+
 pub struct EngineAudio {
     engine: Arc<Engine>,
     outputs: usize,
@@ -222,15 +232,17 @@ impl EngineAudio {
         kept
     }
 
-    /// `entry`, or, for a strip parameter, limiter parameters, duck
-    /// setting or duck mask the engine refuses alone, the first of these
-    /// the engine takes: its values moved to the nearest ones their
+    /// `entry`, or, for a strip parameter, limiter or tone parameters,
+    /// duck setting or duck mask the engine refuses alone, the first of
+    /// these the engine takes: its values moved to the nearest ones their
     /// ranges hold ([`samplez_dsp::StripParam::clamped`],
-    /// [`samplez_dsp::LimiterParams::clamped`], [`DuckSetting::clamped`]),
+    /// [`samplez_dsp::LimiterParams::clamped`],
+    /// [`samplez_dsp::ToneParams::clamped`], [`DuckSetting::clamped`]),
     /// for a finite value out of range; its neutral form
     /// ([`samplez_dsp::StripParam::neutral`], [`DuckSetting::neutral`],
-    /// mask 0, [`samplez_dsp::LimiterParams::OFF`], no delay), value not finite or key the engine
-    /// cannot take, such as a slot or key it lacks. None when it takes
+    /// mask 0, [`samplez_dsp::LimiterParams::OFF`], no delay,
+    /// [`samplez_dsp::ToneParams::DEFAULT`]), value not finite or key the
+    /// engine cannot take, such as a slot or key it lacks. None when it takes
     /// neither. Every other entry as given. The live filter
     /// and the rebuild's state both go through it, so a replica that held
     /// a value before the refused one and one rebuilt without it hold
@@ -256,6 +268,7 @@ impl EngineAudio {
                 params: samplez_dsp::LimiterParams::OFF,
             },
             &Entry::Delay { slot, .. } => Entry::Delay { slot, samples: 0 },
+            &Entry::Tone { slot, .. } => tone_entry(slot, samplez_dsp::ToneParams::DEFAULT),
             _ => return Some(entry.clone()),
         };
         let clamped = match entry {
@@ -270,6 +283,18 @@ impl EngineAudio {
                 output: *output,
                 params,
             }),
+            &Entry::Tone {
+                slot,
+                frequency_hz,
+                level_db,
+                ident,
+            } => samplez_dsp::ToneParams {
+                frequency_hz,
+                level_db,
+                ident,
+            }
+            .clamped()
+            .map(|p| tone_entry(slot, p)),
             _ => None,
         };
         let takes = |e: &Entry| self.engine.admits(std::slice::from_ref(e)).is_ok();
@@ -279,10 +304,14 @@ impl EngineAudio {
         [clamped, Some(neutral)].into_iter().flatten().find(takes)
     }
 
-    /// Per input slot, the flow it reads; none for a detached one.
+    /// Per input slot, the flow it reads; none for a detached one and a
+    /// tone generator.
     fn reading(&self) -> Vec<Option<String>> {
         (self.engine.status().inputs.into_iter())
-            .map(|i| (i.state != InputState::Detached).then_some(i.flow_id))
+            .map(|i| {
+                let reads = !matches!(i.state, InputState::Detached | InputState::Tone);
+                reads.then_some(i.flow_id)
+            })
             .collect()
     }
 
@@ -292,7 +321,7 @@ impl EngineAudio {
     /// rules of [`EngineAudio::kept`] and else left at the one read; a
     /// strip parameter, duck setting or duck mask the engine refuses is
     /// replaced as the live filter replaces it ([`EngineAudio::admitted`])
-    /// or left out, limiter parameters too; a gain it refuses is
+    /// or left out, limiter and tone parameters too; a gain it refuses is
     /// silenced, as the state machine
     /// derives it for every replica
     /// ([`crate::state_machine::StateMachine::product_state`] holds none).
@@ -379,6 +408,49 @@ impl EngineAudio {
                     *samples = 0;
                     dropped += 1;
                 }
+            }
+        }
+        // Tone parameters the engine refuses are replaced as the live
+        // filter replaces them, or left out, for a slot without a
+        // generator; those of slots beyond the engine's too.
+        dropped += state.tones.len().saturating_sub(slots);
+        state.tones.truncate(slots);
+        for (slot, params) in state.tones.iter_mut().enumerate() {
+            let Some(p) = *params else { continue };
+            *params = match self.admitted(&tone_entry(slot, p)) {
+                Some(Entry::Tone {
+                    frequency_hz,
+                    level_db,
+                    ident,
+                    ..
+                }) => {
+                    let q = samplez_dsp::ToneParams {
+                        frequency_hz,
+                        level_db,
+                        ident,
+                    };
+                    dropped += usize::from(!q.same(&p));
+                    Some(q)
+                }
+                _ => {
+                    dropped += 1;
+                    None
+                }
+            };
+        }
+        // Tone ramps of a slot without a generator, beyond the engine's
+        // slots or holding a value no generator holds are left out: the
+        // generator then holds its target, as one the log never ramped.
+        dropped += state.tone_ramps.len().saturating_sub(slots);
+        state.tone_ramps.truncate(slots);
+        for (slot, ramps) in state.tone_ramps.iter_mut().enumerate() {
+            let generator = || {
+                let entry = tone_entry(slot, samplez_dsp::ToneParams::DEFAULT);
+                self.engine.admits(std::slice::from_ref(&entry)).is_ok()
+            };
+            if ramps.is_some_and(|r| !r.is_valid() || !generator()) {
+                *ramps = None;
+                dropped += 1;
             }
         }
         for gain in state.gains.iter_mut().flatten() {

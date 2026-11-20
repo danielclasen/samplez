@@ -75,6 +75,54 @@ pub struct Replicated {
     /// before it was kept, which then carry no running ramps.
     #[serde(default)]
     pub ramps: Vec<Vec<Option<(u32, u64, u32)>>>,
+    /// [`crate::state_machine::StateMachine::tone_ramps`], as bits for the
+    /// same reason; absent from snapshots written before it was kept,
+    /// which then carry none.
+    #[serde(default)]
+    pub tone_ramps: Vec<Option<ToneRampBits>>,
+}
+
+/// [`samplez_dsp::ToneRamps`] with its values as bit patterns: each
+/// glide's from and to and its start, the frequency's from, to, start and
+/// waiting change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToneRampBits {
+    pub level: (u32, u32, u64),
+    pub frequency: (u32, u32, u64, Option<u32>),
+    pub ident: (u32, u32, u64),
+}
+
+impl From<samplez_dsp::ToneRamps> for ToneRampBits {
+    fn from(r: samplez_dsp::ToneRamps) -> ToneRampBits {
+        let glide = |g: samplez_dsp::tone::Glide| (g.from.to_bits(), g.to.to_bits(), g.start);
+        let f = r.frequency;
+        ToneRampBits {
+            level: glide(r.level),
+            frequency: (f.from, f.to, f.start, f.next),
+            ident: glide(r.ident),
+        }
+    }
+}
+
+impl From<ToneRampBits> for samplez_dsp::ToneRamps {
+    fn from(b: ToneRampBits) -> samplez_dsp::ToneRamps {
+        let glide = |(from, to, start): (u32, u32, u64)| samplez_dsp::tone::Glide {
+            from: f32::from_bits(from),
+            to: f32::from_bits(to),
+            start,
+        };
+        let (from, to, start, next) = b.frequency;
+        samplez_dsp::ToneRamps {
+            level: glide(b.level),
+            frequency: samplez_dsp::tone::Frequency {
+                from,
+                to,
+                start,
+                next,
+            },
+            ident: glide(b.ident),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

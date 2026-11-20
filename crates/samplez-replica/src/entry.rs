@@ -252,8 +252,10 @@ pub enum Body {
 
 /// The log protocol this binary writes and applies: 2 adds the
 /// generation flags ([`Command::generation`]), which a binary of
-/// protocol 1 ignores.
-pub const PROTOCOL: u32 = 2;
+/// protocol 1 ignores; 3 adds the tone generator's engine entry
+/// (`samplez::Entry::Tone`) and targets (`samplez::Targets::tones`),
+/// which a product's records carry.
+pub const PROTOCOL: u32 = 3;
 
 impl Body {
     /// An entry whose generation every replica builds on receipt: an
@@ -467,6 +469,17 @@ mod tests {
         };
         assert!(decode(expiry).is_ok());
         assert!(decode(Body::Protocol(PROTOCOL)).is_err());
+    }
+
+    /// The protocol is pinned, as `samplez::COMPUTE_VERSION`'s rows pin
+    /// what that version stands for: a change to the log's wire format,
+    /// the replicated semantics or the page hash and fingerprint
+    /// computation bumps it, with the reason added here, and only such a
+    /// change does. 2: the generation flags; 3: the tone generator's
+    /// entry and targets.
+    #[test]
+    fn the_protocol_is_pinned() {
+        assert_eq!(PROTOCOL, 3);
     }
 
     /// The entries the leader flagged for a generation need one, so a

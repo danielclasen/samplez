@@ -1097,6 +1097,8 @@ mod tests {
                 let state = samplez::ProductState {
                     limiters: Vec::new(),
                     delays: Vec::new(),
+                    tones: Vec::new(),
+                    tone_ramps: Vec::new(),
                     gains: Vec::new(),
                     up: Vec::new(),
                     flows: Vec::new(),

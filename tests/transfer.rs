@@ -800,6 +800,8 @@ fn a_product_state_sets_the_delay() {
     let state = |delays| ProductState {
         limiters: Vec::new(),
         delays,
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: common::diagonal(2, 1.0),
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -832,6 +834,122 @@ fn a_product_state_sets_the_delay() {
     let taps = k0.core.delay_taps(0).unwrap();
     assert_eq!((taps.from, taps.to), (0, 4800), "{taps:?}");
     assert_eq!(taps.start, (j + 1) * B);
+}
+
+/// A product state's tone ramps are installed as they are: a generator
+/// rebuilt mid level ramp, mid frequency crossfade with a change waiting
+/// behind it and mid ident switch computes, from the install on, the bits
+/// of a generator that took the same changes unbroken, per leg. Its ramp
+/// is two seconds, so the install lands inside it. Fails with the held
+/// target taking the ramps' place in `install_product`
+/// (`ramps.or(held)?` replaced by `held.or(ramps)?`).
+#[test]
+fn a_product_state_resumes_the_tone_ramps() {
+    const TONE_RAMP: u32 = 96_000;
+    let domain = Domain::new();
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": MARGIN,
+        "rampSamples": TONE_RAMP,
+        "libmxl": common::libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "tone", "tone": {}, "channels": 2 }],
+        "outputs": [{ "name": "out", "domain": "d", "flowId": new_id(), "label": "tone",
+                      "group": "samplez-test", "role": "Audio", "channels": 2 }],
+        "matrix": [[1.0, 0.0], [0.0, 1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let config = Config::parse(&v.to_string()).unwrap();
+    let (report_tx, _reports) = sync_channel(64);
+    let process = samplez::rt::setup_process(&config.rt);
+    let replication = Replication {
+        voters: 2,
+        reports: report_tx,
+        statuses: None,
+        hashes: None,
+    };
+    let e = Engine::start_replicated(config, process, None, replication).unwrap();
+    wait_for(Duration::from_secs(5), "realised", || {
+        e.status().outputs[0].realised
+    });
+    // The changes, at absolute indices before the install: the level and
+    // ident ramping from `base`, the level again from the second, the
+    // frequency crossfading to 440 Hz with 1 kHz waiting behind it.
+    let base = (now_block() + 10) * B;
+    let p = |frequency_hz, level_db, ident| samplez_dsp::ToneParams {
+        frequency_hz,
+        level_db,
+        ident,
+    };
+    let changes = [
+        (base, p(440, -6.0, true)),
+        (base + 10 * B, p(1000, -3.0, true)),
+    ];
+    let mut ramps = samplez_dsp::ToneRamps::default();
+    for &(at, params) in &changes {
+        assert!(ramps.set(at, params, TONE_RAMP));
+    }
+    assert_eq!(ramps.frequency.next, Some(1000), "a change waiting");
+    let state = ProductState {
+        limiters: Vec::new(),
+        delays: Vec::new(),
+        tones: vec![Some(changes[1].1)],
+        tone_ramps: vec![Some(ramps)],
+        gains: diagonal(2, 1.0),
+        up: vec![true],
+        flows: vec![None],
+        outputs: Vec::new(),
+        loudness_running: Vec::new(),
+        strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
+        pending: Vec::new(),
+        fading: Vec::new(),
+        last_id: 1,
+    };
+    let j = e
+        .install_product(&state, base + 100 * B, Duration::from_secs(2))
+        .unwrap();
+    let from = (j + 1) * B;
+    let to = from + 9600;
+    assert!(
+        to < base + u64::from(TONE_RAMP),
+        "installed at {from}, past the ramps from {base}"
+    );
+    let c = loop {
+        let c = copy(&e);
+        if c.k0 > j {
+            break c;
+        }
+    };
+    // A generator that took the changes unbroken, from `base` on, per leg.
+    let mut unbroken = samplez_dsp::Tone::new(2, 48_000, TONE_RAMP);
+    let mut want = [Vec::new(), Vec::new()];
+    let ends = [changes[1].0, to];
+    for (&(at, params), &end) in changes.iter().zip(&ends) {
+        assert!(unbroken.set(at, params));
+        let frames = (end - at) as usize;
+        let mut buf = vec![0.0; 2 * frames];
+        unbroken.process(at, &mut buf, frames);
+        for (leg, w) in want.iter_mut().enumerate() {
+            w.extend_from_slice(&buf[leg * frames..(leg + 1) * frames]);
+        }
+    }
+    // The installed generator, its ramps functions of the index, from the
+    // install's first sample on.
+    let mut installed = *c.core.tone(0).expect("a tone generator in the core");
+    let frames = (to - from) as usize;
+    let mut got = vec![0.0; 2 * frames];
+    installed.process(from, &mut got, frames);
+    let skip = (from - base) as usize;
+    for (leg, w) in want.iter().enumerate() {
+        for i in 0..frames {
+            let (x, y) = (got[leg * frames + i], w[skip + i]);
+            let at = from + i as u64;
+            assert_eq!(x.to_bits(), y.to_bits(), "leg {leg} at {at}");
+        }
+    }
+    e.stop();
 }
 
 /// An entry the replay applied before the hand-over, which reaches the
@@ -997,6 +1115,8 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
     let mut state = ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
 
@@ -1078,6 +1198,8 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
     let state = ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -1120,6 +1242,8 @@ fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: vec![vec![0.25, 0.0], vec![0.0, 0.5]],
             up: vec![true],
             flows: vec![Some(src.clone())],
@@ -1195,6 +1319,8 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
     let state = ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
@@ -1239,6 +1365,8 @@ fn a_product_entry_the_install_passed_is_folded_in() {
     let state = ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
@@ -1347,6 +1475,8 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: identity,
             up: vec![true, true],
             flows: vec![None, Some(other.clone())],
@@ -1391,6 +1521,8 @@ fn a_product_state_disables_and_enables_an_output() {
     let state = |outputs: Vec<bool>, pending: Vec<(u64, u64, Entry)>| ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: common::diagonal(2, 1.0),
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -1454,6 +1586,8 @@ fn a_product_state_sets_the_limiter() {
     let state = |limiters| ProductState {
         limiters,
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: common::diagonal(2, 4.0),
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -1663,6 +1797,8 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
 
@@ -1726,6 +1862,8 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: diagonal(2, 4.0),
             up: vec![true],
             flows: vec![Some(src.clone())],
@@ -1791,6 +1929,8 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
     let state = ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
@@ -1886,6 +2026,8 @@ fn a_route_the_core_carried_is_not_applied_again() {
     let state = ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true],
 
@@ -2250,6 +2392,8 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
             flows: vec![Some(next.clone())],
@@ -2370,6 +2514,8 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
     let state = ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         up: vec![true, true],
         flows: vec![Some(src0.clone()), Some(next1.clone())],
@@ -2461,6 +2607,8 @@ fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true, true],
             flows: vec![Some(next0.clone()), Some(src1.clone())],
@@ -2644,6 +2792,8 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
             fading: Vec::new(),
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             up: vec![true],
             flows: vec![Some(src.clone())],
@@ -2736,6 +2886,8 @@ fn an_install_leaving_an_output_out_starts_it_as_configured() {
         let state = ProductState {
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             gains: vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 1.0]],
             up: vec![true],
             flows: vec![Some(src.clone())],
@@ -3081,6 +3233,8 @@ fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), S
         fading: vec![vec![fading, None], vec![None, fading]],
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![0.25, 0.0], vec![0.0, 0.25]],
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -3173,6 +3327,8 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
         fading: vec![vec![Some(fade), None], vec![None, None]],
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![0.25, 0.0], vec![0.0, 1.0]],
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -3270,6 +3426,8 @@ fn rebuilt_replica_continues_plain_ramps(chained: bool) -> Result<(), String> {
         fading: vec![vec![Some(last), None], vec![None, None]],
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![target, 0.0], vec![0.0, 1.0]],
         up: vec![true],
         flows: vec![Some(src.clone())],
@@ -3457,6 +3615,8 @@ fn a_rebuilt_replica_keeps_a_meter_paused() {
             strips: vec![Vec::new()],
             limiters: Vec::new(),
             delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),

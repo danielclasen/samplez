@@ -274,6 +274,18 @@ pub fn add_meter(config: &mut Config, name: &str, channels: u32, gain: f32) {
     }
 }
 
+/// Adds a tone generator of `channels` legs named `name`, leg `l`
+/// feeding matrix column `l` at `gain`.
+pub fn add_tone(config: &mut Config, name: &str, channels: u32, gain: f32) {
+    let input = serde_json::json!({ "name": name, "tone": {}, "channels": channels });
+    config.inputs.push(serde_json::from_value(input).unwrap());
+    let columns = config.columns();
+    for leg in 0..channels as usize {
+        let row = (0..columns).map(|c| if c == leg { gain } else { 0.0 });
+        config.matrix.push(row.collect());
+    }
+}
+
 pub fn diagonal(channels: usize, g: f32) -> Vec<Vec<f32>> {
     (0..channels)
         .map(|i| {
@@ -823,6 +835,8 @@ pub fn hold_scenario(e: &Engine) {
     let state = samplez::ProductState {
         limiters: Vec::new(),
         delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
         gains: vec![vec![1.0]],
         up: vec![true],
         flows: e
