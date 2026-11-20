@@ -144,7 +144,7 @@ releases its writers, which deletes the output flows.
                 "flowId": "6fbec3b1-1b0f-417d-9059-8b94a47197ed",
                 "label": "hop out", "group": "hop", "role": "Audio", "channels": 1 }],
   "matrix": [[0.5], [0.5]],
-  "rt": { "enabled": true, "priority": 70, "rtCpu": "auto" }
+  "rt": { "enabled": true, "priority": 70, "rtCpu": "auto", "isolateRtCpu": true }
 }
 ```
 
@@ -530,6 +530,18 @@ SCHED_FIFO for the RT thread, FTZ/DAZ and blocked signals on it.
 `SAMPLEZ_CPU_REQUEST_MILLICORES` and `SAMPLEZ_CPU_LIMIT_MILLICORES` are
 equal whole CPUs matching the allowed set and the cgroup CPU quota is
 unlimited or the same size.
+
+With the RT thread pinned and `rt.isolateRtCpu` true (the default),
+`setup_process` sets the calling thread's affinity to the allowed CPUs
+without the RT thread's, so every thread created after it, the engine's
+and the embedding process's alike, inherits that set and only the RT
+thread, which pins itself, runs on its CPU. A time-shared thread on the
+RT CPU would wait out every block the RT thread computes. It applies to
+threads created after `setup_process`, which is why it runs before any
+other thread exists. With one allowed CPU, or the RT thread not pinned,
+it is off. Its step is `isolation` in the process status. Should the RT
+thread then fail to pin itself, its `affinity` step is degraded and the
+CPU left out stays idle.
 
 ## Replicated mode
 
