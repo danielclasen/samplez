@@ -5,3 +5,9 @@ rtsan.log
 /nmos-specs
 /nmos-testing
 /nmos-results
+/.claude/worktrees/
+graphify-out/
+.graphify/
+.graphify-cache/
+.desloppify/
+scorecard.png
