@@ -1038,6 +1038,34 @@ stopped; otherwise the replica ran under another configuration than the
 set's, holds another state and is rebuilt from an empty volume. A
 configuration change of that kind is made with every replica stopped.
 
+A replica's compatibility key (`rollout::key`) is a hash of three
+versions (`rollout::Versions`) and the output config, and nothing else:
+`samplez::COMPUTE_VERSION`, bumped when the engine computes other
+samples or meters from the same log and inputs, a dependency or
+toolchain change included, or a core copy holds something else;
+`PROTOCOL`, bumped when the log's wire format or the library's
+replicated semantics change: the state machine, the `Entry` variants,
+the `Targets` fields, restamp and void handling, anything a product's
+version cannot see; and the product's `Product::DERIVATION_VERSION`,
+bumped when the same log would apply to another state, derive other
+entries or save another state. `samplez-dsp` pins `libm` to one exact
+version, since another can compute other bits; a product pins it
+likewise, so its build resolves the same one. A release
+that bumps none of them keeps every replica's key, so its pods roll into
+a running set as peers; a core copy is taken only at an equal
+`COMPUTE_VERSION`. Two goldens pin what the version stands for:
+`tests/golden.rs` the bits the DSP kernels compute on a fixed signal,
+and `src/engine/golden.rs` the bits the RT loop computes offline from a
+fixed scene, log and input source, its columns' samples apart from
+every value its meters send, its outputs' page hashes, and the encoded
+core copy of its state. Their hashes sit in tables with a row per
+`COMPUTE_VERSION`: a change that moves any of them fails until the
+version is bumped and a row added. The pages' entry fingerprints are a
+single pinned value: replicas compare page hashes and fingerprints, so
+a change to how either is computed bumps `PROTOCOL`, also where the
+samples stay the same, and the fingerprint value is replaced with that
+bump.
+
 A replica set agrees on its cluster id through the marker ConfigMap that
 ordinal 0 creates on an empty volume (`bootstrap::Kube`). Given the audio
 StatefulSet's name, the one `rollout::follow` reads, with

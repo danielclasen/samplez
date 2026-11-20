@@ -1176,6 +1176,7 @@ mod tests {
     }
 
     impl Product for Mixer {
+        const DERIVATION_VERSION: u32 = 1;
         type Change = ();
         fn apply(
             &mut self,

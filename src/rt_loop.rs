@@ -717,6 +717,11 @@ pub(crate) struct Slot {
     /// The slot's delay line, run after the strip; none on a slot
     /// configured without one.
     pub delay: Option<Delay>,
+    /// The flow the slot reads from [`Rt::test_input`]: the re-routes
+    /// swapped in so far. Its outgoing flow in a crossfade is the one
+    /// before.
+    #[cfg(test)]
+    pub flow: u32,
 }
 
 impl Slot {
@@ -749,6 +754,8 @@ impl Slot {
             strip: (channels <= MAX_LEGS).then(|| Strip::new(channels, ramp)),
             strip_pos: None,
             delay: None,
+            #[cfg(test)]
+            flow: 0,
         }
     }
 
@@ -1826,6 +1833,41 @@ pub(crate) struct Rt {
     /// The index below which a detected clock step lowered F, until the
     /// step is cleared.
     pub step_at: Option<u64>,
+    /// Feeds every readable slot no generation holds a reader for, and
+    /// the outgoing flow of its crossfade, from this source instead of
+    /// silence, its blocks counted copied: an offline loop then computes
+    /// what the loop computes from flows carrying these samples.
+    #[cfg(test)]
+    pub test_input: Option<TestInput>,
+}
+
+/// A deterministic input for [`Rt::test_input`]: the sample of channel
+/// `channel` of flow `flow` of slot `slot` at index `index`.
+#[cfg(test)]
+pub(crate) type TestInput = fn(slot: usize, flow: u32, channel: usize, index: u64) -> f32;
+
+/// Fills `dst`, channels of `b` samples each, with `source`'s samples of
+/// flow `flow` of slot `slot` from index `start` on: true, the block
+/// copied. Without a source it is silence, and false.
+#[cfg(test)]
+fn synthesize(
+    source: Option<TestInput>,
+    slot: usize,
+    flow: u32,
+    start: u64,
+    b: usize,
+    dst: &mut [f32],
+) -> bool {
+    let Some(f) = source else {
+        dst.fill(0.0);
+        return false;
+    };
+    for (c, ch) in dst.chunks_exact_mut(b).enumerate() {
+        for (n, v) in ch.iter_mut().enumerate() {
+            *v = f(slot, flow, c, start + n as u64);
+        }
+    }
+    true
 }
 
 /// A member flow's writer as the hold ring's sink.
@@ -2538,7 +2580,7 @@ impl Rt {
     }
 
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
-    fn drain_commands(&mut self, newest: u64) {
+    pub(crate) fn drain_commands(&mut self, newest: u64) {
         loop {
             // Each command may return one object.
             if self.ret.slots() == 0 {
@@ -2795,6 +2837,10 @@ impl Rt {
             let slot = &mut self.slots[i];
             slot.held = held;
             if rerouted & bit(i) != 0 {
+                #[cfg(test)]
+                {
+                    slot.flow += 1;
+                }
                 slot.prev = slot.state.clone();
                 let s = &mut slot.state;
                 s.last_end = None;
@@ -3244,6 +3290,11 @@ impl Rt {
                     }
                     outcome == Outcome::Copy
                 }
+                #[cfg(test)]
+                None if self.test_input.is_some() && readable && !slot.detached => {
+                    let at = start.saturating_add_signed(slot.offset);
+                    synthesize(self.test_input, i, slot.flow, at, b, dst)
+                }
                 None => {
                     dst.fill(0.0);
                     false
@@ -3269,6 +3320,19 @@ impl Rt {
                         let group = &self.statuses[slot.domain];
                         input.read(&mut slot.prev, k, group, old) == Outcome::Copy
                     });
+                #[cfg(test)]
+                let old_copied = old_copied
+                    || (self.test_input.is_some()
+                        && slot.flow > 0
+                        && generation.is_none_or(|g| g.mxl.outgoing(i).is_none())
+                        && synthesize(
+                            self.test_input,
+                            i,
+                            slot.flow - 1,
+                            start.saturating_add_signed(slot.offset),
+                            b,
+                            old,
+                        ));
                 if !old_copied {
                     failed_out |= 1 << i;
                 }
@@ -4565,6 +4629,7 @@ mod tests {
 
     fn slot(up: bool, held: bool, fade: Option<u64>, silenced: bool, xfade: Option<u64>) -> Slot {
         Slot {
+            flow: 0,
             domain: 0,
             first_channel: 0,
             channels: 1,

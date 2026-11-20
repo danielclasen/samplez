@@ -124,6 +124,7 @@ fn parse(command: &[u8]) -> (String, String, u64) {
 }
 
 impl Product for Paths {
+    const DERIVATION_VERSION: u32 = 1;
     type Change = (String, String);
 
     fn apply(&mut self, origin: &Origin, command: &[u8], _: &Apply) -> Effect<(String, String)> {
@@ -1870,7 +1871,7 @@ impl<P: Product> Set<P> {
                 .versions
                 .get(&id)
                 .cloned()
-                .unwrap_or((1, "r1".to_owned()));
+                .unwrap_or((base_key(), "r1".to_owned()));
             let rollout = Fixed::new(key, Some(revision));
             rollout.set_target(self.target.clone());
             replica.rollout(rollout.clone()).expect("contact runs");
@@ -2137,4 +2138,10 @@ impl Drop for PanicGuard {
             panic!("a task panicked during the test");
         }
     }
+}
+
+/// The compatibility key every replica starts with unless a test rolls it
+/// to another: this build's versions running [`Paths`].
+pub fn base_key() -> u64 {
+    samplez_replica::rollout::key::<Paths>(b"harness")
 }

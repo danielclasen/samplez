@@ -123,6 +123,14 @@ pub trait Product: Send + Sync + 'static {
     /// member reports another one.
     fn config_hash(&self) -> u64;
 
+    /// The version of how the product derives its state and engine
+    /// entries from the log: bumped when the same log would apply to
+    /// another state, derive other entries or save another state. It is
+    /// part of the compatibility key ([`crate::rollout::Versions`]), so
+    /// replicas of a release that keeps it roll in as peers and others
+    /// hand the baseline over.
+    const DERIVATION_VERSION: u32;
+
     /// The input slot a `Route` body re-routes, so the state machine keeps
     /// only the latest passed route per slot; none keeps every distinct
     /// passed route.
@@ -1215,6 +1223,7 @@ pub(crate) mod tests {
     }
 
     impl Product for Paths {
+        const DERIVATION_VERSION: u32 = 1;
         type Change = (String, String);
 
         fn apply(
@@ -2039,6 +2048,7 @@ mod derive_tests {
     }
 
     impl Product for Desk {
+        const DERIVATION_VERSION: u32 = 1;
         type Change = ();
         const DRIVES_ENGINE: bool = true;
 
@@ -3224,6 +3234,7 @@ mod ramp_tests {
     }
 
     impl Product for Gain1 {
+        const DERIVATION_VERSION: u32 = 1;
         type Change = ();
         const DRIVES_ENGINE: bool = true;
 

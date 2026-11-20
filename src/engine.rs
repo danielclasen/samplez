@@ -1140,6 +1140,8 @@ pub(crate) fn replay_rt(
         stop: Arc::new(AtomicBool::new(false)),
         replica: Some(replica),
         step_at: None,
+        #[cfg(test)]
+        test_input: None,
     }
 }
 
@@ -1502,6 +1504,8 @@ impl Engine {
             stop: Arc::clone(&stop),
             replica: rt_replica,
             step_at: None,
+            #[cfg(test)]
+            test_input: None,
         };
 
         let (thread_tx, thread_rx) = mpsc::sync_channel::<ThreadStatus>(1);
@@ -5009,6 +5013,9 @@ fn minor_faults(tid: i32) -> Option<u64> {
     // Field 10, counted from the state field after the command name.
     stat.rsplit_once(") ")?.1.split(' ').nth(7)?.parse().ok()
 }
+
+#[cfg(test)]
+mod golden;
 
 #[cfg(test)]
 mod tests {
