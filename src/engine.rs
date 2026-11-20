@@ -94,6 +94,13 @@ pub struct InputStatus {
     /// The input's state in the log: up from an `InputUp`, down from an
     /// `InputDown` entry, applied by the RT thread.
     pub up: bool,
+    /// Whether the engine reads the input's flow, for input liveness:
+    /// `Some(true)` attached, or down in the log and polled with its head
+    /// advancing for a second as `InputReadable` asks; `Some(false)`
+    /// otherwise pruned; `None` while it waits for its generation, as from
+    /// start-up to the first build, or is detached, which says nothing of
+    /// its flow.
+    pub readable: Option<bool>,
     /// The flow the input reads, changed by `Route` entries; for a
     /// detached input, the flow it read last, empty for one that has read
     /// none.
@@ -1548,6 +1555,7 @@ impl Engine {
                         InputState::Detached
                     },
                     up: true,
+                    readable: None,
                     flow_id: i.flow_id.clone().unwrap_or_default(),
                     error: None,
                     margin_short: None,
@@ -3522,6 +3530,18 @@ fn detach_routing(state: &SupState, end: u64, flow: &str) -> Option<(u64, String
     (!matches!(state, SupState::Pruned { .. })).then(|| (end, flow.to_owned()))
 }
 
+/// What a slot in `state` says of its flow in input liveness
+/// ([`InputStatus::readable`]): read when attached, read when pruned with
+/// its head `advancing` for the recovery period, else not; nothing while
+/// it waits for its generation or is detached.
+fn liveness_vote(state: &SupState, advancing: bool) -> Option<bool> {
+    match state {
+        SupState::Attached => Some(true),
+        SupState::Pruned { .. } => Some(advancing),
+        SupState::Wanted | SupState::Detached => None,
+    }
+}
+
 struct SupSlot {
     state: SupState,
     window: VecDeque<SlotStats>,
@@ -3989,7 +4009,10 @@ impl Supervisor {
             held,
         };
         self.slots[slot].reported = false;
-        self.status().inputs[slot].state = InputState::Pruned;
+        let mut st = self.status();
+        st.inputs[slot].state = InputState::Pruned;
+        st.inputs[slot].readable = liveness_vote(&self.slots[slot].state, false);
+        drop(st);
         if report {
             self.report(Report::InputPruned { slot });
         }
@@ -4094,9 +4117,11 @@ impl Supervisor {
                 heads.insert((d, id.clone()), head.map(|h| (h, limit)));
             }
         }
-        for slot in 0..self.slots.len() {
+        let mut readable = vec![None; self.slots.len()];
+        for (slot, vote) in readable.iter_mut().enumerate() {
             let d = self.input_domain(slot);
             let s = &mut self.slots[slot];
+            *vote = liveness_vote(&s.state, false);
             let polled = heads.get(&(d, s.flow.clone())).copied().flatten();
             let SupState::Pruned { recovery: r, .. } = &mut s.state else {
                 continue;
@@ -4120,12 +4145,20 @@ impl Supervisor {
                 log(format_args!("input {name} advancing again, re-adding"));
                 self.release_poll(slot);
                 self.slots[slot].state = SupState::Wanted;
+                *vote = liveness_vote(&self.slots[slot].state, true);
                 self.dirty[d] = true;
-            } else if !s.reported && self.report(Report::InputReadable { slot }) {
-                let name = &self.config.inputs[slot].name;
-                log(format_args!("input {name} advancing again, reported"));
-                self.slots[slot].reported = true;
+            } else {
+                *vote = liveness_vote(&s.state, true);
+                if !s.reported && self.report(Report::InputReadable { slot }) {
+                    let name = &self.config.inputs[slot].name;
+                    log(format_args!("input {name} advancing again, reported"));
+                    self.slots[slot].reported = true;
+                }
             }
+        }
+        let mut st = self.status();
+        for (input, readable) in st.inputs.iter_mut().zip(readable) {
+            input.readable = readable;
         }
     }
 
@@ -4355,7 +4388,9 @@ impl Supervisor {
                 ));
             }
             self.slots[slot].state = SupState::Attached;
-            self.status().inputs[slot].state = InputState::Attached;
+            let mut st = self.status();
+            st.inputs[slot].state = InputState::Attached;
+            st.inputs[slot].readable = liveness_vote(&self.slots[slot].state, false);
         }
     }
 
@@ -5104,6 +5139,22 @@ mod tests {
         for state in [SupState::Attached, SupState::Wanted] {
             assert_eq!(detach_routing(&state, 9, "f"), Some((9, "f".to_owned())));
         }
+    }
+
+    /// A slot waiting for its generation, as after an `InputUp` or a
+    /// `Route` while the build lags, has no say in input liveness: its
+    /// flow is neither read nor known lost yet. Nor has a detached one.
+    #[test]
+    fn a_slot_waiting_for_its_generation_casts_no_liveness_vote() {
+        let pruned = SupState::Pruned {
+            recovery: Recovery::default(),
+            held: false,
+        };
+        assert_eq!(liveness_vote(&SupState::Wanted, true), None);
+        assert_eq!(liveness_vote(&SupState::Detached, true), None);
+        assert_eq!(liveness_vote(&SupState::Attached, false), Some(true));
+        assert_eq!(liveness_vote(&pruned, false), Some(false));
+        assert_eq!(liveness_vote(&pruned, true), Some(true));
     }
 
     /// A 10 s window of stats, each sample 1 s of 48 kHz with a head
@@ -6461,18 +6512,26 @@ mod tests {
             let s = e.status();
             s.inputs[0].up && s.inputs[0].state == InputState::Attached
         };
+        // Readable while attached, past the polls after the attach too.
+        let readable = || {
+            std::thread::sleep(3 * POLL_PERIOD);
+            e.status().inputs[0].readable
+        };
         wait(&attached);
+        assert_eq!(readable(), Some(true));
         let late = || e.counters().command_late.load(Relaxed);
 
         STAMP_LATE.store(true, Relaxed);
         p.stop();
         wait(&|| !e.status().inputs[0].up);
+        assert_eq!(readable(), Some(false), "pruned");
         assert_eq!(late(), 1);
         assert!(e.status().diverged.is_some());
 
         STAMP_LATE.store(true, Relaxed);
         let p = producer();
         wait(&attached);
+        assert_eq!(readable(), Some(true));
         assert_eq!(late(), 2);
         e.stop();
         p.stop();

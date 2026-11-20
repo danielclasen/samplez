@@ -516,6 +516,19 @@ fn the_supervisor_moves_the_engines_blocks_through_the_bridge() {
     });
 }
 
+/// A report says which inputs the engine reads: one whose flow nobody
+/// writes is unreadable once its first generation could not attach it,
+/// which counts against it in input liveness, not left out.
+#[test]
+fn a_report_names_an_input_nobody_writes_unreadable() {
+    let domain = Domain::new();
+    let (_engine, audio) = bridge(&domain, 1 << 12);
+    wait_for("the input reported unreadable", || {
+        audio.sample().own.unreadable == 1
+    });
+    assert_eq!(audio.sample().own.readable, 0);
+}
+
 /// Reports carry each output's latest page records, an idle output's
 /// too: uncommitted and without digest while it gives no status, and once
 /// it commits with the degradation its blocks' statuses show.

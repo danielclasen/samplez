@@ -19,6 +19,7 @@ pub mod decide;
 pub mod dedup;
 pub mod entry;
 pub mod horizon;
+pub mod liveness;
 pub mod lock_watch;
 pub mod log_store;
 pub mod membership;
@@ -735,6 +736,21 @@ impl<P: Product> Replica<P> {
     /// Contact as status shows it, once started.
     pub fn contact_metrics(&self) -> Option<contact::Metrics> {
         self.shared.contact.get().map(|c| c.metrics())
+    }
+
+    /// On the leader, with contact running, the inputs whose liveness a
+    /// majority of the audio voters decided against the log, held for
+    /// `pruneAfterBlocks` ([`liveness`]), as an engine reports them:
+    /// `InputPruned` for an input to take down, `InputReadable` for one
+    /// to bring up. A product appends each, as an `InputDown` or `InputUp`
+    /// or as what it does on a lost input instead, in place of its
+    /// engine's own reports. Each is returned once, and again after a
+    /// second while the log does not show it; empty elsewhere.
+    pub fn input_liveness(&self) -> Vec<samplez::Report> {
+        match self.shared.contact.get() {
+            Some(contact) if self.shared.leads() => contact.input_liveness(),
+            _ => Vec::new(),
+        }
     }
 
     /// Whether this replica knows a quorum: as leader, one acknowledged it
@@ -1839,7 +1855,9 @@ impl<P: Product> ReplicatedState for Replica<P> {
 }
 
 /// `samplez_replica_version_mismatch`: 1 for the reason `mismatch` names,
-/// 0 for the other.
+/// 0 for the other. A replica of lower versions reads
+/// `below_baseline_versions` until it is named, past the departure
+/// window ([`rollout::DEPARTED`]) too.
 fn mismatch_samples(mismatch: Option<state::Mismatch>) -> Vec<ReplicaMetric> {
     [
         (state::Mismatch::AwaitingHandOver, "awaiting_hand_over"),
@@ -1851,7 +1869,7 @@ fn mismatch_samples(mismatch: Option<state::Mismatch>) -> Vec<ReplicaMetric> {
     .into_iter()
     .map(|(why, name)| ReplicaMetric {
         name: "samplez_replica_version_mismatch",
-        help: "1 for why the audio replica is in version_mismatch.",
+        help: "1 for why the audio replica is in version_mismatch; below_baseline_versions until it is named, past the departure window too.",
         kind: MetricKind::Gauge,
         labels: vec![("reason", name.to_owned())],
         value: if mismatch == Some(why) { 1.0 } else { 0.0 },

@@ -521,6 +521,16 @@ impl Audio for EngineAudio {
             pages: unwritten.pages.iter().flatten().copied().collect(),
             ..Own::default()
         };
+        for (slot, input) in status.inputs.iter().enumerate().take(64) {
+            if input.state == InputState::Detached {
+                continue;
+            }
+            match input.readable {
+                Some(true) => own.readable |= 1 << slot,
+                Some(false) => own.unreadable |= 1 << slot,
+                None => {}
+            }
+        }
         if let Some(newest) = progress.processed {
             let first = (newest + 1).saturating_sub(self.window);
             unwritten.kept.retain(|u| u.to > first * self.block);

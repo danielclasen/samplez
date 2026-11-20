@@ -68,12 +68,18 @@ pub struct Timing {
     /// How long the minute of slack the apply lead falls on lasts
     /// ([`crate::schedule::MINUTE`]); shorter only in tests.
     pub lead_minute: Duration,
+    /// `pruneAfterBlocks`: how long, in blocks, an input's liveness the
+    /// audio voters decided holds before the leader hands it on
+    /// ([`crate::liveness`]). Contact does not read the engine's
+    /// configuration: the product sets it to its engine's
+    /// `pruneAfterBlocks`.
+    pub prune_after_blocks: u32,
 }
 
 impl Timing {
     /// The defaults at block size `block`: p 2 ms, w 8 ms, D 10 ms, a
     /// margin of 576 samples, clockGuard half of it, maxApplyLead 50 ms,
-    /// resyncBudget 50 ms.
+    /// resyncBudget 50 ms, pruneAfterBlocks 50.
     pub fn defaults(block: u64) -> Timing {
         Timing {
             block,
@@ -85,6 +91,7 @@ impl Timing {
             max_apply_lead: Duration::from_millis(50),
             resync_budget: Duration::from_millis(50),
             lead_minute: crate::schedule::MINUTE,
+            prune_after_blocks: 50,
         }
     }
 
@@ -796,6 +803,7 @@ struct State {
     #[cfg(test)]
     verified_always: bool,
     decider: crate::decide::Decider,
+    liveness: crate::liveness::Liveness,
     /// The audio `/readyz` term, as of the last period in contact; none
     /// before the first.
     serving: Option<bool>,
@@ -1121,6 +1129,7 @@ impl Contact {
                     #[cfg(test)]
                     verified_always: false,
                     decider: crate::decide::Decider::default(),
+                    liveness: crate::liveness::Liveness::default(),
                     serving: None,
                     off_flows_since: None,
                     flows_at: 0,
@@ -1424,6 +1433,7 @@ impl Contact {
         let st = &mut *st;
         let voters = members.voters();
         st.peers.retain(|id, _| voters.contains(id));
+        st.lead_raised_by = st.lead_raised_by.filter(|id| voters.contains(id));
         st.learners
             .retain(|id, _| members.addrs.contains_key(id) && !voters.contains(id));
         st.members = members;
@@ -2648,6 +2658,12 @@ impl Contact {
         }
         st.own.state = Some(state);
         st.own.ready = ready;
+        // Without an engine core, or with one being rebuilt or replayed,
+        // what the inputs read says nothing of their flows.
+        if matches!(state, ReplicaState::Starting | ReplicaState::Resync) {
+            st.own.readable = 0;
+            st.own.unreadable = 0;
+        }
         st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
         // Diverged or resyncing with outputs, or withdrawn once a
         // `Baseline` applied with an output enabled, it writes none of
@@ -2833,6 +2849,15 @@ impl Contact {
         st.leader.step_down();
         st.clock.step_down();
         st.decider.step_down();
+        st.liveness.step_down();
+    }
+
+    /// The leader's changes to the inputs' liveness that held for
+    /// `pruneAfterBlocks` ([`crate::liveness`]), each once.
+    pub fn input_liveness(&self) -> Vec<samplez::Report> {
+        let blocks = u64::from(self.timing.prune_after_blocks) * self.timing.block;
+        let debounce = Duration::from_nanos(time_of(blocks));
+        self.lock().liveness.due(debounce, Instant::now())
     }
 
     /// The leader's decisions this period ([`crate::baseline`]): none
@@ -2843,6 +2868,7 @@ impl Contact {
         let mut st = self.lock();
         let st = &mut *st;
         if !st.in_contact || st.members.configs.is_empty() {
+            st.liveness.step_down();
             return Vec::new();
         }
         let t = self.timing;
@@ -2889,6 +2915,26 @@ impl Contact {
                 }
             })
             .collect();
+        // Input liveness takes a copy by its own age alone, not from when
+        // contact was regained: a copy from before a loss of contact says
+        // nothing of what that voter reads now, and counts only once a
+        // fresh one replaces it.
+        let heard: Vec<Voter> = audio
+            .iter()
+            .map(|v| Voter {
+                id: v.id,
+                silent: copies.get(&v.id).is_none_or(|(age, _)| *age > fresh),
+                own: v.own,
+            })
+            .collect();
+        let (up, down) = crate::liveness::majority(&st.members.configs, &heard);
+        let mut logged_up = u64::MAX;
+        self.log.pending(&mut |_, body| match *body {
+            Body::InputDown { slot, .. } if slot < 64 => logged_up &= !(1 << slot),
+            Body::InputUp { slot, .. } if slot < 64 => logged_up |= 1 << slot,
+            _ => {}
+        });
+        st.liveness.period(up, down, logged_up, now);
         let log = &self.log;
         let committed = st.known_committed;
         let own_term_committed = log.log_id_at(committed).is_some_and(|id| id.term == term);
