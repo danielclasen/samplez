@@ -25,7 +25,7 @@ use crate::log_store::Store;
 use crate::peer::{PeerRequest, PeerResponse};
 use crate::rank::Baselines;
 use crate::report::{Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report, Slack};
-use crate::resync::{CoreReply, Missed, Resynced, Source};
+use crate::resync::{CoreReply, Failed, Missed, Resynced, Source};
 use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
 use crate::state::{Life, PageBook, ReplicaState, Seen, View};
@@ -231,8 +231,8 @@ pub trait Audio: Send + Sync + 'static {
     /// `source` says go. Blocks until handed over or failed. `source`
     /// takes contact's lock, which contact holds while it calls the other
     /// methods here: no lock those take may be held across a call to it.
-    fn resync(&self, _core: &CoreReply, _source: &dyn Source) -> Result<Resynced, String> {
-        Err("no engine to resync".to_owned())
+    fn resync(&self, _core: &CoreReply, _source: &dyn Source) -> Result<Resynced, Failed> {
+        Err("no engine to resync".into())
     }
     /// Whether the engine's inputs read the flows a rebuild from `state`
     /// would have them read. A replay reads the inputs the engine reads,
@@ -790,6 +790,8 @@ struct State {
     /// Voters reporting TAI offset 0.
     offset_zero: Vec<NodeId>,
     /// The donor core's last log id a replay last missed a record after.
+    /// One value only: a repeat of it is not logged again, and a value
+    /// alternating with another is logged on every change.
     missed_after: Option<u64>,
     #[cfg(test)]
     verified_always: bool,
@@ -3556,7 +3558,7 @@ impl Contact {
     /// pages all equal the donor's reported ones leaves the replica to
     /// resume on its next matched page, holding the donor's unresolved
     /// entries as its own; anything else leaves it diverged, to try again.
-    pub fn resync_ended(&self, epoch: u64, donor: NodeId, result: Result<Resynced, String>) {
+    pub fn resync_ended(&self, epoch: u64, donor: NodeId, result: Result<Resynced, Failed>) {
         let Some(audio) = self.audio.clone() else {
             return;
         };
@@ -3565,7 +3567,9 @@ impl Contact {
         let st = &mut *st;
         let result = result.and_then(|r| {
             match crate::resync::mismatch(&r.pages, |o, q| st.pages.get(donor, o, q).copied()) {
-                Some(q) => Err(format!("replayed page {q} differs from the donor's")),
+                Some(q) => Err(Failed::Other(format!(
+                    "replayed page {q} differs from the donor's"
+                ))),
                 None => Ok(r),
             }
         });
@@ -3580,7 +3584,7 @@ impl Contact {
             Ok(r) => r,
             // A missed record is logged where it was found, once per last
             // log id.
-            Err(e) if e == crate::resync::MISSED => {
+            Err(e @ Failed::Missed) => {
                 tracing::debug!(donor, error = %e, "a resync failed");
                 life.resync_failed();
                 return;
@@ -3635,7 +3639,8 @@ impl Contact {
             return Ok(out);
         }
         // Each attempt fetches the newest core, which in a quiet set has
-        // the same last id: logged once per value.
+        // the same last id: logged only when it differs from the last one
+        // missed ([`State::missed_after`]).
         let mut st = self.lock();
         if st.missed_after != Some(after) {
             st.missed_after = Some(after);
@@ -3862,7 +3867,8 @@ async fn resync(
     let core = match core {
         Ok(core) => core,
         Err(e) => {
-            contact.resync_ended(epoch, donor, Err(format!("no core from {donor}: {e}")));
+            let e = Failed::Other(format!("no core from {donor}: {e}"));
+            contact.resync_ended(epoch, donor, Err(e));
             return;
         }
     };
@@ -3878,7 +3884,7 @@ async fn resync(
     };
     let result = tokio::task::spawn_blocking(move || audio.resync(&core, &feed))
         .await
-        .unwrap_or_else(|e| Err(format!("the replay panicked: {e}")));
+        .unwrap_or_else(|e| Err(Failed::Other(format!("the replay panicked: {e}"))));
     contact.resync_ended(epoch, donor, result);
 }
 

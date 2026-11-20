@@ -43,7 +43,7 @@ use samplez_replica::entry::{NodeId, Origin, SessionKey};
 use samplez_replica::membership::{Slot, slot_of};
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest, PeerResponse};
 use samplez_replica::report::{ClockFlags, Own, Page, Report, Run, runs};
-use samplez_replica::resync::{CoreReply, Missed, Resynced, Source};
+use samplez_replica::resync::{CoreReply, Failed, Resynced, Source};
 use samplez_replica::state::ReplicaState;
 use samplez_replica::state_machine::{Apply, Changed, Effect, Product};
 use samplez_replica::{RaftRpcs, RaftTiming, Replica, Settings, TypeConfig, raft_config_with};
@@ -1165,30 +1165,30 @@ impl Audio for FakeAudio {
     /// The replay catches up within `catch_up` blocks and hands over.
     /// `source` is read before the fake's lock is taken: it takes
     /// contact's lock, which contact holds while it calls into the fake.
-    fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, String> {
+    fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, Failed> {
         self.step();
         let replays = self.lock().replays;
         let entries = source.entries(core.last_id);
         let go = source.go();
         if replays {
-            entries.map_err(|Missed| samplez_replica::resync::MISSED.to_owned())?;
+            entries?;
         }
         let mut st = self.lock();
         if !st.resyncs {
-            return Err("resyncs are off".to_owned());
+            return Err("resyncs are off".into());
         }
         if st.failing > 0 {
             st.failing -= 1;
-            return Err("a replay failed".to_owned());
+            return Err("a replay failed".into());
         }
         if !go {
-            return Err("given up".to_owned());
+            return Err("given up".into());
         }
         let (mut donor, reads): (Vec<f32>, Vec<Option<String>>) =
             serde_json::from_str(&core.core).map_err(|e| e.to_string())?;
         if st.route_digests && reads != st.reads(st.computed.unwrap_or(0)) {
             if !st.hands_over_off_flows {
-                return Err("a replayed page differs from the donor's".to_owned());
+                return Err("a replayed page differs from the donor's".into());
             }
             donor.push(OFF_FLOWS);
         }

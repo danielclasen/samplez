@@ -30,7 +30,7 @@ use samplez::{
 
 use crate::contact::{Audio, Sample, Timing};
 use crate::report::{ClockFlags, Own, Page, Unwritten, page_digest, runs};
-use crate::resync::{CoreReply, Missed, Resynced, Source};
+use crate::resync::{CoreReply, Failed, Resynced, Source};
 
 /// How long a rebuild waits for the RT thread to take the core, past the
 /// floor's lead over the engine ([`EngineAudio::rebuild_engine`]).
@@ -701,7 +701,7 @@ impl Audio for EngineAudio {
         None
     }
 
-    fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, String> {
+    fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, Failed> {
         let copy = CoreCopy::decode(&core.core).map_err(|e| e.to_string())?;
         let mut unresolved = copy.core.unresolved().to_vec();
         let mut replay = self.engine.replay(copy).map_err(|e| e.to_string())?;
@@ -710,9 +710,7 @@ impl Audio for EngineAudio {
         let j = loop {
             // A gap is never replayed: the attempt fails, and the next
             // takes a newer core.
-            let records = source
-                .entries(after)
-                .map_err(|Missed| crate::resync::MISSED.to_owned())?;
+            let records = source.entries(after)?;
             // The lowest index of the records from each one on.
             let mut lowest = vec![u64::MAX; records.len() + 1];
             for (n, (_, r)) in records.iter().enumerate().rev() {
@@ -743,7 +741,7 @@ impl Audio for EngineAudio {
                 appended.map_err(|e| e.to_string())?;
             }
             if !source.go() {
-                return Err("given up before the hand-over".to_owned());
+                return Err("given up before the hand-over".into());
             }
             replay.run_to(u64::MAX);
             match self.engine.hand_over(&mut replay, HANDOVER_TRY) {
@@ -752,7 +750,7 @@ impl Audio for EngineAudio {
                 // and the replay are read again.
                 Err(ReplayError::Missed { .. } | ReplayError::Timeout { .. })
                     if Instant::now() < deadline => {}
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(e.to_string().into()),
             }
         };
         // Taken late by the donor after its core and held unresolved, as
