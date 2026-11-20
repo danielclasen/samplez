@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.17.0](https://github.com/danielclasen/samplez/compare/v0.16.0...v0.17.0) (2026-11-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** `samplez::ENGINE_VERSION` is replaced by `samplez::COMPUTE_VERSION: u32`, and a core copy's encoding carries it as a number. `rollout::key` is `rollout::key::<P: Product>(output)`. `Product` has the required associated const `DERIVATION_VERSION`. `samplez-dsp` requires `libm` at exactly 0.2.16.
+* **engine:** `Entry` has the variants `LoudnessRun` and `ResetLoudness`. `Engine::reset_loudness` appends a `ResetLoudness` entry to an engine's own log and returns `GainError`; an engine that follows a replicated log refuses it as invalid. `ResetError` is removed. `Engine::set_loudness_running` is new. `Targets` and `ProductState` have the field `loudness_running`. `OutputMeters` has the fields `paused` and `running`. `samplez_dsp::Slice` has the variant `Paused`. Core copies carry the paused meters. `Targets` has the field `loudness_resets`, one reset epoch per meter. `StateMachine` and the snapshot's `Replicated` have the field `resets`; a snapshot without it loads with none.
+
+### Features
+
+* **engine:** reset and pause loudness through log entries ([2650fc5](https://github.com/danielclasen/samplez/commit/2650fc543bc3155c2d4a48c8e73f4ae148bb7b06))
+* **replica:** key compatibility on explicit versions ([#151](https://github.com/danielclasen/samplez/issues/151)) ([d29e070](https://github.com/danielclasen/samplez/commit/d29e0702ce2fa3e1f89cc073797c3a85696075ac))
+
+
+### Bug Fixes
+
+* **replica:** replay a resync from before a snapshot with no record ([#155](https://github.com/danielclasen/samplez/issues/155)) ([bf48522](https://github.com/danielclasen/samplez/commit/bf48522ad30b87cdfdb655ab706c5b39fef6942c))
+
 ## [0.16.0](https://github.com/danielclasen/samplez/compare/v0.15.0...v0.16.0) (2026-11-20)
 
 
