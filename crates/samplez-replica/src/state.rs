@@ -1064,6 +1064,7 @@ mod tests {
                     up: Vec::new(),
                     flows: Vec::new(),
                     outputs: Vec::new(),
+                    loudness_running: Vec::new(),
                     strips: Vec::new(),
                     ducks: Vec::new(),
                     masks: Vec::new(),

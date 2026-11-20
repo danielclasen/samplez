@@ -1009,6 +1009,7 @@ impl<P: Product> StateMachine<P> {
             up,
             flows: targets.flows,
             outputs: targets.outputs,
+            loudness_running: targets.loudness_running,
             strips: targets.strips,
             delays: targets.delays,
             ducks: targets.ducks,
@@ -1969,7 +1970,7 @@ mod derive_tests {
     /// the slot's fader times the VCA, slot 1 silent while a session holds
     /// solo on slot 0. Commands: `fader <slot> <gain>`, `vca <gain>`,
     /// `trim <slot> <db>`, `route <slot> <flow>`, `pair <flow> <flow>`
-    /// (both slots), `solo`, `noop`, `stale`.
+    /// (both slots), `pause <meter> <0|1>`, `solo`, `noop`, `stale`.
     /// The input domain of each slot, as configured.
     const DOMAINS: [u8; 2] = [0, 1];
 
@@ -1983,6 +1984,9 @@ mod derive_tests {
         /// Slot 1 ducked by group 0 on its coefficient.
         #[serde(default)]
         ducked: bool,
+        /// Per meter, its loudness measurement paused.
+        #[serde(default)]
+        paused: [bool; 2],
     }
 
     impl Desk {
@@ -1994,6 +1998,7 @@ mod derive_tests {
                 flows: ["a".into(), "b".into()],
                 solo: None,
                 ducked: false,
+                paused: [false; 2],
             }
         }
     }
@@ -2011,6 +2016,7 @@ mod derive_tests {
                 }
                 ["vca", gain] => self.vca = gain.parse().unwrap(),
                 ["duck", on] => self.ducked = on == "1",
+                ["pause", meter, on] => self.paused[meter.parse::<usize>().unwrap()] = on == "1",
                 ["trim", slot, db] => {
                     self.trims[slot.parse::<usize>().unwrap()] = db.parse().unwrap()
                 }
@@ -2070,6 +2076,12 @@ mod derive_tests {
                     .map(|&db| vec![StripParam::Trim { db }])
                     .collect(),
                 masks: vec![vec![0], vec![u8::from(self.ducked)]],
+                // Listed only while a meter is paused.
+                loudness_running: if self.paused.contains(&true) {
+                    self.paused.iter().map(|&p| !p).collect()
+                } else {
+                    Vec::new()
+                },
                 ..Targets::default()
             })
         }
@@ -2112,6 +2124,22 @@ mod derive_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A command pausing a meter derives its `LoudnessRun`, and one
+    /// running it again another, at the command's index; the product state
+    /// carries the meter paused, so a rebuilt engine pauses it too.
+    #[test]
+    fn a_meter_paused_by_a_command_derives_its_entry_and_state() {
+        let mut sm = machine();
+        sm.apply_at(1, 1, &one("1", "pause 1 1", 0, 960, None));
+        let run = |running| Entry::LoudnessRun { meter: 1, running };
+        assert_eq!(sm.records[&1].entries, [run(false)]);
+        assert_eq!(sm.records[&1].at_index, 960);
+        assert_eq!(sm.product_state(1).loudness_running, [true, false]);
+        sm.apply_at(2, 1, &one("2", "pause 1 0", 48, 1008, None));
+        assert_eq!(sm.records[&2].entries, [run(true)]);
+        assert!(sm.product_state(2).loudness_running.is_empty());
     }
 
     /// The product state carries the ramp each plain gain entry left the

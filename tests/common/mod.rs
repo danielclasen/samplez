@@ -791,6 +791,15 @@ pub fn hold_scenario(e: &Engine) {
         e.append(id, at, samplez::Entry::Strip { slot: 0, param })
             .unwrap();
     }
+    // The output's loudness paused, reset and run again in one log
+    // entry, folded to a batch, then paused alone, mid-slice.
+    let run = |running| samplez::Entry::LoudnessRun { meter: 0, running };
+    let reset = samplez::Entry::ResetLoudness { meter: 0 };
+    id += 1;
+    e.append_batch(id, at, &[run(false), reset, run(true)])
+        .unwrap();
+    id += 1;
+    e.append(id, at + (PAGE / B + 3) * B, run(false)).unwrap();
     e.commit(id);
     // Applied, their pages hashed, before the core is dropped.
     wait((kp + 10).max((at + 4 * PAGE) / B + PAGE / B));
@@ -823,6 +832,8 @@ pub fn hold_scenario(e: &Engine) {
             .map(|i| Some(i.flow_id.clone()))
             .collect(),
         outputs: Vec::new(),
+        // Rebuilt with the output's loudness paused, as the log left it.
+        loudness_running: vec![false],
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),

@@ -132,6 +132,12 @@ pub enum Slice {
     Gap,
     /// Not all of its samples were measured.
     Lost,
+    /// Measured while the measurement is paused: its power, not finite
+    /// when not all of its samples were measured, keeps the momentary
+    /// and short-term loudness running, but the slice is left out of the
+    /// integrated loudness, the loudness range and the maxima as a gap
+    /// is, and counts in [`Loudness::paused`] alone.
+    Paused(f64),
 }
 
 /// Loudness measurement of one programme, fed one slice at a time.
@@ -142,7 +148,8 @@ pub enum Slice {
 /// and short-term values are taken over consecutive kept slices, on the
 /// 100 ms grid of the kept slices counted from the start of the
 /// measurement. Without such a slice that grid is the 100 ms grid of the
-/// slice index. The momentary and short-term loudness restart after it.
+/// slice index. The momentary and short-term loudness restart after it,
+/// but not after a [`Slice::Paused`] one with a finite power.
 pub struct Loudness {
     edges: Vec<f64>,
     /// Weighted powers of the last [`SHORT`] slices, a ring indexed by the
@@ -165,6 +172,10 @@ pub struct Loudness {
     next: Option<u64>,
     gaps: u64,
     lost: u64,
+    paused: u64,
+    /// The slice index after the last [`Slice::Paused`] one: the maxima
+    /// take no momentary or short-term value reaching back before it.
+    resumed: u64,
     blocks: Histogram,
     short_terms: Histogram,
     max_momentary: Option<f64>,
@@ -191,6 +202,8 @@ impl Loudness {
             next: None,
             gaps: 0,
             lost: 0,
+            paused: 0,
+            resumed: 0,
             blocks: Histogram::new(),
             short_terms: Histogram::new(),
             max_momentary: None,
@@ -204,21 +217,25 @@ impl Loudness {
     /// loudness or the loudness range.
     ///
     /// A [`Slice::Gap`] or a power that is not finite counts in
-    /// [`Loudness::gaps`]; a [`Slice::Lost`], each slice index skipped
-    /// before `index` and a slice out of order count in
-    /// [`Loudness::lost`]. Without a [`Loudness::reset`] the measurement
-    /// starts at the first slice that is not lost, so lost slices before
-    /// it, such as the incomplete first slice of a stream, count nowhere.
+    /// [`Loudness::gaps`], a [`Slice::Paused`] in [`Loudness::paused`];
+    /// a [`Slice::Lost`], each slice index skipped before `index` and a
+    /// slice out of order count in [`Loudness::lost`]. Without a
+    /// [`Loudness::reset`] the measurement starts at the first slice
+    /// that is not lost, so lost slices before it, such as the incomplete
+    /// first slice of a stream, count nowhere.
     pub fn push(&mut self, index: u64, slice: Slice) -> bool {
         if self.last.is_some_and(|l| l.checked_add(1) != Some(index)) {
             self.contiguous = 0;
         }
         self.last = Some(index);
-        let power = match slice {
-            Slice::Power(p) if p.is_finite() => Some(p),
+        // What the momentary and short-term loudness take: a paused
+        // slice's power too.
+        let live = match slice {
+            Slice::Power(p) | Slice::Paused(p) if p.is_finite() => Some(p),
             _ => None,
         };
-        match power {
+        let power = live.filter(|_| matches!(slice, Slice::Power(_)));
+        match live {
             Some(p) => {
                 self.recent[index as usize % SHORT] = p;
                 self.contiguous = (self.contiguous + 1).min(SHORT);
@@ -244,13 +261,19 @@ impl Loudness {
         let Some(p) = power else {
             match slice {
                 Slice::Lost => self.lost += 1,
+                Slice::Paused(_) => {
+                    self.paused += 1;
+                    self.resumed = index.saturating_add(1);
+                }
                 _ => self.gaps += 1,
             }
             return false;
         };
         // The maxima follow the momentary and short-term loudness, over
-        // slices of the measurement only.
-        let since = index - start + 1;
+        // slices of the measurement only, none of them paused.
+        let since = index
+            .checked_sub(start.max(self.resumed))
+            .map_or(0, |d| d.saturating_add(1));
         if let Some(m) = self.mean(index, BLOCK).filter(|_| since >= BLOCK as u64) {
             self.max_momentary = Some(self.max_momentary.map_or(m, |x| x.max(m)));
         }
@@ -279,8 +302,9 @@ impl Loudness {
     }
 
     /// Adds `count` slices from `index` on that were not measured, all
-    /// [`Slice::Gap`] or all [`Slice::Lost`], as [`Loudness::push`] adds
-    /// each, in one step however many they are.
+    /// [`Slice::Gap`], all [`Slice::Paused`] (the power not taken) or all
+    /// [`Slice::Lost`], as [`Loudness::push`] adds each with no power, in
+    /// one step however many they are.
     pub fn skip(&mut self, index: u64, count: u64, slice: Slice) {
         let Some(last) = count.checked_sub(1).and_then(|c| index.checked_add(c)) else {
             return;
@@ -302,10 +326,13 @@ impl Loudness {
             }
         }
         self.next = last.checked_add(1);
-        if gap {
-            self.gaps += count;
-        } else {
-            self.lost += count;
+        match slice {
+            Slice::Lost => self.lost += count,
+            Slice::Paused(_) => {
+                self.paused += count;
+                self.resumed = last.saturating_add(1);
+            }
+            _ => self.gaps += count,
         }
     }
 
@@ -356,6 +383,7 @@ impl Loudness {
         self.kept = 0;
         self.gaps = 0;
         self.lost = 0;
+        self.paused = 0;
         self.blocks.clear();
         self.short_terms.clear();
         self.max_momentary = None;
@@ -377,6 +405,11 @@ impl Loudness {
     /// skipped and slices out of order.
     pub fn lost(&self) -> u64 {
         self.lost
+    }
+
+    /// Slices of the measurement left out as [`Slice::Paused`].
+    pub fn paused(&self) -> u64 {
+        self.paused
     }
 
     /// Momentary loudness of the last 400 ms, LUFS, once 40 contiguous
@@ -766,5 +799,95 @@ mod tests {
         l.skip(0, 0, Slice::Gap);
         l.skip(10, 2, Slice::Gap);
         assert_eq!((l.gaps(), l.lost()), (5, 8), "out of order");
+    }
+
+    /// The integrated loudness and the range over a measurement paused
+    /// for spans, pushed and skipped, are the same bits as a measurement
+    /// of the running slices alone, fed one after the other from the same
+    /// start: a pause takes its slices out of the programme, however loud
+    /// they are. They count as paused, neither gaps nor lost.
+    #[test]
+    fn the_measurement_over_the_running_slices_is_the_one_without_the_paused() {
+        // A level that moves, so every block and short-term value differs.
+        let level = |w: u64| -30.0 + ((w * 7919) % 211) as f64 / 10.0;
+        let (mut l, mut kept) = (Loudness::new(), Loudness::new());
+        let (start, end) = (20, 20 + 40_000);
+        let (mut k, mut paused, mut w) = (start, 0, start);
+        while w < end {
+            match w % 1999 {
+                // Paused, and louder than anything kept.
+                100..400 => {
+                    l.push(w, Slice::Paused(power(level(w) + 15.0)));
+                    paused += 1;
+                }
+                // Paused and skipped.
+                1000 => {
+                    l.skip(w, 250, Slice::Paused(f64::NAN));
+                    paused += 250;
+                    w += 250;
+                    continue;
+                }
+                _ => {
+                    l.push(w, Slice::Power(power(level(w))));
+                    kept.push(k, Slice::Power(power(level(w))));
+                    k += 1;
+                }
+            }
+            w += 1;
+        }
+        assert_eq!((l.gaps(), l.lost(), l.paused()), (0, 0, paused));
+        assert!(paused > 1000);
+        assert!(l.integrated().is_some() && l.range().is_some());
+        assert_eq!(
+            l.integrated().map(f64::to_bits),
+            kept.integrated().map(f64::to_bits)
+        );
+        assert_eq!(l.range().map(f64::to_bits), kept.range().map(f64::to_bits));
+    }
+
+    /// While paused the momentary and short-term loudness follow the
+    /// programme, but the integrated loudness, the range and the maxima
+    /// do not; once running again, the maxima take no momentary value
+    /// whose 400 ms reach back into the pause.
+    #[test]
+    fn the_momentary_loudness_keeps_running_while_paused() {
+        let mut l = Loudness::new();
+        let w = constant(&mut l, 0, 400, -23.0);
+        let (i, r) = (l.integrated(), l.range());
+        for w in w..w + 400 {
+            l.push(w, Slice::Paused(power(-10.0)));
+        }
+        for v in [l.momentary(), l.short_term()] {
+            assert!((v.unwrap() + 10.0).abs() < 1e-9, "{v:?}");
+        }
+        assert_eq!((l.integrated(), l.range()), (i, r));
+        for v in [l.max_momentary(), l.max_short_term()] {
+            assert!((v.unwrap() + 23.0).abs() < 1e-9, "{v:?}");
+        }
+        assert_eq!((l.gaps(), l.lost(), l.paused()), (0, 0, 400));
+        let w = constant(&mut l, w + 400, 39, -23.0);
+        assert!(l.momentary().unwrap() > -22.0, "{:?}", l.momentary());
+        assert!((l.max_momentary().unwrap() + 23.0).abs() < 1e-9);
+        constant(&mut l, w, 1, -23.0);
+        assert!((l.momentary().unwrap() + 23.0).abs() < 1e-9);
+        assert!((l.max_momentary().unwrap() + 23.0).abs() < 1e-9);
+    }
+
+    /// A paused slice counts in `paused` alone, whatever its power, pushed
+    /// or skipped; one without a finite power restarts the momentary
+    /// loudness, as a skip does. Paused slices start a measurement, as
+    /// gaps do, and a reset restarts their count.
+    #[test]
+    fn a_paused_slice_is_neither_a_gap_nor_lost() {
+        let mut l = Loudness::new();
+        l.push(5, Slice::Paused(power(-23.0)));
+        assert_eq!(l.start(), Some(5));
+        let w = constant(&mut l, 6, 100, -23.0);
+        l.push(w, Slice::Paused(f64::NAN));
+        assert_eq!(l.momentary(), None);
+        l.skip(w + 1, 10, Slice::Paused(0.0));
+        assert_eq!((l.gaps(), l.lost(), l.paused()), (0, 0, 12));
+        l.reset(w + 11);
+        assert_eq!(l.paused(), 0);
     }
 }

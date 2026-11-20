@@ -102,6 +102,8 @@ pub fn word_or_skip(word: Option<BlockStatus>, k: u64) -> BlockStatus {
 pub struct EngineAudio {
     engine: Arc<Engine>,
     outputs: usize,
+    /// The outputs and the configured meters.
+    meters: usize,
     block: u64,
     /// Blocks up to the processed one whose statuses reports carry.
     window: u64,
@@ -128,11 +130,16 @@ impl EngineAudio {
         hashes: Receiver<PageHash>,
         timing: &Timing,
     ) -> EngineAudio {
-        let outputs = engine.status().outputs.len();
+        let status = engine.status();
+        let (outputs, meters) = (
+            status.outputs.len(),
+            status.outputs.len() + status.meters.len(),
+        );
         let span = timing.hold + timing.contact_window + 2 * timing.report_period;
         let samples = (span.as_nanos() as u64 * crate::contact::RATE).div_ceil(1_000_000_000);
         EngineAudio {
             outputs,
+            meters,
             engine,
             block: timing.block,
             window: samples.div_ceil(timing.block) + 1,
@@ -348,6 +355,10 @@ impl EngineAudio {
                 }
             };
         }
+        // The running state of meters beyond the engine's is left out, as
+        // the live filter leaves out their entries.
+        dropped += state.loudness_running.len().saturating_sub(self.meters);
+        state.loudness_running.truncate(self.meters);
         // A delay the engine refuses is replaced as the live filter
         // replaces it: no delay; those of slots beyond the engine's left
         // out.

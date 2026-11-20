@@ -26,7 +26,7 @@ pub use ducks::{DuckMeter, DuckSetting, DuckTargets};
 pub use engine::{
     ClockStatus, ControlError, DuckError, Engine, Entry, EntryError, Fade, GainError,
     GenerationStatus, InputState, InputStatus, MeterStatus, OutputStatus, Progress, Replication,
-    Report, ResetError, Status,
+    Report, Status,
 };
 pub use meters::{InputMeters, OutputMeters};
 pub use rt_loop::{BlockVerdict, Counters, LogId, Verdict};

@@ -4,7 +4,7 @@
 //! syscall) inside it aborts the process. The run covers input generation
 //! swaps, a re-route crossfade, detach and route cycles, output disable
 //! and enable cycles, a gain ramp,
-//! output commits, output, meter and input metering and loudness resets,
+//! output commits, output, meter and input metering, loudness resets and pauses,
 //! strips with every unit on, a writer's refusals, a read of selected
 //! channels of a wide flow, and, for a replicated engine, every path of
 //! the hold ring
@@ -120,6 +120,13 @@ fn the_rt_thread_passes_rtsan() {
     engine.reset_loudness(0, reset).unwrap();
     // The meter after the output.
     engine.reset_loudness(1, reset).unwrap();
+    // The meter's loudness paused, and run again mid-slice.
+    engine
+        .set_loudness_running(1, false, (index / B + 30) * B)
+        .unwrap();
+    engine
+        .set_loudness_running(1, true, (index / B + 33) * B)
+        .unwrap();
     std::thread::sleep(Duration::from_millis(500));
     // A re-route: a generation holding both flows, then one without the
     // old flow once the crossfade ended.

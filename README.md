@@ -206,19 +206,40 @@ RMS per channel and the momentary loudness of the input after its
 strip, read or silenced; it has no true peak.
 RMS is referenced to a sine as in AES17: the root mean square times the
 square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
-`Engine::reset_loudness` restarts the measurement of an output or a
-meter at a sample index.
+
+A meter's measurement is reset and paused by log entries, applied at
+their index like every other entry, so every replica following the log
+resets and pauses it at the same sample; the log decides, not a
+replica's own timing. Meters are numbered as their statuses are: the
+outputs, then the configured meters. A `ResetLoudness` entry restarts the
+measurement (the integrated loudness, the loudness range, the maxima and
+the counts below) at the first 100 ms window starting at or after its
+index. A `LoudnessRun` entry pauses the measurement from its index, or
+runs it again: every 10 ms slice with a sample metered while paused,
+computed or skipped, is left out of the integrated loudness, the
+loudness range and the maxima as a gap is, but counted in `paused`, not
+in `gaps` or `lost`, and the momentary and short-term loudness keep
+following the output through it. Once the measurement runs again, the
+maxima take no momentary or short-term value reaching back into the
+pause. Each meter's status reports `running`: whether the last slice
+metered was not paused, so a slice the log paused or ran again within
+reads paused. Every meter starts running. A standalone engine takes
+both through `Engine::reset_loudness` and
+`Engine::set_loudness_running`, which append the entries to its own
+log; a replicated engine takes them from the log only.
 
 Integrated loudness and loudness range leave out every 10 ms slice that
-is a gap or lost, and carry on over the rest: their gating blocks and
+is a gap, lost or paused, and carry on over the rest: their gating
+blocks and
 short-term values are taken over the kept slices one after the other,
 as if the slices left out had not been there. This is a deliberate
 deviation from a strict reading of EBU Tech 3341 and 3342, which measure
 a programme without interruption: an input taken down or a slice lost
 neither blanks the measurement nor lowers it with the silence or the
 partial mix it leaves. Momentary and short-term loudness restart after
-such a slice. Each output's and meter's status counts both since the
-measurement started:
+a gap or a lost slice, not after a paused one. Each output's and
+meter's status counts gaps and lost slices since the measurement
+started:
 
 - `gaps`: slices in which an input down by the log (an `InputDown`
   applied; a `Detach` is not one) fed one of the meter's columns through
@@ -241,8 +262,8 @@ measurement started:
   records found the ring full, and after a reset the slices from its
   window to the first one metered. A slice that never arrived is
   counted once a later one is metered. A slice metered while diverged
-  is lost even where it would be a gap, since the entry that made it
-  one may be one the log voided; otherwise a slice with a block that
+  is lost even where it would be a gap or paused, since the entry that
+  made it one may be one the log voided; otherwise a slice with a block that
   was a gap counts as a gap.
 
 `samplez-replica` sets the divergence flag on the contact tick after it
@@ -260,13 +281,21 @@ from a state the log later voided, before the flag was set, counts as
 that state made it.
 
 Meter state is per replica and lives in the engine: a core copy carries
-none of it. A resync, a rebuild from product state and a hand-over do
-not reset the measurement; the replica measures on from its own state,
-the slices it lost meanwhile counted in `lost`. The measurement restarts
-only with the process or at `Engine::reset_loudness`. `since` is the
-sample index the measurement started at, so a replica whose `since` is
-later than its peers' restarted its measurement and measures a shorter
-programme.
+none of it but which meters the log holds paused, which is product state
+(`Targets::loudness_running`, `ProductState::loudness_running`), so a
+replica rebuilt or handed over pauses the meters its peers pause. A
+resync, a rebuild from product state and a hand-over do not reset the
+measurement; the replica measures on from its own state, the slices it
+lost meanwhile counted in `lost`. A reset is an event, not state: no
+target or product state holds one. A reset entry a replica takes without
+a core, or after its window from a replayed or rebuilt core that knew
+it, restarts the measurement at its window all the same, the slices
+from there to the first one metered counted in `lost`.
+The measurement restarts only with the process or at a reset. `since`
+is the sample index the measurement started at, so a replica whose
+`since` is later than its peers' restarted its measurement and measures
+a shorter programme. `paused`, like `gaps`, is equal on all replicas
+whose `lost` is 0.
 After samples that were not metered, the true peak counts only
 interpolated values computed from samples after them.
 
@@ -281,7 +310,10 @@ index), `Detach` (it crossfades to silence over the ramp length from the
 index and reads no flow, is not polled and is not reported until a
 `Route` fades it in from silence; its up or down state is kept),
 `Limiter` (an output's limiter parameters, below), `Delay` (an input's
-delay, below), `Output` (an output
+delay, below), `LoudnessRun` (a meter's loudness measurement paused or
+run from the index, see Meters), `ResetLoudness` (a meter's loudness
+measurement restarted at the first window from the index, see Meters),
+`Output` (an output
 disabled: nothing is written to it from the index
 on and its writer is released, which deletes its flow unless another
 writer holds it; or enabled: its flow is created as at start-up and
@@ -311,7 +343,8 @@ buildLead after the one before, and an `Output`
 A replicated log entry may carry any number of engine entries
 (`append_batch`). They are folded off the RT thread: per matrix
 coefficient, strip parameter and output the last value, per output
-its last limiter parameters and per input slot its last delay; per input slot
+its last limiter parameters, per input slot its last delay, per meter
+its last `LoudnessRun` and each meter reset once; per input slot
 whether it is re-routed or detached, the last `Route` or `Detach`
 counting, goes down and comes up, an `InputUp` after an `InputDown`
 fading in from silence and a route kept whatever the state. The log
@@ -588,9 +621,11 @@ state and fades, each strip with its filter and dynamics state and
 position, each output's limiter with its rings and released gain, each
 delay line's taps and the history its taps reach, the
 entries waiting for a generation and the pending
-generation's entry id, and the unresolved entries.
-Meters, the loudness measurement with its gating histograms, `gaps` and
-`lost` included, hold rings, statuses and readers stay with the replica.
+generation's entry id, the meters the log holds paused, and the
+unresolved entries.
+Meters, the loudness measurement with its gating histograms, `gaps`,
+`lost` and `paused` included, hold rings, statuses and readers stay with
+the replica.
 History rings (`History` in samplez-dsp) hold a delay plus
 `historySlackMs` of slack as relaxed atomic bit patterns; the RT thread
 publishes the block it starts before it stores any history sample, and a
@@ -765,17 +800,21 @@ page verdict, and it resyncs from a donor's core, which carries every
 group's detector state. A keyed group whose envelope never reaches 0 or
 full depth, which would keep the two apart for good, so costs one page,
 the reports that carry it and a resync. The product state also names
-each slot's flow, strip parameters and delay and each output's limiter
-parameters: the supervisor hands over generations reading those flows
+each slot's flow, strip parameters and delay, each output's limiter
+parameters and each meter's loudness measurement running or paused,
+which the core takes at the install: the supervisor hands over
+generations reading those flows
 before the core, a slot on another flow moving to it with no crossfade,
 and the strip and limiter parameters and delays are set from the
 install's index, each strip, limiter and delay line keeping its own
 state, so a delayed input plays the line's own history until the delay
 has passed. `Targets` holds every gain, flow, strip parameter, limiter
-parameter, delay, duck group setting and duck mask as values;
+parameter, delay, duck group setting, duck mask and meter's running
+state as values;
 `Targets::diff` gives the entries that move an engine from one
 set of targets to another, comparing every value by bit pattern, and
-`Targets::assert` the entries that set all of them.
+`Targets::assert` the entries that set all of them. A loudness reset is
+an event no target holds, so neither gives a `ResetLoudness`.
 
 In `samplez-replica` every audio replica starts clock-unverified, which
 drops its engine's core until it verifies, and a snapshot install, a

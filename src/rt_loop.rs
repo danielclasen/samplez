@@ -521,10 +521,17 @@ pub(crate) enum Change {
     /// disabled: nothing is written from the index on and its writer is
     /// handed back.
     Output { output: usize, enabled: bool },
+    /// The loudness measurement of `meter`, an output or after the
+    /// outputs a configured meter, runs from the index on, or is paused:
+    /// the slices metered while it is are left out of it.
+    LoudnessRun { meter: usize, running: bool },
+    /// The loudness measurement of `meter` restarts at the first 100 ms
+    /// window starting at or after the index.
+    ResetLoudness { meter: usize },
     /// The engine entries of one log entry, folded: its gains, strip
     /// and limiter parameters (`strips` says whether it has any),
-    /// `InputDown`s and
-    /// `Output`s in
+    /// `InputDown`s, `Output`s, `LoudnessRun`s and loudness resets
+    /// (`resets` says whether it has any) in
     /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
     /// slots it raises after them and those it re-routes, all of one
     /// input domain, for which one generation is built; of the re-routed
@@ -534,6 +541,7 @@ pub(crate) enum Change {
         up: u64,
         routed: u64,
         detached: u64,
+        resets: bool,
     },
 }
 
@@ -575,24 +583,70 @@ impl Change {
 
     /// Whether a core holds what this change did once applied: a gain
     /// change is in the matrix, an `InputDown` in the slot state, an
-    /// `Output` in the outputs disabled and a
+    /// `Output` in the outputs disabled, a `LoudnessRun` in the meters
+    /// paused and a
     /// strip entry in the strip of a core holding `strips`, but a
-    /// swapped-in generation, and the strips under a core built from
-    /// product state, stay with the RT thread, so an entry making them
-    /// must still reach it.
+    /// swapped-in generation, the strips under a core built from
+    /// product state and the meters a loudness reset restarts stay with
+    /// the RT thread, so an entry making them must still reach it.
     pub fn in_core(&self, strips: bool) -> bool {
         match *self {
-            Change::Gain { .. } | Change::InputDown { .. } | Change::Output { .. } => true,
+            Change::Gain { .. }
+            | Change::InputDown { .. }
+            | Change::Output { .. }
+            | Change::LoudnessRun { .. } => true,
             Change::Strip { .. } | Change::Limiter { .. } | Change::Delay { .. } => strips,
-            Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => false,
+            Change::InputUp { .. }
+            | Change::Route { .. }
+            | Change::Detach { .. }
+            | Change::ResetLoudness { .. } => false,
             Change::Batch {
                 strips: has,
                 up,
                 routed,
+                resets,
                 ..
-            } => up | routed == 0 && (strips || !has),
+            } => up | routed == 0 && (strips || !has) && !resets,
         }
     }
+
+    /// `paused`, the meters paused by bit, after this change with its
+    /// batch `b` applied: a `LoudnessRun`'s meter, or each of a batch's,
+    /// paused or running as it says.
+    pub fn paused_after(&self, paused: u128, b: Option<&Batch>) -> u128 {
+        let set = |p: u128, meter: usize, running: bool| {
+            let m = meter_bit(meter);
+            if running { p & !m } else { p | m }
+        };
+        match *self {
+            Change::LoudnessRun { meter, running } => set(paused, meter, running),
+            Change::Batch { .. } => b.map_or(paused, |b| {
+                (b.runs.iter()).fold(paused, |p, &(m, r)| set(p, m as usize, r))
+            }),
+            _ => paused,
+        }
+    }
+
+    /// The meters, by bit, whose loudness measurement this change with its
+    /// batch `b` restarts.
+    pub fn resets(&self, b: Option<&Batch>) -> u128 {
+        match *self {
+            Change::ResetLoudness { meter } => meter_bit(meter),
+            Change::Batch { resets: true, .. } => b.map_or(0, |b| {
+                (b.resets.iter()).fold(0, |r, &m| r | meter_bit(m as usize))
+            }),
+            _ => 0,
+        }
+    }
+}
+
+/// The bit of meter `meter`, an output or a configured meter, in a mask of
+/// [`METERS_IN_A_MASK`] meters; none past them.
+pub(crate) fn meter_bit(meter: usize) -> u128 {
+    u32::try_from(meter)
+        .ok()
+        .and_then(|m| 1u128.checked_shl(m))
+        .unwrap_or(0)
 }
 
 /// A committed log entry, applied at sample index `at_index`, a multiple
@@ -796,7 +850,7 @@ pub(crate) struct MeterRecord {
     pub plain_sum_sq: f64,
     /// [`MeterRecord::reset`], or [`NO_RESET`].
     pub reset_at: u64,
-    /// [`GAP`], [`DIVERGED`] and [`SPAN`].
+    /// [`GAP`], [`DIVERGED`], [`PAUSED`] and [`SPAN`].
     pub flags: u8,
 }
 
@@ -812,9 +866,13 @@ pub(crate) const GAP: u8 = 1;
 pub(crate) const DIVERGED: u8 = 2;
 /// One record for the whole meter covering `frames` slices from `slice`
 /// on, none of them computed: an overrun or a forward clock step skipped
-/// them. They are lost with [`DIVERGED`], else gaps with [`GAP`], else
-/// lost.
+/// them. They are lost with [`DIVERGED`], else paused with [`PAUSED`],
+/// else gaps with [`GAP`], else lost.
 pub(crate) const SPAN: u8 = 4;
+/// The log held the meter's loudness measurement paused in a block of
+/// the slice, computed or skipped: the slice is left out of it, neither a
+/// gap nor lost.
+pub(crate) const PAUSED: u8 = 8;
 
 impl MeterRecord {
     /// The loudness measurement restarts at this index, a window boundary
@@ -836,16 +894,10 @@ impl MeterRecord {
     pub fn span(&self) -> bool {
         self.flags & SPAN != 0
     }
-}
 
-/// Restarts the loudness measurement of `meter`, an output or a
-/// configured meter as [`MeterRecord::meter`] numbers them, at the first
-/// 100 ms window starting at or after `at_index`. A reset replaces one
-/// still pending for the same meter.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct LoudnessReset {
-    pub meter: usize,
-    pub at_index: u64,
+    pub fn paused(&self) -> bool {
+        self.flags & PAUSED != 0
+    }
 }
 
 /// Per metered channel: sample peak, true peak (none on an input) and
@@ -860,17 +912,13 @@ pub(crate) struct OutMeter {
     /// The slice in progress starts the measurement the reset at this
     /// index restarts.
     pub reset: Option<u64>,
-    /// An input slot down by the log feeds the meter's columns in the
-    /// block being metered.
-    pub block_gap: bool,
-    /// The slice in progress is a gap: `block_gap` was set in one of its
-    /// blocks.
-    pub gap: bool,
-    /// The replica is diverged in the block being metered.
-    pub block_diverged: bool,
-    /// The slice in progress was metered while diverged: `block_diverged`
-    /// was set in one of its blocks.
-    pub diverged: bool,
+    /// The flags of the block being metered: [`GAP`] where an input slot
+    /// down by the log feeds the meter's columns, [`DIVERGED`] where the
+    /// replica is diverged, [`PAUSED`] where the log holds the meter's
+    /// loudness measurement paused.
+    pub block: u8,
+    /// The flags of the slice in progress: those of its blocks, ORed.
+    pub flags: u8,
     /// The first sample of a skip this meter has not sent yet.
     pub skip_from: u64,
     /// The index after the last sample metered.
@@ -901,10 +949,8 @@ impl OutMeter {
             slice: None,
             reset_at: None,
             reset: None,
-            block_gap: false,
-            gap: false,
-            block_diverged: false,
-            diverged: false,
+            block: 0,
+            flags: 0,
             skip_from: 0,
             next: None,
             tp_skip: 0,
@@ -914,6 +960,12 @@ impl OutMeter {
             sum_sq: vec![0.0; channels],
             plain_sum_sq: vec![0.0; channels],
         }
+    }
+
+    /// Restarts the loudness measurement at the first 100 ms window
+    /// starting at or after `at_index`, replacing a reset still pending.
+    pub fn set_reset(&mut self, at_index: u64) {
+        self.reset_at = Some(at_index.div_ceil(WINDOW) * WINDOW);
     }
 
     /// Adds `frames` samples of output channels `first..` of `buf`,
@@ -960,8 +1012,7 @@ impl OutMeter {
                 }
             }
             let len = ((slice + 1) * SLICE - index).min((frames - n) as u64) as usize;
-            self.gap |= self.block_gap;
-            self.diverged |= self.block_diverged;
+            self.flags |= self.block;
             for c in 0..self.peak.len() {
                 let x = &buf.channel(first + c)[n..n + len];
                 accumulate(x, &mut self.peak[c], &mut self.plain_sum_sq[c]);
@@ -989,19 +1040,20 @@ impl OutMeter {
     }
 
     /// Samples `[from, to)` were not computed: an overrun or a forward
-    /// clock step skipped them, `gap` telling whether an input slot down
-    /// by the log fed the meter there. A slice in progress takes the flag
+    /// clock step skipped them, `flags` telling whether an input slot down
+    /// by the log fed the meter there ([`GAP`]), the log held its
+    /// measurement paused there ([`PAUSED`]) and the replica was diverged
+    /// ([`DIVERGED`]). A slice in progress takes the flags
     /// and is sent once the samples reach its end; whole slices go out as
     /// [`SPAN`] records, one per run; a slice the samples end inside is
-    /// started with the flag, for the block computed next to fill.
-    fn skip(&mut self, sink: &mut MeterSink<'_>, from: u64, to: u64, gap: bool, diverged: bool) {
+    /// started with the flags, for the block computed next to fill.
+    fn skip(&mut self, sink: &mut MeterSink<'_>, from: u64, to: u64, flags: u8) {
         let mut i = from;
         while i < to {
             let slice = i / SLICE;
             let end = (slice + 1) * SLICE;
             if self.slice == Some(slice) {
-                self.gap |= gap;
-                self.diverged |= diverged;
+                self.flags |= flags;
                 if end <= to {
                     self.flush(sink);
                 }
@@ -1016,7 +1068,7 @@ impl OutMeter {
                 if t > i {
                     // The run up to the reset's slice goes out first.
                     let first = t / SLICE;
-                    self.span(sink, slice, first - slice, (gap, diverged), None);
+                    self.span(sink, slice, first - slice, flags, None);
                     i = first * SLICE;
                     continue;
                 }
@@ -1026,14 +1078,13 @@ impl OutMeter {
             }
             if end <= to && i == slice * SLICE {
                 let n = (to - i) / SLICE;
-                self.span(sink, slice, n, (gap, diverged), reset);
+                self.span(sink, slice, n, flags, reset);
                 i += n * SLICE;
             } else {
                 // Taken up again above, or by the block computed next.
                 self.slice = Some(slice);
                 self.reset = reset;
-                self.gap = gap;
-                self.diverged = diverged;
+                self.flags = flags;
             }
         }
     }
@@ -1044,7 +1095,7 @@ impl OutMeter {
         sink: &mut MeterSink<'_>,
         slice: u64,
         n: u64,
-        (gap, diverged): (bool, bool),
+        flags: u8,
         reset: Option<u64>,
     ) {
         let (mut slice, mut n, mut reset) = (slice, n, reset);
@@ -1061,7 +1112,7 @@ impl OutMeter {
                 sum_sq: 0.0,
                 plain_sum_sq: 0.0,
                 reset_at: reset.take().unwrap_or(NO_RESET),
-                flags: SPAN | flags(gap, diverged),
+                flags: SPAN | flags,
             };
             *sink.seq += 1;
             if sink.ring.push(r).is_err() {
@@ -1089,7 +1140,7 @@ impl OutMeter {
                 sum_sq: self.sum_sq[c],
                 plain_sum_sq: self.plain_sum_sq[c],
                 reset_at: self.reset.unwrap_or(NO_RESET),
-                flags: flags(self.gap, self.diverged),
+                flags: self.flags,
             };
             *sink.seq += 1;
             if sink.ring.push(r).is_err() {
@@ -1098,8 +1149,7 @@ impl OutMeter {
         }
         self.frames = 0;
         self.reset = None;
-        self.gap = false;
-        self.diverged = false;
+        self.flags = 0;
         self.peak.fill(0.0);
         self.true_peak.fill(0.0);
         self.sum_sq.fill(0.0);
@@ -1107,8 +1157,14 @@ impl OutMeter {
     }
 }
 
-fn flags(gap: bool, diverged: bool) -> u8 {
-    (if gap { GAP } else { 0 }) | (if diverged { DIVERGED } else { 0 })
+/// The flags of meter `m` of a run or block: [`GAP`] by its bit in
+/// `gaps`, [`PAUSED`] by its bit in `paused`, [`DIVERGED`] with
+/// `diverged`.
+fn flags(m: usize, gaps: u128, paused: u128, diverged: bool) -> u8 {
+    let bit = meter_bit(m);
+    (if gaps & bit != 0 { GAP } else { 0 })
+        | (if paused & bit != 0 { PAUSED } else { 0 })
+        | (if diverged { DIVERGED } else { 0 })
 }
 
 /// Whether an input channel of a slot in `down` feeds one of `columns`
@@ -1135,24 +1191,34 @@ const _: () = assert!(crate::config::MAX_OUTPUTS + crate::config::MAX_METERS <= 
 
 /// What the meters of a skip follow over its runs ([`Mix::bring_to`]):
 /// the slots' state and, per slot down, the meters it feeds, each looked
-/// up once and again only after an entry changes a target of its rows; a
-/// meter's skipped samples go out once its gap changes, and at the end.
+/// up once and again only after an entry changes a target of its rows,
+/// and the meters paused and reset by the entries applied; a meter's
+/// skipped samples go out once its gap or pause changes or it is reset,
+/// and at the end.
 struct SkipState {
     /// The slots up and the slots detached, from the first run on.
     slots: Option<(u64, u64)>,
     /// Per slot, the meters, by bit, its rows feed; valid for `known`.
     feeds: [u128; 64],
     known: u64,
-    /// The meters' gaps over the run before, none before the first.
-    gaps: Option<u128>,
+    /// The meters paused, by bit, from the next run on.
+    paused: u128,
+    /// The meters the entries at the next run's start reset, by bit.
+    resets: u128,
+    /// The meters' gaps and the meters paused over the run before, none
+    /// before the first.
+    gaps: Option<(u128, u128)>,
 }
 
 impl SkipState {
-    fn new() -> SkipState {
+    /// From the meters paused before the skip.
+    fn new(paused: u128) -> SkipState {
         SkipState {
             slots: None,
             feeds: [0; 64],
             known: 0,
+            paused,
+            resets: 0,
             gaps: None,
         }
     }
@@ -1169,9 +1235,10 @@ impl SkipState {
     }
 
     /// Run `[from, to)`, the samples up to the next entry applied, or up
-    /// to the block computed next when `last`: each meter whose gap
-    /// differs from the run before sends the samples it held since its
-    /// gap last changed; with `last` every meter sends the rest.
+    /// to the block computed next when `last`: each meter whose gap or
+    /// pause differs from the run before, or that the entries at `from`
+    /// reset, sends the samples it held since that last changed, and a
+    /// reset applies at `from`; with `last` every meter sends the rest.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
@@ -1204,31 +1271,40 @@ impl SkipState {
         let n = outs.len() + buses.len();
         // At most 128 meters (`METERS_IN_A_MASK`), and none past `n` set.
         let every = (0..n).fold(0u128, |e, m| e | 1 << m);
-        let mut rest = self.gaps.map_or(every, |g| g ^ gaps);
+        let paused = self.paused;
+        let changed = self.gaps.map_or(every, |(g, p)| (g ^ gaps) | (p ^ paused));
+        let mut rest = (changed | self.resets) & every;
         while rest != 0 {
             let m = rest.trailing_zeros() as usize;
             rest &= rest - 1;
             let meter = meter_of(outs, buses, m);
-            if let Some(g) = self.gaps {
+            if let Some((g, p)) = self.gaps {
                 sink.meter = m as u32;
-                meter.skip(sink, meter.skip_from, from, g & 1 << m != 0, diverged);
+                meter.skip(sink, meter.skip_from, from, flags(m, g, p, diverged));
             }
             meter.skip_from = from;
+            if self.resets & 1 << m != 0 {
+                meter.set_reset(from);
+            }
         }
-        self.gaps = Some(gaps);
+        self.resets = 0;
+        self.gaps = Some((gaps, paused));
         if last {
             for m in 0..n {
                 let meter = meter_of(outs, buses, m);
                 sink.meter = m as u32;
-                meter.skip(sink, meter.skip_from, to, gaps & 1 << m != 0, diverged);
+                meter.skip(sink, meter.skip_from, to, flags(m, gaps, paused, diverged));
             }
         }
     }
 
     /// Entry `e` with its batch applies after the run before: the slots
     /// it takes down, raises, re-routes or detaches, and the slots whose
-    /// rows' targets it sets, looked up again at the next run.
+    /// rows' targets it sets, looked up again at the next run, and the
+    /// meters it pauses, runs or resets, its index the next run's start.
     fn apply(&mut self, slots: &[Slot], matrix: &Matrix, e: &RtEntry, batch: Option<&Batch>) {
+        self.paused = e.change.paused_after(self.paused, batch);
+        self.resets |= e.change.resets(batch);
         let Some((up, detached)) = self.slots.as_mut() else {
             return;
         };
@@ -1396,6 +1472,10 @@ pub(crate) struct Mix {
     pub entries_page: Option<u64>,
     /// An entry of `entries_page` found the list full.
     pub entries_lost: bool,
+    /// The meters whose loudness measurement the log holds paused, by
+    /// bit: the outputs, then the configured meters
+    /// ([`Change::LoudnessRun`]).
+    pub paused: u128,
 }
 
 impl Mix {
@@ -1416,6 +1496,7 @@ impl Mix {
             page_entries: Vec::new(),
             entries_page: None,
             entries_lost: false,
+            paused: 0,
         }
     }
 
@@ -1736,7 +1817,6 @@ pub(crate) struct Rt {
     pub meters: Producer<MeterRecord>,
     /// Each duck group's readings per meter slice.
     pub duck_meters: Producer<DuckRecord>,
-    pub resets: Consumer<LoudnessReset>,
     /// The sequence number of the next meter record.
     pub meter_seq: u64,
     pub counters: Arc<Counters>,
@@ -1890,6 +1970,7 @@ fn capture_core(
     c.outputs_disabled = (outs.iter().enumerate())
         .filter(|(_, o)| !o.enabled)
         .fold(0, |m, (o, _)| m | bit(o));
+    c.loudness_paused = m.paused;
     for (d, o) in c.limiters.iter_mut().zip(outs) {
         // A limiter holds no heap memory: the copy allocates nothing.
         d.clone_from(&o.limiter);
@@ -2396,7 +2477,7 @@ impl Rt {
             // the install was on the core's pending list, applied here at
             // its index.
             if !entry.change.in_core(false) && entry.at_index < self.install_at {
-                self.apply_known(entry, batch.as_deref(), true, true);
+                self.apply_known(entry, batch.as_deref(), true, true, true);
             }
             self.retire(batch);
             // Taken through the core, as one on the pending list.
@@ -2616,7 +2697,8 @@ impl Rt {
     /// generation off the pending list, so that a long spell neither
     /// fills the list nor holds the log's entries back. A strip entry, and
     /// a batch's strip parameters, are applied to the slots' strips, which
-    /// stay with the slots; the rest passes unapplied. A batch holding a
+    /// stay with the slots, and a loudness reset to the meters, which stay
+    /// with the engine; the rest passes unapplied. A batch holding a
     /// generation-needing entry stays pending whole, as that entry does
     /// alone. A core installed later must know them, as it must know every
     /// entry taken.
@@ -2636,6 +2718,7 @@ impl Rt {
                 Change::Strip { slot, param } => self.set_strip(e, slot, param),
                 Change::Limiter { output, params } => self.set_limiter(e, output, params),
                 Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
+                Change::ResetLoudness { .. } => self.reset_meters(&e, None),
                 Change::Batch { strips, .. } => {
                     let b = self.mix.take_batch(e.id);
                     // Without strips, its strip and limiter parameters and
@@ -2643,6 +2726,7 @@ impl Rt {
                     if let Some(b) = b.as_ref().filter(|_| strips) {
                         self.set_params(e, b);
                     }
+                    self.reset_meters(&e, b.as_deref());
                     self.retire(b);
                 }
                 _ => {}
@@ -2802,13 +2886,15 @@ impl Rt {
 
     /// Applies entry `e`, other than a gain change, at the start of the
     /// block at its index: a batch's `InputDown`s, duck settings, strip
-    /// parameters and generation-needing entry, its gains, duck masks and
-    /// depths set by [`Mix::to`]. An entry that sets what the slot already
-    /// has starts nothing.
-    fn apply(&mut self, e: RtEntry) {
+    /// parameters, meters paused or run and generation-needing entry, its
+    /// gains, duck masks and depths set by [`Mix::to`], and with `resets`
+    /// its loudness resets, which the meters of a skip took otherwise. An
+    /// entry that sets what the slot already has starts nothing.
+    fn apply(&mut self, e: RtEntry, resets: bool) {
         if let Change::Batch { .. } = e.change {
             let b = self.mix.take_batch(e.id);
             self.mix.applied_entry(&e);
+            self.mix.paused = e.change.paused_after(self.mix.paused, b.as_deref());
             if let Some(b) = &b {
                 for &slot in &b.downs {
                     self.apply_change(RtEntry {
@@ -2826,21 +2912,36 @@ impl Rt {
                 let refused = self.mix.apply_ducks(e.at_index, b, legs);
                 add(&self.counters.duck_refused, refused);
             }
-            self.apply_known(e, b.as_deref(), false, true);
+            self.apply_known(e, b.as_deref(), false, true, resets);
             self.retire(b);
             return;
         }
         self.mix.applied_entry(&e);
+        self.mix.paused = e.change.paused_after(self.mix.paused, None);
+        if resets {
+            self.reset_meters(&e, None);
+        }
         self.apply_change(e);
     }
 
     /// Applies what of entry `e`, with batch `b`, a core does not hold:
-    /// its strip parameters with `strips`, and its generation-needing
-    /// entry; a single entry whole. Counted applied for the fingerprint
-    /// with `count`.
-    fn apply_known(&mut self, e: RtEntry, b: Option<&Batch>, count: bool, strips: bool) {
+    /// its strip parameters with `strips`, its loudness resets with
+    /// `resets`, and its generation-needing entry; a single entry whole
+    /// but for a `LoudnessRun`. Counted applied for the fingerprint with
+    /// `count`.
+    fn apply_known(
+        &mut self,
+        e: RtEntry,
+        b: Option<&Batch>,
+        count: bool,
+        strips: bool,
+        resets: bool,
+    ) {
         if count {
             self.mix.applied_entry(&e);
+        }
+        if resets {
+            self.reset_meters(&e, b);
         }
         let Change::Batch { strips: has, .. } = e.change else {
             self.apply_change(e);
@@ -2852,10 +2953,29 @@ impl Rt {
         self.apply_generation(e);
     }
 
-    /// Applies change `e`, a single one other than a gain change.
+    /// Restarts the loudness measurement of each meter entry `e`, with
+    /// batch `b`, resets, at the first window at or after its index: one
+    /// past the index is lost to the measurement up to the slice metered
+    /// next. A replay, which meters its outputs only, resets those.
+    fn reset_meters(&mut self, e: &RtEntry, b: Option<&Batch>) {
+        let mut rest = e.change.resets(b);
+        while rest != 0 {
+            let m = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            if m < self.outs.len() + self.buses.len() {
+                meter_of(&mut self.outs, &mut self.buses, m).set_reset(e.at_index);
+            }
+        }
+    }
+
+    /// Applies change `e`, a single one other than a gain change; a
+    /// meter's pause and reset are applied by the caller.
     fn apply_change(&mut self, e: RtEntry) {
         match e.change {
-            Change::Gain { .. } | Change::Batch { .. } => {}
+            Change::Gain { .. }
+            | Change::Batch { .. }
+            | Change::LoudnessRun { .. }
+            | Change::ResetLoudness { .. } => {}
             Change::InputDown { slot } => {
                 let s = &mut self.slots[slot];
                 if s.up {
@@ -2967,12 +3087,14 @@ impl Rt {
     }
 
     /// The entries [`Mix::to`] took off for block `k`: applied, or
-    /// reported late.
+    /// reported late. The loudness resets of those below its start, in a
+    /// skip, went to the meters with the skipped samples.
     fn apply_due(&mut self, k: u64) {
+        let start = k * self.block;
         for n in 0..self.mix.due.len() {
             let (e, late) = self.mix.due[n];
             if !late {
-                self.apply(e);
+                self.apply(e, e.at_index >= start);
                 continue;
             }
             add(&self.counters.command_late, 1);
@@ -2996,8 +3118,10 @@ impl Rt {
         // Entries apply at the start of the block at their index, before
         // its inputs are read. Samples skipped before the block are
         // metered as skipped, gaps where a slot the log holds down fed a
-        // meter: the slots' state is followed over the entries applied in
-        // them, as the blocks computed there would have held it.
+        // meter and paused where the log held its measurement paused,
+        // and a reset applies at its window among them: the slots' and
+        // meters' state is followed over the entries applied in them, as
+        // the blocks computed there would have held it.
         let (counters, tel) = (&self.counters, &mut self.tel);
         let (slots, outs, buses) = (&self.slots, &mut self.outs, &mut self.buses);
         let (ring, seq) = (&mut self.meters, &mut self.meter_seq);
@@ -3008,7 +3132,7 @@ impl Rt {
                 add(&counters.telemetry_dropped, 1);
             }
         };
-        let mut skip = SkipState::new();
+        let mut skip = SkipState::new(self.mix.paused);
         let skipped =
             |from: u64, to: u64, matrix: &Matrix, next: Option<(&RtEntry, Option<&Batch>)>| {
                 let mut sink = MeterSink {
@@ -3206,10 +3330,12 @@ impl Rt {
         }
 
         // Which meters a slot down feeds, on the coefficients' targets the
-        // block starts with: their slices of this block are gaps.
+        // block starts with: their slices of this block are gaps. Those
+        // the log holds paused are paused.
         let matrix = &self.mix.matrix;
         let diverged = (self.replica.as_ref()).is_some_and(|r| r.shared.diverged.load(Relaxed));
-        for (meter, first) in (self
+        let paused = self.mix.paused;
+        for (m, (meter, first)) in (self
             .outs
             .iter_mut()
             .map(|o| (&mut o.meter, o.first_channel)))
@@ -3217,10 +3343,12 @@ impl Rt {
             self.buses
                 .iter_mut()
                 .map(|m| (&mut m.meter, m.first_channel)),
-        ) {
+        )
+        .enumerate()
+        {
             let columns = first..first + meter.peak.len();
-            meter.block_gap = down != 0 && feeds(matrix, &self.slots, down, columns);
-            meter.block_diverged = diverged;
+            let gap = down != 0 && feeds(matrix, &self.slots, down, columns);
+            meter.block = flags(m, u128::from(gap) << m, paused, diverged);
         }
         let ramping = self.mix.ramping(k);
         let slots = &self.slots;
@@ -3340,13 +3468,6 @@ impl Rt {
         }
         self.counters.processed.store(k + 1, Release);
 
-        while let Ok(r) = self.resets.pop() {
-            let at = Some(r.at_index.div_ceil(WINDOW) * WINDOW);
-            match r.meter.checked_sub(self.outs.len()) {
-                None => self.outs[r.meter].meter.reset_at = at,
-                Some(m) => self.buses[m].meter.reset_at = at,
-            }
-        }
         // Every computed block is metered, written or not: the meters
         // follow the engine's output, not a flow's state; and every input
         // after its strip, read or silenced. After the writes, since
@@ -3471,6 +3592,7 @@ impl Rt {
         m.ducks.core.copy_from(&c.ducks);
         m.pos = c.pos;
         m.ramp_end = c.ramp_end;
+        m.paused = c.loudness_paused;
         // An entry dropped here as known is taken through the core: a
         // later core that did not know it must be refused as Missed.
         for e in &m.pending {
@@ -3575,7 +3697,7 @@ impl Rt {
         for n in 0..self.mix.due.len() {
             let (e, _) = self.mix.due[n];
             let b = self.mix.take_batch(e.id);
-            self.apply_known(e, b.as_deref(), true, !strips);
+            self.apply_known(e, b.as_deref(), true, !strips, true);
             self.retire(b);
         }
         self.mix.due.clear();
@@ -3639,6 +3761,7 @@ impl Rt {
                         up: 0,
                         routed: 0,
                         detached: 0,
+                        resets: false,
                     },
                 };
                 for n in 0..h.strips.len() {
@@ -3731,17 +3854,16 @@ mod tests {
             counters: &counters,
         };
         m.add(&mut sink, 0, &buf, 0, 240);
-        m.skip(&mut sink, 240, 1200, true, false);
-        m.skip(&mut sink, 1200, 2000, false, false);
+        m.skip(&mut sink, 240, 1200, GAP);
+        m.skip(&mut sink, 1200, 2000, 0);
         m.add(&mut sink, 0, &buf, 2000, 400);
         m.reset_at = Some(WINDOW);
-        m.skip(&mut sink, 2400, WINDOW + 3 * SLICE, false, false);
+        m.skip(&mut sink, 2400, WINDOW + 3 * SLICE, 0);
         m.skip(
             &mut sink,
             WINDOW + 3 * SLICE,
             WINDOW + 5 * SLICE,
-            true,
-            true,
+            GAP | DIVERGED,
         );
         let mut got = Vec::new();
         while let Ok(r) = rx.pop() {
@@ -4478,6 +4600,8 @@ mod tests {
         m.page_entries.extend([(3, 2 * B), (4, 3 * B)]);
         m.entries_page = Some(1);
         m.entries_lost = true;
+        // Meters on both words of the mask paused.
+        m.paused = (1 << 2) | (1 << 100);
         let mut slots = [
             slot(true, true, Some(5 * B), false, Some(18 * B)),
             slot(false, false, None, true, None),
@@ -4540,6 +4664,7 @@ mod tests {
             entries_page: Some(1),
             entries_lost: true,
             outputs_disabled: 0b010,
+            loudness_paused: (1 << 2) | (1 << 100),
             slots: vec![
                 SlotCore {
                     up: true,

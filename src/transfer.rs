@@ -7,7 +7,8 @@
 //! entries pending and applied in the page in progress, each input slot's
 //! log state, fades and strip with its position, the entries waiting for
 //! their generation and the pending generation's entry id, the outputs
-//! disabled, and the
+//! disabled, the meters whose loudness measurement the log holds paused,
+//! and the
 //! unresolved entries with the late re-routes. Meters, hold rings, block statuses, page hashes in progress
 //! and the readers stay with the replica. The RT thread copies it into a
 //! buffer allocated off the RT thread, of the same shape, so the copy
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::{self, Batch, DuckItem, Item};
 use crate::blocks::PageHash;
+use crate::config::{MAX_METERS, MAX_OUTPUTS};
 use crate::ducks::{DuckChange, DuckCore, DuckSetting, DuckTargets, KeySet};
 use crate::engine::{Entry, Fade};
 use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRESOLVED, slots_of};
@@ -71,6 +73,21 @@ pub(crate) struct DelayCore {
     /// base64: about 5.3 bytes a sample.
     #[serde(with = "span_bits")]
     pub span: Vec<Vec<f32>>,
+}
+
+/// Serde of a mask of meters as two words, the low one first: a JSON
+/// number holds 64 bits.
+mod meter_mask {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(mask: &u128, s: S) -> Result<S::Ok, S::Error> {
+        [*mask as u64, (*mask >> 64) as u64].serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+        let [low, high] = <[u64; 2]>::deserialize(d)?;
+        Ok((u128::from(high) << 64) | u128::from(low))
+    }
 }
 
 /// Serde of a delay span as one base64 string of f32 bit patterns per
@@ -191,6 +208,10 @@ pub struct Core {
     pub(crate) entries_lost: bool,
     /// The outputs disabled by an `Output` entry, a bit per output.
     pub(crate) outputs_disabled: u64,
+    /// The meters whose loudness measurement a `LoudnessRun` entry
+    /// paused, a bit per meter: the outputs, then the configured meters.
+    #[serde(with = "meter_mask")]
+    pub(crate) loudness_paused: u128,
     pub(crate) slots: Vec<SlotCore>,
     /// Per output its limiter, its state included; none where the
     /// configuration has none. A core built from product state leaves the
@@ -241,6 +262,7 @@ impl Core {
             entries_page: None,
             entries_lost: false,
             outputs_disabled: 0,
+            loudness_paused: 0,
             slots: vec![SlotCore::default(); slots],
             limiters: vec![None; outs],
             awaiting_gen: Vec::with_capacity(PENDING_CHANGES),
@@ -362,6 +384,12 @@ impl Core {
         &self.unresolved
     }
 
+    /// Whether the log holds the loudness measurement of `meter`, an
+    /// output or after the outputs a configured meter, paused.
+    pub fn meter_paused(&self, meter: usize) -> bool {
+        self.loudness_paused & crate::rt_loop::meter_bit(meter) != 0
+    }
+
     /// Whether everything this core holds is a value an engine holds:
     /// every index at most [`INDEX_MAX`], every gain one a ramp takes,
     /// every strip parameter and duck setting within its range (legs
@@ -382,6 +410,9 @@ impl Core {
                     Change::Strip { param, .. } => param.check(usize::MAX).is_ok(),
                     Change::Limiter { params, .. } => params.check().is_ok(),
                     Change::Delay { samples, .. } => samples <= samplez_dsp::MAX_DELAY_SAMPLES,
+                    Change::LoudnessRun { meter, .. } | Change::ResetLoudness { meter } => {
+                        meter < MAX_OUTPUTS + MAX_METERS
+                    }
                     Change::Batch {
                         routed, detached, ..
                     } => detached & !routed == 0,
@@ -425,7 +456,7 @@ impl Core {
     fn batches_match(&self) -> bool {
         let mut held = 0;
         for e in &self.pending {
-            let Change::Batch { strips, .. } = e.change else {
+            let Change::Batch { strips, resets, .. } = e.change else {
                 continue;
             };
             held += 1;
@@ -435,6 +466,7 @@ impl Core {
             };
             if !b.sane()
                 || (strips && b.strips.is_empty() && b.limiters.is_empty() && b.delays.is_empty())
+                || resets == b.resets.is_empty()
             {
                 return false;
             }
@@ -444,7 +476,8 @@ impl Core {
 
     /// Whether this sane core is of an engine with `inputs` and `columns`
     /// matrix channels, `outputs` outputs, none beyond them disabled,
-    /// input slots of `legs` legs each, strips and duck key
+    /// `meters` meters (the outputs and the configured meters), none
+    /// beyond them paused, input slots of `legs` legs each, strips and duck key
     /// filters ramping over `ramp` samples and room for `page_entries`
     /// entries of one page's fingerprint, every entry and every duck key
     /// within them, and ducks only on the duck columns `ducked`: checked
@@ -459,6 +492,7 @@ impl Core {
         inputs: usize,
         columns: usize,
         outputs: usize,
+        meters: usize,
         legs: &[usize],
         limiters: &[Option<usize>],
         delays: &[u32],
@@ -472,11 +506,11 @@ impl Core {
             None => legs > MAX_LEGS,
         };
         let entry = |e: &RtEntry| {
-            fits(&e.change, inputs, columns, outputs, legs)
+            fits(&e.change, inputs, columns, outputs, meters, legs)
                 && !matches!(e.change, Change::Gain { fade: Some(f), .. } if !f.within(e.at_index))
         };
         let batch = |(id, b): &(LogId, Arc<Batch>)| {
-            b.fits(inputs, columns, outputs, legs, ducked)
+            b.fits(inputs, columns, outputs, meters, legs, ducked)
                 && (self.pending.iter().chain(&self.awaiting_gen))
                     .filter(|e| e.id == *id)
                     .all(|e| b.fades_within(e.at_index))
@@ -500,6 +534,7 @@ impl Core {
                 .checked_shr(outputs as u32)
                 .unwrap_or(0)
                 == 0
+            && self.loudness_paused.checked_shr(meters as u32).unwrap_or(0) == 0
             && self.page_entries.len() <= page_entries
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
             && self.batches.iter().all(batch)
@@ -530,15 +565,16 @@ impl Core {
 }
 
 /// Whether change `c` is within an engine of `inputs` and `columns`
-/// matrix channels, `outputs` outputs and input slots of `legs` legs: a
-/// coefficient and a gain it has, a slot, an output, and a strip
-/// parameter that slot's strip takes. A batch's own values are checked
-/// by [`Batch::fits`].
+/// matrix channels, `outputs` outputs, `meters` meters and input slots
+/// of `legs` legs: a coefficient and a gain it has, a slot, an output, a
+/// meter, and a strip parameter that slot's strip takes. A batch's own
+/// values are checked by [`Batch::fits`].
 pub(crate) fn fits(
     c: &Change,
     inputs: usize,
     columns: usize,
     outputs: usize,
+    meters: usize,
     legs: &[usize],
 ) -> bool {
     let slots = legs.len();
@@ -555,6 +591,7 @@ pub(crate) fn fits(
                 && fade.is_none_or(|f| f.is_valid())
         }
         Change::Output { output, .. } => output < outputs,
+        Change::LoudnessRun { meter, .. } | Change::ResetLoudness { meter } => meter < meters,
         Change::InputDown { slot }
         | Change::InputUp { slot }
         | Change::Route { slot }
@@ -703,6 +740,9 @@ pub struct Replay {
     pub(crate) late: Vec<(LogId, u64)>,
     /// The engine's duck columns.
     pub(crate) duck_columns: Vec<usize>,
+    /// The engine's meters, the outputs and the configured meters: the
+    /// replay meters its outputs alone.
+    pub(crate) meters: usize,
 }
 
 impl Replay {
@@ -749,8 +789,9 @@ impl Replay {
             items_of(e, &rows, &mut items).map_err(|_| outside())?;
         }
         // The engine's checks: a donor took no entry outside them.
+        let meters = self.meters;
         let fit = |i: &Item| match i {
-            Item::Change(c) => fits(c, inputs, columns, outputs, &legs),
+            Item::Change(c) => fits(c, inputs, columns, outputs, meters, &legs),
             Item::Duck(DuckItem::Mask {
                 input,
                 output,
@@ -773,7 +814,7 @@ impl Replay {
             return Ok(());
         };
         if batch.as_ref().is_some_and(|b| {
-            !(b.sane() && b.fits(inputs, columns, outputs, &legs, &self.duck_columns))
+            !(b.sane() && b.fits(inputs, columns, outputs, meters, &legs, &self.duck_columns))
         }) {
             return Err(outside());
         }
@@ -959,6 +1000,8 @@ fn change_of(entry: &Entry) -> Change {
         Entry::Strip { slot, param } => Change::Strip { slot, param },
         Entry::Limiter { output, params } => Change::Limiter { output, params },
         Entry::Delay { slot, samples } => Change::Delay { slot, samples },
+        Entry::LoudnessRun { meter, running } => Change::LoudnessRun { meter, running },
+        Entry::ResetLoudness { meter } => Change::ResetLoudness { meter },
         Entry::Duck { .. } | Entry::DuckMask { .. } => {
             unreachable!("duck entries are items of their own")
         }
@@ -988,6 +1031,11 @@ pub struct ProductState {
     /// Per output whether it is enabled in the log, its last `Output`'s
     /// value; an output past the list is as configured (`enabled`).
     pub outputs: Vec<bool>,
+    /// Per meter, the outputs then the configured meters, whether its
+    /// loudness measurement runs in the log, its last `LoudnessRun`'s
+    /// value; a meter past the list runs. A loudness reset is not state:
+    /// a rebuild keeps the replica's own measurement.
+    pub loudness_running: Vec<bool>,
     /// Per input slot the strip parameters the log set, as values: each
     /// one set again at the install, the strip's own state kept.
     pub strips: Vec<Vec<StripParam>>,
@@ -1195,6 +1243,38 @@ mod tests {
         assert_eq!(decoded.core.gain(1, 0), copy.core.gain(1, 0));
     }
 
+    /// The meters a core holds paused decode as encoded, on both words of
+    /// the mask; a core pausing a meter the engine lacks, or pending a
+    /// loudness entry for one, does not fit it, and one naming a meter
+    /// beyond any engine's is refused as it decodes.
+    #[test]
+    fn a_core_carries_the_meters_paused_within_the_engines_meters() {
+        let fits = |c: &Core, meters| c.fits(2, 2, 1, meters, &[1, 1], &[], &[], 48, 8, &[]);
+        let mut c = copy();
+        c.core.loudness_paused = (1 << 1) | (1 << 70);
+        let decoded = CoreCopy::decode(&c.encode()).unwrap();
+        assert_eq!(decoded.core.loudness_paused, (1 << 1) | (1 << 70));
+        assert!(fits(&decoded.core, 71));
+        assert!(!fits(&decoded.core, 70), "meter 70 of 70");
+        let mut c = copy();
+        c.core.pending.push(RtEntry {
+            id: 8,
+            at_index: 9600,
+            change: Change::LoudnessRun {
+                meter: 3,
+                running: false,
+            },
+        });
+        let decoded = CoreCopy::decode(&c.encode()).unwrap();
+        assert!(fits(&decoded.core, 4));
+        assert!(!fits(&decoded.core, 3), "meter 3 of 3");
+        c.core.pending[1].change = Change::ResetLoudness { meter: 128 };
+        assert!(matches!(
+            CoreCopy::decode(&c.encode()),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
     /// A core copied by another engine version is refused: its state may
     /// mean something else here.
     #[test]
@@ -1396,6 +1476,7 @@ mod tests {
                     up: 0,
                     routed: 1,
                     detached: 2,
+                    resets: false,
                 },
             })
         });
@@ -1442,18 +1523,18 @@ mod tests {
     #[test]
     fn a_core_fits_only_its_own_shape() {
         let mut copy = copy();
-        assert!(copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 3, 1, &[1, 1], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 0, &[]));
+        assert!(copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 3, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 0, &[]));
         // Strips of other legs, another ramp, or none on a narrow slot;
         // a slot wider than a strip has none.
-        assert!(!copy.core.fits(2, 2, 1, &[1, 2], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 480, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 2], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 480, 8, &[]));
         copy.core.slots[0].strip = None;
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
         assert!(
             copy.core
-                .fits(2, 2, 1, &[MAX_LEGS + 1, 1], &[], &[], 48, 8, &[])
+                .fits(2, 2, 1, 1, &[MAX_LEGS + 1, 1], &[], &[], 48, 8, &[])
         );
         copy.core.slots[0].strip = Some(Strip::new(1, 48));
         copy.core.pending.push(RtEntry {
@@ -1461,16 +1542,16 @@ mod tests {
             at_index: 9648,
             change: Change::InputDown { slot: 2 },
         });
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
         copy.core.pending.pop();
         // Output 1 disabled: a core of two outputs, not of one.
         copy.core.outputs_disabled = 0b10;
-        assert!(copy.core.fits(2, 2, 2, &[1, 1], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(copy.core.fits(2, 2, 2, 2, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
         copy.core.outputs_disabled = 0;
         // A delay on slot 0 of 1 leg and a line of 100: its span reaches
         // from the floor to the core's position.
-        let fits = |c: &Core, delays: &[u32]| c.fits(2, 2, 1, &[1, 1], &[], delays, 48, 8, &[]);
+        let fits = |c: &Core, delays: &[u32]| c.fits(2, 2, 1, 1, &[1, 1], &[], delays, 48, 8, &[]);
         let pos = copy.core.pos.unwrap();
         copy.core.slots[0].delay = Some(DelayCore {
             taps: Taps {
@@ -1514,8 +1595,8 @@ mod tests {
                 enabled: false,
             },
         });
-        assert!(copy.core.fits(2, 2, 2, &[1, 1], &[], &[], 48, 8, &[]));
-        assert!(!copy.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(copy.core.fits(2, 2, 2, 2, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(!copy.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
     }
 
     /// A copy whose detector 2 is keyed by slot 1, forced on and
@@ -1556,17 +1637,29 @@ mod tests {
         );
         assert_eq!(a.envelope().to_bits(), b.envelope().to_bits());
         assert_eq!(decoded.core.duck_mask(1, 0), 0b100);
-        assert!(decoded.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[0]));
+        assert!(
+            decoded
+                .core
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[0])
+        );
         // Its mask is on column 0: refused on an engine whose duck
         // columns leave it out, or that has none.
-        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[1]));
-        assert!(!decoded.core.fits(2, 2, 1, &[1, 1], &[], &[], 48, 8, &[]));
         assert!(
-            !decoded.core.fits(2, 2, 1, &[1, 2], &[], &[], 48, 8, &[0]),
+            !decoded
+                .core
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[1])
+        );
+        assert!(!decoded.core.fits(2, 2, 1, 1, &[1, 1], &[], &[], 48, 8, &[]));
+        assert!(
+            !decoded
+                .core
+                .fits(2, 2, 1, 1, &[1, 2], &[], &[], 48, 8, &[0]),
             "key 0 of another width"
         );
         assert!(
-            !decoded.core.fits(2, 2, 1, &[1, 1], &[], &[], 480, 8, &[0]),
+            !decoded
+                .core
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], 480, 8, &[0]),
             "another key filter ramp"
         );
     }

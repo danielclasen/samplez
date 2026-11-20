@@ -4069,6 +4069,7 @@ mod tests {
                 up: Vec::new(),
                 flows: log.flows.clone(),
                 outputs: Vec::new(),
+                loudness_running: Vec::new(),
                 strips: Vec::new(),
                 ducks: Vec::new(),
                 masks: Vec::new(),
