@@ -11,7 +11,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::ws::Message;
 use harness::{Options, Set, owner};
-use samplez_replica::entry::{Body, Command, Origin, SessionKey};
+use samplez_replica::entry::{Body, Command, Origin, Request, SessionKey};
 use samplez_replica::peer::{Forwarded, PeerRequest, PeerResponse, Refused};
 use samplez_replica::{MAX_COMMAND_BYTES, MAX_ENTRY_BYTES};
 use samplez_service::replica::{Reason, Resolution};
@@ -165,6 +165,49 @@ async fn quorum_loss_refuses_writes_and_serves_stale_reads_until_it_returns() {
         );
         assert!(replica.revision() >= after.revision, "replica {id}");
     }
+}
+
+/// A forward whose answer is lost after the leader ordered it is sent
+/// again under the same command id: the product applies the command
+/// once, and the follower's client is answered with the resend's
+/// outcome, a duplicate of the first copy's revision. Deduplication is
+/// the state machine's, on every path a command takes into the log.
+#[tokio::test(start_paused = true)]
+async fn a_forward_resent_after_its_answer_was_lost_is_applied_once() {
+    let set_ = Set::start(Options::default()).await;
+    let leader = set_.leader().await;
+    let follower = others(&set_, leader)[0];
+    set_.net.lose_forward_answers(follower, leader, 1);
+    let ack = set_
+        .replica(follower)
+        .submit(&owner("s"), "1", Bytes::from("gain=1@1"))
+        .await
+        .expect("committed");
+    assert_eq!(ack.resolution, Resolution::Duplicate, "the resend's answer");
+    set_.applied(ack.revision).await;
+    for id in set_.ids() {
+        let replica = set_.replica(id);
+        assert_eq!(
+            replica.store().with_state(|sm| sm.product.applied),
+            1,
+            "{id}: applied once"
+        );
+        assert_eq!(
+            replica.command_resolution(&owner("s"), "1"),
+            Some((ack.revision, Resolution::Duplicate)),
+            "{id}"
+        );
+    }
+    // Both copies are in the log, the second resolved as a duplicate.
+    let mut copies = 0;
+    set_.replica(leader)
+        .store()
+        .entries_after(0, |_, request: &Request| {
+            if let Body::Commands(commands) = &request.body {
+                copies += commands.iter().filter(|c| c.id == "1").count();
+            }
+        });
+    assert_eq!(copies, 2, "the first copy and the resend");
 }
 
 /// A quiescing leader orders nothing more: a forwarded command is refused

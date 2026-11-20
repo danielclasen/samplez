@@ -783,10 +783,13 @@ impl Audio for EngineAudio {
         None
     }
 
+    /// A core that does not decode, or that the engine refuses as
+    /// `ReplayError::Invalid` (another engine shape, an entry outside the
+    /// engine), is refused for good ([`Failed::Refused`]).
     fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, Failed> {
-        let copy = CoreCopy::decode(&core.core).map_err(|e| e.to_string())?;
+        let copy = CoreCopy::decode(&core.core).map_err(|e| Failed::Refused(e.to_string()))?;
         let mut unresolved = copy.core.unresolved().to_vec();
-        let mut replay = self.engine.replay(copy).map_err(|e| e.to_string())?;
+        let mut replay = self.engine.replay(copy).map_err(replay_failed)?;
         let deadline = Instant::now() + REPLAY_WAIT;
         let mut after = core.last_id;
         let j = loop {
@@ -820,7 +823,7 @@ impl Audio for EngineAudio {
                     replay.run_to((lowest[n] / self.block).saturating_sub(1));
                     appended = replay.append_batch(index, at_index, &list);
                 }
-                appended.map_err(|e| e.to_string())?;
+                appended.map_err(replay_failed)?;
             }
             if !source.go() {
                 return Err("given up before the hand-over".into());
@@ -832,7 +835,7 @@ impl Audio for EngineAudio {
                 // and the replay are read again.
                 Err(ReplayError::Missed { .. } | ReplayError::Timeout { .. })
                     if Instant::now() < deadline => {}
-                Err(e) => return Err(e.to_string().into()),
+                Err(e) => return Err(replay_failed(e)),
             }
         };
         // Taken late by the donor after its core and held unresolved, as
@@ -862,6 +865,15 @@ impl Audio for EngineAudio {
             pages,
             unresolved,
         })
+    }
+}
+
+/// A replay's refusal as a resync failure: `Invalid` is for good, as no
+/// core of the same donor fits better; any other may pass.
+fn replay_failed(e: ReplayError) -> Failed {
+    match e {
+        ReplayError::Invalid(why) => Failed::Refused(why),
+        e => Failed::Other(e.to_string()),
     }
 }
 

@@ -4,7 +4,10 @@
 //! replayed state to its RT thread at a block boundary. It commits again
 //! once a page after the hand-over matches (Resume) or by the Named rule;
 //! a failed attempt leaves it diverged, and it tries again with a newer
-//! core.
+//! core. A donor has the replica's compatibility key; with committing
+//! replicas of other keys only, or a core its engine refuses for good
+//! ([`Failed::Refused`]), the replica is rebuilt from product state
+//! instead.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +55,11 @@ pub enum Failed {
     /// [`Missed`], logged where it was found
     /// ([`crate::contact::Contact::replay_entries`]).
     Missed,
+    /// The engine refuses the core for good: it does not decode, or does
+    /// not fit the engine (another shape, an entry outside it). No core
+    /// of the same donor fits better, so the replica is rebuilt from
+    /// product state instead of trying again.
+    Refused(String),
     /// Any other cause, as text.
     Other(String),
 }
@@ -60,6 +68,7 @@ impl std::fmt::Display for Failed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Failed::Missed => f.write_str("a record after the donor's core is gone"),
+            Failed::Refused(why) => write!(f, "the core is refused: {why}"),
             Failed::Other(why) => f.write_str(why),
         }
     }
@@ -127,6 +136,12 @@ pub struct Metrics {
     /// an input read another flow than the applied state names
     /// ([`crate::contact::Audio::follows`]).
     pub rebuilt_for_flows: u64,
+    /// Diverged replicas rebuilt from product state rather than resynced:
+    /// every committing donor reported another compatibility key.
+    pub rebuilt_for_key: u64,
+    /// Cores the engine refused for good ([`Failed::Refused`]), each
+    /// followed by a rebuild from product state, not another attempt.
+    pub refused: u64,
     /// From asking for the core to the hand-over, the latest.
     pub last: Option<Duration>,
     /// How long the next attempt waits after the last one ended.
@@ -206,10 +221,15 @@ impl Tracker {
     }
 
     /// A rebuild from product state took the place of an attempt at
-    /// `now`: the next attempt, or rebuild, waits the backoff, which
-    /// doubles as after a failed attempt.
-    pub fn rebuilt(&mut self, now: Instant) {
-        self.metrics.rebuilt_for_flows += 1;
+    /// `now`, for an input on another flow (`flows`) or for want of a
+    /// donor of the replica's key: the next attempt, or rebuild, waits
+    /// the backoff, which doubles as after a failed attempt.
+    pub fn rebuilt(&mut self, now: Instant, flows: bool) {
+        if flows {
+            self.metrics.rebuilt_for_flows += 1;
+        } else {
+            self.metrics.rebuilt_for_key += 1;
+        }
         self.ended(now);
     }
 
@@ -259,20 +279,39 @@ impl Tracker {
     }
 }
 
-/// The donor: a fresh, clock-verified committing audio replica, the
-/// baseline first, else the lowest node id. The caller leaves out the
-/// replicas a `ClockVerdict` excludes.
-pub(crate) fn donor(baseline: Option<NodeId>, peers: &[(NodeId, bool, &Own)]) -> Option<NodeId> {
+/// Whether a peer could donate on its state alone: fresh, committing and
+/// clock-verified.
+fn may_donate(silent: bool, own: &Own) -> bool {
+    !silent && own.state == Some(ReplicaState::Committing) && !own.clock.unverified
+}
+
+/// The donor: a fresh, clock-verified committing audio replica that
+/// reports this replica's compatibility key `mine`, the baseline first,
+/// else the lowest node id. A core of another key is computed by another
+/// engine and would be refused. The caller leaves out the replicas a
+/// `ClockVerdict` excludes.
+pub(crate) fn donor(
+    baseline: Option<NodeId>,
+    mine: Option<u64>,
+    peers: &[(NodeId, bool, &Own)],
+) -> Option<NodeId> {
     let committing: Vec<NodeId> = peers
         .iter()
-        .filter(|(_, silent, own)| {
-            !silent && own.state == Some(ReplicaState::Committing) && !own.clock.unverified
-        })
+        .filter(|(_, silent, own)| may_donate(*silent, own) && crate::state::same_key(mine, own))
         .map(|&(id, _, _)| id)
         .collect();
     baseline
         .filter(|b| committing.contains(b))
         .or_else(|| committing.into_iter().min())
+}
+
+/// Whether a replica of key `mine` finds no donor only for its key: a
+/// peer commits, and every one that does reports another key.
+pub(crate) fn other_keys_only(mine: Option<u64>, peers: &[(NodeId, bool, &Own)]) -> bool {
+    donor(None, mine, peers).is_none()
+        && peers
+            .iter()
+            .any(|(_, silent, own)| may_donate(*silent, own))
 }
 
 /// The first replayed page that differs from what the donor reported for
@@ -321,15 +360,44 @@ mod tests {
             (2, false, &w),
             (1, true, &c),
         ];
-        assert_eq!(donor(Some(5), &peers), Some(5));
-        assert_eq!(donor(Some(2), &peers), Some(3), "a withdrawn baseline");
-        assert_eq!(donor(Some(1), &peers), Some(3), "a silent baseline");
-        assert_eq!(donor(None, &[(2, false, &w)]), None);
+        assert_eq!(donor(Some(5), None, &peers), Some(5));
+        assert_eq!(
+            donor(Some(2), None, &peers),
+            Some(3),
+            "a withdrawn baseline"
+        );
+        assert_eq!(donor(Some(1), None, &peers), Some(3), "a silent baseline");
+        assert_eq!(donor(None, None, &[(2, false, &w)]), None);
         let mut unverified = own(ReplicaState::Committing);
         unverified.clock.unverified = true;
         assert_eq!(
-            donor(Some(4), &[(4, false, &unverified), (6, false, &c)]),
+            donor(Some(4), None, &[(4, false, &unverified), (6, false, &c)]),
             Some(6)
+        );
+    }
+
+    /// Only a replica reporting the joiner's key donates, the baseline
+    /// included: a core of another key is another engine's. With
+    /// committing replicas of other keys only, none is found for the key
+    /// alone.
+    #[test]
+    fn a_donor_reports_the_joiners_key() {
+        let keyed = |key| Own {
+            key: Some(key),
+            ..own(ReplicaState::Committing)
+        };
+        let (old, new) = (keyed(1), keyed(2));
+        let peers = [(3, false, &old), (5, false, &new)];
+        assert_eq!(donor(Some(3), Some(2), &peers), Some(5));
+        assert_eq!(donor(Some(3), Some(1), &peers), Some(3));
+        let peers = [(3, false, &old), (4, false, &old)];
+        assert_eq!(donor(Some(3), Some(2), &peers), None, "the baseline's key");
+        assert!(other_keys_only(Some(2), &peers));
+        assert!(!other_keys_only(Some(1), &peers));
+        let w = own(ReplicaState::Withdrawn);
+        assert!(
+            !other_keys_only(Some(2), &[(3, false, &w)]),
+            "nobody commits"
         );
     }
 

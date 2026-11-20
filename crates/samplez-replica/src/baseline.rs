@@ -15,9 +15,9 @@ use crate::contact::{Timing, index_at};
 use crate::entry::{Baseline, Body, NodeId};
 use crate::rank::{Class, demoted};
 use crate::report::Own;
-use crate::rollout::{DEPARTED, Versions, base_gone, may_take_over};
+use crate::rollout::{DEPARTED, Versions, base_gone, baseline_of, may_take_over};
 use crate::state::{PAGES_KEPT, PageBook, ReplicaState, filling, withheld_from};
-use crate::verdict::judge;
+use crate::verdict::judge_by_key;
 
 /// How long the leader waits for a decision it appended to show in the
 /// log before it decides again.
@@ -66,8 +66,10 @@ pub struct Counts {
     pub renamed: u64,
     /// `Diverged` verdicts appended.
     pub verdicts: u64,
-    /// Pages without a strict majority hash among two or more.
+    /// Pages without a strict majority hash among two or more of one key.
     pub disagreements: u64,
+    /// Pages committed whole by replicas of two keys.
+    pub cross_key_disagreements: u64,
     /// `Baseline` entries naming a target-revision replica with another
     /// key than the baseline's: key hand-overs.
     pub handed_over: u64,
@@ -93,7 +95,9 @@ pub(crate) struct Leader {
     /// that never committed stands idle and says nothing), so this, not
     /// its statuses, keeps the hand-over from naming it every period.
     failed: BTreeMap<NodeId, (u32, Instant)>,
-    /// `replica_disagreement`: the last page judged had no strict majority.
+    /// `replica_disagreement`: the last page judged had no strict majority
+    /// among two or more hashes of one key, or was committed whole by
+    /// replicas of two keys.
     pub disagreement: bool,
     /// The latest `Baseline`'s versions and when a live audio voter last
     /// carried them, or this leader first saw them.
@@ -101,6 +105,23 @@ pub(crate) struct Leader {
     /// No live audio voter has carried the latest `Baseline`'s versions
     /// for [`DEPARTED`]: lower versions may take it over.
     gone: bool,
+    /// Why the key hand-over passed over each replica of another key
+    /// than the baseline's, as last logged: logged again only once the
+    /// reason changes.
+    refused: BTreeMap<NodeId, &'static str>,
+}
+
+/// Which rule a `Baseline` the leader appends follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    /// The key hand-over.
+    HandOver,
+    /// The no-committer rule, or a committing replica while none is
+    /// named.
+    Named,
+    /// A rename of a baseline that stopped committing, was diverged or
+    /// left the audio voters.
+    Renamed,
 }
 
 /// The versions of every live audio voter that reported.
@@ -113,18 +134,32 @@ fn live(v: &LeaderView) -> Vec<Option<Versions>> {
         .collect()
 }
 
-/// The latest `Baseline`'s key and versions; one named before they were
-/// reported carries none, and the named replica's report tells them.
+/// The latest `Baseline`'s key and versions ([`baseline_of`]).
 fn base_of(v: &LeaderView, b: &Baseline) -> (Option<u64>, Option<Versions>) {
     let named = v
         .audio
         .iter()
         .find(|a| a.id == b.replica)
         .and_then(|a| a.own);
-    (
-        b.key.or_else(|| named.and_then(|o| o.key)),
-        b.versions.or_else(|| named.and_then(|o| o.versions)),
-    )
+    baseline_of(b, named)
+}
+
+/// The key `id` reports.
+fn a_key(v: &LeaderView, id: NodeId) -> Option<u64> {
+    (v.audio.iter())
+        .find(|a| a.id == id)
+        .and_then(|a| a.own)
+        .and_then(|o| o.key)
+}
+
+/// Whether `a` may be named: it reports its compatibility key, or no
+/// audio voter reports one, as in a set without a rollout, where every
+/// key is equal. A `Baseline` naming a replica of unknown key carries
+/// none, and that replica may since run under another key than the one
+/// the set commits.
+fn keyed(v: &LeaderView, a: &Voter) -> bool {
+    let reports = |a: &Voter| a.own.is_some_and(|o| o.key.is_some());
+    reports(a) || !v.audio.iter().any(reports)
 }
 
 fn state(v: &Voter) -> Option<ReplicaState> {
@@ -160,7 +195,15 @@ impl Leader {
         self.inflight = None;
         self.failed
             .retain(|id, _| !v.audio.iter().any(|a| a.id == *id && committing(a)));
-        if let Some(b) = self.baseline(v, now) {
+        if let Some((b, rule)) = self.baseline(v, now) {
+            tracing::info!(
+                rule = ?rule,
+                replica = b.replica,
+                key = ?b.key,
+                versions = ?b.versions,
+                order = ?b.order,
+                "Baseline decided"
+            );
             if let Some(cur) = v.baseline
                 && cur.replica != b.replica
                 && !v.audio.iter().any(|a| a.id == cur.replica && committing(a))
@@ -203,8 +246,8 @@ impl Leader {
         self.base_seen = None;
     }
 
-    /// The `Baseline` to append, if any.
-    fn baseline(&mut self, v: &LeaderView, now: Instant) -> Option<Baseline> {
+    /// The `Baseline` to append, if any, and the rule it follows.
+    fn baseline(&mut self, v: &LeaderView, now: Instant) -> Option<(Baseline, Rule)> {
         if self
             .against
             .as_ref()
@@ -215,30 +258,30 @@ impl Leader {
         let anyone = v.audio.iter().any(committing);
         if anyone && let Some(b) = self.hand_over(v, now) {
             self.counts.handed_over += 1;
-            return Some(b);
+            return Some((b, Rule::HandOver));
         }
         let Some(current) = v.baseline else {
             if !anyone {
-                return self.no_committer(v);
+                return self.no_committer(v).map(|b| (b, Rule::Named));
             }
             // One voter commits without waiting for its entry: a set grown
             // from it names the top committing replica.
             let b = self.rename(v, None)?;
             self.counts.named += 1;
-            return Some(b);
+            return Some((b, Rule::Named));
         };
         let named = v.audio.iter().find(|a| a.id == current.replica);
         if !anyone {
             if named.is_some_and(|n| self.about_to_commit(v, n, current)) {
                 return None;
             }
-            return self.no_committer(v);
+            return self.no_committer(v).map(|b| (b, Rule::Named));
         }
         // Left the audio voters: it commits no more.
         let Some(n) = named else {
             let b = self.rename(v, None)?;
             self.counts.renamed += 1;
-            return Some(b);
+            return Some((b, Rule::Renamed));
         };
         let renamed = if self.against.as_ref().is_some_and(|(id, _)| *id == n.id) {
             true
@@ -257,7 +300,7 @@ impl Leader {
         }
         let b = self.rename(v, Some(n.id))?;
         self.counts.renamed += 1;
-        Some(b)
+        Some((b, Rule::Renamed))
     }
 
     /// The key hand-over: in a rollout that changes the key, a `Baseline`
@@ -266,44 +309,97 @@ impl Leader {
     /// block withheld for a cause and may take the baseline over by its
     /// versions ([`may_take_over`]): higher ones, or equal ones under
     /// another output config. A replica passed over, or one that never
-    /// learned of its naming, is named again only then.
+    /// learned of its naming, is named again only then. Why each replica
+    /// of another key than the baseline's is passed over is logged once
+    /// per change of the reason.
     fn hand_over(&mut self, v: &LeaderView, now: Instant) -> Option<Baseline> {
+        let n = self.hand_over_to(v, now);
+        if n.is_none() {
+            self.refused.clear();
+        }
+        let (replica, key, versions) = n?;
+        self.against = None;
+        Some(Baseline {
+            replica,
+            order: order(v, replica),
+            at_index: 0,
+            key: Some(key),
+            versions,
+        })
+    }
+
+    /// The replica the key hand-over names, the target's key and that
+    /// replica's versions; logs why each other one of another key than
+    /// the baseline's is passed over, when the reason changed.
+    fn hand_over_to(
+        &mut self,
+        v: &LeaderView,
+        now: Instant,
+    ) -> Option<(NodeId, u64, Option<Versions>)> {
         let target = v.target?;
         let current = v.baseline?;
-        let at_target = |a: &&Voter| {
-            a.own
-                .is_some_and(|o| o.key.is_some() && o.revision.as_deref() == Some(target))
-        };
-        let key = v.audio.iter().filter(at_target).find_map(|a| a.own?.key)?;
+        let at_target = |own: &Own| own.key.is_some() && own.revision.as_deref() == Some(target);
+        let key = (v.audio.iter())
+            .filter_map(|a| a.own)
+            .filter(|o| at_target(o))
+            .find_map(|o| o.key)?;
         let (base_key, base_versions) = base_of(v, current);
         if base_key.is_none_or(|k| k == key) {
             return None;
         }
         let live = live(v);
-        let n = v
-            .audio
-            .iter()
-            .filter(at_target)
-            .filter(|a| {
-                let own = a.own.expect("reported");
-                own.key == Some(key)
-                    && may_take_over(own.versions, base_versions, self.gone, &live)
-                    && self.failed.get(&a.id).is_none_or(|&(_, until)| now >= until)
-                    && candidate(v, a)
-                    && own.baseline == Some((current.replica, current.at_index))
-                    // One that computes nothing reports every block
-                    // withheld.
-                    && (own.state == Some(ReplicaState::VersionMismatch) || !withheld_from(own, 0))
-            })
-            .min_by_key(|a| ((v.rank)(a.id), a.id))?;
-        self.against = None;
-        Some(Baseline {
-            replica: n.id,
-            order: order(v, n.id),
-            at_index: 0,
-            key: Some(key),
-            versions: n.own.and_then(|o| o.versions),
-        })
+        let refusal = |a: &Voter, own: &Own| {
+            if !at_target(own) {
+                Some("revision")
+            } else if own.key != Some(key) {
+                Some("key")
+            } else if !may_take_over(own.versions, base_versions, self.gone, &live) {
+                Some("versions")
+            } else if self
+                .failed
+                .get(&a.id)
+                .is_some_and(|&(_, until)| now < until)
+            {
+                Some("failed")
+            } else if !candidate(v, a) {
+                Some("candidate")
+            } else if own.baseline != Some((current.replica, current.at_index)) {
+                Some("baseline applied")
+            // One that computes nothing reports every block withheld.
+            } else if own.state != Some(ReplicaState::VersionMismatch) && withheld_from(own, 0) {
+                Some("withheld")
+            } else {
+                None
+            }
+        };
+        let mut refused = BTreeMap::new();
+        let mut named: Option<(NodeId, Option<Versions>)> = None;
+        for a in &v.audio {
+            let Some(own) = a.own.filter(|o| o.key.is_some() && o.key != base_key) else {
+                continue;
+            };
+            match refusal(a, own) {
+                Some(why) => {
+                    refused.insert(a.id, why);
+                }
+                None if named.is_none_or(|(n, _)| ((v.rank)(a.id), a.id) < ((v.rank)(n), n)) => {
+                    named = Some((a.id, own.versions))
+                }
+                None => {}
+            }
+        }
+        for (&id, &why) in &refused {
+            if self.refused.get(&id) != Some(&why) {
+                tracing::info!(
+                    replica = id,
+                    reason = why,
+                    key = ?a_key(v, id),
+                    "the key hand-over passes a replica over"
+                );
+            }
+        }
+        self.refused = refused;
+        named.map(|(id, versions)| (id, key, versions))
     }
 
     /// A `Baseline` naming the highest-ranked replica committing the
@@ -312,7 +408,7 @@ impl Leader {
         let next = v
             .audio
             .iter()
-            .filter(|a| Some(a.id) != from && committing(a))
+            .filter(|a| Some(a.id) != from && committing(a) && keyed(v, a))
             .min_by_key(|a| ((v.rank)(a.id), a.id))?;
         self.against = None;
         Some(Baseline {
@@ -363,7 +459,7 @@ impl Leader {
         let top = v
             .audio
             .iter()
-            .filter(|a| candidate(v, a))
+            .filter(|a| candidate(v, a) && keyed(v, a))
             .filter(may)
             .min_by_key(|a| {
                 let own = a.own.expect("a candidate reported");
@@ -430,9 +526,13 @@ impl Leader {
                 }
                 let records: Vec<_> = reporting
                     .iter()
-                    .filter_map(|a| v.pages.get(a.id, o, *q).map(|p| (a.id, *p)))
+                    .filter_map(|a| {
+                        let key = a.own.and_then(|own| own.key);
+                        v.pages.get(a.id, o, *q).map(|p| (a.id, key, *p))
+                    })
                     .collect();
-                let j = judge(&records, base, v.contradicting);
+                let base_key = v.baseline.and_then(|b| base_of(v, b).0);
+                let j = judge_by_key(&records, base, base_key, v.contradicting);
                 let reported = |id: NodeId| {
                     v.audio
                         .iter()
@@ -450,7 +550,10 @@ impl Leader {
                 if j.disagreement {
                     self.counts.disagreements += 1;
                 }
-                self.disagreement = j.disagreement;
+                if j.cross_key {
+                    self.counts.cross_key_disagreements += 1;
+                }
+                self.disagreement = j.disagreement || j.cross_key;
                 for id in j.diverged {
                     // (4)
                     if Some(id) == base {
@@ -976,6 +1079,143 @@ mod tests {
         assert!(verdicts(&f.decide(&mut leader)).is_empty());
         tokio::time::advance(INFLIGHT).await;
         assert_eq!(verdicts(&f.decide(&mut leader)), [(a(1), q + 1)]);
+    }
+
+    /// A replica reporting another key than the others is not judged
+    /// against their majority: its pages differ by its key alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_verdict_leaves_out_replicas_of_another_key() {
+        let k = 1_000_000;
+        let q = 900;
+        let keyed = |own: Own, key| Own {
+            key: Some(key),
+            ..own
+        };
+        let mut f = Fixture::new(vec![
+            (a(0), false, keyed(committing_own(k), 1)),
+            (a(1), false, keyed(committing_own(k), 1)),
+            (a(2), false, keyed(committing_own(k), 1)),
+            (a(3), false, keyed(own(ReplicaState::Withdrawn, k), 2)),
+        ]);
+        for (x, h) in [(a(0), 1), (a(1), 1), (a(2), 1)] {
+            f.pages.fold(x, &[record(q, h)]);
+        }
+        let held = crate::report::Page {
+            committed: false,
+            ..record(q, 2)
+        };
+        f.pages.fold(a(3), &[held]);
+        let mut leader = Leader::default();
+        let out = f.decide(&mut leader);
+        assert!(
+            !out.iter().any(|b| matches!(b, Body::Diverged { .. })),
+            "{out:?}"
+        );
+        assert!(leader.judged[&0].contains(&q), "judged");
+    }
+
+    /// The leader names no replica whose report carries no key while
+    /// another reports one, by a rename or by the no-committer rule: its
+    /// `Baseline` would carry no key. In a set where none reports a key
+    /// it names as before.
+    #[tokio::test(start_paused = true)]
+    async fn the_leader_names_no_replica_without_a_key() {
+        let k = 1_000_000;
+        let keyed = |own: Own| Own {
+            key: Some(1),
+            ..own
+        };
+        let f = Fixture::new(vec![
+            (a(0), false, committing_own(k)),
+            (a(1), false, keyed(committing_own(k))),
+        ]);
+        assert_eq!(
+            named(&f.decide(&mut Leader::default())),
+            Some(a(1)),
+            "renamed"
+        );
+        let f = Fixture::new(vec![
+            (a(0), false, own(ReplicaState::Withdrawn, k)),
+            (a(1), false, keyed(own(ReplicaState::Withdrawn, k))),
+        ]);
+        assert_eq!(
+            named(&f.decide(&mut Leader::default())),
+            Some(a(1)),
+            "no committer"
+        );
+        let f = Fixture::new(vec![
+            (a(0), false, own(ReplicaState::Withdrawn, k)),
+            (a(1), false, own(ReplicaState::Withdrawn, k)),
+        ]);
+        assert_eq!(
+            named(&f.decide(&mut Leader::default())),
+            Some(a(0)),
+            "no key anywhere"
+        );
+    }
+
+    /// Two committing replicas of two keys that both committed a page
+    /// whole: the output carried both keys. The leader raises
+    /// `replica_disagreement` and diverges the one whose key is not the
+    /// baseline's.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_committed_under_two_keys_diverges_the_other_key() {
+        let k = 1_000_000;
+        let q = 900;
+        let keyed = |own: Own, key| Own {
+            key: Some(key),
+            ..own
+        };
+        let mut f = Fixture::new(vec![
+            (a(0), false, keyed(committing_own(k), 1)),
+            (a(1), false, keyed(committing_own(k), 1)),
+            (a(2), false, keyed(committing_own(k), 2)),
+        ]);
+        f.baseline = Some(Baseline {
+            replica: a(0),
+            order: Vec::new(),
+            at_index: 0,
+            key: Some(1),
+            versions: None,
+        });
+        for x in [a(0), a(1), a(2)] {
+            f.pages.fold(x, &[record(q, 1)]);
+        }
+        let mut leader = Leader::default();
+        let out = f.decide(&mut leader);
+        let diverged: Vec<NodeId> = out
+            .iter()
+            .filter_map(|b| match b {
+                Body::Diverged { replica, .. } => Some(*replica),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(diverged, [a(2)], "{out:?}");
+        assert!(leader.disagreement);
+        assert_eq!(
+            (
+                leader.counts.cross_key_disagreements,
+                leader.counts.disagreements
+            ),
+            (1, 0)
+        );
+        // The reverse: two replicas of one key without a majority.
+        f.owns[2].2.key = Some(1);
+        f.pages = PageBook::default();
+        for (x, h) in [(a(0), 1), (a(1), 2)] {
+            f.pages.fold(x, &[record(q, h)]);
+        }
+        f.owns.pop();
+        let mut leader = Leader::default();
+        f.decide(&mut leader);
+        assert!(leader.disagreement);
+        assert_eq!(
+            (
+                leader.counts.cross_key_disagreements,
+                leader.counts.disagreements
+            ),
+            (0, 1)
+        );
     }
 
     /// A page verdict against the baseline renames it only under the

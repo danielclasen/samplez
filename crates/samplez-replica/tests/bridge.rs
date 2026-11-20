@@ -18,7 +18,7 @@ use samplez_replica::contact::{Audio, Timing};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::{Body, Command, Origin, Request, SessionKey};
 use samplez_replica::report::{Page, page_digest, status_of};
-use samplez_replica::resync::{Missed, Source};
+use samplez_replica::resync::{CoreReply, Failed, Missed, Source};
 use samplez_replica::state_machine::{Apply, Changed, Effect, Product, Record, StateMachine};
 
 const B: u64 = 48;
@@ -774,6 +774,58 @@ fn a_donors_core_is_replayed_and_handed_over_on_the_joiner() {
     let core = donor_audio.copy_core().expect("a core");
     assert!(joiner_audio.resync(&core, &feed(true, true)).is_err());
     assert_eq!(installed(), 1, "no hand-over over a gap");
+}
+
+/// A core the joiner's engine cannot take, one of another engine shape
+/// (a limiter the joiner's output lacks) or one that does not decode, is
+/// refused for good: no core of that donor fits better, so contact
+/// rebuilds the joiner from product state rather than asking again.
+#[test]
+fn a_core_of_another_engine_shape_is_refused_for_good() {
+    let (da, db) = (Domain::new(), Domain::new());
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": da.0 }],
+        "inputs": [{ "name": "in0", "domain": "d",
+                     "flowId": "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a", "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d",
+                      "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01", "label": "bridge",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1,
+                      "limiter": true }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (donor, donor_audio) = bridge_of(&v, 64);
+    let (joiner, joiner_audio) = bridge(&db, 64);
+    let processed = |e: &Engine| e.progress().and_then(|p| p.processed);
+    wait_for("both compute", || {
+        processed(&donor).is_some() && processed(&joiner).is_some()
+    });
+    let feed = Feed {
+        go: true,
+        missed: false,
+    };
+    let core = donor_audio.copy_core().expect("a core");
+    let refused = joiner_audio.resync(&core, &feed);
+    assert!(
+        matches!(&refused, Err(Failed::Refused(why)) if why.contains("another engine shape")),
+        "{refused:?}"
+    );
+    let garbled = CoreReply {
+        core: "{".to_owned(),
+        ..core
+    };
+    let refused = joiner_audio.resync(&garbled, &feed);
+    assert!(matches!(refused, Err(Failed::Refused(_))), "{refused:?}");
+    assert_eq!(
+        joiner
+            .counters()
+            .handovers_installed
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 /// A mixer command's record: it ramps the coefficient to `gain` and

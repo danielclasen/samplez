@@ -244,8 +244,8 @@ async fn a_single_replica_commits_once_ready_also_after_a_restart() {
 /// An input glitch on one of two audio replicas, a stateless shape: it
 /// withholds on the other's committed report, withdraws, resumes on its
 /// own page-hash match within three pages, and the samples its member
-/// skipped are counted in `resume_gap_samples`. It is not Ready while
-/// withdrawn and the other commits.
+/// skipped are counted in `resume_gap_samples`. It is Ready throughout,
+/// withdrawn while the other commits.
 #[tokio::test(start_paused = true)]
 async fn a_glitch_on_one_replica_withdraws_it_until_it_resumes_on_its_hashes() {
     let set = start(vec![a(0), a(1), witness()], 1).await;
@@ -263,8 +263,8 @@ async fn a_glitch_on_one_replica_withdraws_it_until_it_resumes_on_its_hashes() {
     })
     .await;
     assert!(
-        !set.replica(other).replica().ready,
-        "a demoted replica is not Ready while another commits"
+        set.replica(other).replica().ready,
+        "a demoted replica is Ready while another commits"
     );
     until("resumed", 2, || committing(&set, other)).await;
     let f = from(&set, other, 0).unwrap();
@@ -520,11 +520,13 @@ async fn the_per_output_rule_commits_an_output_nobody_commits() {
     assert_eq!(after.named, decided.named, "no Baseline for it");
 }
 
-/// The audio `/readyz` term out of contact: a replica Ready when it lost
-/// contact is not Ready once it withdrew, as it then writes nothing; one
-/// never in contact since its start is not either.
+/// The audio `/readyz` term out of contact keeps its last value: a
+/// replica Ready when it lost contact stays Ready once it withdrew, until
+/// contact tells whether another commits; one never in contact since its
+/// start is not Ready, and once in contact it is Ready only when it
+/// commits, never having committed since it started.
 #[tokio::test(start_paused = true)]
-async fn readiness_follows_a_withdrawal_out_of_contact_and_is_false_before_any() {
+async fn readiness_keeps_its_value_out_of_contact_and_is_false_before_any() {
     let mut set = start(vec![a(0), a(1), witness()], 1).await;
     let ids = audio(&set);
     until("committing", 5, || {
@@ -536,8 +538,8 @@ async fn readiness_follows_a_withdrawal_out_of_contact_and_is_false_before_any()
     until("withdrawn out of contact", 5, || !committing(&set, a(1))).await;
     sleep(Duration::from_millis(10)).await;
     assert!(
-        !set.replica(a(1)).replica().ready,
-        "not Ready while it writes nothing"
+        set.replica(a(1)).replica().ready,
+        "Ready as when it lost contact"
     );
     set.crash(a(1)).await;
     set.restart(a(1)).await;
@@ -547,7 +549,7 @@ async fn readiness_follows_a_withdrawal_out_of_contact_and_is_false_before_any()
         "Ready without contact since its start"
     );
     set.net.heal();
-    until("Ready once in contact and committing", 5, || {
+    until("Ready once it commits again", 5, || {
         set.replica(a(1)).replica().ready
     })
     .await;

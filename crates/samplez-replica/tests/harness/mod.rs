@@ -521,6 +521,16 @@ pub struct Fake {
     pending_handover: Option<(u64, Vec<f32>)>,
     /// Rebuilds fail while set.
     pub rebuild_held: bool,
+    /// The compatibility key the replica starts with.
+    pub key: u64,
+    /// The engine's shape, as a core copy carries it: one of another
+    /// shape is refused for good ([`Failed::Refused`]), as an engine
+    /// refuses a core of another engine shape. Derived from the key: a
+    /// replica of another key runs another engine.
+    pub shape: u64,
+    /// Each page hash has the key mixed in: pages of replicas of two keys
+    /// differ, as those of two engine versions do.
+    pub key_pages: bool,
     /// Times the engine dropped its core for committed entries its RT
     /// thread did not take.
     pub log_overflows: u64,
@@ -834,6 +844,7 @@ impl FakeAudio {
                 .any(|&(a, z, c)| c == Cause::ClockStep && (a..z).contains(&target));
         }
         let b = self.timing.block;
+        let mixed = if st.key_pages { st.key } else { 0 };
         for k in first..=target {
             if let Some((j, _)) = st.pending_handover
                 && k == j + 1
@@ -919,7 +930,9 @@ impl FakeAudio {
                     out.kept.pop_front();
                 }
                 let statuses = &out.statuses;
-                out.kept.push_back(page_of(&h, b, |k| statuses.get(k)));
+                let mut page = page_of(&h, b, |k| statuses.get(k));
+                page.hash ^= mixed;
+                out.kept.push_back(page);
             }
             // As the engine does: before the next output advances.
             if moved.withdraw {
@@ -1173,7 +1186,7 @@ impl Audio for FakeAudio {
         Some(CoreReply {
             k0,
             last_id,
-            core: serde_json::to_string(&(open, reads)).expect("encodes"),
+            core: serde_json::to_string(&(open, reads, st.shape)).expect("encodes"),
         })
     }
     /// The replay catches up within `catch_up` blocks and hands over.
@@ -1198,8 +1211,13 @@ impl Audio for FakeAudio {
         if !go {
             return Err("given up".into());
         }
-        let (mut donor, reads): (Vec<f32>, Vec<Option<String>>) =
+        let (mut donor, reads, shape): (Vec<f32>, Vec<Option<String>>, u64) =
             serde_json::from_str(&core.core).map_err(|e| e.to_string())?;
+        if shape != st.shape {
+            return Err(Failed::Refused(
+                "the core is of another engine shape".into(),
+            ));
+        }
         if st.route_digests && reads != st.reads(st.computed.unwrap_or(0)) {
             if !st.hands_over_off_flows {
                 return Err("a replayed page differs from the donor's".into());
@@ -1264,6 +1282,9 @@ struct Links {
     /// The log protocol every report says this node speaks, its own and
     /// as relayed, as from a binary of that protocol.
     protocols: BTreeMap<NodeId, u32>,
+    /// (from, to): this many more forwards of commands arrive and are
+    /// handled, and their answers are lost.
+    lost_forward_answers: BTreeMap<(NodeId, NodeId), u32>,
 }
 
 /// The links between the replicas of one set.
@@ -1340,6 +1361,14 @@ impl Net {
     /// From now on, an append from `from` to `to` that carries an
     /// application entry arrives and its answer never does, as openraft
     /// waits for an AppendEntries response stalled on the way.
+    /// The answers to the next `n` forwards of commands from `from` to `to`
+    /// are lost: each forward arrives and is handled, and `from` hears
+    /// nothing back, as when a connection drops after the request went
+    /// out.
+    pub fn lose_forward_answers(&self, from: NodeId, to: NodeId, n: u32) {
+        self.links().lost_forward_answers.insert((from, to), n);
+    }
+
     pub fn hold_replies(&self, from: NodeId, to: NodeId) {
         self.links().hold_replies.insert((from, to));
     }
@@ -1550,7 +1579,20 @@ impl Peers {
             links.replicas.get(&target).cloned()
         };
         let replica = replica.ok_or_else(|| format!("{target} down"))?;
-        Ok(replica.handle(to, request).await)
+        let forward = matches!(request, PeerRequest::Forward { .. });
+        let reply = replica.handle(to, request).await;
+        if forward {
+            let mut links = self.net.links();
+            if let Some(n) = links
+                .lost_forward_answers
+                .get_mut(&(self.from, target))
+                .filter(|n| **n > 0)
+            {
+                *n -= 1;
+                return Err(format!("the answer from {target} was lost"));
+            }
+        }
+        Ok(reply)
     }
 }
 
@@ -1684,13 +1726,21 @@ pub struct Options {
     /// Kernel TAI offsets, whole seconds, set before the replicas start;
     /// every other node is at 37.
     pub kernel_offsets: Vec<(NodeId, i64)>,
-    /// The offsets verify nobody: start waits for readiness only.
+    /// The offsets verify nobody: no audio replica leaves `starting`,
+    /// none commits and none is counted, so none reads ready or takes
+    /// writes; start waits for each to be in contact only.
     pub unverified: bool,
     /// Product configuration hashes by node; every other node's is 0.
     pub configs: Vec<(NodeId, u64)>,
     /// Nodes each of whose fsynced writes takes this much longer: a slow
     /// disk.
     pub sync_delays: Vec<(NodeId, Duration)>,
+    /// No replica is given its rollout at the set's start, so it reports
+    /// no key, until [`Set::release_rollout`].
+    pub late_rollout: bool,
+    /// Each [`FakeAudio`] mixes its key into its page hashes
+    /// ([`Fake::key_pages`]).
+    pub key_pages: bool,
 }
 
 /// The raft timers of a test set: short, so a test that waits for a
@@ -1724,6 +1774,8 @@ impl Default for Options {
             unverified: false,
             configs: Vec::new(),
             sync_delays: Vec::new(),
+            late_rollout: false,
+            key_pages: false,
         }
     }
 }
@@ -1748,6 +1800,9 @@ pub struct Set<P: Product = Paths> {
     /// revision `r1` when not set.
     versions: BTreeMap<NodeId, (u64, Option<Versions>, String)>,
     rollouts: BTreeMap<NodeId, Arc<Fixed>>,
+    /// Replicas given no rollout on their next start, until
+    /// [`Set::release_rollout`].
+    held: BTreeSet<NodeId>,
     target: Option<String>,
     /// Per replica, what its fake is set to on its next start, before its
     /// contact runs.
@@ -1803,9 +1858,13 @@ impl<P: Product> Set<P> {
             audios: BTreeMap::new(),
             versions: BTreeMap::new(),
             rollouts: BTreeMap::new(),
+            held: BTreeSet::new(),
             target: None,
             on_start: BTreeMap::new(),
         };
+        if set.options.late_rollout {
+            set.held = set.ids().collect();
+        }
         for &(id, s) in &set.options.kernel_offsets {
             set.clocks[&id].set_kernel_offset(s);
         }
@@ -1817,10 +1876,14 @@ impl<P: Product> Set<P> {
             .await
             .expect("initializes");
         set.leader().await;
-        // Ready, or committing or withdrawn: a replica withdrawn once the
-        // set's first `Baseline` applied writes nothing and reads not
-        // ready until it commits, which in a set whose digests differ it
-        // may never do. Diverged or resyncing is not started.
+        // Ready, or committing or withdrawn: a replica reads not ready
+        // while no audio replica commits, which in a set whose digests
+        // differ may never happen. Diverged or resyncing is not started.
+        // A set whose offsets verify nobody is clock-held: no audio
+        // replica leaves `starting`, so none commits, and under the
+        // readiness rule a set that never commits reads not ready
+        // anywhere. There an audio replica in `starting` and in contact
+        // is started.
         let deadline = Instant::now() + Duration::from_secs(30);
         while !set.replicas.iter().all(|(&id, r)| {
             let info = r.replica();
@@ -1828,7 +1891,11 @@ impl<P: Product> Set<P> {
                 .and_then(|m| m.replica)
                 .and_then(|l| l.state)
                 .is_some_and(|s| matches!(s, ReplicaState::Committing | ReplicaState::Withdrawn));
-            (info.ready || started)
+            let held = set.options.unverified
+                && r.contact_metrics().is_some_and(|m| {
+                    m.in_contact && m.replica.and_then(|l| l.state) == Some(ReplicaState::Starting)
+                });
+            (info.ready || started || held)
                 && (slot_of(id) == Slot::Witness || info.commitable || set.options.unverified)
         }) {
             assert!(
@@ -1932,9 +1999,20 @@ impl<P: Product> Set<P> {
         let replica = Arc::new(replica);
         if let Some(timing) = self.options.contact {
             let clock = self.clocks[&id].clone();
+            let (key, versions, revision) = self.versions.get(&id).cloned().unwrap_or((
+                base_key(),
+                Some(base_versions()),
+                "r1".to_owned(),
+            ));
             let audio = (slot_of(id) != Slot::Witness).then(|| {
                 let alone = self.ids().count() == 1;
                 let audio = FakeAudio::new(clock.clone(), timing, self.options.outputs, alone);
+                {
+                    let mut fake = audio.lock();
+                    fake.key = key;
+                    fake.shape = key;
+                    fake.key_pages = self.options.key_pages;
+                }
                 if let Some(set) = self.on_start.get(&id) {
                     set(&audio);
                 }
@@ -1944,17 +2022,15 @@ impl<P: Product> Set<P> {
                 Arc::new(audio)
             });
             let engine = audio.clone().map(|a| a as Arc<dyn Audio>);
+            let rollout = Fixed::new(key, versions, Some(revision));
+            rollout.set_target(self.target.clone());
+            // Given before contact starts: its first report carries the key.
+            if !self.held.contains(&id) {
+                replica.rollout(rollout.clone()).expect("a rollout");
+            }
             replica
                 .contact(timing, Arc::new(Tai(clock)), engine)
                 .expect("contact starts");
-            let (key, versions, revision) = self.versions.get(&id).cloned().unwrap_or((
-                base_key(),
-                Some(base_versions()),
-                "r1".to_owned(),
-            ));
-            let rollout = Fixed::new(key, versions, Some(revision));
-            rollout.set_target(self.target.clone());
-            replica.rollout(rollout.clone()).expect("contact runs");
             self.rollouts.insert(id, rollout);
             if let Some(audio) = audio {
                 self.audios.insert(id, audio);
@@ -1989,6 +2065,20 @@ impl<P: Product> Set<P> {
     ) {
         self.versions
             .insert(id, (key, versions, revision.to_owned()));
+    }
+
+    /// `id` is given no rollout on its next start, so it reports no key,
+    /// until [`Set::release_rollout`].
+    pub fn hold_rollout(&mut self, id: NodeId) {
+        self.held.insert(id);
+    }
+
+    /// Gives `id` its rollout now, the key and revision it started with.
+    pub fn release_rollout(&mut self, id: NodeId) {
+        if self.held.remove(&id) {
+            let rollout = self.rollouts[&id].clone();
+            self.replicas[&id].rollout(rollout).expect("a rollout");
+        }
     }
 
     /// `set` sets `id`'s fake from its next start on, before its contact

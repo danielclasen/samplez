@@ -83,7 +83,7 @@ fn logged(set: &Set, leader: NodeId) -> Vec<(u32, bool)> {
 /// The leader alone loses the input, its own mirror gone: the input stays
 /// up for the set, and the leader, whose output then differs from its
 /// peers', is caught by its page hashes and withholds while the other two
-/// serve.
+/// commit; it stays Ready, as they commit.
 #[tokio::test(start_paused = true)]
 async fn the_leader_alone_losing_an_input_takes_it_down_for_nobody() {
     let set = start(3).await;
@@ -100,7 +100,8 @@ async fn the_leader_alone_losing_an_input_takes_it_down_for_nobody() {
         state(&set, leader) == Some(ReplicaState::Diverged)
     })
     .await;
-    assert!(!set.replica(leader).replica().ready, "the leader withholds");
+    // Ready all the same: the other two commit.
+    assert!(set.replica(leader).replica().ready, "the leader serves");
     for id in set.ids().filter(|&id| id != leader) {
         assert!(set.replica(id).replica().ready, "{id} serves");
         assert_eq!(state(&set, id), Some(ReplicaState::Committing), "{id}");
