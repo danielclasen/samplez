@@ -2102,6 +2102,14 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
             value: p.silent_gap_max.as_secs_f64(),
         });
     }
+    if let Some(lead) = m.build_lead {
+        out.push(one(
+            "samplez_engine_build_lead_samples",
+            "buildLead: samples a generation-needing entry is stamped ahead, the latest build times, a supervisor tick and the open grace on top of the engine's lead.",
+            Gauge,
+            lead as f64,
+        ));
+    }
     if let Some(node) = m.apply_lead_raised_by {
         out.push(ReplicaMetric {
             name: "samplez_replica_apply_lead_raised_by",

@@ -1,10 +1,10 @@
 //! The engine bridge against a real replicated engine on an MXL domain:
 //! what reports carry of it, and what contact hands it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use samplez::blocks::{HEALTHY, PAGE};
@@ -107,7 +107,11 @@ fn bridge_timed(
     changes: usize,
     timing: &Timing,
 ) -> (Arc<Engine>, EngineAudio) {
-    let config = Config::parse(&v.to_string()).unwrap();
+    bridge_config(Config::parse(&v.to_string()).unwrap(), changes, timing)
+}
+
+/// [`bridge_timed`] of configuration `config`.
+fn bridge_config(config: Config, changes: usize, timing: &Timing) -> (Arc<Engine>, EngineAudio) {
     let (reports, _) = std::sync::mpsc::sync_channel(64);
     let (status_tx, status_rx) = std::sync::mpsc::sync_channel(changes);
     let (hash_tx, hash_rx) = std::sync::mpsc::sync_channel(1 << 10);
@@ -2203,4 +2207,181 @@ fn a_sample_names_the_outputs_the_log_disabled() {
     );
     audio.committed(1);
     wait_for("output 0 disabled", || audio.sample().enabled == [false]);
+}
+
+/// The flows whose lookup [`slow_open`] makes wait, and how long, once.
+static SLOW_OPEN: Mutex<Vec<(String, Duration)>> = Mutex::new(Vec::new());
+
+/// A lookup that waits the first time it looks up a flow [`SLOW_OPEN`]
+/// names: a reader whose open takes that long.
+fn slow_open(dir: &std::path::Path) -> bool {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let wait = {
+        let mut slow = SLOW_OPEN.lock().unwrap();
+        let n = slow
+            .iter()
+            .position(|(id, _)| name.starts_with(id.as_str()));
+        n.map(|n| slow.remove(n).1)
+    };
+    if let Some(wait) = wait {
+        std::thread::sleep(wait);
+    }
+    samplez_mxl::lookup::exists(dir)
+}
+
+/// A re-route whose reader opens past the entry's index on one replica
+/// of three: that replica swaps its generation in on time without the
+/// reader, reads the slot silent and reports it degraded and the input
+/// unreadable, while the two others read it, so the input stays up; the
+/// page verdicts leave its degraded pages out and diverge it on any other
+/// that differs, never the others, with no disagreement. Once its reader
+/// is open it reads the input again through the next build, and from the
+/// first page after that block and the fade-in its pages are the others'
+/// again.
+#[test]
+fn a_reader_open_late_on_one_replica_leaves_its_pages_to_the_verdicts() {
+    let domain = Domain::new();
+    std::fs::write(
+        domain.0.join("options.json"),
+        r#"{"urn:x-mxl:option:history_duration/v1.0": 1000000000}"#,
+    )
+    .unwrap();
+    let next = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd6a11";
+    let _src = Pilot::start(&domain, CONSOLE_INPUT);
+    let _next = Pilot::start(&domain, next);
+    let replica = |n: u32, slow: bool| {
+        let v = serde_json::json!({
+            "blockSize": B,
+            "readerMarginSamples": 960,
+            "rampSamples": 480,
+            "libmxl": libmxl(),
+            "domains": [{ "name": "d", "path": domain.0 }],
+            "inputs": [{ "name": "in0", "domain": "d", "flowId": CONSOLE_INPUT, "channels": 1 }],
+            "outputs": [{ "name": "out0", "domain": "d",
+                          "flowId": format!("8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f5{n}"),
+                          "label": "late open", "group": "samplez-test", "role": "Audio 0",
+                          "channels": 1 }],
+            "matrix": [[1.0]],
+            "rt": { "rtCpu": "none" },
+        });
+        let mut config = Config::parse(&v.to_string()).unwrap();
+        if slow {
+            config.look = slow_open;
+        }
+        let timing = Timing {
+            margin: 960,
+            ..Timing::defaults(B)
+        };
+        bridge_config(config, 1 << 12, &timing)
+    };
+    let replicas = [replica(0, false), replica(1, false), replica(2, true)];
+    // Committing, so that every block gets a status word with its digest.
+    for (e, _) in &replicas {
+        e.set_fence(u64::MAX).unwrap();
+        e.commit_from(0, 0).unwrap();
+    }
+    let reads = |e: &Engine, state: InputState| e.status().inputs[0].state == state;
+    wait_for("every replica reads its input", || {
+        (replicas.iter()).all(|(e, _)| {
+            reads(e, InputState::Attached) && e.progress().and_then(|p| p.processed).is_some()
+        })
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let mut pages = vec![BTreeMap::new(); 3];
+    let collect = |pages: &mut [BTreeMap<u64, Page>]| {
+        for (n, (_, audio)) in replicas.iter().enumerate() {
+            for p in audio.sample().own.pages {
+                pages[n].insert(p.page, p);
+            }
+        }
+    };
+
+    collect(&mut pages);
+    SLOW_OPEN
+        .lock()
+        .unwrap()
+        .push((next.to_owned(), Duration::from_millis(300)));
+    let processed = |e: &Engine| e.progress().and_then(|p| p.processed).unwrap_or(0);
+    let at = (replicas.iter().map(|(e, _)| processed(e)).max().unwrap() + 40) * B;
+    let route = [Entry::Route {
+        slot: 0,
+        flow_id: next.to_owned(),
+    }];
+    for (_, audio) in &replicas {
+        audio.appended(1, at, &route);
+        audio.committed(1);
+    }
+    let (c, audio_c) = &replicas[2];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // The slow replica's votes while its reader is out, and the block it
+    // read the input again at the latest.
+    let (mut voted_down, mut others_up) = (false, true);
+    let rejoined = loop {
+        collect(&mut pages);
+        let own = audio_c.sample().own;
+        voted_down |= own.unreadable & 1 != 0 && own.readable & 1 == 0;
+        for (_, audio) in &replicas[..2] {
+            others_up &= audio.sample().own.readable & 1 != 0;
+        }
+        if voted_down && reads(c, InputState::Attached) {
+            // At the latest: the generation is pushed as the input reads
+            // attached, at most this poll's 5 ms and a 5 ms tick before.
+            break processed(c) + 2;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the slow replica reads again within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(voted_down, "the slow replica voted the input unreadable");
+    assert!(others_up, "the others voted the input readable throughout");
+    let from = (rejoined * B + 480).div_ceil(PAGE);
+    // The earliest page the rejoin can lie in.
+    let rejoin_page = rejoined.saturating_sub(12) * B / PAGE;
+    let end = (from + 6) * PAGE / B;
+    while replicas.iter().any(|(e, _)| processed(e) <= end + PAGE / B) {
+        collect(&mut pages);
+        assert!(Instant::now() < deadline, "pages within 10 s");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    collect(&mut pages);
+    let (mut out, mut left_out) = (0, 0);
+    for p in at / PAGE..=end * B / PAGE {
+        let (Some(a), Some(b), Some(x)) = (pages[0].get(&p), pages[1].get(&p), pages[2].get(&p))
+        else {
+            continue;
+        };
+        let records = [(1, *a), (2, *b), (3, *x)];
+        let judged = samplez_replica::verdict::judge(&records, Some(1), &BTreeSet::new());
+        assert!(!judged.disagreement, "page {p}: {judged:?}");
+        assert!(
+            !judged.diverged.contains(&1) && !judged.diverged.contains(&2),
+            "page {p}: {judged:?}"
+        );
+        assert_eq!((a.hash, a.fingerprint), (b.hash, b.fingerprint), "page {p}");
+        if (x.hash, x.fingerprint) != (a.hash, a.fingerprint) {
+            assert!(p < from, "page {p} differs from {from} on");
+            out += 1;
+            if x.degraded {
+                left_out += 1;
+            } else {
+                // A page it computed healthy that differs follows its local
+                // rejoin and fade-in: the verdicts diverge it, and contact
+                // resyncs it.
+                assert!(
+                    p >= rejoin_page,
+                    "page {p} differs, not degraded, before the rejoin at page {}",
+                    rejoin_page
+                );
+                assert!(judged.diverged.contains(&3), "page {p}: {judged:?}");
+            }
+        }
+    }
+    assert!(left_out > 0, "{out} pages differed, none degraded");
+    let compared = equal_pages(&pages[0], &pages[2], from, end * B / PAGE).unwrap();
+    assert!(compared >= 4, "{compared} pages compared from {from}");
+    for (e, _) in &replicas {
+        assert_eq!(e.counters().generation_late.load(Ordering::Relaxed), 0);
+    }
 }

@@ -158,7 +158,45 @@ unsafe impl Send for Instance {}
 // release, all of which run on the supervisor side.
 unsafe impl Sync for Instance {}
 
+/// The instances created and not yet destroyed in this process.
+static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// This thread is not to release a reader or destroy an instance
+    /// ([`guard_releases`]).
+    static GUARDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Releases made on a guarded thread.
+static GUARDED_RELEASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Marks the calling thread as one that is not to release a reader or
+/// destroy an instance, both of which can wait in the kernel: each such
+/// release made on it while marked is counted ([`guarded_releases`]).
+pub fn guard_releases(on: bool) {
+    GUARDED.with(|g| g.set(on));
+}
+
+/// Readers released and instances destroyed on a thread marked by
+/// [`guard_releases`], in this process.
+pub fn guarded_releases() -> usize {
+    GUARDED_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Counts a release made on a guarded thread.
+pub(crate) fn note_release() {
+    if GUARDED.with(std::cell::Cell::get) {
+        GUARDED_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Instance {
+    /// The instances created and not yet destroyed in this process: each
+    /// holds a libmxl domain watcher, a thread and three descriptors.
+    pub fn live() -> usize {
+        LIVE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn new(api: &Arc<MxlApi>, domain: &Path) -> Result<Arc<Instance>> {
         let c_domain = CString::new(domain.as_os_str().as_encoded_bytes())
             .map_err(|_| Error::Format(format!("path {} contains NUL", domain.display())))?;
@@ -172,6 +210,7 @@ impl Instance {
                 status: mxl_sys::MXL_ERR_UNKNOWN,
             });
         }
+        LIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Arc::new(Instance {
             api: Arc::clone(api),
             raw,
@@ -249,9 +288,11 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        note_release();
         // SAFETY: `raw` came from mxlCreateInstance; every reader, writer and
         // group holds an Arc to this instance, so all are released.
         unsafe { self.api.destroy_instance(self.raw) };
+        LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

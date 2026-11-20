@@ -1208,7 +1208,10 @@ impl Hold {
                         rank: ctx.ranks.of(k, true),
                         cause: Cause::Unfillable,
                         on_silence_of: 0,
-                        digest: None,
+                        // Its own digest: a block computed degraded is
+                        // reported so, its page left out of the verdicts
+                        // rather than judged by its hash.
+                        digest,
                     };
                     if statuses.first(&st).is_ok() {
                         self.withheld += 1;
@@ -1951,8 +1954,14 @@ mod tests {
         assert!(t.sink.writes.is_empty());
         assert!(t.hold.is_empty());
         // Later blocks without a page boundary are withheld at once.
-        t.compute(K0 + 2, Some(HEALTHY));
-        assert_eq!(t.kind(K0 + 2), Some(Kind::Withheld));
+        // Computed withdrawn, no page boundary in it: withheld at once,
+        // keeping the degradation it was computed with.
+        t.compute(K0 + 2, DEGRADED);
+        let st = t.statuses.get(K0 + 2).unwrap();
+        assert_eq!(
+            (st.kind, st.cause, st.digest),
+            (Kind::Withheld, Cause::Unfillable, DEGRADED)
+        );
         assert!(t.sink.writes.is_empty());
     }
 
