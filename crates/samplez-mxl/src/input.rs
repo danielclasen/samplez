@@ -9,6 +9,7 @@
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use mxl_sys::{
@@ -64,11 +65,62 @@ pub struct InputConfig<'a> {
     pub offset: i64,
 }
 
+/// Test-only: called with the flow id before each reader open, under the
+/// instance's lock as libmxl's own open runs, so that a test can make an
+/// open take as long as a slow one does.
+#[cfg(feature = "test-hooks")]
+#[allow(clippy::disallowed_types, reason = "a test hook, supervisor side")]
+static OPEN_DELAY: std::sync::Mutex<Option<fn(&str)>> = std::sync::Mutex::new(None);
+
+/// Test-only: sets the hook [`FlowReader::open`] calls before each open.
+#[cfg(feature = "test-hooks")]
+#[allow(clippy::disallowed_methods, reason = "a test hook, supervisor side")]
+pub fn set_open_delay(hook: Option<fn(&str)>) {
+    *OPEN_DELAY.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
+#[cfg(feature = "test-hooks")]
+#[allow(clippy::disallowed_methods, reason = "a test hook, supervisor side")]
+fn open_delay(flow_id: &str) {
+    let hook = *OPEN_DELAY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hook) = hook {
+        hook(flow_id);
+    }
+}
+
+/// Test-only: called with the flow id before each reader open; an open
+/// it answers true for fails as one of a flow not found does.
+#[cfg(feature = "test-hooks")]
+pub type OpenFailure = fn(&str) -> bool;
+
+/// Test-only: the [`OpenFailure`] hook set.
+#[cfg(feature = "test-hooks")]
+#[allow(clippy::disallowed_types, reason = "a test hook, supervisor side")]
+static OPEN_FAILURE: std::sync::Mutex<Option<OpenFailure>> = std::sync::Mutex::new(None);
+
+/// Test-only: sets the hook that makes [`FlowReader::open`] fail.
+#[cfg(feature = "test-hooks")]
+#[allow(clippy::disallowed_methods, reason = "a test hook, supervisor side")]
+pub fn set_open_failure(hook: Option<OpenFailure>) {
+    *OPEN_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
+#[cfg(feature = "test-hooks")]
+#[allow(clippy::disallowed_methods, reason = "a test hook, supervisor side")]
+fn open_fails(flow_id: &str) -> bool {
+    let hook = *OPEN_FAILURE.lock().unwrap_or_else(|e| e.into_inner());
+    hook.is_some_and(|hook| hook(flow_id))
+}
+
 /// One reference to libmxl's reader for a flow on an instance. libmxl
 /// shares one reader object per flow id within an instance and counts
 /// references to it; dropping this releases one reference, the last one
 /// unmaps the flow and removes the reader from every group of the
 /// instance. Must not be dropped on the RT thread.
+///
+/// Shared between threads ([`Sync`]): every method taking `&self` makes
+/// only libmxl's const reads of the reader, and only Drop releases it. A
+/// method added here must keep to that, or the `Sync` impl is unsound.
 pub struct FlowReader {
     instance: Arc<Instance>,
     raw: mxl_sys::FlowReader,
@@ -79,6 +131,23 @@ pub struct FlowReader {
 // shared memory.
 unsafe impl Send for FlowReader {}
 
+// SAFETY: two generations may hold one reader, the RT thread reading it
+// while the supervisor builds the next one. The calls made through `&self`
+// are libmxl's reads only: mxlFlowReaderGetConfigInfo,
+// mxlFlowReaderGetRuntimeInfo and mxlFlowReaderGetSamplesNonBlocking
+// (lib/src/flow.cpp:311, 334 and 553 of the pinned mxl revision 8f3f109).
+// Each reaches the reader through to_FlowReader and touches no instance
+// state. The first two call the const getFlowConfigInfo and
+// getFlowRuntimeInfo; the third calls getSamples, an override that is not
+// const, which only checks _flowData and calls the const getSamplesImpl
+// (lib/internal/src/PosixContinuousFlowReader.cpp:87-91). The class has no
+// mutable member (lib/internal/src/PosixContinuousFlowReader.hpp), so none
+// of them writes the reader: they read the flow's shared memory. The one
+// call that changes the reader, mxlReleaseFlowReader (flow.cpp:172,
+// Instance::releaseReader at lib/internal/src/Instance.cpp:142), is made
+// only in Drop, which has the reader to itself.
+unsafe impl Sync for FlowReader {}
+
 impl FlowReader {
     /// `mxlCreateFlowReader`.
     pub fn open(instance: &Arc<Instance>, flow_id: &str) -> Result<FlowReader> {
@@ -86,6 +155,15 @@ impl FlowReader {
         let mut raw = std::ptr::null_mut();
         #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = instance.lock();
+        #[cfg(feature = "test-hooks")]
+        open_delay(flow_id);
+        #[cfg(feature = "test-hooks")]
+        if open_fails(flow_id) {
+            return Err(Error::Mxl {
+                call: "mxlCreateFlowReader",
+                status: MXL_ERR_FLOW_NOT_FOUND,
+            });
+        }
         // SAFETY: valid instance, NUL-terminated id, a null options pointer
         // and a writable out pointer.
         check("mxlCreateFlowReader", unsafe {
@@ -102,6 +180,9 @@ impl FlowReader {
         })
     }
 
+    /// The libmxl handle, for a call the caller makes itself. On a reader
+    /// another thread may hold, that call must be one of the reads the
+    /// `Sync` impl names, and never mxlReleaseFlowReader.
     pub fn raw(&self) -> mxl_sys::FlowReader {
         self.raw
     }
@@ -163,6 +244,7 @@ impl Drop for FlowReader {
     fn drop(&mut self) {
         #[allow(clippy::disallowed_methods, reason = "supervisor side")]
         let _lock = self.instance.lock();
+        crate::note_release();
         // SAFETY: `raw` came from mxlCreateFlowReader on this instance and
         // this reference is released exactly once, here.
         unsafe {
@@ -265,19 +347,25 @@ pub enum GroupWait {
     Skipped,
 }
 
-/// One input generation: an instance of its own, a reader reference per
-/// attached slot and one synchronization group holding every reader. Built
-/// on the supervisor side and handed to the RT thread whole; no libmxl call
-/// touches its instance while the RT thread uses it. Must not be dropped
-/// on the RT thread.
+/// One input generation: a reader per attached slot and per flow a
+/// re-route leaves, and an instance of its own whose group holds the
+/// readers opened on it. A reader may be opened on another instance and
+/// shared with other generations ([`Generation::insert`]); each reader
+/// keeps its instance alive. Built on the supervisor side and handed to
+/// the RT thread whole. Must not be dropped on the RT thread.
 pub struct Generation {
-    group: SyncGroup,
-    inputs: Vec<Option<Input>>,
+    /// Holds the readers opened on the generation's own instance; one
+    /// shared from another generation or opened on its own instance is in
+    /// no group, which libmxl ties to one instance. The engine waits on
+    /// [`Generation::behind`], not on the group.
+    /// With the instance, none for a [`Generation::bare`] one.
+    group: Option<SyncGroup>,
+    inputs: Vec<Option<Arc<Input>>>,
     /// Per slot, the reader of the flow a re-route leaves, read until its
     /// crossfade ends.
-    outgoing: Vec<Option<Input>>,
+    outgoing: Vec<Option<Arc<Input>>>,
     max_offset: i64,
-    instance: Arc<Instance>,
+    instance: Option<Arc<Instance>>,
 }
 
 /// An attached input slot.
@@ -296,21 +384,39 @@ impl Generation {
     pub fn new(api: &Arc<MxlApi>, domain: &std::path::Path, slots: usize) -> Result<Generation> {
         let instance = Instance::new(api, domain)?;
         Ok(Generation {
-            group: SyncGroup::new(&instance)?,
-            inputs: (0..slots).map(|_| None).collect(),
-            outgoing: (0..slots).map(|_| None).collect(),
-            max_offset: 0,
-            instance,
+            group: Some(SyncGroup::new(&instance)?),
+            instance: Some(instance),
+            ..Generation::bare(slots)
         })
     }
 
+    /// A generation with `slots` empty input slots and no instance of its
+    /// own: it makes no libmxl call, and takes only readers opened
+    /// elsewhere ([`Generation::open`], [`Generation::insert`]).
+    pub fn bare(slots: usize) -> Generation {
+        Generation {
+            group: None,
+            inputs: (0..slots).map(|_| None).collect(),
+            outgoing: (0..slots).map(|_| None).collect(),
+            max_offset: 0,
+            instance: None,
+        }
+    }
+
+    /// libmxl's API, of a generation made with [`Generation::new`].
     pub fn api(&self) -> &MxlApi {
-        self.instance.api()
+        self.instance
+            .as_ref()
+            .expect("a generation with an instance")
+            .api()
     }
 
     /// True when both generations use the same libmxl instance.
     pub fn same_instance(&self, other: &Generation) -> bool {
-        Arc::ptr_eq(&self.instance, &other.instance)
+        match (&self.instance, &other.instance) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
     }
 
     /// Opens a reader reference for `slot`, checks the flow and adds the
@@ -351,8 +457,27 @@ impl Generation {
         if slot >= self.inputs.len() {
             return Err(Error::Format(format!("no input slot {slot}")));
         }
+        let instance = (self.instance.as_ref())
+            .ok_or_else(|| Error::Format("a generation without an instance".to_owned()))?;
+        let (input, short) = Generation::open(instance, cfg, timing)?;
+        self.insert(slot, Arc::new(input), outgoing)?;
+        Ok(short)
+    }
+
+    /// Opens a reader of `cfg`'s flow on `instance`, a generation's
+    /// ([`Generation::instance`]), and checks the flow as
+    /// [`Generation::attach`] does, without adding it to the generation:
+    /// [`Generation::insert`] does, on the thread that builds it. Makes only
+    /// instance-level libmxl calls, so it may run on any thread meanwhile.
+    /// Returns the input and the margin its producer needs, as `attach`
+    /// does.
+    pub fn open(
+        instance: &Arc<Instance>,
+        cfg: &InputConfig,
+        timing: &Timing,
+    ) -> Result<(Input, Option<u64>)> {
         let legs = legs(cfg)?;
-        let reader = FlowReader::open(&self.instance, cfg.flow_id)?;
+        let reader = FlowReader::open(instance, cfg.flow_id)?;
         let info = reader.config()?;
         // SAFETY: both union members are structs of integers, so any bytes
         // are a valid value; libmxl fills `continuous` for audio, and the
@@ -375,7 +500,7 @@ impl Generation {
                 wanted(cfg)
             )));
         }
-        check_flow_def(&self.instance.flow_def(cfg.flow_id)?, cfg)?;
+        check_flow_def(&instance.flow_def(cfg.flow_id)?, cfg)?;
 
         let buffer_length = u64::from(cont.bufferLength);
         let required = (timing.max_catchup_blocks + 2) * timing.block
@@ -399,18 +524,34 @@ impl Generation {
             + i128::from(timing.block);
         let short = (i128::from(timing.margin) < needed).then_some(needed as u64);
 
-        self.group.add(&reader)?;
-        let input = Some(Input {
+        let input = Input {
             reader,
             block: timing.block,
             width: legs.iter().max().map_or(0, |&c| c + 1),
             legs,
             offset: cfg.offset,
-        });
+        };
+        Ok((input, short))
+    }
+
+    /// Puts `input` ([`Generation::open`]) into `slot`, or as the flow
+    /// `slot` leaves in a re-route with `outgoing`: one opened on this
+    /// generation's instance also into the group. Another generation may
+    /// hold the same reader, the RT thread reading it meanwhile
+    /// ([`FlowReader`]).
+    pub fn insert(&mut self, slot: usize, input: Arc<Input>, outgoing: bool) -> Result<()> {
+        if slot >= self.inputs.len() {
+            return Err(Error::Format(format!("no input slot {slot}")));
+        }
+        if let (Some(instance), Some(group)) = (&self.instance, &mut self.group)
+            && Arc::ptr_eq(instance, &input.reader.instance)
+        {
+            group.add(&input.reader)?;
+        }
         if outgoing {
-            self.outgoing[slot] = input;
+            self.outgoing[slot] = Some(input);
         } else {
-            self.inputs[slot] = input;
+            self.inputs[slot] = Some(input);
         }
         self.max_offset = self
             .inputs
@@ -420,16 +561,27 @@ impl Generation {
             .map(|i| i.offset)
             .max()
             .unwrap_or(0);
-        Ok(short)
+        Ok(())
     }
 
     pub fn input(&self, slot: usize) -> Option<&Input> {
-        self.inputs.get(slot)?.as_ref()
+        self.inputs.get(slot)?.as_deref()
     }
 
     /// The reader of the flow `slot` leaves in a re-route.
     pub fn outgoing(&self, slot: usize) -> Option<&Input> {
-        self.outgoing.get(slot)?.as_ref()
+        self.outgoing.get(slot)?.as_deref()
+    }
+
+    /// [`Generation::input`] or, with `outgoing`, [`Generation::outgoing`],
+    /// to share with another generation.
+    pub fn shared(&self, slot: usize, outgoing: bool) -> Option<Arc<Input>> {
+        let v = if outgoing {
+            &self.outgoing
+        } else {
+            &self.inputs
+        };
+        v.get(slot)?.clone()
     }
 
     pub fn has_inputs(&self) -> bool {
@@ -451,7 +603,7 @@ impl Generation {
             .iter()
             .chain(&self.outgoing)
             .flatten()
-            .map(Input::prefault)
+            .map(|i| i.prefault())
             .sum()
     }
 
@@ -483,9 +635,10 @@ impl Generation {
         note = "the engine waits on `Generation::reached`; the group wait's validity check can block"
     )]
     pub fn wait(&self, timestamp: u64, timeout_ns: u64) -> GroupWait {
-        match self.group.wait(timestamp, timeout_ns) {
-            MXL_STATUS_OK => GroupWait::Ok,
-            status => GroupWait::Failed(status),
+        match self.group.as_ref().map(|g| g.wait(timestamp, timeout_ns)) {
+            Some(MXL_STATUS_OK) => GroupWait::Ok,
+            Some(status) => GroupWait::Failed(status),
+            None => GroupWait::Skipped,
         }
     }
 }
@@ -860,6 +1013,10 @@ pub struct PolledFlow {
     holders: usize,
     /// Empty, or one reference per holder.
     readers: Vec<FlowReader>,
+    /// References let go and not yet taken ([`PolledFlow::take_released`]).
+    released: Vec<Released>,
+    /// References to the flow let go and not yet released.
+    pending: Releases,
     lookup: Lookup,
     backoff: Backoff,
     /// The head the last poll read.
@@ -868,11 +1025,50 @@ pub struct PolledFlow {
     check: Backoff,
 }
 
+/// The references to one flow its poll readers let go and are not yet
+/// released ([`Released`]), shared by the poll readers of that flow on an
+/// instance one after another ([`PolledFlow::with_releases`]): none opens
+/// the flow while one is held, since libmxl would hand out the stale
+/// reader object for the id. A reference has no deadline: one held, as by
+/// a reaper thread that does not get to it, holds back this flow's poll
+/// reader alone.
+#[derive(Clone, Debug, Default)]
+pub struct Releases(Arc<AtomicUsize>);
+
+impl Releases {
+    /// The references let go and not yet released.
+    pub fn pending(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// A reference a [`PolledFlow`] let go: dropping it releases the
+/// reference, which can wait in the kernel.
+pub struct Released {
+    reader: Option<FlowReader>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        drop(self.reader.take());
+        self.pending.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl PolledFlow {
     /// A poll reader with one holder, wanted from now: its first lookup is
     /// started, and a later [`poll`](Self::poll) opens the flow once found.
     pub fn new(instance: &Arc<Instance>, flow_id: &str) -> Result<PolledFlow> {
         PolledFlow::looking_up_with(instance, flow_id, exists)
+    }
+
+    /// This poll reader, counting the references it lets go in `releases`,
+    /// which an earlier poll reader of the flow on the instance may still
+    /// hold references in.
+    pub fn with_releases(mut self, releases: &Releases) -> PolledFlow {
+        self.pending = releases.clone();
+        self
     }
 
     /// [`PolledFlow::new`] with the directory lookup `look`.
@@ -891,6 +1087,8 @@ impl PolledFlow {
             flow_id: flow_id.to_owned(),
             holders: 1,
             readers: Vec::new(),
+            released: Vec::new(),
+            pending: Releases::default(),
             lookup,
             backoff: Backoff::new(now),
             head: None,
@@ -909,7 +1107,7 @@ impl PolledFlow {
             match FlowReader::open(&self.instance, &self.flow_id) {
                 Ok(r) => self.readers.push(r),
                 // Keeps the invariant; poll opens all references again.
-                Err(_) => self.readers.clear(),
+                Err(_) => self.let_go(self.readers.len()),
             }
         }
     }
@@ -929,12 +1127,31 @@ impl PolledFlow {
         }
     }
 
-    /// Removes a holder and releases its reference. Returns the holders
+    /// Removes a holder and lets its reference go. Returns the holders
     /// left; at 0 the poll reader is to be dropped.
     pub fn release(&mut self) -> usize {
         self.holders = self.holders.saturating_sub(1);
-        self.readers.truncate(self.holders);
+        self.let_go(self.readers.len().saturating_sub(self.holders));
         self.holders
+    }
+
+    /// The references let go since the last call, by a release, a flow
+    /// turned invalid or an open that failed, for the caller to release
+    /// where releasing can wait in the kernel.
+    pub fn take_released(&mut self) -> Vec<Released> {
+        std::mem::take(&mut self.released)
+    }
+
+    /// Lets the last `n` references go.
+    fn let_go(&mut self, n: usize) {
+        let from = self.readers.len() - n;
+        for reader in self.readers.drain(from..) {
+            self.pending.0.fetch_add(1, Ordering::Relaxed);
+            self.released.push(Released {
+                reader: Some(reader),
+                pending: Arc::clone(&self.pending.0),
+            });
+        }
     }
 
     /// `maxCommitBatchSizeHint` of the flow, when a reader is open.
@@ -949,7 +1166,7 @@ impl PolledFlow {
             match FlowReader::open(&self.instance, &self.flow_id) {
                 Ok(r) => self.readers.push(r),
                 Err(e) => {
-                    self.readers.clear();
+                    self.let_go(self.readers.len());
                     return Err(e);
                 }
             }
@@ -967,9 +1184,11 @@ impl PolledFlow {
     /// libmxl's validity check, once a lookup found the flow's directory
     /// still there; until it answers the head is reported unchecked. On
     /// `MXL_ERR_FLOW_INVALID`, or a directory gone, every reference is
-    /// released, so that libmxl drops its reader object, and the flow is
-    /// looked up anew, so that a flow recreated under the same id is found
-    /// (upstream mxl-gst sink, `handleInvalidFlow`).
+    /// let go ([`PolledFlow::take_released`]) and the flow is looked up
+    /// anew, so that a flow recreated under the same id is found (upstream
+    /// mxl-gst sink, `handleInvalidFlow`). It is opened again only once
+    /// every reference let go is released ([`Releases`]): until then libmxl
+    /// hands out its stale reader object for the id.
     pub fn poll(&mut self) -> Poll {
         self.poll_at(Instant::now())
     }
@@ -978,6 +1197,12 @@ impl PolledFlow {
     #[doc(hidden)]
     pub fn poll_at(&mut self, now: Instant) -> Poll {
         if self.readers.is_empty() {
+            if self.pending.pending() != 0 {
+                return Poll::Absent(Error::Mxl {
+                    call: "mxlCreateFlowReader",
+                    status: MXL_ERR_FLOW_INVALID,
+                });
+            }
             match self.lookup.answer() {
                 Some(true) => {
                     if let Err(e) = self.open() {
@@ -1025,7 +1250,7 @@ impl PolledFlow {
             // Checked again after a gap, while the head stays.
             self.check.checked(now);
         } else {
-            self.readers.clear();
+            self.let_go(self.readers.len());
             self.head = None;
             self.backoff = Backoff::new(now);
             self.lookup.start();

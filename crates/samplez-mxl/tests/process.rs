@@ -113,6 +113,8 @@ fn poller_recreates_its_reader_after_the_flow_is_replaced() {
     w.blocks(K0 + BLOCKS..K0 + BLOCKS + 5);
 
     assert!(matches!(poll_checked(&mut p), Poll::Invalid));
+    // The stale reference is released before the flow is opened again.
+    drop(p.take_released());
     assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == head + 5 * B));
     w.blocks(K0 + BLOCKS + 5..K0 + BLOCKS + 6);
     assert!(matches!(p.poll(), Poll::Head(h) if h == head + 6 * B));

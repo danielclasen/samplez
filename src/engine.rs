@@ -6,13 +6,13 @@
 //! through the return ring, prunes and re-adds inputs, retries output
 //! creation and turns telemetry into status and log lines.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{
     AtomicBool, AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release,
 };
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -23,8 +23,8 @@ use samplez_dsp::{
     StripParam, Tone, ToneParams, ToneRamps,
 };
 use samplez_mxl::input::{
-    Counters as InputCounters, Generation, GroupWait, Poll, PolledFlow, RECOVERY_NS, Recovery,
-    Timing,
+    Counters as InputCounters, Generation, GroupWait, Input, InputConfig, Poll, PolledFlow,
+    RECOVERY_NS, Recovery, Releases, Timing,
 };
 use samplez_mxl::lookup::{self, Found, Gate};
 use samplez_mxl::output::{self, Creation};
@@ -61,11 +61,11 @@ const HASHES_PER_OUTPUT: usize = 64;
 const MIN_STATUS_SLOTS: usize = 64;
 const SUPERVISOR_TICK: Duration = Duration::from_millis(5);
 const POLL_PERIOD: Duration = Duration::from_millis(100);
-/// How long a generation build, or a replay, waits for the lookups of the
-/// flows it attaches. One that answers at once does so in microseconds; a
-/// flow not found by then is left out, its lookup kept running, rather
-/// than waited for by libmxl's own open on a file system that waits for a
-/// missing name to appear.
+/// How long a build for a product state, or a replay, waits for the
+/// lookups of the flows it attaches. One that answers at once does so in
+/// microseconds; a flow not found by then is left out, its lookup kept
+/// running, rather than waited for by libmxl's own open on a file system
+/// that waits for a missing name to appear.
 const GATE_WAIT: Duration = Duration::from_millis(20);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -73,6 +73,11 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const MARGIN_WINDOW: usize = 11;
 /// The build time assumed before a generation was built.
 const UNMEASURED_BUILD: Duration = Duration::from_millis(100);
+/// The least build time buildLead covers, whatever the build times: a
+/// libmxl reader open was measured at up to 23 ms, unexplained, against
+/// 30-150 us for most, and builds that open little or nothing would
+/// otherwise set a lead too short for one.
+const BUILD_FLOOR: Duration = Duration::from_millis(30);
 /// Quarter-octave buckets of the build-time histogram, up to 2^64 ns.
 const BUILD_BUCKETS: usize = 256;
 
@@ -160,13 +165,20 @@ pub struct GenerationStatus {
     pub ready: bool,
     /// Generations built.
     pub builds: u64,
-    /// The 99.99th percentile of their build times (new instance,
-    /// readers, ring pre-fault), ns.
+    /// The 99.99th percentile of the latest 256 build times, each the
+    /// longest of its new readers' opens (instance, lookup, reader, ring
+    /// pre-fault) and its assembly; a build that opens nothing is not
+    /// counted, a late reader's open up to 100 ms, ns.
     pub build_p9999_ns: Option<u64>,
     /// buildLead: samples a generation-needing entry is stamped ahead of
     /// the earliest index a gain change could take, covering that
-    /// percentile and a supervisor tick.
+    /// percentile, a supervisor tick and the hand-over margin of its
+    /// deadline.
     pub build_lead: u64,
+    /// The latest readers left out of a generation for an open not done
+    /// by its deadline, at most 16: slot, the entry's index, and how long
+    /// the open had run, ns, none for one not started.
+    pub left_out: Vec<(usize, u64, Option<u64>)>,
 }
 
 /// The clocks as the engine sees them.
@@ -478,9 +490,10 @@ pub struct Progress {
     /// buildLead in samples ([`GenerationStatus::build_lead`]).
     pub build_lead: u64,
     /// The 99.99th percentile of the generation build times, or the
-    /// build time assumed before any build, and a supervisor tick, in
-    /// samples: buildLead without the engine's lead, how long a generation
-    /// takes once its entry reaches the engine.
+    /// build time assumed before any build, a supervisor tick and the
+    /// hand-over margin of its deadline, in samples: buildLead
+    /// without the engine's lead, how long a generation takes once its
+    /// entry reaches the engine.
     pub build_time: u64,
     /// Times the engine dropped its core for committed entries its RT
     /// thread did not take ([`Engine::commit`]).
@@ -937,10 +950,15 @@ fn build_lead_samples(p9999_ns: Option<u64>, lead: u64, block: u64) -> u64 {
 }
 
 /// The 99.99th percentile of the build times, or [`UNMEASURED_BUILD`]
-/// before any build, and a supervisor tick, in samples.
+/// before any build, a supervisor tick and [`HAND_OVER_MARGIN`], in
+/// samples: an entry stamped that far ahead is not due yet ([`due`]) when
+/// the supervisor takes it in, a tick after its stamp at the latest, so
+/// its readers have the build time to open.
 fn build_time_samples(p9999_ns: Option<u64>) -> u64 {
-    let ns =
-        p9999_ns.unwrap_or(UNMEASURED_BUILD.as_nanos() as u64) + SUPERVISOR_TICK.as_nanos() as u64;
+    let ns = (p9999_ns.unwrap_or(UNMEASURED_BUILD.as_nanos() as u64))
+        .max(BUILD_FLOOR.as_nanos() as u64)
+        + SUPERVISOR_TICK.as_nanos() as u64
+        + HAND_OVER_MARGIN.as_nanos() as u64;
     (u128::from(ns) * samplez_mxl::SAMPLE_RATE as u128).div_ceil(1_000_000_000) as u64
 }
 
@@ -953,29 +971,64 @@ fn unopened(flow_id: &str, found: Found) -> String {
     }
 }
 
-/// Generation build times in quarter-octave buckets of nanoseconds.
+/// Generation builds the build times are taken over: the latest ones,
+/// so that a slow build ages out once that many faster ones followed.
+const BUILD_WINDOW: usize = 256;
+/// How long the time of a build that left a reader out, counted once the
+/// reader opened, is kept at most: it ages out after this however few
+/// builds followed it. Complete builds' times stay in the window: an
+/// empty window falls back to [`UNMEASURED_BUILD`], so aging them out too
+/// would raise the lead of a set that routes rarely to that maximum.
+const BUILD_AGE: Duration = Duration::from_secs(300);
+
+/// The latest [`BUILD_WINDOW`] generation build times in quarter-octave
+/// buckets of nanoseconds.
 struct BuildTimes {
     counts: Vec<u64>,
-    total: u64,
+    /// The buckets of the builds in the window and when each was taken,
+    /// oldest first.
+    window: VecDeque<(usize, Option<Instant>)>,
 }
 
 impl BuildTimes {
     fn new() -> BuildTimes {
         BuildTimes {
             counts: vec![0; BUILD_BUCKETS],
-            total: 0,
+            window: VecDeque::with_capacity(BUILD_WINDOW + 1),
         }
     }
 
-    fn add(&mut self, ns: u64) {
-        let b = (4.0 * (ns.max(1) as f64).log2()) as usize;
-        self.counts[b.min(BUILD_BUCKETS - 1)] += 1;
-        self.total += 1;
+    /// Adds a build time; `ages`, the time it was taken, for one that
+    /// ages out ([`BUILD_AGE`]).
+    fn add(&mut self, ns: u64, ages: Option<Instant>) {
+        let b = ((4.0 * (ns.max(1) as f64).log2()) as usize).min(BUILD_BUCKETS - 1);
+        self.counts[b] += 1;
+        self.window.push_back((b, ages));
+        if self.window.len() > BUILD_WINDOW
+            && let Some((old, _)) = self.window.pop_front()
+        {
+            self.counts[old] -= 1;
+        }
     }
 
-    /// The upper edge of the bucket holding the 99.99th percentile.
+    /// Drops the build times that age out and are older than
+    /// [`BUILD_AGE`] at `now`.
+    fn expire(&mut self, now: Instant) {
+        let counts = &mut self.counts;
+        self.window.retain(|&(b, at)| {
+            let keep = at.is_none_or(|at| now.saturating_duration_since(at) <= BUILD_AGE);
+            if !keep {
+                counts[b] -= 1;
+            }
+            keep
+        });
+    }
+
+    /// The upper edge of the bucket holding the 99.99th percentile of the
+    /// builds in the window: the longest of them, as the window holds
+    /// fewer than 10,000.
     fn p9999(&self) -> Option<u64> {
-        let rank = (self.total as f64 * 0.9999).ceil() as u64;
+        let rank = (self.window.len() as f64 * 0.9999).ceil() as u64;
         let mut seen = 0;
         for (b, &n) in self.counts.iter().enumerate() {
             seen += n;
@@ -985,6 +1038,375 @@ impl BuildTimes {
         }
         None
     }
+}
+
+/// Threads opening the readers of the generations an engine builds.
+const OPENERS: usize = 4;
+/// libmxl instances the openers keep created ahead per input domain, so
+/// that an open does not create one.
+const SPARES: usize = 4;
+/// How long a rebuild waits for its readers before it leaves out those
+/// not open yet.
+const REBUILD_WAIT: Duration = Duration::from_secs(1);
+/// How long before the RT thread would apply a generation past its
+/// entry's index the generation is due ([`due`]) at the latest: the time
+/// left for assembling it once it no longer waits for a reader.
+const HAND_OVER_MARGIN: Duration = Duration::from_millis(2);
+
+/// `d` in samples, rounded up.
+fn samples_of(d: Duration) -> u64 {
+    (d.as_nanos() as u64 * samplez_mxl::SAMPLE_RATE as u64).div_ceil(1_000_000_000)
+}
+
+/// Whether a generation due at `at_index` must be built now, `earliest`
+/// being the first index an entry reaching the RT thread now is applied
+/// at: from the next supervisor tick on, it would reach the RT thread
+/// with less than [`HAND_OVER_MARGIN`] before that index. A deadline first
+/// seen on one tick leaves more than the margin before it, as one tick
+/// earlier it was not seen; a due generation waits for no reader.
+fn due(earliest: u64, at_index: u64) -> bool {
+    earliest + samples_of(SUPERVISOR_TICK) + samples_of(HAND_OVER_MARGIN) >= at_index
+}
+
+/// One reader a generation wants: its slot, whether it reads the flow the
+/// slot leaves in a re-route, and the flow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Want {
+    slot: usize,
+    outgoing: bool,
+    flow: String,
+}
+
+/// A reader to open, on an instance of its own.
+struct OpenTask {
+    draft: u64,
+    api: Arc<MxlApi>,
+    domain: PathBuf,
+    dir: PathBuf,
+    want: Want,
+    channels: u32,
+    flow_channels: Option<Vec<u32>>,
+    offset: i64,
+}
+
+/// A reader an opener opened, or why it did not.
+struct Opened {
+    draft: u64,
+    want: Want,
+    /// How long the open ran, its instance's creation included.
+    took: Duration,
+    result: Result<(Input, Option<u64>), String>,
+}
+
+/// A domain's instances created ahead, how many are being created, and
+/// after a failure when to try again.
+type Spares = (Vec<Arc<Instance>>, usize, Option<Instant>);
+
+#[derive(Default)]
+struct OpenQueue {
+    tasks: VecDeque<OpenTask>,
+    /// The flows an opener opens now.
+    busy: HashSet<String>,
+    /// The opens running, by draft and reader, and when each started.
+    running: Vec<(u64, Want, Instant)>,
+    /// Per input domain, the instances created ahead, those being created,
+    /// and after a failure when to try again.
+    spares: HashMap<PathBuf, Spares>,
+    stop: bool,
+}
+
+/// The engine's [`OPENERS`] opener threads, which look a flow up with the
+/// configured lookup and open, check and pre-fault its reader off the
+/// supervisor, oldest task first, one open per flow at a time: a task
+/// whose flow an opener opens waits for that open.
+struct Openers {
+    queue: Arc<(Mutex<OpenQueue>, Condvar)>,
+    results: mpsc::Receiver<Opened>,
+    threads: Vec<JoinHandle<()>>,
+    /// Releases what the supervisor no longer needs on a thread of its own:
+    /// destroying a libmxl instance stops its watcher thread and closes
+    /// its descriptors, which can wait in the kernel.
+    reaper: Option<(mpsc::Sender<Reaped>, JoinHandle<()>)>,
+}
+
+/// What the reaper thread releases.
+type Reaped = Box<dyn Send>;
+
+impl Openers {
+    fn start(
+        api: &Arc<MxlApi>,
+        domains: Vec<PathBuf>,
+        look: lookup::Look,
+        timing: Timing,
+        prefault: bool,
+    ) -> std::io::Result<Openers> {
+        let (tx, results) = mpsc::channel();
+        let (reap, reaped) = mpsc::channel::<Reaped>();
+        let reaper = std::thread::Builder::new()
+            .name("samplez-release".into())
+            .spawn(move || reaped.into_iter().for_each(drop))?;
+        let queue = OpenQueue {
+            spares: (domains.into_iter())
+                .map(|d| (d, (Vec::new(), 0, None)))
+                .collect(),
+            ..OpenQueue::default()
+        };
+        let mut openers = Openers {
+            queue: Arc::new((Mutex::new(queue), Condvar::new())),
+            results,
+            threads: Vec::new(),
+            reaper: Some((reap, reaper)),
+        };
+        for _ in 0..OPENERS {
+            let (queue, tx, api) = (Arc::clone(&openers.queue), tx.clone(), Arc::clone(api));
+            let thread = std::thread::Builder::new()
+                .name("samplez-open".into())
+                .spawn(move || open_loop(&queue, &tx, &api, look, &timing, prefault))?;
+            openers.threads.push(thread);
+        }
+        Ok(openers)
+    }
+
+    /// Releases `x` on the reaper thread, or here once it is gone.
+    fn reap(&self, x: impl Send + 'static) {
+        let x: Reaped = Box::new(x);
+        if let Some((tx, _)) = &self.reaper
+            && let Err(mpsc::SendError(x)) = tx.send(x)
+        {
+            drop(x);
+        }
+    }
+
+    fn submit(&self, tasks: Vec<OpenTask>) {
+        let (lock, ready) = &*self.queue;
+        lock.lock().expect("open queue").tasks.extend(tasks);
+        ready.notify_all();
+    }
+
+    /// How long an open of `want`'s slot and flow, for any draft, has been
+    /// running, its lookup included; none while none has started.
+    fn running_for(&self, want: &Want) -> Option<Duration> {
+        let q = self.queue.0.lock().expect("open queue");
+        let same = |w: &Want| w.slot == want.slot && w.flow == want.flow;
+        let opening = (q.running.iter()).filter(|r| same(&r.1)).map(|r| r.2);
+        opening.min().map(|at| at.elapsed())
+    }
+
+    /// Takes draft `id`'s task for `want` off the queue, its open adopted
+    /// from another draft's.
+    fn cancel_want(&self, id: u64, want: &Want) {
+        let mut q = self.queue.0.lock().expect("open queue");
+        let gone: VecDeque<OpenTask> = {
+            let (gone, kept) = std::mem::take(&mut q.tasks)
+                .into_iter()
+                .partition(|t| t.draft == id && t.want == *want);
+            q.tasks = kept;
+            gone
+        };
+        drop(q);
+        drop(gone);
+    }
+
+    /// Takes the tasks of draft `id` no opener started off the queue: how
+    /// many. One an opener runs answers all the same, and a draft wanting
+    /// the same reader adopts it ([`Supervisor::opened`]).
+    fn cancel(&self, id: u64) -> usize {
+        let gone: VecDeque<OpenTask> = {
+            let mut q = self.queue.0.lock().expect("open queue");
+            let (gone, kept) = std::mem::take(&mut q.tasks)
+                .into_iter()
+                .partition(|t| t.draft == id);
+            q.tasks = kept;
+            gone
+        };
+        gone.len()
+    }
+}
+
+impl Drop for Openers {
+    fn drop(&mut self) {
+        let (lock, ready) = &*self.queue;
+        let tasks = {
+            let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+            q.stop = true;
+            std::mem::take(&mut q.tasks)
+        };
+        ready.notify_all();
+        drop(tasks);
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+        if let Some((tx, t)) = self.reaper.take() {
+            drop(tx);
+            let _ = t.join();
+        }
+    }
+}
+
+/// An opener thread: takes the oldest task whose flow no other opener
+/// opens, looks its flow up through a gate of its own, waiting
+/// [`GATE_WAIT`] at most, so a lookup that waits frees the opener and
+/// fails the open, its lookup kept running for the next one; opens the
+/// reader of a flow found and sends what it opened. A task whose flow an
+/// opener opens waits for it, and a draft wanting the same reader adopts
+/// what it opens. Idle, creates the instances its domains are short of,
+/// one at a time.
+fn open_loop(
+    queue: &(Mutex<OpenQueue>, Condvar),
+    tx: &mpsc::Sender<Opened>,
+    api: &Arc<MxlApi>,
+    look: lookup::Look,
+    timing: &Timing,
+    prefault: bool,
+) {
+    let mut gate = Gate::new(look);
+    let (lock, ready) = queue;
+    let mut q = lock.lock().expect("open queue");
+    loop {
+        if q.stop {
+            return;
+        }
+        let now = Instant::now();
+        let next = (q.tasks.iter()).position(|t| !q.busy.contains(&t.want.flow));
+        let Some(n) = next else {
+            // One instance created at a time, so that the others stay free
+            // for opens.
+            let creating = q.spares.values().any(|s| s.1 > 0);
+            let short = (q.spares.iter_mut()).find(|(_, s)| {
+                !creating && s.0.len() + s.1 < SPARES && s.2.is_none_or(|at| now >= at)
+            });
+            let Some((domain, spare)) = short else {
+                let backoff = q.spares.values().any(|s| s.2.is_some());
+                q = if backoff {
+                    let wait = Duration::from_millis(100);
+                    ready.wait_timeout(q, wait).expect("open queue").0
+                } else {
+                    ready.wait(q).expect("open queue")
+                };
+                continue;
+            };
+            let domain = domain.clone();
+            spare.1 += 1;
+            drop(q);
+            let instance = Instance::new(api, &domain);
+            q = lock.lock().expect("open queue");
+            if let Some(spare) = q.spares.get_mut(&domain) {
+                spare.1 -= 1;
+                match instance {
+                    Ok(i) => {
+                        spare.0.push(i);
+                        spare.2 = None;
+                    }
+                    // Tried again after a second.
+                    Err(_) => spare.2 = Some(Instant::now() + Duration::from_secs(1)),
+                }
+            }
+            continue;
+        };
+        let task = q.tasks.remove(n).expect("found above");
+        let spare = (q.spares.get_mut(&task.domain)).and_then(|s| s.0.pop());
+        q.busy.insert(task.want.flow.clone());
+        q.running.push((task.draft, task.want.clone(), now));
+        drop(q);
+        let found = gate.found(std::slice::from_ref(&task.dir), GATE_WAIT)[0];
+        let result = match found {
+            Found::Yes => open_one(&task, spare, timing, prefault),
+            f => Err(unopened(&task.want.flow, f)),
+        };
+        let took = now.elapsed();
+        let (flow, draft, want) = (task.want.flow.clone(), task.draft, task.want.clone());
+        let _ = tx.send(Opened {
+            draft: task.draft,
+            want: task.want,
+            took,
+            result,
+        });
+        q = lock.lock().expect("open queue");
+        q.busy.remove(&flow);
+        q.running.retain(|r| r.0 != draft || r.1 != want);
+        ready.notify_all();
+    }
+}
+
+/// Opens, checks and, with `prefault`, pre-faults the reader of task
+/// `t`, whose lookup found its flow.
+fn open_one(
+    t: &OpenTask,
+    spare: Option<Arc<Instance>>,
+    timing: &Timing,
+    prefault: bool,
+) -> Result<(Input, Option<u64>), String> {
+    let cfg = InputConfig {
+        flow_id: &t.want.flow,
+        channels: t.channels,
+        flow_channels: t.flow_channels.as_deref(),
+        offset: t.offset,
+    };
+    // An instance of its own: a slow open holds no other reader's open on
+    // libmxl's instance mutex. It is destroyed with the reader.
+    let instance = match spare {
+        Some(i) => i,
+        None => Instance::new(&t.api, &t.domain).map_err(|e| e.to_string())?,
+    };
+    let (input, short) = Generation::open(&instance, &cfg, timing).map_err(|e| e.to_string())?;
+    if prefault && let Err(e) = input.prefault() {
+        log(format_args!(
+            "flow {}: reading the ring before handover: {e}",
+            t.want.flow
+        ));
+    }
+    Ok((input, short))
+}
+
+/// A generation in the making: its instance, the readers it wants, and
+/// those its openers sent back.
+struct Draft {
+    id: u64,
+    generation: Generation,
+    wants: Vec<Want>,
+    opened: Vec<Opened>,
+    /// How long each answered open ran.
+    opens: Vec<Duration>,
+    started: Instant,
+}
+
+/// What [`Supervisor::assemble`] made of a draft.
+enum Assembled {
+    /// The generation, the slots it holds and the slots it left out for
+    /// a reader not open yet, by bit.
+    Gen(Box<Gen>, u64, u64),
+    /// Its readers are not all answered yet.
+    Wait(Draft),
+}
+
+/// The time a hand-over waited for a generation: the longest of its new
+/// readers' opens, instance creation included, and its assembly; none for
+/// one that opened nothing, which says nothing of how long an open takes
+/// and so does not shrink buildLead.
+/// It is capped at the time assumed before any build, as a late reader's
+/// is, so that one stalled open does not set buildLead beyond it.
+fn build_sample(opens: &[Duration], assembly: Duration) -> Option<Duration> {
+    (opens.iter().max()).map(|&m| (m + assembly).min(UNMEASURED_BUILD))
+}
+
+/// The slots of a generation, as `(slot, outgoing flow, flow attached)`.
+type Plan = Vec<(usize, Option<String>, Option<String>)>;
+
+/// The readers of `plan`, each slot's outgoing flow before its own.
+fn wants(plan: &Plan) -> Vec<Want> {
+    let mut wants = Vec::new();
+    for (slot, outgoing, attach) in plan {
+        for (flow, outgoing) in [(outgoing, true), (attach, false)] {
+            if let Some(flow) = flow {
+                wants.push(Want {
+                    slot: *slot,
+                    outgoing,
+                    flow: flow.clone(),
+                });
+            }
+        }
+    }
+    wants
 }
 
 /// Whether a copy of history rings with `slack` blocks of slack, read
@@ -1674,19 +2096,25 @@ impl Engine {
             )
             .map(OutputLoudness::new)
             .collect();
+        let timing = Timing {
+            block: b,
+            margin: u64::from(config.reader_margin_samples),
+            max_catchup_blocks: u64::from(config.max_catchup_blocks),
+            // A lone voter has no donor to resync from.
+            resync_budget: if reports.is_some() && !alone {
+                config.resync_budget_samples()
+            } else {
+                0
+            },
+        };
+        let input_domains = (in_domains.iter())
+            .map(|&d| config.domains[d].path.clone())
+            .collect();
+        let openers = Openers::start(&api, input_domains, config.look, timing, prefault)
+            .map_err(|e| Error::Thread(format!("opener thread: {e}")))?;
         let sup = Supervisor {
             api: Arc::clone(&api),
-            timing: Timing {
-                block: b,
-                margin: u64::from(config.reader_margin_samples),
-                max_catchup_blocks: u64::from(config.max_catchup_blocks),
-                // A lone voter has no donor to resync from.
-                resync_budget: if reports.is_some() && !alone {
-                    config.resync_budget_samples()
-                } else {
-                    0
-                },
-            },
+            timing,
             prefault,
             in_domains: in_domains.clone(),
             slots: config
@@ -1707,10 +2135,18 @@ impl Engine {
                 })
                 .collect(),
             jobs: VecDeque::new(),
+            openers,
+            next_draft: 0,
+            rebuilding: (0..in_domains.len()).map(|_| None).collect(),
+            awaiting: 0,
+            arrived: Vec::new(),
+            rejoins: Vec::new(),
+            readers: HashMap::new(),
             log_rx,
             log: Arc::clone(&log),
             reports,
             build_times: BuildTimes::new(),
+            builds: 0,
             build_lead: Arc::clone(&build_lead),
             build_time: Arc::clone(&build_time),
             lead,
@@ -1719,6 +2155,7 @@ impl Engine {
             reroute: vec![0; in_domains.len()],
             product: None,
             pollers: (0..in_domains.len()).map(|_| None).collect(),
+            poll_setups: Vec::new(),
             gate: Gate::new(config.look),
             out_gate: Gate::fresh(config.look),
             poll_errors: vec![None; in_domains.len()],
@@ -3710,6 +4147,11 @@ struct Job {
     routes: Vec<(usize, Option<String>)>,
     domain: usize,
     stage: Stage,
+    /// Its generation's readers opening, from its append until it is
+    /// built.
+    draft: Option<Draft>,
+    /// The slots its generation left out for a reader not open yet.
+    opening: u64,
 }
 
 /// What a product state still needs handed to the RT thread before
@@ -3741,6 +4183,10 @@ struct SupOut {
 struct Pollers {
     instance: Arc<Instance>,
     flows: HashMap<String, PolledFlow>,
+    /// Per flow id, the references its poll readers let go, kept while
+    /// one is unreleased, so that a poll reader created anew does not
+    /// open the flow before they are released.
+    releases: HashMap<String, Releases>,
 }
 
 struct Supervisor {
@@ -3761,6 +4207,9 @@ struct Supervisor {
     /// A product state's generations not all handed over yet.
     product: Option<ProductHandOver>,
     pollers: Vec<Option<Pollers>>,
+    /// Slots whose poll hold waits until no entry falls due soon
+    /// ([`Supervisor::take_poll_hold`]).
+    poll_setups: Vec<usize>,
     /// The lookups of the flows a generation build attaches.
     gate: Gate,
     /// The lookups of the output flows about to be created.
@@ -3772,13 +4221,32 @@ struct Supervisor {
     outs: Vec<SupOut>,
     /// Output instance per configuration domain.
     out_instances: Vec<Option<Arc<Instance>>>,
-    /// Generation-needing entries, oldest first; only the first is built.
+    /// Generation-needing entries, oldest first; each one's readers open
+    /// from its append, only the first is built.
     jobs: VecDeque<Job>,
+    openers: Openers,
+    next_draft: u64,
+    /// Per input domain, a rebuild's draft.
+    rebuilding: Vec<Option<Draft>>,
+    /// Slots left out of a generation for a reader still opening, by bit:
+    /// such a reader, opened, joins through the next build.
+    awaiting: u64,
+    /// Readers the openers sent back while the supervisor waited for one.
+    arrived: Vec<Opened>,
+    /// Slots and flows whose reader opened after their generation left
+    /// it out: they join through the next build.
+    rejoins: Vec<(usize, String, Arc<Input>)>,
+    /// The readers of the generations built last, by slot and flow: a
+    /// generation takes these instead of opening its slots' flows anew.
+    /// A slot's are dropped once it is pruned, so it reads a fresh one.
+    readers: HashMap<(usize, String), Arc<Input>>,
     log_rx: mpsc::Receiver<LogMsg>,
     log: Arc<Mutex<Log>>,
     /// Where reports go; the engine's own log when absent.
     reports: Option<SyncSender<Report>>,
     build_times: BuildTimes,
+    /// Generations built with every slot attached.
+    builds: u64,
     build_lead: Arc<AtomicU64>,
     build_time: Arc<AtomicU64>,
     lead: u64,
@@ -3844,10 +4312,13 @@ impl Supervisor {
         let tid = self.status().rt.thread.tid;
         let mut last_poll = Instant::now();
         let mut last_faults = Instant::now();
+        // Releases go to the reaper thread; one made here is counted.
+        samplez_mxl::guard_releases(true);
         while !self.stop.load(Relaxed) {
             while let Ok(r) = self.ret.pop() {
-                release(r);
+                self.take_back(r);
             }
+            self.opened();
             self.telemetry();
             self.status_changes();
             self.page_hashes();
@@ -3858,7 +4329,8 @@ impl Supervisor {
             // Committed entries the ring had no room for.
             self.log.lock().expect("log lock").flush();
             self.jobs();
-            if last_poll.elapsed() >= POLL_PERIOD {
+            self.deferred_polls();
+            if last_poll.elapsed() >= POLL_PERIOD && !self.handing_over() {
                 last_poll = Instant::now();
                 self.poll();
             }
@@ -3875,7 +4347,7 @@ impl Supervisor {
                 }
             }
             for d in 0..self.dirty.len() {
-                if self.dirty[d] && self.cmd.slots() > 0 {
+                if (self.dirty[d] || self.rebuilding[d].is_some()) && self.cmd.slots() > 0 {
                     self.rebuild(d);
                 }
             }
@@ -3886,15 +4358,23 @@ impl Supervisor {
                     self.counters.rt_minor_faults.store(f, Relaxed);
                 }
                 self.clock();
+                // Build times age out without builds too.
+                self.record_build(false, None, false);
                 self.leaks();
             }
             if rt_thread.as_ref().is_some_and(JoinHandle::is_finished) {
+                samplez_mxl::guard_releases(false);
                 self.rt_ended(rt_thread.take());
                 break;
             }
-            std::thread::sleep(SUPERVISOR_TICK);
+            // A tick, cut short by a reader opened, so that a generation
+            // waiting for it is built at once.
+            if let Ok(o) = self.openers.results.recv_timeout(SUPERVISOR_TICK) {
+                self.arrived.push(o);
+            }
         }
         // The RT thread sees the same flag.
+        samplez_mxl::guard_releases(false);
         self.rt_ended(rt_thread);
     }
 
@@ -4145,11 +4625,16 @@ impl Supervisor {
 
     /// Moves `slot` to polling, reporting it pruned when `report`.
     fn start_polling(&mut self, slot: usize, report: bool) {
-        let held = self.hold_poll(slot);
+        self.forget(|k| k.0 == slot);
+        if report {
+            // Pruned for its flow, not left out for a reader still opening.
+            self.awaiting &= !bit(slot);
+        }
         self.slots[slot].state = SupState::Pruned {
             recovery: Recovery::default(),
-            held,
+            held: false,
         };
+        self.take_poll_hold(slot);
         self.slots[slot].reported = false;
         let mut st = self.status();
         st.inputs[slot].state = InputState::Pruned;
@@ -4160,9 +4645,55 @@ impl Supervisor {
         }
     }
 
+    /// Whether an entry not handed over yet falls due ([`due`]) within
+    /// [`POLL_PERIOD`] and a tick: the supervisor then neither polls nor
+    /// takes a poll hold, which open readers, read flows and create an
+    /// instance. A stall there, a libmxl open taking about 23 ms, can make
+    /// a hand-over late only if its deadline falls inside the stall, which
+    /// the window covers with margin; an entry due later, as one stamped
+    /// seconds ahead, holds back no poll.
+    fn handing_over(&self) -> bool {
+        let earliest = earliest(&self.api, &self.counters, self.timing.margin, self.lead);
+        let window = samples_of(POLL_PERIOD + SUPERVISOR_TICK);
+        (self.jobs.iter())
+            .any(|j| !matches!(j.stage, Stage::Sent(_)) && due(earliest + window, j.at_index))
+    }
+
+    /// Takes the poll hold of pruned `slot` ([`Supervisor::hold_poll`]),
+    /// or queues it while an entry falls due soon
+    /// ([`Supervisor::handing_over`]).
+    fn take_poll_hold(&mut self, slot: usize) {
+        if self.handing_over() {
+            if !self.poll_setups.contains(&slot) {
+                self.poll_setups.push(slot);
+            }
+            return;
+        }
+        let held = self.hold_poll(slot);
+        if let SupState::Pruned { held: h, .. } = &mut self.slots[slot].state {
+            *h = held;
+        }
+    }
+
+    /// Takes the poll holds queued while an entry fell due soon, once none
+    /// does.
+    fn deferred_polls(&mut self) {
+        if self.poll_setups.is_empty() || self.handing_over() {
+            return;
+        }
+        for slot in std::mem::take(&mut self.poll_setups) {
+            if matches!(self.slots[slot].state, SupState::Pruned { held: false, .. }) {
+                self.take_poll_hold(slot);
+            }
+        }
+    }
+
     /// Takes one hold on the poll reader of `slot`'s flow, creating the
     /// domain's poll instance and the poll reader when missing. False when
-    /// either could not be created; `poll` tries again.
+    /// either could not be created; `poll` tries again. Called only while
+    /// no entry falls due soon ([`Supervisor::handing_over`]): creating the
+    /// poll instance and starting the poll reader's lookup thread can stall
+    /// the supervisor as an instance creation there did.
     fn hold_poll(&mut self, slot: usize) -> bool {
         let d = self.input_domain(slot);
         let id = self.slots[slot].flow.clone();
@@ -4174,6 +4705,7 @@ impl Supervisor {
                     self.pollers[d] = Some(Pollers {
                         instance,
                         flows: HashMap::new(),
+                        releases: HashMap::new(),
                     })
                 }
                 Err(e) => {
@@ -4194,10 +4726,12 @@ impl Supervisor {
         if let Some(f) = p.flows.get_mut(&id) {
             f.hold();
             f.want();
+            self.openers.reap(f.take_released());
         } else {
             match PolledFlow::looking_up_with(&p.instance, &id, self.config.look) {
                 Ok(f) => {
-                    p.flows.insert(id, f);
+                    let releases = p.releases.entry(id.clone()).or_default();
+                    p.flows.insert(id, f.with_releases(releases));
                 }
                 Err(e) => {
                     log(format_args!("poll reader of {id}: {e}"));
@@ -4215,21 +4749,25 @@ impl Supervisor {
         };
         let d = self.input_domain(slot);
         let id = &self.slots[slot].flow;
-        if let Some(p) = &mut self.pollers[d]
-            && let Some(f) = p.flows.get_mut(id)
-            && f.release() == 0
+        let Some(p) = &mut self.pollers[d] else {
+            return;
+        };
+        let Some(f) = p.flows.get_mut(id) else {
+            return;
+        };
+        let left = f.release();
+        self.openers.reap(f.take_released());
+        if left == 0
+            && let Some(gone) = p.flows.remove(id)
         {
-            p.flows.remove(id);
+            self.openers.reap(gone);
         }
     }
 
     fn poll(&mut self) {
         for slot in 0..self.slots.len() {
             if matches!(self.slots[slot].state, SupState::Pruned { held: false, .. }) {
-                let held = self.hold_poll(slot);
-                if let SupState::Pruned { held: h, .. } = &mut self.slots[slot].state {
-                    *h = held;
-                }
+                self.take_poll_hold(slot);
             }
             let s = &mut self.slots[slot];
             if s.prune_unsent {
@@ -4251,6 +4789,7 @@ impl Supervisor {
                     Poll::Head(h) => Some(h),
                     Poll::Invalid | Poll::Absent(_) => None,
                 };
+                self.openers.reap(f.take_released());
                 let limit = prune_limit(
                     &self.config,
                     &self.timing,
@@ -4258,6 +4797,8 @@ impl Supervisor {
                 );
                 heads.insert((d, id.clone()), head.map(|h| (h, limit)));
             }
+            let flows = &p.flows;
+            (p.releases).retain(|id, r| r.pending() != 0 || flows.contains_key(id));
         }
         let mut readable = vec![None; self.slots.len()];
         for (slot, vote) in readable.iter_mut().enumerate() {
@@ -4305,31 +4846,516 @@ impl Supervisor {
     }
 
     /// Builds a new generation of input domain `d` with every attached and
-    /// wanted slot and hands it to the RT thread. Waits while a
-    /// generation-needing entry's generation for `d` is built or held by
-    /// the RT thread, which would replace this one at its index: until the
-    /// entry is committed, then until the RT thread reaches its index or
-    /// hands it back. A slot of `d` pruned meanwhile stays in the live
-    /// generation until then, silent.
+    /// wanted slot and hands it to the RT thread: starts its draft, then,
+    /// on later ticks, builds it once its readers are open, leaving out
+    /// those not open after [`REBUILD_WAIT`]. Waits while a
+    /// generation-needing entry for `d` is queued, whose generation holds
+    /// the domain's slots and would replace this one at its index: until
+    /// the RT thread reaches its index or hands it back. A slot of `d`
+    /// pruned meanwhile stays in the live generation until then, silent.
     fn rebuild(&mut self, d: usize) {
-        if self
-            .jobs
-            .front()
-            .is_some_and(|j| j.domain == d && !matches!(j.stage, Stage::Waiting))
-        {
+        if self.jobs.iter().any(|j| j.domain == d) {
             return;
         }
-        let Some((generation, held)) = self.build(d, None) else {
+        let produced = self.counters.produced.load(Acquire);
+        let Some(draft) = self.rebuilding[d].take() else {
+            let plan = self.plan(d, None, produced, std::iter::empty()).0;
+            self.rebuilding[d] = Some(self.start_draft(d, &plan));
+            self.dirty[d] = false;
             return;
+        };
+        let due = draft.started.elapsed() >= REBUILD_WAIT;
+        let (generation, held, opening) = match self.assemble(draft, d, None, produced, due) {
+            Assembled::Gen(g, held, opening) => (g, held, opening),
+            Assembled::Wait(draft) => {
+                self.rebuilding[d] = Some(draft);
+                return;
+            }
         };
         let command = Command::Generation {
             domain: d,
             generation,
         };
         if self.cmd.push(command).is_ok() {
-            self.dirty[d] = false;
-            self.adopt(d, held, 0);
+            self.adopt(d, held, 0, opening);
+            self.rejoin();
+        } else {
+            self.dirty[d] = true;
         }
+    }
+
+    /// The readers a generation of input domain `d` takes at index `at`,
+    /// for `job` or, without one, as a rebuild, once the jobs `ahead` of it
+    /// were applied: every attached and wanted slot of `d`, the outgoing
+    /// flow of a re-route or detach until its crossfade ends, and the
+    /// change of `job`. A detached slot gets no reader, raised or not,
+    /// until a re-route. Also returns the slots `job` moves to another
+    /// flow, by bit.
+    fn plan<'a>(
+        &self,
+        d: usize,
+        job: Option<&Job>,
+        at: u64,
+        ahead: impl Iterator<Item = &'a Job>,
+    ) -> (Plan, u64) {
+        struct View {
+            flow: String,
+            detached: bool,
+            pruned: bool,
+            routing: Option<(u64, String)>,
+        }
+        let mut view: Vec<View> = (self.slots.iter())
+            .map(|s| View {
+                flow: s.flow.clone(),
+                detached: matches!(s.state, SupState::Detached),
+                pruned: matches!(s.state, SupState::Pruned { .. }),
+                routing: s.routing.clone(),
+            })
+            .collect();
+        // As `generation_done` and `adopt` leave the slots once each job
+        // ahead is swapped in.
+        for a in ahead {
+            for slot in slots_of(a.up) {
+                view[slot].pruned = false;
+            }
+            for (slot, flow) in &a.routes {
+                let v = &mut view[*slot];
+                let end = a.at_index + self.ramp;
+                match flow {
+                    None if !v.detached => {
+                        v.routing = (!v.pruned).then(|| (end, v.flow.clone()));
+                        v.detached = true;
+                    }
+                    None => {}
+                    Some(f) if v.detached => {
+                        (v.detached, v.pruned, v.routing) = (false, false, None);
+                        v.flow = f.clone();
+                    }
+                    Some(f) => {
+                        if *f != v.flow {
+                            v.routing = Some((end, std::mem::replace(&mut v.flow, f.clone())));
+                        }
+                        v.pruned = false;
+                    }
+                }
+            }
+        }
+        let mut rerouted = 0;
+        let mut plan = Vec::new();
+        for (slot, v) in view.iter().enumerate() {
+            if self.input_domain(slot) != d {
+                continue;
+            }
+            // The job's re-route of the slot: to a flow, or none to detach.
+            let route =
+                (job.and_then(|j| j.routes.iter().find(|r| r.0 == slot))).map(|r| r.1.as_deref());
+            let target = route.is_some() || job.is_some_and(|j| j.up & bit(slot) != 0);
+            // The flow the slot reads, none detached.
+            let reads = (!v.detached).then_some(v.flow.as_str());
+            let wanted = !v.pruned && !v.detached;
+            // The flow a re-route leaves is read until its crossfade ends.
+            let outgoing = match (route, &v.routing) {
+                (Some(f), _) if f != reads && wanted => Some(v.flow.clone()),
+                (None, Some((end, old))) if at < *end => Some(old.clone()),
+                _ => None,
+            };
+            if route.is_some_and(|f| f != reads) {
+                rerouted |= bit(slot);
+            }
+            let attach = (wanted || target)
+                .then(|| route.unwrap_or(reads).map(str::to_owned))
+                .flatten();
+            plan.push((slot, outgoing, attach));
+        }
+        (plan, rerouted)
+    }
+
+    /// Starts a draft of a generation of input domain `d` taking the
+    /// readers of `plan`: its instance, and the opens of its readers on the
+    /// openers, the flows a slot reads now first, so that a new flow's
+    /// open, which may wait, holds up no other.
+    fn start_draft(&mut self, d: usize, plan: &Plan) -> Draft {
+        // No instance here: each reader brings its own, created on an
+        // opener.
+        let generation = Generation::bare(self.slots.len());
+        self.next_draft += 1;
+        let now = Instant::now();
+        let mut draft = Draft {
+            id: self.next_draft,
+            generation,
+            wants: Vec::new(),
+            opens: Vec::new(),
+            opened: Vec::new(),
+            started: now,
+        };
+        self.extend(&mut draft, d, wants(plan));
+        draft
+    }
+
+    /// Hands the opens of `wants` for `draft`, of input domain `d`, to the
+    /// openers, the flows a slot reads now first, so that a new flow's
+    /// open, which may wait, holds up no other.
+    fn extend(&mut self, draft: &mut Draft, d: usize, mut wants: Vec<Want>) {
+        wants.retain(|w| self.shared(w).is_none());
+        if wants.is_empty() {
+            return;
+        }
+        let read: HashSet<&str> = (self.slots.iter())
+            .filter(|s| matches!(s.state, SupState::Attached))
+            .map(|s| s.flow.as_str())
+            .collect();
+        let mut tasks: Vec<OpenTask> = (wants.iter())
+            .map(|w| self.open_task(draft.id, d, w))
+            .collect();
+        tasks.sort_by_key(|t| !read.contains(t.want.flow.as_str()));
+        drop(read);
+        self.openers.submit(tasks);
+        draft.wants.extend(wants);
+    }
+
+    /// The task opening `w`'s reader for draft `id`, of input domain `d`.
+    fn open_task(&self, id: u64, d: usize, w: &Want) -> OpenTask {
+        let path = &self.config.domains[self.in_domains[d]].path;
+        let cfg = &self.config.inputs[w.slot];
+        OpenTask {
+            draft: id,
+            api: Arc::clone(&self.api),
+            domain: path.clone(),
+            dir: lookup::flow_dir(path, &w.flow),
+            want: w.clone(),
+            channels: cfg.channels,
+            flow_channels: cfg.flow_channels.clone(),
+            offset: cfg.offset_samples,
+        }
+    }
+
+    /// Drops `draft`, its opens not started taken off the queue; those
+    /// running release what they open when it comes back.
+    fn drop_draft(&mut self, draft: Draft) {
+        self.openers.cancel(draft.id);
+        self.openers.reap(draft);
+    }
+
+    /// The generation of `draft` for `job`, none for a rebuild, swapped in
+    /// at index `at`, from the readers its openers opened, with the slots it
+    /// holds and those it left out for a reader not open yet, by bit. A
+    /// reader the generation now wants and the draft lacks, as for a slot
+    /// added back since it started, is opened for it. It waits while a
+    /// reader is not answered; `due`, it waits for none and leaves out
+    /// every reader not open, its slot pruned. Readers still opening are kept until the RT thread
+    /// hands the generation back ([`Late`]). A build that left a slot out
+    /// is not counted in the build times; the others count from the
+    /// draft's start to its last answer.
+    fn assemble(
+        &mut self,
+        mut draft: Draft,
+        d: usize,
+        job: Option<&Job>,
+        at: u64,
+        due: bool,
+    ) -> Assembled {
+        let assembling = Instant::now();
+        let (plan, mut rerouted) = self.plan(d, job, at, std::iter::empty());
+        let wanted = wants(&plan);
+        let new: Vec<Want> = (wanted.iter())
+            .filter(|w| !draft.wants.contains(w))
+            .cloned()
+            .collect();
+        self.extend(&mut draft, d, new);
+        let waiting = |w: &Want| {
+            !due && !draft.opened.iter().any(|o| o.want == *w) && self.shared(w).is_none()
+        };
+        if wanted.iter().any(waiting) {
+            return Assembled::Wait(draft);
+        }
+        if job.is_none() {
+            rerouted |= std::mem::take(&mut self.reroute[d]);
+        }
+        let n = self.slots.len();
+        let mut prune_after = vec![u64::MAX; n];
+        let mut prune_late = vec![u64::MAX; n];
+        let mut held = 0u64;
+        let mut opening = 0u64;
+        let mut complete = true;
+        let mut opened = std::mem::take(&mut draft.opened);
+        let mut generation = draft.generation;
+        for w in &wanted {
+            let found = match opened.iter().position(|o| o.want == *w) {
+                Some(i) => Some(opened.swap_remove(i).result.map(|(i, s)| (Arc::new(i), s))),
+                // The live generation's reader: its margin was logged when
+                // it was opened.
+                None => self.shared(w).map(|i| Ok((i, None))),
+            };
+            let result = match found {
+                Some(r) => r.and_then(|(input, short)| {
+                    (generation.insert(w.slot, input, w.outgoing))
+                        .map(|()| short)
+                        .map_err(|e| e.to_string())
+                }),
+                None => {
+                    if !w.outgoing {
+                        opening |= bit(w.slot);
+                    }
+                    let waited = self.openers.running_for(w);
+                    if !w.outgoing {
+                        let mut st = self.status();
+                        let l = &mut st.generation.left_out;
+                        if l.len() == 16 {
+                            l.remove(0);
+                        }
+                        l.push((w.slot, at, waited.map(|d| d.as_nanos() as u64)));
+                    }
+                    Err(format!(
+                        "flow {}: its reader was not open in time for index {at}, its open \
+                         running for {waited:?}",
+                        w.flow
+                    ))
+                }
+            };
+            if w.outgoing {
+                if let Err(e) = result {
+                    let name = &self.config.inputs[w.slot].name;
+                    log(format_args!("input {name}: flow {} left: {e}", w.flow));
+                }
+                continue;
+            }
+            match result {
+                Ok(short) => {
+                    held |= 1 << w.slot;
+                    (prune_after[w.slot], prune_late[w.slot]) =
+                        self.attached(w.slot, short, &generation);
+                }
+                Err(message) => {
+                    complete = false;
+                    self.not_attached(w.slot, message);
+                }
+            }
+        }
+        // Readers the generation no longer wants, each on an instance of
+        // its own that nothing else holds.
+        self.openers.reap(opened);
+        self.remember(d, &generation, &wanted);
+        if complete {
+            self.record_build(
+                true,
+                build_sample(&draft.opens, assembling.elapsed()),
+                false,
+            );
+        }
+        Assembled::Gen(
+            Box::new(Gen {
+                mxl: generation,
+                prune_after,
+                prune_late,
+                rerouted,
+            }),
+            held,
+            opening,
+        )
+    }
+
+    /// Drops the kept readers whose slot and flow `gone` names, releasing
+    /// them on the reaper thread.
+    fn forget(&mut self, gone: impl Fn(&(usize, String)) -> bool) {
+        let keys: Vec<(usize, String)> = self.readers.keys().filter(|k| gone(k)).cloned().collect();
+        let dropped: Vec<Arc<Input>> = (keys.iter())
+            .filter_map(|k| self.readers.remove(k))
+            .collect();
+        self.openers.reap(dropped);
+    }
+
+    /// The reader of the generations built last for `w`'s slot and flow.
+    fn shared(&self, w: &Want) -> Option<Arc<Input>> {
+        self.readers.get(&(w.slot, w.flow.clone())).cloned()
+    }
+
+    /// Keeps the readers `generation`, of input domain `d`, holds for
+    /// `wanted`, for the next one, in place of those of the domain's slots
+    /// kept before.
+    fn remember(&mut self, d: usize, generation: &Generation, wanted: &[Want]) {
+        let in_d: Vec<bool> = (0..self.slots.len())
+            .map(|s| self.input_domain(s) == d)
+            .collect();
+        self.forget(|k| in_d[k.0]);
+        for w in wanted {
+            if let Some(input) = generation.shared(w.slot, w.outgoing) {
+                self.readers.insert((w.slot, w.flow.clone()), input);
+            }
+        }
+    }
+
+    /// [`due`] now, for an entry at `at_index`.
+    fn due(&self, at_index: u64) -> bool {
+        due(
+            earliest(&self.api, &self.counters, self.timing.margin, self.lead),
+            at_index,
+        )
+    }
+
+    /// Takes the readers the openers sent back to their drafts; one for a
+    /// draft built meanwhile is kept until the RT thread hands its
+    /// generation back, and one for a draft dropped is released.
+    fn opened(&mut self) {
+        let arrived = std::mem::take(&mut self.arrived);
+        let mut late_builds = Vec::new();
+        let mut unused = Vec::new();
+        for o in arrived.into_iter().chain(self.openers.results.try_iter()) {
+            let mut drafts = (self.jobs.iter_mut())
+                .filter_map(|j| j.draft.as_mut())
+                .chain(self.rebuilding.iter_mut().flatten());
+            let same = |w: &Want| w.slot == o.want.slot && w.flow == o.want.flow;
+            // Its own draft's, or adopted by a draft that wants the same
+            // reader and has none yet, as after the draft that asked was
+            // dropped: its own open is not queued behind this one.
+            let taker = drafts.find(|d| {
+                let answered = |w: &Want| d.opened.iter().any(|x| x.want == *w);
+                if d.id == o.draft {
+                    !answered(&o.want)
+                } else {
+                    o.result.is_ok() && d.wants.iter().any(|w| same(w) && !answered(w))
+                }
+            });
+            if let Some(d) = taker {
+                let want = if d.id == o.draft {
+                    o.want.clone()
+                } else {
+                    let answered = |w: &Want| d.opened.iter().any(|x| x.want == *w);
+                    let w = (d.wants.iter())
+                        .find(|w| same(w) && !answered(w))
+                        .expect("found above")
+                        .clone();
+                    self.openers.cancel_want(d.id, &w);
+                    w
+                };
+                if o.result.is_ok() {
+                    d.opens.push(o.took);
+                }
+                d.opened.push(Opened {
+                    draft: d.id,
+                    want,
+                    ..o
+                });
+                continue;
+            }
+            let slot = o.want.slot;
+            let awaited = !o.want.outgoing && self.awaiting & bit(slot) != 0 && {
+                let to =
+                    |r: &(usize, Option<String>)| r.0 == slot && r.1.as_ref() == Some(&o.want.flow);
+                self.slots[slot].flow == o.want.flow
+                    || self.jobs.iter().any(|j| j.routes.iter().any(to))
+            };
+            let input = match o.result {
+                Ok((input, _)) => input,
+                Err(_) => continue,
+            };
+            if awaited {
+                // An open the hand-over did not wait for, bounded by the
+                // time assumed before any build, so that a flow found only
+                // after seconds does not set buildLead for long.
+                late_builds.push(o.took.min(UNMEASURED_BUILD));
+                let input = Arc::new(input);
+                self.rejoins.push((o.want.slot, o.want.flow, input));
+            } else {
+                unused.push(input);
+            }
+        }
+        self.openers.reap(unused);
+        for took in late_builds {
+            self.record_build(false, Some(took), true);
+        }
+        self.rejoin();
+    }
+
+    /// Adds back each slot whose reader opened after its generation left
+    /// it out, once that generation is swapped in and the slot pruned for
+    /// it, without the recovery period a stalled flow waits: it joins
+    /// through the next build. One routed elsewhere meanwhile, or down in
+    /// the log, is left to the poll.
+    fn rejoin(&mut self) {
+        let mut unused = Vec::new();
+        for (slot, flow, input) in std::mem::take(&mut self.rejoins) {
+            let routed = (self.jobs.iter()).any(|j| {
+                (j.routes.iter()).any(|r| r.0 == slot && r.1.as_deref() == Some(flow.as_str()))
+            });
+            // The slot's job is still to be swapped in and adopted, which
+            // marks it left out ([`Supervisor::adopt`]).
+            let d = self.input_domain(slot);
+            let queued = self.jobs.iter().any(|j| j.domain == d);
+            let s = &self.slots[slot];
+            // Its generation is not swapped in yet: kept while an entry
+            // routes the slot to the flow.
+            if queued || s.flow != flow || !matches!(s.state, SupState::Pruned { .. }) {
+                if routed || queued {
+                    self.rejoins.push((slot, flow, input));
+                } else {
+                    unused.push(input);
+                }
+                continue;
+            }
+            if !s.up || self.awaiting & bit(slot) == 0 {
+                unused.push(input);
+                continue;
+            }
+            self.awaiting &= !bit(slot);
+            let name = &self.config.inputs[slot].name;
+            let produced = self.counters.produced.load(Acquire);
+            log(format_args!(
+                "input {name}: its reader of {flow} opened, re-adding after index {produced}"
+            ));
+            self.release_poll(slot);
+            self.slots[slot].state = SupState::Wanted;
+            self.status().inputs[slot].readable = None;
+            // The next build takes this reader rather than opening anew.
+            self.readers.insert((slot, flow), input);
+            let d = self.input_domain(slot);
+            self.dirty[d] = true;
+        }
+        self.openers.reap(unused);
+    }
+
+    /// Releases what the RT thread handed back: a generation on the
+    /// reaper thread, as releasing its readers' instances can wait in the
+    /// kernel.
+    fn take_back(&mut self, r: Returned) {
+        match r {
+            Returned::Generation(g) => self.openers.reap(g),
+            r => release(r),
+        }
+    }
+
+    /// Drafts every job not built yet anew, after the jobs ahead of it
+    /// changed.
+    fn redraft(&mut self) {
+        for i in 0..self.jobs.len() {
+            if !matches!(self.jobs[i].stage, Stage::Waiting) {
+                continue;
+            }
+            if let Some(draft) = self.jobs[i].draft.take() {
+                self.drop_draft(draft);
+            }
+            let j = &self.jobs[i];
+            let (domain, at) = (j.domain, j.at_index);
+            let plan = self.plan(domain, Some(j), at, self.jobs.iter().take(i)).0;
+            self.jobs[i].draft = Some(self.start_draft(domain, &plan));
+        }
+    }
+
+    /// Drops the jobs `gone` names and drafts those after them anew.
+    fn drop_jobs(&mut self, gone: impl Fn(&Job) -> bool) {
+        let (dropped, kept): (VecDeque<Job>, VecDeque<Job>) =
+            std::mem::take(&mut self.jobs).into_iter().partition(&gone);
+        self.jobs = kept;
+        if dropped.is_empty() {
+            return;
+        }
+        for j in &dropped {
+            if let Some(draft) = &j.draft {
+                self.openers.cancel(draft.id);
+            }
+        }
+        // A job built and not sent holds its generation.
+        self.openers.reap(dropped);
+        self.redraft();
     }
 
     /// A generation of input domain `d`, with the slots it holds: every
@@ -4429,27 +5455,11 @@ impl Supervisor {
             match result {
                 Ok(short) => {
                     held |= 1 << slot;
-                    let hint = generation
-                        .input(slot)
-                        .and_then(|i| i.reader().config().ok())
-                        .map_or(0, |c| u64::from(c.common.maxCommitBatchSizeHint));
-                    prune_after[slot] = prune_limit(&self.config, &self.timing, hint);
-                    prune_late[slot] = late_prune_limit(&self.config, prune_after[slot]);
-                    if let Some(needed) = short {
-                        log(format_args!(
-                            "input {}: readerMarginSamples {} is below the {needed} its \
-                             producer's maxCommitBatchSizeHint needs",
-                            cfg.name, self.timing.margin
-                        ));
-                    }
-                    let mut st = self.status();
-                    st.inputs[slot].error = None;
-                    st.inputs[slot].margin_short = short;
+                    (prune_after[slot], prune_late[slot]) = self.attached(slot, short, &generation);
                 }
                 Err(message) => {
                     complete = false;
-                    log(format_args!("input {} not attached: {message}", cfg.name));
-                    self.status().inputs[slot].error = Some(message);
+                    self.not_attached(slot, message);
                 }
             }
         }
@@ -4463,18 +5473,11 @@ impl Supervisor {
         }
         // A build that left a slot out waited for a lookup, or failed an
         // attach: not the time a generation takes to build.
-        if complete {
-            self.build_times.add(started.elapsed().as_nanos() as u64);
-        }
-        let p = self.build_times.p9999();
-        let lead = build_lead_samples(p, self.lead, self.timing.block);
-        self.build_lead.store(lead, Relaxed);
-        self.build_time.store(build_time_samples(p), Relaxed);
-        let mut st = self.status();
-        st.generation.builds = self.build_times.total;
-        st.generation.build_p9999_ns = p;
-        st.generation.build_lead = lead;
-        drop(st);
+        self.record_build(
+            complete,
+            complete.then(|| started.elapsed().min(UNMEASURED_BUILD)),
+            false,
+        );
         let generation = Box::new(Gen {
             mxl: generation,
             prune_after,
@@ -4484,15 +5487,65 @@ impl Supervisor {
         Some((generation, held))
     }
 
+    /// Slot `slot` was attached in `generation`, its producer needing the
+    /// margin `short` when the configured one is below it: its error is
+    /// cleared. Returns its frozen-head and late prune limits.
+    fn attached(&mut self, slot: usize, short: Option<u64>, generation: &Generation) -> (u64, u64) {
+        let hint = generation
+            .input(slot)
+            .and_then(|i| i.reader().config().ok())
+            .map_or(0, |c| u64::from(c.common.maxCommitBatchSizeHint));
+        let after = prune_limit(&self.config, &self.timing, hint);
+        if let Some(needed) = short {
+            log(format_args!(
+                "input {}: readerMarginSamples {} is below the {needed} its \
+                 producer's maxCommitBatchSizeHint needs",
+                self.config.inputs[slot].name, self.timing.margin
+            ));
+        }
+        let mut st = self.status();
+        st.inputs[slot].error = None;
+        st.inputs[slot].margin_short = short;
+        (after, late_prune_limit(&self.config, after))
+    }
+
+    /// Slot `slot` was left out of a generation for `message`.
+    fn not_attached(&mut self, slot: usize, message: String) {
+        let name = &self.config.inputs[slot].name;
+        log(format_args!("input {name} not attached: {message}"));
+        self.status().inputs[slot].error = Some(message);
+    }
+
+    /// Counts a generation `built` whole, adds a build time `took` to the
+    /// window, aging out with `ages` ([`BuildTimes::add`]), and sets
+    /// buildLead from the build times.
+    fn record_build(&mut self, built: bool, took: Option<Duration>, ages: bool) {
+        self.builds += u64::from(built);
+        let now = Instant::now();
+        if let Some(t) = took {
+            self.build_times
+                .add(t.as_nanos() as u64, ages.then_some(now));
+        }
+        self.build_times.expire(now);
+        let p = self.build_times.p9999();
+        let lead = build_lead_samples(p, self.lead, self.timing.block);
+        self.build_lead.store(lead, Relaxed);
+        self.build_time.store(build_time_samples(p), Relaxed);
+        let mut st = self.status();
+        st.generation.builds = self.builds;
+        st.generation.build_p9999_ns = p;
+        st.generation.build_lead = lead;
+    }
+
     /// Takes the slots of input domain `d` that the generation now live
     /// on the RT thread holds, `held`, as attached, and moves the others
     /// that were attached or wanted to polling, reported. `targets` are
     /// the slots, by bit, a log entry raises or re-routes: each reported
-    /// when not held.
-    /// A held slot that was pruned meanwhile, or is down in the log, is
-    /// left out of the next generation instead. A detached slot stays as
-    /// it is.
-    fn adopt(&mut self, d: usize, held: u64, targets: u64) {
+    /// when not held, but for those in `opening`, left out for a reader
+    /// still opening. A held slot that was pruned meanwhile, or is down in
+    /// the log, is left out of the next generation instead. A detached
+    /// slot stays as it is.
+    fn adopt(&mut self, d: usize, held: u64, targets: u64, opening: u64) {
         for slot in 0..self.slots.len() {
             if self.input_domain(slot) != d || matches!(self.slots[slot].state, SupState::Detached)
             {
@@ -4500,9 +5553,15 @@ impl Supervisor {
             }
             let pruned = matches!(self.slots[slot].state, SupState::Pruned { .. });
             if held & (1 << slot) == 0 {
+                // A slot whose reader is still opening is not reported: it
+                // joins once the reader is open ([`Supervisor::rejoin`]).
+                let quiet = opening & bit(slot) != 0;
+                if quiet {
+                    self.awaiting |= bit(slot);
+                }
                 if !pruned {
-                    self.start_polling(slot, true);
-                } else if targets & bit(slot) != 0 {
+                    self.start_polling(slot, !quiet);
+                } else if targets & bit(slot) != 0 && !quiet {
                     self.slots[slot].reported = false;
                     self.report(Report::InputPruned { slot });
                     // Raised or re-routed again: looked up without a gap.
@@ -4552,45 +5611,69 @@ impl Supervisor {
                     let Some(slot) = slots_of(targets).next() else {
                         continue;
                     };
-                    self.jobs.push_back(Job {
+                    let mut job = Job {
                         id,
                         at_index,
                         up,
                         routes,
                         domain: self.input_domain(slot),
                         stage: Stage::Waiting,
-                    });
+                        draft: None,
+                        opening: 0,
+                    };
+                    // The job's generation holds the domain's slots: a
+                    // rebuild of it waits until the job is done.
+                    if let Some(draft) = self.rebuilding[job.domain].take() {
+                        self.drop_draft(draft);
+                        self.dirty[job.domain] = true;
+                    }
+                    let plan = self
+                        .plan(job.domain, Some(&job), at_index, self.jobs.iter())
+                        .0;
+                    job.draft = Some(self.start_draft(job.domain, &plan));
+                    self.jobs.push_back(job);
                 }
-                LogMsg::Truncate { from } => self
-                    .jobs
-                    .retain(|j| j.id < from || matches!(j.stage, Stage::Sent(_))),
-                LogMsg::Skip { id } => self
-                    .jobs
-                    .retain(|j| j.id != id || matches!(j.stage, Stage::Sent(_))),
+                LogMsg::Truncate { from } => {
+                    self.drop_jobs(|j| j.id >= from && !matches!(j.stage, Stage::Sent(_)));
+                }
+                LogMsg::Skip { id } => {
+                    self.drop_jobs(|j| j.id == id && !matches!(j.stage, Stage::Sent(_)));
+                }
                 // A generation sent for one is handed back unused by the
                 // next one sent.
-                LogMsg::Dropped { upto } => self.jobs.retain(|j| j.id > upto),
+                LogMsg::Dropped { upto } => self.drop_jobs(|j| j.id <= upto),
                 LogMsg::Product { up, flows, done } => self.product(&up, flows, done),
             }
         }
     }
 
-    /// Builds the first job's generation, on top of the one live, and
-    /// hands it to the RT thread once its entry is committed. The next
-    /// job waits until the RT thread is done with this one, so it holds
-    /// at most one pending generation.
+    /// Builds the first job's generation, on top of the one live, from
+    /// the readers its draft opened since its append, once they are all
+    /// open or, at the latest, on the last tick from which it still reaches
+    /// the RT thread before its index ([`Supervisor::due`]), leaving out a
+    /// reader not open by then; and hands it to the RT thread once its
+    /// entry is committed. The next job waits until the RT thread is done
+    /// with this one, so it holds at most one pending generation.
     fn jobs(&mut self) {
-        if let Some(j) = self.jobs.pop_front() {
-            let j = match j.stage {
-                Stage::Waiting => match self.build(j.domain, Some(&j)) {
-                    Some((g, held)) => Job {
-                        stage: Stage::Built(g, held),
-                        ..j
-                    },
-                    None => j,
-                },
-                _ => j,
-            };
+        if let Some(mut j) = self.jobs.pop_front() {
+            if matches!(j.stage, Stage::Waiting) {
+                if j.draft.is_none() {
+                    let plan = self
+                        .plan(j.domain, Some(&j), j.at_index, std::iter::empty())
+                        .0;
+                    j.draft = Some(self.start_draft(j.domain, &plan));
+                }
+                if let Some(draft) = j.draft.take() {
+                    let due = self.due(j.at_index);
+                    match self.assemble(draft, j.domain, Some(&j), j.at_index, due) {
+                        Assembled::Gen(g, held, opening) => {
+                            j.stage = Stage::Built(g, held);
+                            j.opening = opening;
+                        }
+                        Assembled::Wait(draft) => j.draft = Some(draft),
+                    }
+                }
+            }
             let committed = self.log.lock().expect("log lock").committed;
             let j = match j.stage {
                 Stage::Built(generation, held) if j.id <= committed && self.cmd.slots() > 0 => {
@@ -4630,6 +5713,8 @@ impl Supervisor {
         };
         let j = self.jobs.pop_front().expect("checked above");
         if !swapped {
+            // The jobs after it were drafted on its re-routes.
+            self.redraft();
             return;
         }
         let mut targets = j.up;
@@ -4670,7 +5755,8 @@ impl Supervisor {
                 self.status().inputs[slot].flow_id = flow;
             }
         }
-        self.adopt(j.domain, held, targets);
+        self.adopt(j.domain, held, targets, j.opening);
+        self.rejoin();
     }
 
     /// Takes the slots' state and flows of a product state: a slot on
@@ -4712,10 +5798,21 @@ impl Supervisor {
             let d = self.input_domain(slot);
             self.reroute[d] |= bit(slot);
         }
-        // A generation built and not sent is built again when sent.
+        // Slots moved to other flows read them anew.
+        self.forget(|_| true);
+        // A generation built and not sent is built again when sent, its
+        // readers opened anew on the new flows, and so is a rebuild's.
         for j in &mut self.jobs {
             if matches!(j.stage, Stage::Built(..)) {
-                j.stage = Stage::Waiting;
+                let built = std::mem::replace(&mut j.stage, Stage::Waiting);
+                self.openers.reap(built);
+            }
+        }
+        self.redraft();
+        for d in 0..self.rebuilding.len() {
+            if let Some(draft) = self.rebuilding[d].take() {
+                self.drop_draft(draft);
+                self.dirty[d] = true;
             }
         }
         let resend = self
@@ -4753,7 +5850,7 @@ impl Supervisor {
             if self.cmd.push(command).is_ok() {
                 p.domains[d] = false;
                 self.dirty[d] = false;
-                self.adopt(d, held, 0);
+                self.adopt(d, held, 0, 0);
             }
         }
         if p.resend
@@ -4909,7 +6006,7 @@ impl Supervisor {
             // their flows, before a flow is created anew, so an output
             // enabled again does not find its own writer live on it.
             while let Ok(r) = self.ret.pop() {
-                release(r);
+                self.take_back(r);
             }
         }
         let disabled = self.counters.outputs_disabled.load(Acquire);
@@ -5412,26 +6509,104 @@ mod tests {
     }
 
     #[test]
+    fn a_deadline_leaves_a_tick_and_the_hand_over_margin() {
+        // 5 ms and 2 ms at 48 kHz.
+        assert_eq!(samples_of(SUPERVISOR_TICK), 240);
+        assert_eq!(samples_of(HAND_OVER_MARGIN), 96);
+        let at = 48_000;
+        assert!(!due(at - 337, at));
+        assert!(due(at - 336, at));
+        // Checks are a tick apart at most: a deadline first seen on one,
+        // not seen a tick before, leaves more than the margin.
+        for first in at - 336..at - 96 {
+            assert!(due(first, at) && !due(first - 240, at));
+            assert!(first + samples_of(HAND_OVER_MARGIN) < at, "{first}");
+        }
+    }
+
+    #[test]
+    fn builds_that_open_nothing_do_not_shrink_build_lead() {
+        let us = Duration::from_micros(1);
+        assert_eq!(build_sample(&[], us), None);
+        assert_eq!(
+            build_sample(&[Duration::from_secs(3)], us),
+            Some(UNMEASURED_BUILD)
+        );
+        assert_eq!(
+            build_sample(&[Duration::from_millis(2), us], us),
+            Some(Duration::from_millis(2) + us)
+        );
+        let mut t = BuildTimes::new();
+        let one = build_sample(&[Duration::from_millis(2)], us).unwrap();
+        t.add(one.as_nanos() as u64, None);
+        // A window of re-routes that share every reader.
+        for _ in 0..2 * BUILD_WINDOW {
+            if let Some(s) = build_sample(&[], us) {
+                t.add(s.as_nanos() as u64, None);
+            }
+        }
+        assert!(t.p9999().unwrap() >= 2_000_000);
+    }
+
+    #[test]
+    fn a_slow_build_ages_out_after_five_minutes_without_builds() {
+        let at = Instant::now();
+        let mut t = BuildTimes::new();
+        for _ in 0..10 {
+            t.add(1_000_000, None);
+        }
+        let fast = t.p9999();
+        // A late reader's open, counted once it opened, raises it ...
+        t.add(80_000_000, Some(at));
+        t.expire(at + Duration::from_secs(300));
+        assert!(t.p9999().unwrap() >= 80_000_000);
+        // ... until it is five minutes old, with no build since; the
+        // complete builds' times stay.
+        t.expire(at + Duration::from_secs(301));
+        assert_eq!(t.p9999(), fast);
+    }
+
+    #[test]
     fn build_lead_covers_the_p9999_build_time() {
+        let at = Instant::now();
         let mut t = BuildTimes::new();
         assert_eq!(t.p9999(), None);
-        for _ in 0..19_999 {
-            t.add(1_000_000);
+        for _ in 0..BUILD_WINDOW {
+            t.add(1_000_000, None);
         }
         let p = t.p9999().unwrap();
         assert!((1_000_000..1_190_000).contains(&p), "{p}");
-        t.add(80_000_000);
-        assert_eq!(t.p9999(), Some(p));
-        t.add(80_000_000);
-        t.add(80_000_000);
+        // One slow build raises it at once, as a late reader's open does.
+        t.add(80_000_000, Some(at));
         assert!(t.p9999().unwrap() >= 80_000_000);
-        // 1 ms + 5 ms is 288 samples, plus a lead of 192: 480.
-        assert_eq!(build_lead_samples(Some(1_000_000), 192, 48), 480);
-        assert_eq!(build_lead_samples(Some(1_000_001), 192, 48), 528);
-        assert_eq!(build_lead_samples(None, 0, 48), 5040);
-        // Without the lead, not rounded: 1 ms + 5 ms, 100 ms + 5 ms.
-        assert_eq!(build_time_samples(Some(1_000_000)), 288);
-        assert_eq!(build_time_samples(None), 5040);
+        let slow = build_lead_samples(t.p9999(), 192, 48);
+        // It ages out after a window of fast builds, and only then.
+        for _ in 0..BUILD_WINDOW - 1 {
+            t.add(1_000_000, None);
+        }
+        assert!(t.p9999().unwrap() >= 80_000_000, "aged out too early");
+        t.add(1_000_000, None);
+        assert_eq!(t.p9999(), Some(p));
+        assert!(build_lead_samples(t.p9999(), 192, 48) < slow);
+        // 1 ms is below the 30 ms floor: 30 + 5 + 2 ms is 1776 samples,
+        // plus a lead of 192: 1968.
+        assert_eq!(build_lead_samples(Some(1_000_000), 192, 48), 1968);
+        // Above the floor: 40 + 5 + 2 ms is 2256 samples, plus 192: 2448.
+        assert_eq!(build_lead_samples(Some(40_000_000), 192, 48), 2448);
+        assert_eq!(build_lead_samples(None, 0, 48), 5136);
+        // Without the lead, not rounded: the floor + 5 ms + 2 ms, 100 ms +
+        // 5 ms + 2 ms.
+        assert_eq!(build_time_samples(Some(1_000_000)), 1776);
+        assert_eq!(build_time_samples(None), 5136);
+        // However short the builds, buildLead holds the lead, the floor,
+        // the tick and the margin.
+        let floor = 192
+            + samples_of(BUILD_FLOOR)
+            + samples_of(SUPERVISOR_TICK)
+            + samples_of(HAND_OVER_MARGIN);
+        for p in [0, 1, 1_000, 100_000] {
+            assert!(build_lead_samples(Some(p), 192, 48) >= floor, "{p}");
+        }
     }
 
     fn log() -> (Log, rtrb::Consumer<RingEntry>, mpsc::Receiver<LogMsg>) {

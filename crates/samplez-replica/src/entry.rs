@@ -254,8 +254,11 @@ pub enum Body {
 /// generation flags ([`Command::generation`]), which a binary of
 /// protocol 1 ignores; 3 adds the tone generator's engine entry
 /// (`samplez::Entry::Tone`) and targets (`samplez::Targets::tones`),
-/// which a product's records carry.
-pub const PROTOCOL: u32 = 3;
+/// which a product's records carry; 4 keeps the digest of a block a
+/// withdrawn replica withholds at once as unfillable, so a page it
+/// computed degraded is reported degraded and left out of the verdicts,
+/// where protocol 3 reported it healthy and the verdicts diverged it.
+pub const PROTOCOL: u32 = 4;
 
 impl Body {
     /// An entry whose generation every replica builds on receipt: an
@@ -476,10 +479,10 @@ mod tests {
     /// the replicated semantics or the page hash and fingerprint
     /// computation bumps it, with the reason added here, and only such a
     /// change does. 2: the generation flags; 3: the tone generator's
-    /// entry and targets.
+    /// entry and targets; 4: an unfillable withheld block's digest.
     #[test]
     fn the_protocol_is_pinned() {
-        assert_eq!(PROTOCOL, 3);
+        assert_eq!(PROTOCOL, 4);
     }
 
     /// The entries the leader flagged for a generation need one, so a

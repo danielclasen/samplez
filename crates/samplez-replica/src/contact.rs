@@ -904,6 +904,9 @@ pub struct Metrics {
     /// ([`crate::rollout::Rollout::versions`]); none for the witness and
     /// where the rollout reports none.
     pub versions: Option<crate::rollout::Versions>,
+    /// buildLead of this replica's engine, in samples
+    /// ([`crate::report::Own::build_lead`]); none without an engine.
+    pub build_lead: Option<u64>,
     /// F, none before it is first computed.
     pub fence: Option<u64>,
     pub in_contact: bool,
@@ -3799,6 +3802,7 @@ impl Contact {
             protocol_blocker,
             config_hash: self.log.config_hash(),
             versions: st.own.versions,
+            build_lead: st.own.build_lead,
             fence: st.fence,
             in_contact: st.in_contact,
             known_committed: st.known_committed,

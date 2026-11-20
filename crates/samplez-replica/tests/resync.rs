@@ -898,3 +898,20 @@ async fn quiet_restart(leader: bool, rebuilt: bool) {
         "an engine entry appended after the restart"
     );
 }
+
+/// `/metrics` carries the engine's buildLead as reported to contact,
+/// `samplez_engine_build_lead_samples`, and follows a change of it.
+#[tokio::test(start_paused = true)]
+async fn metrics_show_the_engines_build_lead() {
+    let set = start(vec![a(0), a(1), a(2)], false).await;
+    for lead in [576, 4_800] {
+        for id in set.ids() {
+            set.audio(id).lock().build_lead = Some(lead);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for id in set.ids() {
+            let got = sample(&set, id, "samplez_engine_build_lead_samples", None);
+            assert_eq!(got, lead as f64, "{id}");
+        }
+    }
+}

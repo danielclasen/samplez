@@ -455,6 +455,7 @@ fn spawn_producer(domain: &Domain, id: &str) -> Producer {
 }
 
 fn killed_producer() {
+    let guarded = samplez_mxl::guarded_releases();
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let producer = spawn_producer(&domain, &src);
@@ -499,6 +500,9 @@ fn killed_producer() {
     assert!(back, "input not re-added: {:?}", engine.status().inputs[0]);
     assert!(c.ramp - gap.ramp >= 10, "no fade-in after re-add: {c:?}");
     assert!(c.clean - gap.clean > 1_000, "{c:?}");
+    // The poll reader of the stale flow, invalid once the flow is
+    // recreated, was released on the reaper thread, not the supervisor.
+    assert_eq!(samplez_mxl::guarded_releases(), guarded);
 
     // The re-added input is pruned again when its producer dies again.
     producer.kill();
