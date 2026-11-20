@@ -46,6 +46,9 @@ pub struct Resynced {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Missed;
 
+/// The reason an attempt that hit [`Missed`] fails with.
+pub const MISSED: &str = "a record after the donor's core is gone";
+
 /// What a joiner's replay reads from the replica while it runs.
 pub trait Source: Send + Sync {
     /// The records of the entries applied after log index `after`, in

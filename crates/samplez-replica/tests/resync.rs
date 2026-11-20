@@ -728,3 +728,169 @@ async fn a_forced_install_holds_through_a_leader_change() {
     })
     .await;
 }
+
+/// A quiet set: the newest entry that derived an engine record lies
+/// before every replica's snapshot, so the core a donor copies names a
+/// last log id below the index a restarted replica's records start from,
+/// though no record lies between them. The restarted replica, its
+/// rebuilt pages off the set's for good, resyncs from that core and
+/// commits again, Ready, with no engine entry appended after it
+/// restarted. Here the donors' cores name an id at or past the newest
+/// record: the replay needs the record floor.
+#[tokio::test(start_paused = true)]
+async fn a_quiet_follower_resync_needs_the_record_floor() {
+    quiet_restart(false, false).await;
+}
+
+/// [`a_quiet_follower_resync_needs_the_record_floor`] through the leader,
+/// the pod a StatefulSet rolls last.
+#[tokio::test(start_paused = true)]
+async fn a_quiet_leader_resync_needs_the_record_floor() {
+    quiet_restart(true, false).await;
+}
+
+/// [`a_quiet_follower_resync_needs_the_record_floor`] with every donor
+/// restarted after the record and rebuilt from product state, so it took
+/// the record from no ring: its core names the state it installed, not
+/// the newest entry it took, which lies below the floor.
+#[tokio::test(start_paused = true)]
+async fn a_quiet_follower_resync_needs_the_installed_last_id() {
+    quiet_restart(false, true).await;
+}
+
+/// `leader`: the replica restarted leads. `rebuilt`: the donors are
+/// restarted after the record, rebuilt from product state.
+async fn quiet_restart(leader: bool, rebuilt: bool) {
+    let mut set = start(vec![a(0), a(1), a(2)], true).await;
+    let ids = audio(&set);
+    for &id in &ids {
+        set.audio(id).lock().replays = true;
+    }
+    let lead = set.leader().await;
+    let store = set.replica(lead).store();
+    let before = store.applied_index();
+    // An engine entry, then one that derives none: every snapshot lies
+    // after the newest record.
+    let at = (index_at(set.clock(lead).tai_ns()) + 48_000).next_multiple_of(BLOCK);
+    set.replica(lead)
+        .append(Body::InputDown {
+            slot: 0,
+            at_index: at,
+        })
+        .unwrap();
+    set.replica(lead)
+        .append(Body::LeaseRenew(Vec::new()))
+        .unwrap();
+    // Bounded in wall time, as an fsync lets the paused clock run ahead.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    harness::until_wall(deadline, "both entries applied", || {
+        store.applied_index() >= before + 2
+    })
+    .await;
+    let newest = store.with_state(|sm| sm.records.keys().next_back().copied());
+    // Every replica has taken the record and done its rebuilds; entries
+    // that derive none then lift the snapshots above every core's last
+    // id, which a rebuild sets to the index it installed.
+    for &id in &ids {
+        let store = set.replica(id).store();
+        harness::until_wall(deadline, "the record applied everywhere", || {
+            store.applied_index() >= before + 2
+        })
+        .await;
+    }
+    let receiver = rebuilt.then(|| ids.iter().copied().find(|&id| id != lead).unwrap());
+    if let Some(receiver) = receiver {
+        // Past the record's index: a donor restarted now takes it from no
+        // ring, and holds it in the state it is rebuilt from.
+        sleep(Duration::from_millis(1500)).await;
+        for &d in ids.iter().filter(|&&d| d != receiver) {
+            set.on_start(d, |audio| {
+                let mut fake = audio.lock();
+                fake.resyncs = true;
+                fake.replays = true;
+            });
+            set.restart(d).await;
+            passes(&set, d, ReplicaState::Committing, 10).await;
+        }
+    }
+    let lead = set.leader().await;
+    let store = set.replica(lead).store();
+    sleep(Duration::from_millis(200)).await;
+    let cores = |set: &Set| {
+        (ids.iter())
+            .map(|&id| set.audio(id).lock().core_last_id())
+            .max()
+            .unwrap_or(0)
+    };
+    while store.applied_index() <= cores(&set) {
+        let applied = store.applied_index();
+        let now = set.leader().await;
+        set.replica(now)
+            .append(Body::LeaseRenew(Vec::new()))
+            .unwrap();
+        harness::until_wall(deadline, "a lease renewal applied", || {
+            store.applied_index() > applied
+        })
+        .await;
+    }
+    let index = store.applied_index();
+    assert!(newest.is_some_and(|n| n < index), "a record before {index}");
+    for &id in &ids {
+        let store = set.replica(id).store();
+        harness::until_wall(deadline, "applied everywhere", || {
+            store.applied_index() >= index
+        })
+        .await;
+        let raft = set.replica(id).raft().clone();
+        raft.trigger().snapshot().await.expect("snapshot");
+        harness::until_wall(deadline, "a snapshot past the record", || {
+            raft.metrics()
+                .borrow()
+                .snapshot
+                .is_some_and(|s| s.index >= index)
+        })
+        .await;
+    }
+    // Leadership may have moved meanwhile.
+    let lead = set.leader().await;
+    let r = match receiver {
+        Some(r) => r,
+        None if leader => lead,
+        None => ids.iter().copied().find(|&id| id != lead).unwrap(),
+    };
+    // Set before its contact runs: its first rebuild is off for good.
+    set.on_start(r, |audio| {
+        let mut fake = audio.lock();
+        fake.resyncs = true;
+        fake.replays = true;
+        fake.rebuild_glitch = Some(0.5);
+    });
+    set.restart(r).await;
+    let from = set.replica(r).store().records_from();
+    assert!(from >= index, "its records start at its snapshot");
+    // The field case: a donor's core names a last log id below the
+    // receiver's records, with no record between them.
+    let newest = newest.unwrap();
+    for &d in ids.iter().filter(|&&d| d != r) {
+        let fake = set.audio(d).lock();
+        let last = fake.core_last_id();
+        assert!(
+            (newest..from).contains(&last),
+            "{d}'s core names {last}, not in [{newest}, {from})"
+        );
+        // Named by the newest entry taken alone, its core would lie below
+        // the floor.
+        if rebuilt {
+            assert!(fake.last_taken() < newest, "{d} took the record");
+        }
+    }
+    passes(&set, r, ReplicaState::Committing, 10).await;
+    assert!(resyncs(&set, r).handovers >= 1, "resynced");
+    until("Ready", 5, || set.replica(r).replica().ready).await;
+    assert!(
+        set.replica(r)
+            .store()
+            .with_state(|sm| sm.records.is_empty()),
+        "an engine entry appended after the restart"
+    );
+}

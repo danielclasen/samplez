@@ -364,6 +364,22 @@ pub struct StateMachine<P> {
     /// the records' indexes rise in log order, so retention drops a
     /// prefix.
     pub records_from: u64,
+    /// Not replicated: the log index of the newest entry at or below
+    /// `records_from` that derived a record, none where that is unknown.
+    /// No entry after it derived one up to `records_from`, so a replay
+    /// from it on misses none ([`StateMachine::records_whole`]). It comes
+    /// with a snapshot, which carries the newest record's index.
+    pub record_floor: Option<u64>,
+}
+
+impl<P> StateMachine<P> {
+    /// Whether `records` holds the record of every entry after log index
+    /// `after` that derived one: `after` is at or above `records_from`,
+    /// or at or above `record_floor`, past which no entry derived one up
+    /// to `records_from`.
+    pub fn records_whole(&self, after: u64) -> bool {
+        after >= self.records_from || self.record_floor.is_some_and(|f| after >= f)
+    }
 }
 
 impl<P: Product> StateMachine<P> {
@@ -396,6 +412,7 @@ impl<P: Product> StateMachine<P> {
             silenced: 0,
             records: BTreeMap::new(),
             records_from: 0,
+            record_floor: Some(0),
         }
         .imaged()
     }
@@ -861,7 +878,10 @@ impl<P: Product> StateMachine<P> {
             if entry.get().at_index >= kept {
                 break;
             }
+            // Every record held lies after `records_from`: the one dropped
+            // is the newest at or below it now.
             self.records_from = self.records_from.max(*entry.key());
+            self.record_floor = Some(self.records_from);
             entry.remove();
         }
     }
@@ -1072,6 +1092,12 @@ impl<P: Product> StateMachine<P> {
             highest_stamp: self.highest_stamp,
             revision: self.revision,
             floor: Some(self.floor),
+            record_floor: self
+                .records
+                .keys()
+                .next_back()
+                .copied()
+                .or(self.record_floor),
             derived: self.derived.clone(),
             resets: self.resets.clone(),
             protocol: self.protocol,
@@ -1138,6 +1164,9 @@ impl<P: Product> StateMachine<P> {
             })
             .collect();
         self.records.clear();
+        // The newest record when the snapshot was taken, at or below the
+        // index it was taken at, which the store sets `records_from` to.
+        self.record_floor = saved.record_floor;
         self.image = if P::DRIVES_ENGINE {
             self.targets().map(|(targets, silenced)| {
                 self.silenced(None, silenced);
@@ -3194,6 +3223,57 @@ mod derive_tests {
         );
         assert_eq!(sm.records.keys().copied().collect::<Vec<_>>(), [2, 3]);
         assert_eq!(sm.records_from, 1);
+        // The record dropped is the newest at or below `records_from`: a
+        // replay from before it misses it.
+        assert_eq!(sm.record_floor, Some(1));
+        assert!(!sm.records_whole(0));
+        assert!(sm.records_whole(1));
+    }
+
+    /// A machine loaded from a snapshot taken after entries that derived
+    /// no record holds every record after the newest that did, though
+    /// `records_from` is the snapshot's index: a replay from that record
+    /// on misses nothing, one from before it does. A snapshot written
+    /// before the floor was kept leaves it unknown, and only
+    /// `records_from` counts.
+    #[test]
+    fn a_snapshot_carries_the_newest_record_as_the_floor() {
+        let mut sm = machine();
+        sm.apply(1, &one("1", "fader 0 0.5", 0, 960, None));
+        for index in 2..=5 {
+            sm.apply(
+                index,
+                &Request {
+                    stamp: 960 + 48 * index,
+                    body: Body::LeaseRenew(Vec::new()),
+                },
+            );
+        }
+        assert_eq!(sm.records.keys().copied().collect::<Vec<_>>(), [1]);
+        let saved = sm.save();
+        assert_eq!(saved.record_floor, Some(1));
+        let load = |saved: Replicated| {
+            let mut loaded = machine();
+            loaded.load(saved, Limits::defaults(48_000)).expect("loads");
+            // As the store sets it.
+            loaded.records_from = 5;
+            loaded
+        };
+        let loaded = load(saved.clone());
+        assert_eq!(loaded.record_floor, Some(1));
+        assert!(!loaded.records_whole(0), "the record at 1 is not held");
+        for after in 1..=5 {
+            assert!(loaded.records_whole(after), "after {after}");
+        }
+        // As bytes: a JSON value holds no u128 command id.
+        let bytes = String::from_utf8(serde_json::to_vec(&saved).expect("encodes")).unwrap();
+        let field = "\"record_floor\":1,";
+        assert!(bytes.contains(field), "{bytes}");
+        let legacy: Replicated = serde_json::from_str(&bytes.replace(field, "")).expect("decodes");
+        assert_eq!(legacy.record_floor, None);
+        let loaded = load(legacy);
+        assert!(!loaded.records_whole(4), "an unknown floor");
+        assert!(loaded.records_whole(5));
     }
 }
 

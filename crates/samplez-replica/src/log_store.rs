@@ -590,8 +590,8 @@ impl<P> Store<P> {
 
     /// Calls `f` with the log index and record of every entry after
     /// `after` up to `up_to` that derived engine entries and is held, in
-    /// log order; false when one is no longer held
-    /// ([`StateMachine::records_from`]).
+    /// log order; false when one may no longer be held
+    /// ([`StateMachine::records_whole`]).
     pub fn records(
         &self,
         after: u64,
@@ -605,13 +605,19 @@ impl<P> Store<P> {
                 f(*index, record);
             }
         }
-        after >= applied.sm.records_from
+        applied.sm.records_whole(after)
     }
 
     /// The log index after which the state machine holds every record
     /// ([`StateMachine::records_from`]).
     pub fn records_from(&self) -> u64 {
         self.read().sm.records_from
+    }
+
+    /// The newest entry at or below `records_from` that derived a record
+    /// ([`StateMachine::record_floor`]).
+    pub fn record_floor(&self) -> Option<u64> {
+        self.read().sm.record_floor
     }
 
     /// The floor after every entry below `index`: the applied state's,

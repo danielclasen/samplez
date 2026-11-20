@@ -712,7 +712,7 @@ impl Audio for EngineAudio {
             // takes a newer core.
             let records = source
                 .entries(after)
-                .map_err(|Missed| "a record after the donor's core is gone".to_owned())?;
+                .map_err(|Missed| crate::resync::MISSED.to_owned())?;
             // The lowest index of the records from each one on.
             let mut lowest = vec![u64::MAX; records.len() + 1];
             for (n, (_, r)) in records.iter().enumerate().rev() {
