@@ -473,6 +473,9 @@ pub struct Replica<P> {
     /// Set once the replica applied the log up to the committed id it
     /// knows ([`ReplicaInfo::ready`]); nothing clears it yet.
     ready: AtomicBool,
+    /// A rollout given before contact started, which contact takes from
+    /// its first report period on ([`Replica::rollout`]).
+    rollout: Mutex<Option<Arc<dyn rollout::Rollout>>>,
 }
 
 impl<P: Product> Replica<P> {
@@ -598,6 +601,7 @@ impl<P: Product> Replica<P> {
             generations,
             estimate,
             ready: AtomicBool::new(false),
+            rollout: Mutex::default(),
         })
     }
 
@@ -689,7 +693,8 @@ impl<P: Product> Replica<P> {
     /// each report period, F published to `audio`, what each entry derived
     /// handed to it as the entry applies, and entries unresolved once
     /// their apply deadline passes unapplied. The witness passes no
-    /// `audio`.
+    /// `audio`. A rollout given before ([`Replica::rollout`]) is contact's
+    /// from its first report period.
     pub fn contact(
         &self,
         timing: contact::Timing,
@@ -709,10 +714,16 @@ impl<P: Product> Replica<P> {
             Arc::new(self.store.clone()),
             first_seq,
         ));
+        // Held until contact is set: a rollout given meanwhile is not lost.
+        let mut pending = self.rollout.lock().expect("rollout lock poisoned");
         self.shared
             .contact
             .set(contact.clone())
             .map_err(|_| "contact runs already".to_owned())?;
+        if let Some(rollout) = pending.take() {
+            contact.set_rollout(rollout);
+        }
+        drop(pending);
         tokio::spawn(contact::run(
             self.shared.clone(),
             contact,
@@ -722,14 +733,16 @@ impl<P: Product> Replica<P> {
     }
 
     /// Gives contact the compatibility key and the revisions of a rollout
-    /// ([`rollout`]); without, every replica's key is equal.
+    /// ([`rollout`]); without, every replica's key is equal. Given before
+    /// [`Replica::contact`], contact reports the key from its first report
+    /// period on; given later, the replica's first periods report none,
+    /// and it may leave `starting` before its key is known.
     pub fn rollout(&self, rollout: Arc<dyn rollout::Rollout>) -> Result<(), String> {
-        let contact = self
-            .shared
-            .contact
-            .get()
-            .ok_or_else(|| "contact does not run".to_owned())?;
-        contact.set_rollout(rollout);
+        let mut pending = self.rollout.lock().expect("rollout lock poisoned");
+        match self.shared.contact.get() {
+            Some(contact) => contact.set_rollout(rollout),
+            None => *pending = Some(rollout),
+        }
         Ok(())
     }
 
@@ -1063,6 +1076,15 @@ impl Shared {
         }
     }
 
+    /// The refusal of a command its deadline passed unordered: no leader,
+    /// while this replica neither leads nor heard a leader within the
+    /// lease, else timed out.
+    fn unordered(&self) -> Refused {
+        let metrics = self.raft.metrics().borrow().clone();
+        let led = metrics.state == ServerState::Leader || self.leader_heard(&metrics);
+        Refused::Unavailable(if led { "timed out" } else { "no leader" }.into())
+    }
+
     /// Another replica this one knows as leader, with its address.
     fn leader(&self) -> Option<(NodeId, String)> {
         let metrics = self.raft.metrics().borrow().clone();
@@ -1195,9 +1217,18 @@ impl Shared {
                 }
                 if let Body::Baseline(b) = &mut body {
                     b.at_index = b.at_index.max(earliest);
-                    if self.contact.get().is_some_and(|c| c.hands_over(b)) {
+                    let hands_over = self.contact.get().is_some_and(|c| c.hands_over(b));
+                    if hands_over {
                         b.at_index = rollout::hand_over_at(b.at_index, self.settings.block);
                     }
+                    tracing::info!(
+                        replica = b.replica,
+                        key = ?b.key,
+                        at_index = b.at_index,
+                        p = b.at_index.next_multiple_of(samplez::blocks::PAGE),
+                        hands_over,
+                        "Baseline stamped"
+                    );
                 }
                 let request = Request {
                     stamp: stamp.stamp,
@@ -1245,7 +1276,7 @@ impl Shared {
                 if expired {
                     let (reply, _) = oneshot::channel();
                     let reply = std::mem::replace(&mut item.reply, reply);
-                    let _ = reply.send(Err(Refused::Unavailable("timed out".into())));
+                    let _ = reply.send(Err(self.unordered()));
                 }
                 !expired
             });
@@ -1599,8 +1630,8 @@ impl<P: Product> ReplicatedState for Replica<P> {
     /// clock verification and the generations 2.11 adds to it are not
     /// known here. With contact running the witness is ready only while
     /// it is in contact, and an audio replica of a set of more than one
-    /// voter only as [`contact::Contact::serving`] says; `commitable`
-    /// does not take that term. `commitable` once ready on a voter other than the
+    /// voter only as [`contact::Contact::serving`] says. `commitable`
+    /// once ready on a voter other than the
     /// witness that a leader counts as a voter, now or within the last
     /// [`membership::UNCOUNTED`]: it forwards what it does not
     /// order itself. The only voter of its membership counts itself while
@@ -1613,6 +1644,11 @@ impl<P: Product> ReplicatedState for Replica<P> {
     /// `ClockVerdict`, fenced on a detected clock step, or flagged by a
     /// self-report while E counts a replica free of flags; with E
     /// counting nobody every replica does.
+    /// An audio replica whose `/readyz` term passes takes writes whether
+    /// a leader counts it yet or not, as one restarted is not counted
+    /// until its first check: it is in contact with its set, and forwards
+    /// them to the leader once it knows one, else answers
+    /// [`Reason::Unavailable`], "no leader", at the write timeout.
     fn replica(&self) -> ReplicaInfo {
         let metrics = self.shared.raft.metrics().borrow().clone();
         let applied = metrics.last_applied.map_or(0, |id| id.index);
@@ -1638,7 +1674,9 @@ impl<P: Product> ReplicatedState for Replica<P> {
             commitable: ready
                 && voter
                 && slot_of(self.id()) != Slot::Witness
-                && (alone || self.shared.counted.load(Ordering::SeqCst))
+                && (alone
+                    || self.shared.counted.load(Ordering::SeqCst)
+                    || self.shared.contact.get().is_some_and(|c| c.serving()))
                 && self
                     .shared
                     .contact
@@ -1825,7 +1863,7 @@ impl<P: Product> ReplicatedState for Replica<P> {
             queued.map_err(|_| stopped())?;
             let replied = match tokio::time::timeout_at(deadline, replied).await {
                 Ok(replied) => replied.unwrap_or_else(|_| Err(self::stopped())),
-                Err(_) => Err(Refused::Unavailable("timed out".into())),
+                Err(_) => Err(self.shared.unordered()),
             };
             match replied {
                 Ok(outcome) => Ok(Ack::new(
@@ -1877,6 +1915,26 @@ fn mismatch_samples(mismatch: Option<state::Mismatch>) -> Vec<ReplicaMetric> {
     .collect()
 }
 
+/// `samplez_replica_disagreements_total`: the page disagreements this
+/// replica raised while it led, by kind: `no_majority`, no strict
+/// majority among two or more hashes of one key, and `cross_key`, a page
+/// committed whole by replicas of two keys.
+fn disagreement_samples(c: &baseline::Counts) -> Vec<ReplicaMetric> {
+    [
+        ("no_majority", c.disagreements),
+        ("cross_key", c.cross_key_disagreements),
+    ]
+    .into_iter()
+    .map(|(kind, n)| ReplicaMetric {
+        name: "samplez_replica_disagreements_total",
+        help: "Page disagreements raised while leading: no_majority among the hashes of one key, cross_key for a page committed whole under two keys.",
+        kind: MetricKind::Counter,
+        labels: vec![("kind", kind.to_owned())],
+        value: n as f64,
+    })
+    .collect()
+}
+
 /// The `/metrics` samples of contact metrics `m`, `serving` the `/readyz`
 /// term ([`contact::Contact::serving`]).
 fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
@@ -1923,6 +1981,7 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
         });
     }
     out.extend(mismatch_samples(m.replica.and_then(|l| l.mismatch)));
+    out.extend(disagreement_samples(&m.leader));
     if let Some(v) = m.versions {
         out.push(ReplicaMetric {
             name: "samplez_replica_versions",
@@ -1973,6 +2032,18 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
             "Diverged replicas rebuilt from product state, not resynced: an input read another flow.",
             Counter,
             r.rebuilt_for_flows as f64,
+        ),
+        one(
+            "samplez_replica_resync_rebuilt_for_key_total",
+            "Diverged replicas rebuilt from product state, not resynced: every committing donor had another key.",
+            Counter,
+            r.rebuilt_for_key as f64,
+        ),
+        one(
+            "samplez_replica_resync_refused_total",
+            "Donor cores the engine refused for good, each followed by a rebuild from product state.",
+            Counter,
+            r.refused as f64,
         ),
         one(
             "samplez_replica_resync_backoff_seconds",
@@ -2103,6 +2174,37 @@ mod tests {
         let none = mismatch_samples(None);
         assert_eq!(reason(&none, "below_baseline_versions"), 0.0);
         assert_eq!(reason(&none, "awaiting_hand_over"), 0.0);
+    }
+
+    /// The value of `samplez_replica_disagreements_total` of `kind`.
+    fn disagreements(samples: &[ReplicaMetric], kind: &str) -> f64 {
+        let s = samples
+            .iter()
+            .find(|s| s.labels == [("kind", kind.to_owned())])
+            .expect("a sample per kind");
+        assert_eq!(s.name, "samplez_replica_disagreements_total");
+        s.value
+    }
+
+    /// Each kind of page disagreement the leader counts is exposed under
+    /// its own label: a cross-key one raises `cross_key` alone, one
+    /// without a majority among a key's hashes `no_majority` alone.
+    #[test]
+    fn disagreements_are_exposed_by_their_kind() {
+        let cross = baseline::Counts {
+            cross_key_disagreements: 1,
+            ..baseline::Counts::default()
+        };
+        let samples = disagreement_samples(&cross);
+        assert_eq!(disagreements(&samples, "cross_key"), 1.0);
+        assert_eq!(disagreements(&samples, "no_majority"), 0.0);
+        let same = baseline::Counts {
+            disagreements: 1,
+            ..baseline::Counts::default()
+        };
+        let samples = disagreement_samples(&same);
+        assert_eq!(disagreements(&samples, "cross_key"), 0.0);
+        assert_eq!(disagreements(&samples, "no_majority"), 1.0);
     }
 
     use crate::state_machine::tests::Paths;

@@ -145,14 +145,7 @@ pub fn filling(own: &Own) -> bool {
 /// baseline's versions, so the reason does not follow peers unheard for
 /// a moment.
 fn mismatch(v: &View) -> Mismatch {
-    let base = v.baseline.and_then(|b| {
-        b.versions.or_else(|| {
-            v.peers
-                .iter()
-                .find(|p| p.id == b.replica)
-                .and_then(|p| p.own.versions)
-        })
-    });
+    let base = v.base().and_then(|(_, versions)| versions);
     if crate::rollout::may_take_over(v.own.versions, base, false, &[]) {
         Mismatch::AwaitingHandOver
     } else {
@@ -163,6 +156,13 @@ fn mismatch(v: &View) -> Mismatch {
 /// Whether two compatibility keys are known and differ.
 pub fn differs(a: Option<u64>, b: Option<u64>) -> bool {
     matches!((a, b), (Some(a), Some(b)) if a != b)
+}
+
+/// The peers whose pages this replica's are compared with: those that
+/// report its key ([`crate::rollout`]). Pages of another key differ
+/// without either replica's state diverging.
+pub(crate) fn same_key(mine: Option<u64>, theirs: &Own) -> bool {
+    theirs.key == mine
 }
 
 /// A peer as this replica's rules see it: its newest copy, direct or
@@ -200,6 +200,22 @@ pub(crate) struct View<'a> {
     pub pages: &'a PageBook,
     pub timing: &'a Timing,
     pub tai: u64,
+}
+
+impl View<'_> {
+    /// The latest `Baseline`'s key and versions, as the leader resolves
+    /// them ([`crate::rollout::baseline_of`]): one named before its
+    /// replica reported a key takes the key that replica reports while it
+    /// commits.
+    fn base(&self) -> Option<(Option<u64>, Option<crate::rollout::Versions>)> {
+        let b = self.baseline?;
+        let named = if b.replica == self.me {
+            Some(self.own)
+        } else {
+            self.peers.iter().find(|p| p.id == b.replica).map(|p| p.own)
+        };
+        Some(crate::rollout::baseline_of(b, named))
+    }
 }
 
 /// Why a commit start was named.
@@ -282,8 +298,12 @@ pub(crate) struct Life {
     spent: Option<u64>,
     /// The highest fill block counted, per output.
     fills_counted: Vec<u64>,
-    /// The key of the latest `Baseline` seen, once one was.
-    base_key: Option<Option<u64>>,
+    /// The latest `Baseline` seen, once one was, by its replica and
+    /// at_index, with its key as last resolved.
+    base_seen: Option<((NodeId, u64), Option<u64>)>,
+    /// A `Baseline` without a key naming this replica, by its replica and
+    /// at_index, with this replica's key when it first saw it.
+    keyless_naming: Option<((NodeId, u64), Option<u64>)>,
     /// An old-key filler from this P on: it fills through only, ranks
     /// below every replica with the baseline's key and never resumes.
     filler: Option<u64>,
@@ -318,7 +338,8 @@ impl Life {
             named: None,
             spent: None,
             fills_counted: Vec::new(),
-            base_key: None,
+            base_seen: None,
+            keyless_naming: None,
             filler: None,
             switching: false,
             computed_from: None,
@@ -347,8 +368,39 @@ impl Life {
         self.filler.is_some()
     }
 
+    /// Named by a key hand-over to its key, under a naming not spent, and
+    /// its Named commit start not taken yet: about to take the baseline
+    /// over, the old-key filler having stopped at P.
+    pub fn taking_over(&self) -> bool {
+        self.switching
+            && !self.state.diverged()
+            && self.named.is_some_and(|(p, _)| self.spent != Some(p))
+    }
+
+    /// Logs a move from `was` to the state now, made outside a report
+    /// period's rules.
+    fn moved(&self, was: ReplicaState) {
+        if self.state != was {
+            tracing::info!(from = ?was, to = ?self.state, "replica state changed");
+        }
+    }
+
     /// One report period.
     pub fn step(&mut self, v: &View, audio: &dyn Audio) {
+        let was = self.state;
+        self.step_held(v, audio);
+        if self.state != was {
+            tracing::info!(
+                from = ?was,
+                to = ?self.state,
+                key = ?v.key,
+                processed = ?v.own.processed,
+                "replica state changed"
+            );
+        }
+    }
+
+    fn step_held(&mut self, v: &View, audio: &dyn Audio) {
         let outputs = v.own.standing.len();
         self.withheld.resize(outputs, None);
         self.starts.resize(outputs, None);
@@ -495,8 +547,9 @@ impl Life {
         let Some(p) = v.own.processed else { return };
         self.ready_at = Some(p);
         self.state = ReplicaState::Withdrawn;
-        let named = v.baseline.is_some_and(|b| b.replica == v.me);
-        if !named && differs(v.key, v.baseline.and_then(|b| b.key)) {
+        // Named or not: a replica named under another key than its own
+        // restarted under a new one since.
+        if differs(v.key, self.base_key(v)) {
             self.state = ReplicaState::VersionMismatch;
         }
     }
@@ -564,6 +617,12 @@ impl Life {
     /// this rule until a later `Baseline` names it.
     fn named_rule(&mut self, v: &View, audio: &dyn Audio) {
         let Some((p, _)) = self.named else { return };
+        // Named under another key than its own: what it computes is not
+        // what the set commits under that `Baseline`. It waits to be
+        // named with its key.
+        if differs(v.key, self.base_key(v)) {
+            return;
+        }
         let kp = p / v.timing.block;
         if self.spent == Some(p) {
             return;
@@ -639,11 +698,34 @@ impl Life {
     /// baseline's key is its own again it is no filler, and one in
     /// `version_mismatch` retargets its core and is withdrawn, its resume
     /// reference that moment.
+    ///
+    /// The baseline's key is the one the leader resolves
+    /// ([`crate::rollout::baseline_of`]); a key resolved late for the same
+    /// `Baseline` is no hand-over.
     fn keys(&mut self, v: &View, audio: &dyn Audio) {
         let Some(b) = v.baseline else { return };
-        let now = b.key;
-        let before = self.base_key.replace(now);
+        let at = (b.replica, b.at_index);
         let mine = v.key;
+        if b.key.is_none()
+            && b.replica == v.me
+            && self.keyless_naming.is_none_or(|(was, _)| was != at)
+        {
+            self.keyless_naming = Some((at, mine));
+        }
+        let now = self.base_key(v);
+        let seen = self.base_seen.replace((at, now));
+        if seen.is_none_or(|(was, _)| was != at) {
+            tracing::info!(
+                replica = b.replica,
+                key = ?now,
+                at_index = b.at_index,
+                own_key = ?mine,
+                "Baseline applied"
+            );
+        }
+        // The key of the `Baseline` before, on the period this one is
+        // first seen.
+        let before = seen.filter(|(was, _)| *was != at).map(|(_, key)| key);
         if !differs(mine, now) {
             // Back to its key before its stop at P took: the stop lapses
             // and the output goes on committing.
@@ -654,8 +736,7 @@ impl Life {
                     }
                 }
             }
-            if before != Some(now) && b.replica == v.me && before.is_some_and(|k| differs(mine, k))
-            {
+            if b.replica == v.me && before.is_some_and(|k| k != now && differs(mine, k)) {
                 self.switching = true;
             }
             if self.state == ReplicaState::VersionMismatch && (v.retarget)() {
@@ -703,6 +784,43 @@ impl Life {
             audio.withdraw();
             audio.drop_engine();
         }
+    }
+
+    /// The latest `Baseline`'s key as the leader resolves it
+    /// ([`View::base`]), else as last resolved for the same `Baseline`: a
+    /// named replica that stops committing for a moment leaves it known.
+    fn base_key(&self, v: &View) -> Option<u64> {
+        let b = v.baseline?;
+        let at = (b.replica, b.at_index);
+        if b.key.is_none() && b.replica == v.me {
+            return self.keyless_naming_key(v, at);
+        }
+        v.base().and_then(|(key, _)| key).or_else(|| {
+            self.base_seen
+                .filter(|(was, _)| *was == at)
+                .and_then(|(_, key)| key)
+        })
+    }
+
+    /// The key a `Baseline` without one, `at`, naming this replica stands
+    /// for: the committing replicas' while none of them reports this
+    /// replica's key, as when it restarted under another key since it was
+    /// named, which no state of its own outlives; else its key when it
+    /// first saw that `Baseline`, if known; else its key now.
+    fn keyless_naming_key(&self, v: &View, at: (NodeId, u64)) -> Option<u64> {
+        let committing: Vec<Option<u64>> = (v.peers.iter())
+            .filter(|p| !p.silent && p.own.state == Some(ReplicaState::Committing))
+            .map(|p| p.own.key)
+            .collect();
+        if let Some(&theirs) = committing.iter().find(|k| k.is_some())
+            && !committing.contains(&v.key)
+        {
+            return theirs;
+        }
+        self.keyless_naming
+            .filter(|(was, _)| *was == at)
+            .and_then(|(_, key)| key)
+            .or(v.key)
     }
 
     /// The `Baseline` naming this replica, as first seen: one taken back
@@ -795,15 +913,17 @@ impl Life {
         }
     }
 
-    /// Whether this replica's page matches the committing replicas',
-    /// none until it can tell.
+    /// Whether this replica's page matches the committing replicas' that
+    /// report its key, none until it can tell.
     fn compare(&self, o: usize, v: &View) -> Option<bool> {
         let b = v.timing.block;
         let first = ((self.reference(o) + 1) * b).div_ceil(PAGE);
         let committing: Vec<&Seen> = v
             .peers
             .iter()
-            .filter(|p| !p.silent && p.own.state == Some(ReplicaState::Committing))
+            .filter(|p| {
+                !p.silent && p.own.state == Some(ReplicaState::Committing) && same_key(v.key, p.own)
+            })
             .collect();
         if committing.is_empty() {
             return None;
@@ -899,7 +1019,9 @@ impl Life {
         if stale {
             return;
         }
+        let was = self.state;
         self.diverge(audio);
+        self.moved(was);
     }
 
     /// Diverged at once: the replica applied an entry the log restamped
@@ -911,7 +1033,9 @@ impl Life {
         ) {
             return;
         }
+        let was = self.state;
         self.diverge(audio);
+        self.moved(was);
     }
 
     /// A donor's core arrived for a diverged replica: `resync`. False
@@ -923,6 +1047,7 @@ impl Life {
         self.state = ReplicaState::Resync;
         self.handed = None;
         self.matched = false;
+        self.moved(ReplicaState::Diverged);
         true
     }
 
@@ -941,6 +1066,7 @@ impl Life {
             self.state = ReplicaState::Diverged;
             self.handed = None;
             self.matched = false;
+            self.moved(ReplicaState::Resync);
         }
     }
 
@@ -957,10 +1083,13 @@ impl Life {
         }
         self.ready_at = None;
         self.filler = None;
+        self.switching = false;
         // A replica still starting has committed nothing to withdraw.
-        if std::mem::replace(&mut self.state, ReplicaState::Starting) != ReplicaState::Starting {
+        let was = std::mem::replace(&mut self.state, ReplicaState::Starting);
+        if was != ReplicaState::Starting {
             audio.withdraw();
         }
+        self.moved(was);
     }
 
     fn diverge(&mut self, audio: &dyn Audio) {
@@ -1083,6 +1212,19 @@ mod tests {
         pages: &PageBook,
         calls: &Calls,
     ) {
+        step_keyed(life, own, baseline, peers, pages, calls, None);
+    }
+
+    /// [`step_with`] for a replica of compatibility key `key`.
+    fn step_keyed(
+        life: &mut Life,
+        own: &Own,
+        baseline: Option<&Baseline>,
+        peers: Vec<Seen>,
+        pages: &PageBook,
+        calls: &Calls,
+        key: Option<u64>,
+    ) {
         let timing = Timing::defaults(B);
         let realised = vec![true; own.standing.len()];
         let v = View {
@@ -1092,7 +1234,7 @@ mod tests {
             ready: true,
             alone: false,
             baseline,
-            key: None,
+            key,
             retarget: &|| {
                 let state = samplez::ProductState {
                     limiters: Vec::new(),
@@ -1417,6 +1559,134 @@ mod tests {
         withdrawn.processed = Some(q * PAGE / B + 31);
         step_with(&mut life, &withdrawn, None, seen(), &pages, &calls);
         assert_eq!(calls.take(), ["cancel 0"]);
+    }
+
+    /// A `Baseline` named before any key was reported carries none: the
+    /// replica takes the key the named replica reports while it commits,
+    /// as the leader does, and leaves `starting` in `version_mismatch`
+    /// under another key, withdrawn under that one.
+    #[test]
+    fn a_keyless_baseline_takes_the_named_replicas_key() {
+        let idle = Standing::Idle { since: 0 };
+        let b = Baseline {
+            replica: peer(),
+            ..naming(0)
+        };
+        let named = Own {
+            key: Some(1),
+            state: Some(ReplicaState::Committing),
+            ..own(K, Standing::Committing { from: 0 })
+        };
+        let pages = PageBook::default();
+        let calls = Calls::default();
+        for (mine, want) in [
+            (2, ReplicaState::VersionMismatch),
+            (1, ReplicaState::Withdrawn),
+        ] {
+            let mut life = Life::new();
+            let seen = vec![Seen {
+                id: peer(),
+                silent: false,
+                own: &named,
+            }];
+            step_keyed(
+                &mut life,
+                &own(K, idle),
+                Some(&b),
+                seen,
+                &pages,
+                &calls,
+                Some(mine),
+            );
+            assert_eq!(life.state(), want, "key {mine}");
+        }
+    }
+
+    /// A `Baseline` without a key naming this replica, which restarted
+    /// under another key than the committing replicas': it takes no commit
+    /// start under it and is `version_mismatch` until named with its key.
+    /// Under their key it commits by the Named rule as before.
+    #[test]
+    fn a_keyless_naming_under_another_key_is_refused() {
+        let idle = Standing::Idle { since: 0 };
+        let b = naming((K + 10) * B);
+        let other = Own {
+            key: Some(1),
+            state: Some(ReplicaState::Committing),
+            ..own(K, Standing::Committing { from: 0 })
+        };
+        let pages = PageBook::default();
+        let calls = Calls::default();
+        for (mine, want) in [
+            (2, ReplicaState::VersionMismatch),
+            (1, ReplicaState::Withdrawn),
+        ] {
+            let mut life = Life::new();
+            for k in [K, K + 1] {
+                let seen = vec![Seen {
+                    id: peer(),
+                    silent: false,
+                    own: &other,
+                }];
+                step_keyed(
+                    &mut life,
+                    &own(k, idle),
+                    Some(&b),
+                    seen,
+                    &pages,
+                    &calls,
+                    Some(mine),
+                );
+            }
+            assert_eq!(life.state(), want, "key {mine}");
+            let started = calls.take().iter().any(|c| c.starts_with("from"));
+            assert_eq!(started, mine == 1, "key {mine}: a commit start");
+        }
+    }
+
+    /// Resume compares a page only with those of committing replicas that
+    /// report this replica's key: another key's page differs without
+    /// either diverging.
+    #[test]
+    fn resume_compares_only_pages_of_its_own_key() {
+        let calls = Calls::default();
+        let q = ((K + 1) * B).div_ceil(PAGE);
+        let mut pages = PageBook::default();
+        pages.fold(me(), &[page(q, false)]);
+        pages.fold(
+            peer(),
+            &[Page {
+                hash: 2,
+                ..page(q, true)
+            }],
+        );
+        for (theirs, want) in [(1, ReplicaState::Withdrawn), (2, ReplicaState::Diverged)] {
+            let mut life = Life::new();
+            let mut withdrawn = own(K, Standing::Withdrawn { since: 0 });
+            step_keyed(
+                &mut life,
+                &withdrawn,
+                None,
+                Vec::new(),
+                &pages,
+                &calls,
+                Some(2),
+            );
+            assert_eq!(life.state(), ReplicaState::Withdrawn);
+            let other = Own {
+                state: Some(ReplicaState::Committing),
+                key: Some(theirs),
+                ..own(q * PAGE / B + 30, Standing::Committing { from: 0 })
+            };
+            withdrawn.processed = Some(q * PAGE / B + 30);
+            let seen = vec![Seen {
+                id: peer(),
+                silent: false,
+                own: &other,
+            }];
+            step_keyed(&mut life, &withdrawn, None, seen, &pages, &calls, Some(2));
+            assert_eq!(life.state(), want, "a committing peer of key {theirs}");
+        }
     }
 
     /// A verdict is ignored only when every output that committed last

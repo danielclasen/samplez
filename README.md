@@ -716,6 +716,16 @@ on across one; it counts anew once an applied entry re-routes or
 detaches an input, and once the replica is neither diverged nor
 resyncing.
 
+A donor reports the joiner's compatibility key (`rollout::key`, in
+"Starting a replica"): a core of another key is another engine's. A
+diverged replica whose committing peers all report other keys is
+rebuilt from product state instead, on the attempts' backoff
+(`samplez_replica_resync_rebuilt_for_key_total`). So is one whose
+engine refuses the donor's core for good, a core that does not decode
+or that `Engine::replay` refuses as `ReplayError::Invalid` (another
+shape, an entry outside the engine): `resync::Failed::Refused`, counted
+in `samplez_replica_resync_refused_total`, is not retried.
+
 `Engine::replay` builds a replay clone from a donor's core: the engine's
 block computation off the RT thread, its readers on a new instance per
 input domain reading the blocks after k0 from the flows' history, its
@@ -823,6 +833,43 @@ created. Replicas reach each other through a headless Service that
 publishes not-ready addresses (`publishNotReadyAddresses: true`), so a
 replica that reads not ready still takes part in the log, contact and
 resync.
+
+An audio replica of a set of more than one voter reads ready once it has
+applied the log up to the commit it knows and is in contact with a
+majority, while it commits, or, once it has committed since its process
+started, while another audio replica's report within `w + D` says that
+one commits, whatever its own state: `starting`, `withdrawn`,
+`diverged`, `resync` or `version_mismatch`. A process that has not
+committed since it started reads ready only once it commits, so a
+broken release that never commits stops a StatefulSet's rolling update
+at its first pod, while an old pod that withdraws, hands the baseline
+over, resyncs or is rebuilt from product state keeps its readiness. A
+rebuild or a return to `starting` within the process keeps that it
+committed; a restart of the process does not. One exception: a replica
+in `version_mismatch` below the baseline's versions, as a pod rolled
+back is, which cannot commit while a newer one is live, reads ready
+while another commits, so a rollback goes on, and the
+`below_baseline_versions` alert covers one that stops part way. A new
+pod awaiting its key hand-over is not ready until it commits; naming and
+hand-overs never read the term, so the hand-over does not wait on it. No
+replica reads ready while none commits, so a set without a quorum or
+without a committing replica is not ready anywhere. A withdrawn replica
+with no output enabled, or with no output, writes nothing on any
+replica and reads ready as one that commits, whether it has committed
+or not, so a set whose outputs are all disabled or absent still serves
+its API. Out of contact the term keeps its last value for
+`rollout::DEPARTED` (3 s), so a blip in contact never flips it; past
+that the replica reads ready only while it commits. Before its first
+contact it reads not ready. A ready replica that commits nothing
+serves the product's API as one that commits: it forwards writes to the
+leader and takes the leader's read index. A ready audio replica takes
+writes whether or not a leader has counted it as a voter yet; reaching
+no leader, it
+answers a write as not applied, unavailable for want of a leader, at the
+write timeout. A replica of a product without contact, which has no
+audio readiness, takes writes only while a leader counts it as a voter,
+so one cut off from the set refuses at once. A forward whose answer is
+lost is sent again under the same command id and applied once.
 
 `Engine::drop_core` drops the RT thread's core while the replica starts:
 the RT thread keeps its writers, flows, hold rings and statuses,
@@ -1057,7 +1104,10 @@ reason a rebuild from product state on a replica committing nothing
 takes the entries held unresolved that its state applied: rebuilt past,
 as entries taken late, not given to the new core again. A replica about
 to commit, such as one retargeted from `version_mismatch`, holds them
-again, as its peers do. One AppendEntries carries up to
+again, as its peers do, and while named in a key hand-over it holds the
+entries it takes late until it commits: rebuilt past them it would
+return to `starting`, the leader would name the old-key filler again
+and the baseline would change hands twice. One AppendEntries carries up to
 `MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
 than the gap between entries takes every entry written meanwhile with
 one fsync rather than falling further behind. `EngineAudio` replaces a
@@ -1174,6 +1224,29 @@ their departure all the same; `DEPARTED` is the one constant that sets
 how long a pause is not one. A replica that reports no versions ranks
 below every one that does.
 
+Page hashes are compared, by Resume and by the leader's page verdicts,
+and state is transferred only between replicas that report equal keys:
+pages of another key differ without either replica diverging, so a
+replica of another key than the baseline's reaches `version_mismatch`
+rather than `diverged`. A page that replicas of two keys both committed
+whole is an output carrying both, which no hand-over leaves: the leader
+raises `replica_disagreement` and diverges those whose key is not the
+baseline's. A `Baseline` named before its replica reported
+a key and versions carries none; the leader and every replica then take
+those the named replica reports while it commits
+(`rollout::baseline_of`), and a replica keeps the key it took for that
+`Baseline` while the named replica stops committing for a moment.
+`Replica::rollout` called before `Replica::contact` puts the key in the
+replica's first report; called after, its first reports carry none.
+The leader names no replica whose report carries no key while another
+reports one, so a new `Baseline` carries a key unless no replica of the
+set has a rollout. A replica named by a `Baseline` without a key, as an
+older log holds, commits under it only under the key it stands for: the
+committing replicas' while none of them reports its own, as after a
+restart under another key, else its own when it first saw that
+`Baseline`. Under another key it is in `version_mismatch` and waits to
+be named with its own, so no output carries pages of two keys.
+
 A complete rollback therefore stops the outputs from the last report of
 the last replica with the higher versions until the replica named after
 it commits: `DEPARTED`, then the leader's next decision within a
@@ -1183,10 +1256,10 @@ start. Those pages are whole on no member; every page before and after
 is. The rollback test bounds the gap at `DEPARTED` plus 2 s.
 
 A replica whose key differs from the baseline's is in
-`version_mismatch`: it computes nothing, and it passes `/readyz` while
-another audio replica commits, so the StatefulSet rolls on, and fails it
-while none does. Naming and hand-overs never read the `/readyz` term, so
-a rollout never waits on it. Its contact metrics give its `versions`
+`version_mismatch`: it computes nothing; an old pod that committed
+since its start, and a pod below the baseline's versions, read ready
+while another commits, a new pod awaiting its hand-over only once it
+commits. Its contact metrics give its `versions`
 and, in `mismatch`, whether it is awaiting the hand-over or below the
 baseline's versions; `/metrics` has them as `samplez_replica_versions`
 and `samplez_replica_version_mismatch`. A replica of lower versions
@@ -1196,6 +1269,26 @@ and past `DEPARTED` until the leader's next decision. An alert on
 `samplez_replica_version_mismatch{reason="below_baseline_versions"} ==
 1` held `for: 10m` fires for a rollout that stopped part way, since a
 replica restart plus `DEPARTED` is well under that per pod.
+
+The leader counts each page disagreement it raises in
+`samplez_replica_disagreements_total`, labelled `kind`: `no_majority`
+for a page without a strict majority among two or more hashes of one
+key, `cross_key` for a page that replicas of two keys both committed
+whole. Each counts from 0 on every process start and only while that
+replica leads. An alert on
+`increase(samplez_replica_disagreements_total[5m]) > 0` fires when
+replicas computed or committed what the set should not: either a
+replica's output diverged from its peers' with no majority to settle
+which is right, or an output carried pages of two keys.
+
+The leader logs at info level each `Baseline` it decides, with its rule
+(`HandOver`, `Named`, `Renamed`), replica, key, versions and order, and
+its at_index and P once stamped; and, once per change of the reason,
+why the key hand-over passes over a replica of another key than the
+baseline's: `revision`, `key`, `versions`, `failed`, `candidate`,
+`baseline applied` or `withheld`. Every audio replica logs each
+`Baseline` it applies, with the key it takes for it and its own, and
+each change of its state.
 
 A replica set agrees on its cluster id through the marker ConfigMap that
 ordinal 0 creates on an empty volume (`bootstrap::Kube`). Given the audio

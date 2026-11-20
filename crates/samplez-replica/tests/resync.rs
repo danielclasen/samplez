@@ -158,8 +158,8 @@ fn sample(set: &Set, id: NodeId, name: &str, label: Option<(&str, &str)>) -> f64
 /// A pod-kill test: 3 replicas after the apply lead reached its
 /// cap, a follower diverged, then the leader killed. The diverged
 /// follower resyncs from the replica still committing and commits again
-/// within 5 s; `/metrics` shows the hand-over and the replica serving
-/// again, and not serving while it wrote nothing.
+/// within 5 s; `/metrics` shows the hand-over, and the replica serving
+/// throughout, the other replicas committing.
 #[tokio::test(start_paused = true)]
 async fn a_follower_diverged_under_a_capped_lead_resyncs_after_the_leader_is_killed() {
     let mut set = start(vec![a(0), a(1), a(2)], false).await;
@@ -204,8 +204,8 @@ async fn a_follower_diverged_under_a_capped_lead_resyncs_after_the_leader_is_kil
     passes(&set, odd, ReplicaState::Diverged, 3).await;
     assert_eq!(
         sample(&set, odd, "samplez_replica_serving", None),
-        0.0,
-        "diverged, it writes nothing"
+        1.0,
+        "diverged, it serves while others commit"
     );
     let diverged = Some(("state", "diverged"));
     assert_eq!(sample(&set, odd, "samplez_replica_state", diverged), 1.0);
@@ -409,7 +409,9 @@ fn the_fake_replay_reads_its_source_without_its_lock() {
     let core = CoreReply {
         k0: 0,
         last_id: 0,
-        core: "[[], []]".to_owned(),
+        // The open glitches, the flows read and the engine's shape, 0 as
+        // the fake's own.
+        core: "[[], [], 0]".to_owned(),
     };
     audio
         .resync(&core, &Probe(audio.clone()))
@@ -640,9 +642,8 @@ async fn commands_during_commits_past_the_capped_lead_commit_without_gaps() {
 
 /// `/readyz` after the whole set restarts: each replica finds the
 /// set's `Baseline` in its log, becomes ready withdrawn, and its engine
-/// stops computing, so nobody commits again. A replica that writes
-/// nothing is not ready, though it has not committed since it started;
-/// only before the set's first `Baseline` would it be.
+/// stops computing, so nobody commits again. No replica is Ready while
+/// none commits.
 #[tokio::test(start_paused = true)]
 async fn a_restarted_set_withdrawn_while_nobody_commits_is_not_ready() {
     let mut set = start(vec![a(0), a(1), a(2)], false).await;
@@ -673,7 +674,10 @@ async fn a_restarted_set_withdrawn_while_nobody_commits_is_not_ready() {
         assert!(m.in_contact, "{id}");
         assert!(baseline(&set, id).is_some(), "{id}");
         assert_ne!(state(&set, id), Some(ReplicaState::Committing), "{id}");
-        assert!(!set.replica(id).replica().ready, "{id} writes nothing");
+        assert!(
+            !set.replica(id).replica().ready,
+            "{id} Ready, nobody commits"
+        );
     }
 }
 

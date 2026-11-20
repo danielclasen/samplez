@@ -11,6 +11,8 @@ use samplez::blocks::PAGE;
 use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::Kube;
+use crate::entry::Baseline;
+use crate::report::Own;
 
 /// The versions a replica computes, logs and derives by. Replicas whose
 /// versions and output config are equal compute equal pages from one
@@ -78,6 +80,21 @@ pub fn may_take_over(
 /// ([`crate::membership::UNCOUNTED`]). A voter unheard for a contact
 /// window is no departure.
 pub const DEPARTED: std::time::Duration = crate::membership::UNCOUNTED;
+
+/// The key and versions of the latest `Baseline` `b`, `named` the latest
+/// report of the replica it names. A `Baseline` named before that replica
+/// reported them carries none, and its report tells them while it
+/// commits: what it commits is the baseline's, and a replica restarted
+/// under another key since commits nothing until named again. The leader
+/// and every replica resolve them by this alone, so a replica's own rules
+/// see the key the leader hands over from.
+pub(crate) fn baseline_of(b: &Baseline, named: Option<&Own>) -> (Option<u64>, Option<Versions>) {
+    let named = named.filter(|o| o.state == Some(crate::state::ReplicaState::Committing));
+    (
+        b.key.or_else(|| named.and_then(|o| o.key)),
+        b.versions.or_else(|| named.and_then(|o| o.versions)),
+    )
+}
 
 /// Whether versions `base` are known and no live voter, its versions in
 /// `live`, carries them now.
