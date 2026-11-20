@@ -237,9 +237,10 @@ deviation from a strict reading of EBU Tech 3341 and 3342, which measure
 a programme without interruption: an input taken down or a slice lost
 neither blanks the measurement nor lowers it with the silence or the
 partial mix it leaves. Momentary and short-term loudness restart after
-a gap or a lost slice, not after a paused one. Each output's and
-meter's status counts gaps and lost slices since the measurement
-started:
+a gap, a lost slice or a paused slice without a power (cut by lost
+records or skipped), not after a paused slice metered whole. Each
+output's and meter's status counts gaps and lost slices since the
+measurement started:
 
 - `gaps`: slices in which an input down by the log (an `InputDown`
   applied; a `Detach` is not one) fed one of the meter's columns through
