@@ -67,9 +67,11 @@ Weakening one is a design change: say so and agree it first.
   sample. Pages are compared as XXH3-64 over f32 bit patterns.
   Enforced by: the page-hash scenarios in `tests/pages.rs` and
   `tests/transfer.rs`; the goldens `tests/golden.rs` and
-  `src/engine/golden.rs`; scalar-vs-AVX2 bit equality of
-  the matrix and true peak (`bit_exact_avx2`, `ducked_bit_exact_avx2`,
-  `true_peak.rs` `bit_exact_vs_scalar`); block-split independence of
+  `src/engine/golden.rs` (`GOLDEN` for samples, meters and page hashes,
+  `CORES` for the bytes of `CoreCopy::encode`); scalar-vs-AVX2 bit
+  equality of the matrix and true peak (`bit_exact_avx2`,
+  `ducked_bit_exact_avx2`, `true_peak.rs` `bit_exact_vs_scalar`);
+  block-split independence of
   delayed fades, the limiter and strip crossfades
   (`a_delayed_fade_is_bit_exact_across_paths_and_block_sizes`,
   `the_output_does_not_depend_on_the_blocks`,
@@ -125,15 +127,20 @@ replica") has the bump rules:
   computed, also where the samples stay the same.
 - `COMPUTE_VERSION`: any change to the samples or meters the engine
   computes, dependency and toolchain changes included, or to what a core
-  copy holds. `samplez-dsp` pins
-  `libm = "=0.2.16"`, and products pin it too.
-- Two goldens pin `COMPUTE_VERSION`, a hash row per version:
-  `tests/golden.rs` the DSP kernels, and `src/engine/golden.rs` the RT
-  loop run offline, with samples, meters, page hashes and entry
-  fingerprints pinned apart.
+  copy holds or how it encodes. `samplez-dsp` pins `libm = "=0.2.16"`,
+  and products pin it too.
+- Two goldens pin what `COMPUTE_VERSION` stands for: `tests/golden.rs`
+  the DSP kernels on a fixed signal, and `src/engine/golden.rs` the RT
+  loop run offline, with `GOLDEN` (samples, meters, page hashes) and
+  `CORES` (the encoded core copy). These are tables with a row per
+  `COMPUTE_VERSION`.
+- `FINGERPRINTS` in `src/engine/golden.rs` is a single pinned value: a
+  change to how page hashes or fingerprints are computed bumps
+  `PROTOCOL` and replaces it in the same change. The `samplez` crate
+  cannot see `PROTOCOL`, so that pairing is a review step.
 
-A version bump a change needs belongs to that change: add a new `GOLDEN`
-row, never edit one. Ask before changing the rules.
+A version bump a change needs belongs to that change: add a new row to
+`GOLDEN` or `CORES`, never edit one. Ask before changing the rules.
 
 ## Build and test
 
@@ -199,8 +206,9 @@ trailers; another project or issue only when it is the reason.
   in `.claude/settings.json`; move the skill back to `.agents/skills/`
   and revert its `CLAUDE.md` and `.claude/CLAUDE.md` edits.
 - desloppify 1.0's Rust scan was seen running `cargo clippy`, `check`
-  and `rustdoc` and building a ~722 MB `target/`; run scans inside the
-  builder container, as the `debug` job runs cargo.
+  and `rustdoc` and building a ~722 MB `target/`. Running it in the
+  builder container would need desloppify installed there, and has not
+  been tried.
 
 ## Harness notes
 
