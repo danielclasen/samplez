@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.16.0](https://github.com/danielclasen/samplez/compare/v0.15.0...v0.16.0) (2026-11-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** keep other threads off the RT thread's CPU ([#148](https://github.com/danielclasen/samplez/issues/148))
+* **engine:** rt::setup_thread takes the ProcessStatus from setup_process. ProcessStatus gains rt_cpu and isolation, and config Rt gains isolate_rt_cpu (rt.isolateRtCpu, default true), which changes the affinity of every thread created after setup_process when the RT thread is pinned.
+
+### Features
+
+* **engine:** keep other threads off the RT thread's CPU ([55b4d5e](https://github.com/danielclasen/samplez/commit/55b4d5e9c5e0963b6a5eae2297f62d8519ac2085))
+* **engine:** keep other threads off the RT thread's CPU ([#148](https://github.com/danielclasen/samplez/issues/148)) ([55b4d5e](https://github.com/danielclasen/samplez/commit/55b4d5e9c5e0963b6a5eae2297f62d8519ac2085))
+* **replica:** count per-peer contact silences ([#146](https://github.com/danielclasen/samplez/issues/146)) ([019e6b2](https://github.com/danielclasen/samplez/commit/019e6b2cc3532182de71ed34414b033800e6e624))
+
 ## [0.15.0](https://github.com/danielclasen/samplez/compare/v0.14.0...v0.15.0) (2026-11-19)
 
 
