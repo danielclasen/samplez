@@ -66,7 +66,8 @@ Weakening one is a design change: say so and agree it first.
   applied at their indices; wall-clock time and thread timing decide no
   sample. Pages are compared as XXH3-64 over f32 bit patterns.
   Enforced by: the page-hash scenarios in `tests/pages.rs` and
-  `tests/transfer.rs`; `tests/golden.rs`; scalar-vs-AVX2 bit equality of
+  `tests/transfer.rs`; the goldens `tests/golden.rs` and
+  `src/engine/golden.rs`; scalar-vs-AVX2 bit equality of
   the matrix and true peak (`bit_exact_avx2`, `ducked_bit_exact_avx2`,
   `true_peak.rs` `bit_exact_vs_scalar`); block-split independence of
   delayed fades, the limiter and strip crossfades
@@ -88,9 +89,11 @@ Weakening one is a design change: say so and agree it first.
   back into `Replica` or `Store` nor wait for an apply. A watched lock
   held past 10 s aborts the process, tests included. README "Ops
   endpoints and the lock watchdog".
-  Enforced by: the `lock_watch.rs` tests and the `log_store.rs` tests
-  that a call back under the lock panics (`*_under_the_lock_panics`,
-  `an_apply_inside_with_state_panics`).
+  Enforced by: the call-back rule, the `log_store.rs` tests that such a
+  call panics (`*_under_the_lock_panics`,
+  `an_apply_inside_with_state_panics`). No test checks the order itself:
+  a violation shows only as a stall the 10 s watchdog in `lock_watch.rs`
+  aborts.
 - **A rebuilt or resynced replica matches its peers from its first
   page.** The exceptions README "Starting a replica" lists for a rebuild
   (duck detector state, a mask crossfade or depth ramp in progress) cost
@@ -114,15 +117,23 @@ Weakening one is a design change: say so and agree it first.
 Replicas run side by side only at equal `samplez::COMPUTE_VERSION`,
 `samplez_replica::PROTOCOL` and `Product::DERIVATION_VERSION`. The README
 paragraph on the compatibility key (`rollout::key`, in "Starting a
-replica") has the bump rules: `PROTOCOL` on the log's wire format and the
-library's replicated semantics (state machine, `Entry` variants,
-`Targets` fields, restamp and void handling); `COMPUTE_VERSION` on any
-change to computed bits, dependency and toolchain changes included; and
-the `libm = "=0.2.16"` pin in `samplez-dsp`, which products repeat.
+replica") has the bump rules:
 
-A version bump a change needs is part of that change; a `COMPUTE_VERSION`
-bump adds a `GOLDEN` row in `tests/golden.rs`, never edits one. Ask
-before changing the rules.
+- `PROTOCOL`: the log's wire format, the library's replicated semantics
+  (state machine, `Entry` variants, `Targets` fields, restamp and void
+  handling), and any change to how page hashes or entry fingerprints are
+  computed, also where the samples stay the same.
+- `COMPUTE_VERSION`: any change to the samples or meters the engine
+  computes, dependency and toolchain changes included, or to what a core
+  copy holds. `samplez-dsp` pins
+  `libm = "=0.2.16"`, and products pin it too.
+- Two goldens pin `COMPUTE_VERSION`, a hash row per version:
+  `tests/golden.rs` the DSP kernels, and `src/engine/golden.rs` the RT
+  loop run offline, with samples, meters, page hashes and entry
+  fingerprints pinned apart.
+
+A version bump a change needs belongs to that change: add a new `GOLDEN`
+row, never edit one. Ask before changing the rules.
 
 ## Build and test
 
@@ -187,7 +198,9 @@ trailers; another project or issue only when it is the reason.
   `graphify install --project` regenerates the skill and the stock hook
   in `.claude/settings.json`; move the skill back to `.agents/skills/`
   and revert its `CLAUDE.md` and `.claude/CLAUDE.md` edits.
-- A desloppify Rust scan runs `cargo clippy`, `check` and `rustdoc`.
+- desloppify 1.0's Rust scan was seen running `cargo clippy`, `check`
+  and `rustdoc` and building a ~722 MB `target/`; run scans inside the
+  builder container, as the `debug` job runs cargo.
 
 ## Harness notes
 
