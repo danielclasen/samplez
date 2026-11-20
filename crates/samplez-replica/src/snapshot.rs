@@ -55,6 +55,12 @@ pub struct Replicated {
     /// snapshots written before it was kept.
     #[serde(default)]
     pub floor: Option<u64>,
+    /// The log index of the newest entry applied that derived an engine
+    /// record ([`crate::state_machine::StateMachine::record_floor`]);
+    /// absent from snapshots written before it was kept, and none where it
+    /// was unknown.
+    #[serde(default)]
+    pub record_floor: Option<u64>,
     /// [`crate::state_machine::StateMachine::derived`].
     #[serde(default)]
     pub derived: BTreeMap<u64, Vec<u32>>,

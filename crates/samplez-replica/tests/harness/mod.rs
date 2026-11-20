@@ -43,7 +43,7 @@ use samplez_replica::entry::{NodeId, Origin, SessionKey};
 use samplez_replica::membership::{Slot, slot_of};
 use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest, PeerResponse};
 use samplez_replica::report::{ClockFlags, Own, Page, Report, Run, runs};
-use samplez_replica::resync::{CoreReply, Resynced, Source};
+use samplez_replica::resync::{CoreReply, Missed, Resynced, Source};
 use samplez_replica::state::ReplicaState;
 use samplez_replica::state_machine::{Apply, Changed, Effect, Product};
 use samplez_replica::{RaftRpcs, RaftTiming, Replica, Settings, TypeConfig, raft_config_with};
@@ -389,6 +389,23 @@ impl Writes {
     }
 }
 
+impl Fake {
+    /// The newest entry appended: the highest log id an engine took from
+    /// its entry ring. One given unresolved goes by the control ring and
+    /// raises none.
+    pub fn last_taken(&self) -> u64 {
+        self.appended.iter().map(|a| a.0).max().unwrap_or(0)
+    }
+
+    /// The last log id a copied core names: the newest entry taken, or
+    /// the last id of the product state the core was last rebuilt from,
+    /// whichever is higher.
+    pub fn core_last_id(&self) -> u64 {
+        let rebuilt = self.rebuilt_with.last().map_or(0, |r| r.0);
+        self.last_taken().max(rebuilt)
+    }
+}
+
 #[derive(Default)]
 pub struct Fake {
     /// Records handed, by log index, with their at_index and entries.
@@ -467,6 +484,11 @@ pub struct Fake {
     /// this factor for good: state a rebuild does not carry, as a duck
     /// group keyed throughout keeps its envelope off 0 and full depth.
     pub rebuild_glitch: Option<f32>,
+    /// A copied core names a last log id as an engine's does
+    /// ([`Fake::core_last_id`]), and a resync fails where the
+    /// replica no longer holds a record after it; off, the last id is 0
+    /// and the records are not checked.
+    pub replays: bool,
     /// Entries the core holds unresolved: a rebuilt core holds none.
     pub core_unresolved: BTreeSet<u64>,
     /// Blocks computed while the core holds an entry unresolved carry a
@@ -1132,9 +1154,10 @@ impl Audio for FakeAudio {
         } else {
             Vec::new()
         };
+        let last_id = if st.replays { st.core_last_id() } else { 0 };
         Some(CoreReply {
             k0,
-            last_id: 0,
+            last_id,
             core: serde_json::to_string(&(open, reads)).expect("encodes"),
         })
     }
@@ -1143,8 +1166,12 @@ impl Audio for FakeAudio {
     /// contact's lock, which contact holds while it calls into the fake.
     fn resync(&self, core: &CoreReply, source: &dyn Source) -> Result<Resynced, String> {
         self.step();
-        let _ = source.entries(core.last_id);
+        let replays = self.lock().replays;
+        let entries = source.entries(core.last_id);
         let go = source.go();
+        if replays {
+            entries.map_err(|Missed| samplez_replica::resync::MISSED.to_owned())?;
+        }
         let mut st = self.lock();
         if !st.resyncs {
             return Err("resyncs are off".to_owned());
@@ -1659,6 +1686,9 @@ impl Default for Options {
     }
 }
 
+/// What [`Set::on_start`] sets a fake to.
+type OnStart = Box<dyn Fn(&FakeAudio) + Send + Sync>;
+
 pub struct Set<P: Product = Paths> {
     options: Options,
     /// Builds a replica's product from its configuration hash.
@@ -1676,6 +1706,9 @@ pub struct Set<P: Product = Paths> {
     versions: BTreeMap<NodeId, (u64, String)>,
     rollouts: BTreeMap<NodeId, Arc<Fixed>>,
     target: Option<String>,
+    /// Per replica, what its fake is set to on its next start, before its
+    /// contact runs.
+    on_start: BTreeMap<NodeId, OnStart>,
 }
 
 impl Set {
@@ -1728,6 +1761,7 @@ impl<P: Product> Set<P> {
             versions: BTreeMap::new(),
             rollouts: BTreeMap::new(),
             target: None,
+            on_start: BTreeMap::new(),
         };
         for &(id, s) in &set.options.kernel_offsets {
             set.clocks[&id].set_kernel_offset(s);
@@ -1857,6 +1891,9 @@ impl<P: Product> Set<P> {
             let audio = (slot_of(id) != Slot::Witness).then(|| {
                 let alone = self.ids().count() == 1;
                 let audio = FakeAudio::new(clock.clone(), timing, self.options.outputs, alone);
+                if let Some(set) = self.on_start.get(&id) {
+                    set(&audio);
+                }
                 if self.options.manual {
                     audio.manual();
                 }
@@ -1900,6 +1937,12 @@ impl<P: Product> Set<P> {
     /// next restart on: its pod rolled to that revision.
     pub fn set_version(&mut self, id: NodeId, key: u64, revision: &str) {
         self.versions.insert(id, (key, revision.to_owned()));
+    }
+
+    /// `set` sets `id`'s fake from its next start on, before its contact
+    /// runs and so before its first rebuild.
+    pub fn on_start(&mut self, id: NodeId, set: impl Fn(&FakeAudio) + Send + Sync + 'static) {
+        self.on_start.insert(id, Box::new(set));
     }
 
     /// The audio StatefulSet's target revision, as every replica reads it.

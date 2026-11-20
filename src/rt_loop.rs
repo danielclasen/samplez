@@ -3543,7 +3543,10 @@ impl Rt {
         // The ring had room: nothing is dropped here.
         let _ = r.copies.push(CoreCopy {
             k0: k,
-            last_id: self.last_entry,
+            // A core installed from a product state or a replay knows
+            // every entry up to the state's last id, though it took none
+            // of them from the ring.
+            last_id: self.last_entry.max(self.skip_upto),
             core,
         });
     }

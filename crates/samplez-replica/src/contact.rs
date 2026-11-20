@@ -378,6 +378,11 @@ pub trait LogView: Send + Sync + 'static {
     fn records_from(&self) -> u64 {
         0
     }
+    /// The newest entry at or below `records_from` that derived a record
+    /// ([`crate::state_machine::StateMachine::record_floor`]).
+    fn record_floor(&self) -> Option<u64> {
+        None
+    }
     /// The applied index, the floor there and the engine state of the
     /// applied log, read at once.
     fn product_state(&self) -> (u64, u64, ProductState);
@@ -455,6 +460,9 @@ impl<P: Product> LogView for Store<P> {
     }
     fn records_from(&self) -> u64 {
         Store::records_from(self)
+    }
+    fn record_floor(&self) -> Option<u64> {
+        Store::record_floor(self)
     }
     fn product_state(&self) -> (u64, u64, ProductState) {
         Store::product_state(self)
@@ -781,6 +789,8 @@ struct State {
     unverified_since: Option<Instant>,
     /// Voters reporting TAI offset 0.
     offset_zero: Vec<NodeId>,
+    /// The donor core's last log id a replay last missed a record after.
+    missed_after: Option<u64>,
     #[cfg(test)]
     verified_always: bool,
     decider: crate::decide::Decider,
@@ -1101,6 +1111,7 @@ impl Contact {
                     unverified: Vec::new(),
                     unverified_since: None,
                     offset_zero: Vec::new(),
+                    missed_after: None,
                     #[cfg(test)]
                     verified_always: false,
                     decider: crate::decide::Decider::default(),
@@ -3553,6 +3564,13 @@ impl Contact {
         let Some(life) = st.life.as_mut() else { return };
         let r = match result {
             Ok(r) => r,
+            // A missed record is logged where it was found, once per last
+            // log id.
+            Err(e) if e == crate::resync::MISSED => {
+                tracing::debug!(donor, error = %e, "a resync failed");
+                life.resync_failed();
+                return;
+            }
             Err(e) => {
                 tracing::warn!(donor, error = %e, "a resync failed");
                 life.resync_failed();
@@ -3599,7 +3617,22 @@ impl Contact {
         let whole = self.log.records(after, applied, &mut |index, record| {
             out.push((index, Arc::clone(record)));
         });
-        if whole { Ok(out) } else { Err(Missed) }
+        if whole {
+            return Ok(out);
+        }
+        // Each attempt fetches the newest core, which in a quiet set has
+        // the same last id: logged once per value.
+        let mut st = self.lock();
+        if st.missed_after != Some(after) {
+            st.missed_after = Some(after);
+            tracing::warn!(
+                last_id = after,
+                records_from = self.log.records_from(),
+                record_floor = ?self.log.record_floor(),
+                "a record after the donor's core is gone"
+            );
+        }
+        Err(Missed)
     }
 
     /// The donor's side of a resync: the core, while this audio replica

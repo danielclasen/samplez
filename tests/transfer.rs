@@ -787,7 +787,8 @@ fn a_replayed_core_carries_the_delay_history() {
 /// A product state's delays are set at the install, the delay lines
 /// keeping their history: an input delayed in the state plays late
 /// after the install. A delay beyond a slot's line is refused before
-/// anything changes.
+/// anything changes. A copy of the installed core names the state's
+/// last log id, though the engine took no entry.
 #[test]
 fn a_product_state_sets_the_delay() {
     let domain = Domain::new();
@@ -825,6 +826,9 @@ fn a_product_state_sets_the_delay() {
             break c;
         }
     };
+    // The core knows the state's entries, which it took from no ring:
+    // its copy names the state's last id.
+    assert_eq!(k0.last_id, 1, "the installed state's last id");
     let taps = k0.core.delay_taps(0).unwrap();
     assert_eq!((taps.from, taps.to), (0, 4800), "{taps:?}");
     assert_eq!(taps.start, (j + 1) * B);
