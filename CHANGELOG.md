@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.18.0](https://github.com/danielclasen/samplez/compare/v0.17.0...v0.18.0) (2026-11-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** `Entry::Tone`, `Engine::set_tone` and `InputState::Tone` are new. `config::Input::domain` is an `Option<String>`, and `config::Input` has the field `tone`. `Targets` and `ProductState` have the field `tones`, `ProductState` the field `tone_ramps`, the snapshot's `Replicated` the field `tone_ramps`. `samplez_replica::PROTOCOL` is 3.
+* **replica:** contact::Timing has a new field, prune_after_blocks, the engine's pruneAfterBlocks, which the product sets. report::Own gains `readable` and `unreadable` and samplez::InputStatus gains `readable`. A product deciding by Replica::input_liveness still drains Replication.reports.
+* **replica:** `Own` and `Baseline` gain a `versions` field on the wire, read as none from a peer without it. `Rollout` gains `versions()`, defaulting to none, and `Fixed::new` takes the versions. `rollout::may_take_over` takes whether the baseline's versions have departed. `state::Metrics` gains `mismatch` and `contact::Metrics` gains `versions`. A replica in `version_mismatch` reads Ready while another audio replica commits.
+
+### Features
+
+* **engine:** add a line-up tone generator input ([#161](https://github.com/danielclasen/samplez/issues/161)) ([60a54de](https://github.com/danielclasen/samplez/commit/60a54de3b26f52920213874646019e3eb92f7e1e))
+* **replica:** decide input liveness by a majority of audio voters ([9538d09](https://github.com/danielclasen/samplez/commit/9538d098ec54b99b76bae02a5646b463780e3a23))
+* **replica:** hand the baseline over only to versions not below it ([d0f639d](https://github.com/danielclasen/samplez/commit/d0f639db2cc8f43daedd93ec60552b6b7805def8))
+
+
+### Bug Fixes
+
+* **replica:** drop apply_lead_raised_by when that voter leaves ([9538d09](https://github.com/danielclasen/samplez/commit/9538d098ec54b99b76bae02a5646b463780e3a23))
+* **replica:** keep a peer connection across a missed report ([#157](https://github.com/danielclasen/samplez/issues/157)) ([cc58feb](https://github.com/danielclasen/samplez/commit/cc58febf6ed8b3036d5ba049d50144db2b329117))
+
 ## [0.17.0](https://github.com/danielclasen/samplez/compare/v0.16.0...v0.17.0) (2026-11-20)
 
 
