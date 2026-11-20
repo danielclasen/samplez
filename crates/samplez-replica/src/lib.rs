@@ -1855,7 +1855,9 @@ impl<P: Product> ReplicatedState for Replica<P> {
 }
 
 /// `samplez_replica_version_mismatch`: 1 for the reason `mismatch` names,
-/// 0 for the other.
+/// 0 for the other. A replica of lower versions reads
+/// `below_baseline_versions` until it is named, past the departure
+/// window ([`rollout::DEPARTED`]) too.
 fn mismatch_samples(mismatch: Option<state::Mismatch>) -> Vec<ReplicaMetric> {
     [
         (state::Mismatch::AwaitingHandOver, "awaiting_hand_over"),
@@ -1867,7 +1869,7 @@ fn mismatch_samples(mismatch: Option<state::Mismatch>) -> Vec<ReplicaMetric> {
     .into_iter()
     .map(|(why, name)| ReplicaMetric {
         name: "samplez_replica_version_mismatch",
-        help: "1 for why the audio replica is in version_mismatch.",
+        help: "1 for why the audio replica is in version_mismatch; below_baseline_versions until it is named, past the departure window too.",
         kind: MetricKind::Gauge,
         labels: vec![("reason", name.to_owned())],
         value: if mismatch == Some(why) { 1.0 } else { 0.0 },

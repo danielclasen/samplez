@@ -1104,8 +1104,11 @@ a stop as the previous baseline of a hand-over that did not take, or
 once no live audio replica has carried the baseline's versions for
 `rollout::DEPARTED` (3 s, `membership::UNCOUNTED`), and then only one
 with the highest live versions; a replica unheard for a contact window
-has not departed. A replica that reports no versions ranks below every
-one that does.
+has not departed. A partition that keeps every replica carrying the
+baseline's versions from the leader for longer than `DEPARTED` counts as
+their departure all the same; `DEPARTED` is the one constant that sets
+how long a pause is not one. A replica that reports no versions ranks
+below every one that does.
 
 A complete rollback therefore stops the outputs from the last report of
 the last replica with the higher versions until the replica named after
@@ -1117,14 +1120,15 @@ is. The rollback test bounds the gap at `DEPARTED` plus 2 s.
 
 A replica whose key differs from the baseline's is in
 `version_mismatch`: it computes nothing, and it passes `/readyz` while
-another audio replica commits, so the StatefulSet rolls on, and fails
-it while none does. Naming and hand-overs never read the `/readyz` term, so a
-rollout never waits on it. Its contact metrics give its `versions` and,
-in `mismatch`, whether it is awaiting the hand-over or below the
+another audio replica commits, so the StatefulSet rolls on, and fails it
+while none does. Naming and hand-overs never read the `/readyz` term, so
+a rollout never waits on it. Its contact metrics give its `versions`
+and, in `mismatch`, whether it is awaiting the hand-over or below the
 baseline's versions; `/metrics` has them as `samplez_replica_versions`
-and `samplez_replica_version_mismatch`. A replica stays below the
-baseline's versions only while a newer one is live, which in a rolling
-update lasts one pod restart per replica. An alert on
+and `samplez_replica_version_mismatch`. A replica of lower versions
+reads below the baseline's versions until it is named: while a newer one
+is live, which in a rolling update lasts one pod restart per replica,
+and past `DEPARTED` until the leader's next decision. An alert on
 `samplez_replica_version_mismatch{reason="below_baseline_versions"} ==
 1` held `for: 10m` fires for a rollout that stopped part way, since a
 replica restart plus `DEPARTED` is well under that per pod.
