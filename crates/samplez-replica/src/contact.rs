@@ -25,7 +25,7 @@ use crate::log_store::Store;
 use crate::peer::{PeerRequest, PeerResponse};
 use crate::rank::Baselines;
 use crate::report::{Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report, Slack};
-use crate::resync::{CoreReply, Missed, Resynced, Source};
+use crate::resync::{CoreReply, Failed, Missed, Resynced, Source};
 use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
 use crate::state::{Life, PageBook, ReplicaState, Seen, View};
@@ -231,8 +231,8 @@ pub trait Audio: Send + Sync + 'static {
     /// `source` says go. Blocks until handed over or failed. `source`
     /// takes contact's lock, which contact holds while it calls the other
     /// methods here: no lock those take may be held across a call to it.
-    fn resync(&self, _core: &CoreReply, _source: &dyn Source) -> Result<Resynced, String> {
-        Err("no engine to resync".to_owned())
+    fn resync(&self, _core: &CoreReply, _source: &dyn Source) -> Result<Resynced, Failed> {
+        Err("no engine to resync".into())
     }
     /// Whether the engine's inputs read the flows a rebuild from `state`
     /// would have them read. A replay reads the inputs the engine reads,
@@ -790,6 +790,8 @@ struct State {
     /// Voters reporting TAI offset 0.
     offset_zero: Vec<NodeId>,
     /// The donor core's last log id a replay last missed a record after.
+    /// One value only: a repeat of it is not logged again, and a value
+    /// alternating with another is logged on every change.
     missed_after: Option<u64>,
     #[cfg(test)]
     verified_always: bool,
@@ -881,6 +883,10 @@ pub struct Metrics {
     /// ([`crate::state_machine::Product::config_hash`]), to compare with
     /// the other replicas'.
     pub config_hash: Option<u64>,
+    /// The versions this replica's compatibility key holds
+    /// ([`crate::rollout::Rollout::versions`]); none for the witness and
+    /// where the rollout reports none.
+    pub versions: Option<crate::rollout::Versions>,
     /// F, none before it is first computed.
     pub fence: Option<u64>,
     pub in_contact: bool,
@@ -1459,6 +1465,7 @@ impl Contact {
             if let Some(r) = &st.rollout {
                 let _product = crate::lock_watch::ProductCode::enter();
                 st.own.key = Some(r.key());
+                st.own.versions = r.versions();
                 st.own.revision = r.revision();
             }
         } else {
@@ -2642,9 +2649,9 @@ impl Contact {
         st.own.state = Some(state);
         st.own.ready = ready;
         st.own.baseline = baseline.map(|b| (b.replica, b.at_index));
-        // Diverged, resyncing or in `version_mismatch` with outputs, or
-        // withdrawn once a `Baseline` applied with an output enabled, it
-        // writes none of what it computes, in contact or not. A disabled
+        // Diverged or resyncing with outputs, or withdrawn once a
+        // `Baseline` applied with an output enabled, it writes none of
+        // what it computes, in contact or not. A disabled
         // output writes nothing on any replica, so a withdrawn replica's
         // counts for none: its engine follows the log, so the outputs it
         // reports disabled are the log's. A resync drops the engine's
@@ -2656,21 +2663,28 @@ impl Contact {
         // finds the baseline in its log.
         let outputs = st.own.standing.len();
         let writes_nothing = match state {
-            ReplicaState::Diverged | ReplicaState::Resync | ReplicaState::VersionMismatch => {
-                outputs > 0
-            }
+            ReplicaState::Diverged | ReplicaState::Resync => outputs > 0,
             ReplicaState::Withdrawn => {
                 st.own.baseline.is_some()
                     && (0..outputs).any(|o| st.enabled.get(o).copied().unwrap_or(true))
             }
             _ => false,
         };
-        if writes_nothing {
+        let other = copies
+            .iter()
+            .any(|(_, age, own)| *age <= fresh && own.state == Some(ReplicaState::Committing));
+        if state == ReplicaState::VersionMismatch {
+            // A StatefulSet rolls on only past a Ready pod: one in
+            // `version_mismatch` is Ready while the set serves, so a
+            // rollout goes on past it, and not Ready once no voter
+            // commits, which a stuck rollout shows. Naming reads no
+            // readiness, so the set leaves that state on its own.
+            if st.in_contact {
+                st.serving = Some(other);
+            }
+        } else if writes_nothing {
             st.serving = Some(false);
         } else if st.in_contact {
-            let other = copies
-                .iter()
-                .any(|(_, age, own)| *age <= fresh && own.state == Some(ReplicaState::Committing));
             st.serving = Some(state == ReplicaState::Committing || !other);
         }
     }
@@ -2778,9 +2792,11 @@ impl Contact {
     /// The audio `/readyz` term (plan 2.11, Deployment): committing, or no
     /// other audio replica committing within `w + D` by its reports;
     /// judged while in contact, kept out of it, false before the first
-    /// contact. False while diverged, resyncing or in `version_mismatch`,
-    /// or withdrawn once a `Baseline` applied, with an output enabled, in
-    /// contact or not: the replica writes none of what it computes. A set
+    /// contact. False while diverged or resyncing, or withdrawn once a
+    /// `Baseline` applied, with an output enabled, in contact or not: the
+    /// replica writes none of what it computes. In `version_mismatch`,
+    /// true while another audio replica commits within `w + D`, so a
+    /// rollout goes on past it, and false while none does. A set
     /// whose outputs are all disabled writes nothing anywhere, and such a
     /// replica serves as one without outputs does. Always true for
     /// the witness and for the only voter of its set; never for a learner,
@@ -3542,7 +3558,7 @@ impl Contact {
     /// pages all equal the donor's reported ones leaves the replica to
     /// resume on its next matched page, holding the donor's unresolved
     /// entries as its own; anything else leaves it diverged, to try again.
-    pub fn resync_ended(&self, epoch: u64, donor: NodeId, result: Result<Resynced, String>) {
+    pub fn resync_ended(&self, epoch: u64, donor: NodeId, result: Result<Resynced, Failed>) {
         let Some(audio) = self.audio.clone() else {
             return;
         };
@@ -3551,7 +3567,9 @@ impl Contact {
         let st = &mut *st;
         let result = result.and_then(|r| {
             match crate::resync::mismatch(&r.pages, |o, q| st.pages.get(donor, o, q).copied()) {
-                Some(q) => Err(format!("replayed page {q} differs from the donor's")),
+                Some(q) => Err(Failed::Other(format!(
+                    "replayed page {q} differs from the donor's"
+                ))),
                 None => Ok(r),
             }
         });
@@ -3566,7 +3584,7 @@ impl Contact {
             Ok(r) => r,
             // A missed record is logged where it was found, once per last
             // log id.
-            Err(e) if e == crate::resync::MISSED => {
+            Err(e @ Failed::Missed) => {
                 tracing::debug!(donor, error = %e, "a resync failed");
                 life.resync_failed();
                 return;
@@ -3621,7 +3639,8 @@ impl Contact {
             return Ok(out);
         }
         // Each attempt fetches the newest core, which in a quiet set has
-        // the same last id: logged once per value.
+        // the same last id: logged only when it differs from the last one
+        // missed ([`State::missed_after`]).
         let mut st = self.lock();
         if st.missed_after != Some(after) {
             st.missed_after = Some(after);
@@ -3667,6 +3686,7 @@ impl Contact {
             protocol_gate_open: protocol_blocker.is_none(),
             protocol_blocker,
             config_hash: self.log.config_hash(),
+            versions: st.own.versions,
             fence: st.fence,
             in_contact: st.in_contact,
             known_committed: st.known_committed,
@@ -3847,7 +3867,8 @@ async fn resync(
     let core = match core {
         Ok(core) => core,
         Err(e) => {
-            contact.resync_ended(epoch, donor, Err(format!("no core from {donor}: {e}")));
+            let e = Failed::Other(format!("no core from {donor}: {e}"));
+            contact.resync_ended(epoch, donor, Err(e));
             return;
         }
     };
@@ -3863,7 +3884,7 @@ async fn resync(
     };
     let result = tokio::task::spawn_blocking(move || audio.resync(&core, &feed))
         .await
-        .unwrap_or_else(|e| Err(format!("the replay panicked: {e}")));
+        .unwrap_or_else(|e| Err(Failed::Other(format!("the replay panicked: {e}"))));
     contact.resync_ended(epoch, donor, result);
 }
 
@@ -4806,7 +4827,9 @@ mod tests {
     /// other replica commits, in contact or out of it, where it read
     /// ready by "nobody else commits"; one withdrawn before the set's
     /// first `Baseline` is, so the first replica of a set becomes ready,
-    /// and one withdrawn after it or in `version_mismatch` is not. A sole
+    /// and one withdrawn after it is not; one in `version_mismatch` is
+    /// while another replica commits, so a rollout goes on past it, and
+    /// is not while none does. A sole
     /// voter always serves, a learner never, and one without outputs as
     /// before.
     #[tokio::test(start_paused = true)]
@@ -4864,6 +4887,7 @@ mod tests {
             order: vec![2, 1, 3],
             at_index: index_at(T0),
             key: None,
+            versions: None,
         });
         for _ in 0..3 {
             f.contact.receive(f.report(2, None));
@@ -4900,12 +4924,14 @@ mod tests {
         // A replica whose key differs from the baseline's computes nothing.
         let f = fixture(&[&[1, 2, 3]]);
         f.engine.outputs.store(true, Ordering::SeqCst);
-        f.contact.set_rollout(crate::rollout::Fixed::new(1, None));
+        f.contact
+            .set_rollout(crate::rollout::Fixed::new(1, None, None));
         f.log.0.lock().unwrap().baseline = Some(Baseline {
             replica: 2,
             order: vec![2, 1, 3],
             at_index: index_at(T0),
             key: Some(2),
+            versions: None,
         });
         f.tick();
         for _ in 0..3 {
@@ -4914,7 +4940,23 @@ mod tests {
             f.tick();
         }
         assert_eq!(f.state(), Some(ReplicaState::VersionMismatch));
-        assert!(!f.contact.serving(), "version mismatch");
+        assert!(!f.contact.serving(), "version mismatch, nobody commits");
+        // Later reports than those before: a report is taken only with a
+        // higher seq, which the fixture's clock gives.
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(4)).await;
+            f.clock.add(Duration::from_millis(4));
+            f.contact.receive(state_report(
+                &f,
+                2,
+                ReplicaState::Committing,
+                Duration::ZERO,
+            ));
+            f.contact.receive(f.report(3, None));
+            f.tick();
+        }
+        assert_eq!(f.state(), Some(ReplicaState::VersionMismatch));
+        assert!(f.contact.serving(), "version mismatch, another commits");
         let f = fixture(&[&[1, 2, 3]]);
         f.engine.outputs.store(true, Ordering::SeqCst);
         diverge(&f);
@@ -5410,12 +5452,14 @@ mod tests {
     async fn a_retargeted_core_holds_the_entries_its_state_applied() {
         let f = fixture(&[&[1, 2, 3]]);
         f.engine.outputs.store(true, Ordering::SeqCst);
-        f.contact.set_rollout(crate::rollout::Fixed::new(1, None));
+        f.contact
+            .set_rollout(crate::rollout::Fixed::new(1, None, None));
         let baseline = |key| Baseline {
             replica: 2,
             order: vec![2, 1, 3],
             at_index: index_at(T0),
             key: Some(key),
+            versions: None,
         };
         f.log.0.lock().unwrap().baseline = Some(baseline(2));
         f.tick();

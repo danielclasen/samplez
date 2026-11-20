@@ -1833,6 +1833,27 @@ impl<P: Product> ReplicatedState for Replica<P> {
     }
 }
 
+/// `samplez_replica_version_mismatch`: 1 for the reason `mismatch` names,
+/// 0 for the other.
+fn mismatch_samples(mismatch: Option<state::Mismatch>) -> Vec<ReplicaMetric> {
+    [
+        (state::Mismatch::AwaitingHandOver, "awaiting_hand_over"),
+        (
+            state::Mismatch::BelowBaselineVersions,
+            "below_baseline_versions",
+        ),
+    ]
+    .into_iter()
+    .map(|(why, name)| ReplicaMetric {
+        name: "samplez_replica_version_mismatch",
+        help: "1 for why the audio replica is in version_mismatch.",
+        kind: MetricKind::Gauge,
+        labels: vec![("reason", name.to_owned())],
+        value: if mismatch == Some(why) { 1.0 } else { 0.0 },
+    })
+    .collect()
+}
+
 /// The `/metrics` samples of contact metrics `m`, `serving` the `/readyz`
 /// term ([`contact::Contact::serving`]).
 fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
@@ -1876,6 +1897,20 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
             kind: Gauge,
             labels: vec![("state", name.to_owned())],
             value: flag(now == Some(state)),
+        });
+    }
+    out.extend(mismatch_samples(m.replica.and_then(|l| l.mismatch)));
+    if let Some(v) = m.versions {
+        out.push(ReplicaMetric {
+            name: "samplez_replica_versions",
+            help: "The versions the replica's compatibility key holds, as labels.",
+            kind: Gauge,
+            labels: vec![
+                ("compute", v.compute.to_string()),
+                ("protocol", v.protocol.to_string()),
+                ("derivation", v.derivation.to_string()),
+            ],
+            value: 1.0,
         });
     }
     let divergences = m.replica.map_or(0, |l| l.divergences);
@@ -1988,6 +2023,34 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The value of `samplez_replica_version_mismatch` with reason `reason`
+    /// among `samples`.
+    fn reason(samples: &[ReplicaMetric], reason: &str) -> f64 {
+        let s = samples
+            .iter()
+            .find(|s| s.labels == [("reason", reason.to_owned())])
+            .expect("a sample per reason");
+        assert_eq!(s.name, "samplez_replica_version_mismatch");
+        s.value
+    }
+
+    /// Each `version_mismatch` reason is exposed under its own label: the
+    /// one the replica is in reads 1, the other 0, and outside
+    /// `version_mismatch` both read 0.
+    #[test]
+    fn the_version_mismatch_reason_is_exposed_by_its_label() {
+        use state::Mismatch::{AwaitingHandOver, BelowBaselineVersions};
+        let below = mismatch_samples(Some(BelowBaselineVersions));
+        assert_eq!(reason(&below, "below_baseline_versions"), 1.0);
+        assert_eq!(reason(&below, "awaiting_hand_over"), 0.0);
+        let awaiting = mismatch_samples(Some(AwaitingHandOver));
+        assert_eq!(reason(&awaiting, "below_baseline_versions"), 0.0);
+        assert_eq!(reason(&awaiting, "awaiting_hand_over"), 1.0);
+        let none = mismatch_samples(None);
+        assert_eq!(reason(&none, "below_baseline_versions"), 0.0);
+        assert_eq!(reason(&none, "awaiting_hand_over"), 0.0);
+    }
 
     use crate::state_machine::tests::Paths;
     use openraft::error::{InstallSnapshotError, RPCError, Unreachable};

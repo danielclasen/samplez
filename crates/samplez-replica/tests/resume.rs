@@ -408,6 +408,7 @@ async fn a_killed_leader_and_baseline_is_renamed_to_a_survivor() {
                 order: Vec::new(),
                 at_index: 0,
                 key: None,
+                versions: None,
             }))
             .unwrap();
         until("the leader named", 2, || {

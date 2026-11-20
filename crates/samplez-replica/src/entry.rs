@@ -149,6 +149,10 @@ pub struct Baseline {
     /// none.
     #[serde(default)]
     pub key: Option<u64>,
+    /// The versions that key holds, as the named replica reported them;
+    /// none when it reported none.
+    #[serde(default)]
+    pub versions: Option<crate::rollout::Versions>,
 }
 
 /// What an entry does once applied.

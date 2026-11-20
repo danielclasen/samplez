@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use samplez::blocks::PAGE;
+use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::Kube;
 
@@ -15,7 +16,11 @@ use crate::bootstrap::Kube;
 /// versions and output config are equal compute equal pages from one
 /// log, so a release that bumps none of them rolls into a running set as
 /// a peer; any other change to the key hands the baseline over.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// They are ordered by compute, then protocol, then derivation: a
+/// hand-over moves the baseline only to higher versions
+/// ([`may_take_over`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Versions {
     /// [`samplez::COMPUTE_VERSION`].
     pub compute: u32,
@@ -50,6 +55,36 @@ pub fn key<P: crate::Product>(output: &[u8]) -> u64 {
     Versions::of::<P>().key(output)
 }
 
+/// Whether a replica reporting versions `mine`, under another key than
+/// the latest `Baseline`'s, may take the baseline over from that
+/// `Baseline`'s versions `base`, `live` the versions every live audio
+/// voter reports. Higher versions may, and equal ones, whose keys differ
+/// by the output config alone. Lower ones may only once `base` is
+/// `gone`, no voter carrying it for the departure window
+/// ([`DEPARTED`]), and then only the highest live. No versions, an older
+/// peer's, rank below any.
+pub fn may_take_over(
+    mine: Option<Versions>,
+    base: Option<Versions>,
+    gone: bool,
+    live: &[Option<Versions>],
+) -> bool {
+    mine >= base || (gone && live.iter().all(|l| *l <= mine))
+}
+
+/// How long no live audio voter carries a `Baseline`'s versions before
+/// they count as gone and lower ones may take the baseline over: as long
+/// as no leader counting a replica takes before it counts as departed
+/// ([`crate::membership::UNCOUNTED`]). A voter unheard for a contact
+/// window is no departure.
+pub const DEPARTED: std::time::Duration = crate::membership::UNCOUNTED;
+
+/// Whether versions `base` are known and no live voter, its versions in
+/// `live`, carries them now.
+pub fn base_gone(base: Option<Versions>, live: &[Option<Versions>]) -> bool {
+    base.is_some() && !live.contains(&base)
+}
+
 /// XXH3-64 over the three versions, little-endian, and `output` prefixed
 /// with its length.
 fn key_of(v: Versions, output: &[u8]) -> u64 {
@@ -82,6 +117,11 @@ pub fn hand_over_at(at: u64, block: u64) -> u64 {
 pub trait Rollout: Send + Sync + 'static {
     /// This replica's compatibility key.
     fn key(&self) -> u64;
+    /// The versions the key holds, reported beside it; none where they
+    /// are not known.
+    fn versions(&self) -> Option<Versions> {
+        None
+    }
     /// This pod's revision, its `controller-revision-hash` label.
     fn revision(&self) -> Option<String>;
     /// The audio StatefulSet's `status.updateRevision`, as last read; the
@@ -89,19 +129,21 @@ pub trait Rollout: Send + Sync + 'static {
     fn target(&self) -> Option<String>;
 }
 
-/// A key and a revision fixed at start, and a target revision set from
-/// outside ([`follow`]).
+/// A key, its versions and a revision fixed at start, and a target
+/// revision set from outside ([`follow`]).
 #[derive(Debug)]
 pub struct Fixed {
     key: u64,
+    versions: Option<Versions>,
     revision: Option<String>,
     target: Mutex<Option<String>>,
 }
 
 impl Fixed {
-    pub fn new(key: u64, revision: Option<String>) -> Arc<Fixed> {
+    pub fn new(key: u64, versions: Option<Versions>, revision: Option<String>) -> Arc<Fixed> {
         Arc::new(Fixed {
             key,
+            versions,
             revision,
             target: Mutex::new(None),
         })
@@ -115,6 +157,10 @@ impl Fixed {
 impl Rollout for Fixed {
     fn key(&self) -> u64 {
         self.key
+    }
+
+    fn versions(&self) -> Option<Versions> {
+        self.versions
     }
 
     fn revision(&self) -> Option<String> {
@@ -170,6 +216,77 @@ mod tests {
     #[test]
     fn the_key_holds_no_crate_version() {
         assert_eq!(key_of(V, b"shape"), 0xac8b_212e_184b_8c77);
+    }
+
+    /// Compute ranks first, then protocol, then derivation: a higher
+    /// compute version outranks any protocol or derivation version.
+    #[test]
+    fn versions_order_by_compute_then_protocol_then_derivation() {
+        let higher = [
+            Versions { derivation: 4, ..V },
+            Versions {
+                protocol: 3,
+                derivation: 0,
+                ..V
+            },
+            Versions {
+                compute: 2,
+                protocol: 0,
+                derivation: 0,
+            },
+        ];
+        let mut prev = V;
+        for v in higher {
+            assert!(v > prev, "{v:?} above {prev:?}");
+            prev = v;
+        }
+        let mut sorted = vec![higher[2], higher[0], V, higher[1]];
+        sorted.sort();
+        assert_eq!(sorted, vec![V, higher[0], higher[1], higher[2]]);
+    }
+
+    /// Higher and equal versions take over; lower ones only once no live
+    /// voter carries the baseline's, and then only the highest live;
+    /// none never outranks some, and a set without any hands over.
+    #[test]
+    fn lower_versions_take_over_only_once_the_baselines_are_gone() {
+        let up = Some(Versions { compute: 2, ..V });
+        let base = Some(V);
+        let low = Some(Versions { compute: 0, ..V });
+        assert!(may_take_over(up, base, false, &[base, up]));
+        assert!(
+            !may_take_over(low, base, false, &[base, low]),
+            "a downgrade"
+        );
+        assert!(
+            may_take_over(base, base, false, &[base]),
+            "equal versions: another output config"
+        );
+        assert!(
+            !may_take_over(low, base, false, &[low, low]),
+            "unheard, not yet gone"
+        );
+        assert!(may_take_over(low, base, true, &[low, low]), "gone");
+        assert!(
+            !may_take_over(low, up, true, &[low, base]),
+            "a higher live voter than it"
+        );
+        assert!(
+            may_take_over(base, up, true, &[low, base]),
+            "the highest live"
+        );
+        assert!(
+            !may_take_over(None, base, false, &[base, None]),
+            "none below some"
+        );
+        assert!(
+            may_take_over(base, None, false, &[None, base]),
+            "some above none"
+        );
+        assert!(may_take_over(None, None, false, &[None]), "none known");
+        assert!(base_gone(base, &[low, None]));
+        assert!(!base_gone(base, &[low, base]));
+        assert!(!base_gone(None, &[low]), "unknown versions are never gone");
     }
 
     /// A hand-over's P is a block boundary: at B = 48 every third page

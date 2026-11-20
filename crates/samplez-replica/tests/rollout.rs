@@ -2,19 +2,21 @@
 //! Replica states): a rollout that changes the compatibility key moves
 //! the baseline to a target-revision replica at P, the old-key replicas
 //! commit up to P and fill only from it, and replicas with another key
-//! commit nothing. Every audio replica's engine is a
+//! commit nothing. The baseline moves only to versions not below its
+//! own while a live voter carries them. Every audio replica's engine is a
 //! [`harness::FakeAudio`] whose outputs are real hold rings.
 
 mod harness;
 
 use std::time::Duration;
 
-use harness::{BLOCK, Options, Paths, Set, base_key};
+use harness::{BLOCK, Options, Paths, Set, base_key, base_versions};
 use samplez::blocks::{Cause, PAGE, Standing};
 use samplez_replica::contact::{Timing, index_at};
 use samplez_replica::entry::{Baseline, Body, NodeId};
 use samplez_replica::membership::{Slot, node_id, slot_of};
-use samplez_replica::state::ReplicaState;
+use samplez_replica::rollout::{DEPARTED, Versions};
+use samplez_replica::state::{Mismatch, ReplicaState};
 use samplez_service::ReplicatedState;
 use tokio::time::{Instant, sleep};
 
@@ -54,6 +56,21 @@ fn state(set: &Set, id: NodeId) -> Option<ReplicaState> {
     set.replica(id).contact_metrics()?.replica?.state
 }
 
+/// Why `id` is in `version_mismatch`.
+fn mismatch(set: &Set, id: NodeId) -> Option<Mismatch> {
+    set.replica(id).contact_metrics()?.replica?.mismatch
+}
+
+/// This build's versions with the compute version raised by `by`: a
+/// release that computes other samples.
+fn up(by: u32) -> Option<Versions> {
+    let v = base_versions();
+    Some(Versions {
+        compute: v.compute + by,
+        ..v
+    })
+}
+
 fn committing(set: &Set, id: NodeId) -> bool {
     state(set, id) == Some(ReplicaState::Committing)
 }
@@ -77,16 +94,17 @@ fn metrics(set: &Set, id: NodeId) -> samplez_replica::state::Metrics {
         .expect("an audio replica")
 }
 
+/// The hand-overs `id` counted while it led, since it last started.
+fn handed_by(set: &Set, id: NodeId) -> u64 {
+    set.replica(id)
+        .contact_metrics()
+        .unwrap()
+        .leader
+        .handed_over
+}
+
 fn handed_over(set: &Set) -> u64 {
-    set.running()
-        .map(|id| {
-            set.replica(id)
-                .contact_metrics()
-                .unwrap()
-                .leader
-                .handed_over
-        })
-        .sum()
+    set.running().map(|id| handed_by(set, id)).sum()
 }
 
 /// The page holding the newest block due on `id`'s clock.
@@ -120,7 +138,8 @@ fn ready(set: &Set, id: NodeId) -> bool {
 }
 
 /// Starts `ids`, waits for every audio replica committing, and rolls the
-/// highest ordinal to key 2 at revision `r2`, the target.
+/// highest ordinal to key 2 of higher versions at revision `r2`, the
+/// target.
 async fn roll_last(ids: Vec<NodeId>) -> (Set, Vec<NodeId>, NodeId) {
     roll(ids, true).await
 }
@@ -138,7 +157,9 @@ async fn roll(ids: Vec<NodeId>, target: bool) -> (Set, Vec<NodeId>, NodeId) {
     if target {
         set.set_target(Some("r2"));
     }
-    set.set_version(n, 2, "r2");
+    set.set_version(n, 2, up(1), "r2");
+    // A restart starts the leader's counts anew: none is lost here.
+    assert_eq!(handed_by(&set, n), 0, "a hand-over before the roll");
     set.restart(n).await;
     (set, ids, n)
 }
@@ -189,11 +210,14 @@ async fn a_rollout_that_keeps_the_key_rolls_pod_by_pod_without_a_gap() {
     // checked before the next restart, while the replicas that wrote it
     // still hold their logs.
     let mut mark = page_now(&set, ids[0]);
+    // A restart also starts the leader's counts anew.
+    let mut handed = 0;
     for &id in ids.iter().rev() {
         let now = page_now(&set, ids[0]);
         pages_whole(&set, &ids, mark, now - 1);
         mark = now - 1;
-        set.set_version(id, base_key(), "r2");
+        set.set_version(id, base_key(), Some(base_versions()), "r2");
+        handed += handed_by(&set, id);
         set.restart(id).await;
         until("the restarted replica committing again", 10, || {
             committing(&set, id)
@@ -208,7 +232,7 @@ async fn a_rollout_that_keeps_the_key_rolls_pod_by_pod_without_a_gap() {
     sleep(Duration::from_millis(200)).await;
     let last = page_now(&set, ids[0]);
     pages_whole(&set, &ids, mark, last - 1);
-    assert_eq!(handed_over(&set), 0, "nothing handed over");
+    assert_eq!(handed + handed_over(&set), 0, "nothing handed over");
     assert!(ids.iter().all(|&id| ready(&set, id)), "every replica Ready");
 }
 
@@ -219,7 +243,8 @@ async fn a_rollout_that_keeps_the_key_rolls_pod_by_pod_without_a_gap() {
 /// counting one discontinuity in `version_switch_total`; every old-key
 /// replica commits up to P and from P fills only, so every page stays
 /// whole on a member. Old-key fillers are not Ready while N commits, and
-/// turn `version_mismatch` once a second replica with N's key commits.
+/// turn `version_mismatch` once a second replica with N's key commits,
+/// where they are Ready.
 #[tokio::test(start_paused = true)]
 async fn a_key_changing_rollout_hands_over_at_p() {
     for ids in [vec![a(0), a(1), witness()], vec![a(0), a(1), a(2)]] {
@@ -231,7 +256,10 @@ async fn a_key_changing_rollout_hands_over_at_p() {
         .await;
         let p = named(&set, old[0], n).await;
         assert_eq!(p % BLOCK, 0, "P is a block boundary");
-        assert_eq!(handed_over(&set), 1);
+        // Counted before each restart too: a restart starts the
+        // leader's counts anew.
+        let mut handed = 0;
+        assert_eq!(handed + handed_over(&set), 1);
         until("N committing", 10, || committing(&set, n)).await;
         assert_eq!(from(&set, n), Some(p), "N commits from P");
         assert_eq!(set.audio(n).writes(0).0[0].0, p, "N's first commit at P");
@@ -253,7 +281,8 @@ async fn a_key_changing_rollout_hands_over_at_p() {
             // remaining old-key filler then commits nothing at all.
             let second = old[1];
             let drops = set.audio(old[0]).lock().drops.len();
-            set.set_version(second, 2, "r2");
+            set.set_version(second, 2, up(1), "r2");
+            handed += handed_by(&set, second);
             set.restart(second).await;
             until("the second new-key replica committing", 10, || {
                 committing(&set, second)
@@ -268,8 +297,8 @@ async fn a_key_changing_rollout_hands_over_at_p() {
                 drops + 1,
                 "its core dropped"
             );
-            assert!(!ready(&set, old[0]));
-            assert_eq!(handed_over(&set), 1, "no further hand-over");
+            assert!(ready(&set, old[0]), "a version_mismatch replica is Ready");
+            assert_eq!(handed + handed_over(&set), 1, "no further hand-over");
         }
     }
 }
@@ -340,7 +369,7 @@ async fn n_learning_late_is_covered_by_the_filler() {
 
 /// N with an inbound-only cut that never ends while the start bound runs:
 /// N is passed over, the leader names the filling old-key replica, which
-/// commits again as baseline; N stays `version_mismatch`, not Ready, and
+/// commits again as baseline; N stays `version_mismatch`, Ready, and
 /// is not named again until it applied that `Baseline`; once the cut
 /// heals the hand-over completes. The output never stops.
 #[tokio::test(start_paused = true)]
@@ -362,7 +391,7 @@ async fn an_inbound_cut_n_is_passed_over_and_named_again_once_it_catches_up() {
     sleep(Duration::from_millis(500)).await;
     assert_eq!(handed_over(&set), 1, "N not named again while cut");
     assert_eq!(state(&set, n), Some(ReplicaState::VersionMismatch));
-    assert!(!ready(&set, n));
+    assert!(ready(&set, n));
     pages_whole(&set, &[a(0)], p / PAGE - 2, page_now(&set, a(0)) - 1);
     set.net.heal();
     until("N committing", 10, || committing(&set, n)).await;
@@ -371,10 +400,14 @@ async fn an_inbound_cut_n_is_passed_over_and_named_again_once_it_catches_up() {
     pages_whole(&set, &ids, p / PAGE - 2, page_now(&set, n) - 1);
 }
 
-/// A rollout superseded by a third revision before it completes, and a
-/// rollback to the earlier revision: the baseline moves to the target's
-/// key each time; the previous baseline's key fills only, and any other
-/// key commits nothing.
+/// A rollout superseded by a third revision of higher versions before it
+/// completes, and a rollback to the first revision: the baseline moves to
+/// the third revision's key; the previous baseline's key fills only, and
+/// the first one's commits nothing. Rolled back, the target names the
+/// first revision, whose versions are below the baseline's: while a
+/// replica with those is live the baseline stays, and the first
+/// revision's replica is `version_mismatch`, below the baseline's
+/// versions.
 #[tokio::test(start_paused = true)]
 async fn superseded_and_rolled_back_rollouts_follow_the_target() {
     let (mut set, ids, n) = roll_last(vec![a(0), a(1), a(2)]).await;
@@ -382,7 +415,7 @@ async fn superseded_and_rolled_back_rollouts_follow_the_target() {
     until("N committing", 10, || committing(&set, n)).await;
     // Superseded: a third revision rolls a(1).
     set.set_target(Some("r3"));
-    set.set_version(a(1), 3, "r3");
+    set.set_version(a(1), 3, up(2), "r3");
     set.restart(a(1)).await;
     until("a(1) named", 10, || {
         baseline(&set, a(0)).is_some_and(|b| b.replica == a(1) && b.key == Some(3))
@@ -393,18 +426,17 @@ async fn superseded_and_rolled_back_rollouts_follow_the_target() {
     // The previous baseline's key fills; the first one's commits nothing.
     assert_eq!(state(&set, n), Some(ReplicaState::Withdrawn));
     assert_eq!(state(&set, a(0)), Some(ReplicaState::VersionMismatch));
-    // Rolled back to r1: the baseline moves to a(0)'s key.
-    set.set_target(Some("r1"));
-    until("a(0) named", 10, || {
-        baseline(&set, a(1)).is_some_and(|b| b.replica == a(0) && b.key == Some(base_key()))
-    })
-    .await;
-    until("a(0) committing", 10, || committing(&set, a(0))).await;
-    sleep(Duration::from_millis(200)).await;
-    assert_eq!(state(&set, a(1)), Some(ReplicaState::Withdrawn));
-    assert_eq!(state(&set, n), Some(ReplicaState::VersionMismatch));
     let p = baseline(&set, a(1)).unwrap().at_index;
-    pages_whole(&set, &ids, p / PAGE - 2, page_now(&set, a(0)) - 1);
+    // Rolled back to r1: a(0) at the target never takes over.
+    set.set_target(Some("r1"));
+    sleep(Duration::from_millis(1000)).await;
+    let b = baseline(&set, a(1)).unwrap();
+    assert_eq!((b.replica, b.key), (a(1), Some(3)), "the baseline moved");
+    assert_eq!(b.versions, up(2));
+    assert!(committing(&set, a(1)));
+    assert_eq!(state(&set, a(0)), Some(ReplicaState::VersionMismatch));
+    assert_eq!(mismatch(&set, a(0)), Some(Mismatch::BelowBaselineVersions));
+    pages_whole(&set, &ids, p / PAGE - 2, page_now(&set, a(1)) - 1);
 }
 
 async fn mismatched(set: &Set, n: NodeId) {
@@ -582,4 +614,275 @@ async fn fenced(cause: Cause, late: bool) {
     assert_eq!(handed_over(&set), 2);
     sleep(Duration::from_millis(100)).await;
     pages_whole(&set, &ids, p / PAGE - 2, page_now(&set, n) - 1);
+}
+
+/// Rolls every audio replica of a running set, the highest ordinal first,
+/// to key 2 of higher versions at revision `r2`, the target, as a
+/// StatefulSet does. Each window is checked before the next restart,
+/// which starts that replica's write log anew. Returns P and the
+/// hand-overs counted over the roll: a restart also starts the leader's
+/// counts anew, so each replica's are read before it restarts.
+async fn roll_forward(set: &mut Set, ids: &[NodeId]) -> (u64, u64) {
+    set.set_target(Some("r2"));
+    let mut mark = page_now(set, ids[0]);
+    let mut p = None;
+    let mut handed = 0;
+    for (i, &id) in ids.iter().enumerate().rev() {
+        let now = page_now(set, ids[0]);
+        pages_whole(set, ids, mark, now - 1);
+        // No page mixed: from P the old-key replicas write nothing.
+        if let Some(p) = p {
+            for &o in &ids[..=i] {
+                writes_none(set, o, p, now * PAGE);
+            }
+        }
+        mark = now - 1;
+        set.set_version(id, 2, up(1), "r2");
+        handed += handed_by(set, id);
+        set.restart(id).await;
+        if p.is_none() {
+            p = Some(named(set, ids[0], id).await);
+        }
+        let p = p.expect("named");
+        until("the restarted replica committing", 10, || {
+            committing(set, id)
+        })
+        .await;
+        // Nor does a new-key replica write before P.
+        assert!(set.audio(id).writes(0).0[0].0 >= p, "{id} wrote before P");
+    }
+    sleep(Duration::from_millis(200)).await;
+    pages_whole(set, ids, mark, page_now(set, ids[0]) - 1);
+    (p.expect("handed over"), handed + handed_over(set))
+}
+
+/// A rollout to strictly higher versions under another key, pod by pod:
+/// the baseline is handed over once, at P, to the first new pod, which
+/// commits from P; the others rejoin as its peers. Every page is whole on
+/// a member throughout and none is committed by both an old-key and a
+/// new-key replica.
+#[tokio::test(start_paused = true)]
+async fn an_incompatible_roll_forward_hands_over_once_without_a_gap() {
+    let mut set = start(vec![a(0), a(1), a(2)]).await;
+    let ids = audio(&set);
+    until("every audio replica committing", 5, || {
+        ids.iter().all(|&id| committing(&set, id))
+    })
+    .await;
+    let (p, handed) = roll_forward(&mut set, &ids).await;
+    assert_eq!(p % BLOCK, 0, "P is a block boundary");
+    assert_eq!(
+        from(&set, a(2)),
+        Some(p),
+        "the first new pod commits from P"
+    );
+    assert_eq!(handed, 1, "handed over once over the roll");
+    let b = baseline(&set, a(0)).unwrap();
+    assert_eq!((b.key, b.versions), (Some(2), up(1)));
+    assert!(ids.iter().all(|&id| ready(&set, id)), "every replica Ready");
+}
+
+/// A rollout forward, then back to the lower versions pod by pod: each
+/// pod rolled back is `version_mismatch`, below the baseline's versions,
+/// and
+/// Ready, while a replica with the higher versions is live, and the
+/// baseline stays. Once the last of those is gone the replicas with the
+/// highest live versions take over and the outputs resume; the only
+/// pages whole on no member are those between that replica's stop and
+/// the new baseline's commit start.
+#[tokio::test(start_paused = true)]
+async fn a_full_rollback_hands_over_to_the_highest_live_versions() {
+    let mut set = start(vec![a(0), a(1), a(2)]).await;
+    let ids = audio(&set);
+    until("every audio replica committing", 5, || {
+        ids.iter().all(|&id| committing(&set, id))
+    })
+    .await;
+    roll_forward(&mut set, &ids).await;
+    set.set_target(Some("r1"));
+    let mut mark = page_now(&set, ids[0]);
+    for &id in ids[1..].iter().rev() {
+        let now = page_now(&set, ids[0]);
+        pages_whole(&set, &ids, mark, now - 1);
+        mark = now - 1;
+        set.set_version(id, base_key(), Some(base_versions()), "r1");
+        set.restart(id).await;
+        until("the rolled-back replica version_mismatch", 10, || {
+            state(&set, id) == Some(ReplicaState::VersionMismatch)
+        })
+        .await;
+    }
+    sleep(Duration::from_millis(500)).await;
+    for &id in &ids[1..] {
+        assert_eq!(state(&set, id), Some(ReplicaState::VersionMismatch));
+        assert_eq!(mismatch(&set, id), Some(Mismatch::BelowBaselineVersions));
+        assert!(ready(&set, id), "{id} Ready");
+    }
+    assert_eq!(baseline(&set, a(0)).unwrap().key, Some(2));
+    assert!(committing(&set, a(0)));
+    let gone = page_now(&set, a(0));
+    pages_whole(&set, &ids, mark, gone - 1);
+    // The last replica with the higher versions rolls back.
+    set.set_version(a(0), base_key(), Some(base_versions()), "r1");
+    set.restart(a(0)).await;
+    until("a replica with the lower versions named", 10, || {
+        baseline(&set, a(1)).is_some_and(|b| b.key == Some(base_key()))
+    })
+    .await;
+    let b = baseline(&set, a(1)).unwrap();
+    assert_eq!(b.versions, Some(base_versions()));
+    until("the outputs resume", 10, || committing(&set, b.replica)).await;
+    let start = from(&set, b.replica).unwrap();
+    sleep(Duration::from_millis(200)).await;
+    let now = page_now(&set, b.replica);
+    pages_whole(&set, &ids, start.div_ceil(PAGE), now - 1);
+    // The gap: the departure window from the last report of the higher
+    // versions, then a decision, the decision lead and a retarget.
+    let bound = index_at((DEPARTED + Duration::from_secs(2)).as_nanos() as u64);
+    assert!(
+        start - gone * PAGE <= bound,
+        "the outputs resumed {} samples after the stop",
+        start - gone * PAGE
+    );
+}
+
+/// A pod rolled back to lower versions while a replica with the
+/// baseline's higher versions is live is `version_mismatch` with its
+/// below the baseline's versions: never named, though it is at the target
+/// revision
+/// and a candidate, and Ready.
+#[tokio::test(start_paused = true)]
+async fn a_downgraded_pod_never_takes_over_while_a_newer_one_is_live() {
+    let (mut set, _, n) = roll_last(vec![a(0), a(1), a(2)]).await;
+    let p = named(&set, a(0), n).await;
+    until("N committing", 10, || committing(&set, n)).await;
+    set.set_version(a(1), 2, up(1), "r2");
+    set.restart(a(1)).await;
+    until("a(1) committing", 10, || committing(&set, a(1))).await;
+    // a(1) rolls back to r1.
+    set.set_target(Some("r1"));
+    set.set_version(a(1), base_key(), Some(base_versions()), "r1");
+    set.restart(a(1)).await;
+    until("a(1) version_mismatch", 10, || {
+        state(&set, a(1)) == Some(ReplicaState::VersionMismatch)
+    })
+    .await;
+    sleep(Duration::from_millis(1000)).await;
+    let b = baseline(&set, a(0)).unwrap();
+    assert_eq!((b.replica, b.key), (n, Some(2)), "the baseline moved");
+    assert_eq!(state(&set, a(1)), Some(ReplicaState::VersionMismatch));
+    assert_eq!(mismatch(&set, a(1)), Some(Mismatch::BelowBaselineVersions));
+    assert!(
+        ready(&set, a(1)),
+        "one below the baseline's versions is Ready"
+    );
+    assert!(committing(&set, n));
+    writes_none(&set, a(1), 0, page_now(&set, n) * PAGE);
+    pages_whole(&set, &[n], p / PAGE, page_now(&set, n) - 1);
+}
+
+/// Makes `id` the Raft leader: an election is called until it wins one,
+/// as votes are refused while the current leader's lease runs.
+async fn lead(set: &Set, id: NodeId) {
+    let raft = set.replica(id).raft().clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while raft.metrics().borrow().state != openraft::ServerState::Leader {
+        assert!(std::time::Instant::now() < deadline, "{id} leads");
+        let _ = raft.trigger().elect().await;
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The `Baseline`s `at` applies over `span`, as (replica, key), each once
+/// in the order they were applied.
+async fn baselines_over(set: &Set, at: NodeId, span: Duration) -> Vec<(NodeId, Option<u64>)> {
+    let end = Instant::now() + span;
+    let mut seen = Vec::new();
+    while Instant::now() < end {
+        if let Some(b) = baseline(set, at) {
+            let now = (b.replica, b.key);
+            if seen.last() != Some(&now) {
+                seen.push(now);
+            }
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
+    seen
+}
+
+/// The only replica with the baseline's higher versions, unheard by the
+/// others for less than the departure window, as a late report makes
+/// it: the rolled-back replicas below its versions do not take over and
+/// the baseline stays. Unheard for longer, it counts as gone: one of them
+/// takes over, once, and nothing hands the baseline back once it is
+/// heard again.
+#[tokio::test(start_paused = true)]
+async fn a_downgrade_waits_for_the_baselines_versions_to_depart() {
+    // N, a(2), has the higher versions; a(0) and a(1) are rolled back.
+    let (mut set, _, n) = roll_last(vec![a(0), a(1), a(2)]).await;
+    named(&set, a(0), n).await;
+    until("N committing", 10, || committing(&set, n)).await;
+    set.set_version(a(1), 2, up(1), "r2");
+    set.restart(a(1)).await;
+    until("a(1) committing", 10, || committing(&set, a(1))).await;
+    set.set_target(Some("r1"));
+    set.set_version(a(1), base_key(), Some(base_versions()), "r1");
+    set.restart(a(1)).await;
+    for id in [a(0), a(1)] {
+        until("rolled back, version_mismatch", 10, || {
+            state(&set, id) == Some(ReplicaState::VersionMismatch)
+        })
+        .await;
+    }
+    // A leader that does not hear N decides.
+    lead(&set, a(0)).await;
+    let base = (n, Some(2));
+    let unheard = |set: &Set, cut: bool| {
+        for o in [a(0), a(1)] {
+            if cut {
+                set.net.cut_peer(n, o);
+            } else {
+                set.net.join_peer(n, o);
+            }
+        }
+    };
+
+    // Unheard for less than the departure window.
+    unheard(&set, true);
+    let short = DEPARTED - Duration::from_millis(500);
+    assert_eq!(baselines_over(&set, a(0), short).await, [base]);
+    unheard(&set, false);
+    let heard = Duration::from_millis(500);
+    assert_eq!(baselines_over(&set, a(0), heard).await, [base]);
+
+    // Unheard for longer: one replica below N's versions takes over.
+    unheard(&set, true);
+    let long = DEPARTED + Duration::from_secs(2);
+    let seen = baselines_over(&set, a(0), long).await;
+    assert_eq!(seen.len(), 2, "one change of baseline: {seen:?}");
+    assert_eq!(seen[0], base);
+    assert_ne!(seen[1].0, n);
+    assert_eq!(seen[1].1, Some(base_key()), "the lower versions' key");
+    unheard(&set, false);
+    assert_eq!(
+        baselines_over(&set, a(0), Duration::from_secs(1)).await,
+        [seen[1]],
+        "handed back once N is heard again"
+    );
+}
+
+/// A replica in `version_mismatch` passes `/readyz`, so a StatefulSet
+/// rolls on past it; awaiting its hand-over, with higher versions and no
+/// target revision yet, it says so and reports its versions.
+#[tokio::test(start_paused = true)]
+async fn a_version_mismatch_replica_is_ready() {
+    let (set, _, n) = roll(vec![a(0), a(1), a(2)], false).await;
+    mismatched(&set, n).await;
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(state(&set, n), Some(ReplicaState::VersionMismatch));
+    assert_eq!(mismatch(&set, n), Some(Mismatch::AwaitingHandOver));
+    assert!(ready(&set, n), "version_mismatch is Ready");
+    let m = set.replica(n).contact_metrics().unwrap();
+    assert_eq!(m.versions, up(1));
+    assert_eq!(handed_over(&set), 0);
 }

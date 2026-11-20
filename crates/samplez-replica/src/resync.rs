@@ -46,8 +46,42 @@ pub struct Resynced {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Missed;
 
-/// The reason an attempt that hit [`Missed`] fails with.
-pub const MISSED: &str = "a record after the donor's core is gone";
+/// Why a resync attempt failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failed {
+    /// [`Missed`], logged where it was found
+    /// ([`crate::contact::Contact::replay_entries`]).
+    Missed,
+    /// Any other cause, as text.
+    Other(String),
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failed::Missed => f.write_str("a record after the donor's core is gone"),
+            Failed::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<Missed> for Failed {
+    fn from(_: Missed) -> Failed {
+        Failed::Missed
+    }
+}
+
+impl From<String> for Failed {
+    fn from(why: String) -> Failed {
+        Failed::Other(why)
+    }
+}
+
+impl From<&str> for Failed {
+    fn from(why: &str) -> Failed {
+        Failed::Other(why.to_owned())
+    }
+}
 
 /// What a joiner's replay reads from the replica while it runs.
 pub trait Source: Send + Sync {

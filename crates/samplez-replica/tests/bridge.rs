@@ -904,7 +904,9 @@ fn resync_with(n: u64, late: fn(u64) -> bool) -> Result<(), String> {
             donor.counters().command_late.load(Ordering::Relaxed) - late_before >= behind
         });
     }
-    let r = joiner_audio.resync(&core, &Log(log.clone()))?;
+    let r = joiner_audio
+        .resync(&core, &Log(log.clone()))
+        .map_err(|e| e.to_string())?;
     // Held unresolved, as the donor holds an entry it took late.
     let taken_late: Vec<u64> = (log.iter())
         .filter(|(_, r)| r.at_index <= core.k0 * B)

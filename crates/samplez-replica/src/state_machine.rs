@@ -364,11 +364,14 @@ pub struct StateMachine<P> {
     /// the records' indexes rise in log order, so retention drops a
     /// prefix.
     pub records_from: u64,
-    /// Not replicated: the log index of the newest entry at or below
-    /// `records_from` that derived a record, none where that is unknown.
-    /// No entry after it derived one up to `records_from`, so a replay
-    /// from it on misses none ([`StateMachine::records_whole`]). It comes
-    /// with a snapshot, which carries the newest record's index.
+    /// Not replicated: a log index with no entry after it up to
+    /// `records_from` that derived a record, none where that is unknown,
+    /// so a replay from it on misses no record
+    /// ([`StateMachine::records_whole`]). A snapshot carries the newest
+    /// record's index and a load takes it. A state saved past the index
+    /// its snapshot is stored under can carry a floor above the
+    /// `records_from` a load sets, which then adds nothing: a replay from
+    /// at or above `records_from` is whole already.
     pub record_floor: Option<u64>,
 }
 
