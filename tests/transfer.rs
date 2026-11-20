@@ -39,12 +39,22 @@ fn slow_look(dir: &std::path::Path) -> bool {
     samplez_mxl::lookup::exists(dir)
 }
 
+/// Held by each test for its whole run: one test's engines never run
+/// beside another's, whose load would make an input read late and
+/// leave a run with no pages to compare.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A replay opens no input flow its lookup has not found: one whose
 /// lookup does not answer within the replay's wait fails the replay at
 /// once, saying so, instead of libmxl's open waiting on a file system that
 /// waits for a missing name.
 #[test]
 fn a_replay_fails_at_once_on_a_flow_its_lookup_has_not_found() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -75,6 +85,7 @@ fn a_replay_fails_at_once_on_a_flow_its_lookup_has_not_found() {
 /// the unresolved entries, and the last log id taken.
 #[test]
 fn the_core_is_copied_after_a_block() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
@@ -120,6 +131,7 @@ fn the_core_is_copied_after_a_block() {
 /// A single voter has no peer to resync: it copies nothing.
 #[test]
 fn a_single_voter_copies_no_core() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
@@ -137,6 +149,7 @@ fn a_single_voter_copies_no_core() {
 /// attaches it.
 #[test]
 fn only_a_set_of_voters_needs_the_replay_history() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
@@ -344,6 +357,7 @@ fn now_block() -> u64 {
 /// included, where before it computed others.
 #[test]
 fn a_replayed_core_computes_the_donors_pages() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -527,6 +541,7 @@ fn strips(release_ms: f32, threshold_db: f32) -> [StripParam; 5] {
 /// both envelopes settled, and with strips set apart, for good.
 #[test]
 fn a_replayed_core_carries_the_strips_mid_envelope() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -606,6 +621,7 @@ fn a_replayed_core_carries_the_strips_mid_envelope() {
 /// of the donor's release, and with its parameters set apart, for good.
 #[test]
 fn a_replayed_core_carries_the_limiter_mid_release() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -707,6 +723,7 @@ fn a_replayed_core_carries_the_limiter_mid_release() {
 /// history, it would differ for the rest of the delay.
 #[test]
 fn a_replayed_core_carries_the_delay_history() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -791,6 +808,7 @@ fn a_replayed_core_carries_the_delay_history() {
 /// last log id, though the engine took no entry.
 #[test]
 fn a_product_state_sets_the_delay() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -959,6 +977,7 @@ fn a_product_state_resumes_the_tone_ramps() {
 /// unwritten.
 #[test]
 fn an_entry_the_replay_applied_is_not_taken_again() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -1030,6 +1049,7 @@ fn an_entry_the_replay_applied_is_not_taken_again() {
 /// would compute without it what the donor computed with it.
 #[test]
 fn a_core_missing_an_entry_the_rt_thread_took_is_refused() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1054,6 +1074,7 @@ fn a_core_missing_an_entry_the_rt_thread_took_is_refused() {
 /// of a core older than the history the flow keeps, whose input is gone.
 #[test]
 fn a_replay_names_its_silenced_blocks() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1076,6 +1097,7 @@ fn a_replay_names_its_silenced_blocks() {
 /// twice, with the product's targets in place and no ramp to them.
 #[test]
 fn a_dropped_core_withholds_until_a_product_core_is_installed() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1190,6 +1212,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
 /// the old flows over the new one.
 #[test]
 fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1233,6 +1256,7 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
 /// before the core the RT thread holds is dropped.
 #[test]
 fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -1293,6 +1317,7 @@ fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
 /// for good before.
 #[test]
 fn a_route_passed_without_a_core_applies_at_the_install() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let (src, other) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1351,6 +1376,7 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
 /// and never apply.
 #[test]
 fn a_product_entry_the_install_passed_is_folded_in() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1408,6 +1434,7 @@ fn a_product_entry_the_install_passed_is_folded_in() {
 /// count it late.
 #[test]
 fn a_strip_entry_the_replay_applied_still_reaches_the_strip() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -1449,6 +1476,7 @@ fn a_strip_entry_the_replay_applied_still_reaches_the_strip() {
 /// the input: it reads none, as the live replicas do.
 #[test]
 fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let (src, other) = (new_id(), new_id());
@@ -1510,6 +1538,7 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
 /// is folded in.
 #[test]
 fn a_product_state_disables_and_enables_an_output() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1576,6 +1605,7 @@ fn a_product_state_disables_and_enables_an_output() {
 /// parameters out of range, is refused before anything changes.
 #[test]
 fn a_product_state_sets_the_limiter() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1639,6 +1669,7 @@ fn a_product_state_sets_the_limiter() {
 /// reading the input: the replay reads the replica's own inputs.
 #[test]
 fn a_core_with_a_detached_input_replays_only_where_it_is_detached() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1776,6 +1807,7 @@ fn assert_same_untouched(
 /// applied it at its index.
 #[test]
 fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -1830,6 +1862,7 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
 /// engines that applied it at its index.
 #[test]
 fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -1904,6 +1937,7 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
 /// to hold it.
 #[test]
 fn a_route_folded_into_a_product_core_still_swaps_in() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let (src, other) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -1963,6 +1997,7 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
 /// index, so the pages of the ramp would differ from the donor's.
 #[test]
 fn a_strip_entry_the_core_carried_is_not_applied_again() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -2003,6 +2038,7 @@ fn a_strip_entry_the_core_carried_is_not_applied_again() {
 /// and would hold the slot silent for good, waiting for another.
 #[test]
 fn a_route_the_core_carried_is_not_applied_again() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let (src, other) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -2101,6 +2137,7 @@ fn scene() -> Vec<Entry> {
 /// other log ids, so only the samples' hashes compare.
 #[test]
 fn a_log_entrys_entries_all_apply_at_its_index() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -2145,6 +2182,7 @@ fn a_log_entrys_entries_all_apply_at_its_index() {
 /// donor's. A log entry of no engine entries leaves the replay as it is.
 #[test]
 fn a_core_copied_with_a_log_entry_pending_replays_all_of_it() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -2247,6 +2285,7 @@ fn a_core_copied_with_a_log_entry_pending_replays_all_of_it() {
 /// coefficient outside the matrix is refused rather than set elsewhere.
 #[test]
 fn a_replay_folds_and_checks_a_log_entry_as_the_engine_does() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -2281,6 +2320,7 @@ fn a_replay_folds_and_checks_a_log_entry_as_the_engine_does() {
 /// a joiner retries with a later copy, not as another engine's core.
 #[test]
 fn a_core_with_a_batch_awaiting_its_generation_decodes() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -2304,6 +2344,7 @@ fn a_core_with_a_batch_awaiting_its_generation_decodes() {
 /// its core, counted, to be rebuilt, rather than hold them without bound.
 #[test]
 fn committed_entries_past_the_wait_bound_drop_the_core() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -2342,6 +2383,7 @@ fn committed_entries_past_the_wait_bound_drop_the_core() {
 /// those of an engine that applied both at their index.
 #[test]
 fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let (src, next) = (new_id(), new_id());
@@ -2450,6 +2492,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
 /// entry.
 #[test]
 fn a_copy_holds_every_unresolved_entry_given_before_it() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -2475,6 +2518,7 @@ fn a_copy_holds_every_unresolved_entry_given_before_it() {
 /// through the log.
 #[test]
 fn a_product_state_rebuilds_a_generation_built_on_the_old_flows() {
+    let _one = one_at_a_time();
     for sent in [false, true] {
         common::undisturbed(|| product_over_a_pending_generation(sent));
     }
@@ -2581,6 +2625,7 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
 /// refused for it.
 #[test]
 fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let (src0, src1, next0) = (new_id(), new_id(), new_id());
@@ -2652,6 +2697,7 @@ fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
 /// so a run with one after the entries is disturbed.
 #[test]
 fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -2783,6 +2829,7 @@ fn replicas_duck_alike_and_a_core_copied_mid_duck_carries_the_detectors() {
 /// no entry could set is refused before anything changes.
 #[test]
 fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
+    let _one = one_at_a_time();
     common::undisturbed(|| {
         let domain = Domain::new();
         let src = new_id();
@@ -2856,6 +2903,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
 /// its core. Listed enabled, it is enabled.
 #[test]
 fn an_install_leaving_an_output_out_starts_it_as_configured() {
+    let _one = one_at_a_time();
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -3187,11 +3235,13 @@ fn wait_comparable(
 
 #[test]
 fn a_replayed_core_carries_a_fade_still_waiting() {
+    let _one = one_at_a_time();
     common::undisturbed(|| replayed_core_carries_a_fade(5_000));
 }
 
 #[test]
 fn a_replayed_core_carries_a_fade_mid_ramp() {
+    let _one = one_at_a_time();
     common::undisturbed(|| replayed_core_carries_a_fade(FADE_DELAY + 20_000));
 }
 
@@ -3263,16 +3313,19 @@ fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), S
 
 #[test]
 fn a_rebuilt_replica_continues_a_fade_still_waiting() {
+    let _one = one_at_a_time();
     common::undisturbed(|| rebuilt_replica_continues_a_fade(2_000, false));
 }
 
 #[test]
 fn a_rebuilt_replica_continues_a_fade_mid_ramp() {
+    let _one = one_at_a_time();
     common::undisturbed(|| rebuilt_replica_continues_a_fade(FADE_DELAY + 20_000, false));
 }
 
 #[test]
 fn a_rebuilt_replica_matches_its_peers_after_a_mid_fade_assert() {
+    let _one = one_at_a_time();
     common::undisturbed(|| rebuilt_replica_continues_a_fade(FADE_DELAY + 20_000, true));
 }
 
@@ -3368,11 +3421,13 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
 
 #[test]
 fn a_rebuilt_replica_continues_a_masked_fade_that_starts_at_its_entry() {
+    let _one = one_at_a_time();
     common::undisturbed(|| rebuilt_replica_continues_a_masked_fade(0));
 }
 
 #[test]
 fn a_rebuilt_replica_continues_a_masked_fade_that_waits() {
+    let _one = one_at_a_time();
     common::undisturbed(|| rebuilt_replica_continues_a_masked_fade(FADE_DELAY as u32));
 }
 
@@ -3453,11 +3508,13 @@ fn rebuilt_replica_continues_plain_ramps(chained: bool) -> Result<(), String> {
 
 #[test]
 fn a_rebuilt_replica_continues_a_plain_ramp() {
+    let _one = one_at_a_time();
     common::undisturbed(|| rebuilt_replica_continues_plain_ramps(false));
 }
 
 #[test]
 fn a_rebuilt_replica_continues_chained_plain_ramps() {
+    let _one = one_at_a_time();
     common::undisturbed(|| rebuilt_replica_continues_plain_ramps(true));
 }
 
@@ -3473,6 +3530,7 @@ fn a_rebuilt_replica_continues_chained_plain_ramps() {
 /// input outside the `InputDown`, is disturbed and runs again.
 #[test]
 fn replicas_agree_on_the_loudness_and_its_gaps() {
+    let _one = one_at_a_time();
     use samplez_dsp::{SLICE, WINDOW};
     common::undisturbed(|| {
         let domain = Domain::new();
@@ -3587,6 +3645,7 @@ fn replicas_agree_on_the_loudness_and_its_gaps() {
 /// input after the install is disturbed and runs again.
 #[test]
 fn a_rebuilt_replica_keeps_a_meter_paused() {
+    let _one = one_at_a_time();
     use samplez_dsp::{SLICE, WINDOW};
     common::undisturbed(|| {
         let domain = Domain::new();
