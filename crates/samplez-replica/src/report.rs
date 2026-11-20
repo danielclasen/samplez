@@ -158,6 +158,16 @@ pub struct Own {
     /// from a binary that reports none, which speaks protocol 1.
     #[serde(default)]
     pub protocol: u32,
+    /// The input slots its engine reads, by bit
+    /// ([`samplez::InputStatus::readable`]), and those it does not: a slot
+    /// in neither, detached, waiting for its generation, past its inputs
+    /// or of a replica without an engine core, in `starting` or
+    /// resyncing, has no say in input liveness
+    /// ([`crate::liveness`]).
+    #[serde(default)]
+    pub readable: u64,
+    #[serde(default)]
+    pub unreadable: u64,
 }
 
 /// One page of one output as the sender computed it (plan 2.11, page

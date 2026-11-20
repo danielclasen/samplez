@@ -1179,6 +1179,9 @@ blocks are withheld, as in any election.
 
 `Timing::lead_minute` is the length of the minute of slack the apply
 lead falls on, 60 s by default; shorter values are for tests.
+`Timing::prune_after_blocks` is the engine's `pruneAfterBlocks`, which
+input liveness holds a decided change for; contact does not read the
+engine's configuration, so the product keeps the two equal.
 
 ## Real-time requirements
 
@@ -1221,15 +1224,38 @@ back is silenced only while it lasts. libmxl's read runs its validity
 check only when the head moves back between the head read and the read,
 which reports the block `TooEarly`.
 
-In replicated mode a prune is a report the product appends as an
-`InputDown`, so the view of the flow on the replica whose report is
-appended decides for every replica: a mirror late on that replica's
-node takes the input down on all of them. That is accepted because the
-lateness has lasted a second by then, every block of that replica
-degraded meanwhile and its outputs withdrawn whenever evidence came
-late. A replica whose clock is not verified, its kernel TAI offset not
-the set's or its clock beyond `clockGuard` of a majority, holds no
-engine core: it reads no input and prunes none.
+In replicated mode the audio voters decide an input's liveness by
+majority, not one engine. Each reports in its side reports the input
+slots its engine reads (`InputStatus::readable`: attached, or down in
+the log and its head advancing for a second) and those it does not; a
+detached slot, one waiting for its generation, as after an `InputUp` or
+a `Route` while the build runs, a replica in `starting` or resyncing,
+and a binary that reports neither have no say. The leader takes an input
+down once more than half of the audio voters of every configuration of
+the membership, the witness left out, report it unreadable, and up once
+more than half report it readable; a voter whose latest report is older
+than `contactWindowMs` plus `holdMs` counts for neither, also right
+after the leader regains contact, and without such a majority the input
+stays as the log has it. Of three audio voters two must agree, of two
+and the witness both; a set with one audio voter decides on its engine
+alone, and nothing while that voter is in `starting`. While a rolling
+update has half or more of a configuration's audio voters on a binary
+that reports neither, as 2 of 4, or 1 of 2 beside the witness, no input
+goes down or up. A change the majority keeps for `pruneAfterBlocks`
+blocks (`Timing::prune_after_blocks`, 50 by default, which the product
+sets to its engine's `pruneAfterBlocks`) is returned once by
+`Replica::input_liveness` on the leader, as `Report::InputPruned` or
+`Report::InputReadable`, again after a second while the log does not
+show it, and never while the log already holds that state; the product
+appends it in place of its engine's reports, as an `InputDown` or
+`InputUp` or what it does on a lost input. So a mirror late on one node,
+the leader's included, takes the input down nowhere: that replica reads
+silence, its pages differ from its peers' and the page verdict diverges
+it, and it withholds while the others serve. A majority flapping faster
+than `pruneAfterBlocks` appends nothing. A replica whose clock is not
+verified, its kernel TAI offset not the set's or its clock beyond
+`clockGuard` of a majority, holds no engine core: it reads no input and
+prunes none.
 
 The host needs swap off and `vm.compact_unevictable_allowed=0`, so that
 neither swapping nor compaction moves the locked pages of the RT

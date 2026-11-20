@@ -524,6 +524,10 @@ pub struct Fake {
     /// Times the engine dropped its core for committed entries its RT
     /// thread did not take.
     pub log_overflows: u64,
+    /// The input slots the engine reads and those it does not, by bit, as
+    /// reports carry them ([`Own::readable`]).
+    pub readable: u64,
+    pub unreadable: u64,
 }
 
 /// An open glitch: a state divergence that lasts until a resync or a
@@ -777,6 +781,14 @@ impl FakeAudio {
         self.lock().outputs[output].realised = true;
     }
 
+    /// The engine reads the input slots `readable` and not those of
+    /// `unreadable`, by bit.
+    pub fn set_inputs(&self, readable: u64, unreadable: u64) {
+        let mut st = self.lock();
+        st.readable = readable;
+        st.unreadable = unreadable;
+    }
+
     /// Commit starts and cancels the supervisor names are recorded only.
     pub fn manual(&self) {
         self.lock().manual = true;
@@ -964,6 +976,8 @@ impl Audio for FakeAudio {
                     .iter()
                     .flat_map(|o| o.kept.iter().copied())
                     .collect(),
+                readable: st.readable,
+                unreadable: st.unreadable,
                 ..Own::default()
             },
             status_changes_lost: 0,
@@ -2022,6 +2036,45 @@ impl<P: Product> Set<P> {
             assert!(Instant::now() < deadline, "no leader agreed within 30 s");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Plays a product's part in input liveness for `d`: every
+    /// millisecond, appends what [`Replica::input_liveness`] returns on
+    /// any running replica, as an `InputDown` or `InputUp`.
+    pub async fn follow_liveness(&self, d: Duration) {
+        let until = Instant::now() + d;
+        while Instant::now() < until {
+            for replica in self.replicas.values() {
+                for report in replica.input_liveness() {
+                    let body = match report {
+                        samplez::Report::InputPruned { slot } => Body::InputDown {
+                            slot: slot as u32,
+                            at_index: 0,
+                        },
+                        samplez::Report::InputReadable { slot } => Body::InputUp {
+                            slot: slot as u32,
+                            at_index: 0,
+                        },
+                    };
+                    replica.append(body).expect("an input entry");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The `InputDown` (false) and `InputUp` (true) entries in `id`'s log,
+    /// in order, by slot.
+    pub fn input_entries(&self, id: NodeId) -> Vec<(u32, bool)> {
+        let mut out = Vec::new();
+        self.replica(id)
+            .store()
+            .entries_after(0, |_, request| match request.body {
+                Body::InputDown { slot, .. } => out.push((slot, false)),
+                Body::InputUp { slot, .. } => out.push((slot, true)),
+                _ => {}
+            });
+        out
     }
 
     /// Waits until `id` takes client writes again: within a check of a
