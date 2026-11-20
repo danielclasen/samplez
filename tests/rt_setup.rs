@@ -16,6 +16,14 @@ const CHANNELS: u32 = 4;
 /// Minor faults the RT thread may take in the second after a re-add.
 const MAX_FAULTS: u64 = 2;
 
+/// Held by each test for its whole run: one test's engine, its mapped
+/// rings and its page faults never overlap another's measurement.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Minor page faults of thread `tid`, field 10 of its stat file.
 fn minor_faults(tid: i32) -> u64 {
     let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap();
@@ -35,6 +43,7 @@ fn rlimit(resource: libc::__rlimit_resource_t) -> u64 {
 
 #[test]
 fn rt_setup_degrades_without_privileges_and_the_engine_runs() {
+    let _one = one_at_a_time();
     // SAFETY: getuid has no preconditions.
     assert_ne!(unsafe { libc::getuid() }, 0, "needs a non-root uid");
     assert_eq!(
@@ -171,6 +180,7 @@ fn threads_named(name: &str) -> Vec<i32> {
 /// allowed CPU but the RT thread's, and the RT thread alone on it.
 #[test]
 fn threads_created_after_set_up_stay_off_the_rt_cpu() {
+    let _one = one_at_a_time();
     // A thread of its own: the isolation is that thread's affinity and
     // the inherited affinity of the threads it creates, not the test
     // harness's.
@@ -211,19 +221,17 @@ fn threads_created_after_set_up_stay_off_the_rt_cpu() {
             s.process.isolation
         );
         let others: Vec<usize> = allowed.iter().copied().filter(|&c| c != cpu).collect();
-        let supervisors = threads_named("samplez-supervisor");
-        assert!(!supervisors.is_empty(), "no supervisor thread");
-        // Other tests in this binary may run engines of their own, set up
-        // without pinning; this one's supervisor is among those off `cpu`.
-        assert!(
-            supervisors
-                .iter()
-                .any(|&t| affinity_of(t).as_ref() == Some(&others)),
-            "no supervisor off CPU {cpu}: {:?}",
-            supervisors
-                .iter()
-                .map(|&t| affinity_of(t))
-                .collect::<Vec<_>>()
+        // A thread takes its name from inside itself once it runs, after
+        // it inherited the affinity of the thread that created it: the
+        // supervisor is waited for by name, its affinity fixed already.
+        wait_for(
+            Duration::from_secs(5),
+            "a supervisor off the RT CPU",
+            || {
+                threads_named("samplez-supervisor")
+                    .iter()
+                    .any(|&t| affinity_of(t).as_ref() == Some(&others))
+            },
         );
         // SAFETY: gettid has no preconditions.
         let later = std::thread::spawn(|| cpus_of(unsafe { libc::gettid() }))
@@ -239,6 +247,7 @@ fn threads_created_after_set_up_stay_off_the_rt_cpu() {
 /// `isolateRtCpu: false` leaves the other threads on every allowed CPU.
 #[test]
 fn isolation_can_be_turned_off() {
+    let _one = one_at_a_time();
     std::thread::spawn(|| {
         // SAFETY: gettid has no preconditions.
         let allowed = cpus_of(unsafe { libc::gettid() });
