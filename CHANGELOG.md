@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.19.0](https://github.com/danielclasen/samplez/compare/v0.18.0...v0.19.0) (2026-11-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** the `/readyz` term of an audio replica in contact passes while it commits; once its process has committed since it started, also while another audio replica commits, in any state (`starting`, `withdrawn`, `diverged`, `resync`, `version_mismatch`); before that only in `version_mismatch` below the baseline's versions while another commits. It fails while none commits. A withdrawn replica with no output enabled passes. Out of contact it keeps its last value for `rollout::DEPARTED` (3 s), then passes only while the replica commits. `ReplicaInfo::commitable` holds for an audio replica whose `/readyz` term passes, counted by a leader or not. `resync::Failed` gains `Refused`, and `resync::Metrics` gains `rebuilt_for_key` and `refused`.
+
+### Bug Fixes
+
+* **replica:** hand the baseline over under a Baseline without a key ([d6615b5](https://github.com/danielclasen/samplez/commit/d6615b5250f4bfe980a126e171a97b31aa34d930))
+
 ## [0.18.0](https://github.com/danielclasen/samplez/compare/v0.17.0...v0.18.0) (2026-11-20)
 
 
