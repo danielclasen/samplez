@@ -1521,6 +1521,7 @@ impl Console {
 }
 
 impl Product for Console {
+    const DERIVATION_VERSION: u32 = 1;
     type Change = ();
     const DRIVES_ENGINE: bool = true;
 

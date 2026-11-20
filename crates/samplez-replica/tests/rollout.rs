@@ -9,7 +9,7 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::{BLOCK, Options, Set};
+use harness::{BLOCK, Options, Paths, Set, base_key};
 use samplez::blocks::{Cause, PAGE, Standing};
 use samplez_replica::contact::{Timing, index_at};
 use samplez_replica::entry::{Baseline, Body, NodeId};
@@ -149,6 +149,67 @@ async fn named(set: &Set, at: NodeId, n: NodeId) -> u64 {
     })
     .await;
     baseline(set, at).unwrap().at_index.next_multiple_of(PAGE)
+}
+
+/// The key a build runs with is its own versions' key over the output
+/// config: this build's compute and protocol versions and the product's
+/// derivation version, each in its own field.
+#[test]
+fn the_key_is_this_builds_versions_over_the_output_config() {
+    use samplez_replica::rollout::{self, Versions};
+    use samplez_replica::state_machine::Product;
+    let v = Versions::of::<Paths>();
+    assert_eq!(
+        v,
+        Versions {
+            compute: samplez::COMPUTE_VERSION,
+            protocol: samplez_replica::entry::PROTOCOL,
+            derivation: <Paths as Product>::DERIVATION_VERSION,
+        }
+    );
+    assert_eq!(rollout::key::<Paths>(b"harness"), v.key(b"harness"));
+    assert_eq!(base_key(), v.key(b"harness"));
+}
+
+/// A rollout that keeps the key, a release that bumps no version, restarts
+/// every audio replica pod by pod at the new revision, the target: each
+/// rejoins as a peer and commits again, nothing is handed over, none is
+/// ever `version_mismatch`, and every page stays whole on a member
+/// throughout.
+#[tokio::test(start_paused = true)]
+async fn a_rollout_that_keeps_the_key_rolls_pod_by_pod_without_a_gap() {
+    let mut set = start(vec![a(0), a(1), a(2)]).await;
+    let ids = audio(&set);
+    until("every audio replica committing", 5, || {
+        ids.iter().all(|&id| committing(&set, id))
+    })
+    .await;
+    set.set_target(Some("r2"));
+    // A restart starts the replica's write log anew, so each window is
+    // checked before the next restart, while the replicas that wrote it
+    // still hold their logs.
+    let mut mark = page_now(&set, ids[0]);
+    for &id in ids.iter().rev() {
+        let now = page_now(&set, ids[0]);
+        pages_whole(&set, &ids, mark, now - 1);
+        mark = now - 1;
+        set.set_version(id, base_key(), "r2");
+        set.restart(id).await;
+        until("the restarted replica committing again", 10, || {
+            committing(&set, id)
+        })
+        .await;
+        assert!(
+            ids.iter()
+                .all(|&o| state(&set, o) != Some(ReplicaState::VersionMismatch)),
+            "a replica with the set's key is never version_mismatch"
+        );
+    }
+    sleep(Duration::from_millis(200)).await;
+    let last = page_now(&set, ids[0]);
+    pages_whole(&set, &ids, mark, last - 1);
+    assert_eq!(handed_over(&set), 0, "nothing handed over");
+    assert!(ids.iter().all(|&id| ready(&set, id)), "every replica Ready");
 }
 
 /// A rollout that changes the key, of two audio replicas plus the witness
@@ -294,7 +355,7 @@ async fn an_inbound_cut_n_is_passed_over_and_named_again_once_it_catches_up() {
     }
     let p = named(&set, a(0), n).await;
     until("the filler named again", 10, || {
-        baseline(&set, a(0)).is_some_and(|b| b.replica == a(0) && b.key == Some(1))
+        baseline(&set, a(0)).is_some_and(|b| b.replica == a(0) && b.key == Some(base_key()))
     })
     .await;
     until("the filler committing", 10, || committing(&set, a(0))).await;
@@ -335,7 +396,7 @@ async fn superseded_and_rolled_back_rollouts_follow_the_target() {
     // Rolled back to r1: the baseline moves to a(0)'s key.
     set.set_target(Some("r1"));
     until("a(0) named", 10, || {
-        baseline(&set, a(1)).is_some_and(|b| b.replica == a(0) && b.key == Some(1))
+        baseline(&set, a(1)).is_some_and(|b| b.replica == a(0) && b.key == Some(base_key()))
     })
     .await;
     until("a(0) committing", 10, || committing(&set, a(0))).await;
@@ -457,7 +518,7 @@ async fn an_aborted_rollout_names_an_old_key_replica_again() {
     .await;
     set.set_target(Some("r1"));
     until("an old-key replica named again", 10, || {
-        baseline(&set, a(0)).is_some_and(|b| b.replica != n && b.key == Some(1))
+        baseline(&set, a(0)).is_some_and(|b| b.replica != n && b.key == Some(base_key()))
     })
     .await;
     let old = baseline(&set, a(0)).unwrap().replica;

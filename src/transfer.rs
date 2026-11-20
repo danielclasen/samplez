@@ -29,9 +29,14 @@ use crate::ducks::{DuckChange, DuckCore, DuckSetting, DuckTargets, KeySet};
 use crate::engine::{Entry, Fade};
 use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRESOLVED, slots_of};
 
-/// The engine version a core's encoding carries: a core is replayed only
-/// by the engine that copied it.
-pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version of what the engine computes from its log and inputs, and
+/// of a core's encoding. Bumped only when a release changes either: the
+/// samples or meters an engine computes from the same log and inputs, or
+/// what a core copy holds and means. A core is replayed only by an engine
+/// of the version that copied it, and replicas compute equal pages only
+/// at equal versions, so a release that changes neither keeps it and its
+/// replicas roll into a running set as peers.
+pub const COMPUTE_VERSION: u32 = 1;
 
 /// The highest sample index a decoded core may hold: far beyond any
 /// running engine's, and low enough that adding a ramp or a block to it
@@ -659,21 +664,21 @@ pub struct CoreCopy {
 
 #[derive(Serialize)]
 struct WireOut<'a> {
-    engine: &'a str,
+    engine: u32,
     copy: &'a CoreCopy,
 }
 
 #[derive(Deserialize)]
 struct WireIn {
-    engine: String,
+    engine: serde_json::Value,
     copy: serde_json::Value,
 }
 
 impl CoreCopy {
-    /// The copy as another replica takes it, with [`ENGINE_VERSION`].
+    /// The copy as another replica takes it, with [`COMPUTE_VERSION`].
     pub fn encode(&self) -> String {
         let wire = WireOut {
-            engine: ENGINE_VERSION,
+            engine: COMPUTE_VERSION,
             copy: self,
         };
         serde_json::to_string(&wire).expect("a core encodes")
@@ -683,8 +688,14 @@ impl CoreCopy {
     pub fn decode(encoded: &str) -> Result<CoreCopy, DecodeError> {
         let wire: WireIn =
             serde_json::from_str(encoded).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-        if wire.engine != ENGINE_VERSION {
-            return Err(DecodeError::Version(wire.engine));
+        // A copy from an engine before explicit versions carries its crate
+        // version as a string: another version too.
+        if wire.engine.as_u64() != Some(u64::from(COMPUTE_VERSION)) {
+            let version = wire
+                .engine
+                .as_str()
+                .map_or_else(|| wire.engine.to_string(), str::to_owned);
+            return Err(DecodeError::Version(version));
         }
         let copy: CoreCopy =
             serde_json::from_value(wire.copy).map_err(|e| DecodeError::Malformed(e.to_string()))?;
@@ -711,7 +722,10 @@ impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DecodeError::Version(v) => {
-                write!(f, "a core of engine {v}, this engine is {ENGINE_VERSION}")
+                write!(
+                    f,
+                    "a core of compute version {v}, this engine's is {COMPUTE_VERSION}"
+                )
             }
             DecodeError::Malformed(m) => write!(f, "a malformed core: {m}"),
         }
@@ -1279,10 +1293,19 @@ mod tests {
     /// mean something else here.
     #[test]
     fn a_core_of_another_engine_version_is_refused() {
-        let encoded = copy().encode().replacen(ENGINE_VERSION, "0.0.0-other", 1);
+        let ours = format!("\"engine\":{COMPUTE_VERSION}");
+        let encoded = copy().encode();
+        assert!(encoded.contains(&ours), "{}", &encoded[..40]);
+        let other = encoded.replacen(&ours, &format!("\"engine\":{}", COMPUTE_VERSION + 1), 1);
         assert_eq!(
-            CoreCopy::decode(&encoded),
-            Err(DecodeError::Version("0.0.0-other".to_owned()))
+            CoreCopy::decode(&other),
+            Err(DecodeError::Version((COMPUTE_VERSION + 1).to_string()))
+        );
+        // An engine before explicit versions sent its crate version.
+        let old = encoded.replacen(&ours, "\"engine\":\"0.16.0\"", 1);
+        assert_eq!(
+            CoreCopy::decode(&old),
+            Err(DecodeError::Version("0.16.0".to_owned()))
         );
     }
 
