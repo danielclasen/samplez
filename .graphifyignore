@@ -1,0 +1,23 @@
+# VCS and local worktrees
+.git/
+.claude/worktrees/
+
+# Graphify output and caches
+graphify-out/
+.graphify/
+.graphify-cache/
+
+# Local tool state
+.desloppify/
+scorecard.png
+
+# Build output and the builder container's cargo registry
+target/
+.cargo-registry/
+
+# Logs and checkouts the CI and test scripts write
+*.log
+nmos-specs/
+nmos-testing/
+nmos-results/
+vm/
