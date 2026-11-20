@@ -145,6 +145,10 @@ pub struct Own {
     /// The pod's revision, its `controller-revision-hash` label.
     #[serde(default)]
     pub revision: Option<String>,
+    /// The versions its key holds ([`crate::rollout::Versions`]); none for
+    /// the witness and from a replica that reports none.
+    #[serde(default)]
+    pub versions: Option<crate::rollout::Versions>,
     /// The product configuration hash it applies the log under
     /// ([`crate::state_machine::Product::config_hash`]); none from a
     /// replica that does not report one.

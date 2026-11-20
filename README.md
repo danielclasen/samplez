@@ -1066,6 +1066,44 @@ a change to how either is computed bumps `PROTOCOL`, also where the
 samples stay the same, and the fingerprint value is replaced with that
 bump.
 
+A rollout that changes the key hands the baseline over at a page and
+block boundary P to a replica at the StatefulSet's target revision,
+once that replica is ready and has applied the latest `Baseline`. Each
+replica reports its versions beside its key, and a `Baseline` carries
+the named replica's. Versions are ordered by compute, then protocol,
+then derivation version, and a replica may take the baseline over when
+its versions are greater than or equal to the baseline's (equal ones
+under another key differ by the output config alone). A replica with
+lower versions, such as a pod rolled back, is named only while it fills
+a stop as the previous baseline of a hand-over that did not take, or
+once no live audio replica has carried the baseline's versions for
+`rollout::DEPARTED` (3 s, `membership::UNCOUNTED`), and then only one
+with the highest live versions; a replica unheard for a contact window
+has not departed. A replica that reports no versions ranks below every
+one that does.
+
+A complete rollback therefore stops the outputs from the last report of
+the last replica with the higher versions until the replica named after
+it commits: `DEPARTED`, then the leader's next decision within a
+contact window `w`, the decision lead the `Baseline` is stamped with,
+and the named replica's retarget from product state before its commit
+start. Those pages are whole on no member; every page before and after
+is. The rollback test bounds the gap at `DEPARTED` plus 2 s.
+
+A replica whose key differs from the baseline's is in
+`version_mismatch`: it computes nothing, and it passes `/readyz` while
+another audio replica commits, so the StatefulSet rolls on, and fails
+it while none does. Naming and hand-overs never read the `/readyz` term, so a
+rollout never waits on it. Its contact metrics give its `versions` and,
+in `mismatch`, whether it is awaiting the hand-over or below the
+baseline's versions; `/metrics` has them as `samplez_replica_versions`
+and `samplez_replica_version_mismatch`. A replica stays below the
+baseline's versions only while a newer one is live, which in a rolling
+update lasts one pod restart per replica. An alert on
+`samplez_replica_version_mismatch{reason="below_baseline_versions"} ==
+1` held `for: 10m` fires for a rollout that stopped part way, since a
+replica restart plus `DEPARTED` is well under that per pod.
+
 A replica set agrees on its cluster id through the marker ConfigMap that
 ordinal 0 creates on an empty volume (`bootstrap::Kube`). Given the audio
 StatefulSet's name, the one `rollout::follow` reads, with

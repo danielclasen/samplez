@@ -15,6 +15,7 @@ use crate::contact::{Timing, index_at};
 use crate::entry::{Baseline, Body, NodeId};
 use crate::rank::{Class, demoted};
 use crate::report::Own;
+use crate::rollout::{DEPARTED, Versions, base_gone, may_take_over};
 use crate::state::{PAGES_KEPT, PageBook, ReplicaState, filling, withheld_from};
 use crate::verdict::judge;
 
@@ -94,6 +95,36 @@ pub(crate) struct Leader {
     failed: BTreeMap<NodeId, (u32, Instant)>,
     /// `replica_disagreement`: the last page judged had no strict majority.
     pub disagreement: bool,
+    /// The latest `Baseline`'s versions and when a live audio voter last
+    /// carried them, or this leader first saw them.
+    base_seen: Option<(Option<Versions>, Instant)>,
+    /// No live audio voter has carried the latest `Baseline`'s versions
+    /// for [`DEPARTED`]: lower versions may take it over.
+    gone: bool,
+}
+
+/// The versions of every live audio voter that reported.
+fn live(v: &LeaderView) -> Vec<Option<Versions>> {
+    v.audio
+        .iter()
+        .filter(|a| !a.silent)
+        .filter_map(|a| a.own)
+        .map(|o| o.versions)
+        .collect()
+}
+
+/// The latest `Baseline`'s key and versions; one named before they were
+/// reported carries none, and the named replica's report tells them.
+fn base_of(v: &LeaderView, b: &Baseline) -> (Option<u64>, Option<Versions>) {
+    let named = v
+        .audio
+        .iter()
+        .find(|a| a.id == b.replica)
+        .and_then(|a| a.own);
+    (
+        b.key.or_else(|| named.and_then(|o| o.key)),
+        b.versions.or_else(|| named.and_then(|o| o.versions)),
+    )
 }
 
 fn state(v: &Voter) -> Option<ReplicaState> {
@@ -118,6 +149,7 @@ fn commits_from(own: &Own, p: u64, block: u64) -> bool {
 impl Leader {
     /// The entries the leader appends this period.
     pub fn decide(&mut self, v: &LeaderView, now: Instant) -> Vec<Body> {
+        self.gone = self.base_departed(v, now);
         let mut out = self.verdicts(v, now);
         if let Some((at, sent)) = &self.inflight
             && sent.as_ref() == v.baseline
@@ -143,10 +175,32 @@ impl Leader {
         out
     }
 
+    /// Whether no live audio voter has carried the latest `Baseline`'s
+    /// versions for [`DEPARTED`]. A leader counts from when it first saw
+    /// them, so a new one waits that long too.
+    fn base_departed(&mut self, v: &LeaderView, now: Instant) -> bool {
+        let Some(versions) = v.baseline.map(|b| base_of(v, b).1) else {
+            self.base_seen = None;
+            return false;
+        };
+        let gone_now = base_gone(versions, &live(v));
+        match &mut self.base_seen {
+            Some((seen, at)) if *seen == versions => {
+                if !gone_now {
+                    *at = now;
+                }
+            }
+            _ => self.base_seen = Some((versions, now)),
+        }
+        let since = self.base_seen.map_or(now, |(_, at)| at);
+        gone_now && now.duration_since(since) >= DEPARTED
+    }
+
     /// Leadership is lost: a verdict taken while leading does not rename
     /// a baseline in a later term.
     pub fn step_down(&mut self) {
         self.against = None;
+        self.base_seen = None;
     }
 
     /// The `Baseline` to append, if any.
@@ -208,9 +262,11 @@ impl Leader {
 
     /// The key hand-over: in a rollout that changes the key, a `Baseline`
     /// naming the top target-revision replica with the target's key once
-    /// it is a candidate, has applied the latest `Baseline` and reports
-    /// no block withheld for a cause. A replica passed over, or one that
-    /// never learned of its naming, is named again only then.
+    /// it is a candidate, has applied the latest `Baseline`, reports no
+    /// block withheld for a cause and may take the baseline over by its
+    /// versions ([`may_take_over`]): higher ones, or equal ones under
+    /// another output config. A replica passed over, or one that never
+    /// learned of its naming, is named again only then.
     fn hand_over(&mut self, v: &LeaderView, now: Instant) -> Option<Baseline> {
         let target = v.target?;
         let current = v.baseline?;
@@ -219,17 +275,11 @@ impl Leader {
                 .is_some_and(|o| o.key.is_some() && o.revision.as_deref() == Some(target))
         };
         let key = v.audio.iter().filter(at_target).find_map(|a| a.own?.key)?;
-        // A `Baseline` named before any key was reported carries none:
-        // the named replica's report tells it.
-        let base_key = current.key.or_else(|| {
-            v.audio
-                .iter()
-                .find(|a| a.id == current.replica)
-                .and_then(|a| a.own?.key)
-        });
+        let (base_key, base_versions) = base_of(v, current);
         if base_key.is_none_or(|k| k == key) {
             return None;
         }
+        let live = live(v);
         let n = v
             .audio
             .iter()
@@ -237,6 +287,7 @@ impl Leader {
             .filter(|a| {
                 let own = a.own.expect("reported");
                 own.key == Some(key)
+                    && may_take_over(own.versions, base_versions, self.gone, &live)
                     && self.failed.get(&a.id).is_none_or(|&(_, until)| now >= until)
                     && candidate(v, a)
                     && own.baseline == Some((current.replica, current.at_index))
@@ -251,6 +302,7 @@ impl Leader {
             order: order(v, n.id),
             at_index: 0,
             key: Some(key),
+            versions: n.own.and_then(|o| o.versions),
         })
     }
 
@@ -268,6 +320,7 @@ impl Leader {
             order: order(v, next.id),
             at_index: 0,
             key: next.own.and_then(|o| o.key),
+            versions: next.own.and_then(|o| o.versions),
         })
     }
 
@@ -283,24 +336,52 @@ impl Leader {
             && !lapsed(v, n, p)
     }
 
-    /// The no-committer rule: the top candidate.
+    /// The no-committer rule: the top candidate that may hold the
+    /// baseline. Under a `Baseline` whose versions a live voter still
+    /// carries, that is one with its key, one that may take it over, or
+    /// one filling a stop: a previous baseline's replica whose hand-over
+    /// did not take, which committed up to it. Once none has carried them
+    /// for [`DEPARTED`], one with the highest versions live.
     fn no_committer(&mut self, v: &LeaderView) -> Option<Baseline> {
-        let top = v.audio.iter().filter(|a| candidate(v, a)).min_by_key(|a| {
+        let live = live(v);
+        let base = v.baseline.map(|b| base_of(v, b));
+        let gone = base.is_some() && self.gone;
+        let highest = live.iter().copied().max().flatten();
+        let may = |a: &&Voter| {
             let own = a.own.expect("a candidate reported");
-            let class = if own.state.is_some_and(ReplicaState::diverged) {
-                Class::Diverged
-            } else {
-                Class::Demoted
+            let Some((key, versions)) = base else {
+                return true;
             };
-            let ids: Vec<NodeId> = v.audio.iter().map(|a| a.id).collect();
-            (!filling(own), !own.ready, demoted(a.id, &ids, class))
-        })?;
+            if gone {
+                return own.versions == highest;
+            }
+            filling(own)
+                || key.is_none()
+                || own.key.is_none_or(|k| Some(k) == key)
+                || may_take_over(own.versions, versions, gone, &live)
+        };
+        let top = v
+            .audio
+            .iter()
+            .filter(|a| candidate(v, a))
+            .filter(may)
+            .min_by_key(|a| {
+                let own = a.own.expect("a candidate reported");
+                let class = if own.state.is_some_and(ReplicaState::diverged) {
+                    Class::Diverged
+                } else {
+                    Class::Demoted
+                };
+                let ids: Vec<NodeId> = v.audio.iter().map(|a| a.id).collect();
+                (!filling(own), !own.ready, demoted(a.id, &ids, class))
+            })?;
         self.counts.named += 1;
         Some(Baseline {
             replica: top.id,
             order: order(v, top.id),
             at_index: 0,
             key: top.own.and_then(|o| o.key),
+            versions: top.own.and_then(|o| o.versions),
         })
     }
 
@@ -549,6 +630,7 @@ mod tests {
         judged: BTreeSet<NodeId>,
         pages: PageBook,
         timing: Timing,
+        target: Option<&'static str>,
     }
 
     impl Fixture {
@@ -560,6 +642,7 @@ mod tests {
                 judged: BTreeSet::new(),
                 pages: PageBook::default(),
                 timing: Timing::defaults(B),
+                target: None,
             }
         }
 
@@ -585,7 +668,7 @@ mod tests {
                 timing: &self.timing,
                 floor: index_at(7_000_000),
                 rank: &rank,
-                target: None,
+                target: self.target,
             };
             leader.decide(&v, Instant::now())
         }
@@ -656,6 +739,7 @@ mod tests {
             order: Vec::new(),
             at_index: p - 1,
             key: None,
+            versions: None,
         };
         let mut f = Fixture::new(vec![
             (a(0), false, own(ReplicaState::Withdrawn, k)),
@@ -713,6 +797,7 @@ mod tests {
             order: Vec::new(),
             at_index: 0,
             key: None,
+            versions: None,
         };
         let committing = || Own {
             standing: vec![Standing::Committing { from: 0 }],
@@ -830,6 +915,7 @@ mod tests {
             order: Vec::new(),
             at_index: 0,
             key: None,
+            versions: None,
         });
         let mut leader = Leader::default();
         assert_eq!(named(&f.decide(&mut leader)), Some(a(1)));
@@ -903,6 +989,7 @@ mod tests {
             order: Vec::new(),
             at_index: 0,
             key: None,
+            versions: None,
         };
         let mut f = Fixture::new(vec![
             (a(0), false, committing_own(k)),
@@ -942,6 +1029,7 @@ mod tests {
             order: Vec::new(),
             at_index: p - 1,
             key: None,
+            versions: None,
         };
         let bound = p + PAGE + index_at(18_000_000) + index_at(7_000_000);
         let past = bound / B + 1;
@@ -961,5 +1049,143 @@ mod tests {
             Some(a(0)),
             "named again, filling first"
         );
+    }
+
+    fn versions(compute: u32) -> Option<Versions> {
+        Some(Versions {
+            compute,
+            protocol: 1,
+            derivation: 1,
+        })
+    }
+
+    /// A replica at `revision` with key `key` of `versions`, which applied
+    /// `applied`.
+    fn rolled(
+        state: ReplicaState,
+        key: u64,
+        versions: Option<Versions>,
+        revision: &str,
+        applied: &Baseline,
+    ) -> Own {
+        Own {
+            key: Some(key),
+            versions,
+            revision: Some(revision.to_owned()),
+            baseline: Some((applied.replica, applied.at_index)),
+            ..own(state, 1_000_000)
+        }
+    }
+
+    /// The hand-over names a target-revision replica with another key
+    /// only when its versions are not below the baseline's: higher ones,
+    /// or equal ones under another output config; a lower one, a
+    /// downgrade, is never named while the baseline's versions are live.
+    /// None ranks below any versions and hands over as before when no
+    /// versions are known.
+    #[tokio::test(start_paused = true)]
+    async fn the_hand_over_names_only_versions_not_below_the_baselines() {
+        let b = Baseline {
+            replica: a(0),
+            order: Vec::new(),
+            at_index: 0,
+            key: Some(1),
+            versions: versions(2),
+        };
+        let cases = [
+            (versions(3), versions(2), Some(a(1)), "higher"),
+            (
+                versions(2),
+                versions(2),
+                Some(a(1)),
+                "equal, another config",
+            ),
+            (versions(1), versions(2), None, "a downgrade"),
+            (None, versions(2), None, "none below some"),
+            (versions(1), None, Some(a(1)), "some above none"),
+            (None, None, Some(a(1)), "none known"),
+        ];
+        for (mine, base, want, what) in cases {
+            let b = Baseline {
+                versions: base,
+                ..b.clone()
+            };
+            let mut f = Fixture::new(vec![
+                (
+                    a(0),
+                    false,
+                    rolled(ReplicaState::Committing, 1, base, "r1", &b),
+                ),
+                (
+                    a(1),
+                    false,
+                    rolled(ReplicaState::VersionMismatch, 2, mine, "r2", &b),
+                ),
+            ]);
+            f.baseline = Some(b);
+            f.target = Some("r2");
+            let mut leader = Leader::default();
+            assert_eq!(named(&f.decide(&mut leader)), want, "{what}");
+            assert_eq!(leader.counts.handed_over, u64::from(want.is_some()));
+        }
+    }
+
+    /// With nobody committing, a candidate below the baseline's versions
+    /// is not named while a live voter carries them, though that voter is
+    /// no candidate, nor while it is unheard for less than the departure
+    /// window; once none has carried them for that long, the candidate
+    /// with the highest live versions is, whatever the order says.
+    #[tokio::test(start_paused = true)]
+    async fn the_highest_live_versions_take_over_once_the_baselines_are_gone() {
+        let b = Baseline {
+            replica: a(0),
+            order: Vec::new(),
+            at_index: 0,
+            key: Some(3),
+            versions: versions(3),
+        };
+        let mut unverified = rolled(ReplicaState::Withdrawn, 3, versions(3), "r3", &b);
+        unverified.clock.unverified = true;
+        let mut f = Fixture::new(vec![
+            (a(0), false, unverified),
+            (
+                a(1),
+                false,
+                rolled(ReplicaState::VersionMismatch, 1, versions(1), "r1", &b),
+            ),
+            (
+                a(2),
+                false,
+                rolled(ReplicaState::VersionMismatch, 2, versions(2), "r1", &b),
+            ),
+        ]);
+        f.baseline = Some(b);
+        f.target = Some("r1");
+        let mut leader = Leader::default();
+        assert_eq!(
+            named(&f.decide(&mut leader)),
+            None,
+            "a downgrade while the baseline's versions are live"
+        );
+        // Unheard for less than the departure window: not gone.
+        f.owns[0].1 = true;
+        tokio::time::advance(DEPARTED - Duration::from_millis(10)).await;
+        assert_eq!(named(&f.decide(&mut leader)), None, "unheard, not gone");
+        // Heard again, then unheard: the window starts over.
+        f.owns[0].1 = false;
+        assert_eq!(named(&f.decide(&mut leader)), None);
+        f.owns[0].1 = true;
+        tokio::time::advance(DEPARTED - Duration::from_millis(10)).await;
+        assert_eq!(named(&f.decide(&mut leader)), None, "the window restarted");
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let bodies = f.decide(&mut leader);
+        let named_b = bodies.iter().find_map(|b| match b {
+            Body::Baseline(b) => Some(b.clone()),
+            _ => None,
+        });
+        let named_b = named_b.expect("a Baseline once the baseline's versions are gone");
+        assert_eq!(named_b.replica, a(2), "the highest live versions");
+        assert_eq!(named_b.key, Some(2));
+        assert_eq!(named_b.versions, versions(2));
     }
 }

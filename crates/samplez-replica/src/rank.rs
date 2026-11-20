@@ -273,6 +273,7 @@ mod tests {
             order: order.to_vec(),
             at_index,
             key: None,
+            versions: None,
         }
     }
 

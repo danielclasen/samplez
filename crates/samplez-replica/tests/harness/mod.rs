@@ -13,7 +13,7 @@
 
 #![allow(dead_code)]
 
-use samplez_replica::rollout::Fixed;
+use samplez_replica::rollout::{Fixed, Versions};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -1702,9 +1702,10 @@ pub struct Set<P: Product = Paths> {
     _panics: PanicGuard,
     replicas: BTreeMap<NodeId, Arc<Replica<P>>>,
     audios: BTreeMap<NodeId, Arc<FakeAudio>>,
-    /// Per replica, the compatibility key and revision it starts with
-    /// next; key 1 at revision `r1` when not set.
-    versions: BTreeMap<NodeId, (u64, String)>,
+    /// Per replica, the compatibility key, its versions and the revision
+    /// it starts with next; [`base_key`] and [`base_versions`] at
+    /// revision `r1` when not set.
+    versions: BTreeMap<NodeId, (u64, Option<Versions>, String)>,
     rollouts: BTreeMap<NodeId, Arc<Fixed>>,
     target: Option<String>,
     /// Per replica, what its fake is set to on its next start, before its
@@ -1904,12 +1905,12 @@ impl<P: Product> Set<P> {
             replica
                 .contact(timing, Arc::new(Tai(clock)), engine)
                 .expect("contact starts");
-            let (key, revision) = self
-                .versions
-                .get(&id)
-                .cloned()
-                .unwrap_or((base_key(), "r1".to_owned()));
-            let rollout = Fixed::new(key, Some(revision));
+            let (key, versions, revision) = self.versions.get(&id).cloned().unwrap_or((
+                base_key(),
+                Some(base_versions()),
+                "r1".to_owned(),
+            ));
+            let rollout = Fixed::new(key, versions, Some(revision));
             rollout.set_target(self.target.clone());
             replica.rollout(rollout.clone()).expect("contact runs");
             self.rollouts.insert(id, rollout);
@@ -1934,10 +1935,18 @@ impl<P: Product> Set<P> {
         self.replicas.insert(id, replica);
     }
 
-    /// `id` starts with compatibility key `key` at `revision` from its
-    /// next restart on: its pod rolled to that revision.
-    pub fn set_version(&mut self, id: NodeId, key: u64, revision: &str) {
-        self.versions.insert(id, (key, revision.to_owned()));
+    /// `id` starts with compatibility key `key` of versions `versions` at
+    /// `revision` from its next restart on: its pod rolled to that
+    /// revision.
+    pub fn set_version(
+        &mut self,
+        id: NodeId,
+        key: u64,
+        versions: Option<Versions>,
+        revision: &str,
+    ) {
+        self.versions
+            .insert(id, (key, versions, revision.to_owned()));
     }
 
     /// `set` sets `id`'s fake from its next start on, before its contact
@@ -2187,4 +2196,10 @@ impl Drop for PanicGuard {
 /// to another: this build's versions running [`Paths`].
 pub fn base_key() -> u64 {
     samplez_replica::rollout::key::<Paths>(b"harness")
+}
+
+/// The versions every replica starts with unless a test rolls it to
+/// others: this build's running [`Paths`].
+pub fn base_versions() -> Versions {
+    Versions::of::<Paths>()
 }

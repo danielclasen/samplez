@@ -138,6 +138,28 @@ pub fn filling(own: &Own) -> bool {
             .any(|run| run.status.kind == Kind::Committed && run.status.digest.is_none())
 }
 
+/// Why a replica in `version_mismatch` is there: its versions at or
+/// above the latest `Baseline`'s await the hand-over, and lower ones are
+/// below them until the leader names the replica, which then leaves
+/// `version_mismatch`. A replica keeps no departure clock of the
+/// baseline's versions, so the reason does not follow peers unheard for
+/// a moment.
+fn mismatch(v: &View) -> Mismatch {
+    let base = v.baseline.and_then(|b| {
+        b.versions.or_else(|| {
+            v.peers
+                .iter()
+                .find(|p| p.id == b.replica)
+                .and_then(|p| p.own.versions)
+        })
+    });
+    if crate::rollout::may_take_over(v.own.versions, base, false, &[]) {
+        Mismatch::AwaitingHandOver
+    } else {
+        Mismatch::BelowBaselineVersions
+    }
+}
+
 /// Whether two compatibility keys are known and differ.
 pub fn differs(a: Option<u64>, b: Option<u64>) -> bool {
     matches!((a, b), (Some(a), Some(b)) if a != b)
@@ -203,10 +225,24 @@ struct Start {
     reference: u64,
 }
 
+/// Why a replica is in `version_mismatch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mismatch {
+    /// Its versions may take the baseline over
+    /// ([`crate::rollout::may_take_over`]): the leader names it once it
+    /// is a candidate at the target revision.
+    AwaitingHandOver,
+    /// Its versions are below the baseline's: it is named only once those
+    /// have departed ([`crate::rollout::DEPARTED`]).
+    BelowBaselineVersions,
+}
+
 /// The replica's moves, counted.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Metrics {
     pub state: Option<ReplicaState>,
+    /// Why it is in `version_mismatch`; none in any other state.
+    pub mismatch: Option<Mismatch>,
     /// Commits on the replica's own state where another's were followed:
     /// a named replica that was not filling taking its commit start, and
     /// each fill of a diverged replica.
@@ -391,6 +427,7 @@ impl Life {
             }
         }
         self.metrics.state = Some(self.state);
+        self.metrics.mismatch = (self.state == ReplicaState::VersionMismatch).then(|| mismatch(v));
     }
 
     /// Each output's latest commit start.
@@ -1119,6 +1156,7 @@ mod tests {
             order: Vec::new(),
             at_index,
             key: None,
+            versions: None,
         }
     }
 
