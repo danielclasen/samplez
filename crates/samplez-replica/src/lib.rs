@@ -65,7 +65,9 @@ use crate::entry::{
 };
 use crate::log_store::Store;
 use crate::membership::{Slot, Voters, slot_of};
-use crate::peer::{Forwarded, PeerClient, PeerReply, PeerRequest, PeerResponse, Refused};
+use crate::peer::{
+    Forwarded, LinkCounts, PeerClient, PeerReply, PeerRequest, PeerResponse, Refused,
+};
 use crate::state_machine::{Factory, Product};
 
 openraft::declare_raft_types!(
@@ -1630,12 +1632,15 @@ impl<P: Product> ReplicatedState for Replica<P> {
     }
 
     /// Contact's view of this audio replica, once contact runs: none for
-    /// a single replica.
+    /// a single replica. Then the counts of the connections to each peer.
     fn replica_metrics(&self) -> Vec<ReplicaMetric> {
-        self.shared
+        let mut samples = self
+            .shared
             .contact
             .get()
-            .map_or_else(Vec::new, |c| contact_samples(c.serving(), &c.metrics()))
+            .map_or_else(Vec::new, |c| contact_samples(c.serving(), &c.metrics()));
+        samples.extend(link_samples(&self.shared.peers.link_counts()));
+        samples
     }
 
     fn epoch(&self) -> u64 {
@@ -2018,6 +2023,36 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
         });
     }
     out
+}
+
+/// The `/metrics` samples of the counts of the connections to each peer,
+/// labelled `node`.
+fn link_samples(links: &[LinkCounts]) -> Vec<ReplicaMetric> {
+    let sample = |name: &'static str, help: &'static str, node: NodeId, value: u64| ReplicaMetric {
+        name,
+        help,
+        kind: MetricKind::Counter,
+        labels: vec![("node", node.to_string())],
+        value: value as f64,
+    };
+    // A name's samples stay together.
+    let timeouts = links.iter().map(|l| {
+        sample(
+            "samplez_replica_peer_report_timeouts_total",
+            "Reports to a peer that got no answer within contactWindowMs.",
+            l.node,
+            l.report_timeouts,
+        )
+    });
+    let dials = links.iter().map(|l| {
+        sample(
+            "samplez_replica_peer_dials_total",
+            "Connections dialed to a peer.",
+            l.node,
+            l.dials,
+        )
+    });
+    timeouts.chain(dials).collect()
 }
 
 #[cfg(test)]

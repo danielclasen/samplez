@@ -137,6 +137,17 @@ pub enum Refused {
 
 pub type PeerReply = Result<PeerResponse, Refused>;
 
+/// What a [`PeerClient`] counted of its exchanges with one peer while it
+/// is a member.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkCounts {
+    pub node: NodeId,
+    /// Reports that got no answer within their time, the contact window.
+    pub report_timeouts: u64,
+    /// Connections dialed to it.
+    pub dials: u64,
+}
+
 /// Sends [`PeerRequest`]s: [`net::Pool`] over the peer listener, or a test
 /// harness in process.
 pub trait PeerClient: Send + Sync + 'static {
@@ -149,6 +160,14 @@ pub trait PeerClient: Send + Sync + 'static {
         request: PeerRequest,
         within: Duration,
     ) -> BoxFuture<'a, Result<PeerReply, String>>;
+
+    /// Its counts per peer, by node id; none by default.
+    fn link_counts(&self) -> Vec<LinkCounts> {
+        Vec::new()
+    }
+
+    /// Drops the counts of the peers `keep` refuses.
+    fn retain_links(&self, _keep: &dyn Fn(NodeId) -> bool) {}
 }
 
 /// The peer listener's routes: `POST /raft/<node id>/{append,vote,snapshot}`

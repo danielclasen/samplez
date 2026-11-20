@@ -6,9 +6,11 @@ mod harness;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
 use axum::body::Bytes;
+use axum::serve::ListenerExt;
 use harness::{Paths, RATE, owner, raft_config};
 use openraft::ServerState;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
@@ -16,9 +18,10 @@ use samplez_replica::bootstrap::{Bootstrap, Volume};
 use samplez_replica::dedup::Limits;
 use samplez_replica::entry::NodeId;
 use samplez_replica::membership::slot_of;
-use samplez_replica::net::MAX_IDLE;
+use samplez_replica::net::{DIAL_WITHIN, MAX_IDLE};
 use samplez_replica::net::{Network, Pool};
-use samplez_replica::peer::{self, PeerClient, PeerRequest, Refused};
+use samplez_replica::peer::{self, LinkCounts, PeerClient, PeerRequest, PeerResponse, Refused};
+use samplez_replica::report::{Own, Report};
 use samplez_replica::{MAX_COMMAND_BYTES, Replica, Settings};
 use samplez_service::config::{Tls, TlsMode};
 use samplez_service::replica::{Reason, Resolution};
@@ -422,4 +425,159 @@ async fn a_large_command_neither_wedges_nor_slows_replication() {
         .await
         .expect("committed");
     assert_eq!(small.resolution, Resolution::Applied);
+}
+
+/// A report's time in the tests below, the contact window: 8 ms by
+/// default, longer here for a loaded test host.
+const REPORT_WITHIN: Duration = Duration::from_millis(50);
+
+/// Every other network step of the tests below finishes within this.
+const LIMIT: Duration = Duration::from_secs(5);
+
+fn report() -> PeerRequest {
+    PeerRequest::Report(Box::new(Report {
+        from: 2,
+        seq: 0,
+        sent_at: 0,
+        echo: None,
+        committed: None,
+        own: Own::default(),
+        heard: Vec::new(),
+        listed: Vec::new(),
+        unlisted: None,
+        estimate: None,
+        slack: Vec::new(),
+    }))
+}
+
+/// A peer, node 1, on loopback with mutual TLS, answering every request
+/// `Reported`, request `slow` (counted from 1) only after `delay`, and
+/// counting the connections it accepted. It serves from `after` past the
+/// bind on: a dial before that connects and waits in the TLS handshake.
+struct FakePeer {
+    root: PathBuf,
+    addr: String,
+    pool: Arc<Pool>,
+    accepted: Arc<AtomicUsize>,
+}
+
+impl FakePeer {
+    async fn start(slow: usize, delay: Duration, after: Duration) -> FakePeer {
+        let root = harness::root("fake-peer");
+        std::fs::create_dir_all(&root).unwrap();
+        let ca = authority();
+        let tls = |name| {
+            Arc::new(PeerTls::new(&identity(&root, name, &ca), &Metrics::default()).unwrap())
+        };
+        let (server, client) = (tls("server"), tls("client"));
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap().to_string();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let reply = move |_: Bytes| {
+            let n = requests.fetch_add(1, SeqCst) + 1;
+            async move {
+                if n == slow {
+                    tokio::time::sleep(delay).await;
+                }
+                serde_json::to_vec(&Ok::<_, Refused>(PeerResponse::Reported)).unwrap()
+            }
+        };
+        let router = axum::Router::new().route("/peer/{to}", axum::routing::post(reply));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let listener = server.bind(tcp).unwrap().tap_io(move |_| {
+                counted.fetch_add(1, SeqCst);
+            });
+            let _ = axum::serve(listener, router).await;
+        });
+        FakePeer {
+            root,
+            addr,
+            pool: Pool::new(client, peer::MAX_RESPONSE),
+            accepted,
+        }
+    }
+}
+
+impl Drop for FakePeer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A report answered after its time counts as missed and leaves its
+/// connection to the reports after it: they take it once the late answer
+/// is in, and nothing dials again.
+#[tokio::test]
+async fn a_late_answer_keeps_its_connection() {
+    let peer = FakePeer::start(2, 2 * REPORT_WITHIN, Duration::ZERO).await;
+    let (pool, addr) = (&peer.pool, peer.addr.as_str());
+    let reported = Ok(Ok(PeerResponse::Reported));
+    // The first report dials, with time for that on a loaded host.
+    let first = pool.call(Some(1), addr, report(), LIMIT).await;
+    assert_eq!(first, reported);
+    let late = pool.call(Some(1), addr, report(), REPORT_WITHIN).await;
+    assert!(late.is_err(), "{late:?}");
+    for _ in 0..3 {
+        let next = pool.call(Some(1), addr, report(), LIMIT).await;
+        assert_eq!(next, reported);
+    }
+    assert_eq!(peer.accepted.load(SeqCst), 1, "connections accepted");
+    let counts = LinkCounts {
+        node: 1,
+        report_timeouts: 1,
+        dials: 1,
+    };
+    assert_eq!(pool.link_counts(), [counts]);
+}
+
+/// A peer slower to connect than a report's time, though within
+/// [`DIAL_WITHIN`], is dialed once: the reports missed meanwhile do not
+/// dial again, and the connection serves the first report after it.
+#[tokio::test]
+async fn a_slow_dial_is_dialed_once_and_serves_the_next_report() {
+    let after = 6 * REPORT_WITHIN;
+    assert!(after < DIAL_WITHIN);
+    let peer = FakePeer::start(0, Duration::ZERO, after).await;
+    let (pool, addr) = (&peer.pool, peer.addr.as_str());
+    let deadline = Instant::now() + LIMIT;
+    let mut missed = 0;
+    loop {
+        match pool.call(Some(1), addr, report(), REPORT_WITHIN).await {
+            Ok(Ok(PeerResponse::Reported)) => break,
+            answered => assert!(answered.is_err(), "{answered:?}"),
+        }
+        missed += 1;
+        assert!(Instant::now() < deadline, "no report answered in 5 s");
+    }
+    assert!(missed > 0, "the dial outlasted a report");
+    assert_eq!(peer.accepted.load(SeqCst), 1, "connections accepted");
+    let counts = LinkCounts {
+        node: 1,
+        report_timeouts: missed,
+        dials: 1,
+    };
+    assert_eq!(pool.link_counts(), [counts]);
+}
+
+/// Every replica exposes, per peer labelled `node`, the reports that
+/// got no answer in time and the connections it dialed.
+#[tokio::test]
+async fn the_exposition_carries_report_timeouts_and_dials_per_peer() {
+    let set = Set::start().await;
+    let leader = set.leader().await;
+    let samples = set.replica(leader).replica_metrics();
+    for peer in (1..=3).filter(|&id| id != leader) {
+        let of = |name: &str| {
+            samples
+                .iter()
+                .find(|m| m.name == name && m.labels == [("node", peer.to_string())])
+                .unwrap_or_else(|| panic!("no {name} sample for node {peer}"))
+                .value
+        };
+        assert!(of("samplez_replica_peer_dials_total") >= 1.0);
+        assert_eq!(of("samplez_replica_peer_report_timeouts_total"), 0.0);
+    }
 }

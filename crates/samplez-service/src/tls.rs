@@ -628,6 +628,11 @@ async fn accept_loop(
             .await
             .expect("the semaphore is never closed");
         let (stream, addr) = axum::serve::Listener::accept(&mut tcp).await;
+        // A small answer goes out at once rather than wait for the ACK of
+        // the one before.
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!(%addr, error = %e, "TCP_NODELAY not set");
+        }
         let acceptor = TlsAcceptor::from(config.read().expect("config lock poisoned").clone());
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -1298,6 +1303,27 @@ mod tests {
         });
         let loaded = tls.client_ca.as_ref().unwrap().loaded.lock().unwrap();
         assert!(*loaded == rotated, "the rotated CA is in use");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_connection_has_nodelay_set() {
+        let (cert, key, der) = write_pair("nodelay");
+        let tls = listener_tls(&files(&cert, &key), &Metrics::default());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = tls.listen(tcp, MAX_HANDSHAKES, ACCEPTED_QUEUE).unwrap();
+        let addr = axum::serve::Listener::local_addr(&listener).unwrap();
+        let client = connector(&[&der], None);
+        let handshake = async {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            client.connect(name, tcp).await.unwrap()
+        };
+        let accept = axum::serve::Listener::accept(&mut listener);
+        let (_client, (accepted, _)) =
+            tokio::time::timeout(LIMIT, async { tokio::join!(handshake, accept) })
+                .await
+                .expect("within 5 s");
+        assert!(accepted.get_ref().0.nodelay().unwrap());
     }
 
     #[tokio::test]

@@ -3810,6 +3810,9 @@ pub(crate) async fn run(
                 let members = enter_term(&contact, &metrics);
                 let voters = members.voters();
                 senders.retain(|id, _| voters.contains(id));
+                // Like its silence metrics, a peer's link counts leave
+                // with it, learners' kept while they are members.
+                shared.peers.retain_links(&|id| members.addrs.contains_key(&id));
                 for (to, addr, report) in contact.tick(members) {
                     senders
                         .entry(to)
