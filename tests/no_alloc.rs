@@ -6,7 +6,7 @@
 //! fading it back in, an output disabled, its writer handed back, and
 //! enabled with a new writer, a gain ramp, strip entries switching every
 //! strip unit on across a prune and a re-add, output, meter and input
-//! metering and loudness resets, duck groups keyed, forced and released,
+//! metering, loudness resets and pauses, duck groups keyed, forced and released,
 //! ducking a coefficient whose mask and depth change while it ducks,
 //! with their readings sent, and, for a replicated engine, every path of
 //! the hold ring (see `common::hold_scenario`) with its pages hashed.
@@ -186,6 +186,13 @@ fn rt_thread_allocates_nothing() {
     engine.reset_loudness(0, reset).unwrap();
     // The meter after the output.
     engine.reset_loudness(1, reset).unwrap();
+    // The meter's loudness paused, and run again mid-slice.
+    engine
+        .set_loudness_running(1, false, (index / B + 30) * B)
+        .unwrap();
+    engine
+        .set_loudness_running(1, true, (index / B + 33) * B)
+        .unwrap();
     // The same id again: polled, re-added in a new generation, faded in.
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
     wait_for(Duration::from_secs(10), "input re-added", attached);

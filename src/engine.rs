@@ -39,9 +39,9 @@ use crate::ducks::{DuckMeter, DuckRecord, DuckSetting};
 use crate::meters::{InputMeters, OutputLoudness, OutputMeters};
 use crate::rt::{self, ProcessStatus, RtStatus, Step, ThreadStatus};
 use crate::rt_loop::{
-    BlockVerdict, Change, Command, Control, Counters, Gen, LogId, LoudnessReset, MeterRecord,
-    Metered, Mix, Out, OutMeter, PENDING_CHANGES, Replica, Returned, RingEntry, Rt, RtEntry, SLICE,
-    SPENT, Shared, Slot, SlotStats, Telemetry, UNRESOLVED, bit, slots_of,
+    BlockVerdict, Change, Command, Control, Counters, Gen, LogId, MeterRecord, Metered, Mix, Out,
+    OutMeter, PENDING_CHANGES, Replica, Returned, RingEntry, Rt, RtEntry, SLICE, SPENT, Shared,
+    Slot, SlotStats, Telemetry, UNRESOLVED, bit, slots_of,
 };
 use crate::transfer::{
     Answer, CopyError, Core, CoreCopy, Handover, ProductState, Replay, ReplayError, SlotCore,
@@ -53,8 +53,6 @@ const RETURN_RING: usize = 64;
 const TELEMETRY_RING: usize = 8192;
 /// Seconds of meter records the meter ring holds.
 const METER_RING_SECONDS: usize = 2;
-/// Loudness resets the reset ring holds per output.
-const RESETS_PER_OUTPUT: usize = 4;
 /// Status changes the change ring holds per output, and the fewest
 /// status words per output.
 const CHANGES_PER_OUTPUT: usize = 1024;
@@ -382,6 +380,17 @@ pub enum Entry {
         output: usize,
         mask: u8,
     },
+    /// Runs the loudness measurement of `meter`, an output or after the
+    /// outputs a configured meter, from the entry's index on, or pauses
+    /// it: every 10 ms slice with a sample from a paused span is left out
+    /// of the integrated loudness, the loudness range and the maxima,
+    /// and counted paused, while the momentary and short-term loudness
+    /// keep running. Every meter starts running.
+    LoudnessRun { meter: usize, running: bool },
+    /// Restarts the loudness measurement of `meter` at the first 100 ms
+    /// window starting at or after the entry's index, as
+    /// [`Engine::reset_loudness`] describes.
+    ResetLoudness { meter: usize },
 }
 
 /// Why the engine refused an entry.
@@ -423,33 +432,6 @@ pub enum Report {
     /// The input's head has advanced for a second while it is down.
     InputReadable { slot: usize },
 }
-
-/// Why [`Engine::reset_loudness`] refused a reset.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResetError {
-    /// No such output, or an index that is not a multiple of the block
-    /// size.
-    Invalid(String),
-    /// `at_index` is below `earliest`, the first index the engine accepts.
-    TooNear { at_index: u64, earliest: u64 },
-    /// The loudness reset ring is full.
-    Full,
-}
-
-impl std::fmt::Display for ResetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ResetError::Invalid(m) => write!(f, "{m}"),
-            ResetError::TooNear { at_index, earliest } => write!(
-                f,
-                "at_index {at_index} is below the earliest accepted index {earliest}"
-            ),
-            ResetError::Full => write!(f, "the loudness reset ring is full"),
-        }
-    }
-}
-
-impl std::error::Error for ResetError {}
 
 /// A replicated engine's progress and clock as [`Engine::progress`] reads
 /// them.
@@ -1153,7 +1135,6 @@ pub(crate) fn replay_rt(
         tel: sink(),
         meters: sink(),
         duck_meters: sink(),
-        resets: none(),
         meter_seq: 0,
         counters: Arc::new(Counters::default()),
         stop: Arc::new(AtomicBool::new(false)),
@@ -1208,7 +1189,6 @@ pub struct Engine {
     /// supervisor.
     build_time: Arc<AtomicU64>,
     shape: (usize, usize),
-    resets: Mutex<rtrb::Producer<LoudnessReset>>,
     config: Config,
     /// Replicated mode with more than one voter.
     replica: Option<(Arc<Shared>, Mutex<ReplicaControl>)>,
@@ -1328,9 +1308,6 @@ impl Engine {
         };
         while duck_tx.push(blank).is_ok() {}
         while duck_rx.pop().is_ok() {}
-        let (reset_tx, reset_rx) = rtrb::RingBuffer::new(
-            (RESETS_PER_OUTPUT * (config.outputs.len() + config.meters.len())).max(1),
-        );
         let hold_blocks = config.hold_blocks();
         let alone = voters == 1;
         let hash_tx = hash_tx.filter(|_| reports.is_some() && !alone);
@@ -1520,7 +1497,6 @@ impl Engine {
             tel: tel_tx,
             meters: meter_tx,
             duck_meters: duck_tx,
-            resets: reset_rx,
             meter_seq: 0,
             counters: Arc::clone(&counters),
             stop: Arc::clone(&stop),
@@ -1760,7 +1736,6 @@ impl Engine {
             build_lead,
             build_time,
             shape: (n, m),
-            resets: Mutex::new(reset_tx),
             config,
             replica,
             transfer,
@@ -2313,6 +2288,13 @@ impl Engine {
                 output: slot,
                 enabled,
             },
+            Entry::LoudnessRun { meter, .. } | Entry::ResetLoudness { meter }
+                if meter >= self.config.outputs.len() + self.config.meters.len() =>
+            {
+                return invalid(format!("no output or meter {meter}"));
+            }
+            Entry::LoudnessRun { meter, running } => Change::LoudnessRun { meter, running },
+            Entry::ResetLoudness { meter } => Change::ResetLoudness { meter },
             Entry::InputDown { slot } => Change::InputDown { slot },
             Entry::InputUp { slot } => Change::InputUp { slot },
             Entry::Route { slot, ref flow_id } => {
@@ -2711,7 +2693,10 @@ impl Engine {
             .map(|i| i.max_delay_samples)
             .collect();
         let ramp = self.config.ramp_samples;
-        if !c.fits(n, m, outputs, &legs, &limiters, &delays, ramp, page, ducked) {
+        let meters = outputs + self.config.meters.len();
+        if !c.fits(
+            n, m, outputs, meters, &legs, &limiters, &delays, ramp, page, ducked,
+        ) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
             ));
@@ -2806,6 +2791,7 @@ impl Engine {
             last_id: copy.last_id,
             late: Vec::new(),
             duck_columns: self.config.duck_columns.clone(),
+            meters: self.config.outputs.len() + self.config.meters.len(),
         })
     }
 
@@ -2932,10 +2918,14 @@ impl Engine {
     /// started, the RT thread keeping the generation it holds pending.
     /// Its gains ramp from silence to their targets over the ramp length
     /// from the install, as the strips take their parameters, so an
-    /// output fades in processed. Returns the block the core followed.
+    /// output fades in processed. Each meter's loudness measurement runs
+    /// or is paused from the install on as `loudness_running` and the
+    /// entries the install passed say; the measurement itself is the
+    /// replica's own and carries on. Returns the block the core followed.
     /// An `at_least` further ahead than `timeout` is refused as invalid
     /// before anything changes, as is a state holding a gain, flow or
-    /// strip parameter an entry could not set. A slot whose flow is none
+    /// strip parameter an entry could not set, or more meters than the
+    /// engine has. A slot whose flow is none
     /// is detached: no reader is built for it. The core holds no
     /// unresolved entry: the caller adds the ones still unresolved with
     /// [`Engine::unresolved`] after the install. While no core is held the
@@ -2968,11 +2958,13 @@ impl Engine {
             || state.delays.len() > slots
             || state.outputs.len() > self.config.outputs.len()
             || state.limiters.len() > self.config.outputs.len()
+            || state.loudness_running.len() > self.config.outputs.len() + self.config.meters.len()
         {
             return Err(ReplayError::Invalid(format!(
-                "a product state of the shape {n} x {m} with {slots} inputs and at most {} \
-                 outputs",
-                self.config.outputs.len()
+                "a product state of the shape {n} x {m} with {slots} inputs, at most {} \
+                 outputs and at most {} meters",
+                self.config.outputs.len(),
+                self.config.outputs.len() + self.config.meters.len()
             )));
         }
         for (slot, (flow, params)) in state.flows.iter().zip(&state.strips).enumerate() {
@@ -3097,6 +3089,10 @@ impl Engine {
         let disabled_targets = (self.config.outputs.iter().enumerate())
             .filter(|&(o, cfg)| !state.outputs.get(o).copied().unwrap_or(cfg.enabled))
             .fold(0, |d, (o, _)| d | bit(o));
+        // A bit per meter paused; one past the list runs.
+        let paused_targets = (state.loudness_running.iter().enumerate())
+            .filter(|&(_, &running)| !running)
+            .fold(0u128, |p, (meter, _)| p | crate::rt_loop::meter_bit(meter));
         // Empty for none, as a fill takes them: a state and pending list
         // without masks or depths pay nothing for them.
         let pending_masks = batches.iter().any(|(_, b)| !b.masks.is_empty());
@@ -3150,6 +3146,7 @@ impl Engine {
                 }
                 up.copy_from_slice(&state.up);
                 let mut disabled = disabled_targets;
+                let mut paused = paused_targets;
                 masks.copy_from_slice(&mask_targets);
                 depths.copy_from_slice(&depth_targets);
                 // Whatever a spare core held.
@@ -3161,6 +3158,7 @@ impl Engine {
                 let next = (j + 1) * self.block;
                 let passed = pending.partition_point(|e| e.at_index < next);
                 for e in &pending[..passed] {
+                    paused = e.change.paused_after(paused, batch(e.id));
                     match e.change {
                         Change::Gain {
                             input,
@@ -3183,14 +3181,18 @@ impl Engine {
                         Change::Output { output, enabled } => {
                             disabled = output_disabled(disabled, output, enabled);
                         }
-                        // core holds neither generation nor a strip, limiter or delay:
-                        // RT thread applies a passed re-route, detach, strip, limiter or
-                        // delay entry itself, taken before install or after.
+                        // Folded into `paused` above.
+                        Change::LoudnessRun { .. } => {}
+                        // core holds neither generation nor a strip, limiter or delay,
+                        // nor the meters: RT thread applies a passed re-route, detach,
+                        // strip, limiter, delay or loudness reset entry itself, taken
+                        // before install or after.
                         Change::Route { .. }
                         | Change::Detach { .. }
                         | Change::Strip { .. }
                         | Change::Limiter { .. }
-                        | Change::Delay { .. } => {}
+                        | Change::Delay { .. }
+                        | Change::ResetLoudness { .. } => {}
                         Change::Batch { up: raised, .. } => {
                             if let Some(b) = batch(e.id) {
                                 b.gains.each(|c, g| {
@@ -3274,6 +3276,7 @@ impl Engine {
                 core.entries_page = None;
                 core.entries_lost = false;
                 core.outputs_disabled = disabled;
+                core.loudness_paused = paused;
                 // The RT thread keeps its strips.
                 for ((c, &up), flow) in core.slots.iter_mut().zip(&up).zip(&state.flows) {
                     // An input that is up and attached continues, as it
@@ -3441,40 +3444,37 @@ impl Engine {
 
     /// Restarts the loudness measurement of `meter`, an output or, after
     /// the outputs, a configured meter (the integrated loudness, the
-    /// loudness range, the maxima and the counts of gaps and lost slices)
-    /// at the first 100 ms window starting at or after
-    /// `at_index`, a multiple of the block size; the K-weighting starts
+    /// loudness range, the maxima and the counts of gaps, lost and paused
+    /// slices) at the first 100 ms window starting at or after
+    /// `at_index`, a multiple of the block size, as [`Entry::ResetLoudness`]
+    /// does; the K-weighting starts
     /// from silence there, and the true-peak interpolator keeps the 11
     /// output samples before it. From that index on the integrated
     /// loudness, the loudness range and the maxima depend only on the
     /// output samples from those 11 on, and so do the momentary and
     /// short-term loudness once 0.4 s and 3 s past it: replicas that
     /// computed those samples and reset at the same index agree there.
-    /// `at_index`
-    /// is refused below the same earliest index as [`Engine::set_gain`].
-    /// A reset replaces one still pending for the same meter;
-    /// [`ResetError::Full`] when the reset ring is full.
-    pub fn reset_loudness(&self, meter: usize, at_index: u64) -> Result<(), ResetError> {
-        let st = self.status.lock().expect("status lock");
-        if meter >= st.outputs.len() + st.meters.len() {
-            return Err(ResetError::Invalid(format!("no output or meter {meter}")));
-        }
-        drop(st);
-        if !at_index.is_multiple_of(self.block) {
-            return Err(ResetError::Invalid(format!(
-                "at_index {at_index} is not a multiple of the block size {}",
-                self.block
-            )));
-        }
-        let mut tx = self.resets.lock().expect("reset lock");
-        // A block start, as the index must be: equivalent for the check.
-        let earliest = earliest(&self.api, &self.counters, self.margin, self.lead)
-            .next_multiple_of(self.block);
-        if at_index < earliest {
-            return Err(ResetError::TooNear { at_index, earliest });
-        }
-        tx.push(LoudnessReset { meter, at_index })
-            .map_err(|_| ResetError::Full)
+    /// A reset replaces one whose window is not reached yet. Refused as
+    /// [`Engine::set_gain`] refuses a change, and as invalid for no such
+    /// meter: an engine that follows a replicated log takes the entry
+    /// from the log.
+    pub fn reset_loudness(&self, meter: usize, at_index: u64) -> Result<(), GainError> {
+        let entry = Entry::ResetLoudness { meter };
+        self.set_local_entry(&entry, at_index, "loudness resets")
+    }
+
+    /// Runs the loudness measurement of `meter` from sample index
+    /// `at_index`, a multiple of the block size, or pauses it, as
+    /// [`Entry::LoudnessRun`] does. Refused as
+    /// [`Engine::reset_loudness`] refuses a reset.
+    pub fn set_loudness_running(
+        &self,
+        meter: usize,
+        running: bool,
+        at_index: u64,
+    ) -> Result<(), GainError> {
+        let entry = Entry::LoudnessRun { meter, running };
+        self.set_local_entry(&entry, at_index, "loudness pauses")
     }
 
     /// Stops the RT thread and the supervisor and releases every libmxl
@@ -5342,15 +5342,6 @@ mod tests {
         );
     }
 
-    /// A full reset ring says so, not that gain changes are outstanding.
-    #[test]
-    fn a_full_reset_ring_names_itself() {
-        assert_eq!(
-            ResetError::Full.to_string(),
-            "the loudness reset ring is full"
-        );
-    }
-
     /// Held by each test that starts engines: the test hooks are process
     /// wide, and any engine's RT thread or supervisor takes them.
     static ENGINES: Mutex<()> = Mutex::new(());
@@ -6797,6 +6788,7 @@ mod tests {
             up: Vec::new(),
             flows: Vec::new(),
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
             strips: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -6864,6 +6856,7 @@ mod tests {
             up: Vec::new(),
             flows: Vec::new(),
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
             strips: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -7026,7 +7019,7 @@ mod tests {
                 other => panic!("{other:?}"),
             }
             match e.reset_loudness(0, 0) {
-                Err(ResetError::TooNear { earliest, .. }) => named.push(earliest),
+                Err(GainError::TooNear { earliest, .. }) => named.push(earliest),
                 other => panic!("{other:?}"),
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -7407,6 +7400,18 @@ mod tests {
         skipped: std::ops::Range<u64>,
         diverged: bool,
     ) -> std::collections::BTreeMap<(u32, u64), u8> {
+        (slice_records(s, skipped, diverged).into_iter())
+            .map(|(k, (flags, _))| (k, flags))
+            .collect()
+    }
+
+    /// [`slice_flags`] with the reset each slice carries.
+    #[allow(clippy::type_complexity)]
+    fn slice_records(
+        s: &Scene,
+        skipped: std::ops::Range<u64>,
+        diverged: bool,
+    ) -> std::collections::BTreeMap<(u32, u64), (u8, Option<u64>)> {
         use crate::rt_loop::{Metered, SPAN};
         const B: u64 = 64;
         let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -7492,17 +7497,19 @@ mod tests {
             rt.process(k, u64::MAX);
             shared.diverged.store(false, Relaxed);
         }
-        let mut flags = std::collections::BTreeMap::new();
+        let mut records = std::collections::BTreeMap::new();
         while let Ok(r) = rx.pop() {
             if r.flags & SPAN != 0 {
                 for slice in r.slice..r.slice + u64::from(r.frames) {
-                    flags.insert((r.meter, slice), r.flags & !SPAN);
+                    // A span's reset is its first slice's.
+                    let reset = r.reset().filter(|_| slice == r.slice);
+                    records.insert((r.meter, slice), (r.flags & !SPAN, reset));
                 }
             } else if r.channel == 0 {
-                flags.insert((r.meter, r.slice), r.flags);
+                records.insert((r.meter, r.slice), (r.flags, r.reset()));
             }
         }
-        flags
+        records
     }
 
     /// The gap flags of `flags`.
@@ -7676,6 +7683,97 @@ mod tests {
         }
     }
 
+    /// A mono slot into a mono output (meter 0) and a mono slot into a
+    /// mono configured meter (meter 1), over 240 blocks of 64 samples, a
+    /// slice 7.5 blocks and a window 75:
+    /// - block 4: meter 0 paused, inside slice 0;
+    /// - 15: meter 0 run at the start of slice 2, and meter 1 reset there,
+    ///   at window 1 (block 75);
+    /// - 26: a batch pausing both meters and resetting meter 0 at window
+    ///   1, inside slice 3;
+    /// - 30: meter 0 run at the start of slice 4; 45: meter 1 run at the
+    ///   start of slice 6;
+    /// - 76: meter 0 paused inside slice 10, and 80: reset, at window 2
+    ///   (block 150); 90: run at the start of slice 12;
+    /// - 120: meter 1 reset at window 2; 155: a batch resetting meter 1 at
+    ///   window 3 (block 225) and pausing it, inside slice 20.
+    fn loudness_scene() -> Scene {
+        let run = |meter, running| Item::Change(Change::LoudnessRun { meter, running });
+        let reset = |meter| Item::Change(Change::ResetLoudness { meter });
+        Scene {
+            slots: vec![1, 1],
+            detached: Vec::new(),
+            outputs: vec![1],
+            meters: vec![1],
+            gains: vec![(0, 0, 1.0), (1, 1, 1.0)],
+            entries: vec![
+                (4, vec![run(0, false)]),
+                (15, vec![run(0, true)]),
+                (15, vec![reset(1)]),
+                (26, vec![run(1, false), reset(0), run(0, false)]),
+                (30, vec![run(0, true)]),
+                (45, vec![run(1, true)]),
+                (76, vec![run(0, false)]),
+                (80, vec![reset(0)]),
+                (90, vec![run(0, true)]),
+                (120, vec![reset(1)]),
+                (155, vec![reset(1), run(1, false)]),
+            ],
+            late: None,
+            blocks: 240,
+        }
+    }
+
+    /// A slice carries the paused flag when a sample of it was metered
+    /// with its meter paused by the log, whether the `LoudnessRun` lies
+    /// inside it or at its start, and the reset of a `ResetLoudness` at the
+    /// first window at or after its index, alone or in a batch. Skipped
+    /// slices carry the same flags and resets as computed ones, over
+    /// skips holding such entries, starting or ending at them, and ending
+    /// inside a slice or before a reset's window.
+    #[test]
+    fn skipped_slices_carry_the_pauses_and_resets_computed_ones_do() {
+        use crate::rt_loop::PAUSED;
+        let s = loudness_scene();
+        let computed = slice_records(&s, 0..0, false);
+        let paused = |m: u32, slices: std::ops::Range<u64>| -> Vec<bool> {
+            slices.map(|i| computed[&(m, i)].0 & PAUSED != 0).collect()
+        };
+        assert_eq!(paused(0, 0..6), [true, true, false, true, false, false]);
+        assert_eq!(paused(0, 9..13), [false, true, true, false]);
+        assert_eq!(paused(1, 2..7), [false, true, true, true, false], "meter 1");
+        // Paused from slice 20 to the end.
+        let mut tail = vec![true; 13];
+        tail[0] = false;
+        assert_eq!(paused(1, 19..32), tail);
+        let resets: Vec<(u32, u64, u64)> = (computed.iter())
+            .filter_map(|(&(m, i), &(_, r))| Some((m, i, r?)))
+            .collect();
+        assert_eq!(
+            resets,
+            [
+                (0, 10, 4800),
+                (0, 20, 9600),
+                (1, 10, 4800),
+                (1, 20, 9600),
+                (1, 30, 14_400)
+            ]
+        );
+        for skip in [
+            5..70,
+            3..80,
+            15..90,
+            4..15,
+            26..30,
+            76..90,
+            60..156,
+            152..226,
+            1..239,
+        ] {
+            assert_eq!(slice_records(&s, skip.clone(), false), computed, "{skip:?}");
+        }
+    }
+
     /// A batch of two gains, a trim and an `InputDown` of slot 0, and
     /// with `up` an `InputUp` of slot 0 after them.
     fn batch_of(up: bool) -> (Change, Option<Arc<Batch>>) {
@@ -7836,6 +7934,7 @@ mod tests {
                 up,
                 routed,
                 detached: 0,
+                resets: false,
             },
         };
         assert!(rt.mix.push_with(held, batch).is_ok());
@@ -8283,9 +8382,6 @@ mod tests {
         let (b, b_changes, _rb) = start("0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1e03");
         let now = || time::timestamp_to_index(&api, time::now(&api));
         let reset = (now() + 24_000).next_multiple_of(WINDOW);
-        for e in [&a, &b] {
-            e.reset_loudness(0, reset).unwrap();
-        }
         // The programme ends at `end`, its gains ramping to 0 over one
         // slice; after it no block nor short-term value is above the
         // gates.
@@ -8296,11 +8392,13 @@ mod tests {
             (end, end)
         };
         for e in [&a, &b] {
-            let mut id = 0;
+            e.append(1, reset, Entry::ResetLoudness { meter: 0 })
+                .unwrap();
+            let mut id = 1;
             if down < up {
-                e.append(1, down, Entry::InputDown { slot: 0 }).unwrap();
-                e.append(2, up, Entry::InputUp { slot: 0 }).unwrap();
-                id = 2;
+                e.append(2, down, Entry::InputDown { slot: 0 }).unwrap();
+                e.append(3, up, Entry::InputUp { slot: 0 }).unwrap();
+                id = 3;
             }
             for c in 0..2 {
                 let gain = Entry::Gain {

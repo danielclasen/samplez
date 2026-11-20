@@ -47,6 +47,22 @@ pub struct Targets {
     /// output that starts other than configured is set only by its first
     /// change.
     pub outputs: Vec<bool>,
+    /// Per meter, the outputs then the configured meters, whether its
+    /// loudness measurement runs ([`Entry::LoudnessRun`]); a meter past
+    /// the list, every meter of an empty one, runs. A product lists every
+    /// meter it pauses or ran again: [`Targets::assert`] sets only the
+    /// meters listed.
+    pub loudness_running: Vec<bool>,
+    /// Per meter, shaped as `loudness_running`, its loudness reset epoch;
+    /// a meter past the list, every meter of an empty one, is at 0. A
+    /// product resets a meter's measurement by moving its epoch forward:
+    /// [`Targets::diff`] gives one [`Entry::ResetLoudness`] for a meter
+    /// whose epoch moved forward, however far. The epoch counts forward
+    /// only and wraps: `next` is ahead of `held` when
+    /// `next.wrapping_sub(held)` is in `1..=i32::MAX`, so a move back
+    /// resets nothing. [`Targets::assert`] gives none, so a restamp, a
+    /// void or a rebuild that re-asserts the targets never resets a meter.
+    pub loudness_resets: Vec<u32>,
 }
 
 impl Targets {
@@ -64,7 +80,11 @@ impl Targets {
     /// `Route` for each slot whose flow differs, a `Detach` for one
     /// `next` holds none for; an `Output` for each output whose enabled
     /// state differs, an output past either list compared as enabled,
-    /// whatever start the engine configures for it. Of the other
+    /// whatever start the engine configures for it; a `LoudnessRun` for
+    /// each meter whose running state differs, a meter past either list
+    /// compared as running; a `ResetLoudness` for each meter whose reset
+    /// epoch `next` holds ahead of `self`'s, one however many resets the
+    /// epochs lie apart, as they would all apply at one index. Of the other
     /// targets, one `next` holds and `self` does not counts as
     /// different; one `self` holds and `next` does not gets no entry, so
     /// the engine keeps it.
@@ -121,14 +141,29 @@ impl Targets {
                 entries.push(Entry::Output { slot, enabled });
             }
         }
+        let runs = |t: &Targets, m: usize| t.loudness_running.get(m).copied().unwrap_or(true);
+        for meter in 0..self.loudness_running.len().max(next.loudness_running.len()) {
+            if runs(self, meter) != runs(next, meter) {
+                let running = runs(next, meter);
+                entries.push(Entry::LoudnessRun { meter, running });
+            }
+        }
+        let epoch = |t: &Targets, m: usize| t.loudness_resets.get(m).copied().unwrap_or(0);
+        for meter in 0..self.loudness_resets.len().max(next.loudness_resets.len()) {
+            if ahead(epoch(self, meter), epoch(next, meter)) {
+                entries.push(Entry::ResetLoudness { meter });
+            }
+        }
         entries
     }
 
     /// The entries that set every gain, strip and limiter parameter and
     /// duck setting of `self`, whatever an engine holds, in the order of
     /// [`Targets::diff`], a `Route`, or a `Detach` for a slot without a
-    /// flow, for each of `slots` in ascending order, and an `Output` for
-    /// each output `self` holds. Of the duck masks,
+    /// flow, for each of `slots` in ascending order, an `Output` for
+    /// each output `self` holds and a `LoudnessRun` for each meter it
+    /// holds; never a `ResetLoudness`, a reset being an event and not a
+    /// value. Of the duck masks,
     /// every one other than 0, and a 0 for each coefficient `masked`
     /// holds a mask other than 0 for: an engine holds
     /// a mask other than 0 only where an entry set one, so `masked`, every
@@ -140,6 +175,8 @@ impl Targets {
         let mut entries = Targets::default().diff(&Targets {
             flows: Vec::new(),
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
+            loudness_resets: Vec::new(),
             ..self.clone()
         });
         for (input, row) in self.masks.iter().enumerate() {
@@ -169,8 +206,17 @@ impl Targets {
         for (slot, &enabled) in self.outputs.iter().enumerate() {
             entries.push(Entry::Output { slot, enabled });
         }
+        for (meter, &running) in self.loudness_running.iter().enumerate() {
+            entries.push(Entry::LoudnessRun { meter, running });
+        }
         entries
     }
+}
+
+/// Whether reset epoch `next` lies ahead of `held` on the wrapping
+/// count: by 1 to `i32::MAX`.
+fn ahead(held: u32, next: u32) -> bool {
+    (1..=i32::MAX as u32).contains(&next.wrapping_sub(held))
 }
 
 /// The entry that has slot `slot` read `flow`: a `Route`, or a `Detach`
@@ -626,6 +672,69 @@ mod tests {
         let n = all.len();
         assert_eq!(all[n - 2..], [off(0), on(1)]);
         assert!(matches!(all[n - 3], Entry::Route { slot: 0, .. }));
+    }
+
+    /// A meter's running state is diffed, a meter past a list counting as
+    /// running, after the outputs; asserted, one entry per meter held,
+    /// last, and none twice.
+    #[test]
+    fn a_meters_running_state_is_diffed_and_asserted() {
+        let run = |meter, running| Entry::LoudnessRun { meter, running };
+        let mut next = targets();
+        next.loudness_running = vec![true, false, true];
+        assert_eq!(targets().diff(&next), vec![run(1, false)]);
+        assert_eq!(next.diff(&next), Vec::new());
+        // Past the list a meter runs: dropping a paused one runs it.
+        assert_eq!(next.diff(&targets()), vec![run(1, true)]);
+        next.loudness_running = vec![true];
+        assert_eq!(targets().diff(&next), Vec::new());
+        next.loudness_running = vec![false, true];
+        next.outputs = vec![false];
+        let changed = targets().diff(&next);
+        let n = changed.len();
+        assert_eq!(
+            changed[n - 2..],
+            [
+                Entry::Output {
+                    slot: 0,
+                    enabled: false
+                },
+                run(0, false)
+            ]
+        );
+        let all = next.assert(&[], None);
+        let n = all.len();
+        assert_eq!(all[n - 2..], [run(0, false), run(1, true)]);
+        let runs = all
+            .iter()
+            .filter(|e| matches!(e, Entry::LoudnessRun { .. }))
+            .count();
+        assert_eq!(runs, 2);
+    }
+
+    /// A meter's reset epoch moving forward gives one `ResetLoudness`,
+    /// however far it moved, a meter past a list at 0; an equal epoch or
+    /// one moved back gives none, across the wrap too. Asserted, targets
+    /// give no reset at all.
+    #[test]
+    fn a_reset_epoch_moving_forward_resets_once_and_assert_never() {
+        let reset = |meter| Entry::ResetLoudness { meter };
+        let at = |epochs: Vec<u32>| Targets {
+            loudness_resets: epochs,
+            ..targets()
+        };
+        assert_eq!(targets().diff(&at(vec![0, 1])), vec![reset(1)]);
+        assert_eq!(at(vec![0, 1]).diff(&at(vec![0, 1])), Vec::new());
+        assert_eq!(at(vec![0, 1]).diff(&at(vec![3, 1, 0])), vec![reset(0)]);
+        assert_eq!(at(vec![2]).diff(&at(vec![1])), Vec::new());
+        assert_eq!(at(vec![1]).diff(&targets()), Vec::new());
+        assert_eq!(at(vec![u32::MAX]).diff(&at(vec![0])), vec![reset(0)]);
+        assert_eq!(at(vec![0]).diff(&at(vec![u32::MAX])), Vec::new());
+        let all = at(vec![5, 7]).assert(&[], None);
+        assert!(
+            !all.iter().any(|e| matches!(e, Entry::ResetLoudness { .. })),
+            "{all:?}"
+        );
     }
 
     /// A slot whose flow `next` holds none for is detached, also when

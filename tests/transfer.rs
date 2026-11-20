@@ -803,6 +803,7 @@ fn a_product_state_sets_the_delay() {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -999,6 +1000,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
@@ -1076,6 +1078,7 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1117,6 +1120,7 @@ fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
             up: vec![true],
             flows: vec![Some(src.clone())],
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
             strips: vec![Vec::new()],
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -1194,6 +1198,7 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
@@ -1237,6 +1242,7 @@ fn a_product_entry_the_install_passed_is_folded_in() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: vec![(
@@ -1341,6 +1347,7 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
             up: vec![true, true],
             flows: vec![None, Some(other.clone())],
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
             strips: vec![Vec::new(), Vec::new()],
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -1384,6 +1391,7 @@ fn a_product_state_disables_and_enables_an_output() {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs,
+        loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1446,6 +1454,7 @@ fn a_product_state_sets_the_limiter() {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1657,6 +1666,7 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
 
             strips: vec![Vec::new()],
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: vec![(1, at, strip)],
@@ -1717,6 +1727,7 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
             flows: vec![Some(src.clone())],
             strips: vec![Vec::new()],
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: vec![(1, at, limiter)],
@@ -1783,6 +1794,7 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: Vec::new(),
@@ -1877,6 +1889,7 @@ fn a_route_the_core_carried_is_not_applied_again() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
         pending: vec![(1, at, route)],
@@ -2131,7 +2144,9 @@ fn a_core_with_a_batch_awaiting_its_generation_decodes() {
     wire["copy"]["core"]["awaiting_gen"] = serde_json::json!([{
         "id": wire["copy"]["last_id"],
         "at_index": at,
-        "change": { "Batch": { "strips": true, "up": 1, "routed": 0, "detached": 0 } },
+        "change": { "Batch": {
+            "strips": true, "up": 1, "routed": 0, "detached": 0, "resets": false,
+        } },
     }]);
     let copy = samplez::CoreCopy::decode(&wire.to_string()).unwrap();
     assert!(matches!(h.e.replay(copy), Err(ReplayError::Generation)));
@@ -2235,6 +2250,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
             up: vec![true],
             flows: vec![Some(next.clone())],
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
             strips: vec![vec![trim]],
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -2354,6 +2370,7 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
         up: vec![true, true],
         flows: vec![Some(src0.clone()), Some(next1.clone())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new(), Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -2444,6 +2461,7 @@ fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
             up: vec![true, true],
             flows: vec![Some(next0.clone()), Some(src1.clone())],
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
             strips: vec![Vec::new(), Vec::new()],
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -2626,6 +2644,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
             up: vec![true],
             flows: vec![Some(src.clone())],
             outputs: Vec::new(),
+            loudness_running: Vec::new(),
             strips: vec![Vec::new()],
             ducks: vec![DuckTargets {
                 keys: vec![(0, 0.5)],
@@ -2718,6 +2737,7 @@ fn an_install_leaving_an_output_out_starts_it_as_configured() {
             flows: vec![Some(src.clone())],
             strips: vec![Vec::new()],
             outputs,
+            loudness_running: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),
@@ -3061,6 +3081,7 @@ fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), S
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -3152,6 +3173,7 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: vec![DuckTargets {
             mode: samplez_dsp::DuckMode::On,
@@ -3248,6 +3270,7 @@ fn rebuilt_replica_continues_plain_ramps(chained: bool) -> Result<(), String> {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -3276,10 +3299,12 @@ fn a_rebuilt_replica_continues_chained_plain_ramps() {
     common::undisturbed(|| rebuilt_replica_continues_plain_ramps(true));
 }
 
-/// Replicas agree on the integrated loudness, the loudness range and the
-/// gaps of a measurement over an `InputDown` and the `InputUp` after it:
-/// the slices the log took the input down for are gaps on both, left out
-/// of both measurements, which carry on after the `InputUp`. The
+/// Replicas agree on the integrated loudness, the loudness range, the
+/// gaps, the paused slices and the start of a measurement the log resets,
+/// over an `InputDown` and the `InputUp` after it and a pause and run
+/// both mid-slice: the slices the log took the input down for are gaps on
+/// both, those it held the measurement paused in are paused on both, each
+/// left out of both measurements, which carry on after them. The
 /// programme ends with its gains at 0, after which nothing changes the
 /// measurement; it is compared once both engines delivered a verdict past
 /// that point and metered it. A run that lost a slice, or silenced an
@@ -3304,19 +3329,26 @@ fn replicas_agree_on_the_loudness_and_its_gaps() {
             )
         };
         let before = hs.each_ref().map(losses);
-        let reset = ((now_block() + 40) * B).next_multiple_of(WINDOW);
-        // 3.5 s of programme around half a second down, enough for a
-        // loudness range.
+        let reset = ((now_block() + 100) * B).next_multiple_of(WINDOW);
+        // 5.5 s of programme around half a second down and half a second
+        // paused, enough for a loudness range. The pause starts and ends
+        // inside a slice.
         let down = reset + 72_000;
         let up = down + 24_000;
-        let end = up + 96_000;
+        let pause = up + 48_000 + 5 * B;
+        let run = pause + 24_000 + 2 * B;
+        let end = run + 96_000;
+        let running = |running| Entry::LoudnessRun { meter: 0, running };
         for h in &hs {
-            h.e.reset_loudness(0, reset).unwrap();
-            h.e.append(1, down, Entry::InputDown { slot: 0 }).unwrap();
-            h.e.append(2, up, Entry::InputUp { slot: 0 }).unwrap();
-            h.e.commit(2);
-            gain(&h.e, 3, end, 0, 0.0);
-            gain(&h.e, 4, end, 1, 0.0);
+            h.e.append(1, reset, Entry::ResetLoudness { meter: 0 })
+                .unwrap();
+            h.e.append(2, down, Entry::InputDown { slot: 0 }).unwrap();
+            h.e.append(3, up, Entry::InputUp { slot: 0 }).unwrap();
+            h.e.append(4, pause, running(false)).unwrap();
+            h.e.append(5, run, running(true)).unwrap();
+            h.e.commit(5);
+            gain(&h.e, 6, end, 0, 0.0);
+            gain(&h.e, 7, end, 1, 0.0);
         }
         // Past the gains' ramp and the 3 s of short-term loudness after
         // it, no gating block or short-term value is above the gates. The
@@ -3365,6 +3397,11 @@ fn replicas_agree_on_the_loudness_and_its_gaps() {
         assert_eq!((ma.lost, mb.lost), (0, 0), "slices lost, no cause measured");
         let gaps = (up - down) / SLICE;
         assert_eq!((ma.gaps, mb.gaps), (gaps, gaps), "{ma:?} {mb:?}");
+        // Every slice with a sample from the paused span.
+        let paused = run.div_ceil(SLICE) - pause / SLICE;
+        assert_eq!((ma.paused, mb.paused), (paused, paused), "{ma:?} {mb:?}");
+        assert!(ma.running && mb.running, "{ma:?} {mb:?}");
+        assert_eq!(ma.since, Some(reset), "{ma:?}");
         assert!(ma.integrated.is_some() && ma.range.is_some(), "{ma:?}");
         let bits = |m: &samplez::OutputMeters| {
             (
@@ -3374,6 +3411,134 @@ fn replicas_agree_on_the_loudness_and_its_gaps() {
             )
         };
         assert_eq!(bits(ma), bits(mb), "{ma:?} {mb:?}");
+        Ok(())
+    });
+}
+
+/// A replica rebuilt from a product state while the log holds its
+/// output's loudness paused keeps it paused, and computes its peer's
+/// pages from the first page after the install. Once a reset after the
+/// install restarts both measurements, it counts the slices paused up to
+/// the `LoudnessRun` that runs the meter again as its peer does, and both
+/// agree on the integrated loudness, the range and the start. A run that
+/// skipped, dropped a meter record, went without a core or silenced an
+/// input after the install is disturbed and runs again.
+#[test]
+fn a_rebuilt_replica_keeps_a_meter_paused() {
+    use samplez_dsp::{SLICE, WINDOW};
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _p = Pilot::start(&domain.0, &src, 2, B, 0);
+        let plain = |c: &mut Config| {
+            c.matrix = diagonal(2, 1.0);
+            c.max_catchup_blocks = 50;
+        };
+        let hs = [0; 2].map(|_| hashed_of(&domain, &[(&src, 2)], plain));
+        let [a, c] = &hs;
+        let running = |running| Entry::LoudnessRun { meter: 0, running };
+        let pause = (now_block() + 100) * B;
+        for h in &hs {
+            h.e.append(1, pause, running(false)).unwrap();
+            h.e.commit(1);
+        }
+        c.e.drop_core().unwrap();
+        let state = ProductState {
+            gains: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            fading: Vec::new(),
+            up: vec![true],
+            flows: vec![Some(src.clone())],
+            outputs: Vec::new(),
+            loudness_running: vec![false],
+            strips: vec![Vec::new()],
+            limiters: Vec::new(),
+            delays: Vec::new(),
+            ducks: Vec::new(),
+            masks: Vec::new(),
+            pending: Vec::new(),
+            last_id: 1,
+        };
+        let j =
+            c.e.install_product(&state, pause + B, Duration::from_secs(2))
+                .map_err(|e| format!("install: {e:?}"))?;
+        let losses = |h: &Hashed| {
+            let c = h.e.counters();
+            (
+                h.skipped(),
+                c.meter_dropped.load(Relaxed),
+                c.blocks_without_core.load(Relaxed),
+            )
+        };
+        let before = hs.each_ref().map(losses);
+        // A reset after the install, the meter still paused; run again
+        // inside a slice.
+        let reset = ((now_block() + 100) * B).next_multiple_of(WINDOW);
+        let run = reset + 24_000 + 2 * B;
+        let end = run + 96_000;
+        for h in &hs {
+            h.e.append(2, reset, Entry::ResetLoudness { meter: 0 })
+                .unwrap();
+            h.e.append(3, run, running(true)).unwrap();
+            h.e.commit(3);
+            gain(&h.e, 4, end, 0, 0.0);
+            gain(&h.e, 5, end, 1, 0.0);
+        }
+        let mut pair = Pair::new(a, c);
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        let pages = wait_comparable(&mut pair, from, end / PAGE, 1, 0)?;
+        if let Some((&p, _)) = pages.iter().find(|(_, same)| !**same) {
+            let why = explain(&pair, p, (j + 1) * B);
+            panic!("pages {pages:?} differ after the install: {why}");
+        }
+        let frozen = end + u64::from(RAMP) + 3 * 48_000 + WINDOW;
+        let mut verdicts = [Vec::new(), Vec::new()];
+        try_wait(
+            Duration::from_secs(30),
+            "both measured past the end",
+            || {
+                for (v, h) in verdicts.iter_mut().zip(&hs) {
+                    v.extend(h.verdicts.try_iter());
+                }
+                let past = |v: &Vec<BlockVerdict>| v.iter().any(|v| v.k * B > frozen);
+                let metered = |h: &Hashed| {
+                    let w = h.e.status().outputs[0].meters.window;
+                    w.is_some_and(|w| w * WINDOW > frozen)
+                };
+                verdicts.iter().all(past) && hs.iter().all(metered)
+            },
+        )?;
+        let meters = hs
+            .each_ref()
+            .map(|h| h.e.status().outputs[0].meters.clone());
+        let [ma, mc] = &meters;
+        let after = hs.each_ref().map(losses);
+        if after != before {
+            return Err(format!(
+                "skipped samples, meter records dropped, blocks without a core: \
+                 {before:?} to {after:?}; slices lost: {} and {}",
+                ma.lost, mc.lost
+            ));
+        }
+        for v in verdicts.iter().flatten() {
+            if v.k * B >= reset && v.silenced != 0 {
+                return Err(format!("block {} silenced", v.k));
+            }
+        }
+        assert_eq!((ma.lost, mc.lost), (0, 0), "slices lost, no cause measured");
+        let paused = run.div_ceil(SLICE) - reset / SLICE;
+        assert_eq!((ma.paused, mc.paused), (paused, paused), "{ma:?} {mc:?}");
+        assert!(ma.running && mc.running, "{ma:?} {mc:?}");
+        assert!(ma.integrated.is_some() && ma.range.is_some(), "{ma:?}");
+        let bits = |m: &samplez::OutputMeters| {
+            (
+                m.integrated.map(f64::to_bits),
+                m.range.map(f64::to_bits),
+                m.gaps,
+                m.since,
+            )
+        };
+        assert_eq!(bits(ma), bits(mc), "{ma:?} {mc:?}");
+        assert_eq!(ma.since, Some(reset), "{ma:?}");
         Ok(())
     });
 }

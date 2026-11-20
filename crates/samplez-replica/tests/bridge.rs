@@ -373,6 +373,56 @@ fn a_delay_beyond_the_line_is_replaced_by_none() {
     assert_eq!(copy.core.delay_taps(0).unwrap().to, 0);
 }
 
+/// A `LoudnessRun` or loudness reset of a meter the engine lacks is left
+/// out of a record and counted, one of its own meter passes through; a
+/// product state naming meters beyond the engine's rebuilds it with those
+/// left out, its own meter paused as the state says.
+#[test]
+fn a_loudness_entry_of_a_meter_the_engine_lacks_is_left_out() {
+    let domain = Domain::new();
+    let (engine, audio) = bridge(&domain, 1 << 12);
+    let processed = || engine.progress().and_then(|p| p.processed);
+    wait_for("a block computed", || processed().is_some());
+    let core = || loop {
+        match engine.copy_core(Duration::from_secs(2)) {
+            Err(samplez::CopyError::Passed { .. }) => continue,
+            c => break c.unwrap(),
+        }
+    };
+    let at = (processed().unwrap() + 100) * B;
+    let run = |meter, running| Entry::LoudnessRun { meter, running };
+    let reset = Entry::ResetLoudness { meter: 1 };
+    audio.appended(1, at, &[run(0, false), run(1, false), reset]);
+    audio.committed(1);
+    assert_eq!(audio.sample().entries_filtered, 2);
+    wait_for("its index passed", || processed().unwrap() > at / B + 2);
+    assert!(core().core.meter_paused(0));
+    let state = samplez::ProductState {
+        limiters: Vec::new(),
+        delays: Vec::new(),
+        gains: vec![vec![1.0]],
+        up: vec![true],
+        flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
+        outputs: Vec::new(),
+        loudness_running: vec![false, true, false],
+        strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
+        pending: Vec::new(),
+        fading: Vec::new(),
+        last_id: 1,
+    };
+    audio.drop_engine();
+    assert!(audio.rebuild_engine(&state, 0), "rebuilt");
+    assert!(core().core.meter_paused(0));
+    let mut state = state;
+    state.loudness_running = vec![true, false];
+    state.last_id = 2;
+    audio.drop_engine();
+    assert!(audio.rebuild_engine(&state, 0), "rebuilt running");
+    assert!(!core().core.meter_paused(0));
+}
+
 /// Of the `InputUp`s and `Route`s of one record whose slots lie in two
 /// input domains, the engine builds one generation: those of the domain
 /// of the lowest slot stay, the others are left out.
@@ -554,6 +604,7 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1204,6 +1255,7 @@ fn rebuild_after_a_route() -> Result<(), String> {
         up: vec![true],
         flows: vec![Some(ROUTED.to_owned())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![vec![StripParam::Trim { db: -6.0 }]],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1334,6 +1386,7 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
         up: vec![true, true],
         flows: routed.map(|f| Some(f.to_owned())).to_vec(),
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new(), Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1424,6 +1477,7 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
         outputs: Vec::new(),
+        loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),

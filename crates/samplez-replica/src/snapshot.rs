@@ -58,6 +58,9 @@ pub struct Replicated {
     /// [`crate::state_machine::StateMachine::derived`].
     #[serde(default)]
     pub derived: BTreeMap<u64, Vec<u32>>,
+    /// [`crate::state_machine::StateMachine::resets`].
+    #[serde(default)]
+    pub resets: BTreeMap<u64, Vec<u32>>,
     /// [`crate::state_machine::StateMachine::protocol`].
     #[serde(default)]
     pub protocol: u32,
