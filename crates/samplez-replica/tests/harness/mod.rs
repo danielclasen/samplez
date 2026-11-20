@@ -41,7 +41,7 @@ use samplez_replica::dedup::Limits;
 use samplez_replica::entry::Body;
 use samplez_replica::entry::{NodeId, Origin, SessionKey};
 use samplez_replica::membership::{Slot, slot_of};
-use samplez_replica::peer::{PeerClient, PeerReply, PeerRequest, PeerResponse};
+use samplez_replica::peer::{LinkCounts, PeerClient, PeerReply, PeerRequest, PeerResponse};
 use samplez_replica::report::{ClockFlags, Own, Page, Report, Run, runs};
 use samplez_replica::resync::{CoreReply, Failed, Resynced, Source};
 use samplez_replica::state::ReplicaState;
@@ -1445,6 +1445,8 @@ impl Net {
 pub struct Peers {
     from: NodeId,
     net: Net,
+    /// Per addressee, the reports that got no answer; nothing dials.
+    counts: Mutex<BTreeMap<NodeId, LinkCounts>>,
 }
 
 impl PeerClient for Peers {
@@ -1462,16 +1464,41 @@ impl PeerClient for Peers {
                 let (net, from) = (self.net.clone(), self.from);
                 tokio::spawn(async move {
                     tokio::time::sleep(by).await;
-                    let peers = Peers { from, net };
+                    let peers = Peers {
+                        from,
+                        net,
+                        counts: Mutex::default(),
+                    };
                     let _ = peers.deliver(to, target, request).await;
                 });
                 return Ok(Ok(PeerResponse::Reported));
             }
+            let report = matches!(request, PeerRequest::Report(_));
             let call = self.deliver(to, target, request);
-            tokio::time::timeout(within, call)
+            let reply = tokio::time::timeout(within, call)
                 .await
-                .unwrap_or_else(|_| Err("timed out".into()))
+                .unwrap_or_else(|_| Err("timed out".into()));
+            if report
+                && reply.is_err()
+                && let Some(to) = to
+            {
+                let mut counts = self.counts.lock().unwrap();
+                let counted = counts.entry(to).or_insert(LinkCounts {
+                    node: to,
+                    ..LinkCounts::default()
+                });
+                counted.report_timeouts += 1;
+            }
+            reply
         })
+    }
+
+    fn link_counts(&self) -> Vec<LinkCounts> {
+        self.counts.lock().unwrap().values().copied().collect()
+    }
+
+    fn retain_links(&self, keep: &dyn Fn(NodeId) -> bool) {
+        self.counts.lock().unwrap().retain(|&node, _| keep(node));
     }
 }
 
@@ -1882,6 +1909,7 @@ impl<P: Product> Set<P> {
             Arc::new(Peers {
                 from: id,
                 net: self.net.clone(),
+                counts: Mutex::default(),
             }),
             Arc::new(move || clock.samples()),
         )

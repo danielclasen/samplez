@@ -9,8 +9,10 @@
 //! pinned default feature set leaves out, so they travel as the mirrors
 //! the volume stores.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,11 +38,13 @@ use samplez_service::PeerTls;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
+use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
 use crate::TypeConfig;
 use crate::entry::NodeId;
-use crate::peer::{PeerClient, PeerReply, PeerRequest};
+use crate::peer::{LinkCounts, PeerClient, PeerReply, PeerRequest};
 use crate::snapshot::{StoredEntry, StoredLogId, StoredMembershipConfig, StoredVote};
 
 type Sender = SendRequest<Full<Bytes>>;
@@ -51,13 +55,28 @@ fn host(addr: &str) -> &str {
     host.trim_start_matches('[').trim_end_matches(']')
 }
 
+fn timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "timed out")
+}
+
 /// Opens an HTTP/1.1 connection to `addr`, over TLS when `tls` is given.
 pub(crate) async fn connect(addr: &str, tls: Option<Arc<ClientConfig>>) -> io::Result<Sender> {
-    let tcp = TcpStream::connect(addr).await?;
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(addr).await?.collect();
+    connect_to(&resolved, host(addr), tls).await
+}
+
+/// Opens an HTTP/1.1 connection to the first of `resolved` that takes
+/// it, over TLS to `name` when `tls` is given.
+async fn connect_to(
+    resolved: &[SocketAddr],
+    name: &str,
+    tls: Option<Arc<ClientConfig>>,
+) -> io::Result<Sender> {
+    let tcp = TcpStream::connect(resolved).await?;
     tcp.set_nodelay(true)?;
     match tls {
         Some(config) => {
-            let name = ServerName::try_from(host(addr).to_owned())
+            let name = ServerName::try_from(name.to_owned())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             handshake(TlsConnector::from(config).connect(name, tcp).await?).await
         }
@@ -112,11 +131,122 @@ pub(crate) fn request(
 /// is answered.
 pub const MAX_IDLE: usize = 4;
 
+/// How long a dial (name resolution, TCP connect, TLS and HTTP
+/// handshakes) may take, whatever the time left to the request waiting
+/// for it; and how much longer than its caller waits an exchange may
+/// take to give its connection back, before the connection is closed
+/// and costs a dial.
+pub const DIAL_WITHIN: Duration = Duration::from_secs(1);
+
+/// The connections to one peer address.
+#[derive(Default)]
+struct Peer {
+    idle: Vec<Sender>,
+    /// What the address resolved to, kept until a dial to it fails: a
+    /// peer restarted under the same name may answer at another.
+    resolved: Option<Vec<SocketAddr>>,
+    dialing: bool,
+    /// Dials ended, and the error of the last one when it failed.
+    dials_ended: u64,
+    dial_error: Option<(io::ErrorKind, String)>,
+    /// Exchanges whose caller stopped waiting, each giving its connection
+    /// back once answered.
+    orphaned: usize,
+}
+
+impl Peer {
+    fn take_idle(&mut self) -> Option<Sender> {
+        std::iter::from_fn(|| self.idle.pop()).find(|sender| !sender.is_closed())
+    }
+
+    /// `sender` back in the pool, or closed beyond [`MAX_IDLE`].
+    fn give_back(&mut self, sender: Sender) {
+        if self.idle.len() < MAX_IDLE {
+            self.idle.push(sender);
+        }
+    }
+}
+
+/// The pool's connections, which dials and exchanges running on after
+/// their caller stopped waiting change too.
+#[derive(Default)]
+struct Conns {
+    peers: Mutex<HashMap<String, Peer>>,
+    /// Notified when a connection is given back or a dial ends.
+    changed: Notify,
+}
+
+impl Conns {
+    fn with<T>(&self, addr: &str, f: impl FnOnce(&mut Peer) -> T) -> T {
+        let mut peers = self.peers.lock().expect("pool lock poisoned");
+        f(peers.entry(addr.to_owned()).or_default())
+    }
+}
+
+/// An exchange's state, changed only under the pool lock.
+const RUNNING: u8 = 0;
+const ABANDONED: u8 = 1;
+const DONE: u8 = 2;
+
+/// Counts an exchange whose caller stops waiting before it is done as
+/// orphaned, so that the next request waits for its connection rather
+/// than dial another.
+struct Waiting {
+    conns: Arc<Conns>,
+    addr: String,
+    state: Arc<AtomicU8>,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.conns.with(&self.addr, |peer| {
+            if self.state.load(Ordering::Relaxed) == RUNNING {
+                self.state.store(ABANDONED, Ordering::Relaxed);
+                peer.orphaned += 1;
+            }
+        });
+    }
+}
+
+/// Ends an exchange when dropped, however it ends: gives its connection
+/// back when it was answered, and counts it out of the orphaned ones.
+struct Ended {
+    conns: Arc<Conns>,
+    addr: String,
+    state: Arc<AtomicU8>,
+    answered: Option<Sender>,
+}
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.conns.with(&self.addr, |peer| {
+            if self.state.swap(DONE, Ordering::Relaxed) == ABANDONED {
+                peer.orphaned -= 1;
+            }
+            if let Some(sender) = self.answered.take() {
+                peer.give_back(sender);
+            }
+        });
+        self.conns.changed.notify_waiters();
+    }
+}
+
 /// Connections to the other replicas, kept open between requests, at
 /// most [`MAX_IDLE`] idle ones per peer.
+///
+/// A request that runs out of time does not cost its connection: it
+/// fails at its deadline while the exchange runs on and gives the
+/// connection back once answered. A request finding no idle connection
+/// waits for one given back or dialed and never dials within its own
+/// time: a dial runs on its own within [`DIAL_WITHIN`], one at a time
+/// per peer, none while an orphaned exchange is still to give one back,
+/// and its connection joins the pool whether or not anyone still waits.
+/// An address is resolved on its first dial and again after a dial to
+/// what it resolved to fails.
 pub struct Pool {
     tls: Arc<PeerTls>,
-    idle: Mutex<HashMap<String, Vec<Sender>>>,
+    conns: Arc<Conns>,
+    counts: Mutex<BTreeMap<NodeId, LinkCounts>>,
     max_response: usize,
 }
 
@@ -127,66 +257,156 @@ impl Pool {
     pub fn new(tls: Arc<PeerTls>, max_response: usize) -> Arc<Pool> {
         Arc::new(Pool {
             tls,
-            idle: Mutex::default(),
+            conns: Arc::default(),
+            counts: Mutex::default(),
             max_response,
         })
     }
 
-    /// POSTs `body` to `path` on `addr` within `within`; a status other
-    /// than 200 is an error.
+    fn count(&self, to: NodeId, f: impl FnOnce(&mut LinkCounts)) {
+        let mut counts = self.counts.lock().expect("counts lock poisoned");
+        f(counts.entry(to).or_insert(LinkCounts {
+            node: to,
+            ..LinkCounts::default()
+        }));
+    }
+
+    /// POSTs `body` to `path` on `addr`, node `to` when given, within
+    /// `within`; a status other than 200 is an error.
     async fn post(
         &self,
+        to: Option<NodeId>,
         addr: &str,
         path: &str,
         body: Vec<u8>,
         within: Duration,
     ) -> io::Result<Bytes> {
-        let exchange = async {
-            let idle = self
-                .idle
-                .lock()
-                .expect("pool lock poisoned")
-                .get_mut(addr)
-                .and_then(|idle| {
-                    std::iter::from_fn(|| idle.pop()).find(|sender| !sender.is_closed())
-                });
-            let mut sender = match idle {
-                Some(sender) => sender,
-                None => {
-                    let tls = self.tls.client().map_err(io::Error::other)?;
-                    connect(addr, Some(tls)).await?
-                }
-            };
-            let (status, body) = send(
-                &mut sender,
-                request(Method::POST, host(addr), path, body),
-                self.max_response,
-            )
-            .await?;
-            let mut idle = self.idle.lock().expect("pool lock poisoned");
-            let idle = idle.entry(addr.to_owned()).or_default();
-            if idle.len() < MAX_IDLE {
-                idle.push(sender);
-            }
-            if status != StatusCode::OK {
-                return Err(io::Error::other(format!("{addr}{path}: {status}")));
-            }
-            Ok(body)
-        };
-        tokio::time::timeout(within, exchange)
+        let deadline = Instant::now() + within;
+        let mut sender = tokio::time::timeout_at(deadline, self.ready(to, addr))
             .await
-            .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")))
+            .map_err(|_| timed_out())??;
+        let request = request(Method::POST, host(addr), path, body);
+        let state = Arc::new(AtomicU8::new(RUNNING));
+        let exchange = tokio::spawn({
+            let mut ended = Ended {
+                conns: self.conns.clone(),
+                addr: addr.to_owned(),
+                state: state.clone(),
+                answered: None,
+            };
+            let limit = self.max_response;
+            async move {
+                let sent = tokio::time::timeout_at(
+                    deadline + DIAL_WITHIN,
+                    send(&mut sender, request, limit),
+                )
+                .await
+                .unwrap_or_else(|_| Err(timed_out()));
+                if sent.is_ok() {
+                    ended.answered = Some(sender);
+                }
+                // Dropping `ended` hands an answered connection back.
+                drop(ended);
+                sent
+            }
+        });
+        let _waiting = Waiting {
+            conns: self.conns.clone(),
+            addr: addr.to_owned(),
+            state,
+        };
+        let (status, body) = tokio::time::timeout_at(deadline, exchange)
+            .await
+            .map_err(|_| timed_out())?
+            .map_err(io::Error::other)??;
+        if status != StatusCode::OK {
+            return Err(io::Error::other(format!("{addr}{path}: {status}")));
+        }
+        Ok(body)
     }
+
+    /// A connection to `addr`: an idle one, else the next one given back
+    /// or dialed. The error of a dial that ends while it waits, when no
+    /// connection is idle.
+    async fn ready(&self, to: Option<NodeId>, addr: &str) -> io::Result<Sender> {
+        let mut seen = None;
+        loop {
+            let changed = self.conns.changed.notified();
+            let mut changed = std::pin::pin!(changed);
+            changed.as_mut().enable();
+            let mut start = false;
+            let ready = self.conns.with(addr, |peer| {
+                if let Some(sender) = peer.take_idle() {
+                    return Some(Ok(sender));
+                }
+                let seen = *seen.get_or_insert(peer.dials_ended);
+                if peer.dials_ended != seen
+                    && let Some((kind, error)) = &peer.dial_error
+                {
+                    return Some(Err(io::Error::new(*kind, error.clone())));
+                }
+                if !peer.dialing && peer.orphaned == 0 {
+                    peer.dialing = true;
+                    start = true;
+                }
+                None
+            });
+            if let Some(ready) = ready {
+                return ready;
+            }
+            if start {
+                if let Some(to) = to {
+                    self.count(to, |c| c.dials += 1);
+                }
+                tokio::spawn(dial(self.conns.clone(), self.tls.clone(), addr.to_owned()));
+            }
+            changed.await;
+        }
+    }
+}
+
+/// Dials `addr` within [`DIAL_WITHIN`], to what it resolved to before
+/// when that is known, and adds the connection to the pool.
+async fn dial(conns: Arc<Conns>, tls: Arc<PeerTls>, addr: String) {
+    let resolved = conns.with(&addr, |peer| peer.resolved.clone());
+    let dialed = tokio::time::timeout(DIAL_WITHIN, async {
+        let resolved = match resolved {
+            Some(resolved) => resolved,
+            None => tokio::net::lookup_host(addr.as_str()).await?.collect(),
+        };
+        let tls = tls.client().map_err(io::Error::other)?;
+        let sender = connect_to(&resolved, host(&addr), Some(tls)).await?;
+        Ok::<_, io::Error>((resolved, sender))
+    })
+    .await
+    .unwrap_or_else(|_| Err(timed_out()));
+    conns.with(&addr, |peer| {
+        peer.dialing = false;
+        peer.dials_ended += 1;
+        match dialed {
+            Ok((resolved, sender)) => {
+                peer.resolved = Some(resolved);
+                peer.dial_error = None;
+                peer.give_back(sender);
+            }
+            Err(e) => {
+                peer.resolved = None;
+                peer.dial_error = Some((e.kind(), e.to_string()));
+            }
+        }
+    });
+    conns.changed.notify_waiters();
 }
 
 impl Pool {
     /// The idle connections kept to `addr`.
     pub fn idle(&self, addr: &str) -> usize {
-        self.idle
+        self.conns
+            .peers
             .lock()
             .expect("pool lock poisoned")
             .get(addr)
-            .map_or(0, Vec::len)
+            .map_or(0, |peer| peer.idle.len())
     }
 }
 
@@ -199,14 +419,32 @@ impl PeerClient for Pool {
         within: Duration,
     ) -> BoxFuture<'a, Result<PeerReply, String>> {
         Box::pin(async move {
-            let to = to.map_or_else(|| "any".to_owned(), |id| id.to_string());
+            let report = matches!(request, PeerRequest::Report(_));
+            let path = format!(
+                "/peer/{}",
+                to.map_or_else(|| "any".to_owned(), |id| id.to_string())
+            );
             let body = serde_json::to_vec(&request).expect("encodes");
-            let reply = self
-                .post(addr, &format!("/peer/{to}"), body, within)
-                .await
-                .map_err(|e| e.to_string())?;
+            let reply = self.post(to, addr, &path, body, within).await;
+            if report
+                && let (Some(to), Err(e)) = (to, &reply)
+                && e.kind() == io::ErrorKind::TimedOut
+            {
+                self.count(to, |c| c.report_timeouts += 1);
+            }
+            let reply = reply.map_err(|e| e.to_string())?;
             serde_json::from_slice(&reply).map_err(|e| e.to_string())
         })
+    }
+
+    fn link_counts(&self) -> Vec<LinkCounts> {
+        let counts = self.counts.lock().expect("counts lock poisoned");
+        counts.values().copied().collect()
+    }
+
+    fn retain_links(&self, keep: &dyn Fn(NodeId) -> bool) {
+        let mut counts = self.counts.lock().expect("counts lock poisoned");
+        counts.retain(|&node, _| keep(node));
     }
 }
 
@@ -380,7 +618,7 @@ impl Link {
         let path = format!("/raft/{}/{rpc}", self.to);
         let reply = self
             .pool
-            .post(&self.addr, &path, body, option.hard_ttl())
+            .post(Some(self.to), &self.addr, &path, body, option.hard_ttl())
             .await
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         serde_json::from_slice(&reply).map_err(|e| RPCError::Network(NetworkError::new(&e)))

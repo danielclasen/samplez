@@ -946,6 +946,29 @@ dropped with it when it leaves, so a peer removed and added again
 starts from 0. Both are also `silent_transitions` and `silent_gap_max`
 in each peer's contact metrics.
 
+Reports, like openraft's RPCs and the other peer requests, travel over
+HTTP/1.1 connections on the peer listener's mutual TLS, both ends with
+`TCP_NODELAY`, kept open between requests (`net::Pool`, at most four
+idle per peer). A request that runs out of time, a report at
+`contactWindowMs`, counts as missed then, but its exchange goes on and
+gives the connection back once answered, closing it only one second
+(`net::DIAL_WITHIN`) past the deadline. A request finding no idle
+connection waits for one given back or dialed and never dials within its
+own time: a dial (name resolution, TCP and TLS) runs on its own within
+`DIAL_WITHIN`, one at a time per peer and none while a timed-out exchange
+is still to give a connection back, and its connection joins the pool
+whether or not the request still waits. Until a timed-out exchange
+ends, at most `DIAL_WITHIN` past its deadline, other requests to that
+peer finding no idle connection wait for it rather than dial, each still
+failing at its own deadline. A peer's address is resolved on
+its first dial and again only after a dial to what it resolved to fails,
+since a peer restarted under its name may answer at another. Per peer,
+labelled `node`, `samplez_replica_peer_report_timeouts_total` counts
+reports with no answer within `contactWindowMs` and
+`samplez_replica_peer_dials_total` every connection dialed, the first
+included. Contact drops both when the peer leaves the membership, so a
+peer removed and added again starts from 0.
+
 A replica catching up, its log having taken no entry past the commit
 index the first voter report named before that entry's deadline since
 it started or installed a snapshot, as one restarted takes the entries

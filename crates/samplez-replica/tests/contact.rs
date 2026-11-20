@@ -5,6 +5,7 @@
 
 mod harness;
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use harness::{BLOCK, Options, Set};
@@ -482,4 +483,49 @@ async fn the_exposition_carries_both_silence_metrics_per_peer() {
         of("samplez_replica_peer_silent_transitions_total", peer);
         of("samplez_replica_peer_longest_silent_gap_seconds", peer);
     }
+}
+
+/// A peer that leaves the membership leaves the exposition: its silence
+/// metrics and its link counts go with it, so a set whose members change
+/// keeps no series of former members.
+#[tokio::test(start_paused = true)]
+async fn a_removed_peer_leaves_no_series_in_the_exposition() {
+    use samplez_service::ReplicatedState;
+    let mut set = start().await;
+    let leader = set.leader().await;
+    let gone = set.ids().find(|&id| id != leader).unwrap();
+    let rest: BTreeSet<NodeId> = set.ids().filter(|&id| id != gone).collect();
+    // The per-peer series labelled `gone` on each remaining replica.
+    let series = |set: &Set| {
+        let label = ("node", gone.to_string());
+        (rest.iter())
+            .flat_map(|&id| set.replica(id).replica_metrics())
+            .filter(|m| m.name.starts_with("samplez_replica_peer_") && m.labels.contains(&label))
+            .map(|m| m.name)
+            .collect::<BTreeSet<_>>()
+    };
+
+    // Crashed first, so that it does not ask to join again; its reports
+    // stop and the leader's to it get no answer.
+    set.crash(gone).await;
+    sleep(Duration::from_millis(50)).await;
+    let before = series(&set);
+    for name in [
+        "samplez_replica_peer_silent_transitions_total",
+        "samplez_replica_peer_longest_silent_gap_seconds",
+        "samplez_replica_peer_report_timeouts_total",
+        "samplez_replica_peer_dials_total",
+    ] {
+        assert!(before.contains(name), "no {name} before the removal");
+    }
+
+    let raft = set.replica(leader).raft().clone();
+    raft.change_membership(
+        openraft::ChangeMembers::ReplaceAllVoters(rest.clone()),
+        false,
+    )
+    .await
+    .expect("removed");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(series(&set), BTreeSet::new(), "series of a former member");
 }
