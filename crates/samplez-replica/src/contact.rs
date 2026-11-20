@@ -586,6 +586,11 @@ struct Peer {
     delay: Histogram,
     gaps: Histogram,
     gaps_over_window: u64,
+    /// Times it went from heard to held silent.
+    silent_transitions: u64,
+    /// The longest time from its last report heard to the next, over the
+    /// gaps in which it was held silent.
+    silent_gap_max: Duration,
     reports: u64,
 }
 
@@ -974,6 +979,11 @@ pub struct PeerMetrics {
     /// The longest gap between two of its reports, and those above w.
     pub gap_max: Duration,
     pub gaps_over_window: u64,
+    /// Times this replica went from hearing it to holding it silent.
+    pub silent_transitions: u64,
+    /// The longest time from its last report heard to the next, over the
+    /// gaps in which this replica held it silent.
+    pub silent_gap_max: Duration,
     /// This replica holds it silent.
     pub silent: bool,
     /// Its clock minus this one's, from the latest exchange, ns.
@@ -1197,6 +1207,7 @@ impl Contact {
                 .map(|&(_, t)| t)
         };
         let t1 = report.echo.and_then(|e| sent_at(e.seq));
+        let regained = st.regained;
         let peer = st.peers.entry(report.from).or_default();
         // A copy, or a report delayed past a newer one from the same
         // process.
@@ -1210,6 +1221,13 @@ impl Contact {
         peer.reports += 1;
         if let Some(last) = &peer.last {
             let gap = since(now, last.received);
+            if peer.silent {
+                // Silence is only held while in contact, so the gap
+                // counts from the later of the last report and the
+                // time contact was regained, as the tick does.
+                let held = since(now, last.received.max(regained));
+                peer.silent_gap_max = peer.silent_gap_max.max(held);
+            }
             peer.gaps.add(gap.as_nanos() as u64);
             if gap > w {
                 peer.gaps_over_window += 1;
@@ -1466,7 +1484,11 @@ impl Contact {
                 .last
                 .as_ref()
                 .map_or(regained, |d| d.received.max(regained));
+            let was_silent = p.silent;
             p.silent = in_contact && since(now, from) > w;
+            if p.silent && !was_silent {
+                p.silent_transitions += 1;
+            }
             if p.silent {
                 p.silent_at = Some(tai);
             }
@@ -3624,6 +3646,8 @@ impl Contact {
                     delay_p9999: p.delay.quantile(0.9999).map(Duration::from_nanos),
                     gap_max: Duration::from_nanos(p.gaps.max()),
                     gaps_over_window: p.gaps_over_window,
+                    silent_transitions: p.silent_transitions,
+                    silent_gap_max: p.silent_gap_max,
                     silent: p.silent,
                     offset_ns: p.offset_ns,
                 })
