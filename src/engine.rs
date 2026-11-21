@@ -1073,7 +1073,11 @@ fn new_meters(config: &Config) -> (Vec<Metered>, Vec<Metered>) {
     for i in &config.inputs {
         taps.push(Metered {
             first_channel: channel,
-            meter: OutMeter::without_true_peak(i.channels as usize),
+            meter: if i.true_peak {
+                OutMeter::new(i.channels as usize)
+            } else {
+                OutMeter::without_true_peak(i.channels as usize)
+            },
         });
         channel += i.channels as usize;
     }
@@ -3949,8 +3953,8 @@ impl Supervisor {
             for (m, l) in st.meters.iter_mut().zip(meters) {
                 m.meters.clone_from(&l.meters);
             }
-            for (i, l) in st.inputs.iter_mut().zip(inputs) {
-                i.meters.update(&l.meters);
+            for ((i, l), c) in st.inputs.iter_mut().zip(inputs).zip(&self.config.inputs) {
+                i.meters.update(&l.meters, c.true_peak);
             }
         }
     }
@@ -7378,6 +7382,96 @@ mod tests {
                 assert!(same, "block {k} leg {ch}");
             }
         }
+    }
+
+    /// Two loops metering a 9.6 kHz tone input with `truePeak`, the
+    /// second skipping blocks as after an overrun up to a window
+    /// boundary, read the same true peak, bit for bit, in every 100 ms
+    /// window both meter whole, the one after the skip included, and the
+    /// same largest true peak: after the skip the interpolator restarts
+    /// and leaves out the outputs that reach back over it. The tone's
+    /// samples fall 18 degrees off its crest, so every window reads the
+    /// true peak `TruePeak` computes from the formula, above the sample
+    /// peak. Fails with `self.tp_skip = TP_HISTORY` dropped from
+    /// `OutMeter::add`, the window after the skip then reading the
+    /// interpolator's rise from silence, and with that reset dropped
+    /// whole, the window then reading history from before the skip.
+    #[test]
+    fn an_input_true_peak_is_the_same_bits_across_an_overrun_skip() {
+        let mut config = tone_config();
+        config.inputs[0].true_peak = true;
+        let api = samplez_mxl::load(&config.libmxl).unwrap();
+        let b = u64::from(config.block_size);
+        let (f, level) = (9600, samplez_dsp::tone::level_gain(-6.0));
+        // Ending on a window boundary, so the window after it is metered
+        // whole, and not a multiple of the tone's 5-sample period long, so
+        // history kept across it is out of phase.
+        let skip = 2003..2100;
+        assert!((skip.end * b).is_multiple_of(4800));
+        assert!(!((skip.end - skip.start) * b).is_multiple_of(5));
+        let run = |skip: &std::ops::Range<u64>| {
+            let (hashes, _) = rtrb::RingBuffer::new(1);
+            let (_, control) = rtrb::RingBuffer::new(1);
+            let mut rt = replay_rt(&config, &api, Vec::new(), hashes, control);
+            // As the engine's loop, its input meters included.
+            rt.replay = false;
+            (rt.buses, rt.taps) = new_meters(&config);
+            let (meters, mut rx) = rtrb::RingBuffer::new(1 << 10);
+            rt.meters = meters;
+            let (ducks, _ducks) = rtrb::RingBuffer::new(1 << 10);
+            rt.duck_meters = ducks;
+            let (ret, _back) = rtrb::RingBuffer::new(64);
+            rt.ret = ret;
+            let params = ToneParams {
+                frequency_hz: f,
+                level_db: -6.0,
+                ident: false,
+            };
+            let change = Change::Tone { slot: 0, params };
+            assert!(rt.mix.push(RtEntry {
+                id: 1,
+                at_index: 0,
+                change,
+            }));
+            let tap = config.outputs.len() as u32;
+            let mut l = OutputLoudness::new(config.inputs[0].loudness_weights().unwrap());
+            let mut windows = std::collections::BTreeMap::new();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            for k in (0..2400).filter(|k| !skip.contains(k)) {
+                rt.process(k, u64::MAX);
+                while let Ok(r) = rx.pop() {
+                    if r.meter == tap {
+                        l.record(&r);
+                    }
+                }
+                if let Some(w) = l.meters.window {
+                    windows.insert(w, (bits(&l.meters.true_peak), bits(&l.meters.peak)));
+                }
+            }
+            (windows, bits(&l.meters.max_true_peak))
+        };
+        let (whole, max) = run(&(0..0));
+        let (skipped, skipped_max) = run(&skip);
+        let after = skip.end * b / 4800;
+        assert!(!skipped.contains_key(&(after - 1)) && skipped.contains_key(&after));
+        let x: Vec<f32> = (0..71)
+            .map(|n| level * samplez_dsp::tone::sine(n, f, 48_000))
+            .collect();
+        let mut tp = samplez_dsp::TruePeak::new(1, 64);
+        tp.process(0, &x[..samplez_dsp::TruePeak::HISTORY]);
+        let want = tp.process(0, &x[samplez_dsp::TruePeak::HISTORY..]);
+        let peak = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(want > peak * 1.04, "{want} {peak}");
+        for (w, (true_peak, peak)) in &whole {
+            if *w > 0 {
+                assert_eq!(*true_peak, [want.to_bits(); 2], "window {w}");
+                assert!(peak.iter().all(|&p| f32::from_bits(p) < want));
+            }
+            if let Some(s) = skipped.get(w) {
+                assert_eq!(s.0, *true_peak, "window {w}");
+            }
+        }
+        assert_eq!(skipped_max, max);
     }
 
     /// Tone parameters are checked against the configuration: a slot

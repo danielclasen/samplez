@@ -974,7 +974,8 @@ impl OutMeter {
         }
     }
 
-    /// An input's meter: sample peak, power and K-weighted power only.
+    /// An input's meter without `truePeak`: sample peak, power and
+    /// K-weighted power only.
     pub fn without_true_peak(channels: usize) -> Self {
         Self {
             tp: None,
@@ -4174,8 +4175,9 @@ mod tests {
         }
     }
 
-    /// An input's meter measures what an output's does but the true peak:
-    /// the same sample peaks and powers, bit for bit, and a true peak of 0.
+    /// An input's meter without `truePeak` measures what an output's does
+    /// but the true peak: the same sample peaks and powers, bit for bit,
+    /// and a true peak of 0.
     #[test]
     fn an_input_meter_is_an_output_meter_without_true_peak() {
         let (mut tx, mut rx) = rtrb::RingBuffer::new(1 << 12);
