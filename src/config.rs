@@ -161,6 +161,14 @@ pub struct Input {
     /// this length plus `historySlackMs`, are allocated at start.
     #[serde(default)]
     pub max_delay_samples: u32,
+    /// Meters the input's true peak per channel, as an output's: 48
+    /// multiply-adds per sample per channel on the RT thread. Off by
+    /// default; the input's meters then carry no true peak. Meters are
+    /// per replica and enter no page hash, so replicas that differ in it
+    /// compute the same pages; a product may still keep it in its
+    /// configuration hash to keep the meters of a set alike.
+    #[serde(default)]
+    pub true_peak: bool,
 }
 
 /// A tone generator's configuration: none beyond its presence, `{}`.

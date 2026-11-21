@@ -121,6 +121,67 @@ fn a_tone_input_is_its_formula_metered_and_never_late() {
     common::stop(e);
 }
 
+/// An input meters its true peak where its config sets `truePeak`: a
+/// 9.6 kHz tone at -6 dBFS, whose samples fall 18 degrees off its crest,
+/// reads the true peak `TruePeak` computes from its formula, 0.36 dB
+/// above its sample peak and within 0.1 dB of its crest, the level. The
+/// same tone on an input without it reads no true peak. Fails with
+/// `OutMeter::without_true_peak` kept for every input in `new_meters`,
+/// whose input meter then reads the sample peak as its true peak.
+#[test]
+fn an_input_meters_its_true_peak_where_its_config_asks() {
+    let domain = Domain::new();
+    let dst = new_id();
+    let tone = |name: &str, true_peak: bool| serde_json::json!({ "name": name, "tone": {}, "channels": 2, "truePeak": true_peak });
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": MARGIN,
+        "rampSamples": RAMP,
+        "libmxl": common::libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [tone("tp", true), tone("plain", false)],
+        "outputs": [{ "name": "out", "domain": "d", "flowId": dst, "label": "tone",
+                      "group": "samplez-test", "role": "Audio", "channels": 2 }],
+        "matrix": [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (e, rx) = common::start(Config::parse(&v.to_string()).unwrap());
+    wait_for(Duration::from_secs(5), "output created", || {
+        e.status().outputs[0].realised
+    });
+    let (f, level) = (9600, level_gain(-6.0));
+    let at = (now(&rx) + 100) * B;
+    for slot in 0..2 {
+        let params = ToneParams {
+            frequency_hz: f,
+            level_db: -6.0,
+            ident: false,
+        };
+        e.set_tone(slot, params, at).unwrap();
+    }
+    let after = |w: Option<u64>| w.is_some_and(|w| w * 4800 >= at + u64::from(RAMP) + 4800);
+    wait_for(Duration::from_secs(10), "meters past the level", || {
+        let s = e.status();
+        after(s.inputs[0].meters.window) && after(s.inputs[1].meters.window)
+    });
+    let x: Vec<f32> = (0..71).map(|n| level * sine(n, f, 48_000)).collect();
+    let mut tp = samplez_dsp::TruePeak::new(1, 64);
+    tp.process(0, &x[..samplez_dsp::TruePeak::HISTORY]);
+    let want = tp.process(0, &x[samplez_dsp::TruePeak::HISTORY..]);
+    let db = |v: f32| 20.0 * f64::from(v).log10();
+    let s = e.status();
+    let (m, plain) = (&s.inputs[0].meters, &s.inputs[1].meters);
+    for c in 0..2 {
+        assert_eq!(m.true_peak[c].to_bits(), want.to_bits(), "{m:?}");
+        assert!(m.max_true_peak[c] >= want, "{m:?}");
+        assert!((db(want) - db(m.peak[c]) - 0.36).abs() < 0.01, "{m:?}");
+        assert!((db(want) - db(level)).abs() < 0.1, "{m:?}");
+    }
+    assert!(plain.true_peak.is_empty() && plain.max_true_peak.is_empty());
+    assert_eq!(plain.peak, m.peak, "{plain:?}");
+    common::stop(e);
+}
+
 /// Tone entries out of range, on a slot that reads flows or on no slot
 /// are refused when appended or set, and the entries of a flow are
 /// refused for a tone generator: `InputDown`, `InputUp`, `Route` and

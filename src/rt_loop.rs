@@ -875,7 +875,8 @@ pub(crate) struct MeterRecord {
     /// slices it covers.
     pub frames: u32,
     pub peak: f32,
-    /// 0 for an input, whose meter has no true peak.
+    /// 0 for an input whose config does not set `truePeak`, whose meter
+    /// has no true peak.
     pub true_peak: f32,
     /// Sum of squares of the K-weighted samples.
     pub sum_sq: f64,
@@ -933,8 +934,9 @@ impl MeterRecord {
     }
 }
 
-/// Per metered channel: sample peak, true peak (none on an input) and
-/// K-weighted power of the slice in progress, sent at its end.
+/// Per metered channel: sample peak, true peak (none on an input whose
+/// config does not set `truePeak`) and K-weighted power of the slice in
+/// progress, sent at its end.
 pub(crate) struct OutMeter {
     pub tp: Option<TruePeak>,
     pub kw: KWeighting,
@@ -974,7 +976,8 @@ impl OutMeter {
         }
     }
 
-    /// An input's meter: sample peak, power and K-weighted power only.
+    /// An input's meter without `truePeak`: sample peak, power and
+    /// K-weighted power only.
     pub fn without_true_peak(channels: usize) -> Self {
         Self {
             tp: None,
@@ -4174,8 +4177,9 @@ mod tests {
         }
     }
 
-    /// An input's meter measures what an output's does but the true peak:
-    /// the same sample peaks and powers, bit for bit, and a true peak of 0.
+    /// An input's meter without `truePeak` measures what an output's does
+    /// but the true peak: the same sample peaks and powers, bit for bit,
+    /// and a true peak of 0.
     #[test]
     fn an_input_meter_is_an_output_meter_without_true_peak() {
         let (mut tx, mut rx) = rtrb::RingBuffer::new(1 << 12);
