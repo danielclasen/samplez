@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.22.0](https://github.com/danielclasen/samplez/compare/v0.21.0...v0.22.0) (2026-11-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** resync::Metrics has a new public field, rebuilt_writing_nothing, so code that builds it with a struct literal must set it.
+
+### Bug Fixes
+
+* **replica:** rebuild a diverged replica with every output disabled ([#179](https://github.com/danielclasen/samplez/issues/179)) ([b1c6af0](https://github.com/danielclasen/samplez/commit/b1c6af0d6ed67938202e74642a8cabd34080b122))
+
 ## [0.21.0](https://github.com/danielclasen/samplez/compare/v0.20.0...v0.21.0) (2026-11-21)
 
 
