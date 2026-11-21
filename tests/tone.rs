@@ -132,9 +132,7 @@ fn a_tone_input_is_its_formula_metered_and_never_late() {
 fn an_input_meters_its_true_peak_where_its_config_asks() {
     let domain = Domain::new();
     let dst = new_id();
-    let tone = |name: &str, true_peak: bool| {
-        serde_json::json!({ "name": name, "tone": {}, "channels": 2, "truePeak": true_peak })
-    };
+    let tone = |name: &str, true_peak: bool| serde_json::json!({ "name": name, "tone": {}, "channels": 2, "truePeak": true_peak });
     let v = serde_json::json!({
         "blockSize": B,
         "readerMarginSamples": MARGIN,
