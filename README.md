@@ -1465,27 +1465,24 @@ product's non-RT runtime.
 - Resource versions are TAI times. `Nmos::new` reads them from the
   product's `TaiClock`. `Nmos::with_versions` takes them only from the
   product, so instances serving one Node, such as a replica set's,
-  serve the same versions when fed the same changes: a port's version is
-  the TAI time of the change in the product's replicated state that last
-  changed it, given at start, by `Nmos::set_versions` (as at a leader
-  takeover; it never moves one back) and with each change by
-  `Nmos::replicated_change`, or the next nanosecond after the port's own
-  where that is not earlier. A sender's Source and Flow and a receiver's
-  caps carry the port's version, and the Node and the Device the latest
-  of all. An activation the node serves, and a failed apply, change
-  `/active` without a new version; the product reports the replicated
-  change of a served activation with `Nmos::replicated_change` and no
-  connection, which moves the version only and keeps the activations
-  queued behind it.
-- Scheduled activations are held in memory: a restart drops them.
-- No IS-10 or BCP-003-01: the APIs answer without authentication, and
-  the registration client sends no credentials and uses registries
-  advertising `api_proto=http` and `api_auth=false` only, so no TLS.
-- No peer-to-peer mode: without a registry the node is not advertised.
+  serve the same documents when fed the same changes. A served
+  activation writes `/active` but leaves the IS-04 resource and its
+  version; the product takes the change from `Nmos::activation` in its
+  `apply`, replicates it, and every instance passes it to
+  `Nmos::replicated_change` with the change's TAI time in the replicated
+  state. The port's version becomes that time, or the next nanosecond
+  after its own where that is not earlier, and is returned for the
+  product to keep: `Nmos::with_versions` at start and
+  `Nmos::set_versions` at a takeover (which never moves one back) take
+  it. A sender's Source and Flow and a receiver's caps carry the port's
+  version, the Node and the Device the latest of all. A failed apply
+  changes only the port's status, and the product replicates what its
+  state holds instead. `/staged` and pending scheduled activations are
+  each instance's own.
 - A 200 on a process's first Node POST deletes the Node and registers it
-  anew, as IS-04 asks of a restarted Node, and so does a 400, a Node held
-  at a later version, as after a replica set is rebuilt under the same
-  Node id. With
+  anew, as IS-04 asks of a restarted Node, and so does a 400 whose error
+  names a later held version or carries no error, as after a replica set
+  is rebuilt under the same Node id. With
   `NmosConfig::continue_held` the process heartbeats first instead and,
   when the registry still holds the Node, gives every resource a new
   version (with `Nmos::with_versions` each keeps its own) and posts it

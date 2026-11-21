@@ -43,6 +43,48 @@ pub struct Active {
     pub flow: Option<Uuid>,
 }
 
+/// How an IS-05 activation was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationMode {
+    Immediate,
+    ScheduledAbsolute,
+    ScheduledRelative,
+}
+
+/// An IS-05 activation as `/active` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activation {
+    pub mode: ActivationMode,
+    /// `requested_time` as the controller sent it, `None` for an
+    /// immediate activation.
+    pub requested: Option<String>,
+    /// `activation_time`.
+    pub time: Tai,
+}
+
+/// A port's change as a product replicates it to every instance, for
+/// [`crate::Nmos::replicated_change`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replicated {
+    pub active: Active,
+    /// The activation behind it, from [`crate::Nmos::activation`]; `None`
+    /// for a change the product made itself, which leaves the activation
+    /// `/active` shows as it is.
+    pub activation: Option<Activation>,
+}
+
+/// What [`crate::Nmos::replicated_change`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamped {
+    /// The port's version now: what the product keeps for
+    /// [`crate::Nmos::with_versions`] and [`crate::Nmos::set_versions`],
+    /// so an instance restored from it serves what its peers serve.
+    pub version: Tai,
+    /// The change's generation, as [`crate::Nmos::external_change`]
+    /// returns it; for a served activation the port's last one.
+    pub generation: u64,
+}
+
 /// What a port's domain holds under a flow id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowSeen {

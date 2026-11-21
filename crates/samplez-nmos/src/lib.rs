@@ -37,8 +37,8 @@ pub use model::{
 };
 pub use product::DEFAULT_APPLY_TIMEOUT;
 pub use product::{
-    Active, Applied, BoxFuture, Connections, Fail, FlowSeen, NmosStatus, NoStore, Port, PortKey,
-    PortStatus, Reject, Store,
+    Activation, ActivationMode, Active, Applied, BoxFuture, Connections, Fail, FlowSeen,
+    NmosStatus, NoStore, Port, PortKey, PortStatus, Reject, Replicated, Stamped, Store,
 };
 pub use tai::{SystemTai, Tai, TaiClock};
 pub use uuid;
@@ -122,7 +122,14 @@ impl State {
 
     /// With shared versions, after a port's version moved: a sender's
     /// Source and Flow take the sender's version, the Node and the Device
-    /// the latest of all, so instances fed the same changes agree.
+    /// the latest of all, and a receiver's caps its receiver's
+    /// ([`resources`]). This is deliberate: their content never changes,
+    /// but their version has to be the same on every instance and must not
+    /// go back across a takeover or a restore, and the crate keeps no
+    /// replicated state of its own that could hold one. A version derived
+    /// from the ports' replicated versions is both; the cost is a re-post
+    /// of the Node, the Device and a sender's Source and Flow with each
+    /// change of a port.
     fn derive(&mut self) {
         let mut latest = Tai::default();
         for s in &mut self.senders {
@@ -230,13 +237,19 @@ impl Nmos {
     /// Source and Flow carry the sender's version, a receiver's caps the
     /// receiver's, and the Node and the Device the latest of all.
     ///
-    /// An activation the node serves writes `/active` without a new
-    /// version, and so does a failed apply; the product reports the change
-    /// it replicates for a served activation with
-    /// [`Nmos::replicated_change`]. A continued registration
-    /// ([`NmosConfig::continue_held`]) keeps the versions as they are.
-    /// Every instance advertises the same host and port, as the Node
-    /// carries them.
+    /// An activation the node serves writes `/active` and leaves the
+    /// IS-04 resource and its version as they are: in its
+    /// [`Connections::apply`] the product takes the change from
+    /// [`Nmos::activation`] and replicates it, and every instance, the
+    /// serving one included, passes it to [`Nmos::replicated_change`], so
+    /// `/active` and the resources are the replicated ones everywhere. A
+    /// failed apply changes nothing but the port's status: the product
+    /// replicates what its state then holds for the port, such as the
+    /// connection before or one with `master_enable` false. `/staged` is
+    /// each instance's own, as is a scheduled activation still pending. A
+    /// continued registration ([`NmosConfig::continue_held`]) keeps the
+    /// versions as they are. Every instance advertises the same host and
+    /// port, as the Node carries them.
     pub fn with_versions(
         model: NodeModel,
         cfg: NmosConfig,
@@ -395,6 +408,7 @@ impl Nmos {
         let mut st = self.inner.lock();
         let version = st.bump(now);
         let p = st.port_mut(port);
+        p.published = active.clone();
         p.active = active;
         p.version = version;
         p.applied = Applied::Applied;
@@ -405,17 +419,25 @@ impl Nmos {
     /// built with [`Nmos::with_versions`]; `version` is the change's TAI
     /// time there. The port's version becomes `version`, or the next after
     /// its own where that is not earlier, so it increases also for two
-    /// changes at one time.
+    /// changes at one time; the IS-04 resource shows `change.active` from
+    /// now on. Returns the version set, which the product keeps, and the
+    /// generation.
     ///
-    /// `Some(active)` is a change as [`Nmos::external_change`] makes it,
-    /// for one that came from another instance or that the product made
-    /// itself, and returns its generation. `None` is an activation this
-    /// node served, whose connection `/active` already shows: only the
-    /// version moves, and the activations queued behind it still reach the
-    /// product; it returns the port's last generation.
+    /// `served` is true on the instance that served the activation behind
+    /// the change, whose `/active` already shows it: the activations queued
+    /// behind it still reach the product. Otherwise the change is one as
+    /// [`Nmos::external_change`] makes it, from another instance or by the
+    /// product itself, and `/active` shows `change.active` with
+    /// `change.activation`.
     ///
     /// Panics on a node built with [`Nmos::new`].
-    pub fn replicated_change(&self, port: Port, active: Option<Active>, version: Tai) -> u64 {
+    pub fn replicated_change(
+        &self,
+        port: Port,
+        change: &Replicated,
+        version: Tai,
+        served: bool,
+    ) -> Stamped {
         assert!(
             self.inner.shared,
             "nmos: replicated_change needs a node built with with_versions"
@@ -423,16 +445,30 @@ impl Nmos {
         let mut st = self.inner.lock();
         let p = st.port_mut(port);
         p.version = version.max(p.version.next());
-        let generation = match active {
-            Some(active) => {
-                p.active = active;
-                p.applied = Applied::Applied;
-                p.changed_by_product()
+        p.published = change.active.clone();
+        let generation = if served {
+            p.generation()
+        } else {
+            p.active = change.active.clone();
+            if let Some(a) = &change.activation {
+                p.active_activation = connection::Activation::of(a);
             }
-            None => p.generation(),
+            p.applied = Applied::Applied;
+            p.changed_by_product()
         };
+        let version = p.version;
         st.derive();
-        generation
+        Stamped {
+            version,
+            generation,
+        }
+    }
+
+    /// The change the [`Connections::apply`] call of `generation` makes,
+    /// the connection and the activation `/active` shows for it, while
+    /// that call is with the product; for the product to replicate.
+    pub fn activation(&self, port: Port, generation: u64) -> Option<Replicated> {
+        self.inner.lock().port(port).in_flight(generation)
     }
 
     /// Moves each port's version up to the one `versions` holds for it,

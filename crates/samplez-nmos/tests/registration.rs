@@ -191,8 +191,12 @@ async fn answer(
         return reply(status, location);
     }
     let v: Value = serde_json::from_slice(&body).unwrap();
+    let refused = |error: String| {
+        let body = json!({ "code": 400, "error": error, "debug": null });
+        (StatusCode::BAD_REQUEST, body.to_string()).into_response()
+    };
     if m.refuse == v["type"].as_str() {
-        return reply(StatusCode::BAD_REQUEST, None);
+        return refused("Bad Request; schema validation failed".into());
     }
     let id = v["data"]["id"].as_str().unwrap().to_owned();
     // nmos-cpp: a changed document at a version not newer is refused.
@@ -205,7 +209,12 @@ async fn answer(
         && *held != v["data"]
         && tai(version(&v["data"])) <= tai(version(held))
     {
-        return reply(StatusCode::BAD_REQUEST, None);
+        // nmos-cpp's error.
+        return refused(format!(
+            "Bad Request; request for registration with version {} conflicts with the existing registration with version {}",
+            version(&v["data"]),
+            version(held)
+        ));
     }
     m.docs.insert(id.clone(), v["data"].clone());
     let known = !m.ids.insert(id) || m.mode == Some(Mode::FirstRegistration);
@@ -572,6 +581,21 @@ async fn a_fresh_node_refused_for_a_later_held_version_is_registered_anew() {
         ]
     );
     assert_eq!(types(&seen)[..2], ["node".to_owned(), "node".to_owned()]);
+}
+
+/// A fresh Node refused for another reason than a later held version is
+/// not deleted: a repost cannot cure it, and the registration goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_node_refused_for_another_reason_is_not_deleted() {
+    let r = Registry::start(Mode::Up).await;
+    r.state.lock().unwrap().refuse = Some("node");
+    let n = node(&[&r], Duration::ZERO);
+    let task = tokio::spawn(n.registration());
+    until("a heartbeat", || r.seen().iter().any(Seen::is_heartbeat)).await;
+    task.abort();
+    let seen = r.seen();
+    assert!(seen.iter().all(|s| s.method != Method::DELETE));
+    assert_eq!(types(&seen)[..2], ["node".to_owned(), "device".to_owned()]);
 }
 
 /// With versions from the product, a continued registration posts the

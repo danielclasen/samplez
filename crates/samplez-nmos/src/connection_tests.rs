@@ -1086,8 +1086,14 @@ async fn a_served_activation_takes_its_version_from_the_replicated_change() {
     }
     assert_eq!(is04(&n, "receivers", &r).await["version"], "7:0");
     settle().await;
-    assert_eq!(fake.calls.lock().unwrap().len(), 1);
-    n.replicated_change(Port::Receiver(0), None, Tai::new(8, 0));
+    let generation = {
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        calls[0].4
+    };
+    let change = n.activation(Port::Receiver(0), generation).unwrap();
+    assert_eq!(change.active.flow, Some(OTHER));
+    n.replicated_change(Port::Receiver(0), &change, Tai::new(8, 0), true);
     assert_eq!(is04(&n, "receivers", &r).await["version"], "8:0");
     assert_eq!(
         leg(&active(&n, "receivers", &r).await)["mxl_flow_id"],
@@ -1098,6 +1104,37 @@ async fn a_served_activation_takes_its_version_from_the_replicated_change() {
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert_eq!(calls[1].1.flow, Some(THIRD));
     assert_eq!(n.status().ports[1].applied, Applied::Applied);
+}
+
+/// With shared versions a failed apply is recorded and nothing else: the
+/// product replicates what its state holds, so no instance shows a
+/// connection or a version of its own.
+#[tokio::test(start_paused = true)]
+async fn a_failed_apply_with_shared_versions_changes_only_the_status() {
+    let fake = Arc::new(Fake::default());
+    fake.results
+        .lock()
+        .unwrap()
+        .push_back((Duration::ZERO, Err(Fail("refused".into()))));
+    let n = Nmos::with_versions(
+        model(),
+        config(),
+        fake.clone(),
+        &NoStore,
+        fake.clock.clone(),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let r = receiver(&n, 0);
+    let body = json!({ "transport_params": [{ "mxl_flow_id": OTHER }], "activation": { "mode": "activate_immediate" } });
+    assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    let before = is04(&n, "receivers", &r).await;
+    settle().await;
+    assert_eq!(active(&n, "receivers", &r).await["master_enable"], true);
+    assert_eq!(is04(&n, "receivers", &r).await, before);
+    let status = &n.status().ports[1];
+    assert_eq!(status.applied, Applied::Failed("refused".into()));
+    assert_eq!(status.failures, 1);
 }
 
 #[tokio::test(start_paused = true)]

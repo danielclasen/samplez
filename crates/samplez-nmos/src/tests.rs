@@ -13,6 +13,7 @@ use super::*;
 pub(crate) const DOMAIN: Uuid = uuid::uuid!("11111111-2222-4333-8444-555555555555");
 pub(crate) const OUT_FLOW: Uuid = uuid::uuid!("aaaaaaaa-0000-4000-8000-000000000001");
 pub(crate) const IN_FLOW: Uuid = uuid::uuid!("aaaaaaaa-0000-4000-8000-000000000002");
+const OTHER_RECEIVER: Uuid = uuid::uuid!("bbbbbbbb-0000-4000-8000-000000000005");
 
 /// A clock tests step by hand.
 #[derive(Clone)]
@@ -548,16 +549,8 @@ fn bump_never_repeats_or_goes_back() {
     assert_eq!(d, Tai::new(9, 0));
 }
 
-fn shared(clock: Clock, versions: &BTreeMap<PortKey, Tai>) -> Nmos {
-    Nmos::with_versions(
-        model(),
-        config(),
-        Arc::new(Fake::default()),
-        &NoStore,
-        clock,
-        versions,
-    )
-    .unwrap()
+fn shared(fake: Arc<Fake>, clock: Clock, versions: &BTreeMap<PortKey, Tai>) -> Nmos {
+    Nmos::with_versions(model(), config(), fake, &NoStore, clock, versions).unwrap()
 }
 
 /// The version of every resource the Node API serves and of each
@@ -583,43 +576,92 @@ async fn all_versions(n: &Nmos) -> BTreeMap<String, String> {
     all
 }
 
+/// The bytes `n` answers a GET of `path` with.
+async fn raw(n: &Nmos, path: &str) -> Vec<u8> {
+    let req = Request::get(path).body(Body::empty()).unwrap();
+    let resp = n.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+/// Every Node API document and every port's `/active`, as bytes.
+async fn documents(n: &Nmos) -> Vec<Vec<u8>> {
+    let mut all = vec![raw(n, &format!("{N}/self")).await];
+    for kind in ["devices", "sources", "flows", "senders", "receivers"] {
+        all.push(raw(n, &format!("{N}/{kind}")).await);
+    }
+    let ids = &n.inner.ids;
+    let c = "/x-nmos/connection/v1.2/single";
+    all.push(raw(n, &format!("{c}/senders/{}/active", ids.senders[0].sender)).await);
+    for r in &ids.receivers {
+        all.push(raw(n, &format!("{c}/receivers/{r}/active")).await);
+    }
+    all
+}
+
 /// Instances of a replicated product, their clocks apart, serve the same
-/// version for every resource once fed the same changes, also where one
-/// of them served the activation behind a change: a registry sees no
-/// change when another instance takes the registration over.
-#[tokio::test]
-async fn instances_fed_the_same_changes_serve_the_same_versions() {
+/// documents byte for byte, versions included, once fed the same changes,
+/// also where one of them served the activation behind a change: a
+/// registry sees no change when another instance takes the registration
+/// over. Until the change is replicated, the serving instance's resource
+/// stays as its version says.
+#[tokio::test(start_paused = true)]
+async fn instances_fed_the_same_changes_serve_the_same_documents() {
     let start = BTreeMap::from([
         (PortKey::Sender("pgm".into()), Tai::new(100, 0)),
         (PortKey::Receiver("pgm".into()), Tai::new(200, 0)),
     ]);
-    // Both clocks read later than every change, so a version read from
-    // either would show.
-    let a = shared(Clock::at(5_000_000), &start);
-    let b = shared(Clock::at(9_000_000), &start);
-    assert_eq!(all_versions(&a).await, all_versions(&b).await);
+    // Both clocks read later than every change, so a version or a time
+    // read from either would show.
+    let fake = Arc::new(Fake::default());
+    let a = shared(fake.clone(), Clock::at(5_000_000), &start);
+    let b = shared(Arc::new(Fake::default()), Clock::at(9_000_000), &start);
+    assert_eq!(documents(&a).await, documents(&b).await);
     let s = a.inner.ids.senders[0].sender;
     let body = serde_json::json!({
         "master_enable": false,
+        "receiver_id": OTHER_RECEIVER,
         "activation": { "mode": "activate_immediate" },
     });
     let path = format!("/x-nmos/connection/v1.2/single/senders/{s}/staged");
     let (status, _, v) = call(&a, "PATCH", &path, Some(body)).await;
     assert_eq!(status, StatusCode::OK, "{v}");
-    let served = a.status().ports[0].active.clone();
-    assert!(!served.master_enable);
-    let switched = Active {
-        master_enable: true,
-        peer: None,
-        domain: Some(DOMAIN),
-        flow: Some(IN_FLOW),
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let sender = format!("{N}/senders/{s}");
+    assert_eq!(raw(&a, &sender).await, raw(&b, &sender).await);
+    // The product's apply takes the change and replicates it.
+    let generation = fake.calls.lock().unwrap()[0].4;
+    let change = a.activation(Port::Sender(0), generation).unwrap();
+    assert!(!change.active.master_enable);
+    assert_eq!(change.active.peer, Some(OTHER_RECEIVER));
+    let activation = change.activation.clone().unwrap();
+    assert_eq!(activation.mode, ActivationMode::Immediate);
+    assert_eq!(activation.time, Tai::new(5_000_000, 0));
+    let at = Tai::new(300, 0);
+    assert_eq!(
+        a.replicated_change(Port::Sender(0), &change, at, true)
+            .version,
+        at
+    );
+    assert_eq!(
+        b.replicated_change(Port::Sender(0), &change, at, false)
+            .version,
+        at
+    );
+    let switched = Replicated {
+        active: Active {
+            master_enable: true,
+            peer: None,
+            domain: Some(DOMAIN),
+            flow: Some(IN_FLOW),
+        },
+        activation: None,
     };
-    // a served the activation, b learns it from the replicated state.
-    a.replicated_change(Port::Sender(0), None, Tai::new(300, 0));
-    b.replicated_change(Port::Sender(0), Some(served.clone()), Tai::new(300, 0));
-    assert_eq!(b.status().ports[0].active, served);
     for n in [&a, &b] {
-        n.replicated_change(Port::Receiver(1), Some(switched.clone()), Tai::new(400, 0));
+        n.replicated_change(Port::Receiver(1), &switched, Tai::new(400, 0), false);
     }
     // b takes over and sets the versions from the product's state.
     b.set_versions(&BTreeMap::from([
@@ -627,8 +669,8 @@ async fn instances_fed_the_same_changes_serve_the_same_versions() {
         (PortKey::Receiver("pgm".into()), Tai::new(200, 0)),
         (PortKey::Receiver("spare".into()), Tai::new(400, 0)),
     ]));
+    assert_eq!(documents(&a).await, documents(&b).await);
     let versions = all_versions(&a).await;
-    assert_eq!(versions, all_versions(&b).await);
     let ids = &a.inner.ids;
     let at = |id: Uuid| versions[&id.to_string()].as_str();
     assert_eq!(at(ids.node), "400:0");
@@ -643,6 +685,11 @@ async fn instances_fed_the_same_changes_serve_the_same_versions() {
     assert_eq!(at(ids.receivers[0]), "200:0");
     assert_eq!(at(ids.receivers[1]), "400:0");
     assert_eq!(versions[&format!("{}/caps", ids.receivers[1])], "400:0");
+    let resource = get(&b, &sender).await;
+    assert_eq!(
+        resource["subscription"],
+        serde_json::json!({ "receiver_id": OTHER_RECEIVER, "active": false })
+    );
 }
 
 /// Two changes of a port at one time, or the second at an earlier one,
@@ -650,7 +697,7 @@ async fn instances_fed_the_same_changes_serve_the_same_versions() {
 /// only.
 #[tokio::test]
 async fn shared_versions_increase_per_resource() {
-    let n = shared(Clock::at(1_000), &BTreeMap::new());
+    let n = shared(Arc::default(), Clock::at(1_000), &BTreeMap::new());
     let sender = |n: &Nmos| {
         let st = n.inner.lock();
         let s = &st.senders[0];
@@ -663,13 +710,16 @@ async fn shared_versions_increase_per_resource() {
     };
     // A port the versions lack starts at 0:0.
     assert_eq!(sender(&n), [Tai::default(); 4]);
-    let active = n.status().ports[0].active.clone();
+    let change = Replicated {
+        active: n.status().ports[0].active.clone(),
+        activation: None,
+    };
     let at = Tai::new(500, 0);
-    n.replicated_change(Port::Sender(0), Some(active), at);
+    n.replicated_change(Port::Sender(0), &change, at, false);
     assert_eq!(sender(&n), [at; 4]);
-    n.replicated_change(Port::Sender(0), None, at);
+    n.replicated_change(Port::Sender(0), &change, at, true);
     assert_eq!(sender(&n), [at.next(); 4]);
-    n.replicated_change(Port::Sender(0), None, Tai::new(1, 0));
+    n.replicated_change(Port::Sender(0), &change, Tai::new(1, 0), true);
     assert_eq!(sender(&n), [at.next().next(); 4]);
     let key = PortKey::Sender("pgm".into());
     n.set_versions(&BTreeMap::from([(key.clone(), Tai::new(2, 0))]));
@@ -678,10 +728,31 @@ async fn shared_versions_increase_per_resource() {
     assert_eq!(sender(&n), [Tai::new(900, 0); 4]);
 }
 
+/// An instance restored from the versions replicated_change returned, as
+/// a product persists them, serves its peer's versions also after two
+/// changes of one port at one time.
+#[tokio::test]
+async fn an_instance_restored_from_the_returned_versions_matches_its_peer() {
+    let live = shared(Arc::default(), Clock::at(1_000), &BTreeMap::new());
+    let change = Replicated {
+        active: live.status().ports[1].active.clone(),
+        activation: None,
+    };
+    let at = Tai::new(500, 0);
+    let mut kept = BTreeMap::new();
+    for _ in 0..2 {
+        let stamped = live.replicated_change(Port::Receiver(0), &change, at, false);
+        kept.insert(PortKey::Receiver("pgm".into()), stamped.version);
+    }
+    assert_eq!(kept[&PortKey::Receiver("pgm".into())], at.next());
+    let restored = shared(Arc::default(), Clock::at(9_000), &kept);
+    assert_eq!(all_versions(&restored).await, all_versions(&live).await);
+}
+
 #[tokio::test]
 #[should_panic(expected = "replicated_change")]
 async fn a_clock_free_change_on_shared_versions_panics() {
-    let n = shared(Clock::at(1_000), &BTreeMap::new());
+    let n = shared(Arc::default(), Clock::at(1_000), &BTreeMap::new());
     let active = n.status().ports[0].active.clone();
     n.external_change(Port::Sender(0), active);
 }

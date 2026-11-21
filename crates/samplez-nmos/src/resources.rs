@@ -195,8 +195,8 @@ pub(crate) fn senders(inner: &Inner, st: &State) -> Vec<Value> {
                     "manifest_href": null,
                     "interface_bindings": [],
                     "subscription": {
-                        "receiver_id": s.port.active.peer,
-                        "active": s.port.active.master_enable,
+                        "receiver_id": s.port.published.peer,
+                        "active": s.port.published.master_enable,
                     },
                 }),
             )
@@ -239,8 +239,8 @@ pub(crate) fn receivers(inner: &Inner, st: &State) -> Vec<Value> {
                     "transport": MXL,
                     "interface_bindings": [],
                     "subscription": {
-                        "sender_id": r.active.peer,
-                        "active": r.active.master_enable,
+                        "sender_id": r.published.peer,
+                        "active": r.published.master_enable,
                     },
                     "format": AUDIO,
                     "caps": {

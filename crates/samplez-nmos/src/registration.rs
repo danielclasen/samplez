@@ -14,7 +14,7 @@ use tokio::time::{Instant, sleep, sleep_until};
 use uuid::Uuid;
 
 use crate::discovery::{Discovery, Registry};
-use crate::{Inner, resources};
+use crate::{Inner, Tai, resources};
 
 /// While no registry is found, discovery runs again after this long.
 const RE_BROWSE: Duration = Duration::from_secs(5);
@@ -26,7 +26,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
 /// How a request ended.
 enum Answer {
-    Status(StatusCode, Option<String>),
+    /// The status, the `Location` header, and the `error` of a 400's
+    /// IS-04 error body.
+    Status(StatusCode, Option<String>, Option<String>),
     /// No answer: refused, unreachable or timed out.
     None(String),
 }
@@ -51,7 +53,15 @@ impl Registrar {
                     .get(LOCATION)
                     .and_then(|l| l.to_str().ok())
                     .map(str::to_owned);
-                Answer::Status(r.status(), location)
+                let status = r.status();
+                let error = if status == StatusCode::BAD_REQUEST {
+                    let body = r.text().await.ok();
+                    let body = body.and_then(|b| serde_json::from_str::<Value>(&b).ok());
+                    body.and_then(|b| b["error"].as_str().map(str::to_owned))
+                } else {
+                    None
+                };
+                Answer::Status(status, location, error)
             }
             Err(e) => Answer::None(e.to_string()),
         }
@@ -141,9 +151,9 @@ pub(crate) async fn run(inner: Arc<Inner>) {
             // that continues a held registration from its first.
             let joined = if registered_once || inner.cfg.continue_held {
                 match client.heartbeat(&registry.base).await {
-                    Answer::Status(StatusCode::OK, _) => Ok(true),
-                    Answer::Status(StatusCode::NOT_FOUND, _) => Ok(false),
-                    Answer::Status(StatusCode::CONFLICT, loc) => {
+                    Answer::Status(StatusCode::OK, ..) => Ok(true),
+                    Answer::Status(StatusCode::NOT_FOUND, ..) => Ok(false),
+                    Answer::Status(StatusCode::CONFLICT, loc, _) => {
                         unregister_old(&client, &registry.base, loc).await;
                         Ok(false)
                     }
@@ -210,7 +220,7 @@ pub(crate) async fn run(inner: Arc<Inner>) {
 
 fn log_failover(registry: &Registry, a: &Answer) {
     match a {
-        Answer::Status(s, _) => {
+        Answer::Status(s, ..) => {
             tracing::warn!(registry = %registry.base, status = %s, "nmos: registry unusable")
         }
         Answer::None(e) => {
@@ -301,10 +311,13 @@ async fn post_changed(
                 continue;
             }
             let mut answer = client.post(base, kind, &doc).await;
-            let held = matches!(
-                answer,
-                Answer::Status(StatusCode::OK | StatusCode::BAD_REQUEST, _)
-            );
+            let held = match &answer {
+                Answer::Status(StatusCode::OK, ..) => true,
+                Answer::Status(StatusCode::BAD_REQUEST, _, error) => {
+                    held_later(error.as_deref(), &version)
+                }
+                _ => false,
+            };
             if fresh && kind == "node" && held {
                 client.delete(&format!("{base}/resource/nodes/{id}")).await;
                 answer = client.post(base, kind, &doc).await;
@@ -313,26 +326,26 @@ async fn post_changed(
             // whose new version is still not newer than the held one after
             // a clock skew between hosts: the Node is deleted and every
             // resource registered anew, so none of the predecessor's stays.
-            if continued && matches!(answer, Answer::Status(StatusCode::BAD_REQUEST, _)) {
+            if continued && matches!(answer, Answer::Status(StatusCode::BAD_REQUEST, ..)) {
                 tracing::warn!(%kind, %id, "nmos: the registry refused a continued resource; registering anew");
                 let node = format!("{base}/resource/nodes/{}", client.node);
                 match client.delete(&node).await {
-                    Answer::Status(s, _) if s.is_success() || s == StatusCode::NOT_FOUND => {}
+                    Answer::Status(s, ..) if s.is_success() || s == StatusCode::NOT_FOUND => {}
                     a => return failover(&a),
                 }
                 posted.clear();
                 (fresh, continued) = (true, false);
                 continue 'pass;
             }
-            if let Answer::Status(StatusCode::CONFLICT, loc) = answer {
+            if let Answer::Status(StatusCode::CONFLICT, loc, _) = answer {
                 unregister_old(client, base, loc).await;
                 answer = client.post(base, kind, &doc).await;
             }
             match answer {
-                Answer::Status(s, _) if s.is_success() => {
+                Answer::Status(s, ..) if s.is_success() => {
                     posted.insert(id, version);
                 }
-                Answer::Status(s, _) if s.is_client_error() => {
+                Answer::Status(s, ..) if s.is_client_error() => {
                     // IS-04: a 400 is not retried as it was sent.
                     tracing::warn!(%kind, %id, status = %s, "nmos: the registry refused a resource");
                     posted.insert(id, version);
@@ -342,6 +355,30 @@ async fn post_changed(
         }
         return Ok(());
     }
+}
+
+/// Whether a 400 to a resource POST at `posted` says the registry holds
+/// the resource at a later version. IS-04 gives no structured reason, so
+/// the `error` is read: one naming a TAI time later than `posted`, as
+/// nmos-cpp's "request for registration with version ... conflicts with
+/// the existing registration with version ..." does, or naming a version
+/// without a time. No `error` at all counts too: a repost is the one thing
+/// that can cure such a refusal.
+fn held_later(error: Option<&str>, posted: &str) -> bool {
+    let Some(error) = error else {
+        return true;
+    };
+    let Ok(posted) = posted.parse::<Tai>() else {
+        return false;
+    };
+    let times: Vec<Tai> = error
+        .split(|c: char| !(c.is_ascii_digit() || c == ':'))
+        .filter_map(|w| w.trim_matches(':').parse().ok())
+        .collect();
+    if times.is_empty() {
+        return error.to_ascii_lowercase().contains("version");
+    }
+    times.iter().any(|t| *t > posted)
 }
 
 /// Heartbeats every interval and posts changed resources, until the
@@ -367,16 +404,16 @@ async fn maintain(
             next = Instant::now() + interval;
         }
         match client.heartbeat(base).await {
-            Answer::Status(StatusCode::OK, _) => {}
-            Answer::Status(StatusCode::NOT_FOUND, _) => {
+            Answer::Status(StatusCode::OK, ..) => {}
+            Answer::Status(StatusCode::NOT_FOUND, ..) => {
                 tracing::info!("nmos: the registry lost the node; registering again");
                 register_all(inner, client, base, posted).await?;
             }
-            Answer::Status(StatusCode::CONFLICT, loc) => {
+            Answer::Status(StatusCode::CONFLICT, loc, _) => {
                 unregister_old(client, base, loc).await;
                 register_all(inner, client, base, posted).await?;
             }
-            Answer::Status(s, _) if s.is_client_error() => {
+            Answer::Status(s, ..) if s.is_client_error() => {
                 tracing::warn!(status = %s, "nmos: the registry refused a heartbeat");
             }
             a => {
@@ -417,7 +454,21 @@ pub(crate) async fn unregister(inner: &Inner) {
 
 #[cfg(test)]
 mod tests {
-    use super::absolute;
+    use super::{absolute, held_later};
+
+    #[test]
+    fn a_400_counts_as_a_later_held_version_only_where_it_says_so() {
+        let cpp = "Bad Request; request for registration with version 10:0 \
+                   conflicts with the existing registration with version 1000:0";
+        assert!(held_later(Some(cpp), "10:0"));
+        assert!(!held_later(Some(cpp), "1000:0"));
+        assert!(held_later(Some("the version is not newer"), "10:0"));
+        assert!(!held_later(
+            Some("Bad Request; schema validation failed"),
+            "10:0"
+        ));
+        assert!(held_later(None, "10:0"));
+    }
 
     #[test]
     fn a_location_resolves_against_the_registry_origin() {
