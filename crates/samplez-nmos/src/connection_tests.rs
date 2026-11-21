@@ -1061,7 +1061,8 @@ async fn an_external_change_shows_in_active_with_a_new_version() {
 
 /// With shared versions an activation the node serves changes `/active`
 /// but not the version; the product's report of it moves the version and
-/// keeps the activation queued behind it on its way to the product.
+/// keeps the activation queued behind it on its way to the product, and
+/// `/active` follows the replicated changes in their order.
 #[tokio::test(start_paused = true)]
 async fn a_served_activation_takes_its_version_from_the_replicated_change() {
     let fake = Arc::new(Fake::default());
@@ -1097,13 +1098,20 @@ async fn a_served_activation_takes_its_version_from_the_replicated_change() {
     assert_eq!(is04(&n, "receivers", &r).await["version"], "8:0");
     assert_eq!(
         leg(&active(&n, "receivers", &r).await)["mxl_flow_id"],
-        json!(THIRD)
+        json!(OTHER)
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
     let calls = fake.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert_eq!(calls[1].1.flow, Some(THIRD));
     assert_eq!(n.status().ports[1].applied, Applied::Applied);
+    let change = n.activation(Port::Receiver(0), calls[1].4).unwrap();
+    n.replicated_change(Port::Receiver(0), &change, Tai::new(8, 0), Some(calls[1].4));
+    assert_eq!(is04(&n, "receivers", &r).await["version"], "8:1");
+    assert_eq!(
+        leg(&active(&n, "receivers", &r).await)["mxl_flow_id"],
+        json!(THIRD)
+    );
 }
 
 /// With shared versions a failed apply shows the replicated connection in
@@ -1238,6 +1246,88 @@ async fn a_served_scheduled_activation_shows_once_replicated() {
     };
     assert_eq!(view(&n), view(&peer));
     assert_eq!(view(&n).0.flow, Some(OTHER));
+}
+
+/// With shared versions a cancel after the scheduled activation went to
+/// the product, and was replicated, hands the product the connection
+/// active before it, not the cancelled one `/active` shows.
+#[tokio::test(start_paused = true)]
+async fn a_shared_cancel_in_the_lead_window_hands_back_the_connection_before() {
+    let fake = Arc::new(Fake {
+        lead: Duration::from_millis(100),
+        ..Fake::default()
+    });
+    let n = shared_node(&fake);
+    let r = receiver(&n, 0);
+    let body = json!({
+        "transport_params": [{ "mxl_flow_id": OTHER }],
+        "activation": { "mode": "activate_scheduled_relative", "requested_time": "0:500000000" },
+    });
+    assert_eq!(
+        patch(&n, "receivers", &r, body).await.0,
+        StatusCode::ACCEPTED
+    );
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let generation = fake.calls.lock().unwrap()[0].4;
+    let change = n.activation(Port::Receiver(0), generation).unwrap();
+    n.replicated_change(Port::Receiver(0), &change, Tai::new(9, 0), Some(generation));
+    assert_eq!(
+        leg(&active(&n, "receivers", &r).await)["mxl_flow_id"],
+        json!(OTHER)
+    );
+    let cancel = json!({ "activation": { "mode": null } });
+    assert_eq!(patch(&n, "receivers", &r, cancel).await.0, StatusCode::OK);
+    settle().await;
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[1].1.flow, Some(IN_FLOW));
+    assert_eq!(calls[1].2, calls[0].2);
+}
+
+/// Changes replicated in log order decide `/active`: a change made
+/// elsewhere that reaches the serving instance between its activation and
+/// that activation's replicated change does not leave `/active` on it.
+#[tokio::test(start_paused = true)]
+async fn an_interleaved_change_leaves_every_instance_on_the_last_replicated() {
+    let fake = Arc::new(Fake::default());
+    fake.results
+        .lock()
+        .unwrap()
+        .push_back((Duration::from_millis(50), Ok(())));
+    let n = shared_node(&fake);
+    let peer = shared_node(&Arc::new(Fake::default()));
+    let r = receiver(&n, 0);
+    let body = json!({ "transport_params": [{ "mxl_flow_id": OTHER }], "activation": { "mode": "activate_immediate" } });
+    assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    settle().await;
+    let gb = fake.calls.lock().unwrap()[0].4;
+    let b = n.activation(Port::Receiver(0), gb).unwrap();
+    let a = Replicated {
+        active: Active {
+            master_enable: true,
+            peer: None,
+            domain: Some(DOMAIN),
+            flow: Some(THIRD),
+        },
+        activation: None,
+    };
+    for x in [&n, &peer] {
+        x.replicated_change(Port::Receiver(0), &a, Tai::new(8, 0), None);
+    }
+    n.replicated_change(Port::Receiver(0), &b, Tai::new(9, 0), Some(gb));
+    peer.replicated_change(Port::Receiver(0), &b, Tai::new(9, 0), None);
+    for x in [&n, &peer] {
+        let a = active(x, "receivers", &r).await;
+        assert_eq!(leg(&a)["mxl_flow_id"], json!(OTHER), "{a}");
+    }
+    assert_eq!(
+        active(&n, "receivers", &r).await,
+        active(&peer, "receivers", &r).await
+    );
+    assert_eq!(
+        is04(&n, "receivers", &r).await,
+        is04(&peer, "receivers", &r).await
+    );
 }
 
 /// A replicated change without an activation shows the one last

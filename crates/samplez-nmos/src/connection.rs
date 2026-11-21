@@ -136,6 +136,9 @@ pub(crate) struct Pending {
     task: AbortHandle,
     /// It went to the product, lead early.
     applied: bool,
+    /// `/active` when it went to the product, which a cancel hands the
+    /// product again.
+    before: Option<(Active, Activation)>,
 }
 
 /// An activation queued for the product.
@@ -688,9 +691,13 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
                 p.queue.retain(|j| j.schedule != Some(pending.id));
                 if pending.applied && p.queue.len() == queued {
                     // The product has it already: hand it what stays active,
-                    // for the same time, so it ends where `/active` is.
-                    let active = p.active.clone();
-                    let activation = p.active_activation.clone();
+                    // for the same time. With shared versions `/active` may
+                    // show the cancelled one, replicated, so it is what was
+                    // active when the cancelled one went to the product.
+                    let (active, activation) = match pending.before {
+                        Some(before) if inner.shared => before,
+                        _ => (p.active.clone(), p.active_activation.clone()),
+                    };
                     p.applied = Applied::Applying;
                     let at = Some(pending.at);
                     enqueue(inner, &mut st, port, active, activation, at, None, None);
@@ -758,6 +765,7 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
                 at,
                 task,
                 applied: false,
+                before: None,
             });
             p.staged = staged.clone();
             Ok((StatusCode::ACCEPTED, staged_json(port, &staged)))
@@ -915,8 +923,14 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
     let applied = if target.is_ok() || inner.shared {
         let mut st = inner.lock();
         match st.port_mut(port).pending.as_mut() {
-            Some(p) if p.id == id => p.applied = true,
+            Some(p) if p.id == id => {}
             _ => return,
+        }
+        let p = st.port_mut(port);
+        let before = (p.active.clone(), p.active_activation.clone());
+        if let Some(pending) = p.pending.as_mut() {
+            pending.applied = true;
+            pending.before = Some(before);
         }
         let (reply, applied) = oneshot::channel();
         let p = st.port(port);

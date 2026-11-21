@@ -443,14 +443,14 @@ impl Nmos {
     /// now on. Returns the version set, which the product keeps, and the
     /// generation.
     ///
-    /// `served` is the generation of the [`Connections::apply`] call on
-    /// this node the change replicates, if any: `/active` shows the change
-    /// unless an activation or a change came after that call, and the
-    /// activations queued behind it still reach the product. Otherwise the
-    /// change is one as [`Nmos::external_change`] makes it, from another
-    /// instance or by the product itself. Either way `/active` shows
-    /// `change.activation`, or the activation last replicated when it
-    /// carries none.
+    /// `/active` shows the change, in the order the product replicates
+    /// changes, with `change.activation` or, when it carries none, the
+    /// activation last replicated; an activation served here and not
+    /// replicated yet shows once it is. `served` is the generation of the
+    /// [`Connections::apply`] call on this node the change replicates, if
+    /// any: the activations queued behind it still reach the product.
+    /// Otherwise the change is one as [`Nmos::external_change`] makes it,
+    /// from another instance or by the product itself.
     ///
     /// Panics on a node built with [`Nmos::new`].
     pub fn replicated_change(
@@ -471,15 +471,10 @@ impl Nmos {
         if let Some(a) = &change.activation {
             p.published_activation = connection::Activation::of(a);
         }
+        p.show_published();
         let generation = match served {
-            Some(g) => {
-                if p.generation() == g {
-                    p.show_published();
-                }
-                p.generation()
-            }
+            Some(_) => p.generation(),
             None => {
-                p.show_published();
                 p.applied = Applied::Applied;
                 p.changed_by_product()
             }
