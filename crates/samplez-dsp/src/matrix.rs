@@ -1036,8 +1036,10 @@ impl Matrix {
     /// had there, and the live gain `to`, as they are after a few
     /// intervals at those envelopes, instead of at 1 moving to them over
     /// the two intervals after a fill. A depth ramp is taken to have held
-    /// its start value before its start. A term of mask 0 or with no
-    /// depth set keeps gain 1.
+    /// its start value before its start: one that started after the
+    /// earlier of those two ends while another depth ramp still ran there
+    /// gets other gains than a running matrix, which had the other ramp's
+    /// value. A term of mask 0 or with no depth set keeps gain 1.
     pub fn settle_ducks(&mut self, envelopes: &[f32]) {
         // Samples back from the next one to the last end of an interval.
         let last = self.phase + 1;
@@ -3081,6 +3083,54 @@ mod tests {
                     "{path:?} sample {n}"
                 );
             }
+        }
+    }
+
+    /// A matrix filled at index 272 with a depth ramp that started at
+    /// `start` while an earlier one still ran there, settled at a steady
+    /// envelope, mixes the bits of a running matrix over the first
+    /// interval only where the later ramp started at or before 263, the
+    /// second last end of an interval before the fill: a depth ramp is
+    /// taken to have held its start value before its start, where the
+    /// running matrix had the earlier ramp's.
+    #[test]
+    fn a_depth_changed_again_settles_alike_only_two_interval_ends_after_it() {
+        let at: usize = 272;
+        for (start, alike) in [(at - 9, true), (at - 8, false), (at, false)] {
+            let mut rng = Rng::new(0xde97);
+            let mut input = PlanarBuffer::new(1, CAP);
+            let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
+            env.channel_mut(0).fill(1.0);
+            let mut out = PlanarBuffer::new(1, CAP);
+            let mut live = Matrix::new(1, 1);
+            assert!(live.set_depth(0, 0, 10.0, 0) && live.set_mask(0, 0, 1, 0));
+            assert!(live.set(0, 0, 0.5, 0));
+            fill(&mut rng, &mut input, 200);
+            live.process_ducked_on(Path::Scalar, &input, &env, &mut out, 200);
+            // The earlier ramp, still running at the fill.
+            assert!(live.set_depth(0, 0, 30.0, 480));
+            fill(&mut rng, &mut input, start - 200);
+            live.process_ducked_on(Path::Scalar, &input, &env, &mut out, start - 200);
+            let from = live.depth(0, 0);
+            assert!(live.set_depth(0, 0, 20.0, 480));
+            if at > start {
+                fill(&mut rng, &mut input, at - start);
+                live.process_ducked_on(Path::Scalar, &input, &env, &mut out, at - start);
+            }
+            let mut depths = vec![0.0; MAX_DUCKS];
+            depths[0] = 20.0;
+            let mut built = Matrix::new(1, 1);
+            built.fade_in_ducked(&[0.5], &[1], &depths, 0);
+            let ramp = Ramp::resume(from, 20.0, 0, 480, (at - start) as u32).unwrap();
+            assert!(built.resume_depth(0, 0, ramp));
+            built.align(at as u64);
+            built.settle_ducks(&[1.0]);
+            fill(&mut rng, &mut input, 8);
+            let mut want = PlanarBuffer::new(1, CAP);
+            live.process_ducked_on(Path::Scalar, &input, &env, &mut want, 8);
+            built.process_ducked_on(Path::Scalar, &input, &env, &mut out, 8);
+            let same = (0..8).all(|n| out.channel(0)[n].to_bits() == want.channel(0)[n].to_bits());
+            assert_eq!(same, alike, "the later ramp from {start}");
         }
     }
 }

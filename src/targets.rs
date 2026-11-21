@@ -22,7 +22,10 @@ pub struct Targets {
     /// indices, as [`Fade`] defines it. The one source of the fades:
     /// [`Targets::diff`] and [`Targets::assert`] turn it into entry fades
     /// for the index they are given, and an install of a product state
-    /// resumes it (`ProductState::fading`).
+    /// resumes it (`ProductState::fading`). A coefficient already on the
+    /// fade's value at the index stays on the fade ([`Fade::joined`]), so
+    /// an assert changes no bit of it; one holding another value, as one
+    /// on a join of the fade does, starts a join from that value.
     pub fading: Vec<Vec<Option<Fade>>>,
     /// Per input slot, the flow it reads; none for a detached slot.
     pub flows: Vec<Option<String>>,

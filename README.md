@@ -360,7 +360,19 @@ the generation is swapped in on time without it, and the slot is silent and repo
 unreadable on that engine alone until the reader is open, then added
 back through the next build; a re-route that adopts a dropped entry's
 open whose lookup outlives the 20 ms gate comes back through the poll's
-recovery, within 2 s. The status reports the 99.99th percentile
+recovery, within 2 s. Those 2 ms are the whole budget for what the
+supervisor loop does between two such checks besides the tick's wait,
+and for assembling the generation: a generation handed over with less
+left before its index is counted in `generation_past_margin`, a field
+of `Engine::counters` that the service does not export, as
+`generation_late` is not. While an entry not handed over falls due
+within a poll period (100 ms) and a tick, the supervisor neither polls
+pruned inputs nor creates output writers, checking again after each
+output it creates, so none of their libmxl calls can stall it past the
+deadline. A released output writer is still dropped on the supervisor
+when the RT thread hands it back: its flow must be gone before the
+output's flow is created anew.
+The status reports the 99.99th percentile
 of the latest 256 build times, each the longest of its new readers'
 opens, instance creation included, and its assembly, a build that opens
 nothing left out and a late reader's open counted up to 100 ms, so a slow open raises
@@ -427,9 +439,9 @@ delay; `Fade::after(from, index, delay, len)` builds it) or at it: the
 engine renders the function whatever the coefficient held before.
 Behind it the fade started before the entry applies, and the
 coefficient joins it from the value it holds at the index
-(`Fade::joined`): a coefficient holding the fade's value there, as one
-on the fade does, stays on it, so an entry that repeats a fade
-mid-ramp, as `Targets::assert` does, changes no bit; any other value
+(`Fade::joined`): a coefficient already on the fade's value at the
+index stays on the fade, so an entry that repeats the fade mid-ramp, as
+`Targets::assert` does, changes no bit of it; any other value
 goes in a straight line to the target that ends where the fade ends and
 takes at least `rampSamples`, so a late entry steps by no more than a
 change with no fade; a fade already over ramps to its target over
@@ -946,7 +958,11 @@ cold at the state's settings: key filters at rest, no hold, the envelope
 at 0 or, for a group its mode On or hold triggers, at full depth; masks
 and depths at their targets or on their ramps, so a coefficient is
 ducked from the start, its duck at the gains a running matrix holds at
-the last two ends of a gain interval. A mask crossfade continues bit for
+the last two ends of a gain interval, with a depth ramp taken to have
+held its start value before its start: a depth changed again while its
+earlier ramp ran, the later change after the second last of those
+ends, as one at the install index, gets other gains there than its
+peers held, and its first page can differ. A mask crossfade continues bit for
 bit where the detectors were steady over it and the depth held its
 value before the ramp the state names; over a depth changed more than
 once within it, it differs from its peers until both end. A replica
@@ -1491,7 +1507,11 @@ not found by then, a lookup's finding a flow counting for a second. A
 build that left a slot out is not counted in the build times. An output flow whose
 directory is not found is created without libmxl's check for a live
 writer, which looks the name up; a flow that is there after all is
-opened and reported raced. A
+opened and reported raced. A pruned input's poll reader opens a flow
+its lookup found on its input domain's one poll open thread, started
+with the domain's poll instance, so a slow libmxl open holds up no poll
+and no poll starts a thread for it; opens of different flows wait for
+each other there, and the flow polls as not readable until it is open. A
 pruned input's flow that is missing is looked up again at every poll
 for 10 s after it was wanted (first polled, re-routed to or raised),
 and after that with a gap from 100 ms doubling up to 5 s. A stopped

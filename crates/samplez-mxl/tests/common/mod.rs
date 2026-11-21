@@ -35,9 +35,9 @@ pub fn poll_until(p: &mut PolledFlow, done: impl Fn(&Poll) -> bool) -> Poll {
     }
 }
 
-/// [`poll_until`] the flow is no longer read absent.
+/// [`poll_until`] the flow is no longer read absent or opening.
 pub fn poll_found(p: &mut PolledFlow) -> Poll {
-    poll_until(p, |r| !matches!(r, Poll::Absent(_)))
+    poll_until(p, |r| !matches!(r, Poll::Absent(_) | Poll::Opening))
 }
 
 /// [`poll_until`] the head is no longer reported, checked or not.

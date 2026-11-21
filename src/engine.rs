@@ -23,8 +23,8 @@ use samplez_dsp::{
     StripParam, Tone, ToneParams, ToneRamps,
 };
 use samplez_mxl::input::{
-    Counters as InputCounters, Generation, GroupWait, Input, InputConfig, Poll, PolledFlow,
-    RECOVERY_NS, Recovery, Releases, Timing,
+    Counters as InputCounters, Generation, GroupWait, Input, InputConfig, Poll, PollOpener,
+    PolledFlow, RECOVERY_NS, Recovery, Releases, Timing,
 };
 use samplez_mxl::lookup::{self, Found, Gate};
 use samplez_mxl::output::{self, Creation};
@@ -339,12 +339,13 @@ impl Fade {
     /// The fade an entry carrying this one towards `to`, applied at index
     /// `at` to a coefficient holding `held`, puts the coefficient on:
     /// this one where it starts at or after `at`, or where the
-    /// coefficient holds its value at `at` already, as a coefficient on
-    /// it does; else, started, a straight line from `held` to `to` that
-    /// ends where this one ends and takes at least `ramp` samples, so a
-    /// late entry joins the fade without a step; and over, `ramp` samples
-    /// from `held`, as a change with no fade. None where that leaves
-    /// nothing to ramp: `held` is `to`, or the length is 0.
+    /// coefficient is already on its value at `at`, so that an entry
+    /// repeating it there, as [`Targets::assert`](crate::Targets::assert)
+    /// gives, changes no bit; else, started, a straight line from `held`
+    /// to `to` that ends where this one ends and takes at least `ramp`
+    /// samples, so a late entry joins the fade without a step; and over,
+    /// `ramp` samples from `held`, as a change with no fade. None where
+    /// that leaves nothing to ramp: `held` is `to`, or the length is 0.
     pub fn joined(&self, to: f32, held: f32, at: u64, ramp: u32) -> Option<Fade> {
         if at <= self.start || held.to_bits() == self.value_at(to, at).to_bits() {
             return Some(*self);
@@ -1074,8 +1075,10 @@ const SPARES: usize = 4;
 /// not open yet.
 const REBUILD_WAIT: Duration = Duration::from_secs(1);
 /// How long before the RT thread would apply a generation past its
-/// entry's index the generation is due ([`due`]) at the latest: the time
-/// left for assembling it once it no longer waits for a reader.
+/// entry's index the generation is due ([`due`]) at the latest: the whole
+/// budget, beyond a tick's wait, for the supervisor loop's work between
+/// one due check and the next and for assembling and handing over the
+/// generation once due, not the assembly alone.
 const HAND_OVER_MARGIN: Duration = Duration::from_millis(2);
 
 /// `d` in samples, rounded up.
@@ -1086,11 +1089,32 @@ fn samples_of(d: Duration) -> u64 {
 /// Whether a generation due at `at_index` must be built now, `earliest`
 /// being the first index an entry reaching the RT thread now is applied
 /// at: from the next supervisor tick on, it would reach the RT thread
-/// with less than [`HAND_OVER_MARGIN`] before that index. A deadline first
-/// seen on one tick leaves more than the margin before it, as one tick
-/// earlier it was not seen; a due generation waits for no reader.
+/// with less than [`HAND_OVER_MARGIN`] before that index. The next check
+/// comes a tick's wait after this one plus all the loop does in between,
+/// and the hand-over follows the assembly, so a deadline first seen on
+/// one check leaves the margin before it only while that work and the
+/// assembly fit in it; a hand-over left less is counted
+/// ([`past_margin`]). A due generation waits for no reader.
 fn due(earliest: u64, at_index: u64) -> bool {
     earliest + samples_of(SUPERVISOR_TICK) + samples_of(HAND_OVER_MARGIN) >= at_index
+}
+
+/// Whether an entry at `at_index` falls due ([`due`]) within
+/// [`POLL_PERIOD`] and a tick, `earliest` as for `due`: while one not
+/// handed over does, the supervisor makes none of the calls that can
+/// stall it ([`Supervisor::handing_over`]).
+fn due_soon(earliest: u64, at_index: u64) -> bool {
+    due(
+        earliest + samples_of(POLL_PERIOD + SUPERVISOR_TICK),
+        at_index,
+    )
+}
+
+/// Whether a generation handed over now, `earliest` as for [`due`], has
+/// less than [`HAND_OVER_MARGIN`] left before its entry's index
+/// `at_index`.
+fn past_margin(earliest: u64, at_index: u64) -> bool {
+    earliest + samples_of(HAND_OVER_MARGIN) > at_index
 }
 
 /// One reader a generation wants: its slot, whether it reads the flow the
@@ -3981,6 +4005,8 @@ struct SupOut {
 /// The poll instance of one input domain and its poll readers by flow id.
 struct Pollers {
     instance: Arc<Instance>,
+    /// The one thread every poll reader of the domain opens on.
+    opener: PollOpener,
     flows: HashMap<String, PolledFlow>,
     /// Per flow id, the references its poll readers let go, kept while
     /// one is unreleased, so that a poll reader created anew does not
@@ -4444,18 +4470,17 @@ impl Supervisor {
         }
     }
 
-    /// Whether an entry not handed over yet falls due ([`due`]) within
-    /// [`POLL_PERIOD`] and a tick: the supervisor then neither polls nor
-    /// takes a poll hold, which open readers, read flows and create an
-    /// instance. A stall there, a libmxl open taking about 23 ms, can make
-    /// a hand-over late only if its deadline falls inside the stall, which
-    /// the window covers with margin; an entry due later, as one stamped
-    /// seconds ahead, holds back no poll.
+    /// Whether an entry not handed over yet falls due soon ([`due_soon`]):
+    /// the supervisor then neither polls nor takes a poll hold, which
+    /// start threads, read flows and create an instance, nor creates an
+    /// output's instance or writer. A stall there, a libmxl call taking
+    /// about 23 ms, can make a hand-over late only if its deadline falls
+    /// inside the stall, which the window covers with margin; an entry due
+    /// later, as one stamped seconds ahead, holds back none of them.
     fn handing_over(&self) -> bool {
         let earliest = earliest(&self.api, &self.counters, self.timing.margin, self.lead);
-        let window = samples_of(POLL_PERIOD + SUPERVISOR_TICK);
         (self.jobs.iter())
-            .any(|j| !matches!(j.stage, Stage::Sent(_)) && due(earliest + window, j.at_index))
+            .any(|j| !matches!(j.stage, Stage::Sent(_)) && due_soon(earliest, j.at_index))
     }
 
     /// Takes the poll hold of pruned `slot` ([`Supervisor::hold_poll`]),
@@ -4491,18 +4516,29 @@ impl Supervisor {
     /// domain's poll instance and the poll reader when missing. False when
     /// either could not be created; `poll` tries again. Called only while
     /// no entry falls due soon ([`Supervisor::handing_over`]): creating the
-    /// poll instance and starting the poll reader's lookup thread can stall
-    /// the supervisor as an instance creation there did.
+    /// poll instance, starting the domain's one poll open thread with it
+    /// and starting the poll reader's lookup thread can stall the
+    /// supervisor as an instance creation there did. The poll readers'
+    /// opens run on that thread, so no open starts a thread.
     fn hold_poll(&mut self, slot: usize) -> bool {
         let d = self.input_domain(slot);
         let id = self.slots[slot].flow.clone();
         if self.pollers[d].is_none() {
             let path = &self.config.domains[self.in_domains[d]].path;
-            match Instance::new(&self.api, path) {
-                Ok(instance) => {
+            // The opener first: an instance created for nothing would be
+            // destroyed here.
+            let started = PollOpener::start()
+                .map_err(|e| format!("its open thread: {e}"))
+                .and_then(|o| {
+                    let instance = Instance::new(&self.api, path);
+                    instance.map(|i| (i, o)).map_err(|e| e.to_string())
+                });
+            match started {
+                Ok((instance, opener)) => {
                     self.poll_errors[d] = None;
                     self.pollers[d] = Some(Pollers {
                         instance,
+                        opener,
                         flows: HashMap::new(),
                         releases: HashMap::new(),
                     })
@@ -4530,7 +4566,8 @@ impl Supervisor {
             match PolledFlow::looking_up_with(&p.instance, &id, self.config.look) {
                 Ok(f) => {
                     let releases = p.releases.entry(id.clone()).or_default();
-                    p.flows.insert(id, f.with_releases(releases));
+                    let f = f.with_releases(releases).with_opener(&p.opener);
+                    p.flows.insert(id, f);
                 }
                 Err(e) => {
                     log(format_args!("poll reader of {id}: {e}"));
@@ -4586,7 +4623,7 @@ impl Supervisor {
             for (id, f) in &mut p.flows {
                 let head = match f.poll() {
                     Poll::Head(h) => Some(h),
-                    Poll::Invalid | Poll::Absent(_) => None,
+                    Poll::Opening | Poll::Invalid | Poll::Absent(_) => None,
                 };
                 self.openers.reap(f.take_released());
                 let limit = prune_limit(
@@ -5456,7 +5493,8 @@ impl Supervisor {
     /// open or, at the latest, on the last tick from which it still reaches
     /// the RT thread before its index ([`Supervisor::due`]), leaving out a
     /// reader not open by then; and hands it to the RT thread once its
-    /// entry is committed. The next job waits until the RT thread is done
+    /// entry is committed, counting a hand-over past the margin
+    /// ([`past_margin`]). The next job waits until the RT thread is done
     /// with this one, so it holds at most one pending generation.
     fn jobs(&mut self) {
         if let Some(mut j) = self.jobs.pop_front() {
@@ -5486,6 +5524,11 @@ impl Supervisor {
                         domain: j.domain,
                         generation,
                     };
+                    let earliest =
+                        earliest(&self.api, &self.counters, self.timing.margin, self.lead);
+                    if past_margin(earliest, j.at_index) {
+                        self.counters.generation_past_margin.fetch_add(1, Relaxed);
+                    }
                     if self.cmd.push(command).is_err() {
                         unreachable!("a free command slot was checked");
                     }
@@ -5812,7 +5855,9 @@ impl Supervisor {
     /// Takes the outputs the RT thread released and the ones the log
     /// disabled or enabled into the status, and creates a writer for each
     /// enabled output without one, retried with a backoff while that
-    /// fails.
+    /// fails, once no entry falls due soon ([`Supervisor::handing_over`]):
+    /// creating the domain's output instance and the flow can stall the
+    /// supervisor.
     fn outputs(&mut self) {
         let released = self.counters.outputs_released.swap(0, Acquire);
         if released != 0 {
@@ -5825,7 +5870,12 @@ impl Supervisor {
         }
         let disabled = self.counters.outputs_disabled.load(Acquire);
         let now = Instant::now();
+        let mut handing_over = self.handing_over();
+        let mut created = false;
         for o in 0..self.outs.len() {
+            if std::mem::take(&mut created) {
+                handing_over = self.handing_over();
+            }
             let out = &mut self.outs[o];
             let enabled = disabled & bit(o) == 0;
             if released & bit(o) != 0 || enabled != out.enabled {
@@ -5853,11 +5903,19 @@ impl Supervisor {
                     s.reason = Some("not created yet".to_owned());
                 }
             }
-            if !enabled || out.realised || now < out.next_try || self.cmd.slots() == 0 {
+            if !enabled
+                || out.realised
+                || now < out.next_try
+                || self.cmd.slots() == 0
+                || handing_over
+            {
                 continue;
             }
             let cfg = &self.config.outputs[o];
             let d = self.config.domain(&cfg.domain).expect("validated");
+            // Checked again before each next output: a creation can take
+            // its lookup's gate wait, and an entry may fall due meanwhile.
+            created = true;
             if self.out_instances[d].is_none() {
                 match Instance::new(&self.api, &self.config.domains[d].path) {
                     Ok(i) => self.out_instances[d] = Some(i),
@@ -6338,6 +6396,30 @@ mod tests {
             assert!(due(first, at) && !due(first - 240, at));
             assert!(first + samples_of(HAND_OVER_MARGIN) < at, "{first}");
         }
+    }
+
+    /// The window in which an entry holds back the calls that can stall
+    /// the supervisor reaches a poll period and a tick past its deadline:
+    /// an entry not due yet but due within them counts, one beyond them
+    /// does not.
+    #[test]
+    fn an_entry_due_within_a_poll_period_and_a_tick_is_due_soon() {
+        // 100 ms and 5 ms at 48 kHz, past the deadline's 336 samples.
+        let at = 48_000;
+        let edge = at - 336 - 5_040;
+        assert!(!due(at - 337, at) && due_soon(at - 337, at));
+        assert!(due_soon(edge, at));
+        assert!(!due_soon(edge - 1, at));
+    }
+
+    /// A hand-over with less than the 2 ms margin left before its index
+    /// is past the margin, one with the margin left is not.
+    #[test]
+    fn a_hand_over_with_less_than_the_margin_left_is_past_it() {
+        let at = 48_000;
+        assert!(!past_margin(at - 96, at));
+        assert!(past_margin(at - 95, at));
+        assert!(past_margin(at + 48, at));
     }
 
     #[test]

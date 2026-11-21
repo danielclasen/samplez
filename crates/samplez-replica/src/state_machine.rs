@@ -367,7 +367,10 @@ pub struct StateMachine<P> {
     /// crossfades the derived entries leave running, as the engine renders
     /// them at the block-aligned index the bridge applies each entry at,
     /// over `ramp_samples`. A function of the log, carried by snapshots;
-    /// what ended is pruned below the floor.
+    /// what ended is pruned below the floor. Besides the snapshots, only
+    /// [`StateMachine::product_state`] reads it, for an engine built from
+    /// product state, which continues these ramps; the samples of an
+    /// engine not built from it never depend on it.
     in_flight: samplez::InFlight,
     /// The input slots the derived entries hold down, a bit per slot: an
     /// `InputUp` fades in only a slot it raises from down.
