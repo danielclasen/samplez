@@ -262,6 +262,7 @@ pub fn add_meter(config: &mut Config, name: &str, channels: u32, gain: f32) {
         name: name.to_owned(),
         channels,
         loudness_channels: None,
+        correlation: false,
     });
     for (i, row) in config.matrix.iter_mut().enumerate() {
         row.extend((0..channels as usize).map(|j| {

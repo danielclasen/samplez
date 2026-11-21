@@ -48,6 +48,13 @@ pub struct OutputMeters {
     pub true_peak: Vec<f32>,
     /// Per channel, the largest true peak since the measurement started.
     pub max_true_peak: Vec<f32>,
+    /// Where the configuration asks for it, the correlation of legs 0
+    /// and 1 over the 400 ms up to the end of that window: the sum of
+    /// their products over the root of the product of their sums of
+    /// squares, -1 to 1, over the slices of the window and the three
+    /// before it whose records all arrived. 0 with one leg silent, `None`
+    /// with both, and without the configuration.
+    pub correlation: Option<f64>,
     /// Loudness in LUFS, `None` until enough audio has been measured.
     pub momentary: Option<f64>,
     pub short_term: Option<f64>,
@@ -102,6 +109,7 @@ impl Default for OutputMeters {
             rms: Vec::new(),
             true_peak: Vec::new(),
             max_true_peak: Vec::new(),
+            correlation: None,
             momentary: None,
             short_term: None,
             max_momentary: None,
@@ -187,6 +195,66 @@ impl Mark {
     }
 }
 
+/// The sums a meter's correlation is read from.
+struct Correlation {
+    /// The slice and the sum of the products of legs 0 and 1 of the last
+    /// [`MeterRecord::cross`] record.
+    cross: Option<(u64, f64)>,
+    /// The sums of squares of legs 0 and 1 of the slice being assembled.
+    legs: [f64; 2],
+    /// Per 100 ms window of the last four, at its index modulo 4: the
+    /// window, `u64::MAX` for none, and its sums of squares of legs 0 and
+    /// 1 and of their products, over its slices assembled whole.
+    windows: [(u64, [f64; 3]); 4],
+}
+
+impl Correlation {
+    fn new() -> Self {
+        Self {
+            cross: None,
+            legs: [0.0; 2],
+            windows: [(u64::MAX, [0.0; 3]); 4],
+        }
+    }
+
+    /// Adds `slice`, its legs' records all arrived, when its cross term
+    /// did too.
+    fn add(&mut self, slice: u64) {
+        let Some((_, lr)) = self.cross.take().filter(|&(s, _)| s == slice) else {
+            return;
+        };
+        let w = slice * SLICE / WINDOW;
+        let (x, sums) = &mut self.windows[(w % 4) as usize];
+        if *x != w {
+            (*x, *sums) = (w, [0.0; 3]);
+        }
+        for (s, v) in sums.iter_mut().zip([self.legs[0], self.legs[1], lr]) {
+            *s += v;
+        }
+    }
+
+    /// The correlation over window `w` and the three before it.
+    fn read(&self, w: u64) -> Option<f64> {
+        let mut sums = [0.0; 3];
+        for j in w.saturating_sub(3)..=w {
+            let (x, s) = self.windows[(j % 4) as usize];
+            if x == j {
+                for (t, v) in sums.iter_mut().zip(s) {
+                    *t += v;
+                }
+            }
+        }
+        let [ll, rr, lr] = sums;
+        if ll == 0.0 && rr == 0.0 {
+            None
+        } else if ll == 0.0 || rr == 0.0 {
+            Some(0.0)
+        } else {
+            Some((lr / (ll * rr).sqrt()).clamp(-1.0, 1.0))
+        }
+    }
+}
+
 /// Turns the records of one meter into [`OutputMeters`].
 pub(crate) struct OutputLoudness {
     weights: Vec<f64>,
@@ -200,6 +268,8 @@ pub(crate) struct OutputLoudness {
     /// Per channel, the unweighted sum of squares of the window so far
     /// and the samples it covers.
     window_power: Vec<(f64, u64)>,
+    /// Where the meter correlates legs 0 and 1.
+    correlation: Option<Correlation>,
     /// The integrated loudness and the loudness range may have changed:
     /// a window of the measured slices ended, or a reset cleared them.
     /// Evaluating them walks every histogram bin, so they are evaluated
@@ -225,6 +295,7 @@ impl OutputLoudness {
             window_peak: vec![0.0; n],
             window_true_peak: vec![0.0; n],
             window_power: vec![(0.0, 0); n],
+            correlation: None,
             dirty: false,
             #[cfg(test)]
             evaluations: 0,
@@ -235,6 +306,15 @@ impl OutputLoudness {
                 max_true_peak: vec![0.0; n],
                 ..OutputMeters::default()
             },
+        }
+    }
+
+    /// The meter, reading the correlation of legs 0 and 1 from its
+    /// [`MeterRecord::cross`] records with `on`.
+    pub fn correlating(self, on: bool) -> Self {
+        Self {
+            correlation: on.then(Correlation::new),
+            ..self
         }
     }
 
@@ -250,6 +330,12 @@ impl OutputLoudness {
     }
 
     pub fn record(&mut self, r: &MeterRecord) {
+        if r.cross() {
+            if let Some(k) = &mut self.correlation {
+                k.cross = Some((r.slice, r.plain_sum_sq));
+            }
+            return;
+        }
         let c = r.channel as usize;
         if c == 0 {
             if self.slice.is_some() {
@@ -287,16 +373,26 @@ impl OutputLoudness {
         *frames += u64::from(r.frames);
         let m = &mut self.meters.max_true_peak[c];
         *m = max(*m, true_peak);
+        if let Some(k) = self.correlation.as_mut().filter(|_| c < 2) {
+            k.legs[c] = r.plain_sum_sq;
+        }
         if *next < self.weights.len() {
             return;
         }
         let Some((slice, power, complete, _, mark)) = self.slice.take() else {
             return;
         };
+        if let Some(k) = &mut self.correlation {
+            k.add(slice);
+        }
         let s = mark.slice(complete.then_some(power));
         self.dirty |= self.loudness.push(slice, s);
         if ((slice + 1) * SLICE).is_multiple_of(WINDOW) {
-            self.meters.window = Some(slice * SLICE / WINDOW);
+            let w = slice * SLICE / WINDOW;
+            self.meters.window = Some(w);
+            if let Some(k) = &self.correlation {
+                self.meters.correlation = k.read(w);
+            }
             self.meters.peak.copy_from_slice(&self.window_peak);
             self.meters
                 .true_peak
@@ -599,6 +695,39 @@ mod tests {
             ..rec(0, 0, 102, 0.0)
         });
         assert_eq!((l.meters.gaps, l.meters.lost), (0, 6));
+    }
+
+    /// A correlating meter reads its legs' sums and their cross terms
+    /// over the last four windows, leaving out a slice whose cross term
+    /// did not arrive rather than reading its legs alone; a meter that
+    /// does not correlate reads none.
+    #[test]
+    fn a_slice_without_its_cross_term_is_left_out() {
+        use crate::rt_loop::CROSS;
+        let mut l = OutputLoudness::new(vec![1.0, 1.0]).correlating(true);
+        let mut plain = OutputLoudness::new(vec![1.0, 1.0]);
+        for s in 0..40 {
+            let cross = MeterRecord {
+                channel: 2,
+                plain_sum_sq: 0.5,
+                flags: CROSS,
+                ..rec(0, 0, s, 0.0)
+            };
+            for m in [&mut l, &mut plain] {
+                if s != 5 {
+                    m.record(&cross);
+                }
+                for c in 0..2 {
+                    m.record(&MeterRecord {
+                        plain_sum_sq: 1.0,
+                        ..rec(0, c, s, 0.0)
+                    });
+                }
+            }
+        }
+        assert_eq!(l.meters.window, Some(3));
+        assert_eq!(l.meters.correlation, Some(0.5));
+        assert_eq!((plain.meters.window, plain.meters.correlation), (Some(3), None));
     }
 
     /// Stereo records of slice `s` at `level` LUFS with `flags`.

@@ -197,6 +197,14 @@ pub struct Meter {
     /// The loudness role of each channel, as for an output.
     #[serde(default)]
     pub loudness_channels: Option<Vec<String>>,
+    /// Meters the correlation of legs 0 and 1 (L and R of a stereo or
+    /// wider element) in [`crate::OutputMeters::correlation`]: one
+    /// multiply-add per sample on the RT thread. Off by default; at least
+    /// 2 channels. A product that hashes its configuration into its
+    /// compatibility key covers it there, so replicas metering
+    /// differently do not run as peers.
+    #[serde(default)]
+    pub correlation: bool,
 }
 
 impl Meter {
@@ -240,6 +248,14 @@ pub struct Output {
     /// or off. At most [`samplez_dsp::strip::MAX_LEGS`] channels wide.
     #[serde(default)]
     pub limiter: bool,
+    /// Meters the correlation of legs 0 and 1 (L and R of a stereo or
+    /// wider element) in [`crate::OutputMeters::correlation`]: one
+    /// multiply-add per sample on the RT thread. Off by default; at least
+    /// 2 channels. A product that hashes its configuration into its
+    /// compatibility key covers it there, so replicas metering
+    /// differently do not run as peers.
+    #[serde(default)]
+    pub correlation: bool,
 }
 
 impl Output {
@@ -609,6 +625,12 @@ impl Config {
                 return fail(format!("meter {}: channels must be at least 1", m.name));
             }
             m.loudness_weights()?;
+            if m.correlation && m.channels < 2 {
+                return fail(format!(
+                    "meter {}: 1 channel, correlation takes at least 2",
+                    m.name
+                ));
+            }
         }
         for o in &self.outputs {
             if self.domain(&o.domain).is_none() {
@@ -622,6 +644,12 @@ impl Config {
                 return fail(format!(
                     "output {}: {} channels, a limiter takes at most {max}",
                     o.name, o.channels
+                ));
+            }
+            if o.correlation && o.channels < 2 {
+                return fail(format!(
+                    "output {}: 1 channel, correlation takes at least 2",
+                    o.name
                 ));
             }
         }
@@ -779,6 +807,30 @@ mod tests {
         assert!(e.contains("a limiter takes at most 8"), "{e}");
         v["outputs"][0]["limiter"] = serde_json::json!(false);
         assert!(parse(&v).is_ok());
+    }
+
+    /// Correlation is metered only where an output or a configured meter
+    /// asks for it, and only on 2 channels or more: a mono element has no
+    /// second leg.
+    #[test]
+    fn correlation_is_opt_in_and_needs_two_channels() {
+        let mut v = base();
+        v["meters"] = serde_json::json!([{ "name": "aux", "channels": 1 }]);
+        v["matrix"] = serde_json::json!([[0.5, 0.5], [0.5, 0.5]]);
+        let c = parse(&v).unwrap();
+        assert!(!c.outputs[0].correlation && !c.meters[0].correlation);
+        v["outputs"][0]["correlation"] = serde_json::json!(true);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("output out: 1 channel, correlation"), "{e}");
+        v["outputs"][0]["channels"] = serde_json::json!(2);
+        v["meters"][0]["correlation"] = serde_json::json!(true);
+        v["matrix"] = serde_json::json!([[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]]);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("meter aux: 1 channel, correlation"), "{e}");
+        v["meters"][0]["channels"] = serde_json::json!(6);
+        v["matrix"] = serde_json::json!(vec![vec![0.5; 8]; 2]);
+        let c = parse(&v).unwrap();
+        assert!(c.outputs[0].correlation && c.meters[0].correlation);
     }
 
     /// The delay lines of every input together hold at most

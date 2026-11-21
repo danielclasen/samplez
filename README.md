@@ -160,10 +160,10 @@ generator) none, per output
 `enabled` true, per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
 Table 3; without it every channel weighs 1), per input `maxDelaySamples`
-0 and `truePeak` false (Meters), per output `limiter` false (below), and
-`meters`, each with a `name`, `channels` and `loudnessChannels`: matrix
-columns after the outputs' that are computed and metered and written to
-no flow.
+0 and `truePeak` false (Meters), per output `limiter` false (below), per
+output and meter `correlation` false (Meters), and `meters`, each with a
+`name`, `channels` and `loudnessChannels`: matrix columns after the
+outputs' that are computed and metered and written to no flow.
 
 `sampleRate` takes 48000 only, `blockSize` 16 to 1024, `holdMs`,
 `contactWindowMs` and `resyncBudgetMs` 1 to 1000, `historySlackMs` at
@@ -219,6 +219,20 @@ also its true peak and largest true peak, computed as an output's at
 the same cost per channel, and without it none.
 RMS is referenced to a sine as in AES17: the root mean square times the
 square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
+
+An output or meter with `correlation` set in its config, 2 channels or
+more, also carries the correlation of its legs 0 and 1 (L and R of a
+stereo or wider element; legs 2 on are not correlated) over the 400 ms
+up to the end of the last 100 ms window: the sum of their products over
+the root of the product of their sums of squares, from -1 to 1, over
+the 10 ms slices of those windows whose records all arrived. It reads 0
+with one leg silent, none with both, and none without `correlation`.
+It costs one multiply-add per sample on the RT thread and one meter
+record more per 10 ms slice. Like the peaks and RMS it is a reading of
+the samples metered: gap and paused slices count in it, a slice metered
+in part counts with the samples it has, and a reset of the loudness
+measurement does not restart it. A product that hashes its configuration
+into its compatibility key covers the setting there.
 
 A meter's measurement is reset and paused by log entries, applied at
 their index like every other entry, so every replica following the log
@@ -1547,7 +1561,11 @@ product's non-RT runtime.
   `Connections::lead` before its time, so instances can show its
   `activation_time` before it comes. `/staged` and pending scheduled
   activations are each instance's own, so a controller stages and
-  activates a port on one instance.
+  activates a port on one instance. With shared versions, the serving
+  instance's `/active` can briefly step back to the activation last
+  replicated until its newer served one replicates, as in `THIRD` ->
+  `OTHER` -> `THIRD` for `THIRD` served after `OTHER` replicated. Every
+  instance converges.
 - A 200 on a process's first Node POST deletes the Node and registers it
   anew, as IS-04 asks of a restarted Node, and so does any 400, once per
   pass, as after a replica set is rebuilt under the same Node id and the

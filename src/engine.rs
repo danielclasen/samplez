@@ -1511,7 +1511,7 @@ fn new_meters(config: &Config) -> (Vec<Metered>, Vec<Metered>) {
     for m in &config.meters {
         buses.push(Metered {
             first_channel: channel,
-            meter: OutMeter::new(m.channels as usize),
+            meter: OutMeter::new(m.channels as usize).correlating(m.correlation),
         });
         channel += m.channels as usize;
     }
@@ -1558,7 +1558,7 @@ pub(crate) fn replay_rt(
                 writer: None,
                 enabled: true,
                 first_k: 0,
-                meter: OutMeter::new(ch),
+                meter: OutMeter::new(ch).correlating(out.correlation),
                 hold: Hold::new(ch, b, 0, true),
                 pages: Some(Pages::new(o as u32, ch, b, 0)),
                 limiter: out.limiter.then(|| Limiter::new(ch, config.ramp_samples)),
@@ -1782,9 +1782,13 @@ impl Engine {
                 gen_at: 0,
             }),
         }));
+        // A record per metered channel and slice, and one more per
+        // element that correlates its legs.
+        let crosses = (config.outputs.iter().filter(|o| o.correlation).count())
+            + config.meters.iter().filter(|m| m.correlation).count();
         let records = METER_RING_SECONDS
             * (samplez_mxl::SAMPLE_RATE as usize / SLICE as usize)
-            * (config.columns() + config.input_channels());
+            * (config.columns() + config.input_channels() + crosses);
         let (mut meter_tx, mut meter_rx) = rtrb::RingBuffer::new(records.max(1));
         let blank = MeterRecord {
             seq: 0,
@@ -1936,7 +1940,7 @@ impl Engine {
                 writer: None,
                 enabled: o.enabled,
                 first_k: 0,
-                meter: OutMeter::new(o.channels as usize),
+                meter: OutMeter::new(o.channels as usize).correlating(o.correlation),
                 hold: if replica.is_some() {
                     Hold::new(o.channels as usize, b, hold_blocks, alone)
                 } else {
@@ -2106,20 +2110,15 @@ impl Engine {
         // configured meters, the inputs.
         let checked = "checked by Config::parse";
         let config_loudness = (config.outputs.iter())
-            .map(|o| o.loudness_weights().expect(checked))
+            .map(|o| (o.loudness_weights().expect(checked), o.correlation))
             .chain(
-                config
-                    .meters
-                    .iter()
-                    .map(|m| m.loudness_weights().expect(checked)),
+                (config.meters.iter())
+                    .map(|m| (m.loudness_weights().expect(checked), m.correlation)),
             )
             .chain(
-                config
-                    .inputs
-                    .iter()
-                    .map(|i| i.loudness_weights().expect(checked)),
+                (config.inputs.iter()).map(|i| (i.loudness_weights().expect(checked), false)),
             )
-            .map(OutputLoudness::new)
+            .map(|(weights, on)| OutputLoudness::new(weights).correlating(on))
             .collect();
         let timing = Timing {
             block: b,
@@ -8465,6 +8464,182 @@ mod tests {
             }
         }
         assert_eq!(skipped_max, max);
+    }
+
+    /// A stereo input feeding a stereo output that correlates its legs
+    /// with `correlating`, a second stereo output that does not, and a
+    /// 6-channel configured meter that does with `correlating`, legs 0
+    /// and 1 of each fed by the input's L and R.
+    fn correlation_config(correlating: bool) -> Config {
+        let out = |o: usize, correlation: bool| {
+            serde_json::json!({ "name": format!("out{o}"), "domain": "d",
+                "flowId": format!("6fbec3b1-1b0f-417d-9059-00000000000{o}"), "label": "o",
+                "group": "g", "role": "Audio", "channels": 2, "correlation": correlation })
+        };
+        let mut matrix = vec![vec![0.0; 10]; 2];
+        for c in [0, 2, 4] {
+            (matrix[0][c], matrix[1][c + 1]) = (1.0, 1.0);
+        }
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": "/nonexistent" }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "5fbec3b1-1b0f-417d-9059-000000000000", "channels": 2 }],
+            "outputs": [out(0, correlating), out(1, false)],
+            "meters": [{ "name": "wide", "channels": 6, "correlation": correlating }],
+            "matrix": matrix,
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        Config::parse(&v.to_string()).unwrap()
+    }
+
+    /// The meter records of [`correlation_config`] fed `source` over
+    /// blocks `0..blocks` but `skip`, as an overrun skips them, and per
+    /// 100 ms window read, the correlation bits of each output and meter
+    /// read at its end.
+    #[allow(clippy::type_complexity)]
+    fn correlate(
+        config: &Config,
+        source: crate::rt_loop::TestInput,
+        blocks: u64,
+        skip: std::ops::Range<u64>,
+    ) -> (
+        Vec<MeterRecord>,
+        std::collections::BTreeMap<(usize, u64), Option<u64>>,
+        Vec<OutputMeters>,
+    ) {
+        let api = samplez_mxl::load(&config.libmxl).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(config, &api, vec![None], hashes, control);
+        // As the engine's loop: configured and input meters, inputs read.
+        rt.replay = false;
+        (rt.buses, rt.taps) = new_meters(config);
+        rt.test_input = Some(source);
+        for (row, gains) in config.matrix.iter().enumerate() {
+            for (column, &g) in gains.iter().enumerate() {
+                assert!(rt.mix.matrix.set(row, column, g, 0));
+            }
+        }
+        let (meters, mut rx) = rtrb::RingBuffer::new(1 << 12);
+        rt.meters = meters;
+        let (ducks, _ducks) = rtrb::RingBuffer::new(1 << 10);
+        rt.duck_meters = ducks;
+        let (ret, _back) = rtrb::RingBuffer::new(64);
+        rt.ret = ret;
+        let elements = (config.outputs.iter().map(|o| (o.channels, o.correlation)))
+            .chain(config.meters.iter().map(|m| (m.channels, m.correlation)));
+        let mut l: Vec<OutputLoudness> = elements
+            .map(|(n, on)| OutputLoudness::new(vec![1.0; n as usize]).correlating(on))
+            .collect();
+        let (mut records, mut windows) = (Vec::new(), std::collections::BTreeMap::new());
+        for k in (0..blocks).filter(|k| !skip.contains(k)) {
+            rt.process(k, u64::MAX);
+            while let Ok(r) = rx.pop() {
+                if let Some(l) = l.get_mut(r.meter as usize) {
+                    l.record(&r);
+                    records.push(r);
+                }
+            }
+            for (m, l) in l.iter().enumerate() {
+                if let Some(w) = l.meters.window {
+                    windows.insert((m, w), l.meters.correlation.map(f64::to_bits));
+                }
+            }
+        }
+        assert_eq!(rt.counters.meter_dropped.load(Relaxed), 0);
+        (records, windows, l.into_iter().map(|l| l.meters).collect())
+    }
+
+    /// A 1 kHz sine at half scale at sample `n`, phase-shifted by
+    /// `quarters` quarter periods.
+    fn sine_1k(n: u64, quarters: u64) -> f32 {
+        let phase = ((n * 1000 + quarters * 12_000) % 48_000) as f64 / 48_000.0;
+        (0.5 * (std::f64::consts::TAU * phase).sin()) as f32
+    }
+
+    /// An output and a meter that correlate their legs read +1 for L = R,
+    /// -1 for L = -R, 0 within 1e-3 for sines in quadrature, 0 with one
+    /// leg silent and none with both, over each 400 ms; the 6-channel
+    /// meter reads its legs 0 and 1 as the stereo output does. The output
+    /// that does not correlate reads none, and its records, and those of
+    /// the others but their cross terms, are the same bits as without
+    /// the configuration. Fails with the cross term accumulating L * L
+    /// in `OutMeter::add`, which reads L = -R as +1.
+    #[test]
+    fn correlation_reads_the_relation_of_the_legs() {
+        let config = correlation_config(true);
+        let cases: [(crate::rt_loop::TestInput, Option<(f64, f64)>); 5] = [
+            (|_, _, _, n| sine_1k(n, 0), Some((1.0, 0.0))),
+            (|_, _, c, n| sine_1k(n, 0) * if c == 0 { 1.0 } else { -1.0 }, Some((-1.0, 0.0))),
+            (|_, _, c, n| sine_1k(n, c as u64), Some((0.0, 1e-3))),
+            (|_, _, c, n| if c == 0 { sine_1k(n, 0) } else { 0.0 }, Some((0.0, 0.0))),
+            (|_, _, _, _| 0.0, None),
+        ];
+        for (i, (source, want)) in cases.into_iter().enumerate() {
+            let (_, windows, meters) = correlate(&config, source, 500, 0..0);
+            assert_eq!(meters[0].window, Some(4), "case {i}");
+            for m in [0, 2] {
+                // From the fourth window on, 400 ms are metered.
+                for w in 3..5 {
+                    let got = windows[&(m, w)].map(f64::from_bits);
+                    match (got, want) {
+                        (Some(got), Some((want, tolerance))) => {
+                            assert!((got - want).abs() <= tolerance, "case {i} meter {m}: {got}");
+                        }
+                        (got, want) => assert_eq!(got, want.map(|w| w.0), "case {i} meter {m}"),
+                    }
+                }
+            }
+            assert_eq!(meters[1].correlation, None, "case {i}");
+        }
+        // The configuration adds the cross terms and changes nothing else.
+        let source: crate::rt_loop::TestInput = |_, _, c, n| sine_1k(n, c as u64);
+        let (on, ..) = correlate(&config, source, 500, 0..0);
+        let (off, ..) = correlate(&correlation_config(false), source, 500, 0..0);
+        let fields = |r: &MeterRecord| {
+            let bits = [r.peak.to_bits(), r.true_peak.to_bits()];
+            let sums = [r.sum_sq.to_bits(), r.plain_sum_sq.to_bits()];
+            (r.meter, r.channel, r.slice, r.frames, bits, sums, r.reset_at, r.flags)
+        };
+        let crosses = on.iter().filter(|r| r.cross()).count();
+        assert_eq!(crosses, 2 * 50);
+        let on: Vec<_> = on.iter().filter(|r| !r.cross()).map(fields).collect();
+        assert_eq!(on, off.iter().map(fields).collect::<Vec<_>>());
+    }
+
+    /// Two loops metering the same input, the second skipping blocks as
+    /// after an overrun up to a window boundary, read the same
+    /// correlation, bit for bit, in every 100 ms window whose 400 ms both
+    /// metered whole: the reading is a function of the slices' indices,
+    /// not of which records arrived last. The legs beat at 1 Hz, so the
+    /// reading moves from window to window. Fails with `Correlation::add`
+    /// placing a slice in the window by the count of slices it added
+    /// rather than by the slice's index, which the skip shifts.
+    #[test]
+    fn correlation_is_the_same_bits_across_an_overrun_skip() {
+        let config = correlation_config(true);
+        let source: crate::rt_loop::TestInput = |_, _, c, n| {
+            let hz = if c == 0 { 440 } else { 441 };
+            let phase = ((n * hz) % 48_000) as f64 / 48_000.0;
+            (0.5 * (std::f64::consts::TAU * phase).sin()) as f32
+        };
+        // 48-sample blocks; the skip ends on a window boundary.
+        let skip = 1003u64..1100;
+        assert!((skip.end * 48).is_multiple_of(4800));
+        let (_, whole, _) = correlate(&config, source, 2400, 0..0);
+        let (_, skipped, _) = correlate(&config, source, 2400, skip.clone());
+        let (cut, after) = (skip.start * 48 / 4800, skip.end * 48 / 4800);
+        let mut compared = std::collections::BTreeSet::new();
+        for (&(m, w), bits) in &skipped {
+            if w < cut || w >= after + 3 {
+                assert_eq!(*bits, whole[&(m, w)], "meter {m} window {w}");
+                compared.insert(bits.map(f64::from_bits).map(|c| (c * 10.0).round() as i64));
+            }
+        }
+        assert!(skipped.contains_key(&(0, after + 3)) && skipped.contains_key(&(2, 23)));
+        assert!(compared.len() > 5, "{compared:?}");
     }
 
     /// Tone parameters are checked against the configuration: a slot
