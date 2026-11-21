@@ -2040,6 +2040,12 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
             r.rebuilt_for_key as f64,
         ),
         one(
+            "samplez_replica_resync_rebuilt_writing_nothing_total",
+            "Diverged replicas rebuilt from product state, not resynced: every output was disabled.",
+            Counter,
+            r.rebuilt_writing_nothing as f64,
+        ),
+        one(
             "samplez_replica_resync_refused_total",
             "Donor cores the engine refused for good, each followed by a rebuild from product state.",
             Counter,

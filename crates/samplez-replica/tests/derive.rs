@@ -3,11 +3,12 @@
 
 mod harness;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use harness::{BLOCK, Options, Set, owner};
+use harness::{BLOCK, FOR_GOOD, Options, Set, owner};
 use samplez::Targets;
 use samplez_replica::contact::{Timing, index_at};
 use samplez_replica::dedup::Limits;
@@ -1321,4 +1322,195 @@ async fn a_follower_that_applied_late_entries_while_committing_is_rebuilt_past_t
     // engine was rebuilt past them, rather than holding them.
     let rebuilds = (set.replica(follower).contact_metrics()).map_or(0, |m| m.late_rebuilds);
     assert!(rebuilds >= 1, "no rebuild past late entries: {rebuilds}");
+}
+
+/// Every output disabled by the log, the leader restarted while commands
+/// keep coming. Around the leader change and the restart, replicas take
+/// entries past their deadlines and hold them unresolved; with nothing
+/// written every replica reports their blocks withheld, so the leader
+/// decides them, and the replicas that applied them in time are
+/// contradicted. Nothing commits, so no donor comes for them: they are
+/// rebuilt from product state instead, and every replica settles
+/// withdrawn and ready, within the cap of the backoff a rebuild waits.
+/// Each of those rebuilds leaves its replica's pages apart from the
+/// others' for good, as state a rebuild does not carry can; the restarted
+/// replica computes what one that ran through does. With the output
+/// enabled again one replica commits, each other one diverges on a page
+/// that differs and resyncs from a committing one, and every page two
+/// replicas committed is equal.
+#[tokio::test(start_paused = true)]
+async fn a_set_with_every_output_disabled_settles_after_its_leader_restarts() {
+    disabled_through_a_leader_restart(false).await;
+}
+
+/// As [`a_set_with_every_output_disabled_settles_after_its_leader_restarts`],
+/// with the restarted replica's pages apart as well: once the output is
+/// enabled again no replica computes what one that ran through does, and
+/// the set still converges on the pages of the one that commits first.
+#[tokio::test(start_paused = true)]
+async fn a_set_computing_apart_on_every_replica_converges_once_an_output_is_enabled() {
+    disabled_through_a_leader_restart(true).await;
+}
+
+/// The set of the two tests above; `all_apart` sets the restarted
+/// replica's pages apart too.
+async fn disabled_through_a_leader_restart(all_apart: bool) {
+    let mut set = Set::start_with(
+        Options {
+            contact: Some(Timing::defaults(BLOCK)),
+            outputs: 1,
+            ..Options::default()
+        },
+        Arc::new(|_| Desk::new()),
+    )
+    .await;
+    let ids: Vec<NodeId> = set.ids().collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ids.iter().all(|&id| committing(&set, id)) {
+        assert!(Instant::now() < deadline, "every replica committing");
+        sleep(Duration::from_millis(10)).await;
+    }
+    // One factor per replica: a page of each replica's rebuilt state is
+    // equal to no other replica's.
+    let apart = |id: NodeId| 0.25 * (1 + ids.iter().position(|&i| i == id).unwrap()) as f32;
+    for &id in &ids {
+        set.audio(id).set_enabled(0, false);
+        let mut fake = set.audio(id).lock();
+        fake.resyncs = true;
+        fake.rebuild_glitch = Some(apart(id));
+    }
+    let leader = set.leader().await;
+    // Restarted, its engine starts the output as the log left it.
+    let restarted = all_apart.then(|| apart(leader));
+    set.on_start(leader, move |audio| {
+        audio.set_enabled(0, false);
+        let mut fake = audio.lock();
+        fake.resyncs = true;
+        fake.rebuild_glitch = restarted;
+    });
+    set.crash(leader).await;
+    let mut n = 0;
+    let down = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < down {
+        n += 1;
+        move_fader(&set, n).await;
+    }
+    set.restart(leader).await;
+    let up = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < up {
+        n += 1;
+        move_fader(&set, n).await;
+    }
+    let state = |set: &Set<Desk>, id: NodeId| {
+        let m = set.replica(id).contact_metrics();
+        m.and_then(|m| m.replica).and_then(|r| r.state)
+    };
+    let settled = |set: &Set<Desk>| {
+        ids.iter().all(|&id| {
+            state(set, id) == Some(ReplicaState::Withdrawn) && set.replica(id).replica().ready
+        })
+    };
+    let shown = |set: &Set<Desk>| -> Vec<_> {
+        (ids.iter())
+            .map(|&id| {
+                let m = set.replica(id).contact_metrics().unwrap();
+                let ready = set.replica(id).replica().ready;
+                (id, state(set, id), ready, m.contradicted, m.resync)
+            })
+            .collect()
+    };
+    // A rebuild waits the attempts' backoff, at most `RETRY_MAX`.
+    let within = samplez_replica::resync::RETRY_MAX + Duration::from_secs(2);
+    let deadline = Instant::now() + within;
+    let mut since: Option<Instant> = None;
+    loop {
+        if settled(&set) {
+            let from = *since.get_or_insert_with(Instant::now);
+            if from.elapsed() >= Duration::from_secs(1) {
+                break;
+            }
+        } else {
+            since = None;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "every replica withdrawn and ready for 1 s within {within:?}: {:?}",
+            shown(&set)
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    // The scenario's premise: a replica that applied the entries in time
+    // was contradicted, diverged and rebuilt for want of a donor.
+    let rebuilt = (ids.iter()).any(|&id| {
+        let m = set.replica(id).contact_metrics().unwrap();
+        m.contradicted > 0 && m.resync.rebuilt_writing_nothing > 0
+    });
+    assert!(
+        rebuilt,
+        "no replica contradicted and rebuilt: {:?}",
+        shown(&set)
+    );
+    // The kinds of page the replicas compute: the factor each one's pages
+    // are apart by from now on.
+    let kinds: BTreeSet<u32> = (ids.iter())
+        .map(|&id| {
+            let fake = set.audio(id).lock();
+            let open = fake.glitched.iter().rev().find(|g| g.1 == FOR_GOOD);
+            open.map_or(0.0, |g| g.2).to_bits()
+        })
+        .collect();
+    for &id in &ids {
+        set.audio(id).set_enabled(0, true);
+    }
+    // Every page a replica committed, by page and replica: a page record
+    // is sent once every block it overlaps is final.
+    let mut committed: BTreeMap<u64, BTreeMap<NodeId, u64>> = BTreeMap::new();
+    // A resync waits the attempts' backoff too.
+    let deadline = Instant::now() + within;
+    let mut since: Option<Instant> = None;
+    loop {
+        for &id in &ids {
+            let fake = set.audio(id).lock();
+            for p in fake.outputs[0].kept.iter().filter(|p| p.committed) {
+                committed.entry(p.page).or_default().insert(id, p.hash);
+            }
+        }
+        if ids.iter().all(|&id| committing(&set, id)) {
+            let from = *since.get_or_insert_with(Instant::now);
+            if from.elapsed() >= Duration::from_millis(500) {
+                break;
+            }
+        } else {
+            since = None;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "every replica committing for 500 ms within {within:?}: {:?}",
+            shown(&set)
+        );
+        sleep(Duration::from_millis(1)).await;
+    }
+    for (q, by) in &committed {
+        let hashes: BTreeSet<u64> = by.values().copied().collect();
+        assert_eq!(hashes.len(), 1, "page {q} committed apart: {by:?}");
+    }
+    let shared = (committed.values()).filter(|by| by.len() == ids.len());
+    assert!(
+        shared.count() >= 4,
+        "pages every replica committed: {committed:?}"
+    );
+    // Replicas computing k kinds of page commit one kind: the replicas of
+    // k - 1 kinds at least took a donor's core.
+    let resynced = (ids.iter())
+        .filter(|&&id| set.replica(id).contact_metrics().unwrap().resync.handovers > 0)
+        .count();
+    assert!(
+        resynced + 1 >= kinds.len(),
+        "{} kinds, {resynced} resynced: {:?}",
+        kinds.len(),
+        shown(&set)
+    );
+    if all_apart {
+        assert_eq!(kinds.len(), ids.len(), "every replica apart");
+    }
 }
