@@ -1522,7 +1522,8 @@ impl SkipState {
             if row < inputs {
                 (slots.partition_point(|s| s.first_channel <= row)).saturating_sub(1)
             } else {
-                slots.iter().position(pre).unwrap_or(0)
+                // Gains are checked against the configured rows.
+                (slots.iter().position(pre)).expect("a row past the inputs' is a pre-strip row")
             }
         };
         match e.change {

@@ -226,3 +226,40 @@ fn manual_settings_apply_at_their_index() {
     assert_eq!(e.status().diverged, None);
     common::stop(e);
 }
+
+/// A pre-strip row is the input as read and takes no duck: a duck mask
+/// other than 0 on one is refused, in an entry as in a batch, while the
+/// input's own rows take it and a mask of 0 there is taken. Fails with
+/// the pre-strip row check dropped from `check_mask`, which then takes
+/// the mask.
+#[test]
+fn a_pre_strip_row_takes_no_duck_mask() {
+    let domain = Domain::new();
+    let (src, out) = (new_id(), new_id());
+    let mut cfg = config(
+        &domain.0,
+        &[(&src, 2)],
+        &[(&out, 2)],
+        vec![vec![0.0; 2]; 2],
+        MARGIN,
+    );
+    cfg.inputs[0].pre_strip_rows = true;
+    cfg.matrix = vec![vec![0.0; 2]; 4];
+    cfg.duck_columns = vec![0];
+    let (e, _rx, _reports) = common::start_replicated(cfg);
+    let mask = |input, mask| Entry::DuckMask {
+        input,
+        output: 0,
+        mask,
+    };
+    assert_eq!(e.admits(&[mask(1, 1), mask(2, 0), mask(3, 0)]), Ok(()));
+    for entries in [vec![mask(2, 1)], vec![mask(1, 1), mask(3, 0xff)]] {
+        let r = e.admits(&entries);
+        assert!(
+            matches!(&r, Err(EntryError::Invalid(m)) if m.contains("pre-strip row")),
+            "{entries:?}: {r:?}"
+        );
+        assert_eq!(e.append_batch(1, 48_000 * B, &entries), r);
+    }
+    e.stop();
+}

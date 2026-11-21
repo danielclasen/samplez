@@ -873,9 +873,9 @@ fn inputs_pre_strip_rows() -> samplez::bench::Slice {
 // slice, about 2,425 an input.
 const INPUTS_PLAIN: u64 = 418_467;
 const INPUTS_PRE_STRIP: u64 = 759_836;
-// Measured 389,051, 8,896 above `plain`: the copies into the pre-strip
-// rows and the 256 coefficients they add.
-const INPUTS_PRE_STRIP_ROWS: u64 = 427_957;
+// Measured 389,253, 8,896 above `plain` (380,357 in the same run): the
+// copies into the pre-strip rows and the 256 coefficients they add.
+const INPUTS_PRE_STRIP_ROWS: u64 = 428_179;
 
 library_benchmark_group!(name = slices, benchmarks = [slice_end, input_slice_end]);
 

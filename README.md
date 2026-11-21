@@ -549,9 +549,11 @@ output whose column takes them carries the input untrimmed. They carry
 the block as read or generated, its `flowChannels` selected, after the
 fade-in, a re-route's crossfade and silencing, before the trim and the
 rest of the strip and before the delay: they are undelayed whatever
-the input's `Delay`. They mix, duck, fade and hash as every row does
-and count against the matrix's coefficient limits; without the setting
-the input has none and nothing is copied.
+the input's `Delay`. They mix, fade and hash as every row does and
+count against the matrix's coefficient limits, but take no duck: a
+duck mask other than 0 on one is refused, and a depth applies to the
+input's own rows only. Without the setting the input has none and
+nothing is copied.
 
 ### Output strip
 

@@ -937,6 +937,12 @@ fn check_mask(config: &Config, input: usize, output: usize, mask: u8) -> Result<
     if input >= config.rows() || output >= config.columns() {
         return Err(format!("no matrix coefficient {input} -> {output}"));
     }
+    // A pre-strip row is the input as read: it takes no duck.
+    if mask != 0 && input >= config.input_channels() {
+        return Err(format!(
+            "duck mask on pre-strip row {input}, which takes none"
+        ));
+    }
     if mask != 0 && !config.duck_columns.contains(&output) {
         return Err(format!(
             "duck mask on column {output}, which duckColumns does not name"
