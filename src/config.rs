@@ -170,6 +170,14 @@ pub struct Input {
     /// configuration hash to keep the meters of a set alike.
     #[serde(default)]
     pub true_peak: bool,
+    /// Adds a second meter on the input: the selected input before its
+    /// strip, metered as the input's meter is (`truePeak` included), so
+    /// its trim, EQ and dynamics do not reach it. Before the strip means
+    /// the block as read or generated, its `flowChannels` selected, after
+    /// the fade-in, a re-route's crossfade and silencing. Off by default:
+    /// the input then has no such meter and no block copy is made for it.
+    #[serde(default)]
+    pub pre_strip_meter: bool,
 }
 
 /// A tone generator's configuration: none beyond its presence, `{}`.

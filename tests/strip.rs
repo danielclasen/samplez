@@ -133,6 +133,53 @@ fn inputs_and_meters_no_output_carries_are_metered() {
     common::stop(e);
 }
 
+/// An input with `preStripMeter` reads the pilot's full-scale sines
+/// before its strip: a -12 dB trim leaves its pre-strip meter at full
+/// scale, peak and RMS, while its meter after the strip reads them 12 dB
+/// down. An input without it has no pre-strip meter. Fails with the copy
+/// into `prebuf` moved after `run_strip` in `Slot::finish`, the
+/// pre-strip meter then reading the trim.
+#[test]
+fn a_pre_strip_meter_reads_the_input_before_its_trim() {
+    let domain = Domain::new();
+    let (src, dst) = (new_id(), new_id());
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let silent = vec![vec![0.0], vec![0.0], vec![0.0], vec![0.0]];
+    let inputs = [(src.as_str(), 2), (src.as_str(), 2)];
+    let mut cfg = config(&domain.0, &inputs, &[(&dst, 1)], silent, MARGIN);
+    cfg.inputs[0].pre_strip_meter = true;
+    let (e, rx) = common::start(cfg);
+    wait_for(Duration::from_secs(5), "inputs attached", || {
+        (e.status().inputs.iter()).all(|i| i.state == InputState::Attached)
+    });
+    let at = (now(&rx) + 100) * B;
+    e.set_strip(0, StripParam::Trim { db: -12.0 }, at).unwrap();
+    let after = |w: Option<u64>| w.is_some_and(|w| w * 4800 >= at + 5 * 4800);
+    wait_for(Duration::from_secs(10), "meters past the trim", || {
+        let i = &e.status().inputs[0];
+        after(i.meters.window) && i.pre_strip_meters.as_ref().is_some_and(|m| after(m.window))
+    });
+    let s = e.status();
+    let (post, pre) = (
+        &s.inputs[0].meters,
+        s.inputs[0].pre_strip_meters.as_ref().unwrap(),
+    );
+    let db = |v: f32| 20.0 * f64::from(v).log10();
+    let near = |v: f32, want: f64| (db(v) - want).abs() < 0.05;
+    for c in 0..2 {
+        assert!(
+            near(pre.peak[c], 0.0) && near(pre.rms[c], 0.0),
+            "pre {pre:?}"
+        );
+        assert!(
+            near(post.peak[c], -12.0) && near(post.rms[c], -12.0),
+            "post {post:?}"
+        );
+    }
+    assert!(s.inputs[1].pre_strip_meters.is_none());
+    common::stop(e);
+}
+
 /// With a ramp, the engine's output is that of a strip run alone over
 /// the pilot, block by block, its entries set at the start of their
 /// block: trims, polarity and an equaliser band ramp at the rate of one

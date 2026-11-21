@@ -1213,7 +1213,7 @@ fn pass(name: &str, replay: bool) -> Pass {
     // sent, nothing page-hashed, inputs read; or a replay clone with the
     // same meters.
     rt.replay = replay;
-    (rt.buses, rt.taps) = new_meters(&config);
+    (rt.buses, rt.taps, rt.pre_taps) = new_meters(&config);
     rt.test_input = Some(source);
     let (meters, mut meter_rx) = rtrb::RingBuffer::new(1 << 14);
     rt.meters = meters;
