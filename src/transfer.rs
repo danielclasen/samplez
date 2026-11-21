@@ -9,9 +9,10 @@
 //! state, each output's strip with its position, the entries waiting for
 //! their generation and the pending generation's entry id, the outputs
 //! disabled, the meters whose loudness measurement the log holds paused,
-//! and the
-//! unresolved entries with the late re-routes. Meters, hold rings, block statuses, page hashes in progress
-//! and the readers stay with the replica. The RT thread copies it into a
+//! and the unresolved entries with the late re-routes. A delay line's
+//! taps and the history they reach are copied beside it, the history off
+//! the RT thread. Meters, hold rings, block statuses, page hashes in
+//! progress and the readers stay with the replica. The RT thread copies it into a
 //! buffer allocated off the RT thread, of the same shape, so the copy
 //! allocates nothing.
 
@@ -72,13 +73,18 @@ pub(crate) struct SlotCore {
     pub tone: Option<Tone>,
 }
 
-/// An output's part of the core, for an output configured with a strip.
+/// An output's part of the core, for an output configured with a strip
+/// or a delay line.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct OutCore {
     /// The output's strip, its filter and dynamics state included, and
     /// the index of the next sample it processes, as a slot's.
     pub strip: Option<Strip>,
     pub strip_pos: Option<u64>,
+    /// The output's delay, as a slot's; none on an output without a delay
+    /// line, and then not encoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<DelayCore>,
 }
 
 /// A delay's state in a core.
@@ -239,10 +245,10 @@ pub struct Core {
     /// configuration has none. A core built from product state leaves the
     /// RT thread's, as it leaves the strips.
     pub(crate) limiters: Vec<Option<Limiter>>,
-    /// Each output configured with a strip, ascending, and its part: none
-    /// for an engine without one, and then not encoded. A core built from
-    /// product state holds none and leaves the RT thread's, as it leaves
-    /// the slots' strips.
+    /// Each output configured with a strip or a delay line, ascending, and
+    /// its part: none for an engine without one, and then not encoded. A
+    /// core built from product state holds none and leaves the RT
+    /// thread's, as it leaves the slots' strips and delays.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) outs: Vec<(u32, OutCore)>,
     pub(crate) awaiting_gen: Vec<RtEntry>,
@@ -305,8 +311,9 @@ impl Core {
     }
 
     /// Off the RT thread, before a buffer goes to it: drops the batches
-    /// it carries, so the RT thread drops none, and makes room for as
-    /// many as it holds pending, and for a part of every output.
+    /// and the delay spans it carries, so the RT thread drops none, and
+    /// makes room for as many batches as it holds pending, and for a part
+    /// of every output.
     pub(crate) fn prepare(&mut self) {
         for s in &mut self.slots {
             if let Some(d) = &mut s.delay {
@@ -389,6 +396,13 @@ impl Core {
         Some(self.slots.get(slot)?.delay.as_ref()?.taps)
     }
 
+    /// The taps of output `output`'s delay; none for an output without
+    /// one.
+    pub fn output_delay_taps(&self, output: usize) -> Option<Taps> {
+        let (_, o) = self.outs.iter().find(|(o, _)| *o as usize == output)?;
+        Some(o.delay.as_ref()?.taps)
+    }
+
     /// Slot `slot`'s tone generator; none for a slot without one.
     pub fn tone(&self, slot: usize) -> Option<&Tone> {
         self.slots.get(slot)?.tone.as_ref()
@@ -453,7 +467,9 @@ impl Core {
                         param.check(usize::MAX).is_ok()
                     }
                     Change::Limiter { params, .. } => params.check().is_ok(),
-                    Change::Delay { samples, .. } => samples <= samplez_dsp::MAX_DELAY_SAMPLES,
+                    Change::Delay { samples, .. } | Change::OutputDelay { samples, .. } => {
+                        samples <= samplez_dsp::MAX_DELAY_SAMPLES
+                    }
                     Change::Tone { params, .. } => params.is_valid(),
                     Change::LoudnessRun { meter, .. } | Change::ResetLoudness { meter } => {
                         meter < MAX_OUTPUTS + MAX_METERS
@@ -464,25 +480,30 @@ impl Core {
                     _ => true,
                 }
         };
+        let delay = |d: Option<&DelayCore>| {
+            d.is_none_or(|d| {
+                d.pos.is_none_or(index)
+                    && index(d.floor)
+                    && index(d.taps.start)
+                    && d.set < 2
+                    && d.taps.is_within(samplez_dsp::MAX_DELAY_SAMPLES)
+            })
+        };
         let slot = |s: &SlotCore| {
             (!s.detached || s.silenced_last)
                 && s.fade_start.is_none_or(index)
                 && s.xfade.is_none_or(index)
                 && s.strip_pos.is_none_or(index)
-                && s.delay.as_ref().is_none_or(|d| {
-                    d.pos.is_none_or(index)
-                        && index(d.floor)
-                        && index(d.taps.start)
-                        && d.set < 2
-                        && d.taps.is_within(samplez_dsp::MAX_DELAY_SAMPLES)
-                })
+                && delay(s.delay.as_ref())
+        };
+        let out = |(o, c): &(u32, OutCore)| {
+            (*o as usize) < MAX_OUTPUTS && c.strip_pos.is_none_or(index) && delay(c.delay.as_ref())
         };
         let ats = |list: &[(LogId, u64)]| list.iter().all(|&(_, at)| index(at));
         let outs = &self.outs;
         self.pos.is_none_or(index)
             && outs.windows(2).all(|w| w[0].0 < w[1].0)
-            && (outs.iter())
-                .all(|(o, c)| (*o as usize) < MAX_OUTPUTS && c.strip_pos.is_none_or(index))
+            && outs.iter().all(out)
             && self.ducks.sane()
             && index(self.ramp_end)
             && self.entries_page.is_none_or(index)
@@ -532,7 +553,8 @@ impl Core {
     /// an output a limiter and a strip of the legs `limiters` and
     /// `out_strips` name for it, and a slot a delay, with the
     /// span its taps reach, exactly when `delays` names the longest delay for
-    /// it, taps within that; a slot has a tone generator of its legs at
+    /// it, taps within that, an output one as `out_delays` names its legs
+    /// and longest delay; a slot has a tone generator of its legs at
     /// the engine's rate exactly when `tones` names it one, a slot past
     /// the list none.
     #[allow(clippy::too_many_arguments)]
@@ -546,6 +568,7 @@ impl Core {
         limiters: &[Option<usize>],
         out_strips: &[Option<usize>],
         delays: &[u32],
+        out_delays: &[(usize, u32)],
         tones: &[bool],
         ramp: u32,
         page_entries: usize,
@@ -583,6 +606,23 @@ impl Core {
                 .filter(|o| !ducked.contains(o))
                 .all(|o| !m.is_ducked(o) && (0..inputs).all(|i| m.mask(i, o) == 0))
         };
+        // A delay of a line of `max` and `legs` legs, with the span its
+        // taps reach; none for no line.
+        let delay = |d: Option<&DelayCore>, max: u32, legs: usize| match d {
+            None => max == 0,
+            Some(d) => {
+                let len = d.span_len(max);
+                max > 0
+                    && d.taps.is_within(max)
+                    && d.pos == self.pos
+                    && d.pos.is_some_and(|p| d.floor <= p)
+                    && d.span.len() == legs
+                    && d.span.iter().all(|leg| leg.len() == len)
+            }
+        };
+        let out_strip = |o: usize| out_strips.get(o).copied().flatten();
+        let out_delay = |o: usize| out_delays.get(o).copied().unwrap_or_default();
+        let processed = |o: usize| out_strip(o).is_some() || out_delay(o).1 > 0;
         let shape = (
             self.matrix.inputs(),
             self.matrix.outputs(),
@@ -607,27 +647,20 @@ impl Core {
                 held.map(|l| (l.legs(), l.ramp())) == want.map(|legs| (legs, ramp))
             })
             && self.outs.iter().all(|(o, c)| {
-                let want = out_strips.get(*o as usize).copied().flatten();
-                want.is_some()
-                    && c.strip.as_ref().map(|s| (s.legs(), s.ramp())) == want.map(|l| (l, ramp))
+                let o = *o as usize;
+                let (legs, max) = out_delay(o);
+                processed(o)
+                    && c.strip.as_ref().map(|s| (s.legs(), s.ramp()))
+                        == out_strip(o).map(|l| (l, ramp))
+                    && delay(c.delay.as_ref(), max, legs)
             })
-            && (out_strips.iter().enumerate())
-                .filter(|(_, want)| want.is_some())
-                .all(|(o, _)| self.outs.iter().any(|(i, _)| *i as usize == o))
+            && (0..out_strips.len().max(out_delays.len()))
+                .filter(|&o| processed(o))
+                .all(|o| self.outs.iter().any(|(i, _)| *i as usize == o))
             && (0..self.slots.len().max(delays.len())).all(|i| {
                 let max = delays.get(i).copied().unwrap_or(0);
-                match self.slots.get(i).and_then(|s| s.delay.as_ref()) {
-                    None => max == 0,
-                    Some(d) => {
-                        let len = d.span_len(max);
-                        max > 0
-                            && d.taps.is_within(max)
-                            && d.pos == self.pos
-                            && d.pos.is_some_and(|p| d.floor <= p)
-                            && d.span.len() == legs.get(i).copied().unwrap_or(0)
-                            && d.span.iter().all(|leg| leg.len() == len)
-                    }
-                }
+                let legs = legs.get(i).copied().unwrap_or(0);
+                delay(self.slots.get(i).and_then(|s| s.delay.as_ref()), max, legs)
             })
             && self.ducks.fits(legs, ramp)
             && unducked(&self.matrix)
@@ -639,7 +672,9 @@ impl Core {
 /// `legs` legs and output strips of the legs `out_strips` names, none for
 /// an output without one: a coefficient and a gain it has, a slot, an
 /// output, a meter, and a strip parameter that slot's or output's strip
-/// takes. A batch's own values are checked by [`Batch::fits`].
+/// takes; a delay fits any slot or output, one without a line taking it
+/// refusing it on the RT thread. A batch's own values are checked by
+/// [`Batch::fits`].
 pub(crate) fn fits(
     c: &Change,
     inputs: usize,
@@ -677,6 +712,9 @@ pub(crate) fn fits(
         Change::Delay { slot, samples } => {
             slot < slots && samples <= samplez_dsp::MAX_DELAY_SAMPLES
         }
+        Change::OutputDelay { output, samples } => {
+            output < outputs && samples <= samplez_dsp::MAX_DELAY_SAMPLES
+        }
         Change::Tone { slot, params } => slot < slots && params.is_valid(),
         Change::Batch { up, routed, .. } => slots_of(up | routed).all(|s| s < slots),
     }
@@ -707,6 +745,8 @@ pub(crate) struct Handover {
     /// Output strip parameters set at the install index, by output, as
     /// `strips`.
     pub out_strips: Vec<(usize, StripParam)>,
+    /// Output delays set at the install index, by output, as `strips`.
+    pub out_delays: Vec<(usize, u32)>,
     /// Tone generators' ramps installed at the install index, by slot:
     /// the product state's, which replace the generator's own.
     pub tones: Vec<(usize, ToneRamps)>,
@@ -1095,6 +1135,7 @@ fn change_of(entry: &Entry) -> Change {
         Entry::OutputStrip { output, param } => Change::OutputStrip { output, param },
         Entry::Limiter { output, params } => Change::Limiter { output, params },
         Entry::Delay { slot, samples } => Change::Delay { slot, samples },
+        Entry::OutputDelay { output, samples } => Change::OutputDelay { output, samples },
         Entry::Tone {
             slot,
             frequency_hz,
@@ -1160,6 +1201,10 @@ pub struct ProductState {
     /// history, so a slot delayed reads its own past until the delay
     /// has passed.
     pub delays: Vec<u32>,
+    /// Per output its delay in samples, as `delays`: set again at the
+    /// install, the line keeping its history. An output past the list
+    /// keeps its own.
+    pub output_delays: Vec<u32>,
     /// Per input slot its tone parameters, for a tone generator's; none
     /// for one the log never set. Without ramps in `tone_ramps` a
     /// generator holds them from the install on, with no ramp. A slot
@@ -1539,6 +1584,7 @@ mod tests {
         let part = || OutCore {
             strip: Some(strip()),
             strip_pos: Some(4800),
+            delay: None,
         };
         let mut c = copy();
         c.core.outs.push((0, part()));
@@ -1547,7 +1593,21 @@ mod tests {
         assert_eq!(decoded.core.output_strip(0), Some(&strip()));
         let fits = |c: &Core, out_strips: &[Option<usize>]| {
             let n = out_strips.len().max(1);
-            c.fits(2, 2, n, n, &[1, 1], &[], out_strips, &[], &[], 48, 8, &[])
+            c.fits(
+                2,
+                2,
+                n,
+                n,
+                &[1, 1],
+                &[],
+                out_strips,
+                &[],
+                &[],
+                &[],
+                48,
+                8,
+                &[],
+            )
         };
         assert!(fits(&decoded.core, &[Some(1), None]));
         assert!(
@@ -1595,14 +1655,127 @@ mod tests {
         );
     }
 
+    /// An output's delay decodes as encoded, its span bit for bit, and an
+    /// output part without one encodes none, as one before output delays.
+    /// A core fits an engine only where its outputs have delay lines of
+    /// the lines the engine's have, the span reaching from the floor to
+    /// the core's position, of the output's legs; an output delay pending
+    /// fits only an output the engine has.
+    #[test]
+    fn a_core_carries_the_output_delays_of_its_engine() {
+        let fits = |c: &Core, out_delays: &[(usize, u32)]| {
+            let n = out_delays.len().max(1);
+            c.fits(
+                2,
+                2,
+                n,
+                n,
+                &[1, 1],
+                &[],
+                &[],
+                &[],
+                out_delays,
+                &[],
+                48,
+                8,
+                &[],
+            )
+        };
+        let pos = 4800;
+        let line = DelayCore {
+            taps: Taps {
+                from: 10,
+                to: 30,
+                start: pos - 24,
+                next: Some(20),
+            },
+            pos: Some(pos),
+            floor: pos - 30,
+            set: 1,
+            span: vec![vec![0.5; 30], vec![-0.25; 30]],
+        };
+        let lined = OutCore {
+            delay: Some(line.clone()),
+            ..OutCore::default()
+        };
+        let value = serde_json::to_value(&lined).unwrap();
+        assert!(value.get("delay").is_some(), "{value}");
+        let mut c = copy();
+        c.core.outs.push((1, lined));
+        let encoded = c.encode();
+        let decoded = CoreCopy::decode(&encoded).unwrap();
+        assert_eq!(decoded, c);
+        assert_eq!(decoded.core.output_delay_taps(1), Some(line.taps));
+        assert_eq!(decoded.core.output_delay_taps(0), None);
+        let stereo = [(1, 0), (2, 100)];
+        assert!(fits(&decoded.core, &stereo));
+        assert!(
+            !fits(&decoded.core, &[(1, 0), (2, 0)]),
+            "a line on an output without"
+        );
+        assert!(
+            !fits(&decoded.core, &[(1, 0), (2, 20)]),
+            "taps beyond the line"
+        );
+        assert!(
+            !fits(&decoded.core, &[(1, 0), (1, 100)]),
+            "a span of other legs"
+        );
+        assert!(
+            !fits(&copy().core, &stereo),
+            "no delay on an output with a line"
+        );
+        let mut pending = copy();
+        pending.core.pending.push(RtEntry {
+            id: 8,
+            at_index: 9600,
+            change: Change::OutputDelay {
+                output: 1,
+                samples: 50,
+            },
+        });
+        assert!(fits(&pending.core, &[(1, 0), (1, 0)]));
+        assert!(
+            !fits(&pending.core, &[(1, 0)]),
+            "an entry for output 1 of 1"
+        );
+        let mut short = CoreCopy::decode(&encoded).unwrap();
+        short.core.outs[0].1.delay.as_mut().unwrap().span[1].pop();
+        assert!(!fits(&short.core, &stereo), "a span short of the floor");
+        // An output part without a delay encodes as one before them.
+        let part = OutCore {
+            strip: Some(strip()),
+            strip_pos: Some(pos),
+            delay: None,
+        };
+        // A strip's own state can name a delay: the part's own key counts.
+        let value = serde_json::to_value(&part).unwrap();
+        assert!(value.get("delay").is_none(), "{value}");
+    }
+
     /// The meters a core holds paused decode as encoded, on both words of
     /// the mask; a core pausing a meter the engine lacks, or pending a
     /// loudness entry for one, does not fit it, and one naming a meter
     /// beyond any engine's is refused as it decodes.
     #[test]
     fn a_core_carries_the_meters_paused_within_the_engines_meters() {
-        let fits =
-            |c: &Core, meters| c.fits(2, 2, 1, meters, &[1, 1], &[], &[], &[], &[], 48, 8, &[]);
+        let fits = |c: &Core, meters| {
+            c.fits(
+                2,
+                2,
+                1,
+                meters,
+                &[1, 1],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                48,
+                8,
+                &[],
+            )
+        };
         let mut c = copy();
         c.core.loudness_paused = (1 << 1) | (1 << 70);
         let decoded = CoreCopy::decode(&c.encode()).unwrap();
@@ -1891,7 +2064,7 @@ mod tests {
         let mut copy = copy();
         assert!(!copy.encode().contains("tone"));
         let fits = |c: &Core, tones: &[bool], ramp| {
-            c.fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], tones, ramp, 8, &[])
+            c.fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], tones, ramp, 8, &[])
         };
         let mut tone = Tone::new(1, 48_000, 48);
         let lineup = ToneParams {
@@ -1943,35 +2116,35 @@ mod tests {
         let mut copy = copy();
         assert!(
             copy.core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[])
         );
         assert!(
             !copy
                 .core
-                .fits(2, 3, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 3, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[])
         );
         assert!(
             !copy
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 0, &[])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 0, &[])
         );
         // Strips of other legs, another ramp, or none on a narrow slot;
         // a slot wider than a strip has none.
         assert!(
             !copy
                 .core
-                .fits(2, 2, 1, 1, &[1, 2], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 2, 1, 1, &[1, 2], &[], &[], &[], &[], &[], 48, 8, &[])
         );
         assert!(
             !copy
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 480, 8, &[])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 480, 8, &[])
         );
         copy.core.slots[0].strip = None;
         assert!(
             !copy
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[])
         );
         assert!(copy.core.fits(
             2,
@@ -1979,6 +2152,7 @@ mod tests {
             1,
             1,
             &[MAX_LEGS + 1, 1],
+            &[],
             &[],
             &[],
             &[],
@@ -1996,25 +2170,25 @@ mod tests {
         assert!(
             !copy
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[])
         );
         copy.core.pending.pop();
         // Output 1 disabled: a core of two outputs, not of one.
         copy.core.outputs_disabled = 0b10;
         assert!(
             copy.core
-                .fits(2, 2, 2, 2, &[1, 1], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 2, 2, 2, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[])
         );
         assert!(
             !copy
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[])
         );
         copy.core.outputs_disabled = 0;
         // A delay on slot 0 of 1 leg and a line of 100: its span reaches
         // from the floor to the core's position.
         let fits = |c: &Core, delays: &[u32]| {
-            c.fits(2, 2, 1, 1, &[1, 1], &[], &[], delays, &[], 48, 8, &[])
+            c.fits(2, 2, 1, 1, &[1, 1], &[], &[], delays, &[], &[], 48, 8, &[])
         };
         let pos = copy.core.pos.unwrap();
         copy.core.slots[0].delay = Some(DelayCore {
@@ -2061,12 +2235,12 @@ mod tests {
         });
         assert!(
             copy.core
-                .fits(2, 2, 2, 2, &[1, 1], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 2, 2, 2, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[])
         );
         assert!(
             !copy
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[])
         );
     }
 
@@ -2111,30 +2285,30 @@ mod tests {
         assert!(
             decoded
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 8, &[0])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[0])
         );
         // Its mask is on column 0: refused on an engine whose duck
         // columns leave it out, or that has none.
         assert!(
             !decoded
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 8, &[1])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[1])
         );
         assert!(
             !decoded
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 48, 8, &[])
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 48, 8, &[])
         );
         assert!(
             !decoded
                 .core
-                .fits(2, 2, 1, 1, &[1, 2], &[], &[], &[], &[], 48, 8, &[0]),
+                .fits(2, 2, 1, 1, &[1, 2], &[], &[], &[], &[], &[], 48, 8, &[0]),
             "key 0 of another width"
         );
         assert!(
             !decoded
                 .core
-                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], 480, 8, &[0]),
+                .fits(2, 2, 1, 1, &[1, 1], &[], &[], &[], &[], &[], 480, 8, &[0]),
             "another key filter ramp"
         );
     }

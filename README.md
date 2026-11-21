@@ -35,6 +35,8 @@ matrix, are built on it.
   entries of one log entry are folded and applied whole at its index
 - A channel strip per output of up to 8 channels, configured per output
   and set by output strip entries, ahead of its limiter
+- A delay line per output, opt-in by configuration, up to 5 s, between
+  its strip and its limiter
 - A true-peak limiter per output of up to 8 channels, configured per
   output and set by limiter entries
 - Meters per output and meter: sample peak, RMS, true peak and EBU R 128
@@ -163,7 +165,8 @@ generator) none, per output
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
 Table 3; without it every channel weighs 1), per input `maxDelaySamples`
 0 and `truePeak` false (Meters), per output `strip` and `limiter` false
-(below), per output and meter `correlation` false (Meters), and
+and `maxDelaySamples` 0 (below), per output and meter `correlation`
+false (Meters), and
 `meters`, each with a `name`, `channels` and `loudnessChannels`: matrix
 columns after the outputs' that are computed and metered and written to
 no flow.
@@ -343,7 +346,8 @@ index), `Detach` (it crossfades to silence over the ramp length from the
 index and reads no flow, is not polled and is not reported until a
 `Route` fades it in from silence; its up or down state is kept),
 `Limiter` (an output's limiter parameters, below), `Delay` (an input's
-delay, below), `Tone` (a tone generator's frequency, level and ident,
+delay, below), `OutputDelay` (an output's delay, below), `Tone` (a tone
+generator's frequency, level and ident,
 below), `LoudnessRun` (a meter's loudness measurement paused or
 run from the index, see Meters), `ResetLoudness` (a meter's loudness
 measurement restarted at the first window from the index, see Meters),
@@ -416,8 +420,8 @@ A replicated log entry may carry any number of engine entries
 (`append_batch`). They are folded off the RT thread: per matrix
 coefficient, strip parameter of a slot or an output, and output the
 last value, per output
-its last limiter parameters, per input slot its last delay and tone
-parameters, per meter
+its last limiter parameters and delay, per input slot its last delay and
+tone parameters, per meter
 its last `LoudnessRun` and each meter reset once; per input slot
 whether it is re-routed or detached, the last `Route` or `Detach`
 counting, goes down and comes up, an `InputUp` after an `InputDown`
@@ -538,10 +542,11 @@ passes its input unchanged until an `OutputStrip` entry sets it
 (`Engine::set_output_strip`). It runs on every block computed, on the
 matrix's output for the output's channels: after the matrix's gains,
 which carry any bus fader a product sets, so there is no strip ahead of
-a fader, and before the output's limiter, so the limiter's ceiling holds
-on what the strip makes of the mix. The write, the page hash and
-the output's own meters read after both; a configured meter reads
-matrix columns of its own and passes through no output strip. Its
+a fader, and before the output's delay line and limiter, so the
+limiter's ceiling holds on what the strip makes of the mix. The write,
+the page hash and the output's own meters read after them; a configured
+meter reads matrix columns of its own and passes through no output
+strip. Its
 ramps advance over skipped samples, as an input strip's do; its filter
 and envelope state follows the samples it processed, so after a skip,
 or after a rebuild from product state, which sets its parameters again
@@ -558,8 +563,8 @@ limiter (`samplez_dsp::Limiter`), off until a `Limiter` entry sets it
 (`Engine::set_limiter`, `samplez_dsp::LimiterParams`): on or off, a
 ceiling of -20 to 0 dBTP and a release time constant of 1 to 1000 ms.
 It runs on every block computed, after the matrix and the output's
-strip and before the write, the page hash and the output's meters, so
-they all see what leaves.
+strip and delay line and before the write, the page hash and the
+output's meters, so they all see what leaves.
 Such an output is `samplez_dsp::LIMITER_DELAY` samples (53, 1.1 ms)
 later than one without, on or off; switching it on or off ramps over the
 ramp length, a new ceiling or release takes effect at the next sample.
@@ -590,7 +595,8 @@ that length plus `historySlackMs`, allocated at start; an input without
 it has none and costs nothing. A replay builds rings of its own, so
 during a resync a replica holds the budget's rings twice more.
 `delayBudgetSamples`, 2^22 by default,
-caps `maxDelaySamples` times `channels` summed over the inputs: a
+caps `maxDelaySamples` times `channels` summed over the inputs and the
+outputs (Output delay): a
 resync copies at most that much history, about 6 bytes a sample, and a
 replica reads a donor's answer of up to
 `samplez_replica::peer::max_response` of it, the limit it gives
@@ -608,6 +614,24 @@ reads nothing older than its taps reached without a break, so that is
 all the history a resync copies. The rings are indexed by sample index,
 so the output does not depend on the block size; samples an overrun
 skipped are stored as silence.
+
+### Output delay
+
+An output configured with `maxDelaySamples` above 0, at most 240000
+(5 s), has a delay line of the input delay's kind, its rings allocated
+at start and counted in `delayBudgetSamples` with the inputs'. An
+`OutputDelay` entry (`Engine::set_output_delay`) sets the output's delay
+in samples, at most its `maxDelaySamples`; a delay of 0 any output
+takes. The line runs on every block computed, on the matrix's output
+for the output's channels after the output's strip and before its
+limiter, so the limiter's ceiling holds on what leaves, a delay's
+crossfade included, and the write, the page hash and the output's own
+meters see the output late; there is no line ahead of a bus fader, and
+a configured meter reads matrix columns of its own and passes through
+no line. A change crossfades, waits and reaches back over silence as an
+input's does. An output with a line is its delay later than the mix,
+and `samplez_dsp::LIMITER_DELAY` more with a limiter; an output without
+one has none and costs nothing.
 
 ### Tone generator
 
@@ -973,10 +997,10 @@ the RT thread keeps its writers, flows, hold rings and statuses,
 computes no block and withholds each one, overrun skips included, cause
 `NoCore` (`StatusChange::NoCore` ranges), with the replica withdrawn.
 Entries needing no generation whose index passes meanwhile are taken off
-the pending list, strip, output strip, limiter, delay and tone entries
-applied to the strips, delay lines and tone generators the slots and the
-strips and limiters the outputs keep and the others, duck entries
-included, not, and the core
+the pending list, strip, output strip, limiter, delay, output delay and
+tone entries applied to the strips, delay lines and tone generators the
+slots and the strips, delay lines and limiters the outputs keep and the
+others, duck entries included, not, and the core
 installed next must know them; a batch holding an `InputUp` or `Route`
 stays pending whole. A replayed core replaces the strips, limiters,
 delays and tone generators; one built from product state leaves them,
@@ -1024,14 +1048,19 @@ group's detector state. A keyed group whose envelope never reaches 0 or
 full depth, which would keep the two apart for good, so costs one page,
 the reports that carry it and a resync. The product state also names
 each slot's flow, strip parameters, delay and tone parameters, each
-output's strip and limiter parameters and each meter's loudness measurement
-running or paused, which the core takes at the install: the supervisor
-hands over generations reading those flows before the core, a slot on
-another flow moving to it with no crossfade, and the strip and limiter
-parameters and delays are set from the install's index, each strip,
-limiter and delay line keeping its own state, so a delayed input plays
-the line's own history until the delay has passed; each tone generator
-takes the state's tone ramps (Tone generator). `Targets` holds every gain, flow, strip parameter, limiter
+output's strip and limiter parameters and delay and each meter's loudness
+measurement running or paused, which the core takes at the install: the
+supervisor hands over generations reading those flows before the core, a
+slot on another flow moving to it with no crossfade, and the strip and
+limiter parameters and delays are set from the install's index, each
+strip, limiter and delay line keeping its own state, so a delayed input
+or output plays the line's own history until the delay has passed; each
+tone generator takes the state's tone ramps (Tone generator). That state,
+the strips' filter and envelope state, the limiters' rings and gain and
+the lines' history and taps (a crossfade in flight), follows the
+samples the engine computed, and starts cold in a new process: where it differs from a peer's, the output does,
+and as with the duck groups the first page that differs diverges the
+replica and costs a resync, whose core carries that state. `Targets` holds every gain, flow, strip parameter, limiter
 parameter, delay, tone parameter, duck group setting, duck mask and
 meter's running state as values;
 `Targets::diff` gives the entries that move an engine from one
@@ -1075,8 +1104,8 @@ leave an engine (below): a flow other than the one an input reads is a
 re-route kept by the same rules and else left as read, a strip
 parameter, limiter parameters, delay, a duck setting or mask the engine
 refuses is replaced as the filter replaces it (below), strip and limiter
-parameters of an output it lacks or that has no strip or limiter left
-out, and a gain it
+parameters of an output it lacks or that has no strip or limiter, and
+the delay of an output it lacks, left out, and a gain it
 refuses is silent. A
 product without targets gives an empty
 state, which an engine refuses: its replicas stay in `starting`.
@@ -1309,8 +1338,9 @@ a running set as peers; a core copy is taken only at an equal
 and `src/engine/golden.rs` the bits the RT loop computes offline from a
 fixed scene, log and input source, its columns' samples apart from
 every value its meters send, its outputs' page hashes, and the encoded
-core copy of its state, and from scenes of their own a tone generator's
-and output strips' samples and core copies. Their hashes sit in tables
+core copy of its state, and from scenes of their own a tone generator's,
+output strips' and output delay lines' samples and core copies. Their
+hashes sit in tables
 with a row per
 `COMPUTE_VERSION`: a change that moves any of them fails until the
 version is bumped and a row added. The pages' entry fingerprints are a

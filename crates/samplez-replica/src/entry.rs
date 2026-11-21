@@ -262,8 +262,10 @@ pub enum Body {
 /// engine joins it and the input fade-ins and crossfades and duck depth
 /// and mask ramps in flight, which its snapshots carry, so a replica
 /// rebuilt inside one continues it as its peers do; 5 adds the output
-/// strip's engine entry (`samplez::Entry::OutputStrip`) and targets
-/// (`samplez::Targets::output_strips`).
+/// strip's and output delay's engine entries
+/// (`samplez::Entry::OutputStrip`, `samplez::Entry::OutputDelay`) and
+/// targets (`samplez::Targets::output_strips`,
+/// `samplez::Targets::output_delays`).
 pub const PROTOCOL: u32 = 5;
 
 impl Body {
@@ -486,7 +488,7 @@ mod tests {
     /// computation bumps it, with the reason added here, and only such a
     /// change does. 2: the generation flags; 3: the tone generator's
     /// entry and targets; 4: an unfillable withheld block's digest; 5: the
-    /// output strip's entry and targets.
+    /// output strip's and output delay's entries and targets.
     #[test]
     fn the_protocol_is_pinned() {
         assert_eq!(PROTOCOL, 5);

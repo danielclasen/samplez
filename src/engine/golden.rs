@@ -47,7 +47,10 @@
 //! output strips through equaliser, compressor, gate and order changes,
 //! one ahead of a limiter, with a skip across a ramp, pins the outputs'
 //! samples and their strips in a core copy the same way, and checks that
-//! a replay from that copy computes the loop's samples.
+//! a replay from that copy computes the loop's samples. A fifth, output
+//! delay lines through changes during a crossfade and across a skip, one
+//! between a strip and a limiter, does so for the lines, their history
+//! copied with the core.
 //!
 //! Left out: the output write and hold path, real MXL reads and clock
 //! steps. An offline loop has no flow writer, so blocks never reach a
@@ -142,6 +145,21 @@ const OUTPUT_CORE_AT: u64 = 305;
 /// strip inside them.
 const OUTPUT_SKIP: Range<u64> = 600..640;
 const OUTPUT_BLOCKS: u64 = 1200;
+
+/// The output delay scene's hashes for each compute version: (version,
+/// samples, XXH3-64 of the encoded core copy after [`DELAY_CORE_AT`]). A
+/// scene of its own, so the other scenes' rows stay as they are.
+/// `the_engine_computes_the_bits_pinned_for_this_compute_version` reports
+/// the output delay scene's hashes, which replace it.
+const OUTPUT_DELAYS: &[(u32, u64, u64)] = &[(2, 0x6892_1966_4d94_67a0, 0xe010_062c_d8f9_b2d7)];
+
+/// The block after which the output delay scene's core is copied: inside
+/// output 0's crossfade to a longer delay, a shorter one waiting behind it.
+const DELAY_CORE_AT: u64 = 305;
+/// The blocks the output delay scene does not compute, entries for output
+/// 1's line at the first of them and inside them.
+const DELAY_SKIP: Range<u64> = 600..640;
+const DELAY_BLOCKS: u64 = 1200;
 
 /// The block after which the tone scene's core is copied: inside the
 /// crossfade to 440 Hz, the change to 1 kHz waiting behind it.
@@ -933,6 +951,170 @@ fn output_scene() -> (u64, u64) {
     (samples.digest(), core.expect("a core copied"))
 }
 
+/// The output delay scene: two inputs into a stereo output with a strip, a
+/// delay line and a limiter, and a mono output with a delay line alone.
+/// Output 0 trimmed up into its limiter and delayed, its delay raised and,
+/// during that crossfade, lowered; output 1 delayed, its delay changed at
+/// the first block of a skipped span and inside it, and output 0's line
+/// taken back to no delay later. The hashes of every output sample and of
+/// the encoded core copy after block [`DELAY_CORE_AT`], the lines' history
+/// in it; a replay clone installed from that copy, its rings filled from
+/// it, computes the loop's samples from there on.
+fn output_delay_scene() -> (u64, u64) {
+    let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+        .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+    let inputs = (0..2).map(|i| {
+        serde_json::json!({ "name": format!("in{i}"), "domain": "d",
+            "flowId": format!("5fbec3b1-1b0f-417d-9059-00000000000{i}"), "channels": 1 })
+    });
+    let outputs = [(2, true, 4800), (1, false, 2400)].map(|(ch, processed, max)| {
+        serde_json::json!({ "name": format!("out{ch}"), "domain": "d",
+            "flowId": format!("6fbec3b1-1b0f-417d-9059-00000000000{ch}"), "label": "o",
+            "group": "g", "role": "Audio", "channels": ch, "strip": processed,
+            "limiter": processed, "maxDelaySamples": max })
+    });
+    let v = serde_json::json!({
+        "libmxl": libmxl,
+        "blockSize": B,
+        "rampSamples": RAMP,
+        "domains": [{ "name": "d", "path": "/nonexistent" }],
+        "inputs": inputs.collect::<Vec<_>>(),
+        "outputs": outputs,
+        "matrix": [[0.8, 0.0, 0.5], [0.0, 0.8, 0.5]],
+        "rt": { "enabled": false, "rtCpu": "none" },
+    });
+    let config = Config::parse(&v.to_string()).unwrap();
+    let api = samplez_mxl::load(&config.libmxl).unwrap();
+    let new_rt = || {
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt: Rt = replay_rt(&config, &api, vec![None], hashes, control);
+        rt.test_input = Some(source);
+        rt
+    };
+    let mut rt = new_rt();
+    let (mut core_tx, core_rx) = rtrb::RingBuffer::new(1);
+    let (copy_tx, mut copy_rx) = rtrb::RingBuffer::new(1);
+    let r = rt.replica.as_mut().unwrap();
+    (r.cores, r.copies) = (core_rx, copy_tx);
+    for (row, column, g) in [(0, 0, 0.8), (1, 1, 0.8), (0, 2, 0.5), (1, 2, 0.5)] {
+        assert!(rt.mix.matrix.set(row, column, g, 0));
+    }
+    let delay = |output, samples| Item::Change(Change::OutputDelay { output, samples });
+    let trim = Item::Change(Change::OutputStrip {
+        output: 0,
+        param: StripParam::Trim { db: 6.0 },
+    });
+    let log: [(u64, Vec<Item>); 6] = [
+        (
+            0,
+            vec![trim, limiter(0, -3.0, 50.0), delay(0, 960), delay(1, 480)],
+        ),
+        (300 * B, vec![delay(0, 2400)]),
+        // Inside the crossfade to 2400: waits for its end.
+        (303 * B, vec![delay(0, 1200)]),
+        (DELAY_SKIP.start * B, vec![delay(1, 2000)]),
+        ((DELAY_SKIP.start + 10) * B, vec![delay(1, 100)]),
+        (900 * B, vec![delay(0, 0)]),
+    ];
+    for (n, (at_index, items)) in log.iter().enumerate() {
+        let entry = |change| RtEntry {
+            id: n as u64 + 1,
+            at_index: *at_index,
+            change,
+        };
+        match items[..] {
+            [Item::Change(change)] => assert!(rt.mix.push(entry(change))),
+            _ => {
+                let (change, batch) = batch::fold(items, 3, 6).unwrap().unwrap();
+                assert!(rt.mix.push_with(entry(change), batch).is_ok());
+            }
+        }
+    }
+    let ceiling = 10f32.powf(-3.0 / 20.0) * (1.0 + 1e-6);
+    let mut samples = Xxh3Default::new();
+    let mut replay: Option<Rt> = None;
+    let mut core = None;
+    let saved = samplez_dsp::set_ftz_daz(true);
+    for k in (0..DELAY_BLOCKS).filter(|k| !DELAY_SKIP.contains(k)) {
+        if k == DELAY_CORE_AT {
+            let page = PENDING_CHANGES * PAGE.div_ceil(B) as usize;
+            let mut buffer = Box::new(Core::new(2, 3, 2, page, 2));
+            buffer.prepare();
+            assert!(core_tx.push(buffer).is_ok());
+        }
+        rt.process(k, u64::MAX);
+        if let Some(replay) = replay.as_mut() {
+            replay.process(k, u64::MAX);
+            for c in 0..3 {
+                let bits = |rt: &Rt| -> Vec<u32> {
+                    rt.outbuf.channel(c)[..B as usize]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect()
+                };
+                assert_eq!(bits(&*replay), bits(&rt), "column {c} of block {k}");
+            }
+        }
+        if let Ok(mut copy) = copy_rx.pop() {
+            assert_eq!(copy.k0, DELAY_CORE_AT);
+            // The lines' history before the block after the core, as
+            // `Engine::copy_core` adds it off the RT thread.
+            let end = (copy.k0 + 1) * B;
+            for (o, part) in copy.core.outs.iter_mut() {
+                if let (Some(d), Some(l)) = (&mut part.delay, &rt.outs[*o as usize].delay) {
+                    let rings = l.rings();
+                    let len = d.span_len(rings.max()) as u32;
+                    d.span = rings.copy(usize::from(d.set), end, len);
+                }
+            }
+            assert_eq!(copy.core.outs.len(), 2, "an output's part missing");
+            let taps = copy.core.output_delay_taps(0).expect("output 0's line");
+            assert!(taps.from != taps.to && taps.next.is_some(), "{taps:?}");
+            // Output 1's line as the first log entry's batch set it.
+            let taps = copy.core.output_delay_taps(1).map(|t| (t.from, t.to));
+            assert_eq!(taps, Some((0, 480)));
+            let encoded = CoreCopy::encode(&copy);
+            core = Some(xxhash_rust::xxh3::xxh3_64(encoded.as_bytes()));
+            let mut decoded = CoreCopy::decode(&encoded).unwrap();
+            let mut clone = new_rt();
+            // Into the clone's rings, as `Engine::replay` fills them.
+            for (o, part) in decoded.core.outs.iter_mut() {
+                if let (Some(d), Some(l)) = (&mut part.delay, &clone.outs[*o as usize].delay) {
+                    let set = l.rings().active();
+                    l.rings().fill(set, end, &d.span);
+                    d.set = set as u8;
+                }
+            }
+            clone.install_core(&mut decoded.core, decoded.last_id, true);
+            replay = Some(clone);
+        }
+        for c in 0..3 {
+            for v in &rt.outbuf.channel(c)[..B as usize] {
+                samples.update(&v.to_bits().to_le_bytes());
+            }
+        }
+        // Past the ramp of switching the limiter on, output 0 holds its
+        // ceiling: the delay's crossfades are ahead of it.
+        if k >= 20 {
+            for c in 0..2 {
+                let peak =
+                    (rt.outbuf.channel(c)[..B as usize].iter()).fold(0.0f32, |m, v| m.max(v.abs()));
+                assert!(peak <= ceiling, "output 0 at {peak} in block {k}");
+            }
+        }
+    }
+    samplez_dsp::restore_mxcsr(saved);
+    assert!(replay.is_some(), "no replay from the copy");
+    assert_eq!(rt.outs[0].delay.as_ref().map(|d| d.taps().to), Some(0));
+    assert_eq!(rt.outs[1].delay.as_ref().map(|d| d.taps().to), Some(100));
+    let c = &rt.counters;
+    for counter in [&c.command_late, &c.strip_refused] {
+        assert_eq!(counter.load(Relaxed), 0);
+    }
+    (samples.digest(), core.expect("a core copied"))
+}
+
 fn generation(api: &Arc<MxlApi>, domain: &Path, rerouted: u64) -> Box<Gen> {
     Box::new(Gen {
         mxl: Generation::new(api, domain, SLOTS).unwrap(),
@@ -1303,6 +1485,15 @@ fn the_engine_computes_the_bits_pinned_for_this_compute_version() {
          encodes to {c:#018x}: a change to either needs a COMPUTE_VERSION \
          bump and its hashes here"
     );
+    let (s, c) = output_delay_scene();
+    let pinned = OUTPUT_DELAYS.iter().find(|g| g.0 == crate::COMPUTE_VERSION);
+    assert_eq!(
+        Some((s, c)),
+        pinned.map(|g| (g.1, g.2)),
+        "the output delay scene computes samples {s:#018x} and its core copy \
+         encodes to {c:#018x}: a change to either needs a COMPUTE_VERSION \
+         bump and its hashes here"
+    );
 }
 
 /// The run is a function of its scene and log alone: two runs agree.
@@ -1312,4 +1503,5 @@ fn the_engine_golden_run_is_deterministic() {
     assert_eq!(phased_core(), phased_core());
     assert_eq!(tone_scene(), tone_scene());
     assert_eq!(output_scene(), output_scene());
+    assert_eq!(output_delay_scene(), output_delay_scene());
 }

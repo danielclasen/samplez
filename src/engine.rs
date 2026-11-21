@@ -417,6 +417,11 @@ pub enum Entry {
     /// a crossfade still running. At most the slot's `maxDelaySamples`;
     /// 0 on a slot without a delay line sets nothing.
     Delay { slot: usize, samples: u32 },
+    /// Delays output `output` by `samples` from the entry's index, as
+    /// `Delay` does an input slot: on the output's strip's output, ahead
+    /// of its limiter. At most the output's `maxDelaySamples`; 0 on an
+    /// output without a delay line sets nothing.
+    OutputDelay { output: usize, samples: u32 },
     /// Sets the tone generator of input slot `slot`, one configured with
     /// `tone`, from the entry's index: `frequency_hz` within
     /// [`samplez_dsp::TONE_FREQUENCY_HZ`], crossfading from the sine
@@ -828,6 +833,21 @@ fn check_delay(config: &Config, slot: usize, samples: u32) -> Result<(), String>
         return Err(format!(
             "a delay of {samples} samples on input slot {slot}, its maxDelaySamples {}",
             input.max_delay_samples
+        ));
+    }
+    Ok(())
+}
+
+/// Whether output `output` exists and its delay line takes a delay of
+/// `samples`; 0 any output takes.
+fn check_output_delay(config: &Config, output: usize, samples: u32) -> Result<(), String> {
+    let Some(o) = config.outputs.get(output) else {
+        return Err(format!("no output {output}"));
+    };
+    if samples > o.max_delay_samples {
+        return Err(format!(
+            "a delay of {samples} samples on output {output}, its maxDelaySamples {}",
+            o.max_delay_samples
         ));
     }
     Ok(())
@@ -1528,19 +1548,25 @@ fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
                 config.ramp_samples,
             ));
         }
-        if i.max_delay_samples > 0 {
-            let rings = DelayRings::new(
-                i.channels as usize,
-                i.max_delay_samples,
-                config.history_slack_blocks() as usize,
-                config.block_size as usize,
-            );
-            slot.delay = Some(Delay::new(rings, config.ramp_samples));
-        }
+        slot.delay = delay_line(config, i.channels, i.max_delay_samples);
         slots.push(slot);
         channel += i.channels as usize;
     }
     (slots, in_domains)
+}
+
+/// A delay line of `channels` legs taking delays up to `max` samples, its
+/// rings allocated here; none for a `max` of 0.
+fn delay_line(config: &Config, channels: u32, max: u32) -> Option<Delay> {
+    (max > 0).then(|| {
+        let rings = DelayRings::new(
+            channels as usize,
+            max,
+            config.history_slack_blocks() as usize,
+            config.block_size as usize,
+        );
+        Delay::new(rings, config.ramp_samples)
+    })
 }
 
 /// The configured meters on their matrix columns, after the outputs',
@@ -1603,6 +1629,7 @@ pub(crate) fn replay_rt(
                 pages: Some(Pages::new(o as u32, ch, b, 0)),
                 strip: out.strip.then(|| Strip::new(ch, config.ramp_samples)),
                 strip_pos: None,
+                delay: delay_line(config, out.channels, out.max_delay_samples),
                 limiter: out.limiter.then(|| Limiter::new(ch, config.ramp_samples)),
             }
         })
@@ -1719,6 +1746,8 @@ pub struct Engine {
     /// Per input slot the rings of its delay line, shared with the RT
     /// thread: copied for a core, filled for a hand-over.
     delays: Vec<Option<Arc<DelayRings>>>,
+    /// Per output the rings of its delay line, as `delays`.
+    out_delays: Vec<Option<Arc<DelayRings>>>,
     stop: Arc<AtomicBool>,
     supervisor: Option<JoinHandle<()>>,
     counters: Arc<Counters>,
@@ -1995,12 +2024,16 @@ impl Engine {
                     .strip
                     .then(|| Strip::new(o.channels as usize, config.ramp_samples)),
                 strip_pos: None,
+                delay: delay_line(&config, o.channels, o.max_delay_samples),
                 limiter: o
                     .limiter
                     .then(|| Limiter::new(o.channels as usize, config.ramp_samples)),
             });
             channel += o.channels as usize;
         }
+        let out_delays: Vec<Option<Arc<DelayRings>>> = (outs.iter())
+            .map(|o| o.delay.as_ref().map(|d| Arc::clone(d.rings())))
+            .collect();
         let (n, m) = (config.input_channels(), config.columns());
         let mut matrix = Matrix::new(n, m);
         let (buses, taps) = new_meters(&config);
@@ -2309,6 +2342,7 @@ impl Engine {
             transfer,
             replay_gate,
             delays,
+            out_delays,
         })
     }
 
@@ -2448,6 +2482,21 @@ impl Engine {
     pub fn set_delay(&self, slot: usize, samples: u32, at_index: u64) -> Result<(), GainError> {
         check_delay(&self.config, slot, samples).map_err(GainError::Invalid)?;
         self.set_local(Change::Delay { slot, samples }, at_index, "delay changes")
+    }
+
+    /// Delays output `output` by `samples` from sample index `at_index`, a
+    /// multiple of the block size, as [`Entry::OutputDelay`] does. Refused
+    /// as [`Engine::set_gain`] refuses a change, and as invalid for an
+    /// output that does not exist or a delay above its `maxDelaySamples`.
+    pub fn set_output_delay(
+        &self,
+        output: usize,
+        samples: u32,
+        at_index: u64,
+    ) -> Result<(), GainError> {
+        check_output_delay(&self.config, output, samples).map_err(GainError::Invalid)?;
+        let change = Change::OutputDelay { output, samples };
+        self.set_local(change, at_index, "delay changes")
     }
 
     /// Sets the tone generator of input slot `slot` to `params` from
@@ -2928,6 +2977,10 @@ impl Engine {
                 check_delay(&self.config, slot, samples).map_err(EntryError::Invalid)?;
                 Change::Delay { slot, samples }
             }
+            Entry::OutputDelay { output, samples } => {
+                check_output_delay(&self.config, output, samples).map_err(EntryError::Invalid)?;
+                Change::OutputDelay { output, samples }
+            }
             Entry::Tone {
                 slot,
                 frequency_hz,
@@ -3266,8 +3319,14 @@ impl Engine {
         // The delays' history before the block after the core, kept only
         // as long as the RT thread has not reached it, as checked below.
         let end = (copy.k0 + 1) * self.block;
-        for (s, rings) in copy.core.slots.iter_mut().zip(&self.delays) {
-            if let (Some(d), Some(rings)) = (&mut s.delay, rings) {
+        let slots = copy.core.slots.iter_mut().map(|s| &mut s.delay);
+        let lines = slots
+            .zip(&self.delays)
+            .chain((copy.core.outs.iter_mut()).filter_map(|(o, part)| {
+                Some((&mut part.delay, self.out_delays.get(*o as usize)?))
+            }));
+        for (d, rings) in lines {
+            if let (Some(d), Some(rings)) = (d, rings) {
                 let len = d.span_len(rings.max()) as u32;
                 d.span = rings.copy(usize::from(d.set), end, len);
             }
@@ -3322,6 +3381,9 @@ impl Engine {
             .iter()
             .map(|i| i.max_delay_samples)
             .collect();
+        let out_delays: Vec<(usize, u32)> = (self.config.outputs.iter())
+            .map(|o| (o.channels as usize, o.max_delay_samples))
+            .collect();
         let tones: Vec<bool> = self
             .config
             .inputs
@@ -3339,6 +3401,7 @@ impl Engine {
             &limiters,
             &out_strips,
             &delays,
+            &out_delays,
             &tones,
             ramp,
             page,
@@ -3420,8 +3483,12 @@ impl Engine {
         let mut rt = replay_rt(&self.config, &self.api, gens, hashes_tx, control_rx);
         // The delays' history before the core, into the replay's rings.
         let end = next;
-        for (slot, s) in rt.slots.iter().zip(c.slots.iter_mut()) {
-            if let (Some(l), Some(d)) = (&slot.delay, &mut s.delay) {
+        let slots =
+            (rt.slots.iter().map(|s| &s.delay)).zip(c.slots.iter_mut().map(|s| &mut s.delay));
+        let outs = (c.outs.iter_mut())
+            .filter_map(|(o, part)| Some((&rt.outs.get(*o as usize)?.delay, &mut part.delay)));
+        for (l, d) in slots.chain(outs) {
+            if let (Some(l), Some(d)) = (l, d) {
                 let set = l.rings().active();
                 l.rings().fill(set, end, &d.span);
                 d.set = set as u8;
@@ -3470,14 +3537,17 @@ impl Engine {
         // went to: should an earlier call's core install meanwhile, the
         // other set is copied whole. Each attempt runs after the answers
         // to earlier calls are taken.
-        let mut filled: Vec<Option<(usize, u64)>> = vec![None; rings.len()];
-        self.offer(timeout, 0, true, &[], &[], &[], &[], &[], |j, core| {
+        let out_rings = &self.out_delays;
+        let mut filled: Vec<Option<(usize, u64)>> = vec![None; rings.len() + out_rings.len()];
+        self.offer(timeout, 0, true, &[], &[], &[], &[], &[], &[], |j, core| {
             replay.run(j);
             replay.rt.capture(core);
             let end = replay.next * replay.rt.block;
-            for ((slot, rings), done) in (replay.rt.slots.iter()).zip(rings).zip(filled.iter_mut())
-            {
-                if let (Some(l), Some(rings)) = (&slot.delay, rings) {
+            let lines = (replay.rt.slots.iter().map(|s| &s.delay))
+                .zip(rings)
+                .chain((replay.rt.outs.iter().map(|o| &o.delay)).zip(out_rings));
+            for ((l, rings), done) in lines.zip(filled.iter_mut()) {
+                if let (Some(l), Some(rings)) = (l, rings) {
                     *done = Some(samplez_dsp::copy_since(
                         l.rings(),
                         rings,
@@ -3489,6 +3559,12 @@ impl Engine {
             }
             for (s, rings) in core.slots.iter_mut().zip(rings) {
                 if let (Some(d), Some(rings)) = (&mut s.delay, rings) {
+                    d.set = rings.inactive() as u8;
+                }
+            }
+            for (o, part) in core.outs.iter_mut() {
+                if let (Some(d), Some(Some(rings))) = (&mut part.delay, out_rings.get(*o as usize))
+                {
                     d.set = rings.inactive() as u8;
                 }
             }
@@ -3608,6 +3684,7 @@ impl Engine {
             || state.outputs.len() > self.config.outputs.len()
             || state.limiters.len() > self.config.outputs.len()
             || state.output_strips.len() > self.config.outputs.len()
+            || state.output_delays.len() > self.config.outputs.len()
             || state.loudness_running.len() > self.config.outputs.len() + self.config.meters.len()
         {
             return Err(ReplayError::Invalid(format!(
@@ -3639,6 +3716,9 @@ impl Engine {
         }
         for (slot, &samples) in state.delays.iter().enumerate() {
             check_delay(&self.config, slot, samples).map_err(ReplayError::Invalid)?;
+        }
+        for (output, &samples) in state.output_delays.iter().enumerate() {
+            check_output_delay(&self.config, output, samples).map_err(ReplayError::Invalid)?;
         }
         for (slot, params) in state.tones.iter().enumerate() {
             if let Some(params) = params {
@@ -3685,6 +3765,8 @@ impl Engine {
             .filter_map(|(o, p)| Some((o, (*p)?)))
             .collect();
         let delays: Vec<(usize, u32)> = state.delays.iter().copied().enumerate().collect();
+        let out_delays: Vec<(usize, u32)> =
+            (state.output_delays.iter().copied().enumerate()).collect();
         // Per tone generator the ramps the state carries, or its target
         // held where it carries none.
         let tones: Vec<(usize, ToneRamps)> = (0..slots)
@@ -3767,6 +3849,7 @@ impl Engine {
             &limiters,
             &delays,
             &out_strips,
+            &out_delays,
             &tones,
             |j, core| fill.fill(j, core),
         )
@@ -3796,6 +3879,7 @@ impl Engine {
         limiters: &[(usize, LimiterParams)],
         delays: &[(usize, u32)],
         out_strips: &[(usize, StripParam)],
+        out_delays: &[(usize, u32)],
         tones: &[(usize, ToneRamps)],
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
@@ -3896,6 +3980,7 @@ impl Engine {
                 limiters: limiters.to_vec(),
                 delays: delays.to_vec(),
                 out_strips: out_strips.to_vec(),
+                out_delays: out_delays.to_vec(),
                 tones: tones.to_vec(),
                 answer: Answer::Waiting,
             };
@@ -8037,6 +8122,7 @@ mod tests {
             limiters: Vec::new(),
             delays: Vec::new(),
             out_strips: Vec::new(),
+            out_delays: Vec::new(),
             tones: Vec::new(),
             answer: Answer::Waiting,
         };
@@ -8102,6 +8188,7 @@ mod tests {
                 Duration::from_secs(5),
                 0,
                 false,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -8280,6 +8367,7 @@ mod tests {
                 Duration::from_secs(5),
                 0,
                 false,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -8937,6 +9025,71 @@ mod tests {
         set.advance(192 - 48);
         assert!(set.set(gain));
         assert_eq!(rt.slots[0].strip.as_ref(), Some(&set));
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Without a core an output delay entry whose index passed still
+    /// reaches the output's line, which the output keeps across the drop,
+    /// as a slot's delay entry reaches the slot's; one the core knew whose
+    /// index it passed applies at the install of a core built from product
+    /// state, which holds no line, and waits for the crossfade the first
+    /// started.
+    #[test]
+    fn an_output_delay_entry_due_without_a_core_reaches_the_line() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("no-core-output-delay", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d15", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d16", "label": "delay",
+                          "group": "delay", "role": "Audio", "channels": 1,
+                          "maxDelaySamples": 4800 }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let entry = |id, at_index, change| RtEntry {
+            id,
+            at_index,
+            change,
+        };
+        let out = |samples| Change::OutputDelay { output: 0, samples };
+        assert!(rt.mix.push(entry(1, 48, out(960))));
+        assert!(rt.mix.push(entry(2, 960, Change::InputDown { slot: 0 })));
+        rt.pass_entries(2);
+        let ids: Vec<LogId> = rt.mix.pending.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [2]);
+        let taps = |rt: &Rt| rt.outs[0].delay.as_ref().map(Delay::taps);
+        let fading = samplez_dsp::Taps {
+            from: 0,
+            to: 960,
+            start: 48,
+            next: None,
+        };
+        assert_eq!(taps(&rt), Some(fading));
+
+        assert!(rt.mix.push(entry(3, 192, out(480))));
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64, 1));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        rt.install_core(&mut core, 3, false);
+        assert!(rt.mix.pending.is_empty());
+        let waiting = samplez_dsp::Taps {
+            next: Some(480),
+            ..fading
+        };
+        assert_eq!(taps(&rt), Some(waiting));
+        assert_eq!(rt.counters.strip_refused.load(Relaxed), 0);
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }
@@ -9928,6 +10081,7 @@ mod tests {
                 limiters: Vec::new(),
                 delays: Vec::new(),
                 out_strips: Vec::new(),
+                out_delays: Vec::new(),
                 tones: Vec::new(),
                 answer: Answer::Waiting,
             };
@@ -9979,6 +10133,7 @@ mod tests {
             Duration::from_secs(1),
             0,
             true,
+            &[],
             &[],
             &[],
             &[],
@@ -10038,6 +10193,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             |j, _| (j, 0),
         );
         let spent = cpu() - before;
@@ -10061,6 +10217,7 @@ mod tests {
             Duration::from_millis(300),
             0,
             true,
+            &[],
             &[],
             &[],
             &[],
