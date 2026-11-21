@@ -1467,11 +1467,37 @@ product's non-RT runtime.
   the registration client sends no credentials and uses registries
   advertising `api_proto=http` and `api_auth=false` only, so no TLS.
 - No peer-to-peer mode: without a registry the node is not advertised.
+- Resource versions are TAI times. `Nmos::new` reads them from the
+  product's `TaiClock`. `Nmos::with_versions` takes them only from the
+  product, so instances serving one Node, such as a replica set's,
+  serve the same documents when fed the same changes. A served
+  activation writes `/active` but leaves the IS-04 resource and its
+  version; the product takes the change from `Nmos::activation` in its
+  `apply`, replicates it, and every instance passes it to
+  `Nmos::replicated_change` with the change's TAI time in the replicated
+  state. The port's version becomes that time, or the next nanosecond
+  after its own where that is not earlier, and is returned for the
+  product to keep: `Nmos::with_versions` at start and
+  `Nmos::set_versions` at a takeover (which never moves one back) take
+  it, and a `Store` that also returns the replicated activations
+  (`Store::activations`) starts an instance on its peers' `/active`. A
+  sender's Source and Flow and a receiver's caps carry the port's
+  version, the Node and the Device the latest of all. A failed apply
+  shows the replicated connection in `/active` again, and a scheduled
+  activation that no longer checks out at its time goes to the product
+  with `master_enable` false. The apply of a scheduled activation runs
+  `Connections::lead` before its time, so instances can show its
+  `activation_time` before it comes. `/staged` and pending scheduled
+  activations are each instance's own, so a controller stages and
+  activates a port on one instance.
 - A 200 on a process's first Node POST deletes the Node and registers it
-  anew, as IS-04 asks of a restarted Node. With
+  anew, as IS-04 asks of a restarted Node, and so does any 400, once per
+  pass, as after a replica set is rebuilt under the same Node id and the
+  registry holds the Node at a later version. With
   `NmosConfig::continue_held` the process heartbeats first instead and,
   when the registry still holds the Node, gives every resource a new
-  version and posts it without deleting the Node: for processes that
+  version (with `Nmos::with_versions` each keeps its own) and posts it
+  without deleting the Node: for processes that
   take turns under one Node id, one at a time and with the same resource
   ids, such as a replica set's leaders. A resource the predecessor
   registered and the process lacks stays registered. When the registry

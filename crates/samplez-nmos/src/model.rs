@@ -102,9 +102,11 @@ pub struct NmosConfig {
     /// Whether this process continues a registration that a registry
     /// still holds for its Node when it first registers. On, it heartbeats
     /// first; when the registry holds the Node, every resource gets a new
-    /// version and is posted, and the Node is not deleted. Off, a 200 on
-    /// the first Node POST deletes the Node and registers it anew, as IS-04
-    /// asks of a restarted Node. On is for processes that take turns under
+    /// version (with [`crate::Nmos::with_versions`] it keeps its own) and
+    /// is posted, and the Node is not deleted. Off, a 200 on the first
+    /// Node POST deletes the Node and registers it anew, as IS-04 asks of a
+    /// restarted Node, and so does any 400, once per pass.
+    /// On is for processes that take turns under
     /// one Node id, such as a replica set's leaders, so a hand-over keeps
     /// the Node registered. It assumes one process registers the Node at a
     /// time, which the application ensures, and that each presents the

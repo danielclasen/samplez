@@ -191,8 +191,12 @@ async fn answer(
         return reply(status, location);
     }
     let v: Value = serde_json::from_slice(&body).unwrap();
+    let refused = |error: String| {
+        let body = json!({ "code": 400, "error": error, "debug": null });
+        (StatusCode::BAD_REQUEST, body.to_string()).into_response()
+    };
     if m.refuse == v["type"].as_str() {
-        return reply(StatusCode::BAD_REQUEST, None);
+        return refused("Bad Request; schema validation failed".into());
     }
     let id = v["data"]["id"].as_str().unwrap().to_owned();
     // nmos-cpp: a changed document at a version not newer is refused.
@@ -205,7 +209,12 @@ async fn answer(
         && *held != v["data"]
         && tai(version(&v["data"])) <= tai(version(held))
     {
-        return reply(StatusCode::BAD_REQUEST, None);
+        // nmos-cpp's error.
+        return refused(format!(
+            "Bad Request; request for registration with version {} conflicts with the existing registration with version {}",
+            version(&v["data"]),
+            version(held)
+        ));
     }
     m.docs.insert(id.clone(), v["data"].clone());
     let known = !m.ids.insert(id) || m.mode == Some(Mode::FirstRegistration);
@@ -259,6 +268,43 @@ fn node_clocked(
     continue_held: bool,
     clock: impl TaiClock,
 ) -> Nmos {
+    let (model, cfg) = parts(registries, continue_held);
+    Nmos::new(
+        model,
+        cfg,
+        Arc::new(Product { delay: apply }),
+        &NoStore,
+        clock,
+    )
+    .unwrap()
+}
+
+/// [`node_with`] taking its versions from `versions`, every port at that
+/// time.
+fn node_shared(registries: &[&Registry], continue_held: bool, versions: Tai) -> Nmos {
+    let (model, cfg) = parts(registries, continue_held);
+    let versions = [
+        PortKey::Sender("pgm".into()),
+        PortKey::Receiver("a".into()),
+        PortKey::Receiver("b".into()),
+    ]
+    .into_iter()
+    .map(|k| (k, versions))
+    .collect();
+    Nmos::with_versions(
+        model,
+        cfg,
+        Arc::new(Product {
+            delay: Duration::ZERO,
+        }),
+        &NoStore,
+        SystemTai,
+        &versions,
+    )
+    .unwrap()
+}
+
+fn parts(registries: &[&Registry], continue_held: bool) -> (NodeModel, NmosConfig) {
     let domain = uuid!("11111111-2222-4333-8444-555555555555");
     let model = NodeModel {
         label: "mixer".into(),
@@ -301,14 +347,7 @@ fn node_clocked(
         dns_sd_domain: None,
         continue_held,
     };
-    Nmos::new(
-        model,
-        cfg,
-        Arc::new(Product { delay: apply }),
-        &NoStore,
-        clock,
-    )
-    .unwrap()
+    (model, cfg)
 }
 
 /// A TAI clock `behind` the system's.
@@ -499,6 +538,89 @@ async fn a_continued_registration_posts_newer_versions_than_the_held_ones() {
             .iter()
             .map(|s| (&s.method, &s.path))
             .collect::<Vec<_>>()
+    );
+}
+
+/// A replica set rebuilt under the same Node id, its versions from the
+/// product's state started anew: the registry holds the Node at a later
+/// version and refuses the first POST with 400, so the Node is deleted
+/// and registered anew, and the registry holds the rebuilt set's
+/// documents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_node_refused_for_a_later_held_version_is_registered_anew() {
+    let r = Registry::start(Mode::Up).await;
+    let first = node_shared(&[&r], false, Tai::new(1_000, 0));
+    let task = tokio::spawn(first.registration());
+    until("registered", || types(&r.seen()).len() == 7).await;
+    task.abort();
+    r.clear();
+    let rebuilt = node_shared(&[&r], false, Tai::new(10, 0));
+    let task = tokio::spawn(rebuilt.registration());
+    until("every resource at the rebuilt version", || {
+        let held = r.versions();
+        held.len() == 7 && held.values().all(|v| v == "10:0")
+    })
+    .await;
+    task.abort();
+    let seen = r.seen();
+    let calls: Vec<(String, String)> = seen
+        .iter()
+        .take(3)
+        .map(|s| (s.method.to_string(), s.path.clone()))
+        .collect();
+    let id = rebuilt.node_id();
+    assert_eq!(
+        calls,
+        [
+            ("POST".into(), "/x-nmos/registration/v1.3/resource".into()),
+            (
+                "DELETE".into(),
+                format!("/x-nmos/registration/v1.3/resource/nodes/{id}")
+            ),
+            ("POST".into(), "/x-nmos/registration/v1.3/resource".into()),
+        ]
+    );
+    assert_eq!(types(&seen)[..2], ["node".to_owned(), "node".to_owned()]);
+}
+
+/// A fresh Node refused with a 400 whatever the reason is deleted and
+/// registered again once per pass: one refused for a reason a repost
+/// cannot cure is refused again, and the registration goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_node_refused_for_another_reason_is_deleted_once_and_goes_on() {
+    let r = Registry::start(Mode::Up).await;
+    r.state.lock().unwrap().refuse = Some("node");
+    let n = node(&[&r], Duration::ZERO);
+    let task = tokio::spawn(n.registration());
+    until("a heartbeat", || r.seen().iter().any(Seen::is_heartbeat)).await;
+    task.abort();
+    let seen = r.seen();
+    // One pass, up to the first heartbeat: the Node deleted once.
+    let pass: Vec<&Seen> = seen.iter().take_while(|s| !s.is_heartbeat()).collect();
+    let deletes = pass.iter().filter(|s| s.method == Method::DELETE).count();
+    assert_eq!(deletes, 1, "{pass:?}");
+}
+
+/// With versions from the product, a continued registration posts the
+/// versions the predecessor registered, as both took them from the same
+/// state: the registry keeps them and the Node is not deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_continued_registration_with_shared_versions_keeps_them() {
+    let r = Registry::start(Mode::Up).await;
+    let first = node_shared(&[&r], true, Tai::new(1_000, 0));
+    let task = tokio::spawn(first.registration());
+    until("registered", || types(&r.seen()).len() == 7).await;
+    task.abort();
+    let held = r.versions();
+    r.clear();
+    let next = node_shared(&[&r], true, Tai::new(1_000, 0));
+    let task = tokio::spawn(next.registration());
+    until("registered again", || types(&r.seen()).len() == 7).await;
+    task.abort();
+    assert_eq!(r.versions(), held);
+    assert!(
+        r.seen().iter().all(|s| s.method != Method::DELETE),
+        "the Node deleted"
     );
 }
 
