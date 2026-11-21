@@ -263,9 +263,9 @@ fn id_version(doc: &Value) -> (Uuid, String) {
 
 /// Posts every resource whose version the registry has not seen, parents
 /// first. A 200 on a first Node registration means the registry still held
-/// an earlier registration, and a 400 that it holds one at a later version,
-/// as of a replica set rebuilt under the same Node id: the node deletes it
-/// and registers anew.
+/// an earlier registration, and any 400 may mean it holds one at a later
+/// version, as of a replica set rebuilt under the same Node id: the node
+/// deletes it and registers anew, once per pass.
 async fn register_all(
     inner: &Inner,
     client: &Registrar,

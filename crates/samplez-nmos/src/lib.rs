@@ -242,14 +242,19 @@ impl Nmos {
     /// [`Connections::apply`] the product takes the change from
     /// [`Nmos::activation`] and replicates it, and every instance, the
     /// serving one included, passes it to [`Nmos::replicated_change`], so
-    /// `/active` and the resources are the replicated ones everywhere. A
-    /// failed apply changes nothing but the port's status: the product
-    /// replicates what its state then holds for the port, such as the
-    /// connection before or one with `master_enable` false. `/staged` is
-    /// each instance's own, as is a scheduled activation still pending. A
-    /// continued registration ([`NmosConfig::continue_held`]) keeps the
-    /// versions as they are. Every instance advertises the same host and
-    /// port, as the Node carries them.
+    /// `/active` and the resources are the replicated ones everywhere. The
+    /// apply of a scheduled activation runs [`Connections::lead`] before
+    /// its time, so instances can show its `activation_time` before it
+    /// comes. A scheduled activation that no longer checks out at its time
+    /// goes to the product with `master_enable` false. A failed apply
+    /// shows the replicated connection in `/active` again. `/staged` and
+    /// pending scheduled activations are each instance's own, so a
+    /// controller stages and activates a port on one instance. A product
+    /// that keeps the replicated activations in its [`Store`]
+    /// ([`Store::activations`]) starts an instance on its peers'
+    /// `/active`. A continued registration ([`NmosConfig::continue_held`])
+    /// keeps the versions as they are. Every instance advertises the same
+    /// host and port, as the Node carries them.
     pub fn with_versions(
         model: NodeModel,
         cfg: NmosConfig,
@@ -279,6 +284,12 @@ impl Nmos {
             model.receivers.iter().map(|r| r.key.as_str()),
         );
         let stored = store.load();
+        let stored_activations = store.activations();
+        // The activation stored with a connection the port starts from.
+        let activation = |key: &PortKey, from_store: bool| {
+            let a = stored_activations.get(key).filter(|_| from_store);
+            a.map(connection::Activation::of).unwrap_or_default()
+        };
         let now = clock.now();
         let changed = Arc::new(tokio::sync::Notify::new());
         let mut st = State {
@@ -303,17 +314,23 @@ impl Nmos {
                 flow: Some(s.flow),
             };
             let key = PortKey::Sender(s.key.clone());
-            let active = from_store(&stored, &key, s.domain, Some(s.flow)).unwrap_or(initial);
+            let stored = from_store(&stored, &key, s.domain, Some(s.flow));
+            let activation = activation(&key, stored.is_some());
+            let active = stored.unwrap_or(initial);
             let state = match versions {
                 Some(v) => SenderState {
                     source_version: Tai::default(),
                     flow_version: Tai::default(),
-                    port: PortState::new(v.get(&key).copied().unwrap_or_default(), active),
+                    port: PortState::new(
+                        v.get(&key).copied().unwrap_or_default(),
+                        active,
+                        activation,
+                    ),
                 },
                 None => SenderState {
                     source_version: st.bump(now),
                     flow_version: st.bump(now),
-                    port: PortState::new(st.bump(now), active),
+                    port: PortState::new(st.bump(now), active, activation),
                 },
             };
             st.senders.push(state);
@@ -326,12 +343,15 @@ impl Nmos {
                 flow: r.flow,
             };
             let key = PortKey::Receiver(r.key.clone());
-            let active = from_store(&stored, &key, r.domain, None).unwrap_or(initial);
+            let stored = from_store(&stored, &key, r.domain, None);
+            let activation = activation(&key, stored.is_some());
+            let active = stored.unwrap_or(initial);
             let version = match versions {
                 Some(v) => v.get(&key).copied().unwrap_or_default(),
                 None => st.bump(now),
             };
-            st.receivers.push(PortState::new(version, active));
+            st.receivers
+                .push(PortState::new(version, active, activation));
         }
         if versions.is_some() {
             st.derive();
@@ -423,12 +443,14 @@ impl Nmos {
     /// now on. Returns the version set, which the product keeps, and the
     /// generation.
     ///
-    /// `served` is true on the instance that served the activation behind
-    /// the change, whose `/active` already shows it: the activations queued
-    /// behind it still reach the product. Otherwise the change is one as
-    /// [`Nmos::external_change`] makes it, from another instance or by the
-    /// product itself, and `/active` shows `change.active` with
-    /// `change.activation`.
+    /// `served` is the generation of the [`Connections::apply`] call on
+    /// this node the change replicates, if any: `/active` shows the change
+    /// unless an activation or a change came after that call, and the
+    /// activations queued behind it still reach the product. Otherwise the
+    /// change is one as [`Nmos::external_change`] makes it, from another
+    /// instance or by the product itself. Either way `/active` shows
+    /// `change.activation`, or the activation last replicated when it
+    /// carries none.
     ///
     /// Panics on a node built with [`Nmos::new`].
     pub fn replicated_change(
@@ -436,7 +458,7 @@ impl Nmos {
         port: Port,
         change: &Replicated,
         version: Tai,
-        served: bool,
+        served: Option<u64>,
     ) -> Stamped {
         assert!(
             self.inner.shared,
@@ -446,15 +468,21 @@ impl Nmos {
         let p = st.port_mut(port);
         p.version = version.max(p.version.next());
         p.published = change.active.clone();
-        let generation = if served {
-            p.generation()
-        } else {
-            p.active = change.active.clone();
-            if let Some(a) = &change.activation {
-                p.active_activation = connection::Activation::of(a);
+        if let Some(a) = &change.activation {
+            p.published_activation = connection::Activation::of(a);
+        }
+        let generation = match served {
+            Some(g) => {
+                if p.generation() == g {
+                    p.show_published();
+                }
+                p.generation()
             }
-            p.applied = Applied::Applied;
-            p.changed_by_product()
+            None => {
+                p.show_published();
+                p.applied = Applied::Applied;
+                p.changed_by_product()
+            }
         };
         let version = p.version;
         st.derive();

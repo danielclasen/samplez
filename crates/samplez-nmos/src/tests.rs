@@ -642,12 +642,12 @@ async fn instances_fed_the_same_changes_serve_the_same_documents() {
     assert_eq!(activation.time, Tai::new(5_000_000, 0));
     let at = Tai::new(300, 0);
     assert_eq!(
-        a.replicated_change(Port::Sender(0), &change, at, true)
+        a.replicated_change(Port::Sender(0), &change, at, Some(generation))
             .version,
         at
     );
     assert_eq!(
-        b.replicated_change(Port::Sender(0), &change, at, false)
+        b.replicated_change(Port::Sender(0), &change, at, None)
             .version,
         at
     );
@@ -661,7 +661,7 @@ async fn instances_fed_the_same_changes_serve_the_same_documents() {
         activation: None,
     };
     for n in [&a, &b] {
-        n.replicated_change(Port::Receiver(1), &switched, Tai::new(400, 0), false);
+        n.replicated_change(Port::Receiver(1), &switched, Tai::new(400, 0), None);
     }
     // b takes over and sets the versions from the product's state.
     b.set_versions(&BTreeMap::from([
@@ -715,17 +715,72 @@ async fn shared_versions_increase_per_resource() {
         activation: None,
     };
     let at = Tai::new(500, 0);
-    n.replicated_change(Port::Sender(0), &change, at, false);
+    n.replicated_change(Port::Sender(0), &change, at, None);
     assert_eq!(sender(&n), [at; 4]);
-    n.replicated_change(Port::Sender(0), &change, at, true);
+    n.replicated_change(Port::Sender(0), &change, at, None);
     assert_eq!(sender(&n), [at.next(); 4]);
-    n.replicated_change(Port::Sender(0), &change, Tai::new(1, 0), true);
+    n.replicated_change(Port::Sender(0), &change, Tai::new(1, 0), None);
     assert_eq!(sender(&n), [at.next().next(); 4]);
     let key = PortKey::Sender("pgm".into());
     n.set_versions(&BTreeMap::from([(key.clone(), Tai::new(2, 0))]));
     assert_eq!(sender(&n), [at.next().next(); 4]);
     n.set_versions(&BTreeMap::from([(key, Tai::new(900, 0))]));
     assert_eq!(sender(&n), [Tai::new(900, 0); 4]);
+}
+
+/// What a product keeps of its replicated state: each port's connection
+/// and activation.
+struct Kept(BTreeMap<PortKey, (Active, Activation)>);
+
+impl Store for Kept {
+    fn load(&self) -> BTreeMap<PortKey, Active> {
+        self.0
+            .iter()
+            .map(|(k, (a, _))| (k.clone(), a.clone()))
+            .collect()
+    }
+    fn activations(&self) -> BTreeMap<PortKey, Activation> {
+        self.0
+            .iter()
+            .map(|(k, (_, a))| (k.clone(), a.clone()))
+            .collect()
+    }
+}
+
+/// An instance restarted from what the product keeps, its versions,
+/// connections and activations, serves its peer's `/active` byte for byte.
+#[tokio::test]
+async fn a_restarted_instance_serves_its_peers_active() {
+    let peer = shared(Arc::default(), Clock::at(1_000), &BTreeMap::new());
+    let key = PortKey::Receiver("pgm".into());
+    let change = Replicated {
+        active: Active {
+            master_enable: true,
+            peer: Some(OTHER_RECEIVER),
+            domain: Some(DOMAIN),
+            flow: Some(IN_FLOW),
+        },
+        activation: Some(Activation {
+            mode: ActivationMode::ScheduledAbsolute,
+            requested: Some("700:5".into()),
+            time: Tai::new(700, 5),
+        }),
+    };
+    let stamped = peer.replicated_change(Port::Receiver(0), &change, Tai::new(700, 5), None);
+    let kept = Kept(BTreeMap::from([(
+        key.clone(),
+        (change.active.clone(), change.activation.clone().unwrap()),
+    )]));
+    let restarted = Nmos::with_versions(
+        model(),
+        config(),
+        Arc::new(Fake::default()),
+        &kept,
+        Clock::at(9_000),
+        &BTreeMap::from([(key, stamped.version)]),
+    )
+    .unwrap();
+    assert_eq!(documents(&restarted).await, documents(&peer).await);
 }
 
 /// An instance restored from the versions replicated_change returned, as
@@ -741,7 +796,7 @@ async fn an_instance_restored_from_the_returned_versions_matches_its_peer() {
     let at = Tai::new(500, 0);
     let mut kept = BTreeMap::new();
     for _ in 0..2 {
-        let stamped = live.replicated_change(Port::Receiver(0), &change, at, false);
+        let stamped = live.replicated_change(Port::Receiver(0), &change, at, None);
         kept.insert(PortKey::Receiver("pgm".into()), stamped.version);
     }
     assert_eq!(kept[&PortKey::Receiver("pgm".into())], at.next());

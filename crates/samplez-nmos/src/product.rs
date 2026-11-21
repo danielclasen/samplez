@@ -68,8 +68,8 @@ pub struct Activation {
 pub struct Replicated {
     pub active: Active,
     /// The activation behind it, from [`crate::Nmos::activation`]; `None`
-    /// for a change the product made itself, which leaves the activation
-    /// `/active` shows as it is.
+    /// for a change the product made itself, which keeps the activation
+    /// last replicated.
     pub activation: Option<Activation>,
 }
 
@@ -167,6 +167,13 @@ pub trait Connections: Send + Sync + 'static {
 /// at start; a port missing from it starts from the model.
 pub trait Store: Send + Sync + 'static {
     fn load(&self) -> BTreeMap<PortKey, Active>;
+
+    /// The activation `/active` showed with each stored connection, such
+    /// as the last one [`crate::Nmos::replicated_change`] carried; none by
+    /// default.
+    fn activations(&self) -> BTreeMap<PortKey, Activation> {
+        BTreeMap::new()
+    }
 }
 
 /// Keeps nothing: every start begins from the model.

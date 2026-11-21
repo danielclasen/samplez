@@ -162,6 +162,8 @@ pub(crate) struct PortState {
     /// versions the last one replicated, so the resource changes only with
     /// its version.
     pub published: Active,
+    /// The activation that goes with `published`.
+    pub published_activation: Activation,
     /// The apply with the product, by generation, for
     /// [`crate::Nmos::activation`].
     in_flight: Option<(u64, Replicated)>,
@@ -184,7 +186,7 @@ pub(crate) struct PortState {
 }
 
 impl PortState {
-    pub fn new(version: Tai, active: Active) -> PortState {
+    pub fn new(version: Tai, active: Active, activation: Activation) -> PortState {
         PortState {
             version,
             staged: Staged {
@@ -195,8 +197,9 @@ impl PortState {
                 activation: Activation::default(),
             },
             published: active.clone(),
+            published_activation: activation.clone(),
             active,
-            active_activation: Activation::default(),
+            active_activation: activation,
             in_flight: None,
             pending: None,
             generation: 0,
@@ -215,6 +218,12 @@ impl PortState {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// `/active` shows the connection and the activation last replicated.
+    pub fn show_published(&mut self) {
+        self.active = self.published.clone();
+        self.active_activation = self.published_activation.clone();
     }
 
     /// The change the apply of `generation` makes, while it is with the
@@ -858,8 +867,7 @@ async fn work(inner: Arc<Inner>, port: Port) {
 
 /// Records an apply result; a failure turns `master_enable` false in
 /// `/active` unless something came after what failed. With shared versions
-/// the failure is recorded only: the product replicates what its state
-/// holds for the port.
+/// `/active` shows what was last replicated again instead.
 fn settle(inner: &Inner, port: Port, generation: u64, result: Result<(), String>) {
     let now = inner.clock.now();
     let mut st = inner.lock();
@@ -870,7 +878,8 @@ fn settle(inner: &Inner, port: Port, generation: u64, result: Result<(), String>
         Ok(()) => st.port_mut(port).applied = Applied::Applied,
         Err(reason) => {
             if inner.shared {
-                tracing::warn!(port = ?port, %reason, "nmos: the activation was not applied");
+                tracing::warn!(port = ?port, %reason, "nmos: the activation was not applied; /active shows the replicated connection");
+                st.port_mut(port).show_published();
             } else {
                 tracing::warn!(port = ?port, %reason, "nmos: the activation was not applied; master_enable is false");
                 let version = st.bump(now);
@@ -893,34 +902,42 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
     sleep_until(&inner, at, lead).await;
     let staged = inner.lock().port(port).staged.clone();
     let target = target(&inner, port, &staged).await.map_err(|(_, m)| m);
-    let applied = match &target {
-        Ok(active) => {
-            let mut st = inner.lock();
-            match st.port_mut(port).pending.as_mut() {
-                Some(p) if p.id == id => p.applied = true,
-                _ => return,
-            }
-            let (reply, applied) = oneshot::channel();
-            let active = active.clone();
-            let p = st.port(port);
-            let activation = Activation {
-                mode: p.staged.activation.mode,
-                requested: p.staged.activation.requested.clone(),
-                time: Some(at),
-            };
-            enqueue(
-                &inner,
-                &mut st,
-                port,
-                active,
-                activation,
-                Some(at),
-                Some(reply),
-                Some(id),
-            );
-            Some(applied)
+    // A target that no longer checks out is written as it would be and
+    // then failed below, so `/active` shows what was asked for. With
+    // shared versions it goes to the product disabled, so the failure is
+    // replicated and no instance shows the request enabled.
+    let asked = target.clone().unwrap_or_else(|_| Active {
+        master_enable: staged.master_enable && !inner.shared,
+        peer: staged.peer,
+        domain: staged.domain.resolve(Some(inner.own(port).0)),
+        flow: staged.flow.resolve(inner.own(port).1),
+    });
+    let applied = if target.is_ok() || inner.shared {
+        let mut st = inner.lock();
+        match st.port_mut(port).pending.as_mut() {
+            Some(p) if p.id == id => p.applied = true,
+            _ => return,
         }
-        Err(_) => None,
+        let (reply, applied) = oneshot::channel();
+        let p = st.port(port);
+        let activation = Activation {
+            mode: p.staged.activation.mode,
+            requested: p.staged.activation.requested.clone(),
+            time: Some(at),
+        };
+        let job = enqueue(
+            &inner,
+            &mut st,
+            port,
+            asked.clone(),
+            activation,
+            Some(at),
+            Some(reply),
+            Some(id),
+        );
+        Some((job, applied))
+    } else {
+        None
     };
     sleep_until(&inner, at, Duration::ZERO).await;
     let generation = {
@@ -936,26 +953,28 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
             time: Some(at),
         };
         p.staged.activation = Activation::default();
-        // A target that no longer checks out is written as it would be and
-        // then failed below, so `/active` shows what was asked for.
-        let active = target.clone().unwrap_or_else(|_| Active {
-            master_enable: staged.master_enable,
-            peer: staged.peer,
-            domain: staged.domain.resolve(Some(inner.own(port).0)),
-            flow: staged.flow.resolve(inner.own(port).1),
-        });
-        write_active(&inner, &mut st, port, active, activation, at);
+        write_active(&inner, &mut st, port, asked, activation, at);
         let late = inner.clock.now().since(at);
         if let Some(h) = inner.late.get() {
             h[inner.index(port)].observe(late.as_secs_f64());
         }
         let p = st.port_mut(port);
         p.late = Some(late);
-        p.supersede()
+        // With shared versions the activation keeps its apply's
+        // generation while nothing came after it, so the product's
+        // replicated change of it still finds it.
+        match &applied {
+            Some((job, _)) if inner.shared && p.generation() == *job => *job,
+            _ => p.supersede(),
+        }
     };
     let result = match (target, applied) {
-        (Err(reason), _) => Err(reason),
-        (Ok(_), Some(applied)) => applied
+        (Err(reason), Some((_, applied))) => {
+            let _ = applied.await;
+            Err(reason)
+        }
+        (Err(reason), None) => Err(reason),
+        (Ok(_), Some((_, applied))) => applied
             .await
             .unwrap_or_else(|_| Err("apply did not complete".into())),
         (Ok(_), None) => Ok(()),
