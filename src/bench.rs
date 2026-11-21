@@ -82,3 +82,54 @@ impl Skip {
         self.rt.bring_to_block(self.k);
     }
 }
+
+/// An RT loop off any flow of one mono input feeding every channel of
+/// `outputs` stereo outputs, each correlating its legs with
+/// `correlation`, before the block that ends a meter slice.
+pub struct Slice {
+    rt: Rt,
+    k: u64,
+    _records: rtrb::Consumer<MeterRecord>,
+}
+
+impl Slice {
+    pub fn new(libmxl: &str, outputs: usize, correlation: bool) -> Slice {
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "blockSize": 48,
+            "domains": [{ "name": "d", "path": "/nonexistent" }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "5fbec3b1-1b0f-417d-9059-000000000000", "channels": 1 }],
+            "outputs": (0..outputs).map(|o| serde_json::json!({
+                "name": format!("out{o}"), "domain": "d",
+                "flowId": format!("6fbec3b1-1b0f-417d-9059-{o:012}"), "label": "o",
+                "group": "g", "role": "Audio", "channels": 2, "correlation": correlation }))
+                .collect::<Vec<_>>(),
+            "matrix": [vec![1.0; 2 * outputs]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).expect("a valid configuration");
+        let api = samplez_mxl::load(std::path::Path::new(libmxl)).expect("libmxl");
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = crate::engine::replay_rt(&config, &api, vec![None], hashes, control);
+        let (tx, mut records) = rtrb::RingBuffer::new(1 << 16);
+        rt.meters = tx;
+        // Blocks of 48 samples, ten to a slice: the slice ends with the
+        // tenth block, computed in the benchmark.
+        for k in 1000..1009 {
+            rt.process(k, u64::MAX);
+        }
+        assert!(records.pop().is_err(), "a slice ended before the benchmark");
+        Slice {
+            rt,
+            k: 1009,
+            _records: records,
+        }
+    }
+
+    /// Computes and meters the block that ends the slice.
+    pub fn run(&mut self) {
+        self.rt.process(self.k, u64::MAX);
+    }
+}

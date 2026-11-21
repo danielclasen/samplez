@@ -26,6 +26,8 @@
 //! well, which a replica computes as each log entry applies, and a fader
 //! move on 64 stereo slots into 56 columns with every strip parameter
 //! unchanged.
+//! And on the block that ends a meter slice for 48 stereo outputs, with
+//! and without each correlating its legs.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -798,6 +800,39 @@ const SKIP_FULL: u64 = 3_438_134;
 
 library_benchmark_group!(name = skips, benchmarks = [skip_meters]);
 
+// The block that ends a meter slice, computed and metered: one mono input
+// feeding 48 stereo outputs, without and with every output correlating
+// its legs. The difference is the cross terms' multiply-adds over the
+// block and their records.
+#[library_benchmark]
+#[bench::plain(setup = slice_plain, config = limit(SLICE_PLAIN))]
+#[bench::correlated(setup = slice_correlated, config = limit(SLICE_CORRELATED))]
+fn slice_end(mut s: samplez::bench::Slice) -> samplez::bench::Slice {
+    s.run();
+    s
+}
+
+fn slice_setup(correlation: bool) -> samplez::bench::Slice {
+    let libmxl =
+        std::env::var("SAMPLEZ_TEST_LIBMXL").unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".into());
+    samplez::bench::Slice::new(&libmxl, 48, correlation)
+}
+
+fn slice_plain() -> samplez::bench::Slice {
+    slice_setup(false)
+}
+
+fn slice_correlated() -> samplez::bench::Slice {
+    slice_setup(true)
+}
+
+// Measured 485,469 and 512,541: the cross terms of 48 outputs cost
+// 27,072 instructions in the block that ends a slice.
+const SLICE_PLAIN: u64 = 534_016;
+const SLICE_CORRELATED: u64 = 563_796;
+
+library_benchmark_group!(name = slices, benchmarks = [slice_end]);
+
 library_benchmark_group!(
     name = batches,
     benchmarks = [batch_recall, duck_batch, product_fill, targets_diff]
@@ -808,5 +843,6 @@ main!(
     pages,
     strips,
     batches,
-    skips
+    skips,
+    slices
 );

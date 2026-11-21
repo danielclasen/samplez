@@ -887,11 +887,12 @@ pub(crate) struct MeterRecord {
     pub true_peak: f32,
     /// Sum of squares of the K-weighted samples.
     pub sum_sq: f64,
-    /// Sum of squares of the samples, unweighted.
+    /// Sum of squares of the samples, unweighted; for a [`CROSS`]
+    /// record the sum of the products of legs 0 and 1.
     pub plain_sum_sq: f64,
     /// [`MeterRecord::reset`], or [`NO_RESET`].
     pub reset_at: u64,
-    /// [`GAP`], [`DIVERGED`], [`PAUSED`] and [`SPAN`].
+    /// [`GAP`], [`DIVERGED`], [`PAUSED`], [`SPAN`] and [`CROSS`].
     pub flags: u8,
 }
 
@@ -914,6 +915,10 @@ pub(crate) const SPAN: u8 = 4;
 /// the slice, computed or skipped: the slice is left out of it, neither a
 /// gap nor lost.
 pub(crate) const PAUSED: u8 = 8;
+/// The slice's cross term of a meter that correlates legs 0 and 1, sent
+/// before its channels' records: channel the meter's channel count,
+/// the sum of their products in `plain_sum_sq`, the slice's flags.
+pub(crate) const CROSS: u8 = 16;
 
 impl MeterRecord {
     /// The loudness measurement restarts at this index, a window boundary
@@ -938,6 +943,10 @@ impl MeterRecord {
 
     pub fn paused(&self) -> bool {
         self.flags & PAUSED != 0
+    }
+
+    pub fn cross(&self) -> bool {
+        self.flags & CROSS != 0
     }
 }
 
@@ -973,6 +982,9 @@ pub(crate) struct OutMeter {
     pub true_peak: Vec<f32>,
     pub sum_sq: Vec<f64>,
     pub plain_sum_sq: Vec<f64>,
+    /// Where the meter correlates legs 0 and 1, the sum of their products
+    /// over the slice in progress.
+    pub cross: Option<f64>,
 }
 
 impl OutMeter {
@@ -1002,6 +1014,15 @@ impl OutMeter {
             true_peak: vec![0.0; channels],
             sum_sq: vec![0.0; channels],
             plain_sum_sq: vec![0.0; channels],
+            cross: None,
+        }
+    }
+
+    /// The meter, correlating legs 0 and 1 with `on`.
+    pub fn correlating(self, on: bool) -> Self {
+        Self {
+            cross: on.then_some(0.0),
+            ..self
         }
     }
 
@@ -1072,6 +1093,12 @@ impl OutMeter {
                     }
                 }
                 self.sum_sq[c] += self.kw.process(c, x);
+            }
+            if let Some(cross) = &mut self.cross {
+                let (l, r) = (buf.channel(first), buf.channel(first + 1));
+                for (&a, &b) in l[n..n + len].iter().zip(&r[n..n + len]) {
+                    *cross += f64::from(a) * f64::from(b);
+                }
             }
             self.tp_skip -= self.tp_skip.min(len);
             self.frames += len as u32;
@@ -1171,6 +1198,25 @@ impl OutMeter {
         let Some(slice) = self.slice.take() else {
             return;
         };
+        if let Some(cross) = self.cross.as_mut().map(std::mem::take) {
+            let r = MeterRecord {
+                seq: *sink.seq,
+                meter: sink.meter,
+                channel: self.peak.len() as u32,
+                slice,
+                frames: self.frames,
+                peak: 0.0,
+                true_peak: 0.0,
+                sum_sq: 0.0,
+                plain_sum_sq: cross,
+                reset_at: NO_RESET,
+                flags: self.flags | CROSS,
+            };
+            *sink.seq += 1;
+            if sink.ring.push(r).is_err() {
+                add(&sink.counters.meter_dropped, 1);
+            }
+        }
         for c in 0..self.peak.len() {
             let r = MeterRecord {
                 seq: *sink.seq,

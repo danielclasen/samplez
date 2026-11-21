@@ -131,6 +131,8 @@ fn rt_thread_allocates_nothing() {
     common::add_meter(&mut cfg, "bus", 2, 0.5);
     common::add_tone(&mut cfg, "tone", 2, 0.25);
     cfg.outputs[0].limiter = true;
+    cfg.outputs[0].correlation = true;
+    cfg.meters[0].correlation = true;
     cfg.inputs[0].max_delay_samples = 4800;
     let (engine, rx) = start(cfg);
     RT_TID.store(engine.status().rt.thread.tid, Relaxed);
@@ -268,6 +270,7 @@ fn rt_thread_allocates_nothing() {
         m.window.is_some() && m.max_true_peak.iter().all(|&t| t > 0.0),
         "{m:?}"
     );
+    assert!(m.correlation.is_some(), "{m:?}");
     RT_TID.store(0, Relaxed);
     assert_no_rt_calls();
     common::stop(engine);
