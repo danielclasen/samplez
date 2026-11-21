@@ -88,6 +88,13 @@ pub struct Counters {
     /// Entries needing a generation that were due before their generation
     /// arrived: applied, with the slot silent until it arrives.
     pub generation_late: AtomicU64,
+    /// Generations the supervisor handed to the RT thread with less than
+    /// its 2 ms hand-over margin left before their entry's index, by the
+    /// earliest index an entry reaching the RT thread then is applied at:
+    /// the supervisor loop's work and the assembly outlasted the margin,
+    /// or the entry came in or was committed that late. Counted whether
+    /// the generation arrives in time or not.
+    pub generation_past_margin: AtomicU64,
     /// Strip entries the slot's strip refused, or for a slot without a
     /// strip, and limiter entries for an output without a limiter: not
     /// applied, and each one marks the engine diverged.

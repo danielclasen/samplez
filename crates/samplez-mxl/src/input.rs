@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
 use std::time::Instant;
 
 use mxl_sys::{
@@ -992,6 +993,9 @@ impl Input {
 pub enum Poll {
     /// No reader could be opened.
     Absent(Error),
+    /// The lookup found the flow and its references are being opened, on
+    /// the poll reader's [`PollOpener`].
+    Opening,
     /// libmxl reported the flow invalid: every reader reference was
     /// released and opening new ones was attempted.
     Invalid,
@@ -1003,19 +1007,27 @@ pub enum Poll {
 /// slots read, on the supervisor's poll instance: one libmxl reader
 /// reference per holding slot, all to the reader libmxl shares per flow
 /// id. libmxl is called for the flow only once a [`Lookup`] found its
-/// directory, and no call waits for a lookup: a missing flow is looked up
-/// on a thread of its own, at the pace of its [`Backoff`], and a flow
-/// whose head stopped is checked the same way before libmxl's validity
-/// check, which looks up the flow's data file.
+/// directory, and no call waits for a lookup or an open: a missing flow
+/// is looked up on a thread of its own, at the pace of its [`Backoff`],
+/// a flow whose head stopped is checked the same way before libmxl's
+/// validity check, which looks up the flow's data file, and the
+/// references are opened on a [`PollOpener`]'s thread, a libmxl open
+/// having been measured at up to 23 ms, and taken by the first poll
+/// after.
 pub struct PolledFlow {
     instance: Arc<Instance>,
     flow_id: String,
     holders: usize,
-    /// Empty, or one reference per holder.
+    /// Empty, or one reference per holder; while an open runs, fewer.
     readers: Vec<FlowReader>,
+    /// The open of the references the holders are short of, at most one.
+    opening: Option<Opening>,
+    /// Where the references are opened.
+    opener: Option<PollOpener>,
     /// References let go and not yet taken ([`PolledFlow::take_released`]).
     released: Vec<Released>,
-    /// References to the flow let go and not yet released.
+    /// References to the flow let go and not yet released, and its opens
+    /// running.
     pending: Releases,
     lookup: Lookup,
     backoff: Backoff,
@@ -1026,17 +1038,17 @@ pub struct PolledFlow {
 }
 
 /// The references to one flow its poll readers let go and are not yet
-/// released ([`Released`]), shared by the poll readers of that flow on an
-/// instance one after another ([`PolledFlow::with_releases`]): none opens
-/// the flow while one is held, since libmxl would hand out the stale
-/// reader object for the id. A reference has no deadline: one held, as by
-/// a reaper thread that does not get to it, holds back this flow's poll
-/// reader alone.
+/// released ([`Released`]), and the opens of the flow they run, shared by
+/// the poll readers of that flow on an instance one after another
+/// ([`PolledFlow::with_releases`]): none opens the flow while one is held
+/// or runs, since libmxl would hand out the stale reader object for the
+/// id. A reference has no deadline: one held, as by a reaper thread that
+/// does not get to it, holds back this flow's poll reader alone.
 #[derive(Clone, Debug, Default)]
 pub struct Releases(Arc<AtomicUsize>);
 
 impl Releases {
-    /// The references let go and not yet released.
+    /// The references let go and not yet released, and the opens running.
     pub fn pending(&self) -> usize {
         self.0.load(Ordering::Acquire)
     }
@@ -1056,6 +1068,103 @@ impl Drop for Released {
     }
 }
 
+/// An open of a [`PolledFlow`]'s references running on a thread of its
+/// own.
+struct Opening {
+    opened: Receiver<Opened>,
+    /// Every reference was let go since it started: what it opens is let
+    /// go too.
+    stale: bool,
+}
+
+/// What an open thread opened, and the error that stopped it.
+struct Opened {
+    readers: Vec<FlowReader>,
+    error: Option<Error>,
+    /// Counted in the flow's [`Releases`] while the open runs and until
+    /// what it opened is taken, or released where this is dropped: no
+    /// other poll reader of the flow opens it meanwhile. Dropped after the
+    /// readers.
+    _running: Running,
+}
+
+/// The thread that opens poll readers' references, one open after
+/// another in the order they are asked for, so that a poll asks for an
+/// open without starting a thread: its creation is the only spawn, and
+/// its thread ends once every clone is dropped. A poll reader given none
+/// ([`PolledFlow::with_opener`]) starts its own at its first open.
+#[derive(Clone)]
+pub struct PollOpener(Sender<OpenJob>);
+
+impl PollOpener {
+    /// Starts the thread, named `samplez-poll-open`. Nothing joins it: it
+    /// ends after the open it runs once every clone is dropped, at
+    /// shutdown too.
+    pub fn start() -> std::io::Result<PollOpener> {
+        let (tx, jobs) = channel::<OpenJob>();
+        std::thread::Builder::new()
+            .name("samplez-poll-open".into())
+            .spawn(move || jobs.into_iter().for_each(OpenJob::run))?;
+        Ok(PollOpener(tx))
+    }
+
+    /// Test-only: an opener whose thread is gone.
+    #[cfg(feature = "test-hooks")]
+    pub fn gone() -> PollOpener {
+        let (tx, jobs) = channel::<OpenJob>();
+        drop(jobs);
+        PollOpener(tx)
+    }
+}
+
+/// An open a [`PolledFlow`] asks its [`PollOpener`] for.
+struct OpenJob {
+    instance: Arc<Instance>,
+    flow_id: String,
+    n: usize,
+    reply: SyncSender<Opened>,
+    running: Running,
+}
+
+impl OpenJob {
+    /// Opens the references and replies; with the poll reader gone, what
+    /// it opened is released here.
+    fn run(self) {
+        let OpenJob {
+            instance,
+            flow_id,
+            n,
+            reply,
+            running,
+        } = self;
+        let mut readers = Vec::with_capacity(n);
+        let mut error = None;
+        while readers.len() < n {
+            match FlowReader::open(&instance, &flow_id) {
+                Ok(r) => readers.push(r),
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        let _ = reply.send(Opened {
+            readers,
+            error,
+            _running: running,
+        });
+    }
+}
+
+/// One open counted in a flow's [`Releases`].
+struct Running(Arc<AtomicUsize>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl PolledFlow {
     /// A poll reader with one holder, wanted from now: its first lookup is
     /// started, and a later [`poll`](Self::poll) opens the flow once found.
@@ -1068,6 +1177,13 @@ impl PolledFlow {
     /// hold references in.
     pub fn with_releases(mut self, releases: &Releases) -> PolledFlow {
         self.pending = releases.clone();
+        self
+    }
+
+    /// This poll reader, opening its references on `opener`, which other
+    /// poll readers may share.
+    pub fn with_opener(mut self, opener: &PollOpener) -> PolledFlow {
+        self.opener = Some(opener.clone());
         self
     }
 
@@ -1087,6 +1203,8 @@ impl PolledFlow {
             flow_id: flow_id.to_owned(),
             holders: 1,
             readers: Vec::new(),
+            opening: None,
+            opener: None,
             released: Vec::new(),
             pending: Releases::default(),
             lookup,
@@ -1100,16 +1218,12 @@ impl PolledFlow {
         &self.flow_id
     }
 
-    /// Adds a holder.
+    /// Adds a holder. A flow open gets the holder's reference opened on
+    /// the [`PollOpener`]; a later [`poll`](Self::poll) takes it, or, when
+    /// the open fails, lets every reference go and opens them all again.
     pub fn hold(&mut self) {
         self.holders += 1;
-        if !self.readers.is_empty() {
-            match FlowReader::open(&self.instance, &self.flow_id) {
-                Ok(r) => self.readers.push(r),
-                // Keeps the invariant; poll opens all references again.
-                Err(_) => self.let_go(self.readers.len()),
-            }
-        }
+        self.top_up();
     }
 
     /// The flow is wanted anew, as by a re-route or raise of a slot that
@@ -1160,22 +1274,86 @@ impl PolledFlow {
         Some(u64::from(info.common.maxCommitBatchSizeHint))
     }
 
-    /// Opens one reference per holder; the lookup found the flow.
-    fn open(&mut self) -> Result<()> {
-        while self.readers.len() < self.holders {
-            match FlowReader::open(&self.instance, &self.flow_id) {
-                Ok(r) => self.readers.push(r),
-                Err(e) => {
-                    self.let_go(self.readers.len());
-                    return Err(e);
-                }
-            }
+    /// Has `n` references opened on the poll reader's [`PollOpener`],
+    /// started here when it has none. When it could not be started, or its
+    /// thread is gone, a later poll tries again, on one started then: a
+    /// gone thread's opener is dropped.
+    fn open(&mut self, n: usize) {
+        if self.opener.is_none() {
+            self.opener = PollOpener::start().ok();
         }
-        Ok(())
+        let Some(opener) = &self.opener else {
+            return;
+        };
+        let (reply, opened) = sync_channel(1);
+        let running = Running(Arc::clone(&self.pending.0));
+        running.0.fetch_add(1, Ordering::Relaxed);
+        let job = OpenJob {
+            instance: Arc::clone(&self.instance),
+            flow_id: self.flow_id.clone(),
+            n,
+            reply,
+            running,
+        };
+        if opener.0.send(job).is_ok() {
+            self.opening = Some(Opening {
+                opened,
+                stale: false,
+            });
+        } else {
+            self.opener = None;
+        }
+    }
+
+    /// Opens the references the holders are short of while the flow is
+    /// open, unless an open runs.
+    fn top_up(&mut self) {
+        if self.opening.is_none() && !self.readers.is_empty() && self.readers.len() < self.holders {
+            self.open(self.holders - self.readers.len());
+        }
+    }
+
+    /// Takes what the open running opened once it is done. One that
+    /// failed lets every reference go, the opened ones included, and the
+    /// flow is looked up anew: the error. One started before every
+    /// reference was let go lets what it opened go.
+    fn opened(&mut self, now: Instant) -> Option<Error> {
+        let opened = match self.opening.as_ref()?.opened.try_recv() {
+            Ok(opened) => opened,
+            Err(TryRecvError::Empty) => return None,
+            // The open thread ended without an answer.
+            Err(TryRecvError::Disconnected) => {
+                self.opening = None;
+                return None;
+            }
+        };
+        let stale = self.opening.take().is_some_and(|o| o.stale);
+        let Opened {
+            readers,
+            error,
+            _running,
+        } = opened;
+        if self.readers.is_empty() {
+            self.head = None;
+        }
+        self.readers.extend(readers);
+        if stale || error.is_some() {
+            self.let_go(self.readers.len());
+        } else {
+            // Holders released while it ran.
+            self.let_go(self.readers.len().saturating_sub(self.holders));
+        }
+        let error = error.filter(|_| !stale)?;
+        self.backoff.missing(now);
+        self.restart(now);
+        Some(error)
     }
 
     /// The flow's head, opening the flow once a lookup found it.
-    /// `Absent` until then, with the status libmxl gives a missing flow.
+    /// `Absent` until then, with the status libmxl gives a missing flow,
+    /// and `Opening` while the open runs, on the [`PollOpener`]; the
+    /// first poll after it ended reads the head, or `Absent` with the
+    /// error of an open that failed.
     ///
     /// While the head moves, nothing else is checked. A head unchanged
     /// since the last poll is checked, at once and then with the gaps of a
@@ -1196,7 +1374,14 @@ impl PolledFlow {
     /// [`PolledFlow::poll`] at `now`, the time the backoff reads.
     #[doc(hidden)]
     pub fn poll_at(&mut self, now: Instant) -> Poll {
+        if let Some(e) = self.opened(now) {
+            return Poll::Absent(e);
+        }
         if self.readers.is_empty() {
+            if self.opening.as_ref().is_some_and(|o| !o.stale) {
+                return Poll::Opening;
+            }
+            // A stale open running counts too.
             if self.pending.pending() != 0 {
                 return Poll::Absent(Error::Mxl {
                     call: "mxlCreateFlowReader",
@@ -1205,11 +1390,11 @@ impl PolledFlow {
             }
             match self.lookup.answer() {
                 Some(true) => {
-                    if let Err(e) = self.open() {
-                        self.backoff.missing(now);
-                        self.restart(now);
-                        return Poll::Absent(e);
+                    self.open(self.holders);
+                    if self.opening.is_some() {
+                        return Poll::Opening;
                     }
+                    return self.missing(now);
                 }
                 Some(false) => {
                     self.backoff.missing(now);
@@ -1217,8 +1402,9 @@ impl PolledFlow {
                 }
                 None => return self.missing(now),
             }
-            self.head = None;
         }
+        // A holder added while an open ran, or whose open did not start.
+        self.top_up();
         let head = match self.readers[0].head() {
             Ok(head) => head,
             Err(status) => {
@@ -1251,6 +1437,9 @@ impl PolledFlow {
             self.check.checked(now);
         } else {
             self.let_go(self.readers.len());
+            if let Some(o) = &mut self.opening {
+                o.stale = true;
+            }
             self.head = None;
             self.backoff = Backoff::new(now);
             self.lookup.start();

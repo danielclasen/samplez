@@ -99,8 +99,10 @@ Weakening one is a design change: say so and agree it first.
 - **A rebuilt or resynced replica matches its peers from its first
   page.** The exceptions README "Starting a replica" lists for a rebuild
   (duck detector state, a mask crossfade over a depth changed more than
-  once within it) cost one diverged page and a resync; do not widen
-  that list.
+  once within it, a depth changed again while its earlier ramp ran, the
+  later change after the second last end of a duck gain interval
+  before the install index or at it) cost one diverged page and a
+  resync; do not widen that list.
   Enforced by: the replay, install and rebuild tests in
   `tests/transfer.rs` (`a_replayed_core_computes_the_donors_pages`,
   `a_replayed_core_carries_*`, `a_product_core_installs_at_the_index_*`,

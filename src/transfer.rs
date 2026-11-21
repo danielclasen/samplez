@@ -1161,7 +1161,10 @@ pub struct InFlight {
     /// joins the one before when it comes within the ramp length and two
     /// duck gain intervals of it. The crossfades are continued on
     /// detectors steady at the install, and depths that held their value
-    /// before the ramp `depths` names.
+    /// before the ramp `depths` names. Only an engine built from product
+    /// state reads it, to continue those crossfades; the samples of an
+    /// engine not built from it never depend on it, and no entry, target,
+    /// page hash or fingerprint carries it.
     pub masks: Vec<MaskChain>,
 }
 

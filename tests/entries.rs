@@ -978,6 +978,108 @@ fn polls_wait_only_for_an_entry_due_soon() {
     common::stop(e);
 }
 
+/// While an entry not handed over falls due within a poll period and a
+/// tick, the supervisor creates no output writer, whose instance and flow
+/// creation could stall it past that entry's deadline: an output enabled
+/// meanwhile is realised once the entry is gone.
+#[test]
+fn outputs_wait_for_an_entry_due_soon() {
+    let domain = Domain::new();
+    let (src, next, out) = (new_id(), new_id(), new_id());
+    let _pilots = [&src, &next].map(|id| Pilot::start(&domain.0, id, 1, B, 0));
+    let mut c = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    );
+    c.outputs[0].enabled = false;
+    let (e, rx, _reports) = start_replicated(c);
+    let output = || e.status().outputs[0].clone();
+    // The output enabled 100 blocks on; the re-route, never committed,
+    // falls due soon before that, about 40 blocks on.
+    let k = now(&rx);
+    let enable = Entry::Output {
+        slot: 0,
+        enabled: true,
+    };
+    e.append(1, (k + 100) * B, enable).unwrap();
+    let route = Entry::Route {
+        slot: 0,
+        flow_id: next.clone(),
+    };
+    e.append(2, (k + 150) * B, route).unwrap();
+    e.commit(1);
+    wait_for(5 * SECOND, "the output enabled", || output().enabled);
+    std::thread::sleep(Duration::from_millis(300));
+    let o = output();
+    assert!(!o.realised && !domain.has_flow(&out), "{o:?}");
+    e.truncate(2);
+    wait_for(10 * SECOND, "output realised", || {
+        let o = output();
+        o.realised && domain.has_flow(&out)
+    });
+    common::stop(e);
+}
+
+/// Outputs enabled together are created one after another, each taking
+/// its lookup's gate wait on the supervisor: an entry falling due soon in
+/// the middle of that pass stops it before the next output, and no output
+/// is created while the entry waits for its hand-over.
+#[test]
+fn an_entry_falling_due_stops_a_pass_creating_outputs() {
+    let domain = Domain::new();
+    let (src, next) = (new_id(), new_id());
+    let outs: Vec<String> = (0..16).map(|_| new_id()).collect();
+    let _pilots = [&src, &next].map(|id| Pilot::start(&domain.0, id, 1, B, 0));
+    let outputs: Vec<(&str, u32)> = outs.iter().map(|o| (o.as_str(), 1)).collect();
+    let mut c = config(
+        &domain.0,
+        &[(&src, 1)],
+        &outputs,
+        vec![vec![1.0; 16]],
+        MARGIN,
+    );
+    for o in &mut c.outputs {
+        o.enabled = false;
+    }
+    // Each output's lookup waits past the 20 ms gate, so each creation
+    // takes the gate's whole wait.
+    c.look = slow_open;
+    (SLOW_OPEN.lock().unwrap())
+        .extend((outs.iter()).map(|o| (o.clone(), 0, Duration::from_millis(100))));
+    let (e, rx, _reports) = start_replicated(c);
+    let enabled = || e.status().outputs.iter().all(|o| o.enabled);
+    let realised = || e.status().outputs.iter().filter(|o| o.realised).count();
+    // All enabled at one index 100 blocks on. The re-route, never
+    // committed, at 300 falls due soon at 188 (a poll period and a tick,
+    // and a tick and the margin, before it), 88 ms into a pass that takes
+    // 320 ms at least.
+    let k = now(&rx);
+    for o in 0..16 {
+        let enable = Entry::Output {
+            slot: o,
+            enabled: true,
+        };
+        e.append(1 + o as u64, (k + 100) * B, enable).unwrap();
+    }
+    let route = Entry::Route {
+        slot: 0,
+        flow_id: next.clone(),
+    };
+    e.append(17, (k + 300) * B, route).unwrap();
+    e.commit(16);
+    wait_for(5 * SECOND, "the outputs enabled", enabled);
+    // Past the end of a pass that went on.
+    std::thread::sleep(Duration::from_millis(500));
+    let n = realised();
+    assert!(n < 16, "{n} outputs created while the entry was due soon");
+    e.truncate(17);
+    wait_for(10 * SECOND, "every output realised", || realised() == 16);
+    common::stop(e);
+}
+
 /// A re-route opens only the flow it brings in: the other slot keeps the
 /// live generation's reader, so a lookup of its flow that would wait is
 /// never made, and it is never silenced.
@@ -1228,7 +1330,8 @@ fn a_rebuild_waiting_for_a_slow_open_holds_back_no_re_route() {
 /// Generation-needing entries at one index, as a replica that lagged the
 /// leader by more than buildLead gets them: the first swaps in on time,
 /// the others are applied before their generations and each is swapped
-/// in once it arrives. No input stays silent.
+/// in once it arrives, handed over past the hand-over margin. No input
+/// stays silent.
 #[test]
 fn entries_at_one_index_each_get_their_generation() {
     let domain = Domain::new();
@@ -1270,6 +1373,8 @@ fn entries_at_one_index_each_get_their_generation() {
     }
     let s = e.status();
     assert!(e.counters().generation_late.load(Relaxed) >= 2);
+    // Each handed over once the RT thread had passed its index.
+    assert!(e.counters().generation_past_margin.load(Relaxed) >= 2);
     assert_eq!(s.diverged, None);
     common::stop(e);
 }
