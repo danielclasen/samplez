@@ -2115,9 +2115,7 @@ impl Engine {
                 (config.meters.iter())
                     .map(|m| (m.loudness_weights().expect(checked), m.correlation)),
             )
-            .chain(
-                (config.inputs.iter()).map(|i| (i.loudness_weights().expect(checked), false)),
-            )
+            .chain((config.inputs.iter()).map(|i| (i.loudness_weights().expect(checked), false)))
             .map(|(weights, on)| OutputLoudness::new(weights).correlating(on))
             .collect();
         let timing = Timing {
@@ -8572,9 +8570,15 @@ mod tests {
         let config = correlation_config(true);
         let cases: [(crate::rt_loop::TestInput, Option<(f64, f64)>); 5] = [
             (|_, _, _, n| sine_1k(n, 0), Some((1.0, 0.0))),
-            (|_, _, c, n| sine_1k(n, 0) * if c == 0 { 1.0 } else { -1.0 }, Some((-1.0, 0.0))),
+            (
+                |_, _, c, n| sine_1k(n, 0) * if c == 0 { 1.0 } else { -1.0 },
+                Some((-1.0, 0.0)),
+            ),
             (|_, _, c, n| sine_1k(n, c as u64), Some((0.0, 1e-3))),
-            (|_, _, c, n| if c == 0 { sine_1k(n, 0) } else { 0.0 }, Some((0.0, 0.0))),
+            (
+                |_, _, c, n| if c == 0 { sine_1k(n, 0) } else { 0.0 },
+                Some((0.0, 0.0)),
+            ),
             (|_, _, _, _| 0.0, None),
         ];
         for (i, (source, want)) in cases.into_iter().enumerate() {
@@ -8601,7 +8605,9 @@ mod tests {
         let fields = |r: &MeterRecord| {
             let bits = [r.peak.to_bits(), r.true_peak.to_bits()];
             let sums = [r.sum_sq.to_bits(), r.plain_sum_sq.to_bits()];
-            (r.meter, r.channel, r.slice, r.frames, bits, sums, r.reset_at, r.flags)
+            (
+                r.meter, r.channel, r.slice, r.frames, bits, sums, r.reset_at, r.flags,
+            )
         };
         let crosses = on.iter().filter(|r| r.cross()).count();
         assert_eq!(crosses, 2 * 50);
@@ -8614,9 +8620,13 @@ mod tests {
     /// correlation, bit for bit, in every 100 ms window whose 400 ms both
     /// metered whole: the reading is a function of the slices' indices,
     /// not of which records arrived last. The legs beat at 1 Hz, so the
-    /// reading moves from window to window. Fails with `Correlation::add`
+    /// reading moves from window to window, and every window's reading
+    /// is the correlation computed from the samples of its 400 ms,
+    /// `[(w - 3) * 4800, (w + 1) * 4800)`. Fails with `Correlation::add`
     /// placing a slice in the window by the count of slices it added
-    /// rather than by the slice's index, which the skip shifts.
+    /// rather than by the slice's index, which the skip shifts, and with
+    /// `Correlation::read` summing three windows, five over a ring of
+    /// five, or the window before.
     #[test]
     fn correlation_is_the_same_bits_across_an_overrun_skip() {
         let config = correlation_config(true);
@@ -8629,6 +8639,22 @@ mod tests {
         let skip = 1003u64..1100;
         assert!((skip.end * 48).is_multiple_of(4800));
         let (_, whole, _) = correlate(&config, source, 2400, 0..0);
+        // From the fifth window on, clear of the input's fade-in.
+        for (&(m, w), bits) in whole.iter().filter(|((m, w), _)| *m != 1 && *w >= 4) {
+            let mut sums = [0.0f64; 3];
+            for n in (w - 3) * 4800..(w + 1) * 4800 {
+                let (l, r) = (f64::from(source(0, 0, 0, n)), f64::from(source(0, 0, 1, n)));
+                for (s, v) in sums.iter_mut().zip([l * l, r * r, l * r]) {
+                    *s += v;
+                }
+            }
+            let want = sums[2] / (sums[0] * sums[1]).sqrt();
+            let got = f64::from_bits(bits.expect("a correlation"));
+            assert!(
+                (got - want).abs() < 1e-9,
+                "meter {m} window {w}: {got} {want}"
+            );
+        }
         let (_, skipped, _) = correlate(&config, source, 2400, skip.clone());
         let (cut, after) = (skip.start * 48 / 4800, skip.end * 48 / 4800);
         let mut compared = std::collections::BTreeSet::new();

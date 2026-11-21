@@ -727,7 +727,10 @@ mod tests {
         }
         assert_eq!(l.meters.window, Some(3));
         assert_eq!(l.meters.correlation, Some(0.5));
-        assert_eq!((plain.meters.window, plain.meters.correlation), (Some(3), None));
+        assert_eq!(
+            (plain.meters.window, plain.meters.correlation),
+            (Some(3), None)
+        );
     }
 
     /// Stereo records of slice `s` at `level` LUFS with `flags`.
