@@ -675,7 +675,8 @@ fn a_poll_reader_follows_a_replaced_flow_for_every_holder() {
     w.blocks(K0 + 8..K0 + 9);
     assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 9) * B));
 
-    assert_eq!(p.release(), 1);
+    let (left, released) = p.release();
+    assert_eq!((left, released.len()), (1, 1));
     assert!(matches!(p.poll(), Poll::Head(_)));
 }
 
