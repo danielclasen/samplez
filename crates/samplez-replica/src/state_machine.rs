@@ -148,6 +148,12 @@ pub type Factory<P> = std::sync::Arc<dyn Fn() -> P + Send + Sync>;
 pub struct Apply {
     /// [`Command::generation`].
     pub generation: Option<bool>,
+    /// The sample index the command's entry takes effect at, at the
+    /// engine's rate in the epoch of the flows' indexes: its own
+    /// at_index, raised to [`StateMachine::floor`] ([`floored`]), the
+    /// index its engine entries apply at. Every replica applies the entry
+    /// at the same one. None for an entry that has none.
+    pub at_index: Option<u64>,
 }
 
 /// An entry's at_index further than this past its stamping index, one
@@ -740,7 +746,7 @@ impl<P: Product> StateMachine<P> {
                 .max(request.at_index().unwrap_or(0));
             self.decided.entry(named).or_insert((revision, until));
         }
-        let response = self.apply_body(revision, term, request);
+        let response = self.apply_body(revision, term, request, at);
         if let Some(at) = at {
             let changed = self.revision != revision_before;
             self.derive(revision, request, at, changed, restamped);
@@ -749,10 +755,16 @@ impl<P: Product> StateMachine<P> {
         response
     }
 
-    fn apply_body(&mut self, revision: u64, term: u64, request: &Request) -> Response {
+    fn apply_body(
+        &mut self,
+        revision: u64,
+        term: u64,
+        request: &Request,
+        at: Option<u64>,
+    ) -> Response {
         let stamp = request.stamp;
         match &request.body {
-            Body::Commands(commands) => self.commands(stamp, commands),
+            Body::Commands(commands) => self.commands(stamp, at, commands),
             Body::Baseline(baseline) => {
                 self.baseline = Some(baseline.clone());
                 Response::default()
@@ -939,7 +951,7 @@ impl<P: Product> StateMachine<P> {
     /// at the next product revision. Each command resolves at the revision
     /// after the entry: the entry's when it changed the product, the one
     /// before when it did not.
-    fn commands(&mut self, stamp: u64, commands: &[Command]) -> Response {
+    fn commands(&mut self, stamp: u64, at: Option<u64>, commands: &[Command]) -> Response {
         // Recorded with this placeholder until the entry's revision is
         // known; a copy later in the same entry reads it from the table.
         const ENTRY: u64 = u64::MAX;
@@ -961,6 +973,7 @@ impl<P: Product> StateMachine<P> {
             }
             let ctx = Apply {
                 generation: command.generation,
+                at_index: at,
             };
             let result = match self.product.apply(&command.origin, &command.body, &ctx) {
                 Effect::Changed(change) => {
@@ -1302,6 +1315,8 @@ pub(crate) mod tests {
         pub delta_calls: std::sync::Mutex<Vec<(u64, Vec<Option<u64>>)>>,
         /// The configuration it was built with; not saved.
         pub config: u64,
+        /// Each command's [`Apply::at_index`], in apply order.
+        pub at: Vec<Option<u64>>,
     }
 
     pub fn parse(command: &[u8]) -> (String, String, u64) {
@@ -1319,8 +1334,9 @@ pub(crate) mod tests {
             &mut self,
             origin: &Origin,
             command: &[u8],
-            _: &Apply,
+            ctx: &Apply,
         ) -> Effect<(String, String)> {
+            self.at.push(ctx.at_index);
             let (path, value, seq) = parse(command);
             let held = self.values.get(&path).cloned();
             if held.as_ref().is_some_and(|(_, last)| *last >= seq) {
@@ -1440,6 +1456,36 @@ pub(crate) mod tests {
             .iter()
             .map(|c| (c.revision, c.prev, c.commands.clone(), c.text.clone()))
             .collect()
+    }
+
+    /// A command sees the index its entry takes effect at: the earliest
+    /// of its commands' at_index, raised to the floor an earlier entry
+    /// left, none for an entry with none. Two machines applying one log
+    /// see the same.
+    #[test]
+    fn a_command_sees_the_index_its_entry_takes_effect_at() {
+        let at = |cmd: Command, at_index: Option<u64>| Command { at_index, ..cmd };
+        let log = [
+            commands(
+                960,
+                vec![
+                    at(command("a", "1", "/x=1@1"), Some(2_000)),
+                    at(command("a", "2", "/y=1@1"), Some(1_500)),
+                ],
+            ),
+            commands(1_920, vec![at(command("a", "3", "/x=2@2"), Some(1_000))]),
+            commands(2_880, vec![command("a", "4", "/y=2@2")]),
+        ];
+        let seen = |_: ()| {
+            let mut sm = machine();
+            for (n, request) in log.iter().enumerate() {
+                sm.apply(n as u64 + 1, request);
+            }
+            sm.product.at.clone()
+        };
+        let one = seen(());
+        assert_eq!(one, [Some(1_500), Some(1_500), Some(1_500), None]);
+        assert_eq!(seen(()), one, "another machine on the same log");
     }
 
     /// One entry is one delta at one revision: every command applied in
