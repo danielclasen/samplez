@@ -53,6 +53,10 @@ pub(crate) struct LeaderView<'a> {
     pub rank: &'a dyn Fn(NodeId) -> u8,
     /// The audio StatefulSet's target revision ([`crate::rollout`]).
     pub target: Option<&'a str>,
+    /// The leader's engine has outputs and the log disabled every one:
+    /// no replica writes, so no named replica's start bound lapses. False
+    /// on a leader without an engine.
+    pub nothing_to_write: bool,
 }
 
 /// The leader's decisions, counted.
@@ -649,7 +653,12 @@ fn candidate_unready(v: &LeaderView, a: &Voter) -> bool {
 /// The start bound of the replica `n` named from P: lapsed once an audio
 /// replica E counts reported a processed index past P plus one page plus
 /// `D + w` plus L while no report shows `n` committing at or after P.
+/// It does not lapse while nothing is to be written: a named replica
+/// commits nothing then, and neither would any other named instead.
 fn lapsed(v: &LeaderView, n: &Voter, p: u64) -> bool {
+    if v.nothing_to_write {
+        return false;
+    }
     let t = v.timing;
     let bound = p + PAGE + index_at((t.hold + t.contact_window).as_nanos() as u64) + v.floor;
     let past = v.audio.iter().any(|a| {
@@ -772,6 +781,7 @@ mod tests {
                 floor: index_at(7_000_000),
                 rank: &rank,
                 target: self.target,
+                nothing_to_write: false,
             };
             leader.decide(&v, Instant::now())
         }

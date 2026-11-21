@@ -3017,6 +3017,8 @@ impl Contact {
             floor,
             rank: &rank,
             target: target.as_deref(),
+            // Its engine follows the log, so these are the log's outputs.
+            nothing_to_write: !st.enabled.is_empty() && !st.enabled.contains(&true),
         };
         let mut out = st.leader.decide(&view, now);
         // Re-decisions follow a rename at once: the entries the new

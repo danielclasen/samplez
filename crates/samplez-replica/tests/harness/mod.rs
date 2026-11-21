@@ -362,6 +362,8 @@ pub struct Output {
     pub kept: VecDeque<Page>,
     /// Without a writer the output computes, hashes and commits nothing.
     pub realised: bool,
+    /// Enabled by the log, as a sample names it.
+    pub enabled: bool,
 }
 
 /// The ranges an output committed, `(start, len)`, in order.
@@ -684,6 +686,7 @@ impl FakeAudio {
                     page_rx,
                     kept: VecDeque::new(),
                     realised: true,
+                    enabled: true,
                 }
             })
             .collect();
@@ -789,6 +792,18 @@ impl FakeAudio {
     pub fn realise(&self, output: usize) {
         self.step();
         self.lock().outputs[output].realised = true;
+    }
+
+    /// Output `output` disabled or enabled by the log, as an `Output`
+    /// entry leaves it: disabled, its writer is released
+    /// ([`FakeAudio::unrealise`]); enabled, it has one again.
+    pub fn set_enabled(&self, output: usize, enabled: bool) {
+        if enabled {
+            self.realise(output);
+        } else {
+            self.unrealise(output);
+        }
+        self.lock().outputs[output].enabled = enabled;
     }
 
     /// The engine reads the input slots `readable` and not those of
@@ -997,7 +1012,7 @@ impl Audio for FakeAudio {
             entries_refused: st.entries_refused,
             entries_filtered: 0,
             realised: st.outputs.iter().map(|o| o.realised).collect(),
-            enabled: Vec::new(),
+            enabled: st.outputs.iter().map(|o| o.enabled).collect(),
             generation_ready: !st.generation_pending,
             clock_steps: self.clock.steps(),
             log_overflows: st.log_overflows,
