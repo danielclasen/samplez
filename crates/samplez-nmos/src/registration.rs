@@ -263,7 +263,9 @@ fn id_version(doc: &Value) -> (Uuid, String) {
 
 /// Posts every resource whose version the registry has not seen, parents
 /// first. A 200 on a first Node registration means the registry still held
-/// an earlier registration, which the node deletes and registers anew.
+/// an earlier registration, and a 400 that it holds one at a later version,
+/// as of a replica set rebuilt under the same Node id: the node deletes it
+/// and registers anew.
 async fn register_all(
     inner: &Inner,
     client: &Registrar,
@@ -299,7 +301,11 @@ async fn post_changed(
                 continue;
             }
             let mut answer = client.post(base, kind, &doc).await;
-            if fresh && kind == "node" && matches!(answer, Answer::Status(StatusCode::OK, _)) {
+            let held = matches!(
+                answer,
+                Answer::Status(StatusCode::OK | StatusCode::BAD_REQUEST, _)
+            );
+            if fresh && kind == "node" && held {
                 client.delete(&format!("{base}/resource/nodes/{id}")).await;
                 answer = client.post(base, kind, &doc).await;
             }

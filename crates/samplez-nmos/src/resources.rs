@@ -204,6 +204,16 @@ pub(crate) fn senders(inner: &Inner, st: &State) -> Vec<Value> {
         .collect()
 }
 
+/// BCP-004-01 caps, which never change, carry a version no later than
+/// their receiver's.
+fn caps_version(inner: &Inner, receiver: Tai) -> Tai {
+    if inner.shared {
+        receiver
+    } else {
+        inner.caps_version
+    }
+}
+
 pub(crate) fn receivers(inner: &Inner, st: &State) -> Vec<Value> {
     inner
         .model
@@ -246,7 +256,7 @@ pub(crate) fn receivers(inner: &Inner, st: &State) -> Vec<Value> {
                             "urn:x-nmos:cap:format:sample_depth": { "enum": [BIT_DEPTH] },
                             "urn:x-nmos:cap:format:channel_count": channel_count,
                         }],
-                        "version": inner.caps_version.to_string(),
+                        "version": caps_version(inner, r.version).to_string(),
                     },
                 }),
             )

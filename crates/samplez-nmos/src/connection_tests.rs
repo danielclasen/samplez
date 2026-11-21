@@ -1059,6 +1059,47 @@ async fn an_external_change_shows_in_active_with_a_new_version() {
     assert_eq!(n.status().ports[1].active, switched);
 }
 
+/// With shared versions an activation the node serves changes `/active`
+/// but not the version; the product's report of it moves the version and
+/// keeps the activation queued behind it on its way to the product.
+#[tokio::test(start_paused = true)]
+async fn a_served_activation_takes_its_version_from_the_replicated_change() {
+    let fake = Arc::new(Fake::default());
+    fake.results
+        .lock()
+        .unwrap()
+        .push_back((Duration::from_millis(50), Ok(())));
+    let versions = BTreeMap::from([(PortKey::Receiver("pgm".into()), Tai::new(7, 0))]);
+    let n = Nmos::with_versions(
+        model(),
+        config(),
+        fake.clone(),
+        &NoStore,
+        fake.clock.clone(),
+        &versions,
+    )
+    .unwrap();
+    let r = receiver(&n, 0);
+    for flow in [OTHER, THIRD] {
+        let body = json!({ "transport_params": [{ "mxl_flow_id": flow }], "activation": { "mode": "activate_immediate" } });
+        assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
+    }
+    assert_eq!(is04(&n, "receivers", &r).await["version"], "7:0");
+    settle().await;
+    assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    n.replicated_change(Port::Receiver(0), None, Tai::new(8, 0));
+    assert_eq!(is04(&n, "receivers", &r).await["version"], "8:0");
+    assert_eq!(
+        leg(&active(&n, "receivers", &r).await)["mxl_flow_id"],
+        json!(THIRD)
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[1].1.flow, Some(THIRD));
+    assert_eq!(n.status().ports[1].applied, Applied::Applied);
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_external_change_drops_the_activations_queued_before_it() {
     let fake = Arc::new(Fake::default());

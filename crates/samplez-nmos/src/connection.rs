@@ -175,6 +175,10 @@ impl PortState {
         self.pending.as_ref().map(|p| p.at)
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Marks something that supersedes every apply before it.
     pub fn supersede(&mut self) -> u64 {
         self.generation += 1;
@@ -652,7 +656,7 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
             };
             let mut st = inner.lock();
             st.port_mut(port).staged = staged;
-            write_active(&mut st, port, active.clone(), activation, now);
+            write_active(inner, &mut st, port, active.clone(), activation, now);
             enqueue(inner, &mut st, port, active, None, None, None);
             Ok((StatusCode::OK, staged_json(port, &response)))
         }
@@ -698,13 +702,23 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
     }
 }
 
-/// Writes `/active` and bumps the port's IS-04 version.
-fn write_active(st: &mut State, port: Port, active: Active, activation: Activation, now: Tai) {
-    let version = st.bump(now);
+/// Writes `/active` and bumps the port's IS-04 version; with shared
+/// versions the version stays for the product's replicated change.
+fn write_active(
+    inner: &Inner,
+    st: &mut State,
+    port: Port,
+    active: Active,
+    activation: Activation,
+    now: Tai,
+) {
+    let version = (!inner.shared).then(|| st.bump(now));
     let p = st.port_mut(port);
     p.active = active;
     p.active_activation = activation;
-    p.version = version;
+    if let Some(v) = version {
+        p.version = v;
+    }
     p.applied = Applied::Applying;
 }
 
@@ -788,10 +802,12 @@ fn settle(inner: &Inner, port: Port, generation: u64, result: Result<(), String>
         Ok(()) => st.port_mut(port).applied = Applied::Applied,
         Err(reason) => {
             tracing::warn!(port = ?port, %reason, "nmos: the activation was not applied; master_enable is false");
-            let version = st.bump(now);
+            let version = (!inner.shared).then(|| st.bump(now));
             let p = st.port_mut(port);
             p.active.master_enable = false;
-            p.version = version;
+            if let Some(v) = version {
+                p.version = v;
+            }
             p.applied = Applied::Failed(reason);
             p.failures += 1;
         }
@@ -849,7 +865,7 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
             domain: staged.domain.resolve(Some(inner.own(port).0)),
             flow: staged.flow.resolve(inner.own(port).1),
         });
-        write_active(&mut st, port, active, activation, at);
+        write_active(&inner, &mut st, port, active, activation, at);
         let late = inner.clock.now().since(at);
         if let Some(h) = inner.late.get() {
             h[inner.index(port)].observe(late.as_secs_f64());

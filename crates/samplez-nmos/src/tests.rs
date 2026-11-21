@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -546,6 +546,144 @@ fn bump_never_repeats_or_goes_back() {
     let d = st.bump(Tai::new(9, 0));
     assert!(a < b && b < c && c < d);
     assert_eq!(d, Tai::new(9, 0));
+}
+
+fn shared(clock: Clock, versions: &BTreeMap<PortKey, Tai>) -> Nmos {
+    Nmos::with_versions(
+        model(),
+        config(),
+        Arc::new(Fake::default()),
+        &NoStore,
+        clock,
+        versions,
+    )
+    .unwrap()
+}
+
+/// The version of every resource the Node API serves and of each
+/// receiver's caps, by id.
+async fn all_versions(n: &Nmos) -> BTreeMap<String, String> {
+    let entry = |r: &Value| {
+        (
+            r["id"].as_str().unwrap().to_owned(),
+            r["version"].as_str().unwrap().to_owned(),
+        )
+    };
+    let mut all = BTreeMap::from([entry(&get(n, &format!("{N}/self")).await)]);
+    for kind in ["devices", "sources", "flows", "senders", "receivers"] {
+        for r in get(n, &format!("{N}/{kind}")).await.as_array().unwrap() {
+            let (id, version) = entry(r);
+            if kind == "receivers" {
+                let caps = r["caps"]["version"].as_str().unwrap().to_owned();
+                all.insert(format!("{id}/caps"), caps);
+            }
+            all.insert(id, version);
+        }
+    }
+    all
+}
+
+/// Instances of a replicated product, their clocks apart, serve the same
+/// version for every resource once fed the same changes, also where one
+/// of them served the activation behind a change: a registry sees no
+/// change when another instance takes the registration over.
+#[tokio::test]
+async fn instances_fed_the_same_changes_serve_the_same_versions() {
+    let start = BTreeMap::from([
+        (PortKey::Sender("pgm".into()), Tai::new(100, 0)),
+        (PortKey::Receiver("pgm".into()), Tai::new(200, 0)),
+    ]);
+    // Both clocks read later than every change, so a version read from
+    // either would show.
+    let a = shared(Clock::at(5_000_000), &start);
+    let b = shared(Clock::at(9_000_000), &start);
+    assert_eq!(all_versions(&a).await, all_versions(&b).await);
+    let s = a.inner.ids.senders[0].sender;
+    let body = serde_json::json!({
+        "master_enable": false,
+        "activation": { "mode": "activate_immediate" },
+    });
+    let path = format!("/x-nmos/connection/v1.2/single/senders/{s}/staged");
+    let (status, _, v) = call(&a, "PATCH", &path, Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let served = a.status().ports[0].active.clone();
+    assert!(!served.master_enable);
+    let switched = Active {
+        master_enable: true,
+        peer: None,
+        domain: Some(DOMAIN),
+        flow: Some(IN_FLOW),
+    };
+    // a served the activation, b learns it from the replicated state.
+    a.replicated_change(Port::Sender(0), None, Tai::new(300, 0));
+    b.replicated_change(Port::Sender(0), Some(served.clone()), Tai::new(300, 0));
+    assert_eq!(b.status().ports[0].active, served);
+    for n in [&a, &b] {
+        n.replicated_change(Port::Receiver(1), Some(switched.clone()), Tai::new(400, 0));
+    }
+    // b takes over and sets the versions from the product's state.
+    b.set_versions(&BTreeMap::from([
+        (PortKey::Sender("pgm".into()), Tai::new(300, 0)),
+        (PortKey::Receiver("pgm".into()), Tai::new(200, 0)),
+        (PortKey::Receiver("spare".into()), Tai::new(400, 0)),
+    ]));
+    let versions = all_versions(&a).await;
+    assert_eq!(versions, all_versions(&b).await);
+    let ids = &a.inner.ids;
+    let at = |id: Uuid| versions[&id.to_string()].as_str();
+    assert_eq!(at(ids.node), "400:0");
+    assert_eq!(at(ids.device), "400:0");
+    for id in [
+        ids.senders[0].source,
+        ids.senders[0].flow,
+        ids.senders[0].sender,
+    ] {
+        assert_eq!(at(id), "300:0");
+    }
+    assert_eq!(at(ids.receivers[0]), "200:0");
+    assert_eq!(at(ids.receivers[1]), "400:0");
+    assert_eq!(versions[&format!("{}/caps", ids.receivers[1])], "400:0");
+}
+
+/// Two changes of a port at one time, or the second at an earlier one,
+/// still give it a newer version each; setting the versions moves one up
+/// only.
+#[tokio::test]
+async fn shared_versions_increase_per_resource() {
+    let n = shared(Clock::at(1_000), &BTreeMap::new());
+    let sender = |n: &Nmos| {
+        let st = n.inner.lock();
+        let s = &st.senders[0];
+        [
+            s.port.version,
+            s.source_version,
+            s.flow_version,
+            st.node_version,
+        ]
+    };
+    // A port the versions lack starts at 0:0.
+    assert_eq!(sender(&n), [Tai::default(); 4]);
+    let active = n.status().ports[0].active.clone();
+    let at = Tai::new(500, 0);
+    n.replicated_change(Port::Sender(0), Some(active), at);
+    assert_eq!(sender(&n), [at; 4]);
+    n.replicated_change(Port::Sender(0), None, at);
+    assert_eq!(sender(&n), [at.next(); 4]);
+    n.replicated_change(Port::Sender(0), None, Tai::new(1, 0));
+    assert_eq!(sender(&n), [at.next().next(); 4]);
+    let key = PortKey::Sender("pgm".into());
+    n.set_versions(&BTreeMap::from([(key.clone(), Tai::new(2, 0))]));
+    assert_eq!(sender(&n), [at.next().next(); 4]);
+    n.set_versions(&BTreeMap::from([(key, Tai::new(900, 0))]));
+    assert_eq!(sender(&n), [Tai::new(900, 0); 4]);
+}
+
+#[tokio::test]
+#[should_panic(expected = "replicated_change")]
+async fn a_clock_free_change_on_shared_versions_panics() {
+    let n = shared(Clock::at(1_000), &BTreeMap::new());
+    let active = n.status().ports[0].active.clone();
+    n.external_change(Port::Sender(0), active);
 }
 
 #[test]
