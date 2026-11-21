@@ -520,6 +520,42 @@ async fn the_per_output_rule_commits_an_output_nobody_commits() {
     assert_eq!(after.named, decided.named, "no Baseline for it");
 }
 
+/// Every output disabled by the log and the leader stopped: no replica
+/// has anything to write, so the new leader names a baseline once and
+/// does not name one again each time its start bound would lapse. With
+/// the output enabled again the survivors commit.
+#[tokio::test(start_paused = true)]
+async fn a_set_with_every_output_disabled_names_a_baseline_once_after_a_leader_stop() {
+    let mut set = start(vec![a(0), a(1), a(2)], 1).await;
+    let ids = audio(&set);
+    until("committing", 5, || {
+        ids.iter().all(|&id| committing(&set, id))
+    })
+    .await;
+    for &id in &ids {
+        set.audio(id).set_enabled(0, false);
+    }
+    until("withdrawn", 5, || {
+        ids.iter().all(|&id| !committing(&set, id))
+    })
+    .await;
+    let leader = set.leader().await;
+    set.crash(leader).await;
+    set.leader().await;
+    let survivors = audio(&set);
+    let before = baselines(&set, survivors[0]).len();
+    sleep(Duration::from_secs(3)).await;
+    let named = baselines(&set, survivors[0]).len() - before;
+    assert!(named <= 1, "{named} Baselines with nothing to write");
+    for &id in &survivors {
+        set.audio(id).set_enabled(0, true);
+    }
+    until("the survivors commit", 5, || {
+        survivors.iter().all(|&id| committing(&set, id))
+    })
+    .await;
+}
+
 /// The audio `/readyz` term out of contact keeps its last value: a
 /// replica Ready when it lost contact stays Ready once it withdrew, until
 /// contact tells whether another commits; one never in contact since its
