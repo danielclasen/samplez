@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.20.0](https://github.com/danielclasen/samplez/compare/v0.19.0...v0.20.0) (2026-11-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** Apply has a new public field, at_index, so a product that builds Apply with a struct literal must set it.
+
+### Features
+
+* **replica:** give Product::apply the index its entry takes effect at ([#166](https://github.com/danielclasen/samplez/issues/166)) ([fe63fcb](https://github.com/danielclasen/samplez/commit/fe63fcb0bf841962d68017077611f6ae2ba84e54))
+
 ## [0.19.0](https://github.com/danielclasen/samplez/compare/v0.18.0...v0.19.0) (2026-11-20)
 
 
