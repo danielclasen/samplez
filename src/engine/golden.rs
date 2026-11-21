@@ -5,19 +5,19 @@
 //! deterministic source ([`Rt::test_input`]).
 //!
 //! The log applies, at the start of its entries' blocks, gain ramps and
-//! fades (absolute, and delayed and resumed mid-ramp from indices inside
-//! a block), duck masks, depths, modes, hold and detector settings,
-//! strip, limiter and delay settings, an input crossfade to another flow
-//! with its generation on time, an input taken down and raised with its
-//! generation on time, one raised with its generation late and held
-//! silent until it arrives, and loudness pauses, runs and resets of
-//! outputs and configured meters, at slice boundaries and inside slices.
-//! Entries also apply while ramps and fades are in flight. A span of
-//! blocks is not computed, as after an overrun, with a fade in flight
-//! across it and entries at its first block, inside it and at its last
-//! block. A burst on the output of the tighter limiter stays below its
-//! ceiling in its samples and exceeds it between them, so only the
-//! true-peak estimate engages it.
+//! fades (absolute, delayed, and applied after their start from indices
+//! inside a block, joined from the value held), duck masks, depths, modes,
+//! hold and detector settings, strip, limiter and delay settings, an input
+//! crossfade to another flow with its generation on time, an input taken
+//! down and raised with its generation on time, one raised with its
+//! generation late and held silent until it arrives, and loudness pauses,
+//! runs and resets of outputs and configured meters, at slice boundaries
+//! and inside slices. Entries also apply while ramps and fades are in
+//! flight. A span of blocks is not computed, as after an overrun, with a
+//! fade in flight across it and entries at its first block, inside it and
+//! at its last block. A burst on the output of the tighter limiter stays
+//! below its ceiling in its samples and exceeds it between them, so only
+//! the true-peak estimate engages it.
 //!
 //! Pinned apart: every column's samples; every value the meters send,
 //! each field of each meter and duck record, with the readings the
@@ -80,12 +80,20 @@ use crate::transfer::{Core, CoreCopy};
 
 /// The golden run's hashes for each compute version: (version, samples,
 /// meters, page hashes).
-const GOLDEN: &[(u32, u64, u64, u64)] = &[(
-    1,
-    0x7355_b2cf_4e99_c835,
-    0xede8_c40d_9813_dca1,
-    0x2993_dbbc_89ad_9800,
-)];
+const GOLDEN: &[(u32, u64, u64, u64)] = &[
+    (
+        1,
+        0x7355_b2cf_4e99_c835,
+        0xede8_c40d_9813_dca1,
+        0x2993_dbbc_89ad_9800,
+    ),
+    (
+        2,
+        0x8219_0f50_2117_74a0,
+        0xb8de_6030_57c2_013e,
+        0x791b_ba52_022d_4223,
+    ),
+];
 
 /// The pages' entry fingerprints: a function of the log's ids and indices
 /// alone, whatever the samples. Replacing it goes with a `PROTOCOL` bump
@@ -98,7 +106,7 @@ const FINGERPRINTS: u64 = 0xfd09_ad6f_7cbc_3be9;
 /// is taken only at an equal `COMPUTE_VERSION`, so a change to what it
 /// holds or how it encodes needs a bump here, or replicas of the new
 /// release fail to decode the running set's copies mid-roll.
-const CORES: &[(u32, u64)] = &[(1, 0xcd98_6111_aa8d_c6be)];
+const CORES: &[(u32, u64)] = &[(1, 0xcd98_6111_aa8d_c6be), (2, 0xd976_b4b6_f4c1_ba1f)];
 
 /// The block after which the core is copied: entries and their batches
 /// pending, slot 0's `InputUp` awaiting its late generation, the
@@ -107,12 +115,15 @@ const CORE_AT: u64 = 1650;
 
 /// The small scene's encoded core copy for each compute version:
 /// (version, XXH3-64 of [`CoreCopy::encode`]'s bytes).
-const PHASED_CORES: &[(u32, u64)] = &[(1, 0x9a09_eea1_eddb_5e87)];
+const PHASED_CORES: &[(u32, u64)] = &[(1, 0x9a09_eea1_eddb_5e87), (2, 0xdac9_558b_b958_0ffc)];
 
 /// The tone scene's hashes for each compute version: (version, samples,
 /// XXH3-64 of the encoded core copy after [`TONE_CORE_AT`]). A scene of
 /// its own, so the main scene's rows stay as they are.
-const TONES: &[(u32, u64, u64)] = &[(1, 0x7325_ebfb_0d8e_41e4, 0xb8af_9c78_1774_6585)];
+const TONES: &[(u32, u64, u64)] = &[
+    (1, 0x7325_ebfb_0d8e_41e4, 0xb8af_9c78_1774_6585),
+    (2, 0x7325_ebfb_0d8e_41e4, 0xb083_0c30_70c5_ded3),
+];
 
 /// The block after which the tone scene's core is copied: inside the
 /// crossfade to 440 Hz, the change to 1 kHz waiting behind it.
@@ -350,7 +361,8 @@ fn entries() -> Vec<(u64, Vec<Item>)> {
     vec![
         (0, setup),
         (12_000, vec![gain(0, 0, 0.3, None)]),
-        // Absolute, delayed and resumed mid-ramp fades.
+        // Absolute, delayed and late fades, the late one joined from the
+        // value held.
         (
             18_000,
             vec![gain(

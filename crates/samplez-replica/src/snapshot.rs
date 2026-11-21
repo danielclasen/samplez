@@ -80,6 +80,26 @@ pub struct Replicated {
     /// which then carry none.
     #[serde(default)]
     pub tone_ramps: Vec<Option<ToneRampBits>>,
+    /// [`crate::state_machine::StateMachine::in_flight`], absent from
+    /// snapshots written before it was kept, which then carry none.
+    #[serde(default)]
+    pub in_flight: InFlightBits,
+}
+
+/// [`samplez::InFlight`] with each depth ramp as `(from bits, start,
+/// len)`, the input slots the derived entries hold down, a bit per
+/// slot, and per slot the entry that started its last fade-in with what
+/// it changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlightBits {
+    pub down: u64,
+    /// [`crate::state_machine::StateMachine::raised`].
+    #[serde(default)]
+    pub raised: Vec<Option<crate::state_machine::Raise>>,
+    pub fade_ins: Vec<Option<u64>>,
+    pub crossfades: Vec<Option<(u64, Option<String>)>>,
+    pub depths: Vec<Vec<Option<(u32, u64, u32)>>>,
+    pub masks: Vec<samplez::MaskChain>,
 }
 
 /// [`samplez_dsp::ToneRamps`] with its values as bit patterns: each

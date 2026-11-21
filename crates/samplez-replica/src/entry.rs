@@ -257,7 +257,11 @@ pub enum Body {
 /// which a product's records carry; 4 keeps the digest of a block a
 /// withdrawn replica withholds at once as unfillable, so a page it
 /// computed degraded is reported degraded and left out of the verdicts,
-/// where protocol 3 reported it healthy and the verdicts diverged it.
+/// where protocol 3 reported it healthy and the verdicts diverged it,
+/// and its product state names a fade applied after its start as the
+/// engine joins it and the input fade-ins and crossfades and duck depth
+/// and mask ramps in flight, which its snapshots carry, so a replica
+/// rebuilt inside one continues it as its peers do.
 pub const PROTOCOL: u32 = 4;
 
 impl Body {

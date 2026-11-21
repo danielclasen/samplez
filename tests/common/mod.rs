@@ -851,6 +851,7 @@ pub fn hold_scenario(e: &Engine) {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         // Folds in the entries applied before the drop.
         fading: Vec::new(),

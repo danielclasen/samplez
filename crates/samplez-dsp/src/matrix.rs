@@ -889,6 +889,132 @@ impl Matrix {
         self.depths[input * MAX_DUCKS + duck].set_target(db, len)
     }
 
+    /// Sets the depth of `input` by detector `duck` to the ramp `ramp`,
+    /// dB, as it is: a depth ramp the matrix did not run itself continues
+    /// where one that ran it is ([`Ramp::resume`]).
+    ///
+    /// Returns false and changes nothing if `input` or `duck` is out of
+    /// range, or an end of the ramp is not within [`DEPTH_DB`].
+    #[must_use]
+    pub fn resume_depth(&mut self, input: usize, duck: usize, ramp: Ramp) -> bool {
+        if input >= self.inputs || duck >= MAX_DUCKS || !ramp.is_within(DEPTH_DB) {
+            return false;
+        }
+        if self.depths.is_empty() {
+            self.depths.resize(self.inputs * MAX_DUCKS, Ramp::new(0.0));
+        }
+        self.depths[input * MAX_DUCKS + duck] = ramp;
+        true
+    }
+
+    /// Gives the coefficient from `input` to `output` the duck a matrix
+    /// holds at sample index `at`, the next sample, after the mask changes
+    /// of `changes`, each `(index, mask)` in order at or after the first
+    /// change's interval and before `at`, each crossfading over `len`
+    /// samples, the first from mask `from` settled: the gains at each end
+    /// of an interval from the one before the first change on, computed
+    /// as a running matrix computes them, with every detector steady at
+    /// its value in `envelopes` and detector `g`'s depth at index `n`
+    /// `depth(g, n)`. A coefficient at 0 has no duck and keeps none; its
+    /// mask stays as [`Matrix::set_mask`] or a fill set it, which should
+    /// be the last change's.
+    ///
+    /// Returns false and changes nothing if `input` or `output` is out of
+    /// range or `changes` is empty.
+    #[must_use]
+    pub fn resume_mask(
+        &mut self,
+        (input, output): (usize, usize),
+        (from, changes): (u8, &[(u64, u8)]),
+        len: u32,
+        envelopes: &[f32],
+        depth: impl Fn(usize, u64) -> f32,
+        at: u64,
+    ) -> bool {
+        let outputs = self.columns.len();
+        let Some(&(first, _)) = changes.first() else {
+            return false;
+        };
+        if input >= self.inputs || output >= outputs {
+            return false;
+        }
+        let len = len.min(MAX_RAMP_LEN);
+        let gain = |mask: u8, n: u64| {
+            let mut memo = Memo::NONE;
+            for (g, a) in memo.atten.iter_mut().enumerate() {
+                *a = depth(g, n) * envelopes.get(g).copied().unwrap_or(0.0);
+            }
+            memo.order();
+            memo.gain(mask)
+        };
+        let interval = u64::from(GAIN_INTERVAL);
+        // The end of the first change's interval. The duck is settled at
+        // `from` at the two ends before it.
+        let end = first - first % interval + interval - 1;
+        let settled = end.saturating_sub(interval);
+        let mut d = Duck {
+            from: gain(from, settled.saturating_sub(interval)),
+            to: gain(from, settled),
+            live: gain(from, settled),
+            live_mask: from,
+            old: from,
+            bias: 0.0,
+            pos: len,
+            len,
+        };
+        let (mut mask, mut start) = (from, None);
+        let mut next = changes.iter().peekable();
+        let mut e = end;
+        loop {
+            // The changes at or before `e`, before the end of its interval.
+            while let Some(&&(c, m)) = next.peek().filter(|c| c.0 <= e && c.0 < at) {
+                next.next();
+                if m != mask {
+                    mask = m;
+                    d.change(len);
+                    start = Some(c);
+                }
+            }
+            if e >= at {
+                break;
+            }
+            let live = gain(mask, e);
+            let k = start.map_or(u64::MAX, |s| e - s);
+            let to = if k < u64::from(len) {
+                let old = (gain(d.old, e) + d.bias).clamp(0.0, 1.0);
+                old + (k as f32 / len as f32) * (live - old)
+            } else {
+                live
+            };
+            d.live = live;
+            d.live_mask = mask;
+            d.from = d.to;
+            d.to = to;
+            e += interval;
+        }
+        d.pos = start.map_or(len, |s| u32::try_from(at - s).unwrap_or(u32::MAX).min(len));
+        let (col, ducks) = (&mut self.columns[output], &mut self.ducks[output]);
+        let Ok(k) = col.binary_search_by_key(&input, |t| t.input) else {
+            return true;
+        };
+        let i = duck_index(col, k);
+        let rest = col[k].mask == 0 && d.is_rest();
+        let t = &mut col[k];
+        match (t.ducked, rest) {
+            (true, true) => {
+                t.ducked = false;
+                ducks.remove(i);
+            }
+            (true, false) => ducks[i] = d,
+            (false, false) => {
+                t.ducked = true;
+                ducks.insert(i, d);
+            }
+            (false, true) => {}
+        }
+        true
+    }
+
     /// Takes the next sample processed to be sample index `index`: ducks
     /// move on at the multiples of [`GAIN_INTERVAL`] of the index. A
     /// position in the interval other than the current one holds the
@@ -903,28 +1029,36 @@ impl Matrix {
         }
     }
 
-    /// Starts the duck of every ducked term at the gain a running matrix
+    /// Starts the duck of every ducked term at the gains a running matrix
     /// holds for it when the detectors sit at `envelopes`, one per
-    /// detector, steady: `from`, `to` and the live gain all that gain, as
-    /// they are after a few intervals at those envelopes, instead of at 1
-    /// moving to it over the two intervals after a fill. A term of mask 0
-    /// or with no depth set keeps gain 1.
+    /// detector, steady: `from` and `to` the gains at the last two ends of
+    /// an interval before the next sample, at the depths the depth ramps
+    /// had there, and the live gain `to`, as they are after a few
+    /// intervals at those envelopes, instead of at 1 moving to them over
+    /// the two intervals after a fill. A depth ramp is taken to have held
+    /// its start value before its start. A term of mask 0 or with no
+    /// depth set keeps gain 1.
     pub fn settle_ducks(&mut self, envelopes: &[f32]) {
+        // Samples back from the next one to the last end of an interval.
+        let last = self.phase + 1;
         for (col, ducks) in self.columns.iter().zip(&mut self.ducks) {
             for (k, t) in col.iter().filter(|t| t.ducked).enumerate() {
-                let mut memo = Memo::NONE;
-                if !self.depths.is_empty() {
-                    let depths = &self.depths[t.input * MAX_DUCKS..(t.input + 1) * MAX_DUCKS];
-                    for (g, (a, r)) in memo.atten.iter_mut().zip(depths).enumerate() {
-                        *a = r.current() * envelopes.get(g).copied().unwrap_or(0.0);
+                let gain = |back: u32| {
+                    let mut memo = Memo::NONE;
+                    if !self.depths.is_empty() {
+                        let depths = &self.depths[t.input * MAX_DUCKS..(t.input + 1) * MAX_DUCKS];
+                        for (g, (a, r)) in memo.atten.iter_mut().zip(depths).enumerate() {
+                            let depth = r.value_at(r.pos.saturating_sub(back));
+                            *a = depth * envelopes.get(g).copied().unwrap_or(0.0);
+                        }
+                        memo.order();
                     }
-                    memo.order();
-                }
-                let gain = memo.gain(t.mask);
+                    memo.gain(t.mask)
+                };
                 let d = &mut ducks[k];
-                d.from = gain;
-                d.to = gain;
-                d.live = gain;
+                d.from = gain(last + GAIN_INTERVAL);
+                d.to = gain(last);
+                d.live = d.to;
                 d.live_mask = t.mask;
             }
         }
@@ -2856,6 +2990,59 @@ mod tests {
         let mut built = Matrix::new(1, 1);
         assert!(built.fade_in_ducked_resuming(&[0.25], &[0b1], &[], 0, &[(0, ramp)]));
         assert!(live == built);
+    }
+
+    /// A matrix filled at index 272 and given the mask changes a running
+    /// one took at 200 and, inside that crossfade, at 248, under a steady
+    /// envelope, mixes the running one's bits from its first sample, both
+    /// crossfades included.
+    #[test]
+    fn a_resumed_mask_crossfade_mixes_the_bits_of_a_running_matrix() {
+        for path in Path::ALL {
+            if !path_runs(
+                "a_resumed_mask_crossfade_mixes_the_bits_of_a_running_matrix",
+                path,
+            ) {
+                continue;
+            }
+            let mut rng = Rng::new(0x3a5c);
+            let mut input = PlanarBuffer::new(1, CAP);
+            let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
+            env.channel_mut(0).fill(1.0);
+            let mut out = PlanarBuffer::new(1, CAP);
+            let mut live = Matrix::new(1, 1);
+            assert!(live.set_depth(0, 0, 20.0, 0) && live.set(0, 0, 0.5, 0));
+            for (frames, mask) in [(200, 1), (48, 0), (24, 0)] {
+                fill(&mut rng, &mut input, frames);
+                live.process_ducked_on(path, &input, &env, &mut out, frames);
+                assert!(live.set_mask(0, 0, mask, 96));
+            }
+            let mut depths = vec![0.0; MAX_DUCKS];
+            depths[0] = 20.0;
+            let mut built = Matrix::new(1, 1);
+            built.fade_in_ducked(&[0.5], &[0], &depths, 0);
+            built.align(272);
+            built.settle_ducks(&[1.0]);
+            let depth = |g: usize, _| if g == 0 { 20.0 } else { 0.0 };
+            let changes: [(u64, u8); 2] = [(200, 1), (248, 0)];
+            assert!(built.resume_mask((0, 0), (0, &changes), 96, &[1.0], depth, 272));
+            fill(&mut rng, &mut input, 64);
+            let mut want = PlanarBuffer::new(1, CAP);
+            live.process_ducked_on(path, &input, &env, &mut want, 64);
+            built.process_ducked_on(path, &input, &env, &mut out, 64);
+            for n in 0..64 {
+                assert_eq!(
+                    out.channel(0)[n].to_bits(),
+                    want.channel(0)[n].to_bits(),
+                    "{path:?} sample {n}"
+                );
+            }
+            assert_ne!(
+                want.channel(0)[0],
+                0.5 * input.channel(0)[0],
+                "no crossfade"
+            );
+        }
     }
 
     /// A matrix filled with its masked terms settled at steady envelopes

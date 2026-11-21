@@ -1451,9 +1451,10 @@ pub(crate) fn plan(next: Option<u64>, newest: Option<u64>, max_catchup: u64, blo
 }
 
 /// Sets coefficient `(input, output, gain)` at index `at`: to follow
-/// `fade`, whose value at any index is its own function, or over `ramp`
-/// samples from the value held. Whether the matrix took it, and the
-/// index the ramp ends at.
+/// `fade` as it joins the value held ([`crate::engine::Fade::joined`]),
+/// a function of the index alone once it is in, or over `ramp` samples
+/// from the value held. Whether the matrix took it, and the index the
+/// ramp ends at.
 fn set_gain(
     matrix: &mut Matrix,
     ramp: u32,
@@ -1461,13 +1462,19 @@ fn set_gain(
     fade: Option<crate::engine::Fade>,
     at: u64,
 ) -> (bool, u64) {
-    match fade {
-        Some(f) => (
-            matrix.set_resumed(input, output, gain, f.ramp_at(gain, at)),
-            f.start.saturating_add(u64::from(f.len)),
-        ),
-        None => (matrix.set(input, output, gain, ramp), at + u64::from(ramp)),
-    }
+    let Some(f) = fade else {
+        return (matrix.set(input, output, gain, ramp), at + u64::from(ramp));
+    };
+    let held = if output < matrix.outputs() {
+        matrix.gain(input, output)
+    } else {
+        0.0
+    };
+    let f = f.joined(gain, held, at, ramp);
+    (
+        matrix.set_resumed(input, output, gain, f.and_then(|f| f.ramp_at(gain, at))),
+        f.map_or(at, |f| f.start.saturating_add(u64::from(f.len))),
+    )
 }
 
 /// The matrix, its position on the sample timeline and the gain changes
@@ -4410,9 +4417,10 @@ mod tests {
     }
 
     /// The entry a diff derives from an absolute fade renders the
-    /// absolute function bit for bit from its index on, whatever the
-    /// index is, before the start, inside the ramp or after it, and
-    /// whatever value the coefficient held.
+    /// absolute function bit for bit from its index on where the index
+    /// lies at or before the fade's start, whatever value the coefficient
+    /// held; past it, the fade it joins from that value
+    /// ([`crate::engine::Fade::joined`]).
     #[test]
     fn a_diff_of_an_absolute_fade_renders_the_absolute_function() {
         use crate::targets::Targets;
@@ -4448,14 +4456,116 @@ mod tests {
             );
             assert!(m.push(e));
             let gains = walk(&mut m, 14);
+            let rendered = f.joined(0.25, 0.7, at, 480);
+            assert_eq!(rendered == Some(f), at <= f.start, "at {at}");
             for (k, g) in gains.iter().enumerate() {
                 let n = k as u64 * B;
                 if n >= at {
-                    let want = f.value_at(0.25, n);
+                    let want = rendered.map_or(0.25, |f| f.value_at(0.25, n));
                     assert_eq!(g.to_bits(), want.to_bits(), "at {at}, sample {n}");
                 }
             }
         }
+    }
+
+    /// The coefficient at every sample of `blocks` blocks of `m`, the
+    /// matrix moved on sample by sample as the mix moves it over a block.
+    fn walk_samples(m: &mut Mix, blocks: u64) -> Vec<f32> {
+        let mut gains = Vec::new();
+        for k in 0..blocks {
+            to(m, k);
+            for _ in 0..m.block {
+                gains.push(m.matrix.gain(0, 0));
+                m.matrix.advance(1);
+            }
+        }
+        gains
+    }
+
+    /// A fade from 0 to 1 over 4800 samples from index 0, applied late at
+    /// index 960 to a coefficient holding 0.8, while it is at 0.2: the
+    /// coefficient joins it from 0.8 with no step, in a straight line to
+    /// its end at 4800, never steeper than a plain change over the ramp
+    /// length, and the same bits whatever the block size, at ramp lengths
+    /// of 10 and 20 ms. Fails on an engine that renders the fade's own
+    /// value from the entry's index, which steps by 0.6.
+    #[test]
+    fn a_late_fade_joins_from_the_value_held() {
+        let f = crate::engine::Fade {
+            from: 0.0,
+            start: 0,
+            len: 4800,
+        };
+        let at = 960;
+        for ramp in [480u32, 960] {
+            let run = |b: u64| {
+                let mut matrix = Matrix::new(1, 1);
+                assert!(matrix.set(0, 0, 0.8, 0));
+                let mut m = Mix::new(matrix, b, ramp);
+                let e = entry(
+                    Change::Gain {
+                        input: 0,
+                        output: 0,
+                        gain: 1.0,
+                        fade: Some(f),
+                    },
+                    at,
+                );
+                assert!(m.push(e));
+                walk_samples(&mut m, 6000 / b)
+            };
+            let reference = run(48);
+            // The largest step a change over the ramp length takes, and
+            // a rounding's worth over it.
+            let slope = (1.0f32 - 0.8) / ramp as f32;
+            for (n, w) in reference.windows(2).enumerate() {
+                let step = (w[1] - w[0]).abs();
+                assert!(step <= slope * 1.001, "ramp {ramp}, sample {n}: {step}");
+            }
+            assert_eq!(reference[at as usize], 0.8, "ramp {ramp}");
+            assert!(reference[at as usize + 1] > 0.8, "ramp {ramp}");
+            assert!(
+                reference[4799] < 1.0 && reference[4800] == 1.0,
+                "ramp {ramp}"
+            );
+            for b in [16, 24, 40] {
+                let got: Vec<u32> = run(b).iter().map(|g| g.to_bits()).collect();
+                let want: Vec<u32> = reference[..got.len()].iter().map(|g| g.to_bits()).collect();
+                assert_eq!(got, want, "ramp {ramp}, block size {b}");
+            }
+        }
+    }
+
+    /// A fade applied after its end ramps the coefficient from the value
+    /// held to the fade's target over the ramp length, bit for bit as a
+    /// change with no fade does. Fails on an engine that jumps to the
+    /// target.
+    #[test]
+    fn a_fade_past_its_end_ramps_as_a_plain_change() {
+        let f = crate::engine::Fade {
+            from: 0.0,
+            start: 0,
+            len: 96,
+        };
+        let run = |fade| {
+            let mut m = mix();
+            assert!(m.matrix.set(0, 0, 0.25, 0));
+            let e = entry(
+                Change::Gain {
+                    input: 0,
+                    output: 0,
+                    gain: 1.0,
+                    fade,
+                },
+                10 * B,
+            );
+            assert!(m.push(e));
+            walk_samples(&mut m, 30)
+        };
+        let faded: Vec<u32> = run(Some(f)).iter().map(|g| g.to_bits()).collect();
+        let plain: Vec<u32> = run(None).iter().map(|g| g.to_bits()).collect();
+        assert_eq!(faded, plain);
+        assert_ne!(f32::from_bits(faded[10 * B as usize + 1]), 1.0);
     }
 
     /// A fade asserted again mid-ramp leaves the coefficient on the

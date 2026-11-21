@@ -1249,6 +1249,7 @@ mod tests {
                     strips: Vec::new(),
                     ducks: Vec::new(),
                     masks: Vec::new(),
+                    in_flight: Default::default(),
                     pending: Vec::new(),
                     fading: Vec::new(),
                     last_id: 0,

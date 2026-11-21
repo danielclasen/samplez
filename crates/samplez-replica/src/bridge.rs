@@ -346,11 +346,14 @@ impl EngineAudio {
             .collect();
         let kept = self.kept(&routes);
         let mut dropped = routes.len() - kept.len();
+        // The slots left at the flow they read.
+        let mut left = Vec::new();
         for route in &routes {
             if let Entry::Route { slot, .. } | Entry::Detach { slot } = *route
                 && !kept.contains(route)
             {
                 state.flows[slot] = reading[slot].clone();
+                left.push(slot);
             }
         }
         for (slot, params) in state.strips.iter_mut().enumerate() {
@@ -522,6 +525,23 @@ impl EngineAudio {
                 }
             }
         }
+        let takes = |group: usize, slot: usize, db: f32| {
+            matches!(duck(group, DuckSetting::Depth { slot, db }),
+                Some(DuckSetting::Depth { db: d, .. }) if d.to_bits() == db.to_bits())
+        };
+        let mask = |input: usize, output: usize, mask: u8| {
+            let entry = Entry::DuckMask {
+                input,
+                output,
+                mask,
+            };
+            if mask == 0 || self.admitted(&entry) == Some(entry) {
+                mask
+            } else {
+                0
+            }
+        };
+        dropped += filter_in_flight(&mut state, &left, takes, mask);
         if dropped > 0 {
             tracing::error!(
                 dropped,
@@ -877,6 +897,51 @@ fn replay_failed(e: ReplayError) -> Failed {
     }
 }
 
+/// Filters the ramps in flight of `state` as the live filter filters
+/// entries, for an engine of `state`'s input slots: a crossfade of a slot
+/// of `left`, which stays at the flow it reads, is none; fade-ins and
+/// crossfades of slots beyond the engine's are left out; a depth ramp
+/// from or to a depth `takes` refuses, by group, slot and dB, is left
+/// out; each mask of a mask change, the one it starts from included, is
+/// the one `mask` lets through, by input channel and column. How many
+/// were left out.
+fn filter_in_flight(
+    state: &mut ProductState,
+    left: &[usize],
+    takes: impl Fn(usize, usize, f32) -> bool,
+    mask: impl Fn(usize, usize, u8) -> u8,
+) -> usize {
+    let slots = state.flows.len();
+    let flight = &mut state.in_flight;
+    for &slot in left {
+        if let Some(x) = flight.crossfades.get_mut(slot) {
+            *x = None;
+        }
+    }
+    let mut dropped = flight.fade_ins.len().saturating_sub(slots);
+    flight.fade_ins.truncate(slots);
+    dropped += flight.crossfades.len().saturating_sub(slots);
+    flight.crossfades.truncate(slots);
+    for (group, ramps) in flight.depths.iter_mut().enumerate() {
+        for (slot, ramp) in ramps.iter_mut().enumerate() {
+            let target = (state.ducks.get(group))
+                .and_then(|d| d.depths.get(slot).copied())
+                .unwrap_or(0.0);
+            if ramp.is_some_and(|f| !takes(group, slot, f.from) || !takes(group, slot, target)) {
+                *ramp = None;
+                dropped += 1;
+            }
+        }
+    }
+    for (input, output, from, changes) in &mut flight.masks {
+        *from = mask(*input, *output, *from);
+        for (_, k) in changes.iter_mut() {
+            *k = mask(*input, *output, *k);
+        }
+    }
+    dropped
+}
+
 #[cfg(test)]
 mod tests {
     use samplez::blocks::HEALTHY;
@@ -900,6 +965,44 @@ mod tests {
         assert_eq!(
             (skipped.k, skipped.kind, skipped.cause),
             (6, Kind::Withheld, Cause::Skip)
+        );
+    }
+
+    /// The crossfade of a slot left at the flow it reads is dropped, the
+    /// others kept, and a mask change's starting mask is filtered as its
+    /// changes are: a refused mask, here 2, is 0 at both ends.
+    #[test]
+    fn a_rebuild_filters_the_crossfades_and_masks_in_flight() {
+        let mut state = ProductState {
+            gains: vec![vec![1.0, 1.0]],
+            fading: Vec::new(),
+            up: vec![true, true],
+            flows: vec![Some("a".to_owned()), Some("b".to_owned())],
+            outputs: Vec::new(),
+            loudness_running: Vec::new(),
+            strips: vec![Vec::new(), Vec::new()],
+            limiters: Vec::new(),
+            delays: Vec::new(),
+            tones: Vec::new(),
+            tone_ramps: Vec::new(),
+            ducks: Vec::new(),
+            masks: vec![vec![1, 0]],
+            in_flight: samplez::InFlight {
+                crossfades: vec![Some((960, Some("c".to_owned()))), Some((960, None))],
+                masks: vec![(0, 0, 2, vec![(960, 1)]), (0, 1, 1, vec![(960, 2)])],
+                ..samplez::InFlight::default()
+            },
+            pending: Vec::new(),
+            last_id: 0,
+        };
+        let refuse_2 = |_: usize, _: usize, k: u8| if k == 2 { 0 } else { k };
+        let dropped = filter_in_flight(&mut state, &[1], |_, _, _| true, refuse_2);
+        assert_eq!(dropped, 0);
+        let f = &state.in_flight;
+        assert_eq!(f.crossfades, vec![Some((960, Some("c".to_owned()))), None]);
+        assert_eq!(
+            f.masks,
+            vec![(0, 0, 0, vec![(960, 1)]), (0, 1, 1, vec![(960, 0)])]
         );
     }
 }

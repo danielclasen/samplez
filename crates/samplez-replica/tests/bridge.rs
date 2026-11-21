@@ -490,6 +490,7 @@ fn a_loudness_entry_of_a_meter_the_engine_lacks_is_left_out() {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
@@ -503,6 +504,69 @@ fn a_loudness_entry_of_a_meter_the_engine_lacks_is_left_out() {
     audio.drop_engine();
     assert!(audio.rebuild_engine(&state, 0), "rebuilt running");
     assert!(!core().core.meter_paused(0));
+}
+
+/// Ramps in flight that the engine refuses are filtered as the live
+/// filter filters entries, so the rebuild is taken: a fade-in and a
+/// crossfade of a slot beyond the engine's are left out, a depth ramp
+/// from a depth the engine refuses is dropped, and a mask change the
+/// engine refuses, on a column that does not duck, is taken as 0, the
+/// mask the state's own refused mask becomes. Unfiltered, the engine
+/// refuses each state whole.
+#[test]
+fn ramps_in_flight_the_engine_refuses_are_filtered_from_a_rebuild() {
+    let domain = Domain::new();
+    let (engine, audio) = bridge(&domain, 1 << 12);
+    let processed = || engine.progress().and_then(|p| p.processed);
+    wait_for("a block computed", || processed().is_some());
+    let at = processed().unwrap() * B;
+    let base = samplez::ProductState {
+        limiters: Vec::new(),
+        delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
+        gains: vec![vec![1.0]],
+        up: vec![true],
+        flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
+        outputs: Vec::new(),
+        loudness_running: Vec::new(),
+        strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
+        in_flight: samplez::InFlight::default(),
+        pending: Vec::new(),
+        fading: Vec::new(),
+        last_id: 0,
+    };
+    let mut fade_ins = base.clone();
+    fade_ins.in_flight.fade_ins = vec![Some(at), Some(at)];
+    let mut crossfades = base.clone();
+    crossfades.in_flight.crossfades = vec![None, Some((at, None))];
+    let mut depths = base.clone();
+    let from_99 = samplez::Fade {
+        from: 99.0,
+        start: at,
+        len: 480,
+    };
+    depths.in_flight.depths = vec![vec![Some(from_99)]];
+    let mut masks = base.clone();
+    masks.masks = vec![vec![1]];
+    masks.in_flight.masks = vec![(0, 0, 0, vec![(at, 1)])];
+    for (what, state) in [
+        ("fade-ins", &fade_ins),
+        ("crossfades", &crossfades),
+        ("depths", &depths),
+        ("masks", &masks),
+    ] {
+        assert!(
+            engine
+                .install_product(state, 0, Duration::from_secs(2))
+                .is_err(),
+            "the engine takes unfiltered {what}"
+        );
+        audio.drop_engine();
+        assert!(audio.rebuild_engine(state, 0), "{what} filtered: rebuilt");
+    }
 }
 
 /// Of the `InputUp`s and `Route`s of one record whose slots lie in two
@@ -705,6 +769,7 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 0,
@@ -1412,6 +1477,7 @@ fn rebuild_after_a_route() -> Result<(), String> {
         strips: vec![vec![StripParam::Trim { db: -6.0 }]],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
@@ -1545,6 +1611,7 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
         strips: vec![Vec::new(), Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
@@ -1638,6 +1705,7 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,

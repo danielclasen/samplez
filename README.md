@@ -423,10 +423,23 @@ after. Its value at index `n` is `from + (n - start) * step`, `step =
 (target - from) / len`, computed from `n` directly as the matrix ramps
 are, so the same bits come out whatever the block size, the SIMD path or
 the blocks the ramp spans. `start` may lie ahead of the entry's index (a
-delay; `Fade::after(from, index, delay, len)` builds it), at it, or
-behind it (the fade resumed mid-ramp): the engine renders the function
-whatever the coefficient held before, so an entry that repeats a fade
-mid-ramp, as `Targets::assert` does, changes no bit. `from` must be a
+delay; `Fade::after(from, index, delay, len)` builds it) or at it: the
+engine renders the function whatever the coefficient held before.
+Behind it the fade started before the entry applies, and the
+coefficient joins it from the value it holds at the index
+(`Fade::joined`): a coefficient holding the fade's value there, as one
+on the fade does, stays on it, so an entry that repeats a fade
+mid-ramp, as `Targets::assert` does, changes no bit; any other value
+goes in a straight line to the target that ends where the fade ends and
+takes at least `rampSamples`, so a late entry steps by no more than a
+change with no fade; a fade already over ramps to its target over
+`rampSamples`, as a change with no fade does. The value held is the
+log's, the same on every replica, so every replica joins alike. An
+entry that repeats the fade while the coefficient is on its join holds
+no value of the fade, so it starts the join again from the value held:
+no step and the same bits on every replica, but rounded apart from the
+join that ran without it, and where the join outlasts the fade, ending
+`rampSamples` after the repeat. `from` must be a
 valid gain, `len` at most `samplez_dsp::MAX_EXACT_RAMP_LEN` (2^23, about
 174 s), and `start` at most that far past the entry's index;
 An entry with a fade beyond them is refused when it is appended or installed, and a decoded core holding one is refused, so every replica starts the ramp at the same index. With no fade a gain
@@ -452,10 +465,13 @@ gets its coefficients at their targets. A masked coefficient that a gain change,
 in from silence is ducked from the start, with no mask crossfade of its
 own: its ramp hides the step, and an install builds the same state.
 The replica tracks the ramp each derived gain entry leaves a coefficient
-on (`Limits::ramp_samples`, which must equal the engine's `rampSamples`)
-and carries them in its product state, so a rebuilt engine continues the
-ramps of plain gain entries too. The ramps are part of the snapshot
-data, pruned once they end below the floor. A snapshot written before they
+on (`Limits::ramp_samples`, which must equal the engine's `rampSamples`),
+a fade as the engine joins it, and carries them in its product state, so
+a rebuilt engine continues the ramps of plain gain entries too. It
+tracks the input fade-ins and crossfades and the duck depth ramps and
+mask crossfades the derived entries start in the same way
+(`ProductState::in_flight`, Starting a replica). The ramps are part of
+the snapshot data, pruned once they end below the floor. A snapshot written before they
 were kept loads with none, so an engine rebuilt within about two ramp
 lengths of an entry after the upgrade can differ from its peers, once.
 `Limits::ramp_samples` and `Limits::block` must equal the engine's
@@ -918,12 +934,23 @@ follows the withdrawn rules. A state holding a gain, flow, strip
 parameter or duck value no entry could set is refused before anything
 changes. Its gains are at their targets from the first sample of the
 install, with no ramp from silence, and an input that is up and attached
-continues with no fade-in, so a rebuilt replica computes the
-output of a peer that ran through from its first block, as far as the
-gains go. Its duck groups start cold at the state's settings: key
-filters at rest, no hold, the envelope at 0 or, for a group its mode On
-or hold triggers, at full depth; masks and depths at their targets, so a
-coefficient is ducked from the start. An install does not resume a mask crossfade or a depth ramp still in progress: it folds passed mask and depth entries as settled, so an install less than `rampSamples` after such an entry differs from its peers until the ramp ends. A replica that kept computing holds
+continues with no fade-in of its own, but for what the state names in
+flight (`ProductState::in_flight`, `samplez::InFlight`): the fade-in of
+an input an `InputUp` raised from down, the crossfade of an input a
+`Route` or `Detach` moved, its outgoing flow read until it ends, and
+the duck depth ramps and mask crossfades, each continued at its value
+for the install index as a peer that ran through computes it. So a
+rebuilt replica computes the output of a peer that ran through from its
+first block, as far as the gains and inputs go. Its duck groups start
+cold at the state's settings: key filters at rest, no hold, the envelope
+at 0 or, for a group its mode On or hold triggers, at full depth; masks
+and depths at their targets or on their ramps, so a coefficient is
+ducked from the start, its duck at the gains a running matrix holds at
+the last two ends of a gain interval. A mask crossfade continues bit for
+bit where the detectors were steady over it and the depth held its
+value before the ramp the state names; over a depth changed more than
+once within it, it differs from its peers until both end. A replica
+that kept computing holds
 its own key filter, hold and envelope state, so their outputs differ
 after the install until each key filter's state has reached the same
 bits and each group's envelope has reached 0 or full depth in both; on a

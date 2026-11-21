@@ -21,7 +21,10 @@ use samplez_dsp::{
 
 /// The golden run's hashes for each compute version: (version, samples,
 /// loudness).
-const GOLDEN: &[(u32, u64, u64)] = &[(1, 0xe51d_eb18_8958_9e71, 0xcdde_c278_9d44_294c)];
+const GOLDEN: &[(u32, u64, u64)] = &[
+    (1, 0xe51d_eb18_8958_9e71, 0xcdde_c278_9d44_294c),
+    (2, 0xe51d_eb18_8958_9e71, 0xcdde_c278_9d44_294c),
+];
 
 const BLOCK: usize = 48;
 const BLOCKS: usize = 3000;

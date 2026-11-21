@@ -810,6 +810,7 @@ fn a_product_state_sets_the_delay() {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
@@ -903,6 +904,7 @@ fn a_product_state_resumes_the_tone_ramps() {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
@@ -1127,6 +1129,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 0,
@@ -1208,6 +1211,7 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 0,
@@ -1252,6 +1256,7 @@ fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
             strips: vec![Vec::new()],
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 0,
@@ -1285,6 +1290,64 @@ fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
         h.e.stop();
         Ok(())
     });
+}
+
+/// A product state naming a re-route's crossfade still running has the
+/// supervisor read the flow the crossfade leaves until it ends: the
+/// generation handed over for the install holds the outgoing reader, so
+/// the slot mixes the outgoing flow fading out with the new one fading
+/// in. The crossfade takes 2^22 samples, about 87 s, so it runs for the
+/// whole case whatever the load. Both flows carry the same pilot, so the
+/// input reads the pilot at full level from the install on; without the
+/// outgoing reader it reads the new flow alone, at the crossfade's first
+/// percent.
+#[test]
+fn a_product_state_keeps_reading_the_flow_a_crossfade_leaves() {
+    let domain = Domain::new();
+    let (src, old) = (new_id(), new_id());
+    let _pilots = [&src, &old].map(|id| Pilot::start(&domain.0, id, 2, B, 0));
+    let long = |c: &mut Config| c.ramp_samples = 1 << 22;
+    let h = hashed_of(&domain, &[(&src, 2)], long);
+    let start = processed(&h.e) * B;
+    let state = ProductState {
+        limiters: Vec::new(),
+        delays: Vec::new(),
+        tones: Vec::new(),
+        tone_ramps: Vec::new(),
+        gains: diagonal(2, 1.0),
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        outputs: Vec::new(),
+        loudness_running: Vec::new(),
+        strips: vec![Vec::new()],
+        ducks: Vec::new(),
+        masks: Vec::new(),
+        in_flight: samplez::InFlight {
+            crossfades: vec![Some((start, Some(old.clone())))],
+            ..Default::default()
+        },
+        pending: Vec::new(),
+        fading: Vec::new(),
+        last_id: 0,
+    };
+    h.e.drop_core().unwrap();
+    let j =
+        h.e.install_product(&state, 0, Duration::from_secs(2))
+            .unwrap();
+    let installed = (j + 1) * B;
+    let after = |w: Option<u64>| w.is_some_and(|w| w * 4800 >= installed);
+    wait_for(
+        Duration::from_secs(10),
+        "a meter window after the install",
+        || after(h.e.status().inputs[0].meters.window),
+    );
+    let s = h.e.status();
+    let meters = &s.inputs[0].meters;
+    assert!(
+        meters.peak.iter().all(|&p| p > 0.9),
+        "the outgoing flow is not read: {meters:?}"
+    );
+    h.e.stop();
 }
 
 /// A re-route whose index passes while no core is held is applied once a
@@ -1331,6 +1394,7 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
@@ -1377,6 +1441,7 @@ fn a_product_entry_the_install_passed_is_folded_in() {
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: vec![(
             1,
             at,
@@ -1485,6 +1550,7 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
             strips: vec![Vec::new(), Vec::new()],
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 1,
@@ -1531,6 +1597,7 @@ fn a_product_state_disables_and_enables_an_output() {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending,
         fading: Vec::new(),
         last_id: 1,
@@ -1596,6 +1663,7 @@ fn a_product_state_sets_the_limiter() {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
@@ -1809,6 +1877,7 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
             loudness_running: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: vec![(1, at, strip)],
             fading: Vec::new(),
             last_id: 1,
@@ -1872,6 +1941,7 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
             loudness_running: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: vec![(1, at, limiter)],
             fading: Vec::new(),
             last_id: 1,
@@ -1941,6 +2011,7 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
@@ -2038,6 +2109,7 @@ fn a_route_the_core_carried_is_not_applied_again() {
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: vec![(1, at, route)],
         fading: Vec::new(),
         last_id: 1,
@@ -2402,6 +2474,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
             strips: vec![vec![trim]],
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: last,
@@ -2524,6 +2597,7 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
         strips: vec![Vec::new(), Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: if sent {
             vec![(2, at, route(0, &next0))]
         } else {
@@ -2617,6 +2691,7 @@ fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
             strips: vec![Vec::new(), Vec::new()],
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 2,
@@ -2807,6 +2882,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
                 ..DuckTargets::default()
             }],
             masks: vec![vec![1, 0], vec![0, 0]],
+            in_flight: Default::default(),
             pending: Vec::new(),
             last_id: 0,
         };
@@ -2896,6 +2972,7 @@ fn an_install_leaving_an_output_out_starts_it_as_configured() {
             loudness_running: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 0,
@@ -3243,6 +3320,7 @@ fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), S
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         last_id: if assert_mid { 4 } else { 2 },
     };
@@ -3341,6 +3419,7 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
             ..DuckTargets::default()
         }],
         masks: vec![vec![1, 0], vec![0, 0]],
+        in_flight: Default::default(),
         pending: Vec::new(),
         last_id: 2,
     };
@@ -3436,6 +3515,7 @@ fn rebuilt_replica_continues_plain_ramps(chained: bool) -> Result<(), String> {
         strips: vec![Vec::new()],
         ducks: Vec::new(),
         masks: Vec::new(),
+        in_flight: Default::default(),
         pending: Vec::new(),
         last_id: if chained { 2 } else { 1 },
     };
@@ -3619,6 +3699,7 @@ fn a_rebuilt_replica_keeps_a_meter_paused() {
             tone_ramps: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: Vec::new(),
             last_id: 1,
         };

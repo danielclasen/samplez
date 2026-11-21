@@ -44,8 +44,7 @@ use crate::rt_loop::{
     Slot, SlotStats, Telemetry, UNRESOLVED, bit, slots_of,
 };
 use crate::transfer::{
-    Answer, CopyError, Core, CoreCopy, Handover, ProductState, Replay, ReplayError, SlotCore,
-    items_of,
+    Answer, CopyError, Core, CoreCopy, Handover, ProductState, Replay, ReplayError, items_of,
 };
 
 const COMMAND_RING: usize = 64;
@@ -336,6 +335,30 @@ impl Fade {
     pub fn value_at(&self, to: f32, at: u64) -> f32 {
         self.ramp_at(to, at).map_or(to, |r| r.current())
     }
+
+    /// The fade an entry carrying this one towards `to`, applied at index
+    /// `at` to a coefficient holding `held`, puts the coefficient on:
+    /// this one where it starts at or after `at`, or where the
+    /// coefficient holds its value at `at` already, as a coefficient on
+    /// it does; else, started, a straight line from `held` to `to` that
+    /// ends where this one ends and takes at least `ramp` samples, so a
+    /// late entry joins the fade without a step; and over, `ramp` samples
+    /// from `held`, as a change with no fade. None where that leaves
+    /// nothing to ramp: `held` is `to`, or the length is 0.
+    pub fn joined(&self, to: f32, held: f32, at: u64, ramp: u32) -> Option<Fade> {
+        if at <= self.start || held.to_bits() == self.value_at(to, at).to_bits() {
+            return Some(*self);
+        }
+        let end = self.start.saturating_add(u64::from(self.len));
+        let len = u32::try_from(end.saturating_sub(at))
+            .unwrap_or(u32::MAX)
+            .max(ramp);
+        (held != to && len != 0).then_some(Fade {
+            from: held,
+            start: at,
+            len,
+        })
+    }
 }
 
 /// A log entry for the engine. Each sets an absolute target, so one
@@ -607,12 +630,14 @@ enum LogMsg {
     /// the RT thread, and the core with them.
     Dropped { upto: LogId },
     /// A core built from product state is about to be installed: per
-    /// slot whether it is up and the flow it reads, none when detached.
-    /// The generations reading them are handed to the RT thread before
-    /// `done` is sent.
+    /// slot whether it is up, the flow it reads, none when detached, and
+    /// the flow a crossfade still running leaves with the index the
+    /// crossfade ends at. The generations reading them are handed to the
+    /// RT thread before `done` is sent.
     Product {
         up: Vec<bool>,
         flows: Vec<Option<String>>,
+        leaving: Vec<Option<(u64, String)>>,
         done: SyncSender<()>,
     },
 }
@@ -3569,6 +3594,7 @@ impl Engine {
                 f.from, f.len
             )));
         }
+        product::check(&self.config, (n, m), state).map_err(ReplayError::Invalid)?;
         let strips = product_strips(&state.strips);
         let limiters: Vec<(usize, LimiterParams)> = (state.limiters.iter().enumerate())
             .filter_map(|(o, p)| Some((o, (*p)?)))
@@ -3591,7 +3617,6 @@ impl Engine {
         // The entries of one log entry are adjacent and fold into one.
         let mut pending = Vec::with_capacity(state.pending.len());
         let mut batches = Vec::new();
-        let rows = slot_rows(&self.config);
         for group in state.pending.chunk_by(|a, b| a.0 == b.0) {
             let (id, at_index, _) = group[0];
             let entries: Vec<Entry> = group.iter().map(|g| g.2.clone()).collect();
@@ -3620,7 +3645,6 @@ impl Engine {
         if pending.len() > PENDING_CHANGES {
             return Err(ReplayError::Full);
         }
-        let batch = |id: LogId| batches.iter().find(|b| b.0 == id).map(|b| &*b.1);
         // One that cannot be installed within the timeout is refused while
         // the core the RT thread holds is still there.
         let within = (timeout.as_nanos() * samplez_mxl::SAMPLE_RATE as u128 / 1_000_000_000) as u64;
@@ -3643,75 +3667,13 @@ impl Engine {
             .send(LogMsg::Product {
                 up: state.up.clone(),
                 flows: state.flows.clone(),
+                leaving: product::leaving(state, self.config.ramp_samples),
                 done,
             });
         if applied.recv_timeout(left()).is_err() {
             return Err(ReplayError::Timeout { passed: 0 });
         }
-        let ramp = self.config.ramp_samples;
-        // Filled each attempt between two blocks of the RT thread: the
-        // buffers are allocated here, before the first.
-        let targets: Vec<f32> = state.gains.iter().flatten().copied().collect();
-        let mut gains = targets.clone();
-        // The fades still running, per coefficient, and the ramps the core
-        // continues: filled each attempt, the room allocated here.
-        // With none in the state only the cells passed entries touched
-        // (`dirty`) can hold one, so an attempt resets and scans those
-        // alone.
-        let state_fading = !state.fading.is_empty();
-        let fading_targets: Vec<Option<Fade>> = if state_fading {
-            state.fading.iter().flatten().copied().collect()
-        } else {
-            vec![None; n * m]
-        };
-        let mut fadings = fading_targets.clone();
-        let mut dirty: Vec<usize> = Vec::with_capacity(n * m);
-        let mut resumed: Vec<(usize, samplez_dsp::Ramp)> = Vec::with_capacity(n * m);
-        let mut up = state.up.clone();
-        // A bit per output disabled; one past the list is enabled.
-        // An output past the state's list starts as configured.
-        let disabled_targets = (self.config.outputs.iter().enumerate())
-            .filter(|&(o, cfg)| !state.outputs.get(o).copied().unwrap_or(cfg.enabled))
-            .fold(0, |d, (o, _)| d | bit(o));
-        // A bit per meter paused; one past the list runs.
-        let paused_targets = (state.loudness_running.iter().enumerate())
-            .filter(|&(_, &running)| !running)
-            .fold(0u128, |p, (meter, _)| p | crate::rt_loop::meter_bit(meter));
-        // Empty for none, as a fill takes them: a state and pending list
-        // without masks or depths pay nothing for them.
-        let pending_masks = batches.iter().any(|(_, b)| !b.masks.is_empty());
-        let pending_depths = batches.iter().any(|(_, b)| !b.depths.is_empty());
-        let mask_targets: Vec<u8> = if !state.masks.is_empty() {
-            state.masks.iter().flatten().copied().collect()
-        } else if pending_masks {
-            vec![0; n * m]
-        } else {
-            Vec::new()
-        };
-        let mut masks = mask_targets.clone();
-        // Per input channel and group, as the matrix holds them.
-        let any_depth = (state.ducks.iter()).any(|d| d.depths.iter().any(|&db| db != 0.0));
-        let mut depth_targets = if any_depth || pending_depths {
-            vec![0.0f32; n * MAX_DUCKS]
-        } else {
-            Vec::new()
-        };
-        let fill_depths = !depth_targets.is_empty();
-        for (g, d) in state.ducks.iter().enumerate().filter(|_| fill_depths) {
-            for (slot, &db) in d.depths.iter().enumerate() {
-                let (first, legs) = rows[slot];
-                for row in first..first + legs {
-                    depth_targets[row * MAX_DUCKS + g] = db;
-                }
-            }
-        }
-        let mut depths = depth_targets.clone();
-        let legs = |s: usize| self.config.inputs.get(s).map_or(0, |i| i.channels as usize);
-        // Cold detectors at the state's settings, settled, built here: an
-        // attempt copies them.
-        let mut cold = crate::ducks::DuckCore::new(ramp);
-        cold.cold(ramp, &state.ducks, legs);
-        cold.settle(ramp, 0);
+        let mut fill = product::ProductFill::new(&self.config, self.shape, state, pending, batches);
         self.offer(
             left(),
             at_least,
@@ -3720,170 +3682,7 @@ impl Engine {
             &limiters,
             &delays,
             &tones,
-            |j, core| {
-                gains.copy_from_slice(&targets);
-                if state_fading {
-                    fadings.copy_from_slice(&fading_targets);
-                } else {
-                    for c in dirty.drain(..) {
-                        fadings[c] = None;
-                    }
-                }
-                up.copy_from_slice(&state.up);
-                let mut disabled = disabled_targets;
-                let mut paused = paused_targets;
-                masks.copy_from_slice(&mask_targets);
-                depths.copy_from_slice(&depth_targets);
-                // Whatever a spare core held.
-                core.ducks.copy_from(&cold);
-                let mut ducks_passed = false;
-                // The entries whose index the install passed are folded in
-                // like the rest of the state: reported late they would never
-                // apply.
-                let next = (j + 1) * self.block;
-                let passed = pending.partition_point(|e| e.at_index < next);
-                for e in &pending[..passed] {
-                    paused = e.change.paused_after(paused, batch(e.id));
-                    match e.change {
-                        Change::Gain {
-                            input,
-                            output,
-                            gain,
-                            fade,
-                        } => {
-                            dirty.push(input * m + output);
-                            fold_passed(
-                                &mut gains,
-                                &mut fadings,
-                                input * m + output,
-                                (gain, fade),
-                                e.at_index,
-                                ramp,
-                            );
-                        }
-                        Change::InputDown { slot } => up[slot] = false,
-                        Change::InputUp { slot } => up[slot] = true,
-                        Change::Output { output, enabled } => {
-                            disabled = output_disabled(disabled, output, enabled);
-                        }
-                        // Folded into `paused` above.
-                        Change::LoudnessRun { .. } => {}
-                        // core holds neither generation nor a strip, limiter, delay or
-                        // tone generator, nor the meters: RT thread applies a passed
-                        // re-route, detach, strip, limiter, delay, tone or loudness
-                        // reset entry itself, taken before install or after.
-                        Change::Route { .. }
-                        | Change::Detach { .. }
-                        | Change::Strip { .. }
-                        | Change::Limiter { .. }
-                        | Change::Delay { .. }
-                        | Change::Tone { .. }
-                        | Change::ResetLoudness { .. } => {}
-                        Change::Batch { up: raised, .. } => {
-                            if let Some(b) = batch(e.id) {
-                                b.gains.each(|c, g| {
-                                    dirty.push(c);
-                                    fold_passed(
-                                        &mut gains,
-                                        &mut fadings,
-                                        c,
-                                        (g, b.fades.get(c)),
-                                        e.at_index,
-                                        ramp,
-                                    );
-                                });
-                                for &slot in &b.downs {
-                                    up[slot as usize] = false;
-                                }
-                                for &(o, enabled) in &b.outputs {
-                                    disabled = output_disabled(disabled, o as usize, enabled);
-                                }
-                                b.masks.each(|c, k| masks[c] = k);
-                                for &(row, g, db) in &b.depths {
-                                    depths[row as usize * MAX_DUCKS + usize::from(g)] = db;
-                                }
-                                for &(g, change) in &b.ducks {
-                                    let _ = core.ducks.apply(usize::from(g), change, legs);
-                                    ducks_passed = true;
-                                }
-                            }
-                            for slot in slots_of(raised) {
-                                up[slot] = true;
-                            }
-                        }
-                    }
-                }
-                if ducks_passed {
-                    core.ducks.settle(ramp, next);
-                } else {
-                    core.ducks.align(next);
-                }
-                // At the targets from the first sample, whatever a spare
-                // core held, ducked as the masks and depths say.
-                // Fades still running continue at their value for `next`.
-                resumed.clear();
-                let mut ramp_end = 0;
-                let mut resume = |c: usize| {
-                    if let Some(r) = fadings[c].and_then(|f| f.ramp_at(gains[c], next)) {
-                        ramp_end = ramp_end.max(next + u64::from(r.end() - r.position()));
-                        resumed.push((c, r));
-                    }
-                };
-                if state_fading {
-                    (0..fadings.len()).for_each(&mut resume);
-                } else {
-                    dirty.sort_unstable();
-                    dirty.dedup();
-                    dirty.iter().copied().for_each(&mut resume);
-                }
-                let _ = core
-                    .matrix
-                    .fade_in_ducked_resuming(&gains, &masks, &depths, 0, &resumed);
-                core.matrix.align(next);
-                // The duck of each masked term at the gain the live engines
-                // hold for the settled detectors, not 1 moving to it.
-                let mut envelopes = [0.0f32; MAX_DUCKS];
-                for (e, d) in envelopes.iter_mut().zip(&core.ducks.detectors) {
-                    *e = d.envelope();
-                }
-                core.matrix.settle_ducks(&envelopes);
-                core.pos = Some(next);
-                core.ramp_end = ramp_end;
-                core.pending.clear();
-                core.pending.extend_from_slice(&pending[passed..]);
-                // Shared: nothing is allocated in the hand-over's window.
-                core.batches.clear();
-                for e in &pending[passed..] {
-                    if let Some(b) = batches.iter().find(|b| b.0 == e.id) {
-                        core.batches.push((e.id, Arc::clone(&b.1)));
-                    }
-                }
-                core.page_entries.clear();
-                core.entries_page = None;
-                core.entries_lost = false;
-                core.outputs_disabled = disabled;
-                core.loudness_paused = paused;
-                // The RT thread keeps its strips.
-                for ((c, &up), flow) in core.slots.iter_mut().zip(&up).zip(&state.flows) {
-                    // An input that is up and attached continues, as it
-                    // does on a replica that ran through: no fade-in.
-                    *c = SlotCore {
-                        up,
-                        silenced_last: !up || flow.is_none(),
-                        detached: flow.is_none(),
-                        ..SlotCore::default()
-                    };
-                }
-                core.awaiting_gen.clear();
-                // The RT thread keeps the generation it holds pending: the
-                // supervisor sends one only once its entry is committed, so
-                // the status can name one the RT thread does not hold yet.
-                core.pending_gen = None;
-                core.unresolved.clear();
-                core.late_routes.clear();
-                core.late_lost_until = 0;
-                (j, state.last_id)
-            },
+            |j, core| fill.fill(j, core),
         )
     }
 
@@ -5642,7 +5441,12 @@ impl Supervisor {
                 // A generation sent for one is handed back unused by the
                 // next one sent.
                 LogMsg::Dropped { upto } => self.drop_jobs(|j| j.id <= upto),
-                LogMsg::Product { up, flows, done } => self.product(&up, flows, done),
+                LogMsg::Product {
+                    up,
+                    flows,
+                    leaving,
+                    done,
+                } => self.product(&up, flows, &leaving, done),
             }
         }
     }
@@ -5767,14 +5571,24 @@ impl Supervisor {
     /// so is the generation a job built or sent before them, which read
     /// the old flows; `done` is sent once all are handed over
     /// ([`Supervisor::hand_product`]).
-    fn product(&mut self, up: &[bool], flows: Vec<Option<String>>, done: SyncSender<()>) {
+    fn product(
+        &mut self,
+        up: &[bool],
+        flows: Vec<Option<String>>,
+        leaving: &[Option<(u64, String)>],
+        done: SyncSender<()>,
+    ) {
         for (slot, flow) in flows.into_iter().enumerate() {
             self.slots[slot].up = up[slot];
             self.status().inputs[slot].up = up[slot];
+            // The flow a crossfade still running leaves is read until it
+            // ends, by the generations built for the install too.
+            let routing = leaving.get(slot).cloned().flatten();
             let detached = matches!(self.slots[slot].state, SupState::Detached);
             if flow.as_ref().is_some_and(|f| *f == self.slots[slot].flow) && !detached
                 || flow.is_none() && detached
             {
+                self.slots[slot].routing = routing;
                 continue;
             }
             self.release_poll(slot);
@@ -5783,7 +5597,7 @@ impl Supervisor {
                 *held = false;
             }
             self.slots[slot].reported = false;
-            self.slots[slot].routing = None;
+            self.slots[slot].routing = routing;
             let Some(flow) = flow else {
                 self.slots[slot].state = SupState::Detached;
                 self.slots[slot].prune_unsent = false;
@@ -6173,9 +5987,10 @@ fn fade_beyond(entries: &[Entry], at_index: u64) -> Option<Fade> {
 }
 
 /// Folds a gain entry the install passed into the targets and the fades
-/// still running: the coefficient `c` goes to `to` by `fade`, or over
-/// `ramp` samples, from its value at the entry's index `at`, which the
-/// fade it was in counts into.
+/// still running: the coefficient `c` goes to `to` by `fade`, joined
+/// ([`Fade::joined`]), or over `ramp` samples, from its value at the
+/// entry's index `at`, which the fade it was in counts into. Depths fold
+/// in the same way, as values with no fade of their own.
 fn fold_passed(
     gains: &mut [f32],
     fadings: &mut [Option<Fade>],
@@ -6184,16 +5999,16 @@ fn fold_passed(
     at: u64,
     ramp: u32,
 ) {
-    let f = fade.or_else(|| {
-        let from = fadings[c].map_or(gains[c], |f| f.value_at(gains[c], at));
-        (from != to && ramp != 0).then_some(Fade {
-            from,
+    let held = fadings[c].map_or(gains[c], |f| f.value_at(gains[c], at));
+    fadings[c] = match fade {
+        Some(f) => f.joined(to, held, at, ramp),
+        None => (held != to && ramp != 0).then_some(Fade {
+            from: held,
             start: at,
             len: ramp,
-        })
-    });
+        }),
+    };
     gains[c] = to;
-    fadings[c] = f;
 }
 
 /// The outputs disabled, a bit per output, `disabled` with output
@@ -6290,6 +6105,7 @@ fn minor_faults(tid: i32) -> Option<u64> {
 
 #[cfg(test)]
 mod golden;
+mod product;
 
 #[cfg(test)]
 mod tests {
@@ -8179,6 +7995,7 @@ mod tests {
             strips: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 0,
@@ -8249,6 +8066,7 @@ mod tests {
             strips: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
+            in_flight: Default::default(),
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 0,
@@ -10322,7 +10140,8 @@ mod tests {
 
     /// An entry that arrives while a fade runs takes the value the fade
     /// has at its index as the start of its own ramp, or replaces the
-    /// fade with its own, or ends it when it changes nothing.
+    /// fade with its own, joined from that value where its own started
+    /// before the index, or ends it when it changes nothing.
     #[test]
     fn a_passed_entry_folds_into_a_running_fade() {
         let running = Fade {
@@ -10357,6 +10176,22 @@ mod tests {
             len: 100,
         };
         assert_eq!(fold(0.5, Some(own)), (0.5, Some(own)));
+        // A fade started before the entry is joined from the held value.
+        let late = Fade {
+            from: 0.0,
+            start: 900,
+            len: 1000,
+        };
+        let joined = late.joined(0.5, held, at, 480);
+        assert_eq!(
+            joined,
+            Some(Fade {
+                from: held,
+                start: at,
+                len: 700
+            })
+        );
+        assert_eq!(fold(0.5, Some(late)), (0.5, joined));
         // A target equal to the held value leaves no ramp.
         assert_eq!(fold(held, None), (held, None));
     }

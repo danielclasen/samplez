@@ -39,7 +39,7 @@ use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRES
 /// of the version that copied it, and replicas compute equal pages only
 /// at equal versions, so a release that changes neither keeps it and its
 /// replicas roll into a running set as peers.
-pub const COMPUTE_VERSION: u32 = 1;
+pub const COMPUTE_VERSION: u32 = 2;
 
 /// The highest sample index a decoded core may hold: far beyond any
 /// running engine's, and low enough that adding a ramp or a block to it
@@ -1125,12 +1125,132 @@ pub struct ProductState {
     /// The duck mask of every coefficient, shaped as `gains`, or empty for
     /// every mask 0.
     pub masks: Vec<Vec<u8>>,
+    /// The input fades and crossfades and the duck ramps the log left
+    /// running, which the install continues.
+    pub in_flight: InFlight,
     /// Committed entries not applied yet: log id, `at_index` and entry;
     /// the entries of one log entry adjacent, in order, folded as
     /// [`crate::Engine::append_batch`] folds them.
     pub pending: Vec<(LogId, u64, Entry)>,
     /// The highest log id the state folds in.
     pub last_id: LogId,
+}
+
+/// What a product state names of the log's ramps, besides the gain fades
+/// and tone ramps, so that an install continues them at their value for
+/// its index, bit for bit as a replica that ran through computes them.
+/// Each list may be empty or shorter than the engine's: what it leaves
+/// out holds its target from the install on. One that ended before the
+/// install changes nothing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InFlight {
+    /// Per input slot the index its fade-in from silence started at: the
+    /// last `InputUp` that raised it from down.
+    pub fade_ins: Vec<Option<u64>>,
+    /// Per input slot its last `Route` or `Detach` that changed what it
+    /// reads: the index its crossfade started at, and the flow it left,
+    /// none for silence.
+    pub crossfades: Vec<Option<(u64, Option<String>)>>,
+    /// Per duck group, per input slot, the ramp of its depth in dB towards
+    /// its target in `ducks`, as a [`Fade`] of the depth.
+    pub depths: Vec<Vec<Option<Fade>>>,
+    /// The duck mask changes whose crossfades may still run, per
+    /// coefficient `(input channel, column, from, changes)`: the mask the
+    /// coefficient held settled before them, then each change's index and
+    /// mask in order, the last the coefficient's mask in `masks`. A change
+    /// joins the one before when it comes within the ramp length and two
+    /// duck gain intervals of it. The crossfades are continued on
+    /// detectors steady at the install, and depths that held their value
+    /// before the ramp `depths` names.
+    pub masks: Vec<MaskChain>,
+}
+
+/// One coefficient's duck mask changes in [`InFlight::masks`]: (input
+/// channel, column, the mask held before them, each change's index and
+/// mask).
+pub type MaskChain = (usize, usize, u8, Vec<(u64, u8)>);
+
+impl InFlight {
+    /// Takes a duck mask change of the coefficient from input channel
+    /// `input` to column `output`, from `held` to `mask` at index `at`,
+    /// crossfading over `ramp` samples, into [`InFlight::masks`]: onto
+    /// the coefficient's changes while the last of them lies within the
+    /// ramp and two duck gain intervals, the reach of a crossfade's
+    /// gains, else as the first of new ones from `held`. A change to the
+    /// mask held is none. Without a `term`, a coefficient at 0 with no
+    /// ramp running, the change crossfades nothing, and the coefficient's
+    /// changes are dropped: the duck of a term the coefficient gets later
+    /// starts afresh.
+    pub fn mask(
+        &mut self,
+        (input, output): (usize, usize),
+        (held, mask): (u8, u8),
+        at: u64,
+        ramp: u32,
+        term: bool,
+    ) {
+        let found = self
+            .masks
+            .iter()
+            .position(|c| (c.0, c.1) == (input, output));
+        if !term {
+            if let Some(k) = found {
+                self.masks.swap_remove(k);
+            }
+            return;
+        }
+        if held == mask {
+            return;
+        }
+        let Some(k) = found else {
+            self.masks.push((input, output, held, vec![(at, mask)]));
+            return;
+        };
+        let c = &mut self.masks[k];
+        if c.3.last().is_none_or(|&(last, _)| at >= last + reach(ramp)) {
+            c.2 = held;
+            c.3.clear();
+        }
+        c.3.push((at, mask));
+    }
+
+    /// Drops what ended at or before `floor`, each crossfade and fade
+    /// over `ramp` samples: an install at or after it continues none of
+    /// them.
+    pub fn prune(&mut self, floor: u64, ramp: u32) {
+        let len = u64::from(ramp);
+        for f in &mut self.fade_ins {
+            *f = f.filter(|&s| s.saturating_add(len) > floor);
+        }
+        for x in &mut self.crossfades {
+            if x.as_ref()
+                .is_some_and(|&(s, _)| s.saturating_add(len) <= floor)
+            {
+                *x = None;
+            }
+        }
+        for f in self.depths.iter_mut().flatten() {
+            *f = f.filter(|f| f.start.saturating_add(u64::from(f.len)) > floor);
+        }
+        self.masks.retain(|c| {
+            c.3.last()
+                .is_some_and(|&(last, _)| last.saturating_add(reach(ramp)) > floor)
+        });
+    }
+
+    /// Whether it names nothing.
+    pub fn is_empty(&self) -> bool {
+        self.fade_ins.iter().all(Option::is_none)
+            && self.crossfades.iter().all(Option::is_none)
+            && self.depths.iter().flatten().all(Option::is_none)
+            && self.masks.is_empty()
+    }
+}
+
+/// How far past a mask change its crossfade moves the duck's gains: the
+/// ramp and the two ends of a gain interval the gains lag it by.
+fn reach(ramp: u32) -> u64 {
+    u64::from(ramp) + 2 * u64::from(samplez_dsp::strip::GAIN_INTERVAL)
 }
 
 /// Why a replay was not built, took no entry, or was not handed over.
@@ -1215,6 +1335,39 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// A prune at a floor keeps what still runs past it and drops what
+    /// ended at or before it: a fade-in and a crossfade over the ramp, a
+    /// depth ramp over its own length, mask changes over the ramp and two
+    /// gain intervals after the last.
+    #[test]
+    fn a_prune_drops_the_ramps_that_ended() {
+        let depth = |start| Fade {
+            from: 10.0,
+            start,
+            len: 960,
+        };
+        let mut f = InFlight {
+            fade_ins: vec![Some(1000), Some(2000)],
+            crossfades: vec![Some((1000, None)), Some((2000, Some("a".to_owned())))],
+            depths: vec![vec![Some(depth(600)), Some(depth(2000))]],
+            masks: vec![
+                (0, 0, 0, vec![(900, 1), (1000, 0)]),
+                (1, 0, 0, vec![(2000, 1)]),
+            ],
+        };
+        f.prune(1495, 480);
+        assert_eq!(f.fade_ins, vec![None, Some(2000)]);
+        assert_eq!(f.crossfades, vec![None, Some((2000, Some("a".to_owned())))]);
+        assert_eq!(f.depths, vec![vec![Some(depth(600)), Some(depth(2000))]]);
+        assert_eq!(f.masks.len(), 2);
+        f.prune(1560, 480);
+        assert_eq!(f.depths, vec![vec![None, Some(depth(2000))]]);
+        assert_eq!(f.masks, vec![(1, 0, 0, vec![(2000, 1)])]);
+        assert!(!f.is_empty());
+        f.prune(4000, 480);
+        assert!(f.is_empty());
+    }
 
     /// A strip mid-envelope: high-pass, a bell, gate and a compressor of
     /// the longest release on, after a burst over the threshold.

@@ -98,12 +98,15 @@ Weakening one is a design change: say so and agree it first.
   aborts.
 - **A rebuilt or resynced replica matches its peers from its first
   page.** The exceptions README "Starting a replica" lists for a rebuild
-  (duck detector state, a mask crossfade or depth ramp in progress) cost
-  one diverged page and a resync; do not widen that list.
+  (duck detector state, a mask crossfade over a depth changed more than
+  once within it) cost one diverged page and a resync; do not widen
+  that list.
   Enforced by: the replay, install and rebuild tests in
   `tests/transfer.rs` (`a_replayed_core_computes_the_donors_pages`,
   `a_replayed_core_carries_*`, `a_product_core_installs_at_the_index_*`,
-  `a_rebuild_restores_a_route_and_a_strip_parameter_*`).
+  `a_rebuild_restores_a_route_and_a_strip_parameter_*`), and the
+  offline rebuilds on the block clock in `src/engine/product.rs`
+  (`a_rebuilt_engine_continues_*`).
 - **Tests compare pages only once verdicts confirm them**, leaving out
   pages a silenced block touched; no sleep decides a page is final.
   Enforced by: review; `comparable` in `tests/transfer.rs` is the form
