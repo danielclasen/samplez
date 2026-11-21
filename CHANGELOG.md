@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.21.0](https://github.com/danielclasen/samplez/compare/v0.20.0...v0.21.0) (2026-11-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** config::Input has a new public field, pre_strip_rows, so code that builds it with a struct literal must set it.
+* **engine:** config::Input has a new public field, pre_strip_meter, and InputStatus the public field pre_strip_meters, so code that builds either with a struct literal must set them.
+* **engine:** `Entry::OutputDelay`, `Engine::set_output_delay` and `config::Output::max_delay_samples` are new, `Targets` and `ProductState` gain the field `output_delays`, and `delayBudgetSamples` now counts the outputs' delay lines too.
+* **engine:** `Entry::OutputStrip`, `Engine::set_output_strip` and `config::Output::strip` are new, and `Targets` and `ProductState` gain the field `output_strips`. `ProductState` now implements `Default`. `samplez_replica::PROTOCOL` is 5.
+
+### Features
+
+* **engine:** add an opt-in channel strip on outputs ([#173](https://github.com/danielclasen/samplez/issues/173)) ([98a82bc](https://github.com/danielclasen/samplez/commit/98a82bc9f777e5e6434c7c232cf1b08c12ed2654))
+* **engine:** add an opt-in delay line on outputs ([#174](https://github.com/danielclasen/samplez/issues/174)) ([9be6d3d](https://github.com/danielclasen/samplez/commit/9be6d3d268c05c322bc9dc9abe6ab29fd60ccc83))
+* **engine:** feed an input to the matrix before its strip where asked ([6944b5d](https://github.com/danielclasen/samplez/commit/6944b5d151513cd03331ac95a4f0cb53c03934f8))
+* **engine:** meter an input before its strip where its config asks ([0e8ffef](https://github.com/danielclasen/samplez/commit/0e8ffef77c5ed6fccd9c83662da000e0ab05789d))
+
 ## [0.20.0](https://github.com/danielclasen/samplez/compare/v0.19.0...v0.20.0) (2026-11-21)
 
 
