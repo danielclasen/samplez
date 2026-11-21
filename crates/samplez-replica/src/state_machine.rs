@@ -8,7 +8,7 @@ use crate::entry::{
     Baseline, Body, Command, Disruption, NodeId, Origin, Outcome, Request, Resolution, Response,
     SessionKey,
 };
-use crate::snapshot::Replicated;
+use crate::snapshot::{InFlightBits, Replicated};
 
 /// The product's state, applied in log order on every replica. A
 /// snapshot install loads into an empty one its [`Factory`] builds, with
@@ -279,6 +279,11 @@ fn target<P: Product>(product: &P, body: &Body) -> Option<Target> {
 /// last.
 const DELTAS_HELD: usize = 4096;
 
+/// The `InputUp` that started a slot's last fade-in, as a
+/// [`StateMachine`] tracks it: its log index, whether the slot was down
+/// before it, and the fade-in recorded before it.
+pub type Raise = (u64, bool, Option<u64>);
+
 pub struct StateMachine<P> {
     pub product: P,
     pub dedup: Dedup,
@@ -358,6 +363,21 @@ pub struct StateMachine<P> {
     /// carried by snapshots; none for a slot no tone entry was derived
     /// for.
     tone_ramps: Vec<Option<samplez_dsp::ToneRamps>>,
+    /// The input fade-ins and crossfades and the duck depth ramps and mask
+    /// crossfades the derived entries leave running, as the engine renders
+    /// them at the block-aligned index the bridge applies each entry at,
+    /// over `ramp_samples`. A function of the log, carried by snapshots;
+    /// what ended is pruned below the floor.
+    in_flight: samplez::InFlight,
+    /// The input slots the derived entries hold down, a bit per slot: an
+    /// `InputUp` fades in only a slot it raises from down.
+    down: u64,
+    /// Per input slot the `InputUp` that started its last fade-in: the
+    /// log index it is known under, a restamp's once one moved it, and
+    /// whether the slot was down and the fade-in recorded before it. A
+    /// restamp moves the fade-in only of the entry that started it, and a
+    /// void of that entry, which the engine never applies, puts both back.
+    raised: Vec<Option<Raise>>,
     /// The duck masks of the state the replica opened or installed a
     /// snapshot at, which its engine is rebuilt from, and every one
     /// derived since, ORed together: the coefficients an engine may hold
@@ -430,6 +450,9 @@ impl<P: Product> StateMachine<P> {
             image: None,
             ramps: Vec::new(),
             tone_ramps: Vec::new(),
+            in_flight: samplez::InFlight::default(),
+            down: 0,
+            raised: Vec::new(),
             masked: None,
             silenced: 0,
             records: BTreeMap::new(),
@@ -439,14 +462,18 @@ impl<P: Product> StateMachine<P> {
         .imaged()
     }
 
-    /// Follows the ramps the gain entries of `entries`, applied at `at`,
-    /// put the coefficients on, against `held`, the targets before them.
-    /// The value a coefficient has at `at` is the engine's own function of
-    /// the ramp it was on, so a plain entry's ramp starts from the bits the
-    /// engine's coefficient holds there.
+    /// Follows the ramps the entries of `entries`, applied at `at`, put
+    /// the engine on, against `held`, the targets before them: each gain
+    /// and its fade, joined ([`samplez::Fade::joined`]), then, as an
+    /// engine applies them after a log entry's gains, each duck mask
+    /// change and depth, and each crossfade of a re-route or detach. The
+    /// value a coefficient has at `at` is the engine's own function of the
+    /// ramp it was on, so a plain entry's ramp starts from the bits the
+    /// engine's coefficient holds there; a depth likewise.
     fn follow(&mut self, entries: &[samplez::Entry], held: Option<&samplez::Targets>, at: u64) {
         // The index the bridge applies the entries at.
         let at = at.next_multiple_of(self.limits.block);
+        let len = self.limits.ramp_samples;
         for e in entries {
             if let samplez::Entry::Tone {
                 slot,
@@ -480,19 +507,157 @@ impl<P: Product> StateMachine<P> {
                 .copied()
                 .unwrap_or(0.0);
             let slot = &mut row[*output];
+            let from = slot.map_or(old, |f| f.value_at(old, at));
             *slot = match fade {
-                Some(f) => Some(*f),
-                None => {
-                    let from = slot.map_or(old, |f| f.value_at(old, at));
-                    let len = self.limits.ramp_samples;
-                    (from != *gain && len != 0).then_some(samplez::Fade {
+                Some(f) => f.joined(*gain, from, at, len),
+                None => (from != *gain && len != 0).then_some(samplez::Fade {
+                    from,
+                    start: at,
+                    len,
+                }),
+            };
+        }
+        for e in entries {
+            match e {
+                &samplez::Entry::DuckMask {
+                    input,
+                    output,
+                    mask,
+                } => {
+                    let cell = |t: &samplez::Targets| t.masks.get(input)?.get(output).copied();
+                    let was = held.and_then(cell).unwrap_or(0);
+                    // The coefficient's gain after the entries, and whether
+                    // the engine holds a term for it to duck.
+                    let gain = (entries.iter().rev())
+                        .find_map(|e| match *e {
+                            samplez::Entry::Gain {
+                                input: i,
+                                output: o,
+                                gain,
+                                ..
+                            } if (i, o) == (input, output) => Some(gain),
+                            _ => None,
+                        })
+                        .or_else(|| held?.gains.get(input)?.get(output).copied())
+                        .unwrap_or(0.0);
+                    let ramp = self.ramps.get(input).and_then(|r| r.get(output)).copied();
+                    let term = gain != 0.0
+                        || ramp
+                            .flatten()
+                            .is_some_and(|f| f.ramp_at(gain, at).is_some());
+                    self.in_flight
+                        .mask((input, output), (was, mask), at, len, term);
+                }
+                samplez::Entry::Duck {
+                    group,
+                    setting: setting @ samplez::DuckSetting::Depth { slot, .. },
+                } => {
+                    // As the bridge admits it: clamped, else 0 dB.
+                    let db = match setting.clamped() {
+                        Some(samplez::DuckSetting::Depth { db, .. }) => db,
+                        _ => 0.0,
+                    };
+                    let (group, slot) = (*group, *slot);
+                    let old = held
+                        .and_then(|t| t.ducks.get(group)?.depths.get(slot).copied())
+                        .unwrap_or(0.0);
+                    let depths = &mut self.in_flight.depths;
+                    if depths.len() <= group {
+                        depths.resize(group + 1, Vec::new());
+                    }
+                    if depths[group].len() <= slot {
+                        depths[group].resize(slot + 1, None);
+                    }
+                    let cell = &mut depths[group][slot];
+                    let from = cell.map_or(old, |f| f.value_at(old, at));
+                    *cell = (from != db && len != 0).then_some(samplez::Fade {
                         from,
                         start: at,
                         len,
-                    })
+                    });
                 }
-            };
+                samplez::Entry::Route { slot, .. } | samplez::Entry::Detach { slot } => {
+                    // The flow the slot read; unknown without targets.
+                    let Some(Some(was)) = held.map(|t| t.flows.get(*slot).cloned()) else {
+                        continue;
+                    };
+                    let to = match e {
+                        samplez::Entry::Route { flow_id, .. } => Some(flow_id),
+                        _ => None,
+                    };
+                    if was.as_ref() != to {
+                        let x = &mut self.in_flight.crossfades;
+                        if x.len() <= *slot {
+                            x.resize(*slot + 1, None);
+                        }
+                        x[*slot] = Some((at, was));
+                    }
+                }
+                _ => {}
+            }
         }
+    }
+
+    /// Follows the input states `entries` of the entry at log index
+    /// `revision`, applied at `at`, set: an `InputUp` that raises a slot
+    /// from down starts its fade-in there; one a restamp moved from log
+    /// index `moved`, which applied nowhere before, also where the moved
+    /// entry's own record started the slot's last fade-in.
+    fn follow_inputs(
+        &mut self,
+        entries: &[samplez::Entry],
+        at: u64,
+        revision: u64,
+        moved: Option<u64>,
+    ) {
+        let at = at.next_multiple_of(self.limits.block);
+        for e in entries {
+            match *e {
+                samplez::Entry::InputDown { slot } => {
+                    self.down |= 1u64.checked_shl(slot as u32).unwrap_or(0);
+                }
+                samplez::Entry::InputUp { slot } => {
+                    let bit = 1u64.checked_shl(slot as u32).unwrap_or(0);
+                    let fade_ins = &mut self.in_flight.fade_ins;
+                    if fade_ins.len() <= slot {
+                        fade_ins.resize(slot + 1, None);
+                    }
+                    if self.raised.len() <= slot {
+                        self.raised.resize(slot + 1, None);
+                    }
+                    // Moved, the entry keeps what came before it.
+                    let restarted = self.raised[slot].filter(|r| moved == Some(r.0));
+                    if self.down & bit != 0 || restarted.is_some() {
+                        let before = restarted
+                            .map_or((self.down & bit != 0, fade_ins[slot]), |r| (r.1, r.2));
+                        fade_ins[slot] = Some(at);
+                        self.raised[slot] = Some((revision, before.0, before.1));
+                    }
+                    self.down &= !bit;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Follows a void of the `InputUp` for `slot` known under log index
+    /// `of`: where it started the slot's last fade-in, the slot is down
+    /// and its fade-in as they were before it, as on an engine, which
+    /// never applies it.
+    fn unraise(&mut self, slot: usize, of: u64) {
+        let Some(Some((id, was_down, before))) = self.raised.get(slot).copied() else {
+            return;
+        };
+        if id != of {
+            return;
+        }
+        if was_down {
+            self.down |= 1u64.checked_shl(slot as u32).unwrap_or(0);
+        }
+        if let Some(f) = self.in_flight.fade_ins.get_mut(slot) {
+            *f = before;
+        }
+        self.raised[slot] = None;
     }
 
     /// Follows the ramps a tone entry for `slot`, applied at `at`, puts
@@ -683,6 +848,11 @@ impl<P: Product> StateMachine<P> {
         if entries.is_empty() {
             return;
         }
+        let moved = match &request.body {
+            Body::Restamp { revision: of, .. } => Some(*of),
+            _ => None,
+        };
+        self.follow_inputs(&entries, at, revision, moved);
         let generation = entries.iter().any(|e| {
             matches!(
                 e,
@@ -806,7 +976,9 @@ impl<P: Product> StateMachine<P> {
                 ..
             } => {
                 if self.terms.get(of).is_some_and(|&(t, _)| t == *of_term) {
-                    self.pending.remove(of);
+                    if let Some(Body::InputUp { slot, .. }) = self.pending.remove(of) {
+                        self.unraise(slot as usize, *of);
+                    }
                     let behind = self.restamps.remove(of);
                     self.terms.remove(of);
                     let derived = self.derived.remove(of);
@@ -934,6 +1106,7 @@ impl<P: Product> StateMachine<P> {
         self.derived.retain(|index, _| terms.contains_key(index));
         self.resets.retain(|index, _| terms.contains_key(index));
         let floor = self.floor;
+        self.in_flight.prune(floor, self.limits.ramp_samples);
         for f in self.ramps.iter_mut().flatten() {
             if f.is_some_and(|f| f.start.saturating_add(u64::from(f.len)) <= floor) {
                 *f = None;
@@ -1126,6 +1299,7 @@ impl<P: Product> StateMachine<P> {
         }
         let fading = self.fading_of(&targets);
         let tone_ramps = self.tone_ramps_of();
+        let in_flight = self.in_flight.clone();
         samplez::ProductState {
             limiters: targets.limiters,
             fading,
@@ -1140,6 +1314,7 @@ impl<P: Product> StateMachine<P> {
             tone_ramps,
             ducks: targets.ducks,
             masks: targets.masks,
+            in_flight,
             pending: Vec::new(),
             last_id: n,
         }
@@ -1181,6 +1356,23 @@ impl<P: Product> StateMachine<P> {
             tone_ramps: (self.tone_ramps.iter())
                 .map(|r| r.map(Into::into))
                 .collect(),
+            in_flight: {
+                let f = &self.in_flight;
+                InFlightBits {
+                    down: self.down,
+                    raised: self.raised.clone(),
+                    fade_ins: f.fade_ins.clone(),
+                    crossfades: f.crossfades.clone(),
+                    depths: (f.depths.iter())
+                        .map(|g| {
+                            (g.iter())
+                                .map(|d| d.map(|d| (d.from.to_bits(), d.start, d.len)))
+                                .collect()
+                        })
+                        .collect(),
+                    masks: f.masks.clone(),
+                }
+            },
         }
     }
 
@@ -1228,6 +1420,27 @@ impl<P: Product> StateMachine<P> {
         self.tone_ramps = (saved.tone_ramps.iter())
             .map(|r| r.map(samplez_dsp::ToneRamps::from).filter(|r| r.is_valid()))
             .collect();
+        let f = &saved.in_flight;
+        self.down = f.down;
+        self.raised = f.raised.clone();
+        self.in_flight = samplez::InFlight {
+            fade_ins: f.fade_ins.clone(),
+            crossfades: f.crossfades.clone(),
+            depths: (f.depths.iter())
+                .map(|g| {
+                    (g.iter())
+                        .map(|d| {
+                            d.map(|(from, start, len)| samplez::Fade {
+                                from: f32::from_bits(from),
+                                start,
+                                len,
+                            })
+                        })
+                        .collect()
+                })
+                .collect(),
+            masks: f.masks.clone(),
+        };
         self.ramps = (saved.ramps.iter())
             .map(|row| {
                 (row.iter())
@@ -2333,6 +2546,204 @@ mod derive_tests {
 
     fn machine() -> StateMachine<Desk> {
         StateMachine::new(Desk::new(), Limits::defaults(48_000))
+    }
+
+    /// Targets of one coefficient at 0.5 on flow `a`, unmasked, slot 0
+    /// ducked 10 dB by group 0.
+    fn held() -> Targets {
+        Targets {
+            gains: vec![vec![0.5]],
+            flows: vec![Some("a".to_owned()), Some("b".to_owned())],
+            ducks: vec![samplez::DuckTargets {
+                depths: vec![10.0],
+                ..samplez::DuckTargets::default()
+            }],
+            masks: vec![vec![0]],
+            ..Targets::default()
+        }
+    }
+
+    /// A fade started before the index its entry applies at is tracked
+    /// as the engine joins it, from the value the coefficient holds
+    /// there; one starting at its index as it is.
+    #[test]
+    fn the_tracker_joins_a_late_fade() {
+        let mut sm = machine();
+        let f = samplez::Fade {
+            from: 0.2,
+            start: 4800,
+            len: 9600,
+        };
+        let gain = |fade| Entry::Gain {
+            input: 0,
+            output: 0,
+            gain: 1.0,
+            fade: Some(fade),
+        };
+        sm.follow(&[gain(f)], Some(&held()), 9600);
+        let joined = f.joined(1.0, 0.5, 9600, 480);
+        assert_ne!(joined, Some(f));
+        assert_eq!(sm.ramps[0][0], joined);
+        let on_time = samplez::Fade { start: 19_200, ..f };
+        sm.follow(&[gain(on_time)], Some(&held()), 19_200);
+        assert_eq!(sm.ramps[0][0], Some(on_time));
+    }
+
+    /// A depth setting ramps the slot's depth from the value it has at
+    /// the setting's index over the ramp length, a ramp still running
+    /// included, the value as the bridge admits it.
+    #[test]
+    fn the_tracker_follows_the_depth_ramps() {
+        let mut sm = machine();
+        let depth = |db| Entry::Duck {
+            group: 0,
+            setting: samplez::DuckSetting::Depth { slot: 0, db },
+        };
+        sm.follow(&[depth(30.0)], Some(&held()), 9600);
+        let first = samplez::Fade {
+            from: 10.0,
+            start: 9600,
+            len: 480,
+        };
+        assert_eq!(sm.in_flight.depths, vec![vec![Some(first)]]);
+        let mut now = held();
+        now.ducks[0].depths[0] = 30.0;
+        // Clamped to 40 dB, from where the first ramp is.
+        sm.follow(&[depth(99.0)], Some(&now), 9696);
+        let second = samplez::Fade {
+            from: first.value_at(30.0, 9696),
+            start: 9696,
+            len: 480,
+        };
+        assert_eq!(sm.in_flight.depths, vec![vec![Some(second)]]);
+    }
+
+    /// A mask change joins the coefficient's changes while the last of
+    /// them is within the ramp and two gain intervals, starts new ones
+    /// after that, and is no crossfade on a coefficient at 0.
+    #[test]
+    fn the_tracker_follows_the_mask_crossfades() {
+        let mut sm = machine();
+        let mask = |mask| Entry::DuckMask {
+            input: 0,
+            output: 0,
+            mask,
+        };
+        let mut now = held();
+        sm.follow(&[mask(1)], Some(&now), 9600);
+        now.masks[0][0] = 1;
+        sm.follow(&[mask(0)], Some(&now), 9696);
+        now.masks[0][0] = 0;
+        assert_eq!(
+            sm.in_flight.masks,
+            vec![(0, 0, 0, vec![(9600, 1), (9696, 0)])]
+        );
+        sm.follow(&[mask(1)], Some(&now), 20_016);
+        now.masks[0][0] = 1;
+        assert_eq!(sm.in_flight.masks, vec![(0, 0, 0, vec![(20_016, 1)])]);
+        now.gains[0][0] = 0.0;
+        sm.follow(&[mask(0)], Some(&now), 40_032);
+        assert!(sm.in_flight.masks.is_empty());
+    }
+
+    /// An `InputUp` that raises a slot from down starts its fade-in, one
+    /// for a slot up starts none; a snapshot carries which slots are down.
+    #[test]
+    fn the_tracker_follows_the_input_fade_ins() {
+        let mut sm = machine();
+        let (down, up) = (
+            |slot| Entry::InputDown { slot },
+            |slot| Entry::InputUp { slot },
+        );
+        sm.follow_inputs(&[up(0)], 4800, 1, None);
+        assert_eq!(sm.in_flight.fade_ins, vec![None]);
+        sm.follow_inputs(&[down(1)], 4800, 2, None);
+        let mut loaded = machine();
+        loaded
+            .load(sm.save(), Limits::defaults(48_000))
+            .expect("loads");
+        for m in [&mut sm, &mut loaded] {
+            m.follow_inputs(&[up(1)], 9600, 3, None);
+            assert_eq!(m.in_flight.fade_ins, vec![None, Some(9600)]);
+        }
+    }
+
+    /// A restamp moves a fade-in only where the entry it moves started
+    /// it: a moved `InputUp` that raised nothing, its slot up already,
+    /// leaves the fade-in an earlier one started where it is, and one that
+    /// raised the slot moves its own fade-in to the restamp's index, also
+    /// restamped again and after a snapshot load.
+    #[test]
+    fn a_restamp_moves_only_the_fade_in_its_entry_started() {
+        let mut sm = machine();
+        let (down, up) = (
+            |slot| Entry::InputDown { slot },
+            |slot| Entry::InputUp { slot },
+        );
+        sm.follow_inputs(&[down(0)], 4800, 1, None);
+        sm.follow_inputs(&[up(0)], 9600, 2, None);
+        // Up already: raises nothing.
+        sm.follow_inputs(&[up(0)], 9648, 3, None);
+        assert_eq!(sm.in_flight.fade_ins, vec![Some(9600)]);
+        // Entry 3 restamped as 4.
+        sm.follow_inputs(&[up(0)], 9696, 4, Some(3));
+        assert_eq!(sm.in_flight.fade_ins, vec![Some(9600)]);
+        // Entry 2 restamped as 5, then 5 as 6 after a load.
+        sm.follow_inputs(&[up(0)], 9744, 5, Some(2));
+        assert_eq!(sm.in_flight.fade_ins, vec![Some(9744)]);
+        let mut loaded = machine();
+        loaded
+            .load(sm.save(), Limits::defaults(48_000))
+            .expect("loads");
+        loaded.follow_inputs(&[up(0)], 9792, 6, Some(5));
+        assert_eq!(loaded.in_flight.fade_ins, vec![Some(9792)]);
+    }
+
+    /// A void of an `InputUp` that raised a slot, which no engine
+    /// applies, leaves the slot down and its fade-in as before it: no
+    /// fade-in recorded, and the next `InputUp` raises the slot.
+    #[test]
+    fn a_voided_input_up_leaves_the_slot_as_before_it() {
+        let mut sm = machine();
+        let request = |body| Request { stamp: 0, body };
+        let up = |at_index| Body::InputUp { slot: 0, at_index };
+        sm.apply_at(
+            1,
+            1,
+            &request(Body::InputDown {
+                slot: 0,
+                at_index: 4800,
+            }),
+        );
+        sm.apply_at(2, 1, &request(up(9600)));
+        assert_eq!(sm.in_flight.fade_ins, vec![Some(9600)]);
+        let void = Body::Void {
+            revision: 2,
+            term: 1,
+            at_index: None,
+            generation: None,
+        };
+        sm.apply_at(3, 1, &request(void));
+        assert_eq!(sm.in_flight.fade_ins, vec![None]);
+        sm.apply_at(4, 1, &request(up(19_200)));
+        assert_eq!(sm.in_flight.fade_ins, vec![Some(19_200)]);
+    }
+
+    /// A re-route or detach that changes the flow a slot reads starts a
+    /// crossfade from that flow; one to the flow read starts none.
+    #[test]
+    fn the_tracker_follows_the_route_crossfades() {
+        let mut sm = machine();
+        let route = |slot, flow: &str| Entry::Route {
+            slot,
+            flow_id: flow.to_owned(),
+        };
+        sm.follow(&[route(0, "a"), route(1, "c")], Some(&held()), 9600);
+        let from_b = Some((9600, Some("b".to_owned())));
+        assert_eq!(sm.in_flight.crossfades, vec![None, from_b]);
+        sm.follow(&[Entry::Detach { slot: 0 }], Some(&held()), 19_200);
+        let from_a = Some((19_200, Some("a".to_owned())));
+        assert_eq!(sm.in_flight.crossfades[0], from_a);
     }
 
     /// A `Commands` entry of one command `body` of session `s`, stamped
