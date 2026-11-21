@@ -342,12 +342,35 @@ absolute target, so an entry applied again once its ramp has ended
 changes nothing; applied again while it ramps, it starts the ramp over
 from where it is, but for a `Tone` entry, which leaves a running ramp
 alone (Tone generator). `InputUp`, `Route` and `Detach` need a new input
-generation:
-the engine builds it when the entry is appended, one at a time, and
-swaps it in at the entry's index. The status reports the 99.99th
-percentile of the build times and buildLead, how far ahead such entries
-are stamped; `Engine::progress` reports buildLead and the build time,
-the percentile and a supervisor tick without the engine's lead.
+generation: a slot that keeps its flow, and a re-route's outgoing
+flow, take the reader the live generation holds, and the engine opens
+the readers of the other flows from the entry's append, each on a
+libmxl instance of its own (a domain watcher thread and three
+descriptors, released with the reader, four per input domain created
+ahead by the openers), on four opener threads that
+look each flow up first, waiting 20 ms at most, so that a lookup that
+waits fails that open and frees its opener, and open one flow at a
+time; a re-route whose flow a dropped entry's open still opens adopts
+that open. It builds
+the generation once they are open, one generation at a time, and swaps
+it in at the entry's index. Once a supervisor tick and 2 ms are all
+that is left before the generation would reach the RT thread past that
+index, it waits for no reader: one whose open is not done is left out,
+the generation is swapped in on time without it, and the slot is silent and reported
+unreadable on that engine alone until the reader is open, then added
+back through the next build; a re-route that adopts a dropped entry's
+open whose lookup outlives the 20 ms gate comes back through the poll's
+recovery, within 2 s. The status reports the 99.99th percentile
+of the latest 256 build times, each the longest of its new readers'
+opens, instance creation included, and its assembly, a build that opens
+nothing left out and a late reader's open counted up to 100 ms, so a slow open raises
+buildLead until 256 builds followed it,
+and buildLead, how far ahead such entries are stamped: the percentile,
+30 ms at the least (a libmxl reader open was measured at up to 23 ms), a
+supervisor tick and those 2 ms on top of the engine's lead, so an
+entry stamped that far ahead is not due yet when the supervisor takes
+it in. `Engine::progress` reports buildLead
+and the build time, buildLead without the engine's lead.
 `Engine::start` keeps the log itself, stamping `InputDown`
 when an input is pruned and `InputUp` once its head has advanced for a
 second and held, at every poll of that second, the newest block due by
@@ -1184,8 +1207,8 @@ samples or meters from the same log and inputs, a dependency or
 toolchain change included, or a core copy holds something else;
 `PROTOCOL`, bumped when the log's wire format or the library's
 replicated semantics change: the state machine, the `Entry` variants,
-the `Targets` fields, restamp and void handling, anything a product's
-version cannot see; and the product's `Product::DERIVATION_VERSION`,
+the `Targets` fields, restamp and void handling, the block digests
+peers judge pages by, anything a product's version cannot see; and the product's `Product::DERIVATION_VERSION`,
 bumped when the same log would apply to another state, derive other
 entries or save another state. `samplez-dsp` pins `libm` to one exact
 version, since another can compute other bits; a product pins it
@@ -1415,7 +1438,10 @@ appends it in place of its engine's reports, as an `InputDown` or
 `InputUp` or what it does on a lost input. So a mirror late on one node,
 the leader's included, takes the input down nowhere: that replica reads
 silence, its pages differ from its peers' and the page verdict diverges
-it, and it withholds while the others serve. A majority flapping faster
+it, and it withholds while the others serve. A reader that opens past its
+entry's index on one replica is the same case: that replica swaps its
+generation in without it, reports the input unreadable and reads it
+again through the next build once the reader is open. A majority flapping faster
 than `pruneAfterBlocks` appends nothing. A replica whose clock is not
 verified, its kernel TAI offset not the set's or its clock beyond
 `clockGuard` of a majority, holds no engine core: it reads no input and
@@ -1429,11 +1455,13 @@ writeback, and the loop then skips blocks.
 libmxl opens an input flow only once a lookup of the flow's directory,
 on a thread of its own, found it, so a domain whose lookup of a missing
 name waits for the name to appear holds up that thread and not the
-supervisor, which drains the meter records and the status changes. A
-generation build or a replay waits 20 ms at most for the lookups of the
-flows it attaches and leaves out, or fails on, a flow not found by then,
-a lookup's finding a flow counting for a second; a build that left a
-slot out is not counted in the build times. An output flow whose
+supervisor, which drains the meter records and the status changes. An
+opener thread looks a flow up before it opens it, so a lookup that
+waits holds up that opener and the generation wanting the flow, nothing
+else. A replay, and a build for a product state, wait 20 ms at most for
+the lookups of the flows they attach and leave out, or fail on, a flow
+not found by then, a lookup's finding a flow counting for a second. A
+build that left a slot out is not counted in the build times. An output flow whose
 directory is not found is created without libmxl's check for a live
 writer, which looks the name up; a flow that is there after all is
 opened and reported raced. A

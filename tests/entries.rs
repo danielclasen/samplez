@@ -396,10 +396,11 @@ fn slow_look(dir: &std::path::Path) -> bool {
     samplez_mxl::lookup::exists(dir)
 }
 
-/// A generation build opens no flow its lookup has not found: a route to
-/// a flow that is there, but whose lookup does not answer within the
-/// build's wait, leaves the slot out at once, saying so, instead of
+/// A generation build opens no flow its lookup has not found: a re-route
+/// to a flow that is there, but whose lookup does not answer within the
+/// opener's 20 ms gate, leaves the slot out at once, saying so, instead of
 /// libmxl's open waiting on a file system that waits for a missing name.
+/// The generation is not late and blocks go on meanwhile.
 #[test]
 fn a_build_leaves_out_a_flow_its_lookup_has_not_found() {
     let domain = Domain::new();
@@ -438,59 +439,7 @@ fn a_build_leaves_out_a_flow_its_lookup_has_not_found() {
     wait_for(5 * SECOND, "the entry dropped", || {
         generation().pending.is_none()
     });
-    common::stop(e);
-}
-
-/// An input whose flow is deleted while it is attached holds up nothing:
-/// the RT thread waits for it on its head alone, never asking libmxl to
-/// check the flow, which on a file system that waits for a missing name
-/// looks the deleted flow's files up and waits; the input is pruned for
-/// its frozen head, and its flow looked up on the supervisor side, here
-/// with a lookup that waits. The other input is read throughout, and the
-/// frozen head, ever further behind, costs the wait a few wakes per block,
-/// not one per 100 us.
-#[test]
-fn a_deleted_input_flow_is_pruned_without_a_check_on_the_rt_thread() {
-    let domain = Domain::new();
-    let (kept, gone, out) = (new_id(), new_id(), new_id());
-    let _kept = Pilot::start(&domain.0, &kept, 1, B, 0);
-    let pilot = Pilot::start(&domain.0, &gone, 1, B, 0);
-    let mut cfg = config(
-        &domain.0,
-        &[(&kept, 1), (&gone, 1)],
-        &[(&out, 2)],
-        diagonal(2, 1.0),
-        MARGIN,
-    );
-    cfg.look = slow_look;
-    let (e, rx, _reports) = start_replicated(cfg);
-    running(&e);
-    // From now on the flow's lookup waits.
-    SLOW.lock().unwrap().push(gone.clone());
-    let c = e.counters();
-    let sleeps = c.input_wait_sleeps.load(Relaxed);
-    let timeouts = c.input_wait_timeout.load(Relaxed);
-    let k0 = now(&rx);
-    drop(pilot);
-    assert!(!domain.0.join(format!("{gone}.mxl-flow")).exists());
-    wait_for(5 * SECOND, "the input pruned", || {
-        e.status().inputs[1].state == InputState::Pruned
-    });
-    let mut seen = Vec::new();
-    wait_past(&rx, now(&rx) + 200, &mut seen);
-    let sleeps = c.input_wait_sleeps.load(Relaxed) - sleeps;
-    let timeouts = c.input_wait_timeout.load(Relaxed) - timeouts;
-    assert!(timeouts > 0);
-    assert!(
-        sleeps <= 3 * timeouts,
-        "{sleeps} sleeps in {timeouts} late blocks"
-    );
-    // Every block after the deletion read the other input.
-    let read: Vec<_> = seen.iter().filter(|v| v.k > k0).collect();
-    assert!(read.len() > 150, "{} blocks", read.len());
-    for v in read {
-        assert_eq!(v.silenced & 1, 0, "{v:?}");
-    }
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
     common::stop(e);
 }
 
@@ -712,15 +661,567 @@ fn routes_sent_together_on_an_engine_with_its_own_log_each_swap_in() {
     assert!(ats.windows(2).all(|w| w[1] > w[0]), "{ats:?}");
     let mut seen = Vec::new();
     let end = (ats[2] + u64::from(RAMP)) / B;
-    wait_past(&rx, end + 100, &mut seen);
-    for v in seen.iter().filter(|v| v.k > end) {
-        assert_eq!(v.silenced, 0, "{v:?}");
-    }
+    // Past the 2 s a left-out slot may stay silent, so one that never
+    // comes back is seen.
+    wait_past(&rx, end + 2500, &mut seen);
     let s = e.status();
+    // A slot is silent only where its reader was left out at its own
+    // index, its open not done by the deadline, an open slower than
+    // buildLead, and only until the poll's recovery brings it back:
+    // anything else silencing it is a bug.
+    for (slot, &at) in ats.iter().enumerate() {
+        let silent: Vec<u64> = (seen.iter())
+            .filter(|v| v.k >= at / B && v.silenced & (1 << slot) != 0)
+            .map(|v| v.k)
+            .collect();
+        let Some(&last) = silent.last() else { continue };
+        let record = (s.generation.left_out.iter()).find(|l| l.0 == slot && l.1 == at);
+        assert!(
+            record.is_some(),
+            "slot {slot} silenced without a left-out reader: {silent:?}"
+        );
+        let ran = record.unwrap().2;
+        assert!(
+            ran.is_some_and(|ns| ns >= 2_000_000),
+            "slot {slot} left out after its open ran {ran:?} ns"
+        );
+        assert!(
+            last <= at / B + blocks_of(Duration::from_secs(2)),
+            "slot {slot} silent until {last}, its open ran {ran:?} ns"
+        );
+    }
     let flows: Vec<&str> = s.inputs.iter().map(|i| i.flow_id.as_str()).collect();
     assert_eq!(flows, next.iter().map(String::as_str).collect::<Vec<_>>());
     assert_eq!(e.counters().generation_late.load(Relaxed), 0);
     assert_eq!(s.diverged, None);
+    common::stop(e);
+}
+
+/// The flows whose lookup [`slow_open`] makes wait: each after that many
+/// lookups of it, once, for that long.
+static SLOW_OPEN: Mutex<Vec<(String, usize, Duration)>> = Mutex::new(Vec::new());
+
+/// A lookup that waits for a flow [`SLOW_OPEN`] names: a reader whose
+/// open takes that long.
+fn slow_open(dir: &std::path::Path) -> bool {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let wait = {
+        let mut slow = SLOW_OPEN.lock().unwrap();
+        match slow.iter().position(|e| name.starts_with(e.0.as_str())) {
+            Some(n) if slow[n].1 > 0 => {
+                slow[n].1 -= 1;
+                None
+            }
+            Some(n) => Some(slow.remove(n).2),
+            None => None,
+        }
+    };
+    if let Some(wait) = wait {
+        std::thread::sleep(wait);
+    }
+    samplez_mxl::lookup::exists(dir)
+}
+
+/// The flows whose reader opens [`slow_reader`] makes wait, once each.
+static SLOW_READER: Mutex<Vec<(String, Duration)>> = Mutex::new(Vec::new());
+
+/// The open hook of `samplez_mxl` (`set_open_delay`): an opener's open
+/// of a reader of a flow [`SLOW_READER`] names waits, inside libmxl's
+/// open as a slow one does; other threads' opens of it do not.
+fn slow_reader(flow_id: &str) {
+    if std::thread::current().name() != Some("samplez-open") {
+        return;
+    }
+    let wait = {
+        let mut slow = SLOW_READER.lock().unwrap();
+        let n = slow.iter().position(|e| e.0 == flow_id);
+        n.map(|n| slow.remove(n).1)
+    };
+    if let Some(wait) = wait {
+        std::thread::sleep(wait);
+    }
+}
+
+/// Samples of `d` in whole blocks, rounded up.
+fn blocks_of(d: Duration) -> u64 {
+    (d.as_nanos() as u64 * 48_000)
+        .div_ceil(1_000_000_000)
+        .div_ceil(B)
+}
+
+/// Re-routes sent together whose readers open slowly hold up nothing
+/// but their own slots: a reader open after its entry's index leaves
+/// its slot out of a generation swapped in on time, silent until the
+/// next build once the reader is open, and every other slot crossfades
+/// at its index; a reader slower than the gap between two re-routes but
+/// open before its own index, its open having started with its entry,
+/// is in time.
+#[test]
+fn a_slow_reader_open_silences_only_its_own_slot() {
+    let domain = Domain::new();
+    let src: Vec<String> = (0..3).map(|_| new_id()).collect();
+    let next: Vec<String> = (0..3).map(|_| new_id()).collect();
+    let out = new_id();
+    let _pilots: Vec<Pilot> = (src.iter().chain(&next))
+        .map(|id| Pilot::start(&domain.0, id, 1, B, 0))
+        .collect();
+    let ins: Vec<(&str, u32)> = src.iter().map(|s| (s.as_str(), 1)).collect();
+    let cfg = config(&domain.0, &ins, &[(&out, 3)], diagonal(3, 1.0), MARGIN);
+    samplez_mxl::input::set_open_delay(Some(slow_reader));
+    let (e, rx) = common::start(cfg);
+    running(&e);
+    // The re-routes are stamped buildLead apart: next[1]'s reader opens
+    // past its index, next[2]'s within its own lead but past the gap
+    // after next[1]'s index.
+    let lead = e.status().generation.build_lead * 1_000_000 / 48_000;
+    let lead = Duration::from_micros(lead);
+    let slow = (4 * lead).max(Duration::from_millis(50));
+    SLOW_READER
+        .lock()
+        .unwrap()
+        .extend([(next[1].clone(), slow), (next[2].clone(), 5 * lead / 4)]);
+    let ats: Vec<u64> = (0..3).map(|i| e.route(i, &next[i], 0).unwrap()).collect();
+    let mut seen = Vec::new();
+    let end = ats[1] / B + 1500;
+    wait_past(&rx, end, &mut seen);
+    let silent = |slot: usize| -> Vec<u64> {
+        (seen.iter())
+            .filter(|v| v.k >= ats[0] / B && v.silenced & (1 << slot) != 0)
+            .map(|v| v.k)
+            .collect()
+    };
+    assert_eq!(silent(0), Vec::<u64>::new(), "slot 0 silenced");
+    assert_eq!(silent(2), Vec::<u64>::new(), "slot 2 silenced");
+    let one = silent(1);
+    let first = *one.first().expect("slot 1 silent without its reader");
+    let last = *one.last().unwrap();
+    // Silent once the crossfade from its old flow ended, on time.
+    assert!(
+        first <= (ats[1] + u64::from(RAMP)) / B + 1,
+        "slot 1 silent from {first}, its index {}",
+        ats[1] / B
+    );
+    // Its open started with its entry, before its index: it plays again
+    // within the open's time, a build and a supervisor tick of the index.
+    // A tick, and 20 ms for a loaded runner.
+    let bound = ats[1] / B + blocks_of(slow + lead + Duration::from_millis(25));
+    assert!(
+        last <= bound,
+        "slot 1 silent until {last}, its index {}, at most until {bound}",
+        ats[1] / B
+    );
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+    let s = e.status();
+    let flows: Vec<&str> = s.inputs.iter().map(|i| i.flow_id.as_str()).collect();
+    assert_eq!(flows, next.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(s.inputs.iter().all(|i| i.state == InputState::Attached));
+    assert_eq!(s.diverged, None);
+    assert_eq!(samplez_mxl::guarded_releases(), 0);
+    common::stop(e);
+}
+
+/// When [`slow_open`]'s last wait for each flow began and ended.
+static SLOW_TIMES: Mutex<Vec<(String, Instant, Instant)>> = Mutex::new(Vec::new());
+
+/// [`slow_open`], recording its waits in [`SLOW_TIMES`].
+fn timed_open(dir: &std::path::Path) -> bool {
+    let started = Instant::now();
+    let found = slow_open(dir);
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let id = name.split('.').next().unwrap_or_default().to_owned();
+    SLOW_TIMES
+        .lock()
+        .unwrap()
+        .push((id, started, Instant::now()));
+    found
+}
+
+/// A re-route appended already due, as a replica behind the leader gets
+/// one, whose reader open is running when the supervisor takes the entry
+/// in: the generation waits for no open once due, so it leaves the reader
+/// out and is not late, and the slot joins once its reader is open.
+#[test]
+fn an_open_running_at_the_deadline_is_left_out() {
+    let domain = Domain::new();
+    let (src, next, out) = (new_id(), new_id(), new_id());
+    let _p0 = Pilot::start(&domain.0, &src, 1, B, 0);
+    let _p1 = Pilot::start(&domain.0, &next, 1, B, 0);
+    let cfg = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    );
+    samplez_mxl::input::set_open_delay(Some(slow_reader));
+    let (e, rx, _reports) = start_replicated(cfg);
+    running(&e);
+    SLOW_READER
+        .lock()
+        .unwrap()
+        .push((next.clone(), Duration::from_millis(50)));
+    let api = common::api();
+    let clock = || samplez_mxl::time::timestamp_to_index(&api, samplez_mxl::time::now(&api));
+    // The engine's `earliest`: past the newest block due and what it
+    // produced, and a lead of (maxCatchupBlocks + 2) blocks.
+    let lead = 4 * B;
+    let earliest = || (clock() - MARGIN).max(e.counters().produced.load(Relaxed)) + lead;
+    // A supervisor tick and the hand-over margin, 5 ms and 2 ms: due when
+    // the supervisor takes it in, where its open starts.
+    let at = (earliest() + 240 + 96) / B * B;
+    e.append(
+        1,
+        at,
+        Entry::Route {
+            slot: 0,
+            flow_id: next.clone(),
+        },
+    )
+    .unwrap();
+    e.commit(1);
+    let mut seen = Vec::new();
+    wait_past(&rx, at / B + 50, &mut seen);
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+    let s = e.status();
+    assert!(
+        (s.generation.left_out.iter()).any(|l| l.0 == 0 && l.1 == at),
+        "not left out: {:?}",
+        s.generation.left_out
+    );
+    wait_for(5 * SECOND, "the slot attached on its new flow", || {
+        let s = e.status();
+        s.inputs[0].state == InputState::Attached && s.inputs[0].flow_id == next
+    });
+    common::stop(e);
+}
+
+/// While an entry not handed over falls due within a poll period and a
+/// tick, the supervisor neither polls nor takes a poll hold, whose opens
+/// and reads could stall it past that entry's deadline: a pruned slot's
+/// flow is not looked up, by its poll or by a slot pruned meanwhile, until
+/// the entry is gone. An entry due seconds ahead holds back no poll, and
+/// its generation is not late.
+#[test]
+fn polls_wait_only_for_an_entry_due_soon() {
+    let domain = Domain::new();
+    let ids: Vec<String> = (0..5).map(|_| new_id()).collect();
+    let (next, out) = (&ids[3], &ids[4]);
+    let mut pilots: Vec<Option<Pilot>> = (ids[..4].iter())
+        .map(|id| Some(Pilot::start(&domain.0, id, 1, B, 0)))
+        .collect();
+    let mut cfg = config(
+        &domain.0,
+        &[(&ids[0], 1), (&ids[1], 1), (&ids[2], 1)],
+        &[(out, 3)],
+        diagonal(3, 1.0),
+        MARGIN,
+    );
+    cfg.look = timed_open;
+    let (e, rx, _reports) = start_replicated(cfg);
+    running(&e);
+    let looked = |id: &str, since: Instant| {
+        (SLOW_TIMES.lock().unwrap().iter()).any(|t| t.0 == id && t.1 >= since)
+    };
+    let pruned = |slot: usize| {
+        wait_for(5 * SECOND, "the slot pruned", || {
+            e.status().inputs[slot].state == InputState::Pruned
+        });
+    };
+    let route = || Entry::Route {
+        slot: 0,
+        flow_id: next.clone(),
+    };
+    // Slot 1 pruned, its flow gone: its poll looks it up every 100 ms.
+    let stopped = Instant::now();
+    pilots[1] = None;
+    pruned(1);
+    wait_for(5 * SECOND, "slot 1's flow looked up", || {
+        looked(&ids[1], stopped)
+    });
+
+    // Due within the window, and never handed over while uncommitted.
+    e.append(1, (now(&rx) + 10) * B, route()).unwrap();
+    wait_for(5 * SECOND, "the entry taken in", || {
+        e.status().generation.pending.is_some()
+    });
+    // Past a lookup the last poll before it started.
+    std::thread::sleep(Duration::from_millis(100));
+    let held = Instant::now();
+    pilots[2] = None;
+    pruned(2);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!looked(&ids[1], held), "slot 1's flow polled");
+    assert!(!looked(&ids[2], held), "slot 2's poll hold taken");
+    e.truncate(1);
+    wait_for(5 * SECOND, "slot 2's flow looked up", || {
+        looked(&ids[2], held)
+    });
+    assert!(looked(&ids[1], held));
+
+    // Due seconds ahead: polls go on.
+    let late = e.counters().generation_late.load(Relaxed);
+    let at = (now(&rx) + 4000) * B;
+    e.append(1, at, route()).unwrap();
+    wait_for(5 * SECOND, "the generation built", || {
+        e.status().generation.ready
+    });
+    let since = Instant::now();
+    assert!(e.status().generation.pending.is_some());
+    wait_for(SECOND, "slot 1's flow polled", || looked(&ids[1], since));
+    e.commit(1);
+    let mut seen = Vec::new();
+    wait_past(&rx, at / B + 50, &mut seen);
+    assert_eq!(e.counters().generation_late.load(Relaxed), late);
+    let s = e.status();
+    assert_eq!(s.inputs[0].flow_id, *next);
+    assert_eq!(s.inputs[0].state, InputState::Attached);
+    common::stop(e);
+}
+
+/// A re-route opens only the flow it brings in: the other slot keeps the
+/// live generation's reader, so a lookup of its flow that would wait is
+/// never made, and it is never silenced.
+#[test]
+fn a_re_route_reopens_no_other_slots_flow() {
+    let domain = Domain::new();
+    let (src0, src1, next, out) = (new_id(), new_id(), new_id(), new_id());
+    let _pilots: Vec<Pilot> = [&src0, &src1, &next]
+        .iter()
+        .map(|id| Pilot::start(&domain.0, id, 1, B, 0))
+        .collect();
+    let mut cfg = config(
+        &domain.0,
+        &[(&src0, 1), (&src1, 1)],
+        &[(&out, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    );
+    cfg.look = slow_open;
+    let (e, rx) = common::start(cfg);
+    running(&e);
+    SLOW_OPEN
+        .lock()
+        .unwrap()
+        .push((src1.clone(), 0, Duration::from_millis(50)));
+    let at = e.route(0, &next, 0).unwrap();
+    let mut seen = Vec::new();
+    wait_past(&rx, at / B + 50, &mut seen);
+    let silenced: Vec<u64> = (seen.iter())
+        .filter(|v| v.k >= at / B && v.silenced != 0)
+        .map(|v| v.k)
+        .collect();
+    assert_eq!(silenced, Vec::<u64>::new());
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+    assert!(
+        SLOW_OPEN.lock().unwrap().iter().any(|e| e.0 == src1),
+        "src1 looked up again"
+    );
+    common::stop(e);
+}
+
+/// Lookups that wait, as on a file system that waits for a missing name,
+/// hold an opener for the gate's 20 ms at most: with re-routes of four
+/// slots to flows whose lookups wait, as many as there are openers, a
+/// fifth re-route to a flow that is there swaps in on time, or is left out
+/// and joins once its reader is open, within a stated bound; no
+/// generation is late and a slot no entry touches is never silenced.
+#[test]
+fn lookups_that_wait_hold_no_opener() {
+    let domain = Domain::new();
+    let src: Vec<String> = (0..6).map(|_| new_id()).collect();
+    let gone: Vec<String> = (0..4).map(|_| new_id()).collect();
+    let (next, out) = (new_id(), new_id());
+    let _pilots: Vec<Pilot> = (src.iter().chain([&next]))
+        .map(|id| Pilot::start(&domain.0, id, 1, B, 0))
+        .collect();
+    let ins: Vec<(&str, u32)> = src.iter().map(|s| (s.as_str(), 1)).collect();
+    let mut cfg = config(&domain.0, &ins, &[(&out, 6)], diagonal(6, 1.0), MARGIN);
+    cfg.look = slow_open;
+    let (e, rx) = common::start(cfg);
+    running(&e);
+    SLOW_OPEN.lock().unwrap().extend(
+        gone.iter()
+            .map(|id| (id.clone(), 0, Duration::from_secs(2))),
+    );
+    for (slot, id) in gone.iter().enumerate() {
+        e.route(slot, id, 0).unwrap();
+    }
+    let at = e.route(4, &next, 0).unwrap();
+    let mut seen = Vec::new();
+    wait_past(&rx, at / B + 300, &mut seen);
+    let silent = |slot: usize| -> Vec<u64> {
+        (seen.iter())
+            .filter(|v| v.k >= at / B && v.silenced & (1 << slot) != 0)
+            .map(|v| v.k)
+            .collect()
+    };
+    assert_eq!(silent(5), Vec::<u64>::new(), "the untouched slot silenced");
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+    // The gate's 20 ms, a build and a tick, and 20 ms for a loaded runner.
+    let lead = e.status().generation.build_lead * 1_000_000 / 48_000;
+    let bound = at / B + blocks_of(Duration::from_millis(45) + Duration::from_micros(lead));
+    assert!(
+        silent(4).iter().all(|&k| k <= bound),
+        "slot 4 silent past {bound}: {:?}",
+        silent(4)
+    );
+    let s = e.status();
+    assert_eq!(s.inputs[4].flow_id, next);
+    assert_eq!(s.inputs[4].state, InputState::Attached);
+    common::stop(e);
+}
+
+/// Every opener held in a slow reader open: a re-route whose open cannot
+/// start before its deadline is left out, its generation swapped in on
+/// time, and the slot joins once an opener is free and its reader open.
+#[test]
+fn an_open_that_cannot_start_by_its_deadline_is_left_out() {
+    let domain = Domain::new();
+    let src: Vec<String> = (0..5).map(|_| new_id()).collect();
+    let busy: Vec<String> = (0..4).map(|_| new_id()).collect();
+    let (next, out) = (new_id(), new_id());
+    let _pilots: Vec<Pilot> = (src.iter().chain(&busy).chain([&next]))
+        .map(|id| Pilot::start(&domain.0, id, 1, B, 0))
+        .collect();
+    let ins: Vec<(&str, u32)> = src.iter().map(|s| (s.as_str(), 1)).collect();
+    let cfg = config(&domain.0, &ins, &[(&out, 5)], diagonal(5, 1.0), MARGIN);
+    samplez_mxl::input::set_open_delay(Some(slow_reader));
+    let (e, rx) = common::start(cfg);
+    running(&e);
+    let slow = Duration::from_millis(500);
+    SLOW_READER
+        .lock()
+        .unwrap()
+        .extend(busy.iter().map(|id| (id.clone(), slow)));
+    for (slot, id) in busy.iter().enumerate() {
+        e.route(slot, id, 0).unwrap();
+    }
+    let at = e.route(4, &next, 0).unwrap();
+    let mut seen = Vec::new();
+    wait_past(&rx, at / B + 1000, &mut seen);
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+    let s = e.status();
+    assert_eq!(s.inputs[4].flow_id, next);
+    assert_eq!(s.inputs[4].state, InputState::Attached);
+    assert_eq!(samplez_mxl::guarded_releases(), 0);
+    common::stop(e);
+}
+
+/// A re-route whose flow a dropped entry's open still looks up adopts that
+/// open rather than wait for it: no generation is late, and the slot,
+/// left out while the open runs, plays again within the poll's recovery
+/// period at the latest.
+#[test]
+fn an_adopted_slow_open_rejoins_within_the_poll_recovery_limit() {
+    let domain = Domain::new();
+    let (src, next, out) = (new_id(), new_id(), new_id());
+    let _p0 = Pilot::start(&domain.0, &src, 1, B, 0);
+    let _p1 = Pilot::start(&domain.0, &next, 1, B, 0);
+    let mut cfg = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&out, 1)],
+        diagonal(1, 1.0),
+        MARGIN,
+    );
+    cfg.look = slow_open;
+    let (e, rx, _reports) = start_replicated(cfg);
+    running(&e);
+    let slow = Duration::from_millis(300);
+    // The dropped entry's lookup and the next one both wait, so the
+    // re-route's own open does not answer within the gate either.
+    SLOW_OPEN
+        .lock()
+        .unwrap()
+        .extend([(next.clone(), 0, slow), (next.clone(), 0, slow)]);
+    let route = || Entry::Route {
+        slot: 0,
+        flow_id: next.clone(),
+    };
+    e.append(1, (now(&rx) + 2000) * B, route()).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    e.truncate(1);
+    let at = (now(&rx) + 100) * B;
+    e.append(1, at, route()).unwrap();
+    e.commit(1);
+    let mut seen = Vec::new();
+    // Past the poll's recovery second and the build re-adding the slot.
+    wait_past(&rx, at / B + 2500, &mut seen);
+    wait_for(3 * SECOND, "the slot attached on its new flow", || {
+        let s = e.status();
+        s.inputs[0].state == InputState::Attached && s.inputs[0].flow_id == next
+    });
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+    let last = (seen.iter())
+        .filter(|v| v.k >= at / B && v.silenced != 0)
+        .map(|v| v.k)
+        .next_back();
+    // The poll's recovery second, then the re-attach and the rebuild that
+    // adds the slot back, with room for a loaded runner.
+    let bound = at / B + blocks_of(Duration::from_secs(2));
+    assert!(
+        last.is_none_or(|k| k <= bound),
+        "silent until {last:?}, bound {bound}"
+    );
+    let s = e.status();
+    assert_eq!(s.inputs[0].flow_id, next);
+    assert_eq!(s.inputs[0].state, InputState::Attached);
+    assert_eq!(samplez_mxl::guarded_releases(), 0);
+    common::stop(e);
+}
+
+/// A rebuild waiting for a reader whose open is slow holds back no
+/// entry: a re-route appended meanwhile swaps in at its index, its slot
+/// crossfading and never silenced, while the generation leaves out the
+/// slot whose open is still running, which joins once it is open.
+#[test]
+fn a_rebuild_waiting_for_a_slow_open_holds_back_no_re_route() {
+    let domain = Domain::new();
+    let (src0, src1, x, y, out) = (new_id(), new_id(), new_id(), new_id(), new_id());
+    let _pilots: Vec<Pilot> = [&src0, &src1, &x, &y]
+        .iter()
+        .map(|id| Pilot::start(&domain.0, id, 1, B, 0))
+        .collect();
+    let mut cfg = config(
+        &domain.0,
+        &[(&src0, 1), (&src1, 1)],
+        &[(&out, 2)],
+        diagonal(2, 1.0),
+        MARGIN,
+    );
+    cfg.look = slow_open;
+    let (e, rx) = common::start(cfg);
+    running(&e);
+    // src1's next open after the first re-route's, the rebuild's once
+    // that re-route's crossfade ended, waits.
+    let slow = Duration::from_millis(300);
+    SLOW_OPEN.lock().unwrap().push((src1.clone(), 1, slow));
+    let first = e.route(0, &x, 0).unwrap();
+    let mut seen = Vec::new();
+    wait_past(&rx, (first + u64::from(RAMP)) / B + 20, &mut seen);
+    // The rebuild's open of src1 runs for another 200 ms or more.
+    let at = e.route(0, &y, 0).unwrap();
+    let end = at / B + 1000;
+    wait_past(&rx, end, &mut seen);
+    assert_eq!(e.counters().generation_late.load(Relaxed), 0);
+    let silent = |slot: usize| -> Vec<u64> {
+        (seen.iter())
+            .filter(|v| v.k >= first / B && v.silenced & (1 << slot) != 0)
+            .map(|v| v.k)
+            .collect()
+    };
+    assert_eq!(silent(0), Vec::<u64>::new(), "the re-routed slot silenced");
+    let lead = e.status().generation.build_lead * 1_000_000 / 48_000;
+    let bound = at / B + blocks_of(slow + Duration::from_micros(lead) + Duration::from_millis(25));
+    assert!(
+        silent(1).iter().all(|&k| k <= bound),
+        "slot 1 silent past {bound}: {:?}",
+        silent(1)
+    );
+    let s = e.status();
+    assert_eq!(s.inputs[0].flow_id, y);
+    assert!(s.inputs.iter().all(|i| i.state == InputState::Attached));
+    assert_eq!(samplez_mxl::guarded_releases(), 0);
     common::stop(e);
 }
 

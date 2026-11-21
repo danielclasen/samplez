@@ -13,6 +13,12 @@ mxl = { git = "https://github.com/dmf-mxl/mxl", rev = "8f3f1096e804bfb822eb959cd
 mxl-sys = { git = "https://github.com/dmf-mxl/mxl", rev = "8f3f1096e804bfb822eb959cdf2fc23199a7d15d", features = ["mxl-not-built"] }
 serde_json = "1"
 
+# Test-only hooks (`input::set_open_delay`, `input::set_open_failure`)
+# that integration tests of the
+# crates using this one switch on through their dev-dependencies.
+[features]
+test-hooks = []
+
 [[test]]
 name = "process"
 harness = false

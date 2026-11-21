@@ -14,7 +14,7 @@ use mxl_sys::{
     MXL_ERR_OUT_OF_RANGE_TOO_EARLY,
 };
 use samplez_mxl::input::{
-    Generation, GroupWait, InputConfig, Outcome, Poll, PolledFlow, RECOVERY_NS, Recovery,
+    Generation, GroupWait, InputConfig, Outcome, Poll, PolledFlow, RECOVERY_NS, Recovery, Releases,
     SlotState, Timing,
 };
 use samplez_mxl::{Error, Instance, time};
@@ -665,18 +665,62 @@ fn a_poll_reader_follows_a_replaced_flow_for_every_holder() {
     w.blocks(K0..K0 + 5);
     assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 5) * B));
 
-    // Both holders' references are released, else libmxl would hand the
-    // stale reader out again and every poll would report it invalid.
+    // Both holders' references are let go, and the flow is opened again
+    // only once they are released: libmxl would hand the stale reader out
+    // again and every poll would report it invalid.
     drop(w);
     let mut w = RawWriter::create(&api, &domain.0, &id, 1);
     w.blocks(K0 + 7..K0 + 8);
     assert!(matches!(poll_checked(&mut p), Poll::Invalid));
+    let stale = p.take_released();
+    assert_eq!(stale.len(), 2);
+    // Past the lookup finding the recreated flow.
+    std::thread::sleep(WAIT);
+    assert!(matches!(p.poll(), Poll::Absent(_)));
+    drop(stale);
     assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 8) * B));
     w.blocks(K0 + 8..K0 + 9);
     assert!(matches!(p.poll(), Poll::Head(h) if h == (K0 + 9) * B));
 
     assert_eq!(p.release(), 1);
+    assert_eq!(p.take_released().len(), 1);
     assert!(matches!(p.poll(), Poll::Head(_)));
+}
+
+/// A poll reader created anew for a flow an earlier poll reader on the
+/// instance let a reference of go shares its releases: it does not open
+/// the flow while that reference is held, as libmxl would hand out the
+/// stale reader of the flow that was replaced meanwhile.
+#[test]
+fn a_poll_reader_created_anew_waits_for_the_references_an_earlier_one_let_go() {
+    let api = api();
+    let domain = Domain::new();
+    let id = new_id();
+    let poll = Instance::new(&api, &domain.0).unwrap();
+    let releases = Releases::default();
+    let mut w = RawWriter::create(&api, &domain.0, &id, 1);
+    w.blocks(K0..K0 + 5);
+    let mut p = PolledFlow::new(&poll, &id)
+        .unwrap()
+        .with_releases(&releases);
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 5) * B));
+    assert_eq!(p.release(), 0);
+    let held = p.take_released();
+    drop(p);
+    assert_eq!(releases.pending(), 1);
+
+    drop(w);
+    let mut w = RawWriter::create(&api, &domain.0, &id, 1);
+    w.blocks(K0 + 7..K0 + 8);
+    let mut p = PolledFlow::new(&poll, &id)
+        .unwrap()
+        .with_releases(&releases);
+    // Past the lookup finding the recreated flow.
+    std::thread::sleep(WAIT);
+    assert!(matches!(p.poll(), Poll::Absent(_)));
+    drop(held);
+    assert_eq!(releases.pending(), 0);
+    assert!(matches!(poll_found(&mut p), Poll::Head(h) if h == (K0 + 8) * B));
 }
 
 /// How long the lookups of the poll tests below wait: as a file system
