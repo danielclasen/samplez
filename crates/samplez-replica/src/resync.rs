@@ -5,8 +5,9 @@
 //! once a page after the hand-over matches (Resume) or by the Named rule;
 //! a failed attempt leaves it diverged, and it tries again with a newer
 //! core. A donor has the replica's compatibility key; with committing
-//! replicas of other keys only, or a core its engine refuses for good
-//! ([`Failed::Refused`]), the replica is rebuilt from product state
+//! replicas of other keys only, with every output disabled, when nothing
+//! commits and no donor ever comes, or with a core its engine refuses for
+//! good ([`Failed::Refused`]), the replica is rebuilt from product state
 //! instead.
 
 use std::sync::Arc;
@@ -139,6 +140,10 @@ pub struct Metrics {
     /// Diverged replicas rebuilt from product state rather than resynced:
     /// every committing donor reported another compatibility key.
     pub rebuilt_for_key: u64,
+    /// Diverged replicas rebuilt from product state rather than resynced:
+    /// every output was disabled by the log, or there was none, so nothing
+    /// commits and no donor comes.
+    pub rebuilt_writing_nothing: u64,
     /// Cores the engine refused for good ([`Failed::Refused`]), each
     /// followed by a rebuild from product state, not another attempt.
     pub refused: u64,
@@ -146,6 +151,18 @@ pub struct Metrics {
     pub last: Option<Duration>,
     /// How long the next attempt waits after the last one ended.
     pub backoff: Duration,
+}
+
+/// Why a diverged replica is rebuilt from product state rather than
+/// resynced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Instead {
+    /// An input reads another flow than the applied state names.
+    Flows,
+    /// Every committing replica reports another compatibility key.
+    Key,
+    /// Every output is disabled by the log, or there is none.
+    WritingNothing,
 }
 
 /// The attempt in progress and the counts.
@@ -221,15 +238,15 @@ impl Tracker {
     }
 
     /// A rebuild from product state took the place of an attempt at
-    /// `now`, for an input on another flow (`flows`) or for want of a
-    /// donor of the replica's key: the next attempt, or rebuild, waits
-    /// the backoff, which doubles as after a failed attempt.
-    pub fn rebuilt(&mut self, now: Instant, flows: bool) {
-        if flows {
-            self.metrics.rebuilt_for_flows += 1;
-        } else {
-            self.metrics.rebuilt_for_key += 1;
-        }
+    /// `now`, for `why`: the next attempt, or rebuild, waits the backoff,
+    /// which doubles as after a failed attempt.
+    pub fn rebuilt(&mut self, now: Instant, why: Instead) {
+        let count = match why {
+            Instead::Flows => &mut self.metrics.rebuilt_for_flows,
+            Instead::Key => &mut self.metrics.rebuilt_for_key,
+            Instead::WritingNothing => &mut self.metrics.rebuilt_writing_nothing,
+        };
+        *count += 1;
         self.ended(now);
     }
 

@@ -2423,6 +2423,18 @@ impl Contact {
         }
     }
 
+    /// Whether this audio replica's engine has no output enabled, as of
+    /// its last sample, nor the applied product state `logged` names one
+    /// enabled (`ProductState::outputs`): every output either lists is
+    /// disabled in both, or neither lists one. An output the engine does
+    /// not list, as one `logged` names past its list, counts as enabled,
+    /// and an output past `logged` as the engine holds it.
+    fn writes_nothing(st: &State, logged: &[bool]) -> bool {
+        let listed = st.own.standing.len().max(logged.len());
+        !(0..listed)
+            .any(|o| logged.get(o) == Some(&true) || st.enabled.get(o).copied().unwrap_or(true))
+    }
+
     /// Whether this audio replica is starting, withdrawn or diverged with
     /// outputs none of which commits, as of its last sample. One taking
     /// the baseline over in a key hand-over, retargeted from
@@ -2726,9 +2738,7 @@ impl Contact {
         }
         let below = st.life.as_ref().and_then(|l| l.metrics.mismatch)
             == Some(crate::state::Mismatch::BelowBaselineVersions);
-        let outputs = st.own.standing.len();
-        let nothing_to_write = state == ReplicaState::Withdrawn
-            && !(0..outputs).any(|o| st.enabled.get(o).copied().unwrap_or(true));
+        let nothing_to_write = state == ReplicaState::Withdrawn && Self::writes_nothing(st, &[]);
         let other = copies
             .iter()
             .any(|(_, age, own)| *age <= fresh && own.state == Some(ReplicaState::Committing));
@@ -3558,10 +3568,11 @@ impl Contact {
         // once an entry re-routed or detached an input since, it counts
         // anew, though the flows it left may equal those it began with.
         let lead = self.timing.max_apply_lead + crate::schedule::EXTRA_LEAD;
-        if st.resync.due(now) {
-            let state = self.log.product_state().2;
+        let product = st.resync.due(now).then(|| self.log.product_state().2);
+        if let Some(state) = &product {
             let off = (self.audio.as_ref())
-                .is_some_and(|audio| !state.flows.is_empty() && !audio.follows(&state));
+                .is_some_and(|audio| !state.flows.is_empty() && !audio.follows(state));
+
             st.off_flows_since = match st.off_flows_since.take() {
                 Some((since, at)) if off && at == st.flows_at => Some((since, at)),
                 _ if off => Some((now, st.flows_at)),
@@ -3573,7 +3584,7 @@ impl Contact {
                 .is_some_and(|(since, _)| *since + lead <= now)
             {
                 st.off_flows_since = None;
-                st.resync.rebuilt(now, true);
+                st.resync.rebuilt(now, crate::resync::Instead::Flows);
                 tracing::warn!(
                     flows = ?state.flows,
                     "diverged with an input on another flow than the log names: rebuilt, not resynced"
@@ -3615,12 +3626,26 @@ impl Contact {
             && crate::resync::other_keys_only(mine, &peers_within(fresh))
             && st.resync.due(now)
         {
-            st.resync.rebuilt(now, false);
+            st.resync.rebuilt(now, crate::resync::Instead::Key);
             tracing::warn!(
                 key = ?mine,
                 "diverged with committing donors of other keys only: rebuilt, not resynced"
             );
             self.begin_restart(st, self.log.applied(), "no donor of its key");
+            return None;
+        }
+        // Every output disabled, by the applied log and by the engine, or
+        // none: nothing commits, so no donor comes, and nothing is written
+        // for a rebuilt state to get wrong. The engine is rebuilt from
+        // product state instead, on the attempts' backoff; what a rebuild
+        // does not carry costs a page and a resync once an output is
+        // enabled again and a peer commits.
+        let logged = product.map(|state| state.outputs);
+        if donor.is_none() && logged.is_some_and(|l| Self::writes_nothing(st, &l)) {
+            st.resync
+                .rebuilt(now, crate::resync::Instead::WritingNothing);
+            tracing::warn!("diverged with every output disabled: rebuilt, not resynced");
+            self.begin_restart(st, self.log.applied(), "every output disabled");
             return None;
         }
         let Some(donor) = donor else {
@@ -4106,6 +4131,8 @@ mod tests {
         visited_most: usize,
         /// The flows of [`LogView::product_state`].
         flows: Vec<Option<String>>,
+        /// The outputs of [`LogView::product_state`].
+        outputs: Vec<bool>,
     }
 
     #[derive(Default)]
@@ -4245,7 +4272,7 @@ mod tests {
                 gains: Vec::new(),
                 up: Vec::new(),
                 flows: log.flows.clone(),
-                outputs: Vec::new(),
+                outputs: log.outputs.clone(),
                 loudness_running: Vec::new(),
                 strips: Vec::new(),
                 ducks: Vec::new(),
@@ -5267,10 +5294,12 @@ mod tests {
     /// A diverged replica asks a donor committing by a report of the last
     /// period first, not one whose committing report is older though
     /// within `w + D`; with no committing donor at all it keeps checking,
-    /// counted and logged with a backoff, rather than going silent.
+    /// counted and logged with a backoff, rather than going silent, while
+    /// it has an output enabled.
     #[tokio::test(start_paused = true)]
     async fn a_resync_prefers_a_fresh_donor_and_retries_without_one() {
         let f = fixture(&[&[1, 2, 3]]);
+        f.engine.outputs.store(true, Ordering::SeqCst);
         diverge(&f);
         let attempts = |f: &Fixture| f.contact.metrics().resync;
         assert_eq!(f.contact.resync_due(), None, "nobody commits");
@@ -5299,6 +5328,69 @@ mod tests {
         let (_, donor, _) = f.contact.resync_due().expect("an attempt");
         assert_eq!(donor, 3, "the fresh donor");
         assert_eq!(attempts(&f).attempts, 1);
+    }
+
+    /// A diverged replica whose every output the log disabled has no donor
+    /// to wait for: nothing commits while the log keeps them disabled. It
+    /// is rebuilt from product state instead and leaves `diverged`, again
+    /// once diverged again, after the attempts' backoff. With an output
+    /// enabled, by its engine or by the applied log ahead of the engine,
+    /// it waits for a donor.
+    #[tokio::test(start_paused = true)]
+    async fn a_diverged_replica_with_every_output_disabled_is_rebuilt() {
+        // Whether the engine has an output and has it disabled, and
+        // whether the log has it enabled: an engine listing none while the
+        // log enables one is not taken as writing nothing.
+        let cases = [
+            (true, true, false),
+            (true, false, false),
+            (true, true, true),
+            (false, true, true),
+        ];
+        for (output, disabled, logged) in cases {
+            let f = fixture(&[&[1, 2, 3]]);
+            f.engine.outputs.store(output, Ordering::SeqCst);
+            f.engine
+                .disabled
+                .store(u64::from(disabled), Ordering::SeqCst);
+            f.log.0.lock().unwrap().outputs = vec![logged];
+            diverge(&f);
+            let rebuilds = f.engine.rebuilt_with.lock().unwrap().len();
+            assert_eq!(f.contact.resync_due(), None, "nobody commits");
+            let m = f.contact.metrics().resync;
+            for _ in 0..3 {
+                f.tick();
+            }
+            let rebuilt = f.engine.rebuilt_with.lock().unwrap().len() - rebuilds;
+            if output && disabled && !logged {
+                assert_eq!((m.rebuilt_writing_nothing, m.no_donor), (1, 0), "{m:?}");
+                assert_eq!(rebuilt, 1, "rebuilt from product state");
+                assert_ne!(f.state(), Some(ReplicaState::Diverged));
+                let audio: Arc<dyn Audio> = f.engine.clone();
+                {
+                    let mut st = f.contact.lock();
+                    let life = st.life.as_mut().unwrap();
+                    life.contradicted(audio.as_ref());
+                    assert_eq!(life.state(), ReplicaState::Diverged);
+                }
+                assert_eq!(f.contact.resync_due(), None);
+                let m = f.contact.metrics().resync;
+                assert_eq!(m.rebuilt_writing_nothing, 1, "within the backoff");
+                tokio::time::advance(m.backoff).await;
+                assert_eq!(f.contact.resync_due(), None);
+                let m = f.contact.metrics().resync;
+                assert_eq!(m.rebuilt_writing_nothing, 2, "after the backoff");
+            } else {
+                let case = (output, disabled, logged);
+                assert_eq!(
+                    (m.rebuilt_writing_nothing, m.no_donor),
+                    (0, 1),
+                    "{case:?}: {m:?}"
+                );
+                assert_eq!(rebuilt, 0, "{case:?}");
+                assert_eq!(f.state(), Some(ReplicaState::Diverged), "{case:?}");
+            }
+        }
     }
 
     /// A fresh donor without a peer address is no donor: the one

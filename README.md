@@ -868,6 +868,24 @@ or that `Engine::replay` refuses as `ReplayError::Invalid` (another
 shape, an entry outside the engine): `resync::Failed::Refused`, counted
 in `samplez_replica_resync_refused_total`, is not retried.
 
+A diverged replica whose outputs are all disabled, in the applied
+product state (`ProductState::outputs`, an output it does not list as
+the engine holds it) and in its engine, or that has none, is rebuilt
+from product state too, on the attempts' backoff
+(`samplez_replica_resync_rebuilt_writing_nothing_total`): nothing
+commits then, so no donor comes, and nothing is written that the
+rebuilt state could get wrong. As after any rebuild ("Starting a
+replica"), its duck detectors start cold and its strips, limiters and
+delay lines keep what they computed, so its pages can differ from a
+peer's once an output is enabled again. Then the leader names a
+replica that commits by the Named rule, and each other one whose page
+differs diverges and resyncs from it, also when every replica was
+rebuilt. Such a replica diverges when the log restamps an entry it
+applied in time: with nothing written every replica reports the
+entry's block withheld, so the leader decides an entry another replica
+took late and holds unresolved, as one does around a leader change or
+a restart.
+
 `Engine::replay` builds a replay clone from a donor's core: the engine's
 block computation off the RT thread, its readers on a new instance per
 input domain reading the blocks after k0 from the flows' history, its
