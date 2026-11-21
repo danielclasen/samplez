@@ -164,12 +164,11 @@ generator) none, per output
 `enabled` true, per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
 Table 3; without it every channel weighs 1), per input `maxDelaySamples`
-0 and `truePeak` false (Meters), per output `strip` and `limiter` false
-and `maxDelaySamples` 0 (below), per output and meter `correlation`
-false (Meters), and
-`meters`, each with a `name`, `channels` and `loudnessChannels`: matrix
-columns after the outputs' that are computed and metered and written to
-no flow.
+0, `truePeak` false and `preStripMeter` false (Meters), per output
+`strip` and `limiter` false and `maxDelaySamples` 0 (below), per output
+and meter `correlation` false (Meters), and `meters`, each with a
+`name`, `channels` and `loudnessChannels`: matrix columns after the
+outputs' that are computed and metered and written to no flow.
 
 `sampleRate` takes 48000 only, `blockSize` 16 to 1024, `holdMs`,
 `contactWindowMs` and `resyncBudgetMs` 1 to 1000, `historySlackMs` at
@@ -223,6 +222,13 @@ RMS per channel and the momentary loudness of the input after its
 strip, read or silenced; with `truePeak` set in the input's config,
 also its true peak and largest true peak, computed as an output's at
 the same cost per channel, and without it none.
+With `preStripMeter` set in an input's config, its status also carries
+`pre_strip_meters`, the same readings of the input before its strip:
+the block as read or generated, its `flowChannels` selected, after the
+fade-in, a re-route's crossfade and silencing, before the trim and the
+rest of the strip and before the delay. It costs a copy of the block
+and a second input meter on the RT thread; without it the input has
+none and nothing is copied.
 RMS is referenced to a sine as in AES17: the root mean square times the
 square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
 

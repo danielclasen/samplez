@@ -124,6 +124,9 @@ pub struct InputStatus {
     pub counters: InputCounters,
     /// The input after its strip, read or silenced.
     pub meters: InputMeters,
+    /// The input before its strip, where its config sets
+    /// `preStripMeter`; none otherwise.
+    pub pre_strip_meters: Option<InputMeters>,
 }
 
 #[derive(Clone, Debug)]
@@ -1541,6 +1544,7 @@ fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
         // Without a flow it starts as a `Detach` leaves it; a tone
         // generator reads none for good.
         slot.detached = i.flow_id.is_none();
+        slot.pre_strip = i.pre_strip_meter;
         if i.tone.is_some() {
             slot.tone = Some(Tone::new(
                 i.channels as usize,
@@ -1570,8 +1574,9 @@ fn delay_line(config: &Config, channels: u32, max: u32) -> Option<Delay> {
 }
 
 /// The configured meters on their matrix columns, after the outputs',
-/// and each input slot's meter on its channels.
-fn new_meters(config: &Config) -> (Vec<Metered>, Vec<Metered>) {
+/// each input slot's meter on its channels, and the pre-strip meter of
+/// each input slot that has one on its channels of `prebuf`.
+pub(crate) fn new_meters(config: &Config) -> (Vec<Metered>, Vec<Metered>, Vec<Metered>) {
     let mut channel = config.output_channels();
     let mut buses = Vec::new();
     for m in &config.meters {
@@ -1582,19 +1587,23 @@ fn new_meters(config: &Config) -> (Vec<Metered>, Vec<Metered>) {
         channel += m.channels as usize;
     }
     let mut channel = 0;
-    let mut taps = Vec::new();
+    let (mut taps, mut pre_taps) = (Vec::new(), Vec::new());
     for i in &config.inputs {
-        taps.push(Metered {
+        let meter = || Metered {
             first_channel: channel,
             meter: if i.true_peak {
                 OutMeter::new(i.channels as usize)
             } else {
                 OutMeter::without_true_peak(i.channels as usize)
             },
-        });
+        };
+        taps.push(meter());
+        if i.pre_strip_meter {
+            pre_taps.push(meter());
+        }
         channel += i.channels as usize;
     }
-    (buses, taps)
+    (buses, taps, pre_taps)
 }
 
 /// A replay clone of `config`'s shape: an engine computing off the RT
@@ -1683,11 +1692,13 @@ pub(crate) fn replay_rt(
         // as they were before the configured and input meters.
         buses: Vec::new(),
         taps: Vec::new(),
+        pre_taps: Vec::new(),
         mix: Mix {
             page_entries: Vec::with_capacity(PENDING_CHANGES * PAGE.div_ceil(b) as usize),
             ..Mix::new(Matrix::new(n, m), b, config.ramp_samples)
         },
         inbuf: PlanarBuffer::new(n, b as usize),
+        prebuf: PlanarBuffer::new(n, b as usize),
         outbuf: PlanarBuffer::new(m, b as usize),
         scratch: vec![0.0; widest * b as usize],
         scratch_out: vec![0.0; widest * b as usize],
@@ -1853,13 +1864,17 @@ impl Engine {
                 gen_at: 0,
             }),
         }));
+        let pre_strip: usize = (config.inputs.iter())
+            .filter(|i| i.pre_strip_meter)
+            .map(|i| i.channels as usize)
+            .sum();
         // A record per metered channel and slice, and one more per
         // element that correlates its legs.
         let crosses = (config.outputs.iter().filter(|o| o.correlation).count())
             + config.meters.iter().filter(|m| m.correlation).count();
         let records = METER_RING_SECONDS
             * (samplez_mxl::SAMPLE_RATE as usize / SLICE as usize)
-            * (config.columns() + config.input_channels() + crosses);
+            * (config.columns() + config.input_channels() + crosses + pre_strip);
         let (mut meter_tx, mut meter_rx) = rtrb::RingBuffer::new(records.max(1));
         let blank = MeterRecord {
             seq: 0,
@@ -2036,7 +2051,7 @@ impl Engine {
             .collect();
         let (n, m) = (config.input_channels(), config.columns());
         let mut matrix = Matrix::new(n, m);
-        let (buses, taps) = new_meters(&config);
+        let (buses, taps, pre_taps) = new_meters(&config);
         for (i, row) in config.matrix.iter().enumerate() {
             for (j, &g) in row.iter().enumerate() {
                 assert!(matrix.set(i, j, g, 0), "validated gain");
@@ -2061,11 +2076,13 @@ impl Engine {
             outs,
             buses,
             taps,
+            pre_taps,
             mix: Mix {
                 page_entries: Vec::with_capacity(page_entries),
                 ..Mix::new(matrix, b, config.ramp_samples)
             },
             inbuf: PlanarBuffer::new(n, b as usize),
+            prebuf: PlanarBuffer::new(n, b as usize),
             outbuf: PlanarBuffer::new(m, b as usize),
             scratch: vec![0.0; widest * b as usize],
             scratch_out: vec![0.0; widest * b as usize],
@@ -2143,6 +2160,7 @@ impl Engine {
                     margin_warning: None,
                     counters: InputCounters::default(),
                     meters: InputMeters::default(),
+                    pre_strip_meters: i.pre_strip_meter.then(InputMeters::default),
                 })
                 .collect(),
             outputs: config
@@ -2186,7 +2204,7 @@ impl Engine {
         let build_lead = Arc::new(AtomicU64::new(build_lead_samples(None, lead, b)));
         let build_time = Arc::new(AtomicU64::new(build_time_samples(None)));
         // Per meter, as MeterRecord numbers them: the outputs, the
-        // configured meters, the inputs.
+        // configured meters, the inputs, the inputs' pre-strip meters.
         let checked = "checked by Config::parse";
         let config_loudness = (config.outputs.iter())
             .map(|o| (o.loudness_weights().expect(checked), o.correlation))
@@ -2195,6 +2213,11 @@ impl Engine {
                     .map(|m| (m.loudness_weights().expect(checked), m.correlation)),
             )
             .chain((config.inputs.iter()).map(|i| (i.loudness_weights().expect(checked), false)))
+            .chain(
+                (config.inputs.iter())
+                    .filter(|i| i.pre_strip_meter)
+                    .map(|i| (i.loudness_weights().expect(checked), false)),
+            )
             .map(|(weights, on)| OutputLoudness::new(weights).correlating(on))
             .collect();
         let timing = Timing {
@@ -4400,7 +4423,8 @@ impl Supervisor {
             let mut st = self.status();
             let st = &mut *st;
             let (outs, rest) = self.loudness.split_at(st.outputs.len());
-            let (meters, inputs) = rest.split_at(st.meters.len());
+            let (meters, rest) = rest.split_at(st.meters.len());
+            let (inputs, mut pre) = rest.split_at(st.inputs.len());
             for (o, l) in st.outputs.iter_mut().zip(outs) {
                 o.meters.clone_from(&l.meters);
             }
@@ -4409,6 +4433,10 @@ impl Supervisor {
             }
             for ((i, l), c) in st.inputs.iter_mut().zip(inputs).zip(&self.config.inputs) {
                 i.meters.update(&l.meters, c.true_peak);
+                if let Some(m) = &mut i.pre_strip_meters {
+                    m.update(&pre[0].meters, c.true_peak);
+                    pre = &pre[1..];
+                }
             }
         }
     }
@@ -8647,7 +8675,7 @@ mod tests {
             let mut rt = replay_rt(&config, &api, Vec::new(), hashes, control);
             // As the engine's loop, its input meters included.
             rt.replay = false;
-            (rt.buses, rt.taps) = new_meters(&config);
+            (rt.buses, rt.taps, rt.pre_taps) = new_meters(&config);
             let (meters, mut rx) = rtrb::RingBuffer::new(1 << 10);
             rt.meters = meters;
             let (ducks, _ducks) = rtrb::RingBuffer::new(1 << 10);
@@ -8755,7 +8783,7 @@ mod tests {
         let mut rt = replay_rt(config, &api, vec![None], hashes, control);
         // As the engine's loop: configured and input meters, inputs read.
         rt.replay = false;
-        (rt.buses, rt.taps) = new_meters(config);
+        (rt.buses, rt.taps, rt.pre_taps) = new_meters(config);
         rt.test_input = Some(source);
         for (row, gains) in config.matrix.iter().enumerate() {
             for (column, &g) in gains.iter().enumerate() {
@@ -8908,6 +8936,109 @@ mod tests {
         }
         assert!(skipped.contains_key(&(0, after + 3)) && skipped.contains_key(&(2, 23)));
         assert!(compared.len() > 5, "{compared:?}");
+    }
+
+    /// Two loops on one log metering a 1 kHz tone input with
+    /// `preStripMeter`, trimmed by 20 dB in its strip, the second
+    /// skipping blocks across the trim as after an overrun, read the same
+    /// pre-strip peaks, bit for bit, in every 100 ms window both meter
+    /// whole. The pre-strip meter reads the tone's peak before the trim
+    /// and after it alike, while the input's meter after the strip reads
+    /// it 20 dB down. Fails with the copy into `prebuf` moved after
+    /// `run_strip` in `Slot::finish`, the pre-strip meter then reading the
+    /// trim.
+    #[test]
+    fn a_pre_strip_meter_reads_the_input_before_its_trim_across_a_skip() {
+        let mut config = tone_config();
+        config.inputs[0].pre_strip_meter = true;
+        let api = samplez_mxl::load(&config.libmxl).unwrap();
+        let b = u64::from(config.block_size);
+        assert!(4800 % b == 0);
+        let per_window = 4800 / b;
+        // The trim at the start of window 10; the skip from window 9 to
+        // window 12, so the loop skipping it meters window 12 on whole.
+        let trim_at = 10 * 4800;
+        let skip = 9 * per_window..12 * per_window;
+        let run = |skip: &std::ops::Range<u64>| {
+            let (hashes, _) = rtrb::RingBuffer::new(1);
+            let (_, control) = rtrb::RingBuffer::new(1);
+            let mut rt = replay_rt(&config, &api, Vec::new(), hashes, control);
+            rt.replay = false;
+            (rt.buses, rt.taps, rt.pre_taps) = new_meters(&config);
+            let (meters, mut rx) = rtrb::RingBuffer::new(1 << 10);
+            rt.meters = meters;
+            let (ducks, _ducks) = rtrb::RingBuffer::new(1 << 10);
+            rt.duck_meters = ducks;
+            let (ret, _back) = rtrb::RingBuffer::new(64);
+            rt.ret = ret;
+            let params = ToneParams {
+                frequency_hz: 1000,
+                level_db: -6.0,
+                ident: false,
+            };
+            let entries = [
+                (0, Change::Tone { slot: 0, params }),
+                (
+                    trim_at,
+                    Change::Strip {
+                        slot: 0,
+                        param: StripParam::Trim { db: -20.0 },
+                    },
+                ),
+            ];
+            for (id, (at_index, change)) in entries.into_iter().enumerate() {
+                assert!(rt.mix.push(RtEntry {
+                    id: id as u64 + 1,
+                    at_index,
+                    change,
+                }));
+            }
+            let (tap, pre) = (1, 2);
+            let weights = || config.inputs[0].loudness_weights().unwrap();
+            let (mut post_l, mut pre_l) = (
+                OutputLoudness::new(weights()),
+                OutputLoudness::new(weights()),
+            );
+            let mut windows = std::collections::BTreeMap::new();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            for k in (0..30 * per_window).filter(|k| !skip.contains(k)) {
+                rt.process(k, u64::MAX);
+                while let Ok(r) = rx.pop() {
+                    match r.meter {
+                        m if m == tap => post_l.record(&r),
+                        m if m == pre => pre_l.record(&r),
+                        m => assert_eq!(m, 0),
+                    }
+                }
+                if let (Some(w), Some(v)) = (pre_l.meters.window, post_l.meters.window) {
+                    assert_eq!(w, v);
+                    windows.insert(w, (bits(&pre_l.meters.peak), bits(&post_l.meters.peak)));
+                }
+            }
+            windows
+        };
+        let whole = run(&(0..0));
+        let skipped = run(&skip);
+        assert!(!skipped.contains_key(&11) && skipped.contains_key(&12));
+        let level = whole[&5].0.clone();
+        let db = |v: f32| 20.0 * f64::from(v).log10();
+        for (w, (pre, post)) in &whole {
+            if *w >= 1 {
+                assert_eq!(*pre, level, "window {w}");
+            }
+            // Window 10 holds the trim's ramp.
+            if *w >= 11 {
+                for (p, q) in pre.iter().zip(post) {
+                    let (p, q) = (f32::from_bits(*p), f32::from_bits(*q));
+                    assert!((db(p) - db(q) - 20.0).abs() < 0.01, "window {w}");
+                }
+            } else if (1..10).contains(w) {
+                assert_eq!(pre, post, "window {w}");
+            }
+            if let Some(s) = skipped.get(w) {
+                assert_eq!(s.0, *pre, "window {w}");
+            }
+        }
     }
 
     /// Tone parameters are checked against the configuration: a slot

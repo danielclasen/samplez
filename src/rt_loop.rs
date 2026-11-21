@@ -741,6 +741,9 @@ pub(crate) struct Slot {
     /// The slot's tone generator, which it computes in place of a read;
     /// none on a slot that reads flows.
     pub tone: Option<Tone>,
+    /// Each block is copied into the slot's channels of `prebuf` before
+    /// the strip, for its pre-strip meter.
+    pub pre_strip: bool,
     /// The flow the slot reads from [`Rt::test_input`]: the re-routes
     /// swapped in so far. Its outgoing flow in a crossfade is the one
     /// before.
@@ -779,6 +782,7 @@ impl Slot {
             strip_pos: None,
             delay: None,
             tone: None,
+            pre_strip: false,
             #[cfg(test)]
             flow: 0,
         }
@@ -786,8 +790,22 @@ impl Slot {
 
     /// Runs the strip and the delay over block `dst` of `frames` samples
     /// per channel starting at sample index `start`, read, generated or
-    /// silenced, and copies it into the slot's channels of `inbuf`.
-    fn finish(&mut self, start: u64, dst: &mut [f32], frames: usize, inbuf: &mut PlanarBuffer) {
+    /// silenced, and copies it into the slot's channels of `inbuf`; with
+    /// [`Slot::pre_strip`], copies it before the strip into those of
+    /// `prebuf` too.
+    fn finish(
+        &mut self,
+        start: u64,
+        dst: &mut [f32],
+        frames: usize,
+        inbuf: &mut PlanarBuffer,
+        prebuf: &mut PlanarBuffer,
+    ) {
+        if self.pre_strip {
+            for (c, ch) in dst.chunks_exact(frames).enumerate() {
+                prebuf.channel_mut(self.first_channel + c)[..frames].copy_from_slice(ch);
+            }
+        }
         // Silenced blocks too: the strip's filters and dynamics ring out
         // on silence.
         self.run_strip(start, dst, frames);
@@ -861,7 +879,8 @@ fn strip_to(strip: &mut Option<Strip>, pos: &mut Option<u64>, index: u64) {
 }
 
 /// A meter on channels of a buffer the RT thread computes: one
-/// configured meter's matrix columns, or one input slot after its strip.
+/// configured meter's matrix columns, or one input slot after or before
+/// its strip.
 pub(crate) struct Metered {
     pub first_channel: usize,
     pub meter: OutMeter,
@@ -950,7 +969,8 @@ pub(crate) struct MeterRecord {
     /// shows that one was lost.
     pub seq: u64,
     /// The meter: the outputs, then the configured meters, then the
-    /// inputs, each in configuration order.
+    /// inputs, then the inputs' pre-strip meters, each in configuration
+    /// order.
     pub meter: u32,
     pub channel: u32,
     pub slice: u64,
@@ -1944,8 +1964,15 @@ pub(crate) struct Rt {
     pub buses: Vec<Metered>,
     /// Each input slot's meter, after its strip.
     pub taps: Vec<Metered>,
+    /// The meter before the strip of each input slot whose config sets
+    /// `preStripMeter`, on `prebuf`.
+    pub pre_taps: Vec<Metered>,
     pub mix: Mix,
     pub inbuf: PlanarBuffer,
+    /// The blocks of the slots with [`Slot::pre_strip`] before their
+    /// strips, laid out as `inbuf`; other slots' channels are left as
+    /// they are.
+    pub prebuf: PlanarBuffer,
     pub outbuf: PlanarBuffer,
     /// One input's or one output's channels, planar.
     pub scratch: Vec<f32>,
@@ -3495,7 +3522,7 @@ impl Rt {
             // of the index, never late, silenced or failed.
             if let Some(tone) = &mut slot.tone {
                 tone.process(start, dst, b);
-                slot.finish(start, dst, b, &mut self.inbuf);
+                slot.finish(start, dst, b, &mut self.inbuf, &mut self.prebuf);
                 continue;
             }
             // None for a slot in no input domain.
@@ -3647,7 +3674,7 @@ impl Rt {
                 }
                 slot.silenced_last = true;
             }
-            slot.finish(start, dst, b, &mut self.inbuf);
+            slot.finish(start, dst, b, &mut self.inbuf, &mut self.prebuf);
         }
 
         // Which meters a slot down feeds, on the coefficients' targets the
@@ -3786,23 +3813,27 @@ impl Rt {
         let outs = self
             .outs
             .iter_mut()
-            .map(|o| (&mut o.meter, o.first_channel, false));
+            .map(|o| (&mut o.meter, o.first_channel, &self.outbuf));
         let buses = self
             .buses
             .iter_mut()
-            .map(|m| (&mut m.meter, m.first_channel, false));
+            .map(|m| (&mut m.meter, m.first_channel, &self.outbuf));
         let taps = self
             .taps
             .iter_mut()
-            .map(|m| (&mut m.meter, m.first_channel, true));
-        for (i, (meter, first, input)) in outs.chain(buses).chain(taps).enumerate() {
+            .map(|m| (&mut m.meter, m.first_channel, &self.inbuf));
+        let pre_taps = self
+            .pre_taps
+            .iter_mut()
+            .map(|m| (&mut m.meter, m.first_channel, &self.prebuf));
+        let all = outs.chain(buses).chain(taps).chain(pre_taps);
+        for (i, (meter, first, buf)) in all.enumerate() {
             let mut sink = MeterSink {
                 meter: i as u32,
                 ring: &mut self.meters,
                 seq: &mut self.meter_seq,
                 counters: &self.counters,
             };
-            let buf = if input { &self.inbuf } else { &self.outbuf };
             meter.add(&mut sink, first, buf, k * self.block, b);
         }
 
@@ -5038,6 +5069,7 @@ mod tests {
             strip_pos: None,
             delay: None,
             tone: None,
+            pre_strip: false,
         }
     }
 

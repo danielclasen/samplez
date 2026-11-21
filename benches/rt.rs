@@ -27,9 +27,10 @@
 //! move on 64 stereo slots into 56 columns with every strip parameter
 //! unchanged.
 //! And on the block that ends a meter slice for 48 stereo outputs, with
-//! and without each correlating its legs. And on one block of 32 stereo
-//! outputs with their limiters on, alone and after a strip with every
-//! unit on and a delay line.
+//! and without each correlating its legs, and for 64 stereo inputs, with
+//! and without each metered before its strip as well. And on one block
+//! of 32 stereo outputs with their limiters on, alone and after a strip
+//! with every unit on and a delay line.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -833,7 +834,39 @@ fn slice_correlated() -> samplez::bench::Slice {
 const SLICE_PLAIN: u64 = 534_016;
 const SLICE_CORRELATED: u64 = 563_796;
 
-library_benchmark_group!(name = slices, benchmarks = [slice_end]);
+// The block that ends a meter slice for 64 stereo inputs feeding one
+// stereo output, every input metered, without and with every input
+// metered before its strip too (`preStripMeter`). The difference is the
+// copy of each input's block before its strip and its second meter.
+#[library_benchmark]
+#[bench::plain(setup = inputs_plain, config = limit(INPUTS_PLAIN))]
+#[bench::pre_strip(setup = inputs_pre_strip, config = limit(INPUTS_PRE_STRIP))]
+fn input_slice_end(mut s: samplez::bench::Slice) -> samplez::bench::Slice {
+    s.run();
+    s
+}
+
+fn inputs_setup(pre_strip: bool) -> samplez::bench::Slice {
+    let libmxl =
+        std::env::var("SAMPLEZ_TEST_LIBMXL").unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".into());
+    samplez::bench::Slice::inputs(&libmxl, 64, pre_strip)
+}
+
+fn inputs_plain() -> samplez::bench::Slice {
+    inputs_setup(false)
+}
+
+fn inputs_pre_strip() -> samplez::bench::Slice {
+    inputs_setup(true)
+}
+
+// Measured 380,424 and 690,760: the copies and the pre-strip meters of
+// 64 stereo inputs cost 310,336 instructions in the block that ends a
+// slice, about 2,425 an input.
+const INPUTS_PLAIN: u64 = 418_467;
+const INPUTS_PRE_STRIP: u64 = 759_836;
+
+library_benchmark_group!(name = slices, benchmarks = [slice_end, input_slice_end]);
 
 // One block of 32 stereo outputs, each with its limiter on: alone, and
 // after a strip with every unit on and a delay line delaying, their
