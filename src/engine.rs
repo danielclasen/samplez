@@ -934,7 +934,7 @@ fn check_duck(config: &Config, group: usize, setting: &DuckSetting) -> Result<()
 /// from `input` to `output`: it exists, and a mask other than 0 is of a
 /// column in `duckColumns`.
 fn check_mask(config: &Config, input: usize, output: usize, mask: u8) -> Result<(), String> {
-    if input >= config.input_channels() || output >= config.columns() {
+    if input >= config.rows() || output >= config.columns() {
         return Err(format!("no matrix coefficient {input} -> {output}"));
     }
     if mask != 0 && !config.duck_columns.contains(&output) {
@@ -968,7 +968,7 @@ fn check_product_ducks(config: &Config, state: &ProductState) -> Result<(), Stri
             check_duck(config, g, &setting)?;
         }
     }
-    let (n, m) = (config.input_channels(), config.columns());
+    let (n, m) = (config.rows(), config.columns());
     if !state.masks.is_empty() {
         if state.masks.len() != n || state.masks.iter().any(|row| row.len() != m) {
             return Err(format!("duck masks not of the shape {n} x {m}"));
@@ -1523,6 +1523,7 @@ fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
     let mut in_domains: Vec<usize> = Vec::new();
     let mut slots = Vec::new();
     let mut channel = 0;
+    let mut pre_row = config.input_channels();
     for i in &config.inputs {
         let domain = match i.domain.as_deref().filter(|_| i.tone.is_none()) {
             None => NO_DOMAIN,
@@ -1545,6 +1546,10 @@ fn new_slots(config: &Config) -> (Vec<Slot>, Vec<usize>) {
         // generator reads none for good.
         slot.detached = i.flow_id.is_none();
         slot.pre_strip = i.pre_strip_meter;
+        if i.pre_strip_rows {
+            slot.pre_row = Some(pre_row);
+            pre_row += i.channels as usize;
+        }
         if i.tone.is_some() {
             slot.tone = Some(Tone::new(
                 i.channels as usize,
@@ -1618,7 +1623,7 @@ pub(crate) fn replay_rt(
 ) -> Rt {
     let b = u64::from(config.block_size);
     let (slots, in_domains) = new_slots(config);
-    let (n, m) = (config.input_channels(), config.columns());
+    let (n, m) = (config.rows(), config.columns());
     let mut channel = 0;
     let outs = config
         .outputs
@@ -1974,7 +1979,7 @@ impl Engine {
                     seq: 0,
                     spare: None,
                     shape: (
-                        config.input_channels(),
+                        config.rows(),
                         config.columns(),
                         config.inputs.len(),
                         page_entries,
@@ -2049,7 +2054,7 @@ impl Engine {
         let out_delays: Vec<Option<Arc<DelayRings>>> = (outs.iter())
             .map(|o| o.delay.as_ref().map(|d| Arc::clone(d.rings())))
             .collect();
-        let (n, m) = (config.input_channels(), config.columns());
+        let (n, m) = (config.rows(), config.columns());
         let mut matrix = Matrix::new(n, m);
         let (buses, taps, pre_taps) = new_meters(&config);
         for (i, row) in config.matrix.iter().enumerate() {
@@ -8936,6 +8941,102 @@ mod tests {
         }
         assert!(skipped.contains_key(&(0, after + 3)) && skipped.contains_key(&(2, 23)));
         assert!(compared.len() > 5, "{compared:?}");
+    }
+
+    /// A tone input with `preStripRows` feeds its pre-strip rows, after
+    /// the input's rows, untrimmed: an output whose leg 0 takes the
+    /// input's row 0 reads a -20 dB trim, while its leg 1, on the
+    /// pre-strip row of the input's second channel, stays the formula,
+    /// bit for bit. A core copied at block P, with a gain on that
+    /// pre-strip row pending at it, continues both legs in a second loop
+    /// with the same bits, the gain applied on the same row. Fails with
+    /// the copy into the pre-strip rows moved after `run_strip` in
+    /// `Slot::finish`, leg 1 then reading the trim.
+    #[test]
+    fn pre_strip_rows_carry_the_input_before_its_trim_into_a_copied_core() {
+        let mut config = tone_config();
+        config.inputs[0].pre_strip_rows = true;
+        config.matrix = vec![vec![0.0; 2]; 4];
+        assert_eq!(config.rows(), 4);
+        let api = samplez_mxl::load(&config.libmxl).unwrap();
+        let rt = || {
+            let (hashes, _) = rtrb::RingBuffer::new(1);
+            let (_, control) = rtrb::RingBuffer::new(1);
+            replay_rt(&config, &api, Vec::new(), hashes, control)
+        };
+        let b = u64::from(config.block_size);
+        let first = (1u64 << 40) / b;
+        let mut a = rt();
+        assert!(a.mix.matrix.set(0, 0, 1.0, 0) && a.mix.matrix.set(3, 1, 1.0, 0));
+        let params = ToneParams {
+            frequency_hz: 997,
+            level_db: -6.0,
+            ident: false,
+        };
+        let trim = StripParam::Trim { db: -20.0 };
+        let (input, output, gain, fade) = (3, 1, 0.5, None);
+        let entries = [
+            (first + 2, Change::Tone { slot: 0, params }),
+            (
+                first + 20,
+                Change::Strip {
+                    slot: 0,
+                    param: trim,
+                },
+            ),
+            (
+                first + 150,
+                Change::Gain {
+                    input,
+                    output,
+                    gain,
+                    fade,
+                },
+            ),
+        ];
+        for (id, (k, change)) in entries.into_iter().enumerate() {
+            let at_index = k * b;
+            assert!(a.mix.push(RtEntry {
+                id: id as u64 + 1,
+                at_index,
+                change
+            }));
+        }
+        let leg = |rt: &Rt, c: usize| rt.outbuf.channel(c)[..b as usize].to_vec();
+        let ramp = u64::from(config.ramp_samples).div_ceil(b);
+        let level = samplez_dsp::tone::level_gain(-6.0);
+        let want =
+            |k: u64, j: usize| level * samplez_dsp::tone::sine(k * b + j as u64, 997, 48_000);
+        let p = first + 140;
+        for k in first..=p {
+            a.process(k, u64::MAX);
+            if k > first + 20 + ramp {
+                for (j, (&x, &y)) in leg(&a, 0).iter().zip(&leg(&a, 1)).enumerate() {
+                    assert_eq!(y.to_bits(), want(k, j).to_bits(), "leg 1 at block {k}");
+                    assert!((x - 0.1 * want(k, j)).abs() < 1e-4, "leg 0 at block {k}");
+                }
+            }
+        }
+        assert_eq!(a.counters.strip_refused.load(Relaxed), 0);
+        let (rows, outputs) = (config.rows(), config.output_channels());
+        let mut core = Box::new(Core::new(rows, outputs, 1, 64, 1));
+        a.capture(&mut core);
+        let mut c = rt();
+        c.install_core(&mut core, 3, true);
+        for k in p + 1..p + 400 {
+            a.process(k, u64::MAX);
+            c.process(k, u64::MAX);
+            for ch in 0..2 {
+                let (x, y) = (leg(&a, ch), leg(&c, ch));
+                let same = x.iter().zip(&y).all(|(x, y)| x.to_bits() == y.to_bits());
+                assert!(same, "block {k} leg {ch}");
+            }
+            if k > first + 150 + ramp {
+                for (j, &y) in leg(&c, 1).iter().enumerate() {
+                    assert!((y - 0.5 * want(k, j)).abs() < 1e-6, "leg 1 at block {k}");
+                }
+            }
+        }
     }
 
     /// Two loops on one log metering a 1 kHz tone input with

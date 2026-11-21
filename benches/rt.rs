@@ -28,9 +28,10 @@
 //! unchanged.
 //! And on the block that ends a meter slice for 48 stereo outputs, with
 //! and without each correlating its legs, and for 64 stereo inputs, with
-//! and without each metered before its strip as well. And on one block
-//! of 32 stereo outputs with their limiters on, alone and after a strip
-//! with every unit on and a delay line.
+//! and without each metered before its strip or feeding the matrix
+//! from before its strip as well. And on one block of 32 stereo outputs
+//! with their limiters on, alone and after a strip with every unit on
+//! and a delay line.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -836,28 +837,35 @@ const SLICE_CORRELATED: u64 = 563_796;
 
 // The block that ends a meter slice for 64 stereo inputs feeding one
 // stereo output, every input metered, without and with every input
-// metered before its strip too (`preStripMeter`). The difference is the
-// copy of each input's block before its strip and its second meter.
+// metered before its strip too (`preStripMeter`), and with every input
+// feeding the output from its pre-strip rows as well (`preStripRows`).
+// The differences are the copies of each input's block before its strip
+// and its second meter, and the copies and the 256 coefficients more.
 #[library_benchmark]
 #[bench::plain(setup = inputs_plain, config = limit(INPUTS_PLAIN))]
 #[bench::pre_strip(setup = inputs_pre_strip, config = limit(INPUTS_PRE_STRIP))]
+#[bench::pre_strip_rows(setup = inputs_pre_strip_rows, config = limit(INPUTS_PRE_STRIP_ROWS))]
 fn input_slice_end(mut s: samplez::bench::Slice) -> samplez::bench::Slice {
     s.run();
     s
 }
 
-fn inputs_setup(pre_strip: bool) -> samplez::bench::Slice {
+fn inputs_setup(pre_strip: bool, rows: bool) -> samplez::bench::Slice {
     let libmxl =
         std::env::var("SAMPLEZ_TEST_LIBMXL").unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".into());
-    samplez::bench::Slice::inputs(&libmxl, 64, pre_strip)
+    samplez::bench::Slice::inputs(&libmxl, 64, pre_strip, rows)
 }
 
 fn inputs_plain() -> samplez::bench::Slice {
-    inputs_setup(false)
+    inputs_setup(false, false)
 }
 
 fn inputs_pre_strip() -> samplez::bench::Slice {
-    inputs_setup(true)
+    inputs_setup(true, false)
+}
+
+fn inputs_pre_strip_rows() -> samplez::bench::Slice {
+    inputs_setup(false, true)
 }
 
 // Measured 380,424 and 690,760: the copies and the pre-strip meters of
@@ -865,6 +873,9 @@ fn inputs_pre_strip() -> samplez::bench::Slice {
 // slice, about 2,425 an input.
 const INPUTS_PLAIN: u64 = 418_467;
 const INPUTS_PRE_STRIP: u64 = 759_836;
+// Measured 389,051, 8,896 above `plain`: the copies into the pre-strip
+// rows and the 256 coefficients they add.
+const INPUTS_PRE_STRIP_ROWS: u64 = 427_957;
 
 library_benchmark_group!(name = slices, benchmarks = [slice_end, input_slice_end]);
 

@@ -744,6 +744,11 @@ pub(crate) struct Slot {
     /// Each block is copied into the slot's channels of `prebuf` before
     /// the strip, for its pre-strip meter.
     pub pre_strip: bool,
+    /// The first of the slot's pre-strip matrix rows, after every
+    /// input's rows: each block is copied into these channels of `inbuf`
+    /// before the strip. None on a slot whose config does not set
+    /// `preStripRows`.
+    pub pre_row: Option<usize>,
     /// The flow the slot reads from [`Rt::test_input`]: the re-routes
     /// swapped in so far. Its outgoing flow in a crossfade is the one
     /// before.
@@ -783,6 +788,7 @@ impl Slot {
             delay: None,
             tone: None,
             pre_strip: false,
+            pre_row: None,
             #[cfg(test)]
             flow: 0,
         }
@@ -792,7 +798,8 @@ impl Slot {
     /// per channel starting at sample index `start`, read, generated or
     /// silenced, and copies it into the slot's channels of `inbuf`; with
     /// [`Slot::pre_strip`], copies it before the strip into those of
-    /// `prebuf` too.
+    /// `prebuf` too, and with [`Slot::pre_row`] into its pre-strip rows
+    /// of `inbuf`.
     fn finish(
         &mut self,
         start: u64,
@@ -804,6 +811,11 @@ impl Slot {
         if self.pre_strip {
             for (c, ch) in dst.chunks_exact(frames).enumerate() {
                 prebuf.channel_mut(self.first_channel + c)[..frames].copy_from_slice(ch);
+            }
+        }
+        if let Some(row) = self.pre_row {
+            for (c, ch) in dst.chunks_exact(frames).enumerate() {
+                inbuf.channel_mut(row + c)[..frames].copy_from_slice(ch);
             }
         }
         // Silenced blocks too: the strip's filters and dynamics ring out
@@ -1356,16 +1368,21 @@ fn flags(m: usize, gaps: u128, paused: u128, diverged: bool) -> u8 {
 /// Whether an input channel of a slot in `down` feeds one of `columns`
 /// of `matrix`: at most one look at each of their coefficients.
 fn feeds(matrix: &Matrix, slots: &[Slot], down: u64, columns: Range<usize>) -> bool {
-    // Slots hold ascending channels, so their ranges ascend in bit order.
-    let rows = || {
+    // Slots hold ascending channels, so their ranges ascend in bit order,
+    // and their pre-strip rows, after every input's rows, as well.
+    let down_slots = || {
         let mut rest = down;
         std::iter::from_fn(move || {
             (rest != 0).then(|| {
                 let s = &slots[rest.trailing_zeros() as usize];
                 rest &= rest - 1;
-                s.first_channel..s.first_channel + s.channels
+                s
             })
         })
+    };
+    let rows = || {
+        (down_slots().map(|s| s.first_channel..s.first_channel + s.channels))
+            .chain(down_slots().filter_map(|s| s.pre_row.map(|r| r..r + s.channels)))
     };
     columns.into_iter().any(|c| matrix.feeds(rows(), c))
 }
@@ -1411,11 +1428,12 @@ impl SkipState {
 
     /// The meters of `outs` then `buses` by bit that slot `s` feeds.
     fn feeds_of(matrix: &Matrix, s: &Slot, outs: &[Out], buses: &[Metered]) -> u128 {
-        let rows = s.first_channel..s.first_channel + s.channels;
+        let rows = std::iter::once(s.first_channel..s.first_channel + s.channels)
+            .chain(s.pre_row.map(|r| r..r + s.channels));
         let meters = (outs.iter().map(|o| (o.first_channel, o.meter.peak.len())))
             .chain(buses.iter().map(|m| (m.first_channel, m.meter.peak.len())));
         meters.enumerate().fold(0, |f, (i, (first, n))| {
-            let fed = (first..first + n).any(|c| matrix.feeds(std::iter::once(rows.clone()), c));
+            let fed = (first..first + n).any(|c| matrix.feeds(rows.clone(), c));
             f | u128::from(fed) << i
         })
     }
@@ -1494,10 +1512,18 @@ impl SkipState {
         let Some((up, detached)) = self.slots.as_mut() else {
             return;
         };
+        // An input's row, or a pre-strip row after every input's.
         let slot_of = |row: usize| {
-            slots
-                .partition_point(|s| s.first_channel <= row)
-                .saturating_sub(1)
+            let pre = |s: &Slot| {
+                s.pre_row
+                    .is_some_and(|r| (r..r + s.channels).contains(&row))
+            };
+            let inputs = slots.last().map_or(0, |s| s.first_channel + s.channels);
+            if row < inputs {
+                (slots.partition_point(|s| s.first_channel <= row)).saturating_sub(1)
+            } else {
+                slots.iter().position(pre).unwrap_or(0)
+            }
         };
         match e.change {
             Change::InputDown { slot } => *up &= !bit(slot),
@@ -5070,6 +5096,7 @@ mod tests {
             delay: None,
             tone: None,
             pre_strip: false,
+            pre_row: None,
         }
     }
 
