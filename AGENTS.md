@@ -101,12 +101,12 @@ Weakening one is a design change: say so and agree it first.
   (duck detector state, a mask crossfade over a depth changed more than
   once within it, a depth changed again while its earlier ramp ran, the
   later change after the second last end of a duck gain interval
-  before the install index or at it) cost one diverged page and a
-  resync; do not widen that list. Signal state outside product state
-  (the filter and envelope state of input and output strips, limiters,
-  delay lines) follows the samples an engine computed and is copied
-  only by a resync, so a rebuild from product state alone does not
-  carry it.
+  before the install index or at it, and signal state outside product
+  state: the filter and envelope state of input and output strips, the
+  limiters' state and the delay lines' history and taps (a crossfade
+  in flight), which follow the samples an engine computed and only a
+  resync copies) cost one
+  diverged page and a resync; do not widen that list.
   Enforced by: the replay, install and rebuild tests in
   `tests/transfer.rs` (`a_replayed_core_computes_the_donors_pages`,
   `a_replayed_core_carries_*`, `a_product_core_installs_at_the_index_*`,

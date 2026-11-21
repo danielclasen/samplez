@@ -784,6 +784,93 @@ fn a_replayed_core_carries_the_delay_history() {
     });
 }
 
+/// The resync row with an output's delay line, as with an input's: a
+/// joiner whose input was trimmed apart until shortly before the copy
+/// holds another history in its output's line, which the output plays for
+/// the delay after the trims met. The core copy carries the donor's
+/// history and the hand-over writes the replay's into the joiner's other
+/// rings, so from the hand-over on the joiner computes the donor's pages
+/// bit for bit; keeping its own history, it would differ for the rest of
+/// the delay.
+#[test]
+fn a_replayed_core_carries_the_output_delay_history() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let delayed = |c: &mut Config| c.outputs[0].max_delay_samples = 96_000;
+        let (a, b) = (
+            hashed_of(&domain, &[(&src, 2)], delayed),
+            hashed_of(&domain, &[(&src, 2)], delayed),
+        );
+        // Entry 1 delays both by 2 s; entry 2 trims the joiner apart,
+        // entry 3 brings it back.
+        let at1 = (now_block() + 20) * B;
+        const D: u64 = 96_000;
+        let delay = Entry::OutputDelay {
+            output: 0,
+            samples: D as u32,
+        };
+        for e in [&a.e, &b.e] {
+            e.append(1, at1, delay.clone()).unwrap();
+            e.commit(1);
+        }
+        strip(&a.e, 2, at1, StripParam::Trim { db: 0.0 });
+        strip(&b.e, 2, at1, StripParam::Trim { db: -6.0 });
+        // The trims meet a second after the trimmed history begins to play:
+        // the joiner's output differs from at1 + D to at3 + D.
+        let at3 = at1 + D + 48_000;
+        for e in [&a.e, &b.e] {
+            strip(e, 3, at3, StripParam::Trim { db: 0.0 });
+        }
+        let heard = at1 + D + 4_800;
+        wait_for(Duration::from_secs(10), "the trimmed history heard", || {
+            processed(&a.e) > heard / B && processed(&b.e) > heard / B
+        });
+        let copy = copy(&a.e);
+        let k0 = copy.k0;
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+        let mut replay = b.e.replay(copy).unwrap();
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        // The pages compared lie before the trimmed history has played.
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        if (from + 8) * PAGE > at3 + D {
+            return Err(format!(
+                "handed over at block {j}, past the trimmed history"
+            ));
+        }
+        let before = (k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE;
+        let end = (from + 8) * PAGE / B + PAGE / B;
+        wait_for(Duration::from_secs(10), "pages compared", || {
+            processed(&a.e) > end && processed(&b.e) > end
+        });
+        let (pa, pb) = (a.pages(), b.pages());
+        let disturbed: Vec<u64> = a.disturbed().into_iter().chain(b.disturbed()).collect();
+        let differ = before
+            .filter(|p| matches!((pa.get(p), pb.get(p)), (Some(x), Some(y)) if x.hash != y.hash))
+            .count();
+        assert!(differ > 0, "the joiner never diverged");
+        for p in from..from + 8 {
+            if disturbed.contains(&p) {
+                return Err(format!("page {p} disturbed"));
+            }
+            let (Some(ha), Some(hb)) = (pa.get(&p), pb.get(&p)) else {
+                return Err(format!("page {p} not hashed by both"));
+            };
+            assert_eq!(
+                (hb.hash, hb.fingerprint),
+                (ha.hash, ha.fingerprint),
+                "page {p}"
+            );
+        }
+        Ok(())
+    });
+}
+
 /// A product state's delays are set at the install, the delay lines
 /// keeping their history: an input delayed in the state plays late
 /// after the install. A delay beyond a slot's line is refused before
@@ -834,6 +921,49 @@ fn a_product_state_sets_the_delay() {
     // its copy names the state's last id.
     assert_eq!(k0.last_id, 1, "the installed state's last id");
     let taps = k0.core.delay_taps(0).unwrap();
+    assert_eq!((taps.from, taps.to), (0, 4800), "{taps:?}");
+    assert_eq!(taps.start, (j + 1) * B);
+}
+
+/// A product state's output delays are set at the install, as an input's,
+/// the line keeping its history. A delay beyond an output's line, or one
+/// of an output the engine lacks, is refused before anything changes.
+#[test]
+fn a_product_state_sets_the_output_delay() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed_of(&domain, &[(&src, 2)], |c| {
+        c.outputs[0].max_delay_samples = 4800;
+    });
+    let state = |output_delays| ProductState {
+        gains: common::diagonal(2, 1.0),
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        strips: vec![Vec::new()],
+        output_delays,
+        last_id: 1,
+        ..Default::default()
+    };
+    let refused = |s: &ProductState| {
+        matches!(
+            h.e.install_product(s, 0, Duration::from_secs(2)),
+            Err(ReplayError::Invalid(_))
+        )
+    };
+    assert!(refused(&state(vec![4801])), "a delay beyond the line");
+    assert!(refused(&state(vec![4800, 0])), "a second output");
+    h.e.drop_core().unwrap();
+    let j = (h.e)
+        .install_product(&state(vec![4800]), 0, Duration::from_secs(2))
+        .unwrap();
+    let k0 = loop {
+        let c = copy(&h.e);
+        if c.k0 > j {
+            break c;
+        }
+    };
+    let taps = k0.core.output_delay_taps(0).expect("output 0's line");
     assert_eq!((taps.from, taps.to), (0, 4800), "{taps:?}");
     assert_eq!(taps.start, (j + 1) * B);
 }

@@ -73,9 +73,10 @@ pub struct Config {
     /// beyond the read window.
     #[serde(default = "default_resync_budget_ms")]
     pub resync_budget_ms: u32,
-    /// The most delay-line history the inputs may hold together:
-    /// `maxDelaySamples` times `channels`, summed over the inputs, in
-    /// samples; a resync copies at most that much. 2^22 by default.
+    /// The most delay-line history the inputs and outputs may hold
+    /// together: `maxDelaySamples` times `channels`, summed over the
+    /// inputs and outputs, in samples; a resync copies at most that much.
+    /// 2^22 by default.
     #[serde(default = "default_delay_budget")]
     pub delay_budget_samples: u64,
     /// Path of the libmxl shared library.
@@ -262,6 +263,13 @@ pub struct Output {
     /// At most [`samplez_dsp::strip::MAX_LEGS`] channels wide.
     #[serde(default)]
     pub strip: bool,
+    /// The longest delay an `OutputDelay` entry may set on the output, in
+    /// samples, at most `samplez_dsp::MAX_DELAY_SAMPLES` (5 s); 0, the
+    /// default, gives the output no delay line. As an input's: its rings
+    /// are allocated at start and count in `delayBudgetSamples`. The line
+    /// runs after the strip and before the limiter.
+    #[serde(default)]
+    pub max_delay_samples: u32,
 }
 
 impl Output {
@@ -521,11 +529,15 @@ impl Config {
         }
         let delays: u64 = (self.inputs.iter())
             .map(|i| u64::from(i.max_delay_samples) * u64::from(i.channels))
+            .chain(
+                (self.outputs.iter())
+                    .map(|o| u64::from(o.max_delay_samples) * u64::from(o.channels)),
+            )
             .sum();
         if delays > self.delay_budget_samples {
             return fail(format!(
-                "maxDelaySamples times channels sums to {delays} samples over the inputs, above \
-                 delayBudgetSamples {}",
+                "maxDelaySamples times channels sums to {delays} samples over the inputs and \
+                 outputs, above delayBudgetSamples {}",
                 self.delay_budget_samples
             ));
         }
@@ -658,6 +670,14 @@ impl Config {
                 return fail(format!(
                     "output {}: 1 channel, correlation takes at least 2",
                     o.name
+                ));
+            }
+            if o.max_delay_samples > samplez_dsp::MAX_DELAY_SAMPLES {
+                return fail(format!(
+                    "output {}: maxDelaySamples {} is above {}",
+                    o.name,
+                    o.max_delay_samples,
+                    samplez_dsp::MAX_DELAY_SAMPLES
                 ));
             }
         }
@@ -885,6 +905,35 @@ mod tests {
         v["inputs"][0]["maxDelaySamples"] = serde_json::json!(240_001);
         let e = parse(&v).unwrap_err().to_string();
         assert!(e.contains("maxDelaySamples 240001 is above 240000"), "{e}");
+    }
+
+    /// An output has no delay line unless `maxDelaySamples` names one, at
+    /// most 5 s, and its line counts in the budget the inputs' lines share:
+    /// an input's and an output's lines together over it are refused.
+    #[test]
+    fn an_output_delay_line_is_opt_in_and_counts_in_the_budget() {
+        assert_eq!(parse(&base()).unwrap().outputs[0].max_delay_samples, 0);
+        let mut v = base();
+        v["outputs"][0]["maxDelaySamples"] = serde_json::json!(240_000);
+        assert_eq!(parse(&v).unwrap().outputs[0].max_delay_samples, 240_000);
+        v["outputs"][0]["maxDelaySamples"] = serde_json::json!(240_001);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(
+            e.contains("output out: maxDelaySamples 240001 is above 240000"),
+            "{e}"
+        );
+        // 2 input channels of 1000 and 1 output channel of 2000.
+        v["inputs"][0]["maxDelaySamples"] = serde_json::json!(1000);
+        v["outputs"][0]["maxDelaySamples"] = serde_json::json!(2000);
+        v["delayBudgetSamples"] = serde_json::json!(4000);
+        assert!(parse(&v).is_ok(), "4000 of 4000");
+        v["delayBudgetSamples"] = serde_json::json!(3999);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(
+            e.contains("sums to 4000 samples over the inputs and outputs")
+                && e.contains("delayBudgetSamples 3999"),
+            "{e}"
+        );
     }
 
     /// An input's flow is optional: absent or null starts it without one,

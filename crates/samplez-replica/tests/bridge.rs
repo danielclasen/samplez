@@ -521,6 +521,62 @@ fn a_delay_beyond_the_line_is_replaced_by_none() {
     assert_eq!(copy.core.delay_taps(0).unwrap().to, 0);
 }
 
+/// An output delay beyond the output's delay line is replaced by none, as
+/// a rebuild replaces it in the product state; counted as replaced. A
+/// product state naming such a delay, and one of an output the engine
+/// lacks, is rebuilt with the first replaced and the second left out.
+/// Fails with no neutral form of `Entry::OutputDelay` in
+/// `EngineAudio::admitted`, which leaves the entry out and the delay at
+/// 240, or with the state's output delays left unfiltered, which the
+/// engine refuses whole.
+#[test]
+fn an_output_delay_beyond_the_line_is_replaced_by_none() {
+    let domain = Domain::new();
+    let flow = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a";
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "in0", "domain": "d", "flowId": flow, "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d",
+                      "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01", "label": "bridge",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1,
+                      "maxDelaySamples": 480 }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (engine, audio) = bridge_of(&v, 1 << 16);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let at = (engine.progress().unwrap().processed.unwrap() + 100) * B;
+    let delay = |samples| Entry::OutputDelay { output: 0, samples };
+    audio.appended(3, at, &[delay(240)]);
+    audio.committed(3);
+    let at2 = at + 10 * B;
+    audio.appended(4, at2, &[delay(481)]);
+    audio.committed(4);
+    assert_eq!(audio.sample().entries_filtered, 1);
+    wait_for("its index passed", || {
+        engine.progress().unwrap().processed.unwrap() > at2 / B + 2
+    });
+    let copy = engine.copy_core(Duration::from_secs(2)).unwrap();
+    let taps = copy.core.output_delay_taps(0).expect("output 0's line");
+    assert_eq!(taps.to, 0);
+    let state = samplez::ProductState {
+        gains: vec![vec![1.0]],
+        up: vec![true],
+        flows: vec![Some(flow.to_owned())],
+        strips: vec![Vec::new()],
+        output_delays: vec![481, 7],
+        last_id: 4,
+        ..Default::default()
+    };
+    audio.drop_engine();
+    assert!(audio.rebuild_engine(&state, 0), "not rebuilt");
+}
+
 /// A `LoudnessRun` or loudness reset of a meter the engine lacks is left
 /// out of a record and counted, one of its own meter passes through; a
 /// product state naming meters beyond the engine's rebuilds it with those

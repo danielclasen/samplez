@@ -27,7 +27,9 @@
 //! move on 64 stereo slots into 56 columns with every strip parameter
 //! unchanged.
 //! And on the block that ends a meter slice for 48 stereo outputs, with
-//! and without each correlating its legs.
+//! and without each correlating its legs. And on one block of 32 stereo
+//! outputs with their limiters on, alone and after a strip with every
+//! unit on and a delay line.
 //! The hard limits are the instruction counts measured in the builder
 //! image plus 10 %, rounded up; a run above a limit fails.
 
@@ -833,6 +835,40 @@ const SLICE_CORRELATED: u64 = 563_796;
 
 library_benchmark_group!(name = slices, benchmarks = [slice_end]);
 
+// One block of 32 stereo outputs, each with its limiter on: alone, and
+// after a strip with every unit on and a delay line delaying, their
+// ramps ended. The limiter-only count is what an output that does not
+// opt in costs, which the strip and the delay line must not move.
+#[library_benchmark]
+#[bench::limiter_only(setup = outputs_limited, config = limit(OUTPUTS_LIMITER_ONLY))]
+#[bench::processed(setup = outputs_processed, config = limit(OUTPUTS_PROCESSED))]
+fn output_block(mut o: samplez::bench::Outputs) -> samplez::bench::Outputs {
+    o.run();
+    o
+}
+
+fn outputs_setup(processed: bool) -> samplez::bench::Outputs {
+    let libmxl =
+        std::env::var("SAMPLEZ_TEST_LIBMXL").unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".into());
+    samplez::bench::Outputs::new(&libmxl, 32, processed)
+}
+
+fn outputs_limited() -> samplez::bench::Outputs {
+    outputs_setup(false)
+}
+
+fn outputs_processed() -> samplez::bench::Outputs {
+    outputs_setup(true)
+}
+
+// Measured 614,039 and 1,435,127. The limiter-only block measured
+// 613,421 before outputs could have a strip or a delay line: an output
+// that opts into neither costs about 19 instructions more for the checks.
+const OUTPUTS_LIMITER_ONLY: u64 = 675_443;
+const OUTPUTS_PROCESSED: u64 = 1_578_640;
+
+library_benchmark_group!(name = outputs, benchmarks = [output_block]);
+
 library_benchmark_group!(
     name = batches,
     benchmarks = [batch_recall, duck_batch, product_fill, targets_diff]
@@ -844,5 +880,6 @@ main!(
     strips,
     batches,
     skips,
-    slices
+    slices,
+    outputs
 );

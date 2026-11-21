@@ -273,6 +273,7 @@ impl EngineAudio {
                 params: samplez_dsp::LimiterParams::OFF,
             },
             &Entry::Delay { slot, .. } => Entry::Delay { slot, samples: 0 },
+            &Entry::OutputDelay { output, .. } => Entry::OutputDelay { output, samples: 0 },
             &Entry::Tone { slot, .. } => tone_entry(slot, samplez_dsp::ToneParams::DEFAULT),
             _ => return Some(entry.clone()),
         };
@@ -332,8 +333,8 @@ impl EngineAudio {
     /// rules of [`EngineAudio::kept`] and else left at the one read; a
     /// strip parameter, duck setting or duck mask the engine refuses is
     /// replaced as the live filter replaces it ([`EngineAudio::admitted`])
-    /// or left out, output strip, limiter and tone parameters too, those
-    /// of an output beyond the engine's left out; a gain it refuses is
+    /// or left out, output strip, limiter, delay and tone parameters too,
+    /// those of an output beyond the engine's left out; a gain it refuses is
     /// silenced, as the state machine
     /// derives it for every replica
     /// ([`crate::state_machine::StateMachine::product_state`] holds none).
@@ -436,6 +437,27 @@ impl EngineAudio {
             }) {
                 Some(Entry::Delay { samples: s, .. }) if s == *samples => {}
                 Some(Entry::Delay { samples: s, .. }) => {
+                    *samples = s;
+                    dropped += 1;
+                }
+                _ => {
+                    *samples = 0;
+                    dropped += 1;
+                }
+            }
+        }
+        // An output delay the engine refuses is replaced as the live filter
+        // replaces it: no delay; those of outputs beyond the engine's left
+        // out.
+        dropped += state.output_delays.len().saturating_sub(self.outputs);
+        state.output_delays.truncate(self.outputs);
+        for (output, samples) in state.output_delays.iter_mut().enumerate() {
+            match self.admitted(&Entry::OutputDelay {
+                output,
+                samples: *samples,
+            }) {
+                Some(Entry::OutputDelay { samples: s, .. }) if s == *samples => {}
+                Some(Entry::OutputDelay { samples: s, .. }) => {
                     *samples = s;
                     dropped += 1;
                 }

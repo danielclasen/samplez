@@ -96,8 +96,10 @@ pub struct Counters {
     /// the generation arrives in time or not.
     pub generation_past_margin: AtomicU64,
     /// Strip entries the slot's or output's strip refused, or for one
-    /// without a strip, and limiter entries for an output without a
-    /// limiter: not applied, and each one marks the engine diverged.
+    /// without a strip, limiter entries for an output without a limiter,
+    /// delays a slot's or output's line refused and tone entries a
+    /// generator refused or a slot without one got: not applied, and each
+    /// one marks the engine diverged.
     pub strip_refused: AtomicU64,
     /// Duck settings a detector refused: not applied. The engine checks
     /// them against its configuration when they are appended, so none is
@@ -526,6 +528,8 @@ pub(crate) enum Change {
     },
     /// Sets the slot's delay from the index, in samples.
     Delay { slot: usize, samples: u32 },
+    /// Sets the output's delay from the index, in samples.
+    OutputDelay { output: usize, samples: u32 },
     /// Sets the slot's tone generator from the index.
     Tone { slot: usize, params: ToneParams },
     /// The output is written from the index on, once it has a writer, or
@@ -540,8 +544,8 @@ pub(crate) enum Change {
     /// window starting at or after the index.
     ResetLoudness { meter: usize },
     /// The engine entries of one log entry, folded: its gains, strip,
-    /// output strip, limiter, delay and tone parameters (`strips` says
-    /// whether it has any),
+    /// output strip, limiter, delay, output delay and tone parameters
+    /// (`strips` says whether it has any),
     /// `InputDown`s, `Output`s, `LoudnessRun`s and loudness resets
     /// (`resets` says whether it has any) in
     /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
@@ -611,6 +615,7 @@ impl Change {
             | Change::OutputStrip { .. }
             | Change::Limiter { .. }
             | Change::Delay { .. }
+            | Change::OutputDelay { .. }
             | Change::Tone { .. } => strips,
             Change::InputUp { .. }
             | Change::Route { .. }
@@ -881,26 +886,36 @@ pub(crate) struct Out {
     pub strip: Option<Strip>,
     /// The index of the next sample the strip processes.
     pub strip_pos: Option<u64>,
+    /// The output's delay line, when configured: run on every block
+    /// computed, after the strip and before the limiter.
+    pub delay: Option<Delay>,
     /// The output's limiter, when configured: run on every block
     /// computed, before the write, the page hash and the meters.
     pub limiter: Option<Limiter>,
 }
 
 impl Out {
-    /// Runs the strip, then the limiter, over the output's channels of
-    /// block `buf`, `frames` samples per channel starting at sample index
-    /// `start`, through `scratch`, before anything reads them: the write,
-    /// the page hash and the output's meter see what leaves. An output
-    /// with neither is left as the matrix computed it.
+    /// Runs the strip, then the delay line, then the limiter, over the
+    /// output's channels of block `buf`, `frames` samples per channel
+    /// starting at sample index `start`, through `scratch`, before anything
+    /// reads them: the write, the page hash and the output's meter see what
+    /// leaves, and the limiter's ceiling holds on it. An output with none
+    /// of them is left as the matrix computed it.
     fn process(&mut self, start: u64, buf: &mut PlanarBuffer, scratch: &mut [f32], frames: usize) {
-        if self.strip.is_none() && self.limiter.is_none() {
+        if self.strip.is_none() && self.delay.is_none() && self.limiter.is_none() {
             return;
         }
         let legs = &mut scratch[..self.channels * frames];
         for (c, leg) in legs.chunks_exact_mut(frames).enumerate() {
             leg.copy_from_slice(&buf.channel(self.first_channel + c)[..frames]);
         }
-        run_strip(&mut self.strip, &mut self.strip_pos, start, legs, frames);
+        // An output without a strip keeps no position for one.
+        if self.strip.is_some() {
+            run_strip(&mut self.strip, &mut self.strip_pos, start, legs, frames);
+        }
+        if let Some(d) = &mut self.delay {
+            d.process(start, legs, frames);
+        }
         if let Some(limiter) = &mut self.limiter {
             limiter.process(start, legs, frames);
         }
@@ -912,7 +927,7 @@ impl Out {
     /// Sets `param` on the strip from sample index `at_index`. False, and
     /// nothing set, when the output has no strip or the strip refuses it.
     fn set_strip(&mut self, at_index: u64, param: StripParam) -> bool {
-        set_strip(&mut self.strip, &mut self.strip_pos, at_index, param)
+        self.strip.is_some() && set_strip(&mut self.strip, &mut self.strip_pos, at_index, param)
     }
 }
 
@@ -2168,17 +2183,21 @@ fn capture_core(
         // A limiter holds no heap memory: the copy allocates nothing.
         d.clone_from(&o.limiter);
     }
+    // A prepared buffer's list holds no part, so clearing it frees
+    // nothing.
     c.outs.clear();
-    for (o, out) in outs.iter().enumerate().filter(|(_, o)| o.strip.is_some()) {
+    let processed = |o: &&Out| o.strip.is_some() || o.delay.is_some();
+    for (o, out) in outs.iter().enumerate().filter(|(_, o)| processed(o)) {
         if c.outs.len() == c.outs.capacity() {
             debug_assert!(false, "a core buffer without room for its outputs");
             break;
         }
-        // A strip holds no heap memory, and the list has room: the copy
-        // allocates nothing.
+        // A strip holds no heap memory, a delay's span is copied off the
+        // RT thread, and the list has room: the copy allocates nothing.
         let part = OutCore {
             strip: out.strip.clone(),
             strip_pos: out.strip_pos,
+            delay: out.delay.as_ref().map(delay_core),
         };
         c.outs.push((o as u32, part));
     }
@@ -2202,15 +2221,7 @@ fn capture_core(
                 c.floor = l.floor();
                 c.set = l.rings().active() as u8;
             }
-            (c, Some(l)) => {
-                *c = Some(DelayCore {
-                    taps: l.taps(),
-                    pos: l.pos(),
-                    floor: l.floor(),
-                    set: l.rings().active() as u8,
-                    span: Vec::new(),
-                });
-            }
+            (c, Some(l)) => *c = Some(delay_core(l)),
             (c, None) => {
                 if c.is_some() {
                     debug_assert!(false, "a core buffer of another shape");
@@ -2227,6 +2238,18 @@ fn capture_core(
     c.late_routes.clear();
     c.late_routes.extend_from_slice(&r.late_routes);
     c.late_lost_until = r.late_lost_until;
+}
+
+/// Delay `l`'s state in a core, its span left to be copied off the RT
+/// thread: allocates nothing.
+fn delay_core(l: &Delay) -> DelayCore {
+    DelayCore {
+        taps: l.taps(),
+        pos: l.pos(),
+        floor: l.floor(),
+        set: l.rings().active() as u8,
+        span: Vec::new(),
+    }
 }
 
 /// Moves output `o`'s ring below block `limit`
@@ -2673,6 +2696,7 @@ impl Rt {
                 | Change::OutputStrip { .. }
                 | Change::Limiter { .. }
                 | Change::Delay { .. }
+                | Change::OutputDelay { .. }
                 | Change::Tone { .. } => {
                     self.mix.last_taken = self.mix.last_taken.max(entry.id);
                     return;
@@ -2908,12 +2932,12 @@ impl Rt {
     /// Without a core: takes the entries due by block `k` that need no
     /// generation off the pending list, so that a long spell neither
     /// fills the list nor holds the log's entries back. A strip, limiter,
-    /// delay or tone entry, and a batch's parameters, are applied to what
-    /// the slots and outputs keep, and a loudness reset to the meters,
-    /// which stay with the engine; the rest passes unapplied. A batch
-    /// holding a generation-needing entry stays pending whole, as that
-    /// entry does alone. A core installed later must know them, as it must
-    /// know every entry taken.
+    /// delay, output delay or tone entry, and a batch's parameters, are
+    /// applied to what the slots and outputs keep, and a loudness reset to
+    /// the meters, which stay with the engine; the rest passes unapplied. A
+    /// batch holding a generation-needing entry stays pending whole, as
+    /// that entry does alone. A core installed later must know them, as it
+    /// must know every entry taken.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn pass_entries(&mut self, k: u64) {
         let end = (k + 1) * self.block;
@@ -2931,6 +2955,9 @@ impl Rt {
                 Change::OutputStrip { output, param } => self.set_output_strip(e, output, param),
                 Change::Limiter { output, params } => self.set_limiter(e, output, params),
                 Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
+                Change::OutputDelay { output, samples } => {
+                    self.set_output_delay(e, output, samples)
+                }
                 Change::Tone { slot, params } => self.set_tone(e, slot, params),
                 Change::ResetLoudness { .. } => self.reset_meters(&e, None),
                 Change::Batch { strips, .. } => {
@@ -3103,6 +3130,23 @@ impl Rt {
         }
     }
 
+    /// Sets the delay of output `output` from the index of entry `e`,
+    /// which carries it, as a slot's.
+    fn set_output_delay(&mut self, e: RtEntry, output: usize, samples: u32) {
+        let set = match &mut self.outs[output].delay {
+            Some(d) => d.set(e.at_index, samples),
+            None => samples == 0,
+        };
+        if !set {
+            add(&self.counters.strip_refused, 1);
+            let entry = RtEntry {
+                change: Change::OutputDelay { output, samples },
+                ..e
+            };
+            self.send(Telemetry::StripRefused { entry });
+        }
+    }
+
     /// Sets the tone generator of slot `slot` from the index of entry
     /// `e`, which carries it; a refusal, or a slot without one, is
     /// counted and reported as a strip's.
@@ -3118,8 +3162,8 @@ impl Rt {
         }
     }
 
-    /// Sets strip, output strip, limiter, delay and tone parameters of
-    /// batch `b`, entry `e`.
+    /// Sets strip, output strip, limiter, delay, output delay and tone
+    /// parameters of batch `b`, entry `e`.
     fn set_params(&mut self, e: RtEntry, b: &Batch) {
         for &(slot, param) in &b.strips {
             self.set_strip(e, slot as usize, param);
@@ -3132,6 +3176,9 @@ impl Rt {
         }
         for &(slot, samples) in &b.delays {
             self.set_delay(e, slot as usize, samples);
+        }
+        for &(output, samples) in &b.output_delays {
+            self.set_output_delay(e, output as usize, samples);
         }
         for &(slot, params) in &b.tones {
             self.set_tone(e, slot as usize, params);
@@ -3242,6 +3289,7 @@ impl Rt {
             Change::OutputStrip { output, param } => self.set_output_strip(e, output, param),
             Change::Limiter { output, params } => self.set_limiter(e, output, params),
             Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
+            Change::OutputDelay { output, samples } => self.set_output_delay(e, output, samples),
             Change::Tone { slot, params } => self.set_tone(e, slot, params),
             Change::Output { output, enabled } => self.set_output(output, enabled),
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => {
@@ -3943,6 +3991,11 @@ impl Rt {
                     // allocates nothing.
                     d.strip.clone_from(&part.strip);
                     d.strip_pos = part.strip_pos;
+                    // The rings of the set it names hold the history, as a
+                    // slot's.
+                    if let (Some(l), Some(c)) = (&mut d.delay, &part.delay) {
+                        l.install(c.taps, c.pos, c.floor, usize::from(c.set));
+                    }
                 }
             }
         }
@@ -4031,8 +4084,8 @@ impl Rt {
         let counter = match h.answer {
             Answer::Installed => {
                 self.install_core(&mut h.core, h.last_id, h.replayed);
-                // A product state's strip, output strip, limiter and delay
-                // parameters, from the install on.
+                // A product state's strip, output strip, limiter, delay and
+                // output delay parameters, from the install on.
                 let e = RtEntry {
                     id: h.last_id,
                     at_index: first * self.block,
@@ -4059,6 +4112,10 @@ impl Rt {
                 for n in 0..h.delays.len() {
                     let (slot, samples) = h.delays[n];
                     self.set_delay(e, slot, samples);
+                }
+                for n in 0..h.out_delays.len() {
+                    let (output, samples) = h.out_delays[n];
+                    self.set_output_delay(e, output, samples);
                 }
                 // A product state's tone ramps replace the generators',
                 // checked off the RT thread.
@@ -5048,6 +5105,7 @@ mod tests {
             pages: None,
             strip: None,
             strip_pos: None,
+            delay: None,
             limiter: None,
         };
         let mut outs = [out(true), out(false), out(true)];
@@ -5066,6 +5124,22 @@ mod tests {
         out_strip.process(&mut [0.5; 48], 48);
         outs[2].strip = Some(out_strip.clone());
         outs[2].strip_pos = Some(20 * B);
+        // An output delay mid-crossfade, another waiting: its taps,
+        // position, floor and ring set are core, its history copied off
+        // the RT thread.
+        let mut line = Delay::new(samplez_dsp::DelayRings::new(1, 100, 1, B as usize), 480);
+        assert!(line.set(0, 30) && line.set(B, 60));
+        line.process(0, &mut [0.5; 96], 96);
+        let line_core = DelayCore {
+            taps: line.taps(),
+            pos: Some(96),
+            floor: line.floor(),
+            set: 0,
+            span: Vec::new(),
+        };
+        assert_eq!(line_core.taps.next, Some(60));
+        assert!(line_core.floor > 0);
+        outs[0].delay = Some(line);
 
         let mut c = Core::new(1, 1, 2, 4, 3);
         capture_core(&mut c, &m, &slots, &outs, &awaiting, Some(11), &r);
@@ -5107,13 +5181,24 @@ mod tests {
                 },
             ],
             limiters: vec![None, Some(limiter), None],
-            outs: vec![(
-                2,
-                OutCore {
-                    strip: Some(out_strip),
-                    strip_pos: Some(20 * B),
-                },
-            )],
+            outs: vec![
+                (
+                    0,
+                    OutCore {
+                        strip: None,
+                        strip_pos: None,
+                        delay: Some(line_core),
+                    },
+                ),
+                (
+                    2,
+                    OutCore {
+                        strip: Some(out_strip),
+                        strip_pos: Some(20 * B),
+                        delay: None,
+                    },
+                ),
+            ],
             awaiting_gen: awaiting.to_vec(),
             pending_gen: Some(11),
             unresolved: vec![(8, 21 * B), (9, 30 * B)],
@@ -5373,6 +5458,7 @@ mod tests {
             pages: None,
             strip: Some(Strip::new(1, 480)),
             strip_pos: None,
+            delay: None,
             limiter: limiter.then(|| Limiter::new(1, 480)),
         }
     }
@@ -5463,6 +5549,59 @@ mod tests {
             }
         }
         assert!(loudest > 0.4, "the strip unheard: {loudest}");
+    }
+
+    /// An output's delay line runs after its strip and before its limiter:
+    /// the output computes, bit for bit, a strip, a delay and a limiter run
+    /// alone in that order. The strip's trim and the limiter's switching
+    /// on both ramp from index 0 while the line crossfades to a delay of
+    /// 1000 samples, so the samples coming out of the line after it differ
+    /// in either other order: delayed before the strip, they meet the
+    /// trim settled; delayed after the limiter, they come out limited as
+    /// it was while it ramped on.
+    #[test]
+    fn an_output_delay_runs_between_the_strip_and_the_limiter() {
+        let line = || Delay::new(samplez_dsp::DelayRings::new(1, 2400, 1, B as usize), 480);
+        let trim = StripParam::Trim { db: 6.0 };
+        let params = LimiterParams {
+            enabled: true,
+            ceiling_db: -6.0,
+            release_ms: 50.0,
+        };
+        let mut out = strip_out(true);
+        assert!(out.set_strip(0, trim));
+        let mut delay = line();
+        assert!(delay.set(0, 1000));
+        out.delay = Some(delay);
+        assert!(out.limiter.as_mut().is_some_and(|l| l.set_at(0, params)));
+        let (mut strip, mut delay, mut limiter) =
+            (Strip::new(1, 480), line(), Limiter::new(1, 480));
+        assert!(strip.set(trim) && delay.set(0, 1000) && limiter.set_at(0, params));
+        let blocks = 60;
+        // The input computed once and given to both.
+        let input: Vec<f32> = (0..blocks * B)
+            .map(|n| 0.8 * (n as f32 * 0.05).sin())
+            .collect();
+        let mut buf = PlanarBuffer::new(1, B as usize);
+        let mut scratch = vec![0.0f32; B as usize];
+        for (k, block) in input.chunks_exact(B as usize).enumerate() {
+            let start = k as u64 * B;
+            buf.channel_mut(0)[..B as usize].copy_from_slice(block);
+            out.process(start, &mut buf, &mut scratch, B as usize);
+            let mut want = block.to_vec();
+            strip.process(&mut want, B as usize);
+            delay.process(start, &mut want, B as usize);
+            limiter.process(start, &mut want, B as usize);
+            let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&buf.channel(0)[..B as usize]),
+                bits(&want),
+                "block {k}"
+            );
+        }
+        // Past the delay the line plays what it took, limited.
+        let last = &buf.channel(0)[..B as usize];
+        assert!(last.iter().any(|v| v.abs() > 0.3), "{last:?}");
     }
 
     /// A strip's gate and compressor compute their gains on the grid of

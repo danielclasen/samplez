@@ -43,6 +43,8 @@ pub struct Targets {
     /// Per input slot, its delay in samples; a slot past the list keeps
     /// the delay the engine holds.
     pub delays: Vec<u32>,
+    /// Per output, its delay in samples, as `delays`.
+    pub output_delays: Vec<u32>,
     /// Per input slot, its tone parameters, for a slot configured with
     /// `tone`; none, or a slot past the list, leaves the generator as the
     /// engine holds it.
@@ -84,7 +86,8 @@ impl Targets {
     /// pattern, by slot and parameter; an `OutputStrip` for each such
     /// parameter by output and parameter; a `Limiter` output's
     /// parameters differ in any field's bit pattern; a `Delay` slot whose
-    /// delay differs; a `Tone` for each slot whose tone parameters differ
+    /// delay differs, an `OutputDelay` output whose delay differs; a
+    /// `Tone` for each slot whose tone parameters differ
     /// in any field's bit pattern; a `Duck` setting
     /// group that differs in any field's bit pattern, by group, its
     /// parameters, keys, mode and hold, then its depths by slot; a
@@ -146,6 +149,11 @@ impl Targets {
         for (slot, &samples) in next.delays.iter().enumerate() {
             if self.delays.get(slot) != Some(&samples) {
                 entries.push(Entry::Delay { slot, samples });
+            }
+        }
+        for (output, &samples) in next.output_delays.iter().enumerate() {
+            if self.output_delays.get(output) != Some(&samples) {
+                entries.push(Entry::OutputDelay { output, samples });
             }
         }
         for (slot, params) in next.tones.iter().enumerate() {
@@ -1020,6 +1028,11 @@ mod tests {
                 entries.push(Entry::Delay { slot, samples });
             }
         }
+        for (output, &samples) in next.output_delays.iter().enumerate() {
+            if was.output_delays.get(output) != Some(&samples) {
+                entries.push(Entry::OutputDelay { output, samples });
+            }
+        }
         for (slot, flow) in next.flows.iter().enumerate() {
             if was.flows.get(slot) != Some(flow) {
                 entries.push(match flow {
@@ -1156,6 +1169,35 @@ mod tests {
         );
     }
 
+    /// An output's delay gets an entry when it differs, none when equal or
+    /// past the list, and every listed one from `assert`; a slot's delay of
+    /// the same value is an entry of its own.
+    #[test]
+    fn output_delays_differ_by_value() {
+        let was = Targets {
+            delays: vec![480],
+            output_delays: vec![0, 480, 7],
+            ..Targets::default()
+        };
+        let next = Targets {
+            delays: vec![480],
+            output_delays: vec![0, 960],
+            ..Targets::default()
+        };
+        assert_eq!(
+            was.diff(&next),
+            [Entry::OutputDelay {
+                output: 1,
+                samples: 960
+            }]
+        );
+        assert!(was.diff(&was).is_empty());
+        let all = was.assert(&[], None);
+        let count = |f: fn(&Entry) -> bool| all.iter().filter(|e| f(e)).count();
+        assert_eq!(count(|e| matches!(e, Entry::OutputDelay { .. })), 3);
+        assert_eq!(count(|e| matches!(e, Entry::Delay { .. })), 1);
+    }
+
     /// An output's strip parameters get an entry when they differ in any
     /// field's bit pattern, by output and parameter, none when equal or
     /// past the list, and every one from `assert`; a slot's parameters of
@@ -1290,6 +1332,9 @@ mod tests {
                     })
                     .collect(),
                 delays: (0..self.below(3))
+                    .map(|_| self.below(3) as u32 * 100)
+                    .collect(),
+                output_delays: (0..self.below(3))
                     .map(|_| self.below(3) as u32 * 100)
                     .collect(),
                 ..Targets::default()

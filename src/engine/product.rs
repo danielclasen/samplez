@@ -326,14 +326,15 @@ impl ProductFill {
                 // The core holds neither generation nor a strip, limiter,
                 // delay or tone generator, nor the meters: the RT thread
                 // applies a passed re-route, detach, strip, output strip,
-                // limiter, delay, tone or loudness reset entry itself,
-                // taken before the install or after.
+                // limiter, delay, output delay, tone or loudness reset entry
+                // itself, taken before the install or after.
                 Change::Route { .. }
                 | Change::Detach { .. }
                 | Change::Strip { .. }
                 | Change::OutputStrip { .. }
                 | Change::Limiter { .. }
                 | Change::Delay { .. }
+                | Change::OutputDelay { .. }
                 | Change::Tone { .. }
                 | Change::ResetLoudness { .. } => {}
                 Change::Batch { up: raised, .. } => {

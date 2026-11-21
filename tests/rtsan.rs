@@ -77,6 +77,7 @@ fn the_rt_thread_passes_rtsan() {
     cfg.outputs[0].limiter = true;
     cfg.outputs[0].strip = true;
     cfg.inputs[0].max_delay_samples = 4800;
+    cfg.outputs[0].max_delay_samples = 4800;
     let (engine, rx) = start(cfg);
     let attached = || engine.status().inputs[0].state == InputState::Attached;
     wait_for(Duration::from_secs(5), "input attached", attached);
@@ -124,6 +125,13 @@ fn the_rt_thread_passes_rtsan() {
     }
     engine.set_delay(0, 2400, (index / B + 20) * B).unwrap();
     engine.set_delay(0, 1200, (index / B + 21) * B).unwrap();
+    // The output's line between its strip and its limiter, the same way.
+    engine
+        .set_output_delay(0, 2400, (index / B + 20) * B)
+        .unwrap();
+    engine
+        .set_output_delay(0, 1200, (index / B + 21) * B)
+        .unwrap();
     // The tone generator through a level, frequency and ident change,
     // and a frequency change while the first crossfades.
     let tone = |frequency_hz, level_db, ident| samplez_dsp::ToneParams {
@@ -348,7 +356,7 @@ fn the_rt_thread_passes_rtsan_with_ducks_through_a_resync() {
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
-    let extra = serde_json::json!({ "duckColumns": [0] });
+    let extra = common::duck_resync_extra(&dst);
     let (engine, _hashes) = common::start_held_with(&domain.0, &src, &dst, 2, extra);
     wait_for(Duration::from_secs(5), "input attached", || {
         engine.status().inputs[0].state == InputState::Attached

@@ -956,12 +956,26 @@ pub fn undisturbed(scenario: impl Fn() -> Result<(), String>) {
     panic!("every run was disturbed: {seen:?}");
 }
 
+/// The configuration [`duck_resync_scenario`] runs on, beside
+/// [`start_held_with`]'s: duck column 0, and output `out` with a delay
+/// line of 4800 samples.
+#[allow(dead_code)]
+pub fn duck_resync_extra(out: &str) -> serde_json::Value {
+    serde_json::json!({
+        "duckColumns": [0],
+        "outputs": [{ "name": "out0", "domain": "d", "flowId": out, "label": "held",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1,
+                      "maxDelaySamples": 4800 }],
+    })
+}
+
 /// Ducks through a resync on a replicated engine of two voters whose
 /// column 0 ducks: a group keyed, forced on and ducking the input, its
 /// key unkeyed and keyed again while it ducks, then the core copied
 /// mid-duck and replayed and handed back over to the engine, which
-/// installs its detectors. Returns once the hand-over is installed and
-/// a second of blocks ran after it.
+/// installs its detectors, with the output's delay line delaying and
+/// crossfading to a shorter delay near the copy. Returns once the
+/// hand-over is installed and a second of blocks ran after it.
 #[allow(dead_code)]
 pub fn duck_resync_scenario(e: &Engine) {
     use samplez::{DuckSetting, Entry};
@@ -978,6 +992,10 @@ pub fn duck_resync_scenario(e: &Engine) {
             output: 0,
             mask: 1 << 2,
         },
+        Entry::OutputDelay {
+            output: 0,
+            samples: 2400,
+        },
     ];
     e.append_batch(1, at, &entries).unwrap();
     // The key unkeyed, then keyed again: its filters at rest.
@@ -985,7 +1003,13 @@ pub fn duck_resync_scenario(e: &Engine) {
         .unwrap();
     e.append(3, at + 150 * B, duck(DuckSetting::Keys(vec![(0, 0.5)])))
         .unwrap();
-    e.commit(3);
+    // The output's delay line crossfading to another delay near the copy.
+    let shorter = Entry::OutputDelay {
+        output: 0,
+        samples: 1200,
+    };
+    e.append(4, at + 195 * B, shorter).unwrap();
+    e.commit(4);
     let past = at / B + 200;
     wait_for(Duration::from_secs(10), "keys changed", || {
         e.progress()
@@ -994,6 +1018,7 @@ pub fn duck_resync_scenario(e: &Engine) {
     });
     let copy = copy_core(e);
     assert!(copy.core.detector(2).is_some_and(|d| d.key(0).is_some()));
+    assert!(copy.core.output_delay_taps(0).is_some());
     let mut replay = e.replay(copy).unwrap();
     let j = e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
     wait_for(

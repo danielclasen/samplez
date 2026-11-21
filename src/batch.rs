@@ -181,6 +181,9 @@ pub(crate) struct Batch {
     pub limiters: Vec<(u32, LimiterParams)>,
     /// Delays by slot, in samples, ascending.
     pub delays: Vec<(u32, u32)>,
+    /// Delays by output, as `delays` by slot; not encoded while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_delays: Vec<(u32, u32)>,
     /// Tone parameters by slot, ascending; not encoded while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tones: Vec<(u32, ToneParams)>,
@@ -233,6 +236,11 @@ impl Batch {
                     .windows(2)
                     .all(|w| (w[0].0, strip_key(&w[0].1)) < (w[1].0, strip_key(&w[1].1)))
         };
+        let delays = |list: &[(u32, u32)]| {
+            list.iter()
+                .all(|&(_, d)| d <= samplez_dsp::MAX_DELAY_SAMPLES)
+                && list.windows(2).all(|w| w[0].0 < w[1].0)
+        };
         let gains = self.gains.list();
         gains.windows(2).all(|w| w[0].0 < w[1].0)
             && gains.iter().all(|&(_, g)| valid_gain(g))
@@ -241,8 +249,8 @@ impl Batch {
             && strips(&self.output_strips)
             && self.limiters.iter().all(|(_, p)| p.check().is_ok())
             && self.limiters.windows(2).all(|w| w[0].0 < w[1].0)
-            && (self.delays.iter()).all(|&(_, d)| d <= samplez_dsp::MAX_DELAY_SAMPLES)
-            && self.delays.windows(2).all(|w| w[0].0 < w[1].0)
+            && delays(&self.delays)
+            && delays(&self.output_delays)
             && self.tones.iter().all(|(_, p)| p.is_valid())
             && self.tones.windows(2).all(|w| w[0].0 < w[1].0)
             && self.downs.windows(2).all(|w| w[0] < w[1])
@@ -273,9 +281,10 @@ impl Batch {
     /// strips of the legs `out_strips` names, none for an output without
     /// one, and the duck columns `ducked`: a mask other than 0 only on
     /// those.
-    /// Limiter parameters fit any output and tone parameters any slot:
-    /// one without a limiter or generator refuses them on the RT thread,
-    /// as a slot without a strip does.
+    /// Limiter parameters and output delays fit any output and tone
+    /// parameters any slot: one without a limiter, a delay line taking the
+    /// delay or a generator refuses them on the RT thread, as a slot
+    /// without a strip does.
     #[allow(clippy::too_many_arguments)]
     pub fn fits(
         &self,
@@ -306,6 +315,7 @@ impl Batch {
             && self.downs.iter().all(|&s| (s as usize) < legs.len())
             && self.outputs.iter().all(|&(o, _)| (o as usize) < outputs)
             && self.limiters.iter().all(|&(o, _)| (o as usize) < outputs)
+            && (self.output_delays.iter()).all(|&(o, _)| (o as usize) < outputs)
             && self.ducks.iter().all(|(_, c)| c.fits(legs))
             && self
                 .depths
@@ -336,6 +346,7 @@ impl Batch {
             && self.output_strips.is_empty()
             && self.limiters.is_empty()
             && self.delays.is_empty()
+            && self.output_delays.is_empty()
             && self.tones.is_empty())
     }
 
@@ -364,8 +375,8 @@ struct SlotFold {
 /// any duck setting, depth or mask, as a [`Change::Batch`] with its
 /// batch. Per coefficient, strip parameter key, duck setting kind, depth
 /// and mask last value counts, per output its last `Output`, last
-/// limiter parameters and last strip parameter per key, per slot its
-/// last delay and tone parameters, per meter its last
+/// limiter parameters, last delay and last strip parameter per key, per
+/// slot its last delay and tone parameters, per meter its last
 /// `LoudnessRun`; each meter reset is kept once. Per
 /// input slot a `Route` and its up or
 /// down state are kept apart ([`SlotFold`]): an `InputUp` and a `Route`
@@ -390,6 +401,7 @@ pub(crate) fn fold(
     let mut outputs = BTreeMap::new();
     let mut limiters = BTreeMap::new();
     let mut delays = BTreeMap::new();
+    let mut output_delays = BTreeMap::new();
     let mut tones = BTreeMap::new();
     let mut runs = BTreeMap::new();
     let mut resets = BTreeSet::new();
@@ -439,6 +451,9 @@ pub(crate) fn fold(
             Change::Delay { slot, samples } => {
                 delays.insert(slot as u32, samples);
             }
+            Change::OutputDelay { output, samples } => {
+                output_delays.insert(output as u32, samples);
+            }
             Change::Tone { slot, params } => {
                 tones.insert(slot as u32, params);
             }
@@ -483,6 +498,7 @@ pub(crate) fn fold(
         + output_strips.len()
         + limiters.len()
         + delays.len()
+        + output_delays.len()
         + tones.len()
         + downs.len()
         + outputs.len()
@@ -522,6 +538,11 @@ pub(crate) fn fold(
         } else if let Some((&slot, &samples)) = delays.first_key_value() {
             Change::Delay {
                 slot: slot as usize,
+                samples,
+            }
+        } else if let Some((&output, &samples)) = output_delays.first_key_value() {
+            Change::OutputDelay {
+                output: output as usize,
                 samples,
             }
         } else if let Some((&slot, &params)) = tones.first_key_value() {
@@ -565,6 +586,7 @@ pub(crate) fn fold(
             .collect(),
         limiters: limiters.into_iter().collect(),
         delays: delays.into_iter().collect(),
+        output_delays: output_delays.into_iter().collect(),
         tones: tones.into_iter().collect(),
         downs,
         outputs: outputs.into_iter().collect(),
@@ -869,6 +891,38 @@ mod tests {
         assert!(!bad.sane());
     }
 
+    /// An output's delays in one log entry: the last counts, a lone one is
+    /// itself, a batch holding them says it sets parameters and fits only
+    /// the engine's outputs, and a batch without them encodes as one
+    /// before output delays.
+    #[test]
+    fn an_outputs_last_delay_wins() {
+        let set = |output, samples| Change::OutputDelay { output, samples };
+        let one = |changes: &[Change]| fold(&items(changes), 2, 4).unwrap().unwrap();
+        assert_eq!(one(&[set(1, 10), set(1, 20)]), (set(1, 20), None));
+        let (change, batch) = one(&[set(1, 10), set(0, 5), set(1, 30)]);
+        assert!(
+            matches!(change, Change::Batch { strips: true, .. }),
+            "{change:?}"
+        );
+        let batch = batch.unwrap();
+        assert_eq!(batch.output_delays, [(0, 5), (1, 30)]);
+        assert!(batch.delays.is_empty());
+        assert!(batch.sane() && batch.fits(2, 2, 2, 2, &[1, 1], &[], &[]));
+        assert!(!batch.fits(2, 2, 1, 1, &[1, 1], &[], &[]), "output 1 of 1");
+        let mut bad = (*batch).clone();
+        bad.output_delays[0].1 = samplez_dsp::MAX_DELAY_SAMPLES + 1;
+        assert!(!bad.sane());
+        bad.output_delays = vec![batch.output_delays[1], batch.output_delays[0]];
+        assert!(!bad.sane());
+        let (_, plain) = one(&[set(0, 5), Change::InputDown { slot: 1 }]);
+        let encoded = serde_json::to_string(&*plain.unwrap()).unwrap();
+        assert!(encoded.contains("output_delays"), "{encoded}");
+        let (_, plain) = one(&[trim(0, -1.0), Change::InputDown { slot: 1 }]);
+        let encoded = serde_json::to_string(&*plain.unwrap()).unwrap();
+        assert!(!encoded.contains("output_delays"), "{encoded}");
+    }
+
     /// A slot's tone parameters in one log entry: the last counts, a
     /// lone one is itself, a batch holding them says it sets parameters,
     /// and an empty list is not encoded, so a batch without them encodes
@@ -973,6 +1027,7 @@ mod tests {
                     output_strips: Vec::new(),
                     limiters: Vec::new(),
                     delays: Vec::new(),
+                    output_delays: Vec::new(),
                     tones: Vec::new(),
                     downs: Vec::new(),
                     outputs: Vec::new(),
