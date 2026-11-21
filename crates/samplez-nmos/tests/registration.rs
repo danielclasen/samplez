@@ -583,10 +583,11 @@ async fn a_fresh_node_refused_for_a_later_held_version_is_registered_anew() {
     assert_eq!(types(&seen)[..2], ["node".to_owned(), "node".to_owned()]);
 }
 
-/// A fresh Node refused for another reason than a later held version is
-/// not deleted: a repost cannot cure it, and the registration goes on.
+/// A fresh Node refused with a 400 whatever the reason is deleted and
+/// registered again once per pass: one refused for a reason a repost
+/// cannot cure is refused again, and the registration goes on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fresh_node_refused_for_another_reason_is_not_deleted() {
+async fn a_fresh_node_refused_for_another_reason_is_deleted_once_and_goes_on() {
     let r = Registry::start(Mode::Up).await;
     r.state.lock().unwrap().refuse = Some("node");
     let n = node(&[&r], Duration::ZERO);
@@ -594,8 +595,10 @@ async fn a_fresh_node_refused_for_another_reason_is_not_deleted() {
     until("a heartbeat", || r.seen().iter().any(Seen::is_heartbeat)).await;
     task.abort();
     let seen = r.seen();
-    assert!(seen.iter().all(|s| s.method != Method::DELETE));
-    assert_eq!(types(&seen)[..2], ["node".to_owned(), "device".to_owned()]);
+    // One pass, up to the first heartbeat: the Node deleted once.
+    let pass: Vec<&Seen> = seen.iter().take_while(|s| !s.is_heartbeat()).collect();
+    let deletes = pass.iter().filter(|s| s.method == Method::DELETE).count();
+    assert_eq!(deletes, 1, "{pass:?}");
 }
 
 /// With versions from the product, a continued registration posts the
