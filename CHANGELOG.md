@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.20.0](https://github.com/danielclasen/samplez/compare/v0.19.0...v0.20.0) (2026-11-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** config::Output and config::Meter gain the pub field `correlation`, and OutputMeters gains the pub field `correlation`, so struct literals and exhaustive patterns of them need it.
+* **engine:** samplez_mxl::input::Poll has a new variant, Opening, and PolledFlow::hold no longer opens the holder's reference before it returns; samplez_mxl::input::PollOpener and PolledFlow::with_opener are new. samplez::Counters has a new field, generation_past_margin.
+* **engine:** ProductState has a new field, in_flight, and
+* **engine:** PROTOCOL moves from 3 to 4. A block a withdrawn replica withholds at once as unfillable now reports the digest it was computed with, and peers judge its pages by that digest, so replicas of both protocols cannot judge each other's pages alike. The compatibility key changes and a rollout rolls by baseline hand-over, not as peers.
+* **engine:** config::Input has a new public field, true_peak, and InputMeters the public fields true_peak and max_true_peak, so code that builds either with a struct literal must set them.
+* **replica:** Apply has a new public field, at_index, so a product that builds Apply with a struct literal must set it.
+
+### Features
+
+* **engine:** meter an input's true peak where its config asks for it ([#169](https://github.com/danielclasen/samplez/issues/169)) ([baf7ad6](https://github.com/danielclasen/samplez/commit/baf7ad611bf31c44a5585037d2639c447af96a00))
+* **engine:** meter the correlation of an element's front legs where its config asks ([#171](https://github.com/danielclasen/samplez/issues/171)) ([4a28e46](https://github.com/danielclasen/samplez/commit/4a28e46d30e407447990f51fd69a2eeb0a49599f))
+* **nmos:** take resource versions from a replicated product ([#168](https://github.com/danielclasen/samplez/issues/168)) ([4642bbc](https://github.com/danielclasen/samplez/commit/4642bbcb37b087a63374635887f53aa80359e86b))
+* **replica:** give Product::apply the index its entry takes effect at ([#166](https://github.com/danielclasen/samplez/issues/166)) ([fe63fcb](https://github.com/danielclasen/samplez/commit/fe63fcb0bf841962d68017077611f6ae2ba84e54))
+
+
+### Bug Fixes
+
+* **engine:** join late fades and resume input and duck ramps ([#170](https://github.com/danielclasen/samplez/issues/170)) ([78d9100](https://github.com/danielclasen/samplez/commit/78d91000e332871fbc9cf39414429bebcb5ee4b5))
+* **engine:** open a generation's readers off the hand-over path ([#165](https://github.com/danielclasen/samplez/issues/165)) ([98c4225](https://github.com/danielclasen/samplez/commit/98c4225cefe97054825bf86a2d1fb96c603b4e48))
+* **engine:** open poll readers off the supervisor ([#172](https://github.com/danielclasen/samplez/issues/172)) ([3e96b83](https://github.com/danielclasen/samplez/commit/3e96b834bbc906fa9e05f039f2526b00d08d5688))
+* **replica:** name a baseline once while every output is disabled ([#175](https://github.com/danielclasen/samplez/issues/175)) ([b00cffb](https://github.com/danielclasen/samplez/commit/b00cffb3c9139eacd0faeed34431091b6bb5e746))
+
 ## [0.19.0](https://github.com/danielclasen/samplez/compare/v0.18.0...v0.19.0) (2026-11-20)
 
 
