@@ -43,7 +43,11 @@
 //!
 //! A third scene, a tone generator through level, frequency and ident
 //! changes, pins the generator's samples and its state in a core copy
-//! apart, so the main scene's rows stay as they were before it.
+//! apart, so the main scene's rows stay as they were before it. A fourth,
+//! output strips through equaliser, compressor, gate and order changes,
+//! one ahead of a limiter, with a skip across a ramp, pins the outputs'
+//! samples and their strips in a core copy the same way, and checks that
+//! a replay from that copy computes the loop's samples.
 //!
 //! Left out: the output write and hold path, real MXL reads and clock
 //! steps. An offline loop has no flow writer, so blocks never reach a
@@ -124,6 +128,20 @@ const TONES: &[(u32, u64, u64)] = &[
     (1, 0x7325_ebfb_0d8e_41e4, 0xb8af_9c78_1774_6585),
     (2, 0x7325_ebfb_0d8e_41e4, 0xb083_0c30_70c5_ded3),
 ];
+
+/// The output scene's hashes for each compute version: (version,
+/// samples, XXH3-64 of the encoded core copy after [`OUTPUT_CORE_AT`]).
+/// A scene of its own, so the other scenes' rows stay as they are.
+const OUTPUTS: &[(u32, u64, u64)] = &[(2, 0x6057_6bf7_783f_a229, 0x4f92_e32b_2010_01b8)];
+
+/// The block after which the output scene's core is copied: inside the
+/// crossfade of output 0's dynamics order, its compressor mid-envelope
+/// and entries pending.
+const OUTPUT_CORE_AT: u64 = 305;
+/// The blocks the output scene does not compute, an entry for output 1's
+/// strip inside them.
+const OUTPUT_SKIP: Range<u64> = 600..640;
+const OUTPUT_BLOCKS: u64 = 1200;
 
 /// The block after which the tone scene's core is copied: inside the
 /// crossfade to 440 Hz, the change to 1 kHz waiting behind it.
@@ -734,6 +752,187 @@ fn tone_scene() -> (u64, u64) {
     )
 }
 
+/// The output scene: two inputs into a stereo output with a strip and a
+/// limiter and a mono output with a strip alone. Output 0's equaliser
+/// boosts a bell and its compressor makes up gain into the limiter, its
+/// dynamics order flipped and a band changed while that crossfades;
+/// output 1 trimmed and high-passed, its gate switched on at the first
+/// block of a skipped span and its trim changed inside it, its
+/// compressor switched on later. The hashes of every output sample and of
+/// the encoded core copy after block [`OUTPUT_CORE_AT`]; a replay clone
+/// installed from that copy computes the loop's samples from there on.
+fn output_scene() -> (u64, u64) {
+    let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
+        .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
+    let inputs = (0..2).map(|i| {
+        serde_json::json!({ "name": format!("in{i}"), "domain": "d",
+            "flowId": format!("5fbec3b1-1b0f-417d-9059-00000000000{i}"), "channels": 1 })
+    });
+    let outputs = [(2, true), (1, false)].map(|(ch, limiter)| {
+        serde_json::json!({ "name": format!("out{ch}"), "domain": "d",
+            "flowId": format!("6fbec3b1-1b0f-417d-9059-00000000000{ch}"), "label": "o",
+            "group": "g", "role": "Audio", "channels": ch, "strip": true,
+            "limiter": limiter })
+    });
+    let v = serde_json::json!({
+        "libmxl": libmxl,
+        "blockSize": B,
+        "rampSamples": RAMP,
+        "domains": [{ "name": "d", "path": "/nonexistent" }],
+        "inputs": inputs.collect::<Vec<_>>(),
+        "outputs": outputs,
+        "matrix": [[0.8, 0.0, 0.5], [0.0, 0.8, 0.5]],
+        "rt": { "enabled": false, "rtCpu": "none" },
+    });
+    let config = Config::parse(&v.to_string()).unwrap();
+    let api = samplez_mxl::load(&config.libmxl).unwrap();
+    let new_rt = || {
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt: Rt = replay_rt(&config, &api, vec![None], hashes, control);
+        rt.test_input = Some(source);
+        rt
+    };
+    let mut rt = new_rt();
+    let (mut core_tx, core_rx) = rtrb::RingBuffer::new(1);
+    let (copy_tx, mut copy_rx) = rtrb::RingBuffer::new(1);
+    let r = rt.replica.as_mut().unwrap();
+    (r.cores, r.copies) = (core_rx, copy_tx);
+    for (row, column, g) in [(0, 0, 0.8), (1, 1, 0.8), (0, 2, 0.5), (1, 2, 0.5)] {
+        assert!(rt.mix.matrix.set(row, column, g, 0));
+    }
+    let out = |output, param| Item::Change(Change::OutputStrip { output, param });
+    let bell = |gain_db| StripParam::EqBand {
+        band: 1,
+        value: EqBand {
+            kind: samplez_dsp::BandType::Peak,
+            freq: 1000.0,
+            gain_db,
+            q: 1.0,
+        },
+    };
+    let comp = |makeup_db| {
+        StripParam::Comp(CompParams {
+            enabled: true,
+            threshold_db: -24.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 200.0,
+            knee_db: 6.0,
+            makeup_db,
+        })
+    };
+    let gate = StripParam::Gate(GateParams {
+        enabled: true,
+        threshold_db: -30.0,
+        range_db: 20.0,
+        attack_ms: 1.0,
+        release_ms: 50.0,
+    });
+    let log: [(u64, Vec<Item>); 6] = [
+        (
+            0,
+            vec![
+                out(0, StripParam::Eq { enabled: true }),
+                out(0, bell(12.0)),
+                out(0, comp(6.0)),
+                out(1, StripParam::Trim { db: -6.0 }),
+                out(
+                    1,
+                    StripParam::Hpf {
+                        enabled: true,
+                        freq: 120.0,
+                    },
+                ),
+                limiter(0, -3.0, 50.0),
+            ],
+        ),
+        (
+            300 * B,
+            vec![out(0, StripParam::DynamicsBeforeEq { enabled: true })],
+        ),
+        // Inside the order's crossfade.
+        (303 * B, vec![out(0, bell(-6.0))]),
+        (OUTPUT_SKIP.start * B, vec![out(0, comp(3.0)), out(1, gate)]),
+        (
+            (OUTPUT_SKIP.start + 10) * B,
+            vec![out(1, StripParam::Trim { db: 3.0 })],
+        ),
+        (900 * B, vec![out(1, comp(0.0))]),
+    ];
+    for (n, (at_index, items)) in log.iter().enumerate() {
+        let entry = |change| RtEntry {
+            id: n as u64 + 1,
+            at_index: *at_index,
+            change,
+        };
+        match items[..] {
+            [Item::Change(change)] => assert!(rt.mix.push(entry(change))),
+            _ => {
+                let (change, batch) = batch::fold(items, 3, 6).unwrap().unwrap();
+                assert!(rt.mix.push_with(entry(change), batch).is_ok());
+            }
+        }
+    }
+    let ceiling = 10f32.powf(-3.0 / 20.0) * (1.0 + 1e-6);
+    let mut samples = Xxh3Default::new();
+    let mut replay: Option<Rt> = None;
+    let mut core = None;
+    let saved = samplez_dsp::set_ftz_daz(true);
+    for k in (0..OUTPUT_BLOCKS).filter(|k| !OUTPUT_SKIP.contains(k)) {
+        if k == OUTPUT_CORE_AT {
+            let page = PENDING_CHANGES * PAGE.div_ceil(B) as usize;
+            let mut buffer = Box::new(Core::new(2, 3, 2, page, 2));
+            buffer.prepare();
+            assert!(core_tx.push(buffer).is_ok());
+        }
+        rt.process(k, u64::MAX);
+        if let Some(replay) = replay.as_mut() {
+            replay.process(k, u64::MAX);
+            for c in 0..3 {
+                let bits = |rt: &Rt| -> Vec<u32> {
+                    rt.outbuf.channel(c)[..B as usize]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect()
+                };
+                assert_eq!(bits(&*replay), bits(&rt), "column {c} of block {k}");
+            }
+        }
+        if let Ok(copy) = copy_rx.pop() {
+            assert_eq!(copy.k0, OUTPUT_CORE_AT);
+            let encoded = CoreCopy::encode(&copy);
+            assert!(encoded.contains("\"outs\""), "no output strip encoded");
+            core = Some(xxhash_rust::xxh3::xxh3_64(encoded.as_bytes()));
+            let mut decoded = CoreCopy::decode(&encoded).unwrap();
+            let mut clone = new_rt();
+            clone.install_core(&mut decoded.core, decoded.last_id, true);
+            replay = Some(clone);
+        }
+        for c in 0..3 {
+            for v in &rt.outbuf.channel(c)[..B as usize] {
+                samples.update(&v.to_bits().to_le_bytes());
+            }
+        }
+        // Past the ramp of switching the limiter on, output 0 holds its
+        // ceiling: the strip's gain is ahead of it.
+        if k >= 20 {
+            for c in 0..2 {
+                let peak =
+                    (rt.outbuf.channel(c)[..B as usize].iter()).fold(0.0f32, |m, v| m.max(v.abs()));
+                assert!(peak <= ceiling, "output 0 at {peak} in block {k}");
+            }
+        }
+    }
+    samplez_dsp::restore_mxcsr(saved);
+    assert!(replay.is_some(), "no replay from the copy");
+    let c = &rt.counters;
+    for counter in [&c.command_late, &c.strip_refused] {
+        assert_eq!(counter.load(Relaxed), 0);
+    }
+    (samples.digest(), core.expect("a core copied"))
+}
+
 fn generation(api: &Arc<MxlApi>, domain: &Path, rerouted: u64) -> Box<Gen> {
     Box::new(Gen {
         mxl: Generation::new(api, domain, SLOTS).unwrap(),
@@ -1095,6 +1294,15 @@ fn the_engine_computes_the_bits_pinned_for_this_compute_version() {
          to {c:#018x}: a change to either needs a COMPUTE_VERSION bump and its \
          hashes here"
     );
+    let (s, c) = output_scene();
+    let pinned = OUTPUTS.iter().find(|g| g.0 == crate::COMPUTE_VERSION);
+    assert_eq!(
+        Some((s, c)),
+        pinned.map(|g| (g.1, g.2)),
+        "the output scene computes samples {s:#018x} and its core copy \
+         encodes to {c:#018x}: a change to either needs a COMPUTE_VERSION \
+         bump and its hashes here"
+    );
 }
 
 /// The run is a function of its scene and log alone: two runs agree.
@@ -1103,4 +1311,5 @@ fn the_engine_golden_run_is_deterministic() {
     assert_eq!(run("first"), run("second"));
     assert_eq!(phased_core(), phased_core());
     assert_eq!(tone_scene(), tone_scene());
+    assert_eq!(output_scene(), output_scene());
 }

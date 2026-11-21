@@ -30,7 +30,7 @@ use crate::blocks::{
     Cause, Changes, Ctx, Hold, PAGE, PageHash, Pages, Sink, StatusChange, Statuses,
 };
 use crate::ducks::{DuckRecord, Ducks};
-use crate::transfer::{Answer, Core, CoreCopy, DelayCore, Handover};
+use crate::transfer::{Answer, Core, CoreCopy, DelayCore, Handover, OutCore};
 
 /// Engine counters, written by the RT thread and the supervisor.
 #[derive(Debug, Default)]
@@ -95,9 +95,9 @@ pub struct Counters {
     /// or the entry came in or was committed that late. Counted whether
     /// the generation arrives in time or not.
     pub generation_past_margin: AtomicU64,
-    /// Strip entries the slot's strip refused, or for a slot without a
-    /// strip, and limiter entries for an output without a limiter: not
-    /// applied, and each one marks the engine diverged.
+    /// Strip entries the slot's or output's strip refused, or for one
+    /// without a strip, and limiter entries for an output without a
+    /// limiter: not applied, and each one marks the engine diverged.
     pub strip_refused: AtomicU64,
     /// Duck settings a detector refused: not applied. The engine checks
     /// them against its configuration when they are appended, so none is
@@ -517,6 +517,8 @@ pub(crate) enum Change {
     Detach { slot: usize },
     /// Sets one parameter of the slot's strip from the index.
     Strip { slot: usize, param: StripParam },
+    /// Sets one parameter of the output's strip from the index.
+    OutputStrip { output: usize, param: StripParam },
     /// Sets the output's limiter from the index.
     Limiter {
         output: usize,
@@ -538,8 +540,8 @@ pub(crate) enum Change {
     /// window starting at or after the index.
     ResetLoudness { meter: usize },
     /// The engine entries of one log entry, folded: its gains, strip,
-    /// limiter, delay and tone parameters (`strips` says whether it has
-    /// any),
+    /// output strip, limiter, delay and tone parameters (`strips` says
+    /// whether it has any),
     /// `InputDown`s, `Output`s, `LoudnessRun`s and loudness resets
     /// (`resets` says whether it has any) in
     /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
@@ -606,6 +608,7 @@ impl Change {
             | Change::Output { .. }
             | Change::LoudnessRun { .. } => true,
             Change::Strip { .. }
+            | Change::OutputStrip { .. }
             | Change::Limiter { .. }
             | Change::Delay { .. }
             | Change::Tone { .. } => strips,
@@ -795,37 +798,61 @@ impl Slot {
     /// Sets `param` on the strip from sample index `at_index`. False, and
     /// nothing set, when the slot has no strip or the strip refuses it.
     fn set_strip(&mut self, at_index: u64, param: StripParam) -> bool {
-        self.strip_to(at_index);
-        self.strip.as_mut().is_some_and(|s| s.set(param))
+        set_strip(&mut self.strip, &mut self.strip_pos, at_index, param)
     }
 
     /// Runs the strip over block `dst` of `frames` samples per channel
     /// starting at sample index `start`.
     fn run_strip(&mut self, start: u64, dst: &mut [f32], frames: usize) {
-        self.strip_to(start);
-        if let Some(strip) = &mut self.strip {
-            strip.process(dst, frames);
-        }
-        self.strip_pos = Some(start + frames as u64);
+        run_strip(&mut self.strip, &mut self.strip_pos, start, dst, frames);
     }
+}
 
-    /// Brings the strip to sample index `index`: its ramps advance over
-    /// samples not processed, so a parameter's value depends on the
-    /// sample index and the ordered entries alone. A lower index follows
-    /// a backward clock step: the position re-anchors and the ramps hold
-    /// where they are, never rewound. The strip's dynamics compute their
-    /// gains on the grid of the index wherever the strip started.
-    fn strip_to(&mut self, index: u64) {
-        if let Some(strip) = &mut self.strip {
-            if let Some(pos) = self.strip_pos
-                && index > pos
-            {
-                strip.advance((index - pos) as usize);
-            }
-            strip.align(index);
-        }
-        self.strip_pos = Some(index);
+/// Sets `param` on `strip`, at `pos`, from sample index `at_index`. False,
+/// and nothing set, when there is no strip or the strip refuses it.
+fn set_strip(
+    strip: &mut Option<Strip>,
+    pos: &mut Option<u64>,
+    at_index: u64,
+    param: StripParam,
+) -> bool {
+    strip_to(strip, pos, at_index);
+    strip.as_mut().is_some_and(|s| s.set(param))
+}
+
+/// Runs `strip`, at `pos`, over block `dst` of `frames` samples per
+/// channel starting at sample index `start`.
+fn run_strip(
+    strip: &mut Option<Strip>,
+    pos: &mut Option<u64>,
+    start: u64,
+    dst: &mut [f32],
+    frames: usize,
+) {
+    strip_to(strip, pos, start);
+    if let Some(strip) = strip {
+        strip.process(dst, frames);
     }
+    *pos = Some(start + frames as u64);
+}
+
+/// Brings `strip`, at `pos`, the index of the next sample it processes, to
+/// sample index `index`: its ramps advance over samples not processed, so
+/// a parameter's value depends on the sample index and the ordered entries
+/// alone. A lower index follows a backward clock step: the position
+/// re-anchors and the ramps hold where they are, never rewound. The
+/// strip's dynamics compute their gains on the grid of the index wherever
+/// the strip started.
+fn strip_to(strip: &mut Option<Strip>, pos: &mut Option<u64>, index: u64) {
+    if let Some(strip) = strip {
+        if let Some(pos) = *pos
+            && index > pos
+        {
+            strip.advance((index - pos) as usize);
+        }
+        strip.align(index);
+    }
+    *pos = Some(index);
 }
 
 /// A meter on channels of a buffer the RT thread computes: one
@@ -849,9 +876,44 @@ pub(crate) struct Out {
     pub hold: Hold,
     /// The page hashes, in replicated mode with more than one voter.
     pub pages: Option<Pages>,
+    /// The output's strip, when configured: run on every block computed,
+    /// on the matrix's output before the limiter.
+    pub strip: Option<Strip>,
+    /// The index of the next sample the strip processes.
+    pub strip_pos: Option<u64>,
     /// The output's limiter, when configured: run on every block
     /// computed, before the write, the page hash and the meters.
     pub limiter: Option<Limiter>,
+}
+
+impl Out {
+    /// Runs the strip, then the limiter, over the output's channels of
+    /// block `buf`, `frames` samples per channel starting at sample index
+    /// `start`, through `scratch`, before anything reads them: the write,
+    /// the page hash and the output's meter see what leaves. An output
+    /// with neither is left as the matrix computed it.
+    fn process(&mut self, start: u64, buf: &mut PlanarBuffer, scratch: &mut [f32], frames: usize) {
+        if self.strip.is_none() && self.limiter.is_none() {
+            return;
+        }
+        let legs = &mut scratch[..self.channels * frames];
+        for (c, leg) in legs.chunks_exact_mut(frames).enumerate() {
+            leg.copy_from_slice(&buf.channel(self.first_channel + c)[..frames]);
+        }
+        run_strip(&mut self.strip, &mut self.strip_pos, start, legs, frames);
+        if let Some(limiter) = &mut self.limiter {
+            limiter.process(start, legs, frames);
+        }
+        for (c, leg) in legs.chunks_exact(frames).enumerate() {
+            buf.channel_mut(self.first_channel + c)[..frames].copy_from_slice(leg);
+        }
+    }
+
+    /// Sets `param` on the strip from sample index `at_index`. False, and
+    /// nothing set, when the output has no strip or the strip refuses it.
+    fn set_strip(&mut self, at_index: u64, param: StripParam) -> bool {
+        set_strip(&mut self.strip, &mut self.strip_pos, at_index, param)
+    }
 }
 
 /// The shortest sleep between two reads of the input heads while the RT
@@ -2106,6 +2168,20 @@ fn capture_core(
         // A limiter holds no heap memory: the copy allocates nothing.
         d.clone_from(&o.limiter);
     }
+    c.outs.clear();
+    for (o, out) in outs.iter().enumerate().filter(|(_, o)| o.strip.is_some()) {
+        if c.outs.len() == c.outs.capacity() {
+            debug_assert!(false, "a core buffer without room for its outputs");
+            break;
+        }
+        // A strip holds no heap memory, and the list has room: the copy
+        // allocates nothing.
+        let part = OutCore {
+            strip: out.strip.clone(),
+            strip_pos: out.strip_pos,
+        };
+        c.outs.push((o as u32, part));
+    }
     for (d, s) in c.slots.iter_mut().zip(slots) {
         d.up = s.up;
         d.held = s.held;
@@ -2594,6 +2670,7 @@ impl Rt {
             // index; taken through that core.
             match &mut entry.change {
                 Change::Strip { .. }
+                | Change::OutputStrip { .. }
                 | Change::Limiter { .. }
                 | Change::Delay { .. }
                 | Change::Tone { .. } => {
@@ -2830,13 +2907,13 @@ impl Rt {
 
     /// Without a core: takes the entries due by block `k` that need no
     /// generation off the pending list, so that a long spell neither
-    /// fills the list nor holds the log's entries back. A strip entry, and
-    /// a batch's strip parameters, are applied to the slots' strips, which
-    /// stay with the slots, and a loudness reset to the meters, which stay
-    /// with the engine; the rest passes unapplied. A batch holding a
-    /// generation-needing entry stays pending whole, as that entry does
-    /// alone. A core installed later must know them, as it must know every
-    /// entry taken.
+    /// fills the list nor holds the log's entries back. A strip, limiter,
+    /// delay or tone entry, and a batch's parameters, are applied to what
+    /// the slots and outputs keep, and a loudness reset to the meters,
+    /// which stay with the engine; the rest passes unapplied. A batch
+    /// holding a generation-needing entry stays pending whole, as that
+    /// entry does alone. A core installed later must know them, as it must
+    /// know every entry taken.
     #[cfg_attr(samplez_rtsan, sanitize(realtime = "nonblocking"))]
     pub(crate) fn pass_entries(&mut self, k: u64) {
         let end = (k + 1) * self.block;
@@ -2851,6 +2928,7 @@ impl Rt {
             add(&self.counters.entries_without_core, 1);
             match e.change {
                 Change::Strip { slot, param } => self.set_strip(e, slot, param),
+                Change::OutputStrip { output, param } => self.set_output_strip(e, output, param),
                 Change::Limiter { output, params } => self.set_limiter(e, output, params),
                 Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
                 Change::Tone { slot, params } => self.set_tone(e, slot, params),
@@ -2978,6 +3056,20 @@ impl Rt {
         }
     }
 
+    /// Sets parameter `param` of output `output`'s strip from the index of
+    /// entry `e`, which carries it; a refusal is counted and reported as a
+    /// slot's strip's.
+    fn set_output_strip(&mut self, e: RtEntry, output: usize, param: StripParam) {
+        if !self.outs[output].set_strip(e.at_index, param) {
+            add(&self.counters.strip_refused, 1);
+            let entry = RtEntry {
+                change: Change::OutputStrip { output, param },
+                ..e
+            };
+            self.send(Telemetry::StripRefused { entry });
+        }
+    }
+
     /// Sets the limiter of output `output` from the index of entry `e`,
     /// which carries it; a refusal is counted and reported as a strip's.
     fn set_limiter(&mut self, e: RtEntry, output: usize, params: LimiterParams) {
@@ -3026,11 +3118,14 @@ impl Rt {
         }
     }
 
-    /// Sets strip, limiter, delay and tone parameters of batch `b`, entry
-    /// `e`.
+    /// Sets strip, output strip, limiter, delay and tone parameters of
+    /// batch `b`, entry `e`.
     fn set_params(&mut self, e: RtEntry, b: &Batch) {
         for &(slot, param) in &b.strips {
             self.set_strip(e, slot as usize, param);
+        }
+        for &(output, param) in &b.output_strips {
+            self.set_output_strip(e, output as usize, param);
         }
         for &(output, params) in &b.limiters {
             self.set_limiter(e, output as usize, params);
@@ -3144,6 +3239,7 @@ impl Rt {
                 }
             }
             Change::Strip { slot, param } => self.set_strip(e, slot, param),
+            Change::OutputStrip { output, param } => self.set_output_strip(e, output, param),
             Change::Limiter { output, params } => self.set_limiter(e, output, params),
             Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
             Change::Tone { slot, params } => self.set_tone(e, slot, params),
@@ -3547,20 +3643,10 @@ impl Rt {
             &mut self.outbuf,
             sink,
         );
-        // Each limiter on its output's channels, before anything reads
-        // them.
+        // Each output's strip and limiter on its channels, before anything
+        // reads them.
         for out in &mut self.outs {
-            let Some(limiter) = &mut out.limiter else {
-                continue;
-            };
-            let legs = &mut self.scratch[..out.channels * b];
-            for (c, leg) in legs.chunks_exact_mut(b).enumerate() {
-                leg.copy_from_slice(&self.outbuf.channel(out.first_channel + c)[..b]);
-            }
-            limiter.process(start, legs, b);
-            for (c, leg) in legs.chunks_exact(b).enumerate() {
-                self.outbuf.channel_mut(out.first_channel + c)[..b].copy_from_slice(leg);
-            }
+            out.process(start, &mut self.outbuf, &mut self.scratch, b);
         }
 
         let digest = self
@@ -3851,6 +3937,14 @@ impl Rt {
             for (d, l) in self.outs.iter_mut().zip(&c.limiters) {
                 d.limiter.clone_from(l);
             }
+            for (o, part) in &c.outs {
+                if let Some(d) = self.outs.get_mut(*o as usize) {
+                    // Of the same legs, `Core::fits` checked: the copy
+                    // allocates nothing.
+                    d.strip.clone_from(&part.strip);
+                    d.strip_pos = part.strip_pos;
+                }
+            }
         }
         // An entry applied here before its generation arrived keeps
         // waiting for it: the core knew the entry, a refusal as Missed says
@@ -3937,8 +4031,8 @@ impl Rt {
         let counter = match h.answer {
             Answer::Installed => {
                 self.install_core(&mut h.core, h.last_id, h.replayed);
-                // A product state's strip, limiter and delay parameters,
-                // from the install on.
+                // A product state's strip, output strip, limiter and delay
+                // parameters, from the install on.
                 let e = RtEntry {
                     id: h.last_id,
                     at_index: first * self.block,
@@ -3953,6 +4047,10 @@ impl Rt {
                 for n in 0..h.strips.len() {
                     let (slot, param) = h.strips[n];
                     self.set_strip(e, slot, param);
+                }
+                for n in 0..h.out_strips.len() {
+                    let (output, param) = h.out_strips[n];
+                    self.set_output_strip(e, output, param);
                 }
                 for n in 0..h.limiters.len() {
                     let (output, params) = h.limiters[n];
@@ -4948,6 +5046,8 @@ mod tests {
             meter: OutMeter::new(1),
             hold: crate::blocks::Hold::new(1, B, 0, true),
             pages: None,
+            strip: None,
+            strip_pos: None,
             limiter: None,
         };
         let mut outs = [out(true), out(false), out(true)];
@@ -4960,6 +5060,12 @@ mod tests {
         }));
         limiter.process(0, &mut [0.9; 96], 96);
         outs[1].limiter = Some(limiter.clone());
+        // An output strip mid-ramp: its ramps and position are core.
+        let mut out_strip = Strip::new(1, 480);
+        assert!(out_strip.set(StripParam::Trim { db: 6.0 }));
+        out_strip.process(&mut [0.5; 48], 48);
+        outs[2].strip = Some(out_strip.clone());
+        outs[2].strip_pos = Some(20 * B);
 
         let mut c = Core::new(1, 1, 2, 4, 3);
         capture_core(&mut c, &m, &slots, &outs, &awaiting, Some(11), &r);
@@ -5001,6 +5107,13 @@ mod tests {
                 },
             ],
             limiters: vec![None, Some(limiter), None],
+            outs: vec![(
+                2,
+                OutCore {
+                    strip: Some(out_strip),
+                    strip_pos: Some(20 * B),
+                },
+            )],
             awaiting_gen: awaiting.to_vec(),
             pending_gen: Some(11),
             unresolved: vec![(8, 21 * B), (9, 30 * B)],
@@ -5217,7 +5330,7 @@ mod tests {
         assert_ne!(c, d);
 
         let held = slot.strip.clone();
-        slot.strip_to(96);
+        strip_to(&mut slot.strip, &mut slot.strip_pos, 96);
         assert_eq!((slot.strip, slot.strip_pos), (held, Some(96)));
 
         // Over silence, filter and envelope states stay at zero, so a
@@ -5244,6 +5357,112 @@ mod tests {
         processed.process(&mut b, 48);
         assert_eq!(a, b);
         assert_eq!(slot.strip.as_ref(), Some(&processed));
+    }
+
+    /// A mono output of strip and limiter as configured, its strip ramping
+    /// over 480 samples.
+    fn strip_out(limiter: bool) -> Out {
+        Out {
+            first_channel: 0,
+            channels: 1,
+            writer: None,
+            enabled: true,
+            first_k: 0,
+            meter: OutMeter::new(1),
+            hold: crate::blocks::Hold::new(1, B, 0, true),
+            pages: None,
+            strip: Some(Strip::new(1, 480)),
+            strip_pos: None,
+            limiter: limiter.then(|| Limiter::new(1, 480)),
+        }
+    }
+
+    /// An output's strip runs in the loop as a slot's: an output that
+    /// skipped blocks, an entry's index among them, computes the block
+    /// after the skip as a strip advanced to the index, set, and advanced
+    /// on, its ramps running across the skip.
+    #[test]
+    fn an_output_strip_advances_over_samples_not_processed() {
+        let block = |k: u64| -> Vec<f32> {
+            (k * B..(k + 1) * B)
+                .map(|n| 0.8 * (n as f32 * 0.21).sin())
+                .collect()
+        };
+        let mut out = strip_out(false);
+        let mut reference = Strip::new(1, 480);
+        let mut buf = PlanarBuffer::new(1, B as usize);
+        let mut scratch = vec![0.0f32; B as usize];
+        // Each block's input computed once and given to both, so the
+        // comparison does not depend on how often `sin` is evaluated.
+        let mut run = |out: &mut Out, k: u64, input: &[f32]| {
+            buf.channel_mut(0)[..B as usize].copy_from_slice(input);
+            out.process(k * B, &mut buf, &mut scratch, B as usize);
+            buf.channel(0)[..B as usize].to_vec()
+        };
+        let first = StripParam::Trim { db: -12.0 };
+        assert!(out.set_strip(0, first) && reference.set(first));
+        for k in [0, 1] {
+            let input = block(k);
+            let mut want = input.clone();
+            reference.process(&mut want, B as usize);
+            assert_eq!(run(&mut out, k, &input), want, "block {k}");
+        }
+        // Inside the skip of blocks 2..8.
+        let second = StripParam::Trim { db: 6.0 };
+        assert!(out.set_strip(4 * B, second));
+        reference.advance(2 * B as usize);
+        assert!(reference.set(second));
+        reference.advance(4 * B as usize);
+        let input = block(8);
+        let mut want = input.clone();
+        reference.process(&mut want, B as usize);
+        assert_eq!(run(&mut out, 8, &input), want);
+        assert_eq!(out.strip.as_ref(), Some(&reference));
+        assert_eq!(out.strip_pos, Some(9 * B));
+        // The change ramps still: the reference is not a settled strip.
+        let mut settled = reference.clone();
+        settled.advance(1 << 20);
+        let (mut c, mut d) = (block(9), block(9));
+        reference.process(&mut c, B as usize);
+        settled.process(&mut d, B as usize);
+        assert_ne!(c, d);
+    }
+
+    /// An output's strip runs before its limiter: a strip raising the
+    /// output 18 dB above the limiter's ceiling leaves no sample above it
+    /// once the limiter is on, and is heard, the output at the ceiling
+    /// rather than at the matrix's level below it.
+    #[test]
+    fn an_output_strip_runs_before_the_limiter() {
+        let mut out = strip_out(true);
+        assert!(out.set_strip(0, StripParam::Trim { db: 18.0 }));
+        let ceiling_db = -6.0;
+        let params = LimiterParams {
+            enabled: true,
+            ceiling_db,
+            release_ms: 50.0,
+        };
+        assert!(out.limiter.as_mut().unwrap().set(params));
+        let ceiling = 10f32.powf(ceiling_db / 20.0);
+        let mut buf = PlanarBuffer::new(1, B as usize);
+        let mut scratch = vec![0.0f32; B as usize];
+        let mut loudest = 0.0f32;
+        for k in 0..200 {
+            let at = |i: usize| (k * B + i as u64) as f32;
+            for (i, x) in buf.channel_mut(0)[..B as usize].iter_mut().enumerate() {
+                *x = 0.25 * (at(i) * 0.05).sin();
+            }
+            out.process(k * B, &mut buf, &mut scratch, B as usize);
+            // Past the ramps of the trim and of switching the limiter on.
+            if k >= 20 {
+                for &x in &buf.channel(0)[..B as usize] {
+                    let within = ceiling * (1.0 + 1e-6);
+                    assert!(x.abs() <= within, "{x} above {ceiling} in block {k}");
+                    loudest = loudest.max(x.abs());
+                }
+            }
+        }
+        assert!(loudest > 0.4, "the strip unheard: {loudest}");
     }
 
     /// A strip's gate and compressor compute their gains on the grid of

@@ -75,6 +75,7 @@ fn the_rt_thread_passes_rtsan() {
     common::add_meter(&mut cfg, "bus", 2, 0.5);
     common::add_tone(&mut cfg, "tone", 2, 0.25);
     cfg.outputs[0].limiter = true;
+    cfg.outputs[0].strip = true;
     cfg.inputs[0].max_delay_samples = 4800;
     let (engine, rx) = start(cfg);
     let attached = || engine.status().inputs[0].state == InputState::Attached;
@@ -115,6 +116,12 @@ fn the_rt_thread_passes_rtsan() {
     engine
         .set_limiter(0, limiter, (index / B + 20) * B)
         .unwrap();
+    // The output's strip ahead of the limiter, every parameter set.
+    for param in common::strip_params(2) {
+        engine
+            .set_output_strip(0, param, (index / B + 20) * B)
+            .unwrap();
+    }
     engine.set_delay(0, 2400, (index / B + 20) * B).unwrap();
     engine.set_delay(0, 1200, (index / B + 21) * B).unwrap();
     // The tone generator through a level, frequency and ident change,

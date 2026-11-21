@@ -4254,6 +4254,7 @@ mod tests {
                 pending: Vec::new(),
                 fading: Vec::new(),
                 last_id: log.applied,
+                ..Default::default()
             };
             (log.applied, log.floor, state)
         }

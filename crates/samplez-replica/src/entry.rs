@@ -261,8 +261,10 @@ pub enum Body {
 /// and its product state names a fade applied after its start as the
 /// engine joins it and the input fade-ins and crossfades and duck depth
 /// and mask ramps in flight, which its snapshots carry, so a replica
-/// rebuilt inside one continues it as its peers do.
-pub const PROTOCOL: u32 = 4;
+/// rebuilt inside one continues it as its peers do; 5 adds the output
+/// strip's engine entry (`samplez::Entry::OutputStrip`) and targets
+/// (`samplez::Targets::output_strips`).
+pub const PROTOCOL: u32 = 5;
 
 impl Body {
     /// An entry whose generation every replica builds on receipt: an
@@ -483,10 +485,11 @@ mod tests {
     /// the replicated semantics or the page hash and fingerprint
     /// computation bumps it, with the reason added here, and only such a
     /// change does. 2: the generation flags; 3: the tone generator's
-    /// entry and targets; 4: an unfillable withheld block's digest.
+    /// entry and targets; 4: an unfillable withheld block's digest; 5: the
+    /// output strip's entry and targets.
     #[test]
     fn the_protocol_is_pinned() {
-        assert_eq!(PROTOCOL, 4);
+        assert_eq!(PROTOCOL, 5);
     }
 
     /// The entries the leader flagged for a generation need one, so a
