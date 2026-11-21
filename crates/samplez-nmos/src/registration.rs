@@ -141,8 +141,8 @@ pub(crate) async fn run(inner: Arc<Inner>) {
             // that continues a held registration from its first.
             let joined = if registered_once || inner.cfg.continue_held {
                 match client.heartbeat(&registry.base).await {
-                    Answer::Status(StatusCode::OK, _) => Ok(true),
-                    Answer::Status(StatusCode::NOT_FOUND, _) => Ok(false),
+                    Answer::Status(StatusCode::OK, ..) => Ok(true),
+                    Answer::Status(StatusCode::NOT_FOUND, ..) => Ok(false),
                     Answer::Status(StatusCode::CONFLICT, loc) => {
                         unregister_old(&client, &registry.base, loc).await;
                         Ok(false)
@@ -210,7 +210,7 @@ pub(crate) async fn run(inner: Arc<Inner>) {
 
 fn log_failover(registry: &Registry, a: &Answer) {
     match a {
-        Answer::Status(s, _) => {
+        Answer::Status(s, ..) => {
             tracing::warn!(registry = %registry.base, status = %s, "nmos: registry unusable")
         }
         Answer::None(e) => {
@@ -263,7 +263,9 @@ fn id_version(doc: &Value) -> (Uuid, String) {
 
 /// Posts every resource whose version the registry has not seen, parents
 /// first. A 200 on a first Node registration means the registry still held
-/// an earlier registration, which the node deletes and registers anew.
+/// an earlier registration, and any 400 may mean it holds one at a later
+/// version, as of a replica set rebuilt under the same Node id: the node
+/// deletes it and registers anew, once per pass.
 async fn register_all(
     inner: &Inner,
     client: &Registrar,
@@ -299,7 +301,18 @@ async fn post_changed(
                 continue;
             }
             let mut answer = client.post(base, kind, &doc).await;
-            if fresh && kind == "node" && matches!(answer, Answer::Status(StatusCode::OK, _)) {
+            // A 200 means the registry still held the Node (IS-04 asks for
+            // it to be deleted and registered anew). A 400 may be a version
+            // earlier than the one held, as from a set rebuilt under the
+            // same node id; IS-04 gives no structured reason and registries
+            // word it differently, so any 400 gets the same one delete and
+            // re-post per pass. A Node refused for another reason only
+            // loses and regains its own registration and is refused again.
+            let held = matches!(
+                answer,
+                Answer::Status(StatusCode::OK | StatusCode::BAD_REQUEST, ..)
+            );
+            if fresh && kind == "node" && held {
                 client.delete(&format!("{base}/resource/nodes/{id}")).await;
                 answer = client.post(base, kind, &doc).await;
             }
@@ -307,11 +320,11 @@ async fn post_changed(
             // whose new version is still not newer than the held one after
             // a clock skew between hosts: the Node is deleted and every
             // resource registered anew, so none of the predecessor's stays.
-            if continued && matches!(answer, Answer::Status(StatusCode::BAD_REQUEST, _)) {
+            if continued && matches!(answer, Answer::Status(StatusCode::BAD_REQUEST, ..)) {
                 tracing::warn!(%kind, %id, "nmos: the registry refused a continued resource; registering anew");
                 let node = format!("{base}/resource/nodes/{}", client.node);
                 match client.delete(&node).await {
-                    Answer::Status(s, _) if s.is_success() || s == StatusCode::NOT_FOUND => {}
+                    Answer::Status(s, ..) if s.is_success() || s == StatusCode::NOT_FOUND => {}
                     a => return failover(&a),
                 }
                 posted.clear();
@@ -323,10 +336,10 @@ async fn post_changed(
                 answer = client.post(base, kind, &doc).await;
             }
             match answer {
-                Answer::Status(s, _) if s.is_success() => {
+                Answer::Status(s, ..) if s.is_success() => {
                     posted.insert(id, version);
                 }
-                Answer::Status(s, _) if s.is_client_error() => {
+                Answer::Status(s, ..) if s.is_client_error() => {
                     // IS-04: a 400 is not retried as it was sent.
                     tracing::warn!(%kind, %id, status = %s, "nmos: the registry refused a resource");
                     posted.insert(id, version);
@@ -361,8 +374,8 @@ async fn maintain(
             next = Instant::now() + interval;
         }
         match client.heartbeat(base).await {
-            Answer::Status(StatusCode::OK, _) => {}
-            Answer::Status(StatusCode::NOT_FOUND, _) => {
+            Answer::Status(StatusCode::OK, ..) => {}
+            Answer::Status(StatusCode::NOT_FOUND, ..) => {
                 tracing::info!("nmos: the registry lost the node; registering again");
                 register_all(inner, client, base, posted).await?;
             }
@@ -370,7 +383,7 @@ async fn maintain(
                 unregister_old(client, base, loc).await;
                 register_all(inner, client, base, posted).await?;
             }
-            Answer::Status(s, _) if s.is_client_error() => {
+            Answer::Status(s, ..) if s.is_client_error() => {
                 tracing::warn!(status = %s, "nmos: the registry refused a heartbeat");
             }
             a => {

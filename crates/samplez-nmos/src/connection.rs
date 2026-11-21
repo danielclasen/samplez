@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::http::{error, is_get, json as respond, not_allowed, not_found, ok};
 use crate::model::{BIT_DEPTH, ChannelCount, SAMPLE_RATE};
-use crate::product::{Active, Applied, FlowSeen, Port};
+use crate::product::{self, ActivationMode, Active, Applied, FlowSeen, Port, Replicated};
 use crate::resources::CONNECTION_VERSION;
 use crate::tai::Tai;
 use crate::{Inner, State};
@@ -85,6 +85,33 @@ pub(crate) struct Activation {
 }
 
 impl Activation {
+    /// The activation as a product replicates it, `None` before any.
+    fn public(&self) -> Option<product::Activation> {
+        let mode = match self.mode? {
+            IMMEDIATE => ActivationMode::Immediate,
+            ABSOLUTE => ActivationMode::ScheduledAbsolute,
+            _ => ActivationMode::ScheduledRelative,
+        };
+        Some(product::Activation {
+            mode,
+            requested: self.requested.clone(),
+            time: self.time?,
+        })
+    }
+
+    pub fn of(a: &product::Activation) -> Activation {
+        let mode = match a.mode {
+            ActivationMode::Immediate => IMMEDIATE,
+            ActivationMode::ScheduledAbsolute => ABSOLUTE,
+            ActivationMode::ScheduledRelative => RELATIVE,
+        };
+        Activation {
+            mode: Some(mode),
+            requested: a.requested.clone(),
+            time: Some(a.time),
+        }
+    }
+
     fn to_json(&self) -> Value {
         json!({
             "mode": self.mode,
@@ -115,6 +142,8 @@ pub(crate) struct Pending {
 struct Job {
     generation: u64,
     active: Active,
+    /// What `/active` shows for it once it takes effect.
+    activation: Activation,
     at: Option<Tai>,
     /// Where the result goes instead of [`settle`]: a scheduled activation
     /// settles once `/active` shows it.
@@ -128,7 +157,16 @@ pub(crate) struct PortState {
     pub version: Tai,
     pub staged: Staged,
     pub active: Active,
-    active_activation: Activation,
+    pub active_activation: Activation,
+    /// The connection the IS-04 resource shows: `/active`, or with shared
+    /// versions the last one replicated, so the resource changes only with
+    /// its version.
+    pub published: Active,
+    /// The activation that goes with `published`.
+    pub published_activation: Activation,
+    /// The apply with the product, by generation, for
+    /// [`crate::Nmos::activation`].
+    in_flight: Option<(u64, Replicated)>,
     pending: Option<Pending>,
     /// Counts the changes of `/active` and the applies; an apply result
     /// counts only while nothing came after it.
@@ -148,7 +186,7 @@ pub(crate) struct PortState {
 }
 
 impl PortState {
-    pub fn new(version: Tai, active: Active) -> PortState {
+    pub fn new(version: Tai, active: Active, activation: Activation) -> PortState {
         PortState {
             version,
             staged: Staged {
@@ -158,8 +196,11 @@ impl PortState {
                 flow: Param::of(active.flow),
                 activation: Activation::default(),
             },
+            published: active.clone(),
+            published_activation: activation.clone(),
             active,
-            active_activation: Activation::default(),
+            active_activation: activation,
+            in_flight: None,
             pending: None,
             generation: 0,
             queue: VecDeque::new(),
@@ -173,6 +214,23 @@ impl PortState {
 
     pub fn pending_at(&self) -> Option<Tai> {
         self.pending.as_ref().map(|p| p.at)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// `/active` shows the connection and the activation last replicated.
+    pub fn show_published(&mut self) {
+        self.active = self.published.clone();
+        self.active_activation = self.published_activation.clone();
+    }
+
+    /// The change the apply of `generation` makes, while it is with the
+    /// product.
+    pub fn in_flight(&self, generation: u64) -> Option<Replicated> {
+        let (g, change) = self.in_flight.as_ref()?;
+        (*g == generation).then(|| change.clone())
     }
 
     /// Marks something that supersedes every apply before it.
@@ -632,8 +690,10 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
                     // The product has it already: hand it what stays active,
                     // for the same time, so it ends where `/active` is.
                     let active = p.active.clone();
+                    let activation = p.active_activation.clone();
                     p.applied = Applied::Applying;
-                    enqueue(inner, &mut st, port, active, Some(pending.at), None, None);
+                    let at = Some(pending.at);
+                    enqueue(inner, &mut st, port, active, activation, at, None, None);
                 }
             }
             Ok((StatusCode::OK, staged_json(port, &staged)))
@@ -652,8 +712,15 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
             };
             let mut st = inner.lock();
             st.port_mut(port).staged = staged;
-            write_active(&mut st, port, active.clone(), activation, now);
-            enqueue(inner, &mut st, port, active, None, None, None);
+            write_active(
+                inner,
+                &mut st,
+                port,
+                active.clone(),
+                activation.clone(),
+                now,
+            );
+            enqueue(inner, &mut st, port, active, activation, None, None, None);
             Ok((StatusCode::OK, staged_json(port, &response)))
         }
         Some(Some((mode, requested))) => {
@@ -698,23 +765,37 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
     }
 }
 
-/// Writes `/active` and bumps the port's IS-04 version.
-fn write_active(st: &mut State, port: Port, active: Active, activation: Activation, now: Tai) {
-    let version = st.bump(now);
+/// Writes `/active` and bumps the port's IS-04 version; with shared
+/// versions the IS-04 resource and its version stay for the product's
+/// replicated change.
+fn write_active(
+    inner: &Inner,
+    st: &mut State,
+    port: Port,
+    active: Active,
+    activation: Activation,
+    now: Tai,
+) {
+    let version = (!inner.shared).then(|| st.bump(now));
     let p = st.port_mut(port);
+    if let Some(v) = version {
+        p.version = v;
+        p.published = active.clone();
+    }
     p.active = active;
     p.active_activation = activation;
-    p.version = version;
     p.applied = Applied::Applying;
 }
 
 /// Queues an apply behind every earlier one on the port and returns its
 /// generation; the port's task hands them to the product one at a time.
+#[allow(clippy::too_many_arguments)]
 fn enqueue(
     inner: &Arc<Inner>,
     st: &mut State,
     port: Port,
     active: Active,
+    activation: Activation,
     at: Option<Tai>,
     reply: Option<oneshot::Sender<Result<(), String>>>,
     schedule: Option<u64>,
@@ -724,6 +805,7 @@ fn enqueue(
     p.queue.push_back(Job {
         generation,
         active,
+        activation,
         at,
         reply,
         schedule,
@@ -745,7 +827,14 @@ async fn work(inner: Arc<Inner>, port: Port) {
             let mut st = inner.lock();
             let p = st.port_mut(port);
             match p.queue.pop_front() {
-                Some(job) => job,
+                Some(job) => {
+                    let change = Replicated {
+                        active: job.active.clone(),
+                        activation: job.activation.public(),
+                    };
+                    p.in_flight = Some((job.generation, change));
+                    job
+                }
                 None => {
                     p.working = false;
                     return;
@@ -777,7 +866,8 @@ async fn work(inner: Arc<Inner>, port: Port) {
 }
 
 /// Records an apply result; a failure turns `master_enable` false in
-/// `/active` unless something came after what failed.
+/// `/active` unless something came after what failed. With shared versions
+/// `/active` shows what was last replicated again instead.
 fn settle(inner: &Inner, port: Port, generation: u64, result: Result<(), String>) {
     let now = inner.clock.now();
     let mut st = inner.lock();
@@ -787,11 +877,18 @@ fn settle(inner: &Inner, port: Port, generation: u64, result: Result<(), String>
     match result {
         Ok(()) => st.port_mut(port).applied = Applied::Applied,
         Err(reason) => {
-            tracing::warn!(port = ?port, %reason, "nmos: the activation was not applied; master_enable is false");
-            let version = st.bump(now);
+            if inner.shared {
+                tracing::warn!(port = ?port, %reason, "nmos: the activation was not applied; /active shows the replicated connection");
+                st.port_mut(port).show_published();
+            } else {
+                tracing::warn!(port = ?port, %reason, "nmos: the activation was not applied; master_enable is false");
+                let version = st.bump(now);
+                let p = st.port_mut(port);
+                p.active.master_enable = false;
+                p.published = p.active.clone();
+                p.version = version;
+            }
             let p = st.port_mut(port);
-            p.active.master_enable = false;
-            p.version = version;
             p.applied = Applied::Failed(reason);
             p.failures += 1;
         }
@@ -805,27 +902,42 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
     sleep_until(&inner, at, lead).await;
     let staged = inner.lock().port(port).staged.clone();
     let target = target(&inner, port, &staged).await.map_err(|(_, m)| m);
-    let applied = match &target {
-        Ok(active) => {
-            let mut st = inner.lock();
-            match st.port_mut(port).pending.as_mut() {
-                Some(p) if p.id == id => p.applied = true,
-                _ => return,
-            }
-            let (reply, applied) = oneshot::channel();
-            let active = active.clone();
-            enqueue(
-                &inner,
-                &mut st,
-                port,
-                active,
-                Some(at),
-                Some(reply),
-                Some(id),
-            );
-            Some(applied)
+    // A target that no longer checks out is written as it would be and
+    // then failed below, so `/active` shows what was asked for. With
+    // shared versions it goes to the product disabled, so the failure is
+    // replicated and no instance shows the request enabled.
+    let asked = target.clone().unwrap_or_else(|_| Active {
+        master_enable: staged.master_enable && !inner.shared,
+        peer: staged.peer,
+        domain: staged.domain.resolve(Some(inner.own(port).0)),
+        flow: staged.flow.resolve(inner.own(port).1),
+    });
+    let applied = if target.is_ok() || inner.shared {
+        let mut st = inner.lock();
+        match st.port_mut(port).pending.as_mut() {
+            Some(p) if p.id == id => p.applied = true,
+            _ => return,
         }
-        Err(_) => None,
+        let (reply, applied) = oneshot::channel();
+        let p = st.port(port);
+        let activation = Activation {
+            mode: p.staged.activation.mode,
+            requested: p.staged.activation.requested.clone(),
+            time: Some(at),
+        };
+        let job = enqueue(
+            &inner,
+            &mut st,
+            port,
+            asked.clone(),
+            activation,
+            Some(at),
+            Some(reply),
+            Some(id),
+        );
+        Some((job, applied))
+    } else {
+        None
     };
     sleep_until(&inner, at, Duration::ZERO).await;
     let generation = {
@@ -841,26 +953,28 @@ async fn scheduled(inner: Arc<Inner>, port: Port, id: u64, at: Tai) {
             time: Some(at),
         };
         p.staged.activation = Activation::default();
-        // A target that no longer checks out is written as it would be and
-        // then failed below, so `/active` shows what was asked for.
-        let active = target.clone().unwrap_or_else(|_| Active {
-            master_enable: staged.master_enable,
-            peer: staged.peer,
-            domain: staged.domain.resolve(Some(inner.own(port).0)),
-            flow: staged.flow.resolve(inner.own(port).1),
-        });
-        write_active(&mut st, port, active, activation, at);
+        write_active(&inner, &mut st, port, asked, activation, at);
         let late = inner.clock.now().since(at);
         if let Some(h) = inner.late.get() {
             h[inner.index(port)].observe(late.as_secs_f64());
         }
         let p = st.port_mut(port);
         p.late = Some(late);
-        p.supersede()
+        // With shared versions the activation keeps its apply's
+        // generation while nothing came after it, so the product's
+        // replicated change of it still finds it.
+        match &applied {
+            Some((job, _)) if inner.shared && p.generation() == *job => *job,
+            _ => p.supersede(),
+        }
     };
     let result = match (target, applied) {
-        (Err(reason), _) => Err(reason),
-        (Ok(_), Some(applied)) => applied
+        (Err(reason), Some((_, applied))) => {
+            let _ = applied.await;
+            Err(reason)
+        }
+        (Err(reason), None) => Err(reason),
+        (Ok(_), Some((_, applied))) => applied
             .await
             .unwrap_or_else(|_| Err("apply did not complete".into())),
         (Ok(_), None) => Ok(()),

@@ -37,8 +37,8 @@ pub use model::{
 };
 pub use product::DEFAULT_APPLY_TIMEOUT;
 pub use product::{
-    Active, Applied, BoxFuture, Connections, Fail, FlowSeen, NmosStatus, NoStore, Port, PortKey,
-    PortStatus, Reject, Store,
+    Activation, ActivationMode, Active, Applied, BoxFuture, Connections, Fail, FlowSeen,
+    NmosStatus, NoStore, Port, PortKey, PortStatus, Reject, Replicated, Stamped, Store,
 };
 pub use tai::{SystemTai, Tai, TaiClock};
 pub use uuid;
@@ -77,7 +77,10 @@ pub(crate) struct Inner {
     ids: Ids,
     conns: Arc<dyn Connections>,
     clock: Arc<dyn TaiClock>,
-    /// The receivers' caps never change, so their version is the start.
+    /// Versions come only from the product, [`Nmos::with_versions`].
+    shared: bool,
+    /// The receivers' caps never change, so their version is the start;
+    /// with shared versions each receiver's own.
     caps_version: Tai,
     state: Mutex<State>,
     /// One per port, senders first; held across a PATCH to the port's
@@ -117,6 +120,31 @@ impl State {
         v
     }
 
+    /// With shared versions, after a port's version moved: a sender's
+    /// Source and Flow take the sender's version, the Node and the Device
+    /// the latest of all, and a receiver's caps its receiver's
+    /// ([`resources`]). This is deliberate: their content never changes,
+    /// but their version has to be the same on every instance and must not
+    /// go back across a takeover or a restore, and the crate keeps no
+    /// replicated state of its own that could hold one. A version derived
+    /// from the ports' replicated versions is both; the cost is a re-post
+    /// of the Node, the Device and a sender's Source and Flow with each
+    /// change of a port.
+    fn derive(&mut self) {
+        let mut latest = Tai::default();
+        for s in &mut self.senders {
+            s.source_version = s.port.version;
+            s.flow_version = s.port.version;
+            latest = latest.max(s.port.version);
+        }
+        for r in &self.receivers {
+            latest = latest.max(r.version);
+        }
+        self.node_version = latest;
+        self.device_version = latest;
+        self.changed.notify_one();
+    }
+
     fn port(&self, port: Port) -> &PortState {
         match port {
             Port::Sender(i) => &self.senders[i].port,
@@ -136,8 +164,12 @@ impl Inner {
     /// Gives every resource a new version, later than every one handed out
     /// and not before the clock: a registration continued from another
     /// process holds that process's versions, which a registry takes a
-    /// change over only when newer.
+    /// change over only when newer. Nothing with shared versions: the
+    /// predecessor registered the same ones.
     pub(crate) fn restamp(&self) {
+        if self.shared {
+            return;
+        }
         let now = self.clock.now();
         let mut st = self.lock();
         st.node_version = st.bump(now);
@@ -193,6 +225,55 @@ impl Nmos {
         store: &dyn Store,
         clock: impl TaiClock,
     ) -> Result<Nmos, Error> {
+        Nmos::build(model, cfg, conns, store, clock, None)
+    }
+
+    /// [`Nmos::new`] for a product whose instances serve one Node, such as
+    /// a replica set: every version comes from the product, so instances
+    /// fed the same changes serve the same versions. A port's version is
+    /// the TAI time of the change that last changed it, from `versions`
+    /// (`0:0` for a port it lacks), and moves only with
+    /// [`Nmos::replicated_change`] and [`Nmos::set_versions`]. A sender's
+    /// Source and Flow carry the sender's version, a receiver's caps the
+    /// receiver's, and the Node and the Device the latest of all.
+    ///
+    /// An activation the node serves writes `/active` and leaves the
+    /// IS-04 resource and its version as they are: in its
+    /// [`Connections::apply`] the product takes the change from
+    /// [`Nmos::activation`] and replicates it, and every instance, the
+    /// serving one included, passes it to [`Nmos::replicated_change`], so
+    /// `/active` and the resources are the replicated ones everywhere. The
+    /// apply of a scheduled activation runs [`Connections::lead`] before
+    /// its time, so instances can show its `activation_time` before it
+    /// comes. A scheduled activation that no longer checks out at its time
+    /// goes to the product with `master_enable` false. A failed apply
+    /// shows the replicated connection in `/active` again. `/staged` and
+    /// pending scheduled activations are each instance's own, so a
+    /// controller stages and activates a port on one instance. A product
+    /// that keeps the replicated activations in its [`Store`]
+    /// ([`Store::activations`]) starts an instance on its peers'
+    /// `/active`. A continued registration ([`NmosConfig::continue_held`])
+    /// keeps the versions as they are. Every instance advertises the same
+    /// host and port, as the Node carries them.
+    pub fn with_versions(
+        model: NodeModel,
+        cfg: NmosConfig,
+        conns: Arc<dyn Connections>,
+        store: &dyn Store,
+        clock: impl TaiClock,
+        versions: &BTreeMap<PortKey, Tai>,
+    ) -> Result<Nmos, Error> {
+        Nmos::build(model, cfg, conns, store, clock, Some(versions))
+    }
+
+    fn build(
+        model: NodeModel,
+        cfg: NmosConfig,
+        conns: Arc<dyn Connections>,
+        store: &dyn Store,
+        clock: impl TaiClock,
+        versions: Option<&BTreeMap<PortKey, Tai>>,
+    ) -> Result<Nmos, Error> {
         check(&model, &cfg)?;
         if let Some(w) = clock.utc_offset().and_then(tai::offset_warning) {
             tracing::warn!("{w}");
@@ -203,6 +284,12 @@ impl Nmos {
             model.receivers.iter().map(|r| r.key.as_str()),
         );
         let stored = store.load();
+        let stored_activations = store.activations();
+        // The activation stored with a connection the port starts from.
+        let activation = |key: &PortKey, from_store: bool| {
+            let a = stored_activations.get(key).filter(|_| from_store);
+            a.map(connection::Activation::of).unwrap_or_default()
+        };
         let now = clock.now();
         let changed = Arc::new(tokio::sync::Notify::new());
         let mut st = State {
@@ -213,9 +300,12 @@ impl Nmos {
             receivers: Vec::new(),
             changed: changed.clone(),
         };
-        st.node_version = st.bump(now);
-        st.device_version = st.bump(now);
-        let caps_version = st.bump(now);
+        let mut caps_version = Tai::default();
+        if versions.is_none() {
+            st.node_version = st.bump(now);
+            st.device_version = st.bump(now);
+            caps_version = st.bump(now);
+        }
         for s in &model.senders {
             let initial = Active {
                 master_enable: true,
@@ -224,11 +314,24 @@ impl Nmos {
                 flow: Some(s.flow),
             };
             let key = PortKey::Sender(s.key.clone());
-            let active = from_store(&stored, &key, s.domain, Some(s.flow)).unwrap_or(initial);
-            let state = SenderState {
-                source_version: st.bump(now),
-                flow_version: st.bump(now),
-                port: PortState::new(st.bump(now), active),
+            let stored = from_store(&stored, &key, s.domain, Some(s.flow));
+            let activation = activation(&key, stored.is_some());
+            let active = stored.unwrap_or(initial);
+            let state = match versions {
+                Some(v) => SenderState {
+                    source_version: Tai::default(),
+                    flow_version: Tai::default(),
+                    port: PortState::new(
+                        v.get(&key).copied().unwrap_or_default(),
+                        active,
+                        activation,
+                    ),
+                },
+                None => SenderState {
+                    source_version: st.bump(now),
+                    flow_version: st.bump(now),
+                    port: PortState::new(st.bump(now), active, activation),
+                },
             };
             st.senders.push(state);
         }
@@ -240,9 +343,18 @@ impl Nmos {
                 flow: r.flow,
             };
             let key = PortKey::Receiver(r.key.clone());
-            let active = from_store(&stored, &key, r.domain, None).unwrap_or(initial);
-            let version = st.bump(now);
-            st.receivers.push(PortState::new(version, active));
+            let stored = from_store(&stored, &key, r.domain, None);
+            let activation = activation(&key, stored.is_some());
+            let active = stored.unwrap_or(initial);
+            let version = match versions {
+                Some(v) => v.get(&key).copied().unwrap_or_default(),
+                None => st.bump(now),
+            };
+            st.receivers
+                .push(PortState::new(version, active, activation));
+        }
+        if versions.is_some() {
+            st.derive();
         }
         let ports = model.senders.len() + model.receivers.len();
         Ok(Nmos {
@@ -252,6 +364,7 @@ impl Nmos {
                 ids,
                 conns,
                 clock: Arc::new(clock),
+                shared: versions.is_some(),
                 caps_version,
                 state: Mutex::new(st),
                 patching: (0..ports).map(|_| tokio::sync::Mutex::new(())).collect(),
@@ -303,15 +416,106 @@ impl Nmos {
     /// stays). Returns the change's generation: an apply already running
     /// carries a lower one, and the product ignores it when it resolves
     /// after the change; its result no longer changes `/active`.
+    ///
+    /// Panics on a node built with [`Nmos::with_versions`], whose changes
+    /// carry their version: [`Nmos::replicated_change`].
     pub fn external_change(&self, port: Port, active: Active) -> u64 {
+        assert!(
+            !self.inner.shared,
+            "nmos: a node with shared versions takes changes with replicated_change"
+        );
         let now = self.inner.clock.now();
         let mut st = self.inner.lock();
         let version = st.bump(now);
         let p = st.port_mut(port);
+        p.published = active.clone();
         p.active = active;
         p.version = version;
         p.applied = Applied::Applied;
         p.changed_by_product()
+    }
+
+    /// A change of a port in the product's replicated state, on a node
+    /// built with [`Nmos::with_versions`]; `version` is the change's TAI
+    /// time there. The port's version becomes `version`, or the next after
+    /// its own where that is not earlier, so it increases also for two
+    /// changes at one time; the IS-04 resource shows `change.active` from
+    /// now on. Returns the version set, which the product keeps, and the
+    /// generation.
+    ///
+    /// `served` is the generation of the [`Connections::apply`] call on
+    /// this node the change replicates, if any: `/active` shows the change
+    /// unless an activation or a change came after that call, and the
+    /// activations queued behind it still reach the product. Otherwise the
+    /// change is one as [`Nmos::external_change`] makes it, from another
+    /// instance or by the product itself. Either way `/active` shows
+    /// `change.activation`, or the activation last replicated when it
+    /// carries none.
+    ///
+    /// Panics on a node built with [`Nmos::new`].
+    pub fn replicated_change(
+        &self,
+        port: Port,
+        change: &Replicated,
+        version: Tai,
+        served: Option<u64>,
+    ) -> Stamped {
+        assert!(
+            self.inner.shared,
+            "nmos: replicated_change needs a node built with with_versions"
+        );
+        let mut st = self.inner.lock();
+        let p = st.port_mut(port);
+        p.version = version.max(p.version.next());
+        p.published = change.active.clone();
+        if let Some(a) = &change.activation {
+            p.published_activation = connection::Activation::of(a);
+        }
+        let generation = match served {
+            Some(g) => {
+                if p.generation() == g {
+                    p.show_published();
+                }
+                p.generation()
+            }
+            None => {
+                p.show_published();
+                p.applied = Applied::Applied;
+                p.changed_by_product()
+            }
+        };
+        let version = p.version;
+        st.derive();
+        Stamped {
+            version,
+            generation,
+        }
+    }
+
+    /// The change the [`Connections::apply`] call of `generation` makes,
+    /// the connection and the activation `/active` shows for it, while
+    /// that call is with the product; for the product to replicate.
+    pub fn activation(&self, port: Port, generation: u64) -> Option<Replicated> {
+        self.inner.lock().port(port).in_flight(generation)
+    }
+
+    /// Moves each port's version up to the one `versions` holds for it,
+    /// from the product's replicated state, as at a leader takeover; a
+    /// version is never moved back, and a port it lacks keeps its own.
+    /// Panics on a node built with [`Nmos::new`].
+    pub fn set_versions(&self, versions: &BTreeMap<PortKey, Tai>) {
+        assert!(
+            self.inner.shared,
+            "nmos: set_versions needs a node built with with_versions"
+        );
+        let mut st = self.inner.lock();
+        for port in self.inner.ports() {
+            if let Some(v) = versions.get(&self.inner.key(port)) {
+                let p = st.port_mut(port);
+                p.version = p.version.max(*v);
+            }
+        }
+        st.derive();
     }
 
     /// Registers `samplez_nmos_activation_late_seconds{port}`, how long

@@ -195,13 +195,23 @@ pub(crate) fn senders(inner: &Inner, st: &State) -> Vec<Value> {
                     "manifest_href": null,
                     "interface_bindings": [],
                     "subscription": {
-                        "receiver_id": s.port.active.peer,
-                        "active": s.port.active.master_enable,
+                        "receiver_id": s.port.published.peer,
+                        "active": s.port.published.master_enable,
                     },
                 }),
             )
         })
         .collect()
+}
+
+/// BCP-004-01 caps, which never change, carry a version no later than
+/// their receiver's.
+fn caps_version(inner: &Inner, receiver: Tai) -> Tai {
+    if inner.shared {
+        receiver
+    } else {
+        inner.caps_version
+    }
 }
 
 pub(crate) fn receivers(inner: &Inner, st: &State) -> Vec<Value> {
@@ -229,8 +239,8 @@ pub(crate) fn receivers(inner: &Inner, st: &State) -> Vec<Value> {
                     "transport": MXL,
                     "interface_bindings": [],
                     "subscription": {
-                        "sender_id": r.active.peer,
-                        "active": r.active.master_enable,
+                        "sender_id": r.published.peer,
+                        "active": r.published.master_enable,
                     },
                     "format": AUDIO,
                     "caps": {
@@ -246,7 +256,7 @@ pub(crate) fn receivers(inner: &Inner, st: &State) -> Vec<Value> {
                             "urn:x-nmos:cap:format:sample_depth": { "enum": [BIT_DEPTH] },
                             "urn:x-nmos:cap:format:channel_count": channel_count,
                         }],
-                        "version": inner.caps_version.to_string(),
+                        "version": caps_version(inner, r.version).to_string(),
                     },
                 }),
             )
