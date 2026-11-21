@@ -178,6 +178,13 @@ pub struct Input {
     /// the input then has no such meter and no block copy is made for it.
     #[serde(default)]
     pub pre_strip_meter: bool,
+    /// Adds the input's channels as matrix rows after every input's
+    /// rows, in configuration order, fed the input before its strip as
+    /// `preStripMeter` meters it, and before its delay: undelayed. Off by
+    /// default: the input then has no such rows. The rows count against
+    /// the matrix's coefficient limits as every row does.
+    #[serde(default)]
+    pub pre_strip_rows: bool,
 }
 
 /// A tone generator's configuration: none beyond its presence, `{}`.
@@ -460,6 +467,16 @@ impl Config {
         self.inputs.iter().map(|i| i.channels as usize).sum()
     }
 
+    /// The matrix rows: the input channels, then the channels of each
+    /// input whose config sets `preStripRows`, in configuration order.
+    pub fn rows(&self) -> usize {
+        let pre: usize = (self.inputs.iter())
+            .filter(|i| i.pre_strip_rows)
+            .map(|i| i.channels as usize)
+            .sum();
+        self.input_channels() + pre
+    }
+
     pub fn output_channels(&self) -> usize {
         self.outputs.iter().map(|o| o.channels as usize).sum()
     }
@@ -561,11 +578,11 @@ impl Config {
                 self.outputs.len()
             ));
         }
-        let coefficients = self.input_channels().saturating_mul(self.columns());
+        let coefficients = self.rows().saturating_mul(self.columns());
         if coefficients > samplez_dsp::MAX_COEFFICIENTS {
             return fail(format!(
-                "{} input channels by {} output and meter channels, at most {} matrix coefficients",
-                self.input_channels(),
+                "{} matrix rows by {} output and meter channels, at most {} matrix coefficients",
+                self.rows(),
                 self.columns(),
                 samplez_dsp::MAX_COEFFICIENTS
             ));
@@ -583,7 +600,7 @@ impl Config {
         // Of every column in duckColumns, every coefficient counts at a
         // ducked term's cost.
         let coefficients =
-            coefficients + (DUCKED_TERM_COST - 1) * self.input_channels() * self.duck_columns.len();
+            coefficients + (DUCKED_TERM_COST - 1) * self.rows() * self.duck_columns.len();
         let per_block = self.block_size as usize * COEFFICIENTS_PER_BLOCK_SAMPLE;
         if coefficients > per_block {
             let needed = coefficients.div_ceil(COEFFICIENTS_PER_BLOCK_SAMPLE);
@@ -694,10 +711,11 @@ impl Config {
                 self.check_input_flow(slot, flow_id)?;
             }
         }
-        let (n, m) = (self.input_channels(), self.columns());
+        let (n, m) = (self.rows(), self.columns());
         if self.matrix.len() != n || self.matrix.iter().any(|row| row.len() != m) {
             return fail(format!(
-                "matrix must have {n} rows (input channels) of {m} gains (output and meter \
+                "matrix must have {n} rows (input channels, then preStripRows channels) of {m} \
+                 gains (output and meter \
                  channels)"
             ));
         }

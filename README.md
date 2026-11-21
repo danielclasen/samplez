@@ -164,11 +164,12 @@ generator) none, per output
 `enabled` true, per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
 Table 3; without it every channel weighs 1), per input `maxDelaySamples`
-0, `truePeak` false and `preStripMeter` false (Meters), per output
-`strip` and `limiter` false and `maxDelaySamples` 0 (below), per output
-and meter `correlation` false (Meters), and `meters`, each with a
-`name`, `channels` and `loudnessChannels`: matrix columns after the
-outputs' that are computed and metered and written to no flow.
+0, `truePeak` false, `preStripMeter` false (Meters) and `preStripRows`
+false (Channel strip), per output `strip` and `limiter` false and
+`maxDelaySamples` 0 (below), per output and meter `correlation` false
+(Meters), and `meters`, each with a `name`, `channels` and
+`loudnessChannels`: matrix columns after the outputs' that are computed
+and metered and written to no flow.
 
 `sampleRate` takes 48000 only, `blockSize` 16 to 1024, `holdMs`,
 `contactWindowMs` and `resyncBudgetMs` 1 to 1000, `historySlackMs` at
@@ -539,6 +540,20 @@ an input wider than 8 channels, or one its strip refuses, is refused
 when appended (`append`) or set (`set_strip`); one that a strip on the
 RT thread still refuses is counted in `strip_refused`, not applied, and
 marks the engine diverged.
+
+An input configured with `preStripRows: true` also feeds the matrix
+ahead of its strip: its channels are added as matrix rows after every
+input's rows, in configuration order, so the configured `matrix` and
+`Gain` entries address them as rows `input_channels()` on, and an
+output whose column takes them carries the input untrimmed. They carry
+the block as read or generated, its `flowChannels` selected, after the
+fade-in, a re-route's crossfade and silencing, before the trim and the
+rest of the strip and before the delay: they are undelayed whatever
+the input's `Delay`. They mix, fade and hash as every row does and
+count against the matrix's coefficient limits, but take no duck: a
+duck mask other than 0 on one is refused, and a depth applies to the
+input's own rows only. Without the setting the input has none and
+nothing is copied.
 
 ### Output strip
 

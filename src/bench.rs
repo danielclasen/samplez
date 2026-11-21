@@ -118,8 +118,9 @@ impl Slice {
 
     /// An RT loop off any flow of `inputs` stereo inputs, each metered
     /// and, with `pre_strip`, metered before its strip too, all feeding
-    /// one stereo output, before the block that ends a meter slice.
-    pub fn inputs(libmxl: &str, inputs: usize, pre_strip: bool) -> Slice {
+    /// one stereo output, with `rows` from their pre-strip rows as well,
+    /// before the block that ends a meter slice.
+    pub fn inputs(libmxl: &str, inputs: usize, pre_strip: bool, rows: bool) -> Slice {
         let v = serde_json::json!({
             "libmxl": libmxl,
             "blockSize": 48,
@@ -127,12 +128,12 @@ impl Slice {
             "inputs": (0..inputs).map(|i| serde_json::json!({
                 "name": format!("in{i}"), "domain": "d",
                 "flowId": format!("5fbec3b1-1b0f-417d-9059-{i:012}"), "channels": 2,
-                "preStripMeter": pre_strip }))
+                "preStripMeter": pre_strip, "preStripRows": rows }))
                 .collect::<Vec<_>>(),
             "outputs": [{ "name": "out", "domain": "d",
                           "flowId": "6fbec3b1-1b0f-417d-9059-000000000000", "label": "o",
                           "group": "g", "role": "Audio", "channels": 2 }],
-            "matrix": vec![vec![1.0; 2]; 2 * inputs],
+            "matrix": vec![vec![1.0; 2]; 2 * inputs * (1 + usize::from(rows))],
             "rt": { "enabled": false, "rtCpu": "none" },
         });
         let config = Config::parse(&v.to_string()).expect("a valid configuration");
