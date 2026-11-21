@@ -151,8 +151,13 @@ pub struct Apply {
     /// The sample index the command's entry takes effect at, at the
     /// engine's rate in the epoch of the flows' indexes: its own
     /// at_index, raised to [`StateMachine::floor`] ([`floored`]), the
-    /// index its engine entries apply at. Every replica applies the entry
-    /// at the same one. None for an entry that has none.
+    /// index of the record of its engine entries. Every replica applies the
+    /// entry at the same one. None for an entry that has none.
+    ///
+    /// The engine applies the record from the next block boundary,
+    /// `at_index.next_multiple_of(block)`. A later Restamp of the entry
+    /// moves its engine entries to another index, and a Void drops them,
+    /// while the product applied the command with this one.
     pub at_index: Option<u64>,
 }
 
@@ -1486,6 +1491,35 @@ pub(crate) mod tests {
         let one = seen(());
         assert_eq!(one, [Some(1_500), Some(1_500), Some(1_500), None]);
         assert_eq!(seen(()), one, "another machine on the same log");
+    }
+
+    /// A machine loaded from a save taken mid-log sees, for every later
+    /// command, the index a machine that never saved sees: the floor the
+    /// entries before the save left goes with it.
+    #[test]
+    fn a_loaded_machine_sees_the_indexes_one_that_never_saved_sees() {
+        let at = |cmd: Command, at_index: Option<u64>| Command { at_index, ..cmd };
+        let log = [
+            commands(960, vec![at(command("a", "1", "/x=1@1"), Some(3_000))]),
+            commands(1_920, vec![at(command("a", "2", "/y=1@1"), Some(1_000))]),
+            commands(2_880, vec![at(command("a", "3", "/x=2@2"), Some(4_000))]),
+            commands(3_840, vec![command("a", "4", "/y=2@2")]),
+        ];
+        let mut whole = machine();
+        for (n, request) in log.iter().enumerate() {
+            whole.apply(n as u64 + 1, request);
+        }
+        let mut before = machine();
+        before.apply(1, &log[0]);
+        let mut loaded = machine();
+        loaded
+            .load(before.save(), Limits::defaults(48_000))
+            .expect("loads");
+        for (n, request) in log.iter().enumerate().skip(1) {
+            loaded.apply(n as u64 + 1, request);
+        }
+        assert_eq!(loaded.product.at, whole.product.at[1..]);
+        assert_eq!(loaded.product.at, [Some(3_000), Some(4_000), None]);
     }
 
     /// One entry is one delta at one revision: every command applied in
