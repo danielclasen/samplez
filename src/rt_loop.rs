@@ -875,7 +875,8 @@ pub(crate) struct MeterRecord {
     /// slices it covers.
     pub frames: u32,
     pub peak: f32,
-    /// 0 for an input, whose meter has no true peak.
+    /// 0 for an input whose config does not set `truePeak`, whose meter
+    /// has no true peak.
     pub true_peak: f32,
     /// Sum of squares of the K-weighted samples.
     pub sum_sq: f64,
@@ -933,8 +934,9 @@ impl MeterRecord {
     }
 }
 
-/// Per metered channel: sample peak, true peak (none on an input) and
-/// K-weighted power of the slice in progress, sent at its end.
+/// Per metered channel: sample peak, true peak (none on an input whose
+/// config does not set `truePeak`) and K-weighted power of the slice in
+/// progress, sent at its end.
 pub(crate) struct OutMeter {
     pub tp: Option<TruePeak>,
     pub kw: KWeighting,

@@ -176,6 +176,25 @@ fn setup_meters(path: Path) -> (Path, TruePeak, KWeighting, PlanarBuffer) {
     )
 }
 
+// The true peak of the input meters of one block, every input channel
+// opted in (an input's `truePeak`): the cost an opt-in adds to
+// `input_meters` per channel.
+#[library_benchmark]
+#[bench::avx2(args = (Path::Avx2,), setup = setup_input_true_peak, config = limit(INPUT_TRUE_PEAK_AVX2))]
+fn input_true_peak(
+    (path, mut tp, buf): (Path, TruePeak, PlanarBuffer),
+) -> (f32, TruePeak, PlanarBuffer) {
+    let mut peak = 0.0f32;
+    for c in 0..INPUTS {
+        peak = peak.max(tp.process_on(path, c, black_box(buf.channel(c))));
+    }
+    (peak, tp, buf)
+}
+
+fn setup_input_true_peak(path: Path) -> (Path, TruePeak, PlanarBuffer) {
+    (path, TruePeak::new(INPUTS, B), signal(INPUTS))
+}
+
 // The input meters of one block, each input channel after its strip:
 // sample peak, sum of squares and K-weighting, as the RT loop meters
 // every input leg.
@@ -582,6 +601,7 @@ const VARIED_SCALAR: u64 = 17_204_000;
 const VARIED_AVX2: u64 = 5_858_000;
 const METERS_SCALAR: u64 = 1_118_000;
 const METERS_AVX2: u64 = 303_000;
+const INPUT_TRUE_PEAK_AVX2: u64 = 94_500;
 const INPUT_METERS: u64 = 152_623;
 const METER_GAPS: u64 = 58_937;
 const STRIPS_RAMPING: u64 = 1_502_708;
@@ -606,6 +626,7 @@ library_benchmark_group!(
         matrix_ducked,
         meters,
         input_meters,
+        input_true_peak,
         meter_gaps,
         strip,
         limiter,
