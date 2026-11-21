@@ -117,8 +117,9 @@ impl Default for OutputMeters {
     }
 }
 
-/// Meter readings of one input after its strip, as an output's: no
-/// true peak, and of the loudness the momentary only.
+/// Meter readings of one input after its strip, as an output's: the
+/// true peak only where the input's config asks for it (`truePeak`), and
+/// of the loudness the momentary only.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputMeters {
     /// The last 100 ms window the readings cover.
@@ -130,14 +131,24 @@ pub struct InputMeters {
     /// Momentary loudness in LUFS, weighted by the input's
     /// `loudnessChannels`; `None` until 400 ms were measured.
     pub momentary: Option<f64>,
+    /// Per channel, the true peak of that window, as an output's; empty
+    /// unless the input's config sets `truePeak`.
+    pub true_peak: Vec<f32>,
+    /// Per channel, the largest true peak since the measurement started;
+    /// empty unless the input's config sets `truePeak`.
+    pub max_true_peak: Vec<f32>,
 }
 
 impl InputMeters {
-    pub(crate) fn update(&mut self, m: &OutputMeters) {
+    pub(crate) fn update(&mut self, m: &OutputMeters, true_peak: bool) {
         self.window = m.window;
         self.peak.clone_from(&m.peak);
         self.rms.clone_from(&m.rms);
         self.momentary = m.momentary;
+        if true_peak {
+            self.true_peak.clone_from(&m.true_peak);
+            self.max_true_peak.clone_from(&m.max_true_peak);
+        }
     }
 }
 
