@@ -232,7 +232,8 @@ impl EngineAudio {
         kept
     }
 
-    /// `entry`, or, for a strip parameter, limiter or tone parameters,
+    /// `entry`, or, for a slot's or an output's strip parameter, limiter or
+    /// tone parameters,
     /// duck setting or duck mask the engine refuses alone, the first of
     /// these the engine takes: its values moved to the nearest ones their
     /// ranges hold ([`samplez_dsp::StripParam::clamped`],
@@ -252,6 +253,10 @@ impl EngineAudio {
         let neutral = match entry {
             Entry::Strip { slot, param } => Entry::Strip {
                 slot: *slot,
+                param: param.neutral(),
+            },
+            Entry::OutputStrip { output, param } => Entry::OutputStrip {
+                output: *output,
                 param: param.neutral(),
             },
             Entry::Duck { group, setting } => Entry::Duck {
@@ -275,6 +280,12 @@ impl EngineAudio {
             Entry::Strip { slot, param } => param
                 .clamped()
                 .map(|param| Entry::Strip { slot: *slot, param }),
+            Entry::OutputStrip { output, param } => {
+                param.clamped().map(|param| Entry::OutputStrip {
+                    output: *output,
+                    param,
+                })
+            }
             Entry::Duck { group, setting } => setting.clamped().map(|setting| Entry::Duck {
                 group: *group,
                 setting,
@@ -321,7 +332,8 @@ impl EngineAudio {
     /// rules of [`EngineAudio::kept`] and else left at the one read; a
     /// strip parameter, duck setting or duck mask the engine refuses is
     /// replaced as the live filter replaces it ([`EngineAudio::admitted`])
-    /// or left out, limiter and tone parameters too; a gain it refuses is
+    /// or left out, output strip, limiter and tone parameters too, those
+    /// of an output beyond the engine's left out; a gain it refuses is
     /// silenced, as the state machine
     /// derives it for every replica
     /// ([`crate::state_machine::StateMachine::product_state`] holds none).
@@ -361,6 +373,26 @@ impl EngineAudio {
             for &param in params.iter() {
                 match self.admitted(&Entry::Strip { slot, param }) {
                     Some(Entry::Strip { param: p, .. }) => {
+                        dropped += usize::from(p != param);
+                        admitted.push(p);
+                    }
+                    _ => dropped += 1,
+                }
+            }
+            *params = admitted;
+        }
+        // Output strip parameters the engine refuses are replaced as the
+        // live filter replaces them, or left out, for an output without a
+        // strip; those of an output beyond the engine's too.
+        dropped += (state.output_strips.iter().skip(self.outputs))
+            .map(Vec::len)
+            .sum::<usize>();
+        state.output_strips.truncate(self.outputs);
+        for (output, params) in state.output_strips.iter_mut().enumerate() {
+            let mut admitted = Vec::with_capacity(params.len());
+            for &param in params.iter() {
+                match self.admitted(&Entry::OutputStrip { output, param }) {
+                    Some(Entry::OutputStrip { param: p, .. }) => {
                         dropped += usize::from(p != param);
                         admitted.push(p);
                     }
@@ -994,6 +1026,7 @@ mod tests {
             },
             pending: Vec::new(),
             last_id: 0,
+            ..Default::default()
         };
         let refuse_2 = |_: usize, _: usize, k: u8| if k == 2 { 0 } else { k };
         let dropped = filter_in_flight(&mut state, &[1], |_, _, _| true, refuse_2);

@@ -33,6 +33,8 @@ matrix, are built on it.
   with an ident that cuts the legs in turn, set by tone entries
 - A gain matrix with ramped coefficients; in replicated mode the engine
   entries of one log entry are folded and applied whole at its index
+- A channel strip per output of up to 8 channels, configured per output
+  and set by output strip entries, ahead of its limiter
 - A true-peak limiter per output of up to 8 channels, configured per
   output and set by limiter entries
 - Meters per output and meter: sample peak, RMS, true peak and EBU R 128
@@ -160,10 +162,11 @@ generator) none, per output
 `enabled` true, per input and output `loudnessChannels` (one of `L`,
 `R`, `C`, `Ls`, `Rs`, `LFE` per channel, weighted per ITU-R BS.1770-5
 Table 3; without it every channel weighs 1), per input `maxDelaySamples`
-0 and `truePeak` false (Meters), per output `limiter` false (below), per
-output and meter `correlation` false (Meters), and `meters`, each with a
-`name`, `channels` and `loudnessChannels`: matrix columns after the
-outputs' that are computed and metered and written to no flow.
+0 and `truePeak` false (Meters), per output `strip` and `limiter` false
+(below), per output and meter `correlation` false (Meters), and
+`meters`, each with a `name`, `channels` and `loudnessChannels`: matrix
+columns after the outputs' that are computed and metered and written to
+no flow.
 
 `sampleRate` takes 48000 only, `blockSize` 16 to 1024, `holdMs`,
 `contactWindowMs` and `resyncBudgetMs` 1 to 1000, `historySlackMs` at
@@ -350,8 +353,10 @@ on and its writer is released, which deletes its flow unless another
 writer holds it; or enabled: its flow is created as at start-up and
 written from the first block due once the writer is in, another writer
 live on the flow reported in the output's status and the creation
-retried) and `Strip` (one parameter of an input's channel strip, a
-`samplez_dsp::StripParam`, ramping over the ramp length). Each sets an
+retried), `Strip` (one parameter of an input's channel strip, a
+`samplez_dsp::StripParam`, ramping over the ramp length) and
+`OutputStrip` (one parameter of an output's strip, below, as `Strip`
+does). Each sets an
 absolute target, so an entry applied again once its ramp has ended
 changes nothing; applied again while it ramps, it starts the ramp over
 from where it is, but for a `Tone` entry, which leaves a running ramp
@@ -382,7 +387,7 @@ of `Engine::counters` that the service does not export, as
 `generation_late` is not. While an entry not handed over falls due
 within a poll period (100 ms) and a tick, the supervisor neither polls
 pruned inputs nor creates output writers, checking again after each
-output it creates, so none of their libmxl calls can stall it past the
+output it tries to create, so none of their libmxl calls can stall it past the
 deadline. A released output writer is still dropped on the supervisor
 when the RT thread hands it back: its flow must be gone before the
 output's flow is created anew.
@@ -409,7 +414,8 @@ buildLead after the one before, and an `Output`
 
 A replicated log entry may carry any number of engine entries
 (`append_batch`). They are folded off the RT thread: per matrix
-coefficient, strip parameter and output the last value, per output
+coefficient, strip parameter of a slot or an output, and output the
+last value, per output
 its last limiter parameters, per input slot its last delay and tone
 parameters, per meter
 its last `LoudnessRun` and each meter reset once; per input slot
@@ -524,14 +530,36 @@ when appended (`append`) or set (`set_strip`); one that a strip on the
 RT thread still refuses is counted in `strip_refused`, not applied, and
 marks the engine diverged.
 
+### Output strip
+
+An output configured with `strip: true`, of at most 8 channels, has a
+channel strip of the input strip's kind (`samplez_dsp::strip`), which
+passes its input unchanged until an `OutputStrip` entry sets it
+(`Engine::set_output_strip`). It runs on every block computed, on the
+matrix's output for the output's channels: after the matrix's gains,
+which carry any bus fader a product sets, so there is no strip ahead of
+a fader, and before the output's limiter, so the limiter's ceiling holds
+on what the strip makes of the mix. The write, the page hash and
+the output's own meters read after both; a configured meter reads
+matrix columns of its own and passes through no output strip. Its
+ramps advance over skipped samples, as an input strip's do; its filter
+and envelope state follows the samples it processed, so after a skip,
+or after a rebuild from product state, which sets its parameters again
+and keeps that state, it differs from that of an engine that computed
+them, until a resync copies a donor's. An `OutputStrip` entry for an
+output without a strip, or one its strip refuses, is refused when
+appended or set; one that a strip on the RT thread still refuses is
+counted in `strip_refused`, not applied, and marks the engine diverged.
+
 ### Output limiter
 
 An output configured with `limiter: true`, of at most 8 channels, has a
 limiter (`samplez_dsp::Limiter`), off until a `Limiter` entry sets it
 (`Engine::set_limiter`, `samplez_dsp::LimiterParams`): on or off, a
 ceiling of -20 to 0 dBTP and a release time constant of 1 to 1000 ms.
-It runs on every block computed, after the matrix and before the write,
-the page hash and the output's meters, so they all see what leaves.
+It runs on every block computed, after the matrix and the output's
+strip and before the write, the page hash and the output's meters, so
+they all see what leaves.
 Such an output is `samplez_dsp::LIMITER_DELAY` samples (53, 1.1 ms)
 later than one without, on or off; switching it on or off ramps over the
 ramp length, a new ceiling or release takes effect at the next sample.
@@ -746,8 +774,9 @@ with its ramps, delayed fades included, duck masks, depths and mask
 crossfades, the duck
 detectors with their keys, filter, hold and envelope state, the pending
 entries and those applied in the page in progress, each input's log
-state and fades, each strip with its filter and dynamics state and
-position, each output's limiter with its rings and released gain, each
+state and fades, each input's and output's strip with its filter and
+dynamics state and position, each output's limiter with its rings and
+released gain, each
 delay line's taps and the history its taps reach, the
 entries waiting for a generation and the pending
 generation's entry id, the meters the log holds paused, and the
@@ -944,9 +973,10 @@ the RT thread keeps its writers, flows, hold rings and statuses,
 computes no block and withholds each one, overrun skips included, cause
 `NoCore` (`StatusChange::NoCore` ranges), with the replica withdrawn.
 Entries needing no generation whose index passes meanwhile are taken off
-the pending list, strip, limiter, delay and tone entries applied to the
-strips, delay lines and tone generators the slots and the limiters the
-outputs keep and the others, duck entries included, not, and the core
+the pending list, strip, output strip, limiter, delay and tone entries
+applied to the strips, delay lines and tone generators the slots and the
+strips and limiters the outputs keep and the others, duck entries
+included, not, and the core
 installed next must know them; a batch holding an `InputUp` or `Route`
 stays pending whole. A replayed core replaces the strips, limiters,
 delays and tone generators; one built from product state leaves them,
@@ -994,7 +1024,7 @@ group's detector state. A keyed group whose envelope never reaches 0 or
 full depth, which would keep the two apart for good, so costs one page,
 the reports that carry it and a resync. The product state also names
 each slot's flow, strip parameters, delay and tone parameters, each
-output's limiter parameters and each meter's loudness measurement
+output's strip and limiter parameters and each meter's loudness measurement
 running or paused, which the core takes at the install: the supervisor
 hands over generations reading those flows before the core, a slot on
 another flow moving to it with no crossfade, and the strip and limiter
@@ -1044,8 +1074,9 @@ long and 100 ms more. `EngineAudio` installs the state as the records it filters
 leave an engine (below): a flow other than the one an input reads is a
 re-route kept by the same rules and else left as read, a strip
 parameter, limiter parameters, delay, a duck setting or mask the engine
-refuses is replaced as the filter replaces it (below), limiter parameters
-of an output it lacks or that has no limiter left out, and a gain it
+refuses is replaced as the filter replaces it (below), strip and limiter
+parameters of an output it lacks or that has no strip or limiter left
+out, and a gain it
 refuses is silent. A
 product without targets gives an empty
 state, which an engine refuses: its replicas stay in `starting`.
@@ -1194,8 +1225,9 @@ and the baseline would change hands twice. One AppendEntries carries up to
 `MAX_APPEND_BYTES` of commands, so a follower whose fsync takes longer
 than the gap between entries takes every entry written meanwhile with
 one fsync rather than falling further behind. `EngineAudio` replaces a
-strip parameter, limiter or tone parameters, delay, a duck setting or
-duck mask its engine refuses, so a replica holding a value before the
+strip parameter of an input or an output, limiter or tone parameters,
+delay, a duck setting or duck mask its engine refuses, so a replica
+holding a value before the
 refused one and one rebuilt without it hold the same. A finite value out
 of range moves to the nearest one its range holds
 (`StripParam::clamped`, `LimiterParams::clamped`, `ToneParams::clamped`,
@@ -1277,8 +1309,9 @@ a running set as peers; a core copy is taken only at an equal
 and `src/engine/golden.rs` the bits the RT loop computes offline from a
 fixed scene, log and input source, its columns' samples apart from
 every value its meters send, its outputs' page hashes, and the encoded
-core copy of its state, and from a scene of its own a tone generator's
-samples and core copy. Their hashes sit in tables with a row per
+core copy of its state, and from scenes of their own a tone generator's
+and output strips' samples and core copies. Their hashes sit in tables
+with a row per
 `COMPUTE_VERSION`: a change that moves any of them fails until the
 version is bumped and a row added. The pages' entry fingerprints are a
 single pinned value: replicas compare page hashes and fingerprints, so

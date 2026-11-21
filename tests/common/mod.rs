@@ -857,6 +857,7 @@ pub fn hold_scenario(e: &Engine) {
         // Folds in the entries applied before the drop.
         fading: Vec::new(),
         last_id: id,
+        ..Default::default()
     };
     e.install_product(&state, 0, Duration::from_secs(5))
         .unwrap();

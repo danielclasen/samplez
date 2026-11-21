@@ -1253,6 +1253,7 @@ mod tests {
                     pending: Vec::new(),
                     fading: Vec::new(),
                     last_id: 0,
+                    ..Default::default()
                 };
                 calls.rebuild_engine(&state, 0)
             },

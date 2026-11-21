@@ -1,7 +1,7 @@
 //! The engine entries of one log entry, folded into one change the RT
 //! thread applies at the log entry's index: per matrix coefficient, strip
-//! parameter, input slot, tone generator, duck setting, depth, duck mask
-//! and meter's
+//! parameter of a slot or an output, input slot, tone generator, duck
+//! setting, depth, duck mask and meter's
 //! loudness pause the last value the log entry sets, and each meter it
 //! resets once. A folded log entry holds at most one value of each, so
 //! the engine's shape bounds it, whatever the number of entries a command
@@ -173,6 +173,10 @@ pub(crate) struct Batch {
     /// Strip parameters by slot, one per parameter key ([`strip_key`]),
     /// ascending by slot and key.
     pub strips: Vec<(u32, StripParam)>,
+    /// Strip parameters by output, as `strips` by slot; not encoded while
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_strips: Vec<(u32, StripParam)>,
     /// Limiter parameters by output, ascending.
     pub limiters: Vec<(u32, LimiterParams)>,
     /// Delays by slot, in samples, ascending.
@@ -223,15 +227,18 @@ impl Batch {
     /// strictly ascending.
     pub fn sane(&self) -> bool {
         let meter = |m: u32| (m as usize) < MAX_OUTPUTS + MAX_METERS;
+        let strips = |list: &[(u32, StripParam)]| {
+            list.iter().all(|(_, p)| p.check(usize::MAX).is_ok())
+                && list
+                    .windows(2)
+                    .all(|w| (w[0].0, strip_key(&w[0].1)) < (w[1].0, strip_key(&w[1].1)))
+        };
         let gains = self.gains.list();
         gains.windows(2).all(|w| w[0].0 < w[1].0)
             && gains.iter().all(|&(_, g)| valid_gain(g))
             && self.fades.sane(usize::MAX, |f| f.is_valid())
-            && self.strips.iter().all(|(_, p)| p.check(usize::MAX).is_ok())
-            && self
-                .strips
-                .windows(2)
-                .all(|w| (w[0].0, strip_key(&w[0].1)) < (w[1].0, strip_key(&w[1].1)))
+            && strips(&self.strips)
+            && strips(&self.output_strips)
             && self.limiters.iter().all(|(_, p)| p.check().is_ok())
             && self.limiters.windows(2).all(|w| w[0].0 < w[1].0)
             && (self.delays.iter()).all(|&(_, d)| d <= samplez_dsp::MAX_DELAY_SAMPLES)
@@ -262,11 +269,14 @@ impl Batch {
 
     /// Whether every value fits an engine of `inputs` input and `columns`
     /// matrix channels, `outputs` outputs, `meters` meters (the outputs
-    /// and the configured meters), input slots of `legs` legs and
-    /// the duck columns `ducked`: a mask other than 0 only on those.
+    /// and the configured meters), input slots of `legs` legs, output
+    /// strips of the legs `out_strips` names, none for an output without
+    /// one, and the duck columns `ducked`: a mask other than 0 only on
+    /// those.
     /// Limiter parameters fit any output and tone parameters any slot:
     /// one without a limiter or generator refuses them on the RT thread,
     /// as a slot without a strip does.
+    #[allow(clippy::too_many_arguments)]
     pub fn fits(
         &self,
         inputs: usize,
@@ -274,6 +284,7 @@ impl Batch {
         outputs: usize,
         meters: usize,
         legs: &[usize],
+        out_strips: &[Option<usize>],
         ducked: &[usize],
     ) -> bool {
         let coefficients = inputs * columns;
@@ -284,8 +295,12 @@ impl Batch {
             legs.get(s as usize)
                 .is_some_and(|&l| l <= MAX_LEGS && p.check(l).is_ok())
         };
+        let output_strip = |&(o, p): &(u32, StripParam)| {
+            (out_strips.get(o as usize).copied().flatten()).is_some_and(|l| p.check(l).is_ok())
+        };
         gains
             && self.strips.iter().all(strip)
+            && self.output_strips.iter().all(output_strip)
             && self.delays.iter().all(|&(s, _)| (s as usize) < legs.len())
             && self.tones.iter().all(|&(s, _)| (s as usize) < legs.len())
             && self.downs.iter().all(|&s| (s as usize) < legs.len())
@@ -318,6 +333,7 @@ impl Batch {
     /// stay with the RT thread's slots and outputs.
     pub fn has_params(&self) -> bool {
         !(self.strips.is_empty()
+            && self.output_strips.is_empty()
             && self.limiters.is_empty()
             && self.delays.is_empty()
             && self.tones.is_empty())
@@ -347,9 +363,9 @@ struct SlotFold {
 /// fold into: none for no change, a single change as itself, more, or
 /// any duck setting, depth or mask, as a [`Change::Batch`] with its
 /// batch. Per coefficient, strip parameter key, duck setting kind, depth
-/// and mask last value counts, per output its last `Output` and
-/// last limiter parameters, per slot its last delay and tone parameters,
-/// per meter its last
+/// and mask last value counts, per output its last `Output`, last
+/// limiter parameters and last strip parameter per key, per slot its
+/// last delay and tone parameters, per meter its last
 /// `LoudnessRun`; each meter reset is kept once. Per
 /// input slot a `Route` and its up or
 /// down state are kept apart ([`SlotFold`]): an `InputUp` and a `Route`
@@ -366,6 +382,7 @@ pub(crate) fn fold(
     let mut gains = BTreeMap::new();
     let mut fades = BTreeMap::new();
     let mut strips = BTreeMap::new();
+    let mut output_strips = BTreeMap::new();
     let mut slots: BTreeMap<usize, SlotFold> = BTreeMap::new();
     let mut ducks = BTreeMap::new();
     let mut depths = BTreeMap::new();
@@ -412,6 +429,9 @@ pub(crate) fn fold(
             }
             Change::Strip { slot, param } => {
                 strips.insert((slot as u32, strip_key(&param)), param);
+            }
+            Change::OutputStrip { output, param } => {
+                output_strips.insert((output as u32, strip_key(&param)), param);
             }
             Change::Limiter { output, params } => {
                 limiters.insert(output as u32, params);
@@ -460,6 +480,7 @@ pub(crate) fn fold(
     let detached = mask(|s| s.detached);
     let facts = gains.len()
         + strips.len()
+        + output_strips.len()
         + limiters.len()
         + delays.len()
         + tones.len()
@@ -486,6 +507,11 @@ pub(crate) fn fold(
         } else if let Some((&(slot, _), &param)) = strips.first_key_value() {
             Change::Strip {
                 slot: slot as usize,
+                param,
+            }
+        } else if let Some((&(output, _), &param)) = output_strips.first_key_value() {
+            Change::OutputStrip {
+                output: output as usize,
                 param,
             }
         } else if let Some((&output, &params)) = limiters.first_key_value() {
@@ -534,6 +560,9 @@ pub(crate) fn fold(
         gains: Coefs::of(gains.into_iter().collect(), coefficients),
         fades: Coefs::of(fades.into_iter().collect(), coefficients),
         strips: strips.into_iter().map(|((s, _), p)| (s, p)).collect(),
+        output_strips: (output_strips.into_iter())
+            .map(|((o, _), p)| (o, p))
+            .collect(),
         limiters: limiters.into_iter().collect(),
         delays: delays.into_iter().collect(),
         tones: tones.into_iter().collect(),
@@ -610,8 +639,11 @@ mod tests {
         assert_eq!(batch.gains.list(), [(1, 0.998), (4, 0.999)]);
         assert_eq!(batch.strips, [(0, StripParam::Trim { db: -9.99 })]);
         assert_eq!(batch.downs, [1]);
-        assert!(batch.sane() && batch.fits(2, 3, 1, 1, &[1, 1], &[]));
-        assert!(!batch.fits(1, 4, 1, 1, &[1, 1], &[]), "coefficient 4 of 4");
+        assert!(batch.sane() && batch.fits(2, 3, 1, 1, &[1, 1], &[], &[]));
+        assert!(
+            !batch.fits(1, 4, 1, 1, &[1, 1], &[], &[]),
+            "coefficient 4 of 4"
+        );
     }
 
     /// Per slot a re-route and the up or down state are kept apart, in
@@ -667,8 +699,8 @@ mod tests {
         ));
         let batch = batch.unwrap();
         assert_eq!(batch.outputs, [(0, false), (3, true)]);
-        assert!(batch.sane() && batch.fits(2, 2, 4, 4, &[1, 1], &[]));
-        assert!(!batch.fits(2, 2, 3, 3, &[1, 1], &[]), "output 3 of 3");
+        assert!(batch.sane() && batch.fits(2, 2, 4, 4, &[1, 1], &[], &[]));
+        assert!(!batch.fits(2, 2, 3, 3, &[1, 1], &[], &[]), "output 3 of 3");
         let unordered = Batch {
             outputs: vec![(3, true), (0, false)],
             ..(*batch).clone()
@@ -708,8 +740,8 @@ mod tests {
         let batch = batch.unwrap();
         assert_eq!(batch.runs, [(0, false), (3, true)]);
         assert_eq!(batch.resets, [0, 2]);
-        assert!(batch.sane() && batch.fits(2, 2, 1, 4, &[1, 1], &[]));
-        assert!(!batch.fits(2, 2, 1, 3, &[1, 1], &[]), "meter 3 of 3");
+        assert!(batch.sane() && batch.fits(2, 2, 1, 4, &[1, 1], &[], &[]));
+        assert!(!batch.fits(2, 2, 1, 3, &[1, 1], &[], &[]), "meter 3 of 3");
         // Runs alone: a batch that resets nothing.
         let (change, _) = one(&[run(0, false), run(1, false)]);
         assert!(matches!(change, Change::Batch { resets: false, .. }));
@@ -754,13 +786,64 @@ mod tests {
             batch.limiters,
             [(0, params(set(0, -1.0))), (3, params(set(3, -3.0)))]
         );
-        assert!(batch.sane() && batch.fits(2, 2, 4, 4, &[1, 1], &[]));
-        assert!(!batch.fits(2, 2, 3, 3, &[1, 1], &[]), "output 3 of 3");
+        assert!(batch.sane() && batch.fits(2, 2, 4, 4, &[1, 1], &[], &[]));
+        assert!(!batch.fits(2, 2, 3, 3, &[1, 1], &[], &[]), "output 3 of 3");
         let mut bad = (*batch).clone();
         bad.limiters[0].1.ceiling_db = 3.0;
         assert!(!bad.sane());
         bad.limiters = vec![batch.limiters[1], batch.limiters[0]];
         assert!(!bad.sane());
+    }
+
+    /// An output's strip parameters in one log entry: the last per key
+    /// counts, a lone one is itself, a batch holding them says it sets
+    /// parameters and fits only outputs whose strips take them, and a
+    /// batch without them encodes as one before output strips.
+    #[test]
+    fn an_outputs_last_strip_parameter_wins() {
+        let set = |output, db| Change::OutputStrip {
+            output,
+            param: StripParam::Trim { db },
+        };
+        let one = |changes: &[Change]| fold(&items(changes), 2, 4).unwrap().unwrap();
+        assert_eq!(one(&[set(1, -1.0), set(1, -2.0)]), (set(1, -2.0), None));
+        let polarity = Change::OutputStrip {
+            output: 0,
+            param: StripParam::Polarity {
+                leg: 1,
+                inverted: true,
+            },
+        };
+        let (change, batch) = one(&[set(3, -1.0), polarity, set(0, -1.0), set(3, -3.0)]);
+        assert!(
+            matches!(change, Change::Batch { strips: true, .. }),
+            "{change:?}"
+        );
+        let batch = batch.unwrap();
+        let param = |db| StripParam::Trim { db };
+        let inverted = StripParam::Polarity {
+            leg: 1,
+            inverted: true,
+        };
+        assert_eq!(
+            batch.output_strips,
+            [(0, param(-1.0)), (0, inverted), (3, param(-3.0))]
+        );
+        let strips = [Some(2), None, None, Some(1)];
+        assert!(batch.sane() && batch.fits(2, 2, 4, 4, &[1, 1], &strips, &[]));
+        let mono = [Some(1), None, None, Some(1)];
+        assert!(!batch.fits(2, 2, 4, 4, &[1, 1], &mono, &[]), "leg 1 of 1");
+        let without = [Some(2)];
+        assert!(
+            !batch.fits(2, 2, 4, 4, &[1, 1], &without, &[]),
+            "no strip on 3"
+        );
+        let mut bad = (*batch).clone();
+        bad.output_strips.swap(0, 2);
+        assert!(!bad.sane());
+        let (_, plain) = one(&[trim(0, -1.0), Change::InputDown { slot: 1 }]);
+        let encoded = serde_json::to_string(&*plain.unwrap()).unwrap();
+        assert!(!encoded.contains("output_strips"), "{encoded}");
     }
 
     /// A slot's delays in one log entry: the last counts, a lone one is
@@ -777,8 +860,8 @@ mod tests {
         );
         let batch = batch.unwrap();
         assert_eq!(batch.delays, [(0, 5), (1, 30)]);
-        assert!(batch.sane() && batch.fits(2, 2, 1, 1, &[1, 1], &[]));
-        assert!(!batch.fits(2, 2, 1, 1, &[1], &[]), "slot 1 of 1");
+        assert!(batch.sane() && batch.fits(2, 2, 1, 1, &[1, 1], &[], &[]));
+        assert!(!batch.fits(2, 2, 1, 1, &[1], &[], &[]), "slot 1 of 1");
         let mut bad = (*batch).clone();
         bad.delays[0].1 = samplez_dsp::MAX_DELAY_SAMPLES + 1;
         assert!(!bad.sane());
@@ -816,8 +899,8 @@ mod tests {
             batch.tones,
             [(0, params(set(0, 1000))), (1, params(set(1, 997)))]
         );
-        assert!(batch.sane() && batch.fits(2, 2, 1, 1, &[1, 1], &[]));
-        assert!(!batch.fits(2, 2, 1, 1, &[1], &[]), "slot 1 of 1");
+        assert!(batch.sane() && batch.fits(2, 2, 1, 1, &[1, 1], &[], &[]));
+        assert!(!batch.fits(2, 2, 1, 1, &[1], &[], &[]), "slot 1 of 1");
         let mut bad = (*batch).clone();
         bad.tones[0].1.frequency_hz = 19;
         assert!(!bad.sane());
@@ -887,6 +970,7 @@ mod tests {
                     gains: Gains::Sparse(Vec::new()),
                     fades: Coefs::Sparse(Vec::new()),
                     strips: Vec::new(),
+                    output_strips: Vec::new(),
                     limiters: Vec::new(),
                     delays: Vec::new(),
                     tones: Vec::new(),
@@ -983,18 +1067,18 @@ mod tests {
         assert_eq!(b.depths, [(0, 3, 9.8), (1, 3, 9.9)]);
         assert_eq!(b.masks.list(), [(3, 99), (4, 97), (5, 98)]);
         let all = [0, 1, 2];
-        assert!(b.sane() && b.fits(2, 3, 1, 1, &[1, 1, 1, 1], &all));
+        assert!(b.sane() && b.fits(2, 3, 1, 1, &[1, 1, 1, 1], &[], &all));
         assert!(
-            !b.fits(2, 3, 1, 1, &[1, 1, 1], &all),
+            !b.fits(2, 3, 1, 1, &[1, 1, 1], &[], &all),
             "a key of slot 3 of 3"
         );
         assert!(
-            !b.fits(1, 3, 1, 1, &[1, 1, 1, 1], &all),
+            !b.fits(1, 3, 1, 1, &[1, 1, 1, 1], &[], &all),
             "a depth of channel 1 of 1"
         );
         // Masks 99, 97 and 98 on columns 0, 1 and 2.
         assert!(
-            !b.fits(2, 3, 1, 1, &[1, 1, 1, 1], &[0, 2]),
+            !b.fits(2, 3, 1, 1, &[1, 1, 1, 1], &[], &[0, 2]),
             "a mask off the duck columns"
         );
         for item in [
@@ -1088,7 +1172,7 @@ mod tests {
                 )
             ]
         );
-        assert!(batch.sane() && batch.fits(2, 2, 2, 2, &[], &[]));
+        assert!(batch.sane() && batch.fits(2, 2, 2, 2, &[], &[], &[]));
         // A fade beyond the bound is not sane; one past the matrix does
         // not fit.
         let long = Fade {
@@ -1100,7 +1184,7 @@ mod tests {
         bad.fades = Coefs::Sparse(vec![(0, long)]);
         assert!(!bad.sane());
         bad.fades = Coefs::Sparse(vec![(9, Fade::default())]);
-        assert!(!bad.fits(2, 2, 2, 2, &[], &[]));
+        assert!(!bad.fits(2, 2, 2, 2, &[], &[], &[]));
         // One gain alone stays a single change, fade kept.
         let one = fold(&items(&[faded(0, 1, 0.5, 3, 4)]), 2, 4)
             .unwrap()

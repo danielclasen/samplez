@@ -1,6 +1,7 @@
 //! Strip entries on real libmxl flows: checked when appended or set,
 //! applied at their index to the legs of their slot, ramping as a strip
-//! run alone does; and every input metered after its strip.
+//! run alone does; and every input metered after its strip. Output strip
+//! entries are checked the same way.
 
 mod common;
 
@@ -307,5 +308,81 @@ fn strip_entries_are_checked() {
         );
     }
     r.append(1, far, entry).unwrap();
+    r.stop();
+}
+
+/// An output strip entry is refused for an output that does not exist,
+/// one configured without a strip, a leg the output does not have, a
+/// value outside its range and an index off the block grid; and by the
+/// log mode that does not take it.
+#[test]
+fn output_strip_entries_are_checked() {
+    let domain = Domain::new();
+    let (src, stereo, plain) = (new_id(), new_id(), new_id());
+    let mut cfg = config(
+        &domain.0,
+        &[(&src, 1)],
+        &[(&stereo, 2), (&plain, 1)],
+        vec![vec![0.0; 3]],
+        MARGIN,
+    );
+    cfg.outputs[0].strip = true;
+    let (e, _rx) = common::start(cfg.clone());
+    let trim = StripParam::Trim { db: 0.0 };
+    let far = (1u64 << 50).next_multiple_of(B);
+    let invalid = |r: Result<(), GainError>, what: &str| {
+        assert!(
+            matches!(&r, Err(GainError::Invalid(m)) if m.contains(what)),
+            "{what}: {r:?}"
+        );
+    };
+    invalid(e.set_output_strip(2, trim, far), "no output 2");
+    invalid(e.set_output_strip(1, trim, far), "output 1 has no strip");
+    invalid(
+        e.set_output_strip(0, StripParam::LegTrim { leg: 2, db: 0.0 }, far),
+        "no leg 2",
+    );
+    invalid(
+        e.set_output_strip(0, StripParam::Trim { db: 20.5 }, far),
+        "trim",
+    );
+    invalid(
+        e.set_output_strip(0, trim, far + 1),
+        "multiple of the block size",
+    );
+    e.set_output_strip(0, StripParam::LegTrim { leg: 1, db: -3.0 }, far)
+        .unwrap();
+    e.stop();
+
+    let (r, _rx, _reports) = common::start_replicated(cfg);
+    invalid(r.set_output_strip(0, trim, far), "replicated log");
+    let refused = [
+        (2, trim),
+        (1, trim),
+        (
+            0,
+            StripParam::Polarity {
+                leg: 2,
+                inverted: true,
+            },
+        ),
+        (0, StripParam::Trim { db: f32::NAN }),
+    ];
+    for (output, param) in refused {
+        let got = r.append(1, far, Entry::OutputStrip { output, param });
+        assert!(
+            matches!(got, Err(EntryError::Invalid(_))),
+            "{output} {param:?}: {got:?}"
+        );
+    }
+    r.append(
+        1,
+        far,
+        Entry::OutputStrip {
+            output: 0,
+            param: trim,
+        },
+    )
+    .unwrap();
     r.stop();
 }

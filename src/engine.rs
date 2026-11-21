@@ -20,7 +20,7 @@ use samplez_dsp::duck::{DEPTH_DB, MAX_KEYS};
 use samplez_dsp::strip::MAX_LEGS;
 use samplez_dsp::{
     Delay, DelayRings, DuckParam, Limiter, LimiterParams, MAX_DUCKS, Matrix, PlanarBuffer, Started,
-    StripParam, Tone, ToneParams, ToneRamps,
+    Strip, StripParam, Tone, ToneParams, ToneRamps,
 };
 use samplez_mxl::input::{
     Counters as InputCounters, Generation, GroupWait, Input, InputConfig, Poll, PollOpener,
@@ -401,6 +401,10 @@ pub enum Entry {
     /// Sets parameter `param` of input slot `slot`'s strip from the
     /// entry's index, ramping over the ramp length.
     Strip { slot: usize, param: StripParam },
+    /// Sets parameter `param` of the strip of output `output`, one
+    /// configured with `strip`, from the entry's index, ramping over the
+    /// ramp length.
+    OutputStrip { output: usize, param: StripParam },
     /// Sets the limiter of output `output`, one configured with
     /// `limiter`, from the entry's index: switching it on or off ramps
     /// over the ramp length.
@@ -777,17 +781,17 @@ impl Log {
     }
 }
 
-/// A product state's strip parameters, per slot, folded to the last value
-/// per parameter key, off the RT thread: it sets at most one per slot and
-/// key at an install, however long the lists.
+/// A product state's strip parameters, per slot or output, folded to the
+/// last value per parameter key, off the RT thread: it sets at most one
+/// per slot or output and key at an install, however long the lists.
 fn product_strips(strips: &[Vec<StripParam>]) -> Vec<(usize, StripParam)> {
     let mut folded = std::collections::BTreeMap::new();
-    for (slot, params) in strips.iter().enumerate() {
+    for (n, params) in strips.iter().enumerate() {
         for &param in params {
-            folded.insert((slot, batch::strip_key(&param)), param);
+            folded.insert((n, batch::strip_key(&param)), param);
         }
     }
-    folded.into_iter().map(|((slot, _), p)| (slot, p)).collect()
+    folded.into_iter().map(|((n, _), p)| (n, p)).collect()
 }
 
 /// Whether output `output` exists, has a limiter and the limiter takes
@@ -800,6 +804,18 @@ fn check_limiter(config: &Config, output: usize, params: &LimiterParams) -> Resu
         return Err(format!("output {output} has no limiter"));
     }
     params.check()
+}
+
+/// Whether output `output` exists, has a strip and the strip takes
+/// `param`.
+fn check_output_strip(config: &Config, output: usize, param: &StripParam) -> Result<(), String> {
+    let Some(o) = config.outputs.get(output) else {
+        return Err(format!("no output {output}"));
+    };
+    if !o.strip {
+        return Err(format!("output {output} has no strip"));
+    }
+    param.check(o.channels as usize)
 }
 
 /// Whether input slot `slot` exists and its delay line takes a delay of
@@ -1585,6 +1601,8 @@ pub(crate) fn replay_rt(
                 meter: OutMeter::new(ch).correlating(out.correlation),
                 hold: Hold::new(ch, b, 0, true),
                 pages: Some(Pages::new(o as u32, ch, b, 0)),
+                strip: out.strip.then(|| Strip::new(ch, config.ramp_samples)),
+                strip_pos: None,
                 limiter: out.limiter.then(|| Limiter::new(ch, config.ramp_samples)),
             }
         })
@@ -1973,6 +1991,10 @@ impl Engine {
                 pages: hash_tx
                     .is_some()
                     .then(|| Pages::new(n as u32, o.channels as usize, b, hold_blocks)),
+                strip: o
+                    .strip
+                    .then(|| Strip::new(o.channels as usize, config.ramp_samples)),
+                strip_pos: None,
                 limiter: o
                     .limiter
                     .then(|| Limiter::new(o.channels as usize, config.ramp_samples)),
@@ -2383,6 +2405,23 @@ impl Engine {
     ) -> Result<(), GainError> {
         check_strip(&self.config, slot, &param).map_err(GainError::Invalid)?;
         self.set_local(Change::Strip { slot, param }, at_index, "strip changes")
+    }
+
+    /// Sets parameter `param` of output `output`'s strip from sample index
+    /// `at_index`, a multiple of the block size, ramping over the
+    /// configured ramp length. Refused as [`Engine::set_gain`] refuses a
+    /// change, and as invalid for an output that does not exist or is
+    /// configured without `strip`, and for a parameter its strip refuses
+    /// ([`StripParam::check`]).
+    pub fn set_output_strip(
+        &self,
+        output: usize,
+        param: StripParam,
+        at_index: u64,
+    ) -> Result<(), GainError> {
+        check_output_strip(&self.config, output, &param).map_err(GainError::Invalid)?;
+        let change = Change::OutputStrip { output, param };
+        self.set_local(change, at_index, "strip changes")
     }
 
     /// Sets the limiter of output `output` to `params` from sample index
@@ -2877,6 +2916,10 @@ impl Engine {
                 check_strip(&self.config, slot, &param).map_err(EntryError::Invalid)?;
                 Change::Strip { slot, param }
             }
+            Entry::OutputStrip { output, param } => {
+                check_output_strip(&self.config, output, &param).map_err(EntryError::Invalid)?;
+                Change::OutputStrip { output, param }
+            }
             Entry::Limiter { output, params } => {
                 check_limiter(&self.config, output, &params).map_err(EntryError::Invalid)?;
                 Change::Limiter { output, params }
@@ -3270,6 +3313,9 @@ impl Engine {
         let limiters: Vec<Option<usize>> = (self.config.outputs.iter())
             .map(|o| o.limiter.then_some(o.channels as usize))
             .collect();
+        let out_strips: Vec<Option<usize>> = (self.config.outputs.iter())
+            .map(|o| o.strip.then_some(o.channels as usize))
+            .collect();
         let delays: Vec<u32> = self
             .config
             .inputs
@@ -3285,7 +3331,18 @@ impl Engine {
         let ramp = self.config.ramp_samples;
         let meters = outputs + self.config.meters.len();
         if !c.fits(
-            n, m, outputs, meters, &legs, &limiters, &delays, &tones, ramp, page, ducked,
+            n,
+            m,
+            outputs,
+            meters,
+            &legs,
+            &limiters,
+            &out_strips,
+            &delays,
+            &tones,
+            ramp,
+            page,
+            ducked,
         ) {
             return Err(ReplayError::Invalid(
                 "the core is of another engine shape".to_owned(),
@@ -3414,7 +3471,7 @@ impl Engine {
         // other set is copied whole. Each attempt runs after the answers
         // to earlier calls are taken.
         let mut filled: Vec<Option<(usize, u64)>> = vec![None; rings.len()];
-        self.offer(timeout, 0, true, &[], &[], &[], &[], |j, core| {
+        self.offer(timeout, 0, true, &[], &[], &[], &[], &[], |j, core| {
             replay.run(j);
             replay.rt.capture(core);
             let end = replay.next * replay.rt.block;
@@ -3550,6 +3607,7 @@ impl Engine {
             || state.tone_ramps.len() > slots
             || state.outputs.len() > self.config.outputs.len()
             || state.limiters.len() > self.config.outputs.len()
+            || state.output_strips.len() > self.config.outputs.len()
             || state.loudness_running.len() > self.config.outputs.len() + self.config.meters.len()
         {
             return Err(ReplayError::Invalid(format!(
@@ -3572,6 +3630,11 @@ impl Engine {
         for (output, params) in state.limiters.iter().enumerate() {
             if let Some(params) = params {
                 check_limiter(&self.config, output, params).map_err(ReplayError::Invalid)?;
+            }
+        }
+        for (output, params) in state.output_strips.iter().enumerate() {
+            for param in params {
+                check_output_strip(&self.config, output, param).map_err(ReplayError::Invalid)?;
             }
         }
         for (slot, &samples) in state.delays.iter().enumerate() {
@@ -3617,6 +3680,7 @@ impl Engine {
         }
         product::check(&self.config, (n, m), state).map_err(ReplayError::Invalid)?;
         let strips = product_strips(&state.strips);
+        let out_strips = product_strips(&state.output_strips);
         let limiters: Vec<(usize, LimiterParams)> = (state.limiters.iter().enumerate())
             .filter_map(|(o, p)| Some((o, (*p)?)))
             .collect();
@@ -3702,6 +3766,7 @@ impl Engine {
             &strips,
             &limiters,
             &delays,
+            &out_strips,
             &tones,
             |j, core| fill.fill(j, core),
         )
@@ -3730,6 +3795,7 @@ impl Engine {
         strips: &[(usize, StripParam)],
         limiters: &[(usize, LimiterParams)],
         delays: &[(usize, u32)],
+        out_strips: &[(usize, StripParam)],
         tones: &[(usize, ToneRamps)],
         mut make: impl FnMut(u64, &mut Core) -> (u64, LogId),
     ) -> Result<u64, ReplayError> {
@@ -3829,6 +3895,7 @@ impl Engine {
                 strips: strips.to_vec(),
                 limiters: limiters.to_vec(),
                 delays: delays.to_vec(),
+                out_strips: out_strips.to_vec(),
                 tones: tones.to_vec(),
                 answer: Answer::Waiting,
             };
@@ -4400,8 +4467,8 @@ impl Supervisor {
                 }
                 Telemetry::StripRefused { entry } => {
                     let reason = format!(
-                        "log entry {} ({:?}) at index {} was refused by its slot's strip; \
-                         not applied",
+                        "log entry {} ({:?}) at index {} was refused by the strip, limiter, \
+                         delay line or tone generator it sets; not applied",
                         entry.id, entry.change, entry.at_index
                     );
                     log(format_args!("diverged: {reason}"));
@@ -7933,7 +8000,7 @@ mod tests {
         until("divergence", &|| e.status().diverged.is_some());
         let diverged = e.status().diverged.unwrap();
         assert!(
-            diverged.contains("refused by its slot's strip"),
+            diverged.contains("refused by the strip, limiter"),
             "{diverged}"
         );
         // The entry set_strip took is applied; the supervisor's own
@@ -7969,6 +8036,7 @@ mod tests {
             strips: Vec::new(),
             limiters: Vec::new(),
             delays: Vec::new(),
+            out_strips: Vec::new(),
             tones: Vec::new(),
             answer: Answer::Waiting,
         };
@@ -8038,6 +8106,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 |j, core| bare_core(&e, j, core),
             )
             .unwrap();
@@ -8078,6 +8147,7 @@ mod tests {
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 0,
+            ..Default::default()
         };
         let processed = || c.processed.load(Acquire);
         // The RT thread stalls with the ring full. A stall another test's
@@ -8149,6 +8219,7 @@ mod tests {
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 0,
+            ..Default::default()
         };
         let processed = || c.processed.load(Acquire);
         let t = Instant::now();
@@ -8209,6 +8280,7 @@ mod tests {
                 Duration::from_secs(5),
                 0,
                 false,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -8865,6 +8937,68 @@ mod tests {
         set.advance(192 - 48);
         assert!(set.set(gain));
         assert_eq!(rt.slots[0].strip.as_ref(), Some(&set));
+        e.stop();
+        let _ = std::fs::remove_dir_all(domain);
+    }
+
+    /// Without a core an output strip entry whose index passed still
+    /// reaches the output's strip, which the output keeps across the drop,
+    /// as a slot's strip entry reaches the slot's; one the core knew whose
+    /// index it passed applies at the install of a core built from product
+    /// state, which holds no strip.
+    #[test]
+    fn an_output_strip_entry_due_without_a_core_reaches_the_strip() {
+        let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        let (e, _statuses, _verdicts, domain) = outputs_only("no-core-output-strip", 1);
+        let v = serde_json::json!({
+            "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
+                .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned()),
+            "domains": [{ "name": "d", "path": domain }],
+            "inputs": [{ "name": "in", "domain": "d",
+                         "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d13", "channels": 1 }],
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "0b1f6c1e-3a4e-4d0c-9d7e-5f2b8a6c1d14", "label": "strip",
+                          "group": "strip", "role": "Audio", "channels": 1, "strip": true }],
+            "matrix": [[1.0]],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(&config, &e.api, vec![None], hashes, control);
+        let param = StripParam::Trim { db: -6.0 };
+        let entry = |id, at_index, change| RtEntry {
+            id,
+            at_index,
+            change,
+        };
+        let out = |param| Change::OutputStrip { output: 0, param };
+        assert!(rt.mix.push(entry(1, 48, out(param))));
+        assert!(rt.mix.push(entry(2, 960, Change::InputDown { slot: 0 })));
+        rt.pass_entries(2);
+        let ids: Vec<LogId> = rt.mix.pending.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [2]);
+        let mut reference = Strip::new(1, config.ramp_samples);
+        assert!(reference.set(param));
+        assert_eq!(rt.outs[0].strip.as_ref(), Some(&reference));
+        assert_eq!(rt.outs[0].strip_pos, Some(48));
+
+        let gain = StripParam::Trim { db: -3.0 };
+        assert!(rt.mix.push(entry(3, 192, out(gain))));
+        let (inputs, outputs) = (config.input_channels(), config.output_channels());
+        let mut core = Box::new(Core::new(inputs, outputs, 1, 64, 1));
+        rt.capture(&mut core);
+        core.pos = Some(480);
+        core.pending.clear();
+        rt.install_core(&mut core, 3, false);
+        assert!(rt.mix.pending.is_empty());
+        let mut set = Strip::new(1, config.ramp_samples);
+        assert!(set.set(param));
+        set.advance(192 - 48);
+        assert!(set.set(gain));
+        assert_eq!(rt.outs[0].strip.as_ref(), Some(&set));
+        assert_eq!(rt.outs[0].strip_pos, Some(192));
+        assert_eq!(rt.counters.strip_refused.load(Relaxed), 0);
         e.stop();
         let _ = std::fs::remove_dir_all(domain);
     }
@@ -9793,6 +9927,7 @@ mod tests {
                 strips: Vec::new(),
                 limiters: Vec::new(),
                 delays: Vec::new(),
+                out_strips: Vec::new(),
                 tones: Vec::new(),
                 answer: Answer::Waiting,
             };
@@ -9844,6 +9979,7 @@ mod tests {
             Duration::from_secs(1),
             0,
             true,
+            &[],
             &[],
             &[],
             &[],
@@ -9901,6 +10037,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             |j, _| (j, 0),
         );
         let spent = cpu() - before;
@@ -9924,6 +10061,7 @@ mod tests {
             Duration::from_millis(300),
             0,
             true,
+            &[],
             &[],
             &[],
             &[],

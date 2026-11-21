@@ -326,6 +326,74 @@ fn limiter_parameters_out_of_range_are_clamped() {
     assert_eq!(params.clamped().unwrap().ceiling_db, 0.0);
 }
 
+/// Output strip parameters out of range are clamped into it, as a
+/// rebuild clamps them in the product state, so a live replica and a
+/// rebuilt one hold the same; counted as replaced. A product state naming
+/// them, and parameters of an output the engine lacks, is rebuilt with
+/// those clamped and these left out. Fails with the clamped form of
+/// `Entry::OutputStrip` dropped from `EngineAudio::admitted`, which
+/// leaves the neutral trim of 0 dB, or with the state's output strips
+/// left unfiltered, which the engine refuses whole.
+#[test]
+fn output_strip_parameters_out_of_range_are_clamped() {
+    let domain = Domain::new();
+    let flow = "5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a";
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "in0", "domain": "d", "flowId": flow, "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d",
+                      "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01", "label": "bridge",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1,
+                      "strip": true }],
+        "matrix": [[1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (engine, audio) = bridge_of(&v, 1 << 16);
+    let processed = || engine.progress().and_then(|p| p.processed);
+    wait_for("a block computed", || processed().is_some());
+    let at = (processed().unwrap() + 100) * B;
+    let loud = samplez_dsp::StripParam::Trim { db: 30.0 };
+    let clamped = samplez_dsp::StripParam::Trim { db: 20.0 };
+    assert_eq!(loud.clamped(), Some(clamped));
+    audio.appended(
+        3,
+        at,
+        &[Entry::OutputStrip {
+            output: 0,
+            param: loud,
+        }],
+    );
+    audio.committed(3);
+    assert_eq!(audio.sample().entries_filtered, 1);
+    wait_for("its index passed", || processed().unwrap() > at / B + 2);
+    let copy = engine.copy_core(Duration::from_secs(2)).unwrap();
+    // Settled on silence, the strip held trims as one set to the clamped
+    // value does.
+    let mut held = copy.core.output_strip(0).expect("an output strip").clone();
+    let mut want = samplez_dsp::Strip::new(1, held.ramp());
+    assert!(want.set(clamped));
+    held.advance(1 << 20);
+    want.advance(1 << 20);
+    let (mut a, mut b) = ([0.05f32; 48], [0.05f32; 48]);
+    held.process(&mut a, 48);
+    want.process(&mut b, 48);
+    assert_eq!(a, b);
+    let state = samplez::ProductState {
+        gains: vec![vec![1.0]],
+        up: vec![true],
+        flows: vec![Some(flow.to_owned())],
+        strips: vec![Vec::new()],
+        output_strips: vec![vec![loud], vec![clamped]],
+        last_id: 3,
+        ..Default::default()
+    };
+    audio.drop_engine();
+    assert!(audio.rebuild_engine(&state, 0), "not rebuilt");
+}
+
 /// Tone parameters out of range are clamped into it, and a level that is
 /// not finite replaced by the default, as a rebuild replaces them in the
 /// product state, so a live replica and a rebuilt one hold the same;
@@ -494,6 +562,7 @@ fn a_loudness_entry_of_a_meter_the_engine_lacks_is_left_out() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     audio.drop_engine();
     assert!(audio.rebuild_engine(&state, 0), "rebuilt");
@@ -537,6 +606,7 @@ fn ramps_in_flight_the_engine_refuses_are_filtered_from_a_rebuild() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 0,
+        ..Default::default()
     };
     let mut fade_ins = base.clone();
     fade_ins.in_flight.fade_ins = vec![Some(at), Some(at)];
@@ -773,6 +843,7 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 0,
+        ..Default::default()
     };
     wait_for("a block processed", || {
         audio.sample().own.processed.is_some()
@@ -1481,6 +1552,7 @@ fn rebuild_after_a_route() -> Result<(), String> {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     let processed = |e: &Engine| e.progress().and_then(|p| p.processed).unwrap_or(0);
     wait_for("both read the input", || {
@@ -1615,6 +1687,7 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     rebuilt_audio.drop_engine();
     assert!(rebuilt_audio.rebuild_engine(&state, 0), "rebuilt");
@@ -1709,6 +1782,7 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     audio.drop_engine();
     // 180 ms ahead: past the 100 ms a rebuild waits beyond the lead.

@@ -256,6 +256,12 @@ pub struct Output {
     /// differently do not run as peers.
     #[serde(default)]
     pub correlation: bool,
+    /// Whether the output has a channel strip ([`samplez_dsp::Strip`]),
+    /// run on the matrix's output before the limiter and passing it
+    /// unchanged until an `OutputStrip` entry sets it; false by default.
+    /// At most [`samplez_dsp::strip::MAX_LEGS`] channels wide.
+    #[serde(default)]
+    pub strip: bool,
 }
 
 impl Output {
@@ -640,11 +646,13 @@ impl Config {
                 .map_err(|e| Error(format!("output {}: {e}", o.name)))?;
             o.loudness_weights()?;
             let max = samplez_dsp::strip::MAX_LEGS;
-            if o.limiter && o.channels as usize > max {
-                return fail(format!(
-                    "output {}: {} channels, a limiter takes at most {max}",
-                    o.name, o.channels
-                ));
+            for (on, what) in [(o.limiter, "a limiter"), (o.strip, "a strip")] {
+                if on && o.channels as usize > max {
+                    return fail(format!(
+                        "output {}: {} channels, {what} takes at most {max}",
+                        o.name, o.channels
+                    ));
+                }
             }
             if o.correlation && o.channels < 2 {
                 return fail(format!(
@@ -831,6 +839,22 @@ mod tests {
         v["matrix"] = serde_json::json!(vec![vec![0.5; 8]; 2]);
         let c = parse(&v).unwrap();
         assert!(c.outputs[0].correlation && c.meters[0].correlation);
+    }
+
+    /// An output has no strip unless `strip` is true, and takes one only
+    /// up to a strip's width.
+    #[test]
+    fn an_output_strip_is_opt_in_and_at_most_eight_channels_wide() {
+        assert!(!parse(&base()).unwrap().outputs[0].strip);
+        let mut v = base();
+        v["outputs"][0]["strip"] = serde_json::json!(true);
+        assert!(parse(&v).unwrap().outputs[0].strip);
+        v["outputs"][0]["channels"] = serde_json::json!(9);
+        v["matrix"] = serde_json::json!(vec![vec![0.5; 9]; 2]);
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.contains("9 channels, a strip takes at most 8"), "{e}");
+        v["outputs"][0]["strip"] = serde_json::json!(false);
+        assert!(parse(&v).is_ok());
     }
 
     /// The delay lines of every input together hold at most

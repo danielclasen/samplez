@@ -1312,6 +1312,7 @@ impl<P: Product> StateMachine<P> {
             outputs: targets.outputs,
             loudness_running: targets.loudness_running,
             strips: targets.strips,
+            output_strips: targets.output_strips,
             delays: targets.delays,
             tones: targets.tones,
             tone_ramps,

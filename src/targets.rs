@@ -32,6 +32,10 @@ pub struct Targets {
     /// Per input slot, its strip parameters; of two with one key (one
     /// band, one leg, the gate), the later counts.
     pub strips: Vec<Vec<StripParam>>,
+    /// Per output, its strip parameters, for an output configured with
+    /// `strip`, as `strips`; an output past the list keeps the strip as
+    /// the engine holds it.
+    pub output_strips: Vec<Vec<StripParam>>,
     /// Per output, its limiter parameters, for an output configured with
     /// `limiter`; none, or an output past the list, leaves the limiter as
     /// the engine holds it.
@@ -77,7 +81,8 @@ impl Targets {
     /// The entries that move an engine holding `self` to `next`: a `Gain`
     /// for each coefficient whose bit pattern differs, row by row; a
     /// `Strip` for each parameter that differs in any field's bit
-    /// pattern, by slot and parameter; a `Limiter` output's
+    /// pattern, by slot and parameter; an `OutputStrip` for each such
+    /// parameter by output and parameter; a `Limiter` output's
     /// parameters differ in any field's bit pattern; a `Delay` slot whose
     /// delay differs; a `Tone` for each slot whose tone parameters differ
     /// in any field's bit pattern; a `Duck` setting
@@ -123,7 +128,13 @@ impl Targets {
                 }
             }
         }
-        strip_entries(&self.strips, &next.strips, &mut entries);
+        strip_entries(&self.strips, &next.strips, slot_strip, &mut entries);
+        strip_entries(
+            &self.output_strips,
+            &next.output_strips,
+            output_strip,
+            &mut entries,
+        );
         for (output, params) in next.limiters.iter().enumerate() {
             let held = self.limiters.get(output).copied().flatten();
             if let Some(params) = *params
@@ -179,10 +190,11 @@ impl Targets {
         entries
     }
 
-    /// The entries that set every gain, strip, limiter and tone parameter
-    /// and duck setting of `self`, whatever an engine holds, in the order of
-    /// [`Targets::diff`], a `Route`, or a `Detach` for a slot without a
-    /// flow, for each of `slots` in ascending order, an `Output` for
+    /// The entries that set every gain, strip, output strip, limiter and
+    /// tone parameter and duck setting of `self`, whatever an engine
+    /// holds, in the order of [`Targets::diff`], a `Route`, or a `Detach`
+    /// for a slot without a flow, for each of `slots` in ascending
+    /// order, an `Output` for
     /// each output `self` holds and a `LoudnessRun` for each meter it
     /// holds; never a `ResetLoudness`, a reset being an event and not a
     /// value. Of the duck masks,
@@ -253,21 +265,35 @@ fn flow_entry(slot: usize, flow: Option<&str>) -> Entry {
     }
 }
 
-/// The `Strip` entries of [`Targets::diff`], appended to `entries`. Kept
-/// out of line: inlined into `diff`, it raises the instruction count of
-/// a diff of gains alone.
+/// The `Strip` or `OutputStrip` entries of [`Targets::diff`], each built
+/// by `entry` from the slot or output and the parameter, appended to
+/// `entries`. Kept out of line: inlined into `diff`, it raises the
+/// instruction count of a diff of gains alone.
 #[inline(never)]
-fn strip_entries(was: &[Vec<StripParam>], next: &[Vec<StripParam>], entries: &mut Vec<Entry>) {
-    for (slot, params) in next.iter().enumerate() {
-        let mut held = keyed(was.get(slot).map_or(&[], Vec::as_slice)).peekable();
+fn strip_entries(
+    was: &[Vec<StripParam>],
+    next: &[Vec<StripParam>],
+    entry: fn(usize, StripParam) -> Entry,
+    entries: &mut Vec<Entry>,
+) {
+    for (n, params) in next.iter().enumerate() {
+        let mut held = keyed(was.get(n).map_or(&[], Vec::as_slice)).peekable();
         for (key, &param) in keyed(params) {
             while held.next_if(|&(k, _)| k < key).is_some() {}
             let w = held.next_if(|&(k, _)| k == key);
             if w.is_none_or(|(_, w)| !same_bits(w, &param)) {
-                entries.push(Entry::Strip { slot, param });
+                entries.push(entry(n, param));
             }
         }
     }
+}
+
+fn slot_strip(slot: usize, param: StripParam) -> Entry {
+    Entry::Strip { slot, param }
+}
+
+fn output_strip(output: usize, param: StripParam) -> Entry {
+    Entry::OutputStrip { output, param }
 }
 
 /// Whether two limiter settings agree in every field's bit pattern.
@@ -971,6 +997,16 @@ mod tests {
                 }
             }
         }
+        for (output, params) in next.output_strips.iter().enumerate() {
+            let held = (was.output_strips.get(output))
+                .map(|p| keyed(p))
+                .unwrap_or_default();
+            for (key, param) in keyed(params) {
+                if held.get(&key).is_none_or(|w| !same(w, &param)) {
+                    entries.push(Entry::OutputStrip { output, param });
+                }
+            }
+        }
         for (output, params) in next.limiters.iter().enumerate() {
             let held = was.limiters.get(output).copied().flatten();
             if let Some(params) = *params
@@ -1120,6 +1156,46 @@ mod tests {
         );
     }
 
+    /// An output's strip parameters get an entry when they differ in any
+    /// field's bit pattern, by output and parameter, none when equal or
+    /// past the list, and every one from `assert`; a slot's parameters of
+    /// the same values are entries of their own.
+    #[test]
+    fn output_strip_parameters_differ_by_bits() {
+        let trim = |db| StripParam::Trim { db };
+        let was = Targets {
+            strips: vec![vec![trim(-0.0)]],
+            output_strips: vec![vec![trim(-1.0)], vec![trim(-0.0)], vec![trim(2.0)]],
+            ..Targets::default()
+        };
+        let next = Targets {
+            strips: vec![vec![trim(-0.0)]],
+            output_strips: vec![vec![trim(-1.0)], vec![trim(0.0)]],
+            ..Targets::default()
+        };
+        assert_eq!(
+            was.diff(&next),
+            [Entry::OutputStrip {
+                output: 1,
+                param: trim(0.0)
+            }]
+        );
+        assert!(was.diff(&was).is_empty());
+        let all = was.assert(&[], None);
+        assert_eq!(
+            all.iter()
+                .filter(|e| matches!(e, Entry::OutputStrip { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|e| matches!(e, Entry::Strip { .. }))
+                .count(),
+            1
+        );
+    }
+
     /// A xorshift generator, so a failing case reproduces.
     struct Rng(u64);
 
@@ -1179,9 +1255,8 @@ mod tests {
         }
 
         /// Strip lists in key order, out of it and with repeated keys.
-        fn targets(&mut self) -> Targets {
-            let slots = self.below(4);
-            let mut strips: Vec<Vec<StripParam>> = (0..slots)
+        fn strips(&mut self) -> Vec<Vec<StripParam>> {
+            let mut strips: Vec<Vec<StripParam>> = (0..self.below(4))
                 .map(|_| (0..self.below(12)).map(|_| self.param()).collect())
                 .collect();
             for params in &mut strips {
@@ -1190,6 +1265,12 @@ mod tests {
                     params.dedup_by_key(|p| strip_key(p));
                 }
             }
+            strips
+        }
+
+        fn targets(&mut self) -> Targets {
+            let strips = self.strips();
+            let output_strips = self.strips();
             Targets {
                 gains: (0..self.below(4))
                     .map(|_| (0..self.below(4)).map(|_| self.value()).collect())
@@ -1198,6 +1279,7 @@ mod tests {
                     .map(|_| [Some("a"), Some("b"), None][self.below(3)].map(Into::into))
                     .collect(),
                 strips,
+                output_strips,
                 limiters: (0..self.below(3))
                     .map(|_| {
                         (self.below(3) > 0).then(|| LimiterParams {
@@ -1228,6 +1310,9 @@ mod tests {
                 was.clone()
             };
             if let Some(params) = next.strips.first_mut() {
+                params.push(rng.param());
+            }
+            if let Some(params) = next.output_strips.last_mut() {
                 params.push(rng.param());
             }
             // By `Debug` forms, as a NaN gain or field never equals itself.

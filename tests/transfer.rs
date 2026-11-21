@@ -814,6 +814,7 @@ fn a_product_state_sets_the_delay() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     assert!(matches!(
         h.e.install_product(&state(vec![4801]), 0, Duration::from_secs(2)),
@@ -908,6 +909,7 @@ fn a_product_state_resumes_the_tone_ramps() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     let j = e
         .install_product(&state, base + 100 * B, Duration::from_secs(2))
@@ -1133,6 +1135,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 0,
+        ..Default::default()
     };
     // A gain no entry could set is refused before the core is dropped.
     let mut beyond = state.clone();
@@ -1215,6 +1218,7 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 0,
+        ..Default::default()
     };
     let j =
         h.e.install_product(&state, 0, Duration::from_secs(2))
@@ -1260,6 +1264,7 @@ fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 0,
+            ..Default::default()
         };
         let far = processed(&h.e) * B + 10 * 48_000;
         assert!(matches!(
@@ -1329,6 +1334,7 @@ fn a_product_state_keeps_reading_the_flow_a_crossfade_leaves() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 0,
+        ..Default::default()
     };
     h.e.drop_core().unwrap();
     let j =
@@ -1398,6 +1404,7 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     let late = c.command_late.load(Relaxed);
     h.e.install_product(&state, 0, Duration::from_secs(2))
@@ -1454,6 +1461,7 @@ fn a_product_entry_the_install_passed_is_folded_in() {
         )],
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     let late = c.command_late.load(Relaxed);
     let j =
@@ -1554,6 +1562,7 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 1,
+            ..Default::default()
         };
         let j =
             c.e.install_product(&state, 0, Duration::from_secs(2))
@@ -1601,6 +1610,7 @@ fn a_product_state_disables_and_enables_an_output() {
         pending,
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     let install = |s: &ProductState| {
         h.e.drop_core().unwrap();
@@ -1667,6 +1677,7 @@ fn a_product_state_sets_the_limiter() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     let on = LimiterParams {
         enabled: true,
@@ -1698,6 +1709,57 @@ fn a_product_state_sets_the_limiter() {
     for c in 0..2 {
         assert!(m.peak[c] <= ceiling * (1.0 + 1e-6), "{m:?}");
         assert!(m.peak[c] > 0.8 * ceiling, "{m:?}");
+    }
+}
+
+/// A product state's output strip parameters are set at the install, the
+/// strip's state kept: an output the state trims by 12 dB is metered at
+/// that level. A state naming parameters of an output the engine does
+/// not have, or out of range, is refused before anything changes.
+#[test]
+fn a_product_state_sets_the_output_strip() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed_of(&domain, &[(&src, 2)], |c| {
+        c.outputs[0].strip = true;
+        c.matrix = diagonal(2, 1.0);
+    });
+    let state = |output_strips| ProductState {
+        gains: common::diagonal(2, 1.0),
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        strips: vec![Vec::new()],
+        output_strips,
+        last_id: 1,
+        ..Default::default()
+    };
+    let trim = |db| StripParam::Trim { db };
+    let refused = |s: &ProductState| {
+        matches!(
+            h.e.install_product(s, 0, Duration::from_secs(2)),
+            Err(ReplayError::Invalid(_))
+        )
+    };
+    let two = state(vec![vec![trim(-12.0)], vec![trim(-12.0)]]);
+    assert!(refused(&two), "a second output");
+    assert!(
+        refused(&state(vec![vec![trim(20.5)]])),
+        "a trim out of range"
+    );
+    h.e.drop_core().unwrap();
+    let j = (h.e)
+        .install_product(&state(vec![vec![trim(-12.0)]]), 0, Duration::from_secs(2))
+        .unwrap();
+    let window = |w: Option<u64>| w.is_some_and(|w| w * 4800 > (j + 1) * B + 2 * 4800);
+    wait_for(Duration::from_secs(5), "metered past the install", || {
+        window(h.e.status().outputs[0].meters.window)
+    });
+    let level = 10f32.powf(-12.0 / 20.0);
+    let m = h.e.status().outputs[0].meters.clone();
+    for c in 0..2 {
+        assert!(m.peak[c] <= level * (1.0 + 1e-5), "{m:?}");
+        assert!(m.peak[c] > 0.8 * level, "{m:?}");
     }
 }
 
@@ -1881,6 +1943,7 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
             pending: vec![(1, at, strip)],
             fading: Vec::new(),
             last_id: 1,
+            ..Default::default()
         };
         let j =
             b.e.install_product(&state, 0, Duration::from_secs(2))
@@ -1945,6 +2008,7 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
             pending: vec![(1, at, limiter)],
             fading: Vec::new(),
             last_id: 1,
+            ..Default::default()
         };
         let j =
             b.e.install_product(&state, 0, Duration::from_secs(2))
@@ -2015,6 +2079,7 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
         pending: Vec::new(),
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     h.e.install_product(&state, 0, Duration::from_secs(2))
         .unwrap();
@@ -2113,6 +2178,7 @@ fn a_route_the_core_carried_is_not_applied_again() {
         pending: vec![(1, at, route)],
         fading: Vec::new(),
         last_id: 1,
+        ..Default::default()
     };
     let j =
         h.e.install_product(&state, 0, Duration::from_secs(2))
@@ -2478,6 +2544,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: last,
+            ..Default::default()
         };
         let j =
             b.e.install_product(&state, 0, Duration::from_secs(2))
@@ -2605,6 +2672,7 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
         },
         fading: Vec::new(),
         last_id: if sent { 2 } else { 1 },
+        ..Default::default()
     };
     let j =
         b.e.install_product(&state, 0, Duration::from_secs(2))
@@ -2695,6 +2763,7 @@ fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 2,
+            ..Default::default()
         };
         b.e.install_product(&state, 0, Duration::from_secs(2))
             .unwrap();
@@ -2885,6 +2954,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
             in_flight: Default::default(),
             pending: Vec::new(),
             last_id: 0,
+            ..Default::default()
         };
         let refused = |what: &str, f: &dyn Fn(&mut ProductState)| {
             let mut s = state.clone();
@@ -2976,6 +3046,7 @@ fn an_install_leaving_an_output_out_starts_it_as_configured() {
             pending: Vec::new(),
             fading: Vec::new(),
             last_id: 0,
+            ..Default::default()
         };
         let j = e
             .install_product(&state, 0, Duration::from_secs(2))
@@ -3323,6 +3394,7 @@ fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), S
         in_flight: Default::default(),
         pending: Vec::new(),
         last_id: if assert_mid { 4 } else { 2 },
+        ..Default::default()
     };
     let j =
         c.e.install_product(&state, 0, Duration::from_secs(2))
@@ -3422,6 +3494,7 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
         in_flight: Default::default(),
         pending: Vec::new(),
         last_id: 2,
+        ..Default::default()
     };
     let j =
         c.e.install_product(&state, 0, Duration::from_secs(2))
@@ -3518,6 +3591,7 @@ fn rebuilt_replica_continues_plain_ramps(chained: bool) -> Result<(), String> {
         in_flight: Default::default(),
         pending: Vec::new(),
         last_id: if chained { 2 } else { 1 },
+        ..Default::default()
     };
     let j =
         c.e.install_product(&state, install, Duration::from_secs(2))
@@ -3702,6 +3776,7 @@ fn a_rebuilt_replica_keeps_a_meter_paused() {
             in_flight: Default::default(),
             pending: Vec::new(),
             last_id: 1,
+            ..Default::default()
         };
         let j =
             c.e.install_product(&state, pause + B, Duration::from_secs(2))
