@@ -1576,7 +1576,7 @@ fn delay_line(config: &Config, channels: u32, max: u32) -> Option<Delay> {
 /// The configured meters on their matrix columns, after the outputs',
 /// each input slot's meter on its channels, and the pre-strip meter of
 /// each input slot that has one on its channels of `prebuf`.
-fn new_meters(config: &Config) -> (Vec<Metered>, Vec<Metered>, Vec<Metered>) {
+pub(crate) fn new_meters(config: &Config) -> (Vec<Metered>, Vec<Metered>, Vec<Metered>) {
     let mut channel = config.output_channels();
     let mut buses = Vec::new();
     for m in &config.meters {

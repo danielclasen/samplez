@@ -112,7 +112,39 @@ impl Slice {
         let api = samplez_mxl::load(std::path::Path::new(libmxl)).expect("libmxl");
         let (hashes, _) = rtrb::RingBuffer::new(1);
         let (_, control) = rtrb::RingBuffer::new(1);
+        let rt = crate::engine::replay_rt(&config, &api, vec![None], hashes, control);
+        Slice::before_end(rt)
+    }
+
+    /// An RT loop off any flow of `inputs` stereo inputs, each metered
+    /// and, with `pre_strip`, metered before its strip too, all feeding
+    /// one stereo output, before the block that ends a meter slice.
+    pub fn inputs(libmxl: &str, inputs: usize, pre_strip: bool) -> Slice {
+        let v = serde_json::json!({
+            "libmxl": libmxl,
+            "blockSize": 48,
+            "domains": [{ "name": "d", "path": "/nonexistent" }],
+            "inputs": (0..inputs).map(|i| serde_json::json!({
+                "name": format!("in{i}"), "domain": "d",
+                "flowId": format!("5fbec3b1-1b0f-417d-9059-{i:012}"), "channels": 2,
+                "preStripMeter": pre_strip }))
+                .collect::<Vec<_>>(),
+            "outputs": [{ "name": "out", "domain": "d",
+                          "flowId": "6fbec3b1-1b0f-417d-9059-000000000000", "label": "o",
+                          "group": "g", "role": "Audio", "channels": 2 }],
+            "matrix": vec![vec![1.0; 2]; 2 * inputs],
+            "rt": { "enabled": false, "rtCpu": "none" },
+        });
+        let config = Config::parse(&v.to_string()).expect("a valid configuration");
+        let api = samplez_mxl::load(std::path::Path::new(libmxl)).expect("libmxl");
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
         let mut rt = crate::engine::replay_rt(&config, &api, vec![None], hashes, control);
+        (rt.buses, rt.taps, rt.pre_taps) = crate::engine::new_meters(&config);
+        Slice::before_end(rt)
+    }
+
+    fn before_end(mut rt: Rt) -> Slice {
         let (tx, mut records) = rtrb::RingBuffer::new(1 << 16);
         rt.meters = tx;
         // Blocks of 48 samples, ten to a slice: the slice ends with the
