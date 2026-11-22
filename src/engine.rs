@@ -9519,7 +9519,10 @@ mod tests {
         assert!(windows.is_empty(), "{windows:?}");
         assert!(legs.last().unwrap()[0].iter().any(|&y| y != 0.0));
         for c in 0..rt.prebuf.channels() {
-            assert!(rt.prebuf.channel(c).iter().all(|&y| y == 0.0), "channel {c}");
+            assert!(
+                rt.prebuf.channel(c).iter().all(|&y| y == 0.0),
+                "channel {c}"
+            );
         }
     }
 
@@ -9567,7 +9570,10 @@ mod tests {
         };
         for (&w, peaks) in &windows {
             let want = peak(w, if w < 6 { -6.0 } else { -30.0 });
-            assert!(peaks.iter().all(|&p| p == want), "window {w}: {peaks:?} {want}");
+            assert!(
+                peaks.iter().all(|&p| p == want),
+                "window {w}: {peaks:?} {want}"
+            );
         }
     }
 

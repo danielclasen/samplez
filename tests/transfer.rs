@@ -939,7 +939,9 @@ fn a_product_state_switches_the_pre_strip_meter_on() {
     let domain = Domain::new();
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
-    let h = hashed_of(&domain, &[(&src, 2)], |c| c.inputs[0].pre_strip_meter = true);
+    let h = hashed_of(&domain, &[(&src, 2)], |c| {
+        c.inputs[0].pre_strip_meter = true
+    });
     let state = ProductState {
         gains: common::diagonal(2, 1.0),
         up: vec![true],

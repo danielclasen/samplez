@@ -486,7 +486,9 @@ fn three_engines_switch_a_pre_strip_meter_alike() {
             r.e.commit(entries.len() as u64);
         }
         let reads = |want: bool, what: &str| {
-            wait_for(Duration::from_secs(10), what, || rs.iter().all(|r| on(r) == want));
+            wait_for(Duration::from_secs(10), what, || {
+                rs.iter().all(|r| on(r) == want)
+            });
         };
         wait_all(&rs.each_ref(), at / B + 2 * 4800 / B);
         reads(true, "the meter read on every engine");

@@ -156,7 +156,10 @@ fn a_pre_strip_meter_reads_the_input_before_its_trim() {
         (e.status().inputs.iter()).all(|i| i.state == InputState::Attached)
     });
     let at = (now(&rx) + 100) * B;
-    assert!(e.status().inputs[0].pre_strip_meters.is_none(), "off at start");
+    assert!(
+        e.status().inputs[0].pre_strip_meters.is_none(),
+        "off at start"
+    );
     match e.set_pre_strip_meter(1, true, at) {
         Err(GainError::Invalid(m)) => assert!(m.contains("preStripMeter"), "{m}"),
         r => panic!("{r:?}"),

@@ -3920,8 +3920,20 @@ impl Rt {
             .taps
             .iter_mut()
             .map(|m| (&mut m.meter, m.first_channel, &self.inbuf));
-        // A slot's pre-strip meter runs while the log has it on.
-        let on = self.slots.iter().filter(|s| s.pre_strip).map(|s| s.pre_strip_on);
+        // A slot's pre-strip meter runs while the log has it on. The
+        // meters are those of the slots with one, in slot order, so the
+        // zip pairs each with its slot; a replay computes no meters and
+        // has none ([`crate::engine::replay_rt`]).
+        debug_assert!(
+            self.pre_taps.is_empty()
+                || self.pre_taps.len() == self.slots.iter().filter(|s| s.pre_strip).count(),
+            "a pre-strip meter per slot with one"
+        );
+        let on = self
+            .slots
+            .iter()
+            .filter(|s| s.pre_strip)
+            .map(|s| s.pre_strip_on);
         let pre_taps = (self.pre_taps.iter_mut().zip(on))
             .map(|(m, on)| on.then_some((&mut m.meter, m.first_channel, &self.prebuf)));
         let all = (outs.chain(buses).chain(taps).map(Some)).chain(pre_taps);

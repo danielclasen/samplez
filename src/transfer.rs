@@ -1776,8 +1776,9 @@ mod tests {
     /// `PreStripMeter` for one, does not fit it.
     #[test]
     fn a_core_carries_the_pre_strip_meters_within_the_engines_slots() {
-        let fits =
-            |c: &Core, legs: &[usize]| c.fits(2, 2, 1, 1, legs, &[], &[], &[], &[], &[], 48, 8, &[]);
+        let fits = |c: &Core, legs: &[usize]| {
+            c.fits(2, 2, 1, 1, legs, &[], &[], &[], &[], &[], 48, 8, &[])
+        };
         let plain = copy().encode();
         assert!(!plain.contains("pre_strip_meters"));
         let mut c = copy();
