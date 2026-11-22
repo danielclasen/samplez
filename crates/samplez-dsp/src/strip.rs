@@ -51,6 +51,8 @@ pub const COMP_RATIO: RangeInclusive<f32> = 1.0..=20.0;
 pub const COMP_KNEE_DB: RangeInclusive<f32> = 0.0..=24.0;
 /// Compressor makeup gain, dB.
 pub const MAKEUP_DB: RangeInclusive<f32> = 0.0..=24.0;
+/// Compressor mix, the share of the compressed signal in the output.
+pub const COMP_MIX: RangeInclusive<f32> = 0.0..=1.0;
 /// Attack time constant of the gate and the compressor, ms.
 pub const ATTACK_MS: RangeInclusive<f32> = 0.1..=200.0;
 /// Release time constant of the gate and the compressor, ms.
@@ -195,7 +197,7 @@ pub const GATE_OFF: GateParams = GateParams {
 };
 
 /// The compressor a refused compressor setting is replaced with: off,
-/// every value at the low end of its range.
+/// every value at the low end of its range but the mix, which is full.
 pub const COMP_OFF: CompParams = CompParams {
     enabled: false,
     threshold_db: *COMP_THRESHOLD_DB.start(),
@@ -204,6 +206,7 @@ pub const COMP_OFF: CompParams = CompParams {
     release_ms: *RELEASE_MS.start(),
     knee_db: *COMP_KNEE_DB.start(),
     makeup_db: *MAKEUP_DB.start(),
+    mix: *COMP_MIX.end(),
 };
 
 impl StripParam {
@@ -279,6 +282,7 @@ impl StripParam {
                 release_ms: c(p.release_ms, &RELEASE_MS)?,
                 knee_db: c(p.knee_db, &COMP_KNEE_DB)?,
                 makeup_db: c(p.makeup_db, &MAKEUP_DB)?,
+                mix: c(p.mix, &COMP_MIX)?,
             }),
             other => other,
         })
@@ -325,7 +329,8 @@ impl StripParam {
                 within("comp attack", c.attack_ms, &ATTACK_MS)?;
                 within("comp release", c.release_ms, &RELEASE_MS)?;
                 within("comp knee", c.knee_db, &COMP_KNEE_DB)?;
-                within("comp makeup", c.makeup_db, &MAKEUP_DB)
+                within("comp makeup", c.makeup_db, &MAKEUP_DB)?;
+                within("comp mix", c.mix, &COMP_MIX)
             }
             StripParam::DynamicsBeforeEq { .. } => Ok(()),
         }
@@ -838,6 +843,10 @@ mod tests {
                 ratio: 0.0,
                 ..COMP_OFF
             }),
+            StripParam::Comp(CompParams {
+                mix: nan,
+                ..COMP_OFF
+            }),
         ];
         let mut set = Strip::new(2, RAMP);
         for param in refused {
@@ -892,6 +901,10 @@ mod tests {
             ..GATE_OFF
         });
         assert_eq!(gate.clamped().unwrap().check(2), Ok(()));
+        let mix = |mix| StripParam::Comp(CompParams { mix, ..COMP_OFF });
+        assert_eq!(mix(1.5).clamped(), Some(mix(1.0)));
+        assert_eq!(mix(-0.5).clamped(), Some(mix(0.0)));
+        assert_eq!(mix(nan).clamped(), None);
         assert_eq!(StripParam::Trim { db: nan }.clamped(), None);
         assert_eq!(gate_inf().clamped(), None);
         // A leg or band the strip lacks stays refused either way.
@@ -923,6 +936,7 @@ mod tests {
         release_ms: 80.0,
         knee_db: 6.0,
         makeup_db: 4.0,
+        mix: 1.0,
     };
 
     /// The peak of `frames` samples of a 100 Hz sine at `level` from
@@ -959,6 +973,7 @@ mod tests {
             release_ms: 100.0,
             knee_db: 0.0,
             makeup_db: 0.0,
+            mix: 1.0,
         });
         let gate = StripParam::Gate(GateParams {
             enabled: true,
@@ -1283,8 +1298,24 @@ mod tests {
                 makeup_db: -1.0,
                 ..COMP
             }),
+            StripParam::Comp(CompParams { mix: -0.01, ..COMP }),
+            StripParam::Comp(CompParams { mix: 1.01, ..COMP }),
+            StripParam::Comp(CompParams {
+                mix: f32::NAN,
+                ..COMP
+            }),
+            StripParam::Comp(CompParams {
+                mix: f32::INFINITY,
+                ..COMP
+            }),
         ]);
-        for p in [StripParam::Gate(GATE), StripParam::Comp(COMP)] {
+        for p in [
+            StripParam::Gate(GATE),
+            StripParam::Comp(COMP),
+            StripParam::Comp(CompParams { mix: 0.0, ..COMP }),
+            StripParam::Comp(CompParams { mix: -0.0, ..COMP }),
+            StripParam::Comp(CompParams { mix: 0.5, ..COMP }),
+        ] {
             assert_eq!(p.check(1), Ok(()));
         }
         let mut s = Strip::new(2, RAMP);
@@ -1802,6 +1833,7 @@ mod tests {
                 release_ms: pick(rng, &RELEASE_MS),
                 knee_db: pick(rng, &COMP_KNEE_DB),
                 makeup_db: pick(rng, &MAKEUP_DB),
+                mix: pick(rng, &COMP_MIX),
             }),
             _ => StripParam::DynamicsBeforeEq { enabled: on },
         }
@@ -1872,6 +1904,7 @@ mod tests {
                 release_ms: 50.0,
                 knee_db: 0.0,
                 makeup_db: 0.0,
+                mix: 1.0,
             }),
         ];
         for p in params {
@@ -2020,6 +2053,7 @@ mod tests {
             release_ms: 5000.0,
             knee_db: 6.0,
             makeup_db: 3.0,
+            mix: 1.0,
         })));
         assert!(base.set(StripParam::Eq { enabled: true }));
         let mut burst: Vec<f32> = (0..960).map(|n| (n as f32 * 0.1).sin()).collect();

@@ -82,6 +82,7 @@ fn strip() -> Strip {
             release_ms: 80.0,
             knee_db: 6.0,
             makeup_db: 2.0,
+            mix: 1.0,
         }),
     ];
     for (band, b) in DEFAULT_BANDS.iter().enumerate() {

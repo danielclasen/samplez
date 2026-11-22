@@ -9,8 +9,9 @@
 //! reduction for the compressor, opening for the gate), release the
 //! other way. A time constant is the time to 1 - 1/e of a step. The
 //! smoothed gain snaps to its target within 1e-4 dB, so a unit at rest
-//! applies exactly its settled gain. Switching a unit on or off ramps
-//! its effect over the ramp length.
+//! applies exactly its settled gain. Switching a unit on or off, and a
+//! change of the compressor's mix, ramps its effect over the ramp
+//! length.
 //!
 //! With an attack time constant of at least [`PER_SAMPLE_BELOW`]
 //! intervals, the gain computer and the smoother run once every
@@ -290,8 +291,10 @@ impl Interval {
     }
 }
 
-/// A unit's switch: its effect `1 + w * (gain - 1)` with `w` ramping
-/// between 0 and 1.
+/// A unit's switch and mix: its effect `1 + w * (gain - 1)`, which is
+/// `(1 - w) + w * gain`, the input unchanged mixed with the input at
+/// `gain`, with `w` ramping between 0 and its level within `[0, 1]`: 1
+/// for the gate, the mix for the compressor.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Wet(Ramp);
 
@@ -300,8 +303,10 @@ impl Wet {
         Wet(Ramp::new(0.0))
     }
 
-    fn set(&mut self, on: bool, len: u32) {
-        let _ = self.0.set_target(if on { 1.0 } else { 0.0 }, len);
+    /// Ramps to `level` when on, to 0 when off; `level` is within
+    /// `[0, 1]`.
+    fn set(&mut self, on: bool, level: f32, len: u32) {
+        let _ = self.0.set_target(if on { level } else { 0.0 }, len);
     }
 
     /// Off and not ramping.
@@ -309,9 +314,14 @@ impl Wet {
         !self.0.is_active() && self.0.target() == 0.0
     }
 
+    /// Ramping within `[0, 1]`.
+    fn is_valid(&self) -> bool {
+        self.0.is_within(0.0..=1.0)
+    }
+
     /// Ramping within `[0, 1]` to 0 or 1.
-    pub(crate) fn is_valid(&self) -> bool {
-        self.0.is_within(0.0..=1.0) && (self.0.target == 0.0 || self.0.target == 1.0)
+    fn is_switch(&self) -> bool {
+        self.is_valid() && (self.0.target == 0.0 || self.0.target == 1.0)
     }
 }
 
@@ -345,8 +355,23 @@ pub struct CompParams {
     /// Width of the soft knee centred on the threshold, dB; 0 is a hard
     /// knee.
     pub knee_db: f32,
-    /// Gain after the compressor, dB.
+    /// Gain after the compressor, dB, on the compressed signal alone.
     pub makeup_db: f32,
+    /// The share of the compressed signal in the output, within
+    /// [`COMP_MIX`](crate::strip::COMP_MIX), the rest the input
+    /// unchanged and sample-aligned with it: parallel compression. 1,
+    /// the compressed signal alone, when absent from an encoding, and
+    /// left out of one at 1.
+    #[serde(default = "full_mix", skip_serializing_if = "is_full_mix")]
+    pub mix: f32,
+}
+
+fn full_mix() -> f32 {
+    1.0
+}
+
+fn is_full_mix(mix: &f32) -> bool {
+    *mix == 1.0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -382,7 +407,7 @@ impl Gate {
     }
 
     pub(crate) fn set(&mut self, p: &GateParams, ramp: u32) {
-        self.wet.set(p.enabled, ramp);
+        self.wet.set(p.enabled, 1.0, ramp);
         self.threshold = db_to_gain(p.threshold_db);
         self.reopen = db_to_gain(p.threshold_db - GATE_HYSTERESIS_DB);
         self.range_db = -p.range_db;
@@ -488,11 +513,12 @@ impl Gate {
     /// Whether the gate holds values a gate set within the parameter
     /// ranges holds: threshold, reopen level and floor gains within
     /// `[0, 1]`, range and smoothed gain within the range limit, a hold
-    /// within [`GATE_HOLD`], valid poles, switch and interval.
+    /// within [`GATE_HOLD`], valid poles and interval, and a switch
+    /// ramping to 0 or 1.
     pub(crate) fn is_valid(&self) -> bool {
         let unit = |g: f32| (0.0..=1.0).contains(&g);
         let range = -*crate::strip::GATE_RANGE_DB.end()..=0.0;
-        self.wet.is_valid()
+        self.wet.is_switch()
             && unit(self.threshold)
             && unit(self.reopen)
             && range.contains(&self.range_db)
@@ -551,7 +577,7 @@ impl Comp {
     }
 
     pub(crate) fn set(&mut self, p: &CompParams, ramp: u32) {
-        self.wet.set(p.enabled, ramp);
+        self.wet.set(p.enabled, p.mix, ramp);
         self.threshold_db = p.threshold_db;
         self.slope = 1.0 / p.ratio - 1.0;
         self.knee_db = p.knee_db;
@@ -664,7 +690,8 @@ impl Comp {
     /// parameter ranges holds: threshold and knee within theirs, a slope
     /// of a ratio within it, the knee's start gain within `(0, 1]`, a
     /// makeup ramp within its range, a smoothed gain within
-    /// [`COMP_GAIN_MIN_DB`] and 0 dB, valid poles, switch and interval.
+    /// [`COMP_GAIN_MIN_DB`] and 0 dB, valid poles and interval, and a
+    /// switch ramping within the mix's range.
     pub(crate) fn is_valid(&self) -> bool {
         use crate::strip::{COMP_KNEE_DB, COMP_RATIO, COMP_THRESHOLD_DB, MAKEUP_DB};
         let slope = 1.0 / *COMP_RATIO.end() - 1.0..=0.0;
@@ -708,6 +735,7 @@ mod tests {
             release_ms: 50.0,
             knee_db,
             makeup_db,
+            mix: 1.0,
         }
     }
 
@@ -1343,6 +1371,18 @@ mod tests {
         gate_invalid("hold beyond its length", &|u| u.hold = GATE_HOLD + 1);
         gate_invalid("floor above unity", &|u| u.floor = 2.0);
         gate_invalid("switch to neither", &|u| u.wet.0.target = 0.5);
+        let mut half = c;
+        half.set(
+            &CompParams {
+                mix: 0.5,
+                ..comp(-30.0, 4.0, 6.0, 3.0)
+            },
+            48,
+        );
+        half.process(&mut burst, 1, 24);
+        assert!(half.is_valid(), "a compressor ramping to a mix of 0.5");
+        comp_invalid("mix above 1", &|u| u.wet.0.target = 1.5);
+        comp_invalid("mix below 0", &|u| u.wet.0.c0 = -0.25);
         comp_invalid("NaN gain", &|u| u.y = f32::NAN);
         comp_invalid("gain above 0 dB", &|u| u.y = 1.0);
         comp_invalid("NaN key", &|u| u.interval.peak = f32::NAN);
@@ -1394,6 +1434,7 @@ mod tests {
                 release_ms: 50.0,
                 knee_db: 0.0,
                 makeup_db: 0.0,
+                mix: 1.0,
             },
             0,
         );
@@ -1406,5 +1447,313 @@ mod tests {
             assert!(c.is_valid(), "{c:?}");
         }
         assert!((COMP_GAIN_MIN_DB..-789.0).contains(&lowest), "{lowest}");
+    }
+
+    /// A compressor deep in reduction on the programmes below: 20 dB
+    /// over the threshold on their loud parts, 12 dB of makeup.
+    fn heavy(attack_ms: f32, knee_db: f32, mix: f32) -> CompParams {
+        CompParams {
+            enabled: true,
+            threshold_db: -30.0,
+            ratio: 10.0,
+            attack_ms,
+            release_ms: 80.0,
+            knee_db,
+            makeup_db: 12.0,
+            mix,
+        }
+    }
+
+    /// Programme of `legs` legs, planar, `secs` long as sampled at `rate`
+    /// Hz: kind 0 sine bursts, 997 Hz at -6 dBFS for 60 ms every 200 ms
+    /// and -40 dBFS between; kind 1 noise at -30 dBFS with a 180 Hz
+    /// transient from -3 dBFS decaying over 20 ms every 250 ms. Leg `l` is `l + 1` times quieter,
+    /// so a linked sidechain reduces the quiet legs by the loud one's
+    /// gain. The engine computes at `SAMPLE_RATE`: another rate changes
+    /// the programme's shape in samples, not the compressor.
+    fn programme(kind: usize, rate: f64, legs: usize, secs: f64) -> Vec<f32> {
+        let frames = (rate * secs) as usize;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut x = vec![0.0f32; legs * frames];
+        for leg in 0..legs {
+            let scale = 1.0 / (leg + 1) as f64;
+            for n in 0..frames {
+                let t = n as f64 / rate;
+                let v = if kind == 0 {
+                    let level = if t % 0.2 < 0.06 { 0.5 } else { 0.01 };
+                    level * libm::sin(2.0 * core::f64::consts::PI * 997.0 * t + leg as f64)
+                } else {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let noise = ((seed >> 40) as f64 / (1u64 << 24) as f64 - 0.5) * 0.063;
+                    let since = t % 0.25;
+                    noise
+                        + 0.708
+                            * libm::exp(-since / 0.02)
+                            * libm::sin(2.0 * core::f64::consts::PI * 180.0 * since)
+                };
+                x[leg * frames + n] = (scale * v) as f32;
+            }
+        }
+        x
+    }
+
+    /// Runs planar `x` of `legs` legs through a compressor set to `p` at
+    /// index 0 and to each of `changes` at its index, all ramping over
+    /// `ramp` samples, in blocks of `b` frames split at the changes.
+    fn run_comp(
+        p: &CompParams,
+        changes: &[(usize, CompParams)],
+        ramp: u32,
+        x: &[f32],
+        legs: usize,
+        b: usize,
+    ) -> Vec<f32> {
+        let frames = x.len() / legs;
+        let mut c = Comp::new();
+        c.set(p, ramp);
+        let mut y = x.to_vec();
+        let mut buf = vec![0.0f32; legs * b];
+        let mut start = 0;
+        let mut next = changes.iter().peekable();
+        while start < frames {
+            if let Some((_, q)) = next.next_if(|(at, _)| *at == start) {
+                c.set(q, ramp);
+            }
+            let until = next.peek().map_or(frames, |(at, _)| *at);
+            let n = b.min(frames - start).min(until - start);
+            for leg in 0..legs {
+                buf[leg * n..(leg + 1) * n].copy_from_slice(&x[leg * frames + start..][..n]);
+            }
+            c.process(&mut buf[..legs * n], legs, n);
+            for leg in 0..legs {
+                y[leg * frames + start..][..n].copy_from_slice(&buf[leg * n..(leg + 1) * n]);
+            }
+            start += n;
+        }
+        y
+    }
+
+    /// Every programme at 44.1, 48 and 96 kHz, mono and stereo, through
+    /// a compressor at a per-sample and an interval attack, with a hard
+    /// and a soft knee, in blocks of 48 and of 5: (programme, legs,
+    /// block, compressor at full mix).
+    fn mix_cases() -> Vec<(Vec<f32>, usize, usize, CompParams)> {
+        let mut cases = Vec::new();
+        for kind in [0, 1] {
+            for rate in [44_100.0, 48_000.0, 96_000.0] {
+                for legs in [1, 2] {
+                    let x = programme(kind, rate, legs, 0.6);
+                    for (attack, knee) in [(0.1, 0.0), (1.0, 6.0)] {
+                        for b in [48, 5] {
+                            cases.push((x.clone(), legs, b, heavy(attack, knee, 1.0)));
+                        }
+                    }
+                }
+            }
+        }
+        cases
+    }
+
+    /// Parallel compression: at a mix `m` the output is `(1 - m) x + m
+    /// c`, `x` the input and `c` the compressor's output alone, makeup
+    /// included, computed here in f64 from the two. The engine applies it
+    /// as one gain per sample, `1 + m (g - 1)`, whose rounding keeps every
+    /// sample within 4 f32 epsilons of `|x| + |c|` of the reference. A
+    /// makeup applied to both shares, or `m` and `1 - m` swapped, is off
+    /// by far more on these programmes; at 0.5 the output is `(x + c) /
+    /// 2`. Linked legs take one gain: the gain of each sample is the
+    /// same on every leg.
+    #[test]
+    fn a_mix_is_the_input_and_the_compressed_signal_mixed() {
+        let eps = f64::from(f32::EPSILON);
+        for (x, legs, b, p) in mix_cases() {
+            let frames = x.len() / legs;
+            let c = run_comp(&p, &[], 0, &x, legs, b);
+            let reduced = x
+                .iter()
+                .zip(&c)
+                .filter(|(x, c)| c.abs() < 0.5 * x.abs())
+                .count();
+            assert!(
+                reduced > frames / 50,
+                "{p:?}: {reduced} samples reduced 6 dB"
+            );
+            for m in [0.25f32, 0.5, 0.75] {
+                let got = run_comp(&CompParams { mix: m, ..p }, &[], 0, &x, legs, b);
+                let m64 = f64::from(m);
+                for i in 0..x.len() {
+                    let (xi, ci) = (f64::from(x[i]), f64::from(c[i]));
+                    let want = (1.0 - m64) * xi + m64 * ci;
+                    let err = (f64::from(got[i]) - want).abs();
+                    let bound = 4.0 * eps * (xi.abs() + ci.abs()) + f64::from(f32::MIN_POSITIVE);
+                    assert!(
+                        err <= bound,
+                        "{p:?} mix {m}, {legs} legs, blocks of {b}, sample {i}: {} for {want} ({err:e} > {bound:e})",
+                        got[i]
+                    );
+                }
+                if legs == 2 {
+                    for n in 0..frames {
+                        let (x0, x1) = (x[n], x[frames + n]);
+                        if x0.abs() < 1e-3 || x1.abs() < 1e-3 {
+                            continue;
+                        }
+                        let gain = |y: f32, x: f32| f64::from(y) / f64::from(x);
+                        let (g0, g1) = (gain(got[n], x0), gain(got[frames + n], x1));
+                        assert!(
+                            (g0 - g1).abs() <= 4.0 * eps * g0.abs().max(g1.abs()),
+                            "{p:?} mix {m}, sample {n}: leg gains {g0} and {g1}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A mix of 0 passes every bit of the input, switched on at it or
+    /// ramped to it.
+    #[test]
+    fn a_mix_of_0_passes_the_input() {
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for (x, legs, b, p) in mix_cases() {
+            let dry = run_comp(&CompParams { mix: 0.0, ..p }, &[], 480, &x, legs, b);
+            assert_eq!(bits(&dry), bits(&x), "{p:?} at mix 0, {legs} legs");
+            // Ramped from 1 to 0 after 0.1 s: the input from the ramp's
+            // end on.
+            let frames = x.len() / legs;
+            let at = 4801;
+            let ramped = run_comp(&p, &[(at, CompParams { mix: 0.0, ..p })], 480, &x, legs, b);
+            for leg in 0..legs {
+                let from = leg * frames + at + 480;
+                let to = (leg + 1) * frames;
+                assert_eq!(
+                    bits(&ramped[from..to]),
+                    bits(&x[from..to]),
+                    "{p:?} ramped to 0"
+                );
+            }
+        }
+    }
+
+    /// At full mix the compressor computes the bits it computed before
+    /// the mix existed: the FNV-1a hash of its output on every programme
+    /// case is the one samplez v0.24.0 computes.
+    #[test]
+    fn a_full_mix_computes_the_bits_of_the_compressor_before_the_mix() {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for (x, legs, b, p) in mix_cases() {
+            for v in run_comp(&p, &[], 480, &x, legs, b) {
+                h = (h ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        assert_eq!(h, 0x8375_fc3d_06de_0ffd);
+    }
+
+    /// The encoding of a compressor at full mix is the one before the
+    /// mix existed, and that one decodes at full mix: logs, product
+    /// states and core copies written before carry the same meaning and
+    /// bytes. Another mix is encoded and decodes to its bits.
+    #[test]
+    fn a_full_mix_encodes_as_before_the_mix_existed() {
+        let before = r#"{"enabled":true,"threshold_db":-30.0,"ratio":10.0,"attack_ms":1.0,"release_ms":80.0,"knee_db":6.0,"makeup_db":12.0}"#;
+        let p: CompParams = serde_json::from_str(before).unwrap();
+        assert_eq!(p, heavy(1.0, 6.0, 1.0));
+        assert_eq!(p.mix.to_bits(), 1.0f32.to_bits());
+        assert_eq!(serde_json::to_string(&p).unwrap(), before);
+        for mix in [0.0, 0.3, 0.999_999_94] {
+            let q = CompParams { mix, ..p };
+            let encoded = serde_json::to_string(&q).unwrap();
+            assert!(encoded.contains(r#""mix":"#), "{encoded}");
+            let back: CompParams = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(back.mix.to_bits(), mix.to_bits());
+        }
+    }
+
+    /// A mix change ramps over the ramp length from the sample it is set
+    /// at: on a steady level with the compressor settled, each sample
+    /// moves the output by at most the ramp's share of the whole change,
+    /// `|x| |m1 - m0| |g - 1| / len`, `g` the settled gain with makeup,
+    /// and from the ramp's end on the output is that of a compressor set
+    /// to the new mix from the start. Up to the change it is the old
+    /// mix's; the bits do not depend on the blocks.
+    #[test]
+    fn a_mix_change_ramps_without_a_step() {
+        let len = 480u32;
+        let x = vec![db_to_gain(-6.0); 48_000 + 2400];
+        let at = 48_000 + 203;
+        for attack in [0.1, 1.0] {
+            for (m0, m1) in [
+                (1.0f32, 0.25f32),
+                (0.25, 1.0),
+                (0.5, 0.0),
+                (1.0, 0.0),
+                (0.4, 0.6),
+            ] {
+                let p = heavy(attack, 0.0, m0);
+                let q = CompParams { mix: m1, ..p };
+                let runs: Vec<Vec<f32>> = [48, 5, 1000]
+                    .map(|b| run_comp(&p, &[(at, q)], len, &x, 1, b))
+                    .into();
+                assert!(
+                    runs.iter().all(|r| r == &runs[0]),
+                    "{m0} -> {m1}: blocks differ"
+                );
+                let y = &runs[0];
+                let before = run_comp(&p, &[], len, &x, 1, 48);
+                let after = run_comp(&q, &[], len, &x, 1, 48);
+                assert_eq!(y[..at], before[..at], "{m0} -> {m1} before the change");
+                let end = at + len as usize;
+                assert_eq!(y[end..], after[end..], "{m0} -> {m1} after the ramp");
+                // The settled gain with makeup, from the full mix run.
+                let full = run_comp(&CompParams { mix: 1.0, ..p }, &[], 0, &x, 1, 48);
+                let g = f64::from(full[at]) / f64::from(x[at]);
+                let whole = f64::from(x[at]) * f64::from(m1 - m0).abs() * (g - 1.0).abs();
+                assert!(whole > 0.05, "{m0} -> {m1}: the change moves {whole}");
+                let bound = whole / f64::from(len) * 1.001 + 8.0 * f64::from(f32::EPSILON);
+                for n in at - 1..end + 1 {
+                    let step = (f64::from(y[n + 1]) - f64::from(y[n])).abs();
+                    assert!(
+                        step <= bound,
+                        "{m0} -> {m1}, sample {n}: steps {step} > {bound}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The mix adds no latency: an impulse comes out at its own sample
+    /// and nowhere else at every mix, and on programme the output lines
+    /// up with the input, the cross-correlation peaking at lag 0.
+    #[test]
+    fn a_mix_adds_no_latency() {
+        for attack in [0.1, 1.0] {
+            for m in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let p = heavy(attack, 0.0, m);
+                for at in 4800..4800 + GAIN_INTERVAL as usize {
+                    for v in [0.9f32, -0.9] {
+                        let mut x = vec![0.0f32; 9600];
+                        x[at] = v;
+                        let y = run_comp(&p, &[], 0, &x, 1, 48);
+                        let out: Vec<usize> = (0..y.len()).filter(|&n| y[n] != 0.0).collect();
+                        assert_eq!(out, [at], "attack {attack} mix {m}: impulse at {at}");
+                        assert_eq!(y[at].signum(), v.signum());
+                    }
+                }
+                let x = programme(1, 48_000.0, 1, 0.6);
+                let y = run_comp(&p, &[], 0, &x, 1, 48);
+                let corr: Vec<(i64, f64)> = (-64..=64i64)
+                    .map(|lag| {
+                        let sum = (64..x.len() - 64)
+                            .map(|n| f64::from(x[n]) * f64::from(y[(n as i64 + lag) as usize]))
+                            .sum::<f64>();
+                        (lag, sum.abs())
+                    })
+                    .collect();
+                let peak = corr.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+                assert_eq!(peak.0, 0, "attack {attack} mix {m}");
+            }
+        }
     }
 }

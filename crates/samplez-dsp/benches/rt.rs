@@ -2,7 +2,7 @@
 //! by Gungraun (`cargo bench --bench rt`). Each benchmark processes one
 //! block of B = 48 samples at the largest shape measured here, 64 input
 //! channels to 96 output channels, on both dispatch paths, with every
-//! coefficient ramping, undocked and ducked; the strips, 64 mono ones, the meters of the 64
+//! coefficient ramping, undocked and ducked; the strips, 64 mono ones at full and at half compressor mix, the meters of the 64
 //! input channels after them and eight duck detectors keyed by them have
 //! one path, metered as the RT loop runs them, and idle as an engine with
 //! no duck group in use runs them; so does the gap decision of the
@@ -257,10 +257,10 @@ fn setup_meter_gaps() -> (Matrix, u64) {
 }
 
 /// 64 mono strips with trim, high-pass, every band, gate and compressor
-/// on at an attack of `attack_ms`, the signal above both thresholds, all
-/// of them ramping (the costliest block) or all settled. An attack under
-/// 1 ms runs the gain computers every sample.
-fn strips(ramping: bool, attack_ms: f32) -> (Vec<Strip>, PlanarBuffer) {
+/// on at an attack of `attack_ms` and a mix of `mix`, the signal above
+/// both thresholds, all of them ramping (the costliest block) or all
+/// settled. An attack under 1 ms runs the gain computers every sample.
+fn strips(ramping: bool, attack_ms: f32, mix: f32) -> (Vec<Strip>, PlanarBuffer) {
     let mut v = Vec::new();
     for _ in 0..INPUTS {
         let mut s = Strip::new(1, if ramping { 480 } else { 0 });
@@ -286,6 +286,7 @@ fn strips(ramping: bool, attack_ms: f32) -> (Vec<Strip>, PlanarBuffer) {
                 release_ms: 50.0,
                 knee_db: 6.0,
                 makeup_db: 3.0,
+                mix,
             }),
         ];
         for (band, b) in DEFAULT_BANDS.iter().enumerate() {
@@ -301,10 +302,13 @@ fn strips(ramping: bool, attack_ms: f32) -> (Vec<Strip>, PlanarBuffer) {
 }
 
 #[library_benchmark]
-#[bench::ramping(args = (true, 1.0), setup = strips, config = limit(STRIPS_RAMPING))]
-#[bench::settled(args = (false, 1.0), setup = strips, config = limit(STRIPS_SETTLED))]
-#[bench::ramping_fast_attack(args = (true, 0.1), setup = strips, config = limit(STRIPS_RAMPING_FAST))]
-#[bench::settled_fast_attack(args = (false, 0.1), setup = strips, config = limit(STRIPS_SETTLED_FAST))]
+#[bench::ramping(args = (true, 1.0, 1.0), setup = strips, config = limit(STRIPS_RAMPING))]
+#[bench::settled(args = (false, 1.0, 1.0), setup = strips, config = limit(STRIPS_SETTLED))]
+#[bench::ramping_fast_attack(args = (true, 0.1, 1.0), setup = strips, config = limit(STRIPS_RAMPING_FAST))]
+#[bench::settled_fast_attack(args = (false, 0.1, 1.0), setup = strips, config = limit(STRIPS_SETTLED_FAST))]
+// A compressor mix below full costs what the compressor alone does.
+#[bench::ramping_half_mix(args = (true, 1.0, 0.5), setup = strips, config = limit(STRIPS_RAMPING))]
+#[bench::settled_half_mix(args = (false, 1.0, 0.5), setup = strips, config = limit(STRIPS_SETTLED))]
 fn strip((mut strips, mut buf): (Vec<Strip>, PlanarBuffer)) -> (Vec<Strip>, PlanarBuffer) {
     for (c, s) in strips.iter_mut().enumerate() {
         s.process(black_box(buf.channel_mut(c)), B);

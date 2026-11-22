@@ -331,6 +331,7 @@ fn strips() -> Vec<Item> {
                 release_ms: 80.0,
                 knee_db: 6.0,
                 makeup_db: 2.0,
+                mix: 1.0,
             }),
             StripParam::DynamicsBeforeEq { enabled: slot == 1 },
         ];
@@ -511,6 +512,7 @@ fn entries() -> Vec<(u64, Vec<Item>)> {
                         release_ms: 60.0,
                         knee_db: 3.0,
                         makeup_db: 4.0,
+                        mix: 1.0,
                     }),
                 ),
             ],
@@ -859,6 +861,7 @@ fn output_scene() -> (u64, u64) {
             release_ms: 200.0,
             knee_db: 6.0,
             makeup_db,
+            mix: 1.0,
         })
     };
     let gate = StripParam::Gate(GateParams {

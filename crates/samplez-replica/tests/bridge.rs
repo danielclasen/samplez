@@ -1418,6 +1418,7 @@ fn strip_params(pass: f32) -> Vec<StripParam> {
             release_ms: 300.0,
             knee_db: 6.0,
             makeup_db: 2.0,
+            mix: 1.0,
         }),
         StripParam::DynamicsBeforeEq { enabled: true },
     ];

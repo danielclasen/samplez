@@ -945,6 +945,7 @@ pub fn strip_params(legs: usize) -> Vec<samplez_dsp::StripParam> {
             release_ms: 80.0,
             knee_db: 6.0,
             makeup_db: 3.0,
+            mix: 1.0,
         }),
         StripParam::DynamicsBeforeEq { enabled: true },
     ];

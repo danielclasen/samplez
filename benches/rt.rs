@@ -364,6 +364,7 @@ fn slot_strips(on: bool, dynamics: bool) -> (Vec<Strip>, Vec<f32>) {
                     release_ms: 50.0,
                     knee_db: 6.0,
                     makeup_db: 3.0,
+                    mix: 1.0,
                 }));
             }
             params.push(StripParam::DynamicsBeforeEq { enabled: true });
@@ -672,6 +673,7 @@ fn stereo_strip(slot: usize) -> Vec<StripParam> {
         release_ms: 50.0,
         knee_db: 6.0,
         makeup_db: 3.0,
+        mix: 1.0,
     }));
     p.push(StripParam::DynamicsBeforeEq { enabled: false });
     p
