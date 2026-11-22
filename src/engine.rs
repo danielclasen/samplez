@@ -112,7 +112,8 @@ pub struct InputStatus {
     /// detached input, the flow it read last, empty for one that has read
     /// none.
     pub flow_id: String,
-    /// Why the last attach failed.
+    /// Why the last attach failed, or how far the flow's head stays off
+    /// the MXL clock (README "Real-time requirements").
     pub error: Option<String>,
     /// The margin the producer's `maxCommitBatchSizeHint` needs, when the
     /// configured margin is below it.
@@ -2291,6 +2292,7 @@ impl Engine {
                     reported: false,
                     prune_unsent: false,
                     routing: None,
+                    gap: ClockGap::default(),
                 })
                 .collect(),
             jobs: VecDeque::new(),
@@ -4188,6 +4190,8 @@ struct SupSlot {
     /// After a re-route: the index its crossfade ends at and the flow it
     /// left, kept in rebuilt generations until the RT thread passed it.
     routing: Option<(u64, String)>,
+    /// Whether its flow's head stays off the MXL clock.
+    gap: ClockGap,
 }
 
 /// A generation-needing entry, from its append until the RT thread
@@ -4362,6 +4366,80 @@ fn late_prune_limit(config: &Config, limit: u64) -> u64 {
 fn within_reach(head: u64, at: u64, block: u64, margin: u64, offset: i64) -> bool {
     let due = at.saturating_sub(margin) / block * block;
     i128::from(head) >= i128::from(due) + i128::from(offset)
+}
+
+/// Whether a flow's head stays off the MXL clock: farther from the
+/// clock's index, behind or ahead, than the flow's readable history plus
+/// the reader margin and the input's `|offsetSamples|`, so that no block
+/// read at the clock is in the flow's ring, as with a producer stamping
+/// its indices on another epoch. All of it is in samples of the flow.
+#[derive(Clone, Copy, Debug, Default)]
+struct ClockGap {
+    /// The head last observed and the clock index it was first observed
+    /// at.
+    head: Option<(u64, u64)>,
+    /// The clock index of the first observation of the current run off
+    /// the clock.
+    run: Option<u64>,
+    /// The gap reported, clock index minus head, while reported.
+    off: Option<i128>,
+}
+
+/// A change of [`ClockGap`]'s report, with the gap reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GapChange {
+    Off(i128),
+    Back(i128),
+}
+
+impl ClockGap {
+    /// Observes `head` at clock index `at`, for a flow of `history`
+    /// samples of readable history, `slack` the reader margin plus the
+    /// input's `|offsetSamples|`, and `limit` its frozen-head prune limit.
+    /// The head is reported off once it stayed off at every observation
+    /// for `history` samples of the clock, and back at the first
+    /// observation within reach again. A head unchanged for longer than
+    /// `limit` is a stopped producer, which the frozen-head prune reports:
+    /// it ends the run, so a head is reported off only while it moves.
+    fn observe(
+        &mut self,
+        head: u64,
+        at: u64,
+        history: u64,
+        slack: u64,
+        limit: u64,
+    ) -> Option<GapChange> {
+        let since = match self.head {
+            Some((h, t)) if h == head => t,
+            _ => at,
+        };
+        self.head = Some((head, since));
+        let gap = i128::from(at) - i128::from(head);
+        if gap.unsigned_abs() <= u128::from(history.saturating_add(slack)) {
+            self.run = None;
+            return self.off.take().map(GapChange::Back);
+        }
+        if at.saturating_sub(since) > limit {
+            self.run = None;
+            return None;
+        }
+        let start = *self.run.get_or_insert(at);
+        if self.off.is_none() && at.saturating_sub(start) >= history {
+            self.off = Some(gap);
+            return Some(GapChange::Off(gap));
+        }
+        None
+    }
+}
+
+/// The input error of a head `gap` samples, clock index minus head, off
+/// the MXL clock at `rate`.
+fn off_clock(gap: i128, rate: u32) -> String {
+    let side = if gap > 0 { "behind" } else { "ahead of" };
+    format!(
+        "head {:.1} s {side} the MXL clock: producer not on the MXL clock",
+        gap.unsigned_abs() as f64 / f64::from(rate)
+    )
 }
 
 fn log(message: std::fmt::Arguments) {
@@ -4891,8 +4969,9 @@ impl Supervisor {
         }
         let now = time::now(&self.api);
         let at = time::timestamp_to_index(&self.api, now);
-        // Each flow's head and prune limit.
+        // Each flow's head and prune limit, and its readable history.
         let mut heads: HashMap<(usize, String), Option<(u64, u64)>> = HashMap::new();
+        let mut histories: HashMap<(usize, String), u64> = HashMap::new();
         for (d, p) in self.pollers.iter_mut().enumerate() {
             let Some(p) = p else { continue };
             for (id, f) in &mut p.flows {
@@ -4906,10 +4985,25 @@ impl Supervisor {
                     &self.timing,
                     f.commit_batch_hint().unwrap_or(0),
                 );
+                if let Some(history) = f.history() {
+                    histories.insert((d, id.clone()), history);
+                }
                 heads.insert((d, id.clone()), head.map(|h| (h, limit)));
             }
             let flows = &p.flows;
             (p.releases).retain(|id, r| r.pending() != 0 || flows.contains_key(id));
+        }
+        for slot in 0..self.slots.len() {
+            let s = &self.slots[slot];
+            if !matches!(s.state, SupState::Pruned { .. }) {
+                continue;
+            }
+            let key = (self.input_domain(slot), s.flow.clone());
+            if let (Some(&Some((head, limit))), Some(&history)) =
+                (heads.get(&key), histories.get(&key))
+            {
+                self.clock_gap(slot, head, at, history, limit);
+            }
         }
         let mut readable = vec![None; self.slots.len()];
         for (slot, vote) in readable.iter_mut().enumerate() {
@@ -5614,8 +5708,9 @@ impl Supervisor {
                 self.config.inputs[slot].name, self.timing.margin
             ));
         }
+        let gap = self.slots[slot].gap.off;
         let mut st = self.status();
-        st.inputs[slot].error = None;
+        st.inputs[slot].error = gap.map(|g| off_clock(g, self.config.sample_rate));
         st.inputs[slot].margin_short = short;
         (after, late_prune_limit(&self.config, after))
     }
@@ -5625,6 +5720,48 @@ impl Supervisor {
         let name = &self.config.inputs[slot].name;
         log(format_args!("input {name} not attached: {message}"));
         self.status().inputs[slot].error = Some(message);
+    }
+
+    /// Observes `slot`'s head ([`ClockGap::observe`]) and, when its report
+    /// changes, logs it once and sets the input's error, or clears the
+    /// error it set.
+    fn clock_gap(&mut self, slot: usize, head: u64, at: u64, history: u64, limit: u64) {
+        let input = &self.config.inputs[slot];
+        let slack = self.timing.margin + input.offset_samples.unsigned_abs();
+        let Some(change) = (self.slots[slot].gap).observe(head, at, history, slack, limit) else {
+            return;
+        };
+        let rate = self.config.sample_rate;
+        let name = &self.config.inputs[slot].name;
+        let mut st = self.status();
+        let error = &mut st.inputs[slot].error;
+        match change {
+            GapChange::Off(gap) => {
+                let message = off_clock(gap, rate);
+                log(format_args!("input {name}: {message}"));
+                *error = Some(message);
+            }
+            GapChange::Back(gap) => {
+                log(format_args!("input {name}: head back on the MXL clock"));
+                if error.as_deref() == Some(off_clock(gap, rate).as_str()) {
+                    *error = None;
+                }
+            }
+        }
+    }
+
+    /// Starts `slot`'s [`ClockGap`] anew, as for another flow or none,
+    /// clearing the input's error when it is the gap's.
+    fn reset_gap(&mut self, slot: usize) {
+        let Some(gap) = std::mem::take(&mut self.slots[slot].gap).off else {
+            return;
+        };
+        let message = off_clock(gap, self.config.sample_rate);
+        let mut st = self.status();
+        let error = &mut st.inputs[slot].error;
+        if error.as_deref() == Some(message.as_str()) {
+            *error = None;
+        }
     }
 
     /// Counts a generation `built` whole, adds a build time `took` to the
@@ -5853,6 +5990,7 @@ impl Supervisor {
                     s.reported = false;
                     s.prune_unsent = false;
                     self.status().inputs[slot].state = InputState::Detached;
+                    self.reset_gap(slot);
                 }
                 continue;
             };
@@ -5875,6 +6013,7 @@ impl Supervisor {
                     self.slots[slot].routing = Some((j.at_index + self.ramp, old));
                 }
                 self.status().inputs[slot].flow_id = flow;
+                self.reset_gap(slot);
             }
         }
         self.adopt(j.domain, held, targets, j.opening);
@@ -5916,6 +6055,7 @@ impl Supervisor {
             }
             self.slots[slot].reported = false;
             self.slots[slot].routing = routing;
+            self.reset_gap(slot);
             let Some(flow) = flow else {
                 self.slots[slot].state = SupState::Detached;
                 self.slots[slot].prune_unsent = false;
@@ -6106,6 +6246,17 @@ impl Supervisor {
     }
 
     fn stats(&mut self, slot: usize, stats: SlotStats) {
+        // An attached slot's head, which a pruned one's poll reads.
+        let s = &self.slots[slot];
+        let reader = (self.readers.get(&(slot, s.flow.clone()))).map(|i| i.reader());
+        if let (SupState::Attached, Some(head), Some(reader)) = (&s.state, stats.head, reader)
+            && let (Ok(history), Ok(info)) = (reader.history(), reader.config())
+        {
+            let hint = u64::from(info.common.maxCommitBatchSizeHint);
+            let limit = prune_limit(&self.config, &self.timing, hint);
+            let at = time::timestamp_to_index(&self.api, stats.now);
+            self.clock_gap(slot, head, at, history, limit);
+        }
         let window = &mut self.slots[slot].window;
         window.push_back(stats);
         if window.len() > MARGIN_WINDOW {
@@ -6513,6 +6664,114 @@ mod tests {
         assert_eq!(history_kept(&started, k0, slack), Ok(()));
         started.begin(k0 + slack);
         assert_eq!(history_kept(&started, k0, slack), Err(k0 + slack));
+    }
+
+    /// The changes of a [`ClockGap`] observing, every 100 ms of a 48 kHz
+    /// clock for `secs` seconds from `at`, a head `lag(at)` samples below
+    /// the clock index, for a flow of `history` samples, a slack of 960
+    /// and a frozen-head limit of 2400. Returns them with their clock
+    /// index, and the index after the last observation.
+    fn observe(
+        gap: &mut ClockGap,
+        at: u64,
+        secs: u64,
+        history: u64,
+        lag: impl Fn(u64) -> i64,
+    ) -> (Vec<(u64, GapChange)>, u64) {
+        let step = 4_800;
+        let mut changes = Vec::new();
+        let mut at = at;
+        for _ in 0..secs * 10 {
+            let head = at.checked_add_signed(-lag(at)).unwrap();
+            if let Some(c) = gap.observe(head, at, history, 960, 2_400) {
+                changes.push((at, c));
+            }
+            at += step;
+        }
+        (changes, at)
+    }
+
+    /// A head 37 s behind the clock, or 5 s ahead, with a moving head, is
+    /// reported off once it stayed off for the flow's history, which is
+    /// 1 s for one flow and 3 s for another, and once only; the gap is
+    /// the clock index minus the head.
+    #[test]
+    fn a_head_far_off_the_clock_is_reported_after_the_flows_history() {
+        const T0: u64 = 1 << 40;
+        for history in [48_000, 144_000] {
+            for lag in [37 * 48_000, -5 * 48_000] {
+                let mut gap = ClockGap::default();
+                let (changes, _) = observe(&mut gap, T0, 10, history, |_| lag);
+                assert_eq!(
+                    changes,
+                    [(T0 + history, GapChange::Off(i128::from(lag)))],
+                    "history {history}, lag {lag}"
+                );
+            }
+        }
+        assert_eq!(
+            off_clock(37 * 48_000 + 4_800, 48_000),
+            "head 37.1 s behind the MXL clock: producer not on the MXL clock"
+        );
+        assert_eq!(
+            off_clock(-5 * 48_000, 48_000),
+            "head 5.0 s ahead of the MXL clock: producer not on the MXL clock"
+        );
+    }
+
+    /// The rule follows the flow's history: a head 2 s behind is off for
+    /// a flow with 1 s of history and a late one for a flow with 3 s.
+    /// Neither a head a margin or a few hundred milliseconds behind nor a
+    /// head off for one observation is reported.
+    #[test]
+    fn a_head_within_the_flows_history_is_not_reported() {
+        const T0: u64 = 1 << 40;
+        let off = |history, lag| {
+            let mut gap = ClockGap::default();
+            !observe(&mut gap, T0, 10, history, |_| lag).0.is_empty()
+        };
+        assert!(off(48_000, 2 * 48_000));
+        assert!(!off(144_000, 2 * 48_000));
+        for lag in [960, 48 * 4, 14_400, 48_000 + 960, -48_000] {
+            assert!(!off(48_000, lag), "lag {lag}");
+        }
+        // Off for one observation, a run shorter than the history.
+        let mut gap = ClockGap::default();
+        let spike = |at| if at == T0 + 9_600 { 10 * 48_000 } else { 960 };
+        assert!(observe(&mut gap, T0, 10, 48_000, spike).0.is_empty());
+    }
+
+    /// A stopped head, which drifts behind the clock past any history, is
+    /// the frozen-head prune's: it is not reported off, also when it
+    /// stopped after a move, and starting to move again far off starts a
+    /// run of its own.
+    #[test]
+    fn a_frozen_head_is_not_reported_off_the_clock() {
+        const T0: u64 = 1 << 40;
+        let mut gap = ClockGap::default();
+        // On the clock, then stopped at T0 + 1 s.
+        let stop = T0 + 48_000;
+        let stopped = |at: u64| at.saturating_sub(stop) as i64;
+        assert!(observe(&mut gap, T0, 20, 48_000, stopped).0.is_empty());
+        // Far behind and frozen from the first observation.
+        let mut gap = ClockGap::default();
+        let frozen = |at: u64| (at - 37 * 48_000 + 1) as i64;
+        assert!(observe(&mut gap, T0, 20, 48_000, frozen).0.is_empty());
+        // Moving again, 37 s behind.
+        let (changes, _) = observe(&mut gap, T0 + 20 * 48_000, 5, 48_000, |_| 37 * 48_000);
+        assert_eq!(changes, [(T0 + 21 * 48_000, GapChange::Off(37 * 48_000))]);
+    }
+
+    /// A head reported off is reported back at the first observation
+    /// within reach, once.
+    #[test]
+    fn a_head_back_on_the_clock_is_reported_back_once() {
+        const T0: u64 = 1 << 40;
+        let mut gap = ClockGap::default();
+        let (changes, at) = observe(&mut gap, T0, 3, 48_000, |_| 37 * 48_000);
+        assert_eq!(changes.len(), 1);
+        let (changes, _) = observe(&mut gap, at, 5, 48_000, |_| 960);
+        assert_eq!(changes, [(at, GapChange::Back(37 * 48_000))]);
     }
 
     /// Detaching a pruned slot leaves no outgoing flow: its flow is not

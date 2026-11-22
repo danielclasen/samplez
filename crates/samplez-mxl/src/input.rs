@@ -200,6 +200,23 @@ impl FlowReader {
         Ok(info)
     }
 
+    /// The flow's readable history in samples: half its ring,
+    /// `bufferLength / 2`, as [`Generation::attach`] counts it. Refused
+    /// for a flow that is not audio.
+    pub fn history(&self) -> Result<u64> {
+        let info = self.config()?;
+        if info.common.format != MXL_DATA_FORMAT_AUDIO {
+            return Err(Error::Format(format!(
+                "format {}, not audio",
+                info.common.format
+            )));
+        }
+        // SAFETY: both union members are structs of integers, so any bytes
+        // are a valid value; libmxl fills `continuous` for audio.
+        let cont = unsafe { info.__bindgen_anon_1.continuous };
+        Ok(u64::from(cont.bufferLength) / 2)
+    }
+
     /// RT. The head index from `mxlFlowReaderGetRuntimeInfo`.
     pub fn head(&self) -> std::result::Result<u64, Status> {
         let mut info = mxl_sys::FlowRuntimeInfo::default();
@@ -1272,6 +1289,12 @@ impl PolledFlow {
     pub fn commit_batch_hint(&self) -> Option<u64> {
         let info = self.readers.first()?.config().ok()?;
         Some(u64::from(info.common.maxCommitBatchSizeHint))
+    }
+
+    /// The flow's readable history ([`FlowReader::history`]), when a
+    /// reader is open.
+    pub fn history(&self) -> Option<u64> {
+        self.readers.first()?.history().ok()
     }
 
     /// Has `n` references opened on the poll reader's [`PollOpener`],

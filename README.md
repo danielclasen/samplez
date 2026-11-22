@@ -1589,6 +1589,19 @@ back is silenced only while it lasts. libmxl's read runs its validity
 check only when the head moves back between the head read and the read,
 which reports the block `TooEarly`.
 
+A head that stays farther from the MXL clock than its flow's readable
+history (half its ring) plus `readerMarginSamples` and the input's
+`|offsetSamples|`, behind or ahead, as that of a producer stamping its
+indices on another epoch does, leaves no block the input reads in the
+ring: the input is silent, late or `TooLate`. Once the head has stayed
+that far for as long as that history, moving, the input's
+`InputStatus::error` names the gap, as in `head 37.0 s behind the MXL
+clock: producer not on the MXL clock`, and the error clears once the
+head is within that distance again; each change is logged once. A head
+unchanged for longer than the frozen-head prune limit is not reported
+so. The supervisor reads the head of a pruned input at its polls and of
+an attached one from the RT thread's statistics, once a second.
+
 In replicated mode the audio voters decide an input's liveness by
 majority, not one engine. Each reports in its side reports the input
 slots its engine reads (`InputStatus::readable`: attached, or down in
