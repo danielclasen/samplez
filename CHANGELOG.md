@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.1](https://github.com/danielclasen/samplez/compare/v0.23.0...v0.23.1) (2026-11-22)
+
+
+### Features
+
+* **engine:** report an input whose head is off the MXL clock ([#184](https://github.com/danielclasen/samplez/issues/184)) ([572675c](https://github.com/danielclasen/samplez/commit/572675ce65a7ceffa440bbd010a35a03bb3d6d26))
+
 ## [0.23.0](https://github.com/danielclasen/samplez/compare/v0.22.0...v0.23.0) (2026-11-22)
 
 
