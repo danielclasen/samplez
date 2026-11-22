@@ -16,7 +16,7 @@ use std::hash::BuildHasher;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -117,7 +117,8 @@ pub fn pilot(ch: usize, idx: u64) -> f32 {
 /// A pilot producer on its own instance: block `k` of `batch` samples is
 /// committed once libmxl's clock passes index `(k + 1) batch + delay`.
 /// Dropping it stops the thread and releases the writer, which deletes
-/// the flow.
+/// the flow. [`Pilot::set_delay`] changes the delay: the pilot then
+/// starts at the block due, its head jumping there.
 ///
 /// A new flow is zero-filled and its history reaches below the first
 /// commit, so a reader started right after the producer reads zeros
@@ -125,6 +126,7 @@ pub fn pilot(ch: usize, idx: u64) -> f32 {
 /// every margin the tests use.
 pub struct Pilot {
     stop: Arc<AtomicBool>,
+    delay: Arc<AtomicI64>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -173,18 +175,25 @@ impl Pilot {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
+        let delay = Arc::new(AtomicI64::new(delay as i64));
+        let delays = Arc::clone(&delay);
         let (first_tx, first_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let n = batch as usize;
             let mut data = vec![0.0f32; channels as usize * n];
             let mut next: Option<u64> = None;
+            let mut delay = delays.load(Ordering::Relaxed);
             while !flag.load(Ordering::Relaxed) {
                 if gate.as_ref().is_some_and(|g| !g.load(Ordering::Relaxed)) {
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
+                if delays.load(Ordering::Relaxed) != delay {
+                    delay = delays.load(Ordering::Relaxed);
+                    next = None;
+                }
                 let idx = time::timestamp_to_index(&api, time::now(&api));
-                if let Some(due) = (idx.saturating_sub(delay) / batch).checked_sub(1) {
+                if let Some(due) = (idx.saturating_add_signed(-delay) / batch).checked_sub(1) {
                     for k in next.unwrap_or(due)..=due {
                         for (ch, out) in data.chunks_exact_mut(n).enumerate() {
                             for (i, v) in out.iter_mut().enumerate() {
@@ -199,7 +208,7 @@ impl Pilot {
                 let k = next.unwrap_or(0);
                 time::sleep_until(
                     &api,
-                    time::index_to_timestamp(&api, (k + 1) * batch + delay),
+                    time::index_to_timestamp(&api, ((k + 1) * batch).saturating_add_signed(delay)),
                 );
             }
             drop(writer);
@@ -213,8 +222,15 @@ impl Pilot {
         }
         Pilot {
             stop,
+            delay,
             thread: Some(thread),
         }
+    }
+
+    /// Commits from now on with `delay` samples, negative ahead of the
+    /// clock.
+    pub fn set_delay(&self, delay: i64) {
+        self.delay.store(delay, Ordering::Relaxed);
     }
 }
 
