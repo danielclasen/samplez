@@ -897,6 +897,7 @@ fn a_product_state_sets_the_delay() {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -927,6 +928,35 @@ fn a_product_state_sets_the_delay() {
     let taps = k0.core.delay_taps(0).unwrap();
     assert_eq!((taps.from, taps.to), (0, 4800), "{taps:?}");
     assert_eq!(taps.start, (j + 1) * B);
+}
+
+/// A product state with an input's pre-strip meter on switches it on at
+/// the install: the input's status reads it from there, where it read
+/// none before. Fails with the state's pre-strip meters left out of the
+/// core `ProductFill` builds.
+#[test]
+fn a_product_state_switches_the_pre_strip_meter_on() {
+    let domain = Domain::new();
+    let src = new_id();
+    let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+    let h = hashed_of(&domain, &[(&src, 2)], |c| c.inputs[0].pre_strip_meter = true);
+    let state = ProductState {
+        gains: common::diagonal(2, 1.0),
+        up: vec![true],
+        flows: vec![Some(src.clone())],
+        pre_strip_meters: vec![true],
+        strips: vec![Vec::new()],
+        last_id: 1,
+        ..Default::default()
+    };
+    assert!(h.e.status().inputs[0].pre_strip_meters.is_none());
+    h.e.drop_core().unwrap();
+    (h.e)
+        .install_product(&state, 0, Duration::from_secs(2))
+        .unwrap();
+    wait_for(Duration::from_secs(10), "the pre-strip meter read", || {
+        (h.e.status().inputs[0].pre_strip_meters.as_ref()).is_some_and(|m| m.window.is_some())
+    });
 }
 
 /// A product state's output delays are set at the install, as an input's,
@@ -1035,6 +1065,7 @@ fn a_product_state_resumes_the_tone_ramps() {
         up: vec![true],
         flows: vec![None],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -1262,6 +1293,7 @@ fn a_dropped_core_withholds_until_a_product_core_is_installed() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1344,6 +1376,7 @@ fn a_product_core_replaces_a_held_core_only_after_dropping_it() {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -1390,6 +1423,7 @@ fn a_product_core_installs_at_the_index_named_with_its_gains_at_target() {
             up: vec![true],
             flows: vec![Some(src.clone())],
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             strips: vec![Vec::new()],
             ducks: Vec::new(),
@@ -1457,6 +1491,7 @@ fn a_product_state_keeps_reading_the_flow_a_crossfade_leaves() {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -1531,6 +1566,7 @@ fn a_route_passed_without_a_core_applies_at_the_install() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1579,6 +1615,7 @@ fn a_product_entry_the_install_passed_is_folded_in() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -1688,6 +1725,7 @@ fn replicas_detach_alike_and_a_product_state_without_a_flow_matches() {
             up: vec![true, true],
             flows: vec![None, Some(other.clone())],
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             strips: vec![Vec::new(), Vec::new()],
             ducks: Vec::new(),
@@ -1736,6 +1774,7 @@ fn a_product_state_disables_and_enables_an_output() {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs,
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -1803,6 +1842,7 @@ fn a_product_state_sets_the_limiter() {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -2070,6 +2110,7 @@ fn a_strip_entry_folded_into_a_product_core_still_reaches_the_strip() {
 
             strips: vec![Vec::new()],
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -2135,6 +2176,7 @@ fn a_limiter_entry_folded_into_a_product_core_still_reaches_the_limiter() {
             flows: vec![Some(src.clone())],
             strips: vec![Vec::new()],
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -2206,6 +2248,7 @@ fn a_route_folded_into_a_product_core_still_swaps_in() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -2305,6 +2348,7 @@ fn a_route_the_core_carried_is_not_applied_again() {
 
         strips: vec![Vec::new()],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         ducks: Vec::new(),
         masks: Vec::new(),
@@ -2670,6 +2714,7 @@ fn a_rebuild_restores_a_route_and_a_strip_parameter_the_engine_dropped() {
             up: vec![true],
             flows: vec![Some(next.clone())],
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             strips: vec![vec![trim]],
             ducks: Vec::new(),
@@ -2794,6 +2839,7 @@ fn product_over_a_pending_generation(sent: bool) -> Result<(), String> {
         up: vec![true, true],
         flows: vec![Some(src0.clone()), Some(next1.clone())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new(), Vec::new()],
         ducks: Vec::new(),
@@ -2889,6 +2935,7 @@ fn a_product_state_drops_the_generation_of_an_entry_it_folded_in() {
             up: vec![true, true],
             flows: vec![Some(next0.clone()), Some(src1.clone())],
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             strips: vec![Vec::new(), Vec::new()],
             ducks: Vec::new(),
@@ -3076,6 +3123,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
             up: vec![true],
             flows: vec![Some(src.clone())],
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             strips: vec![Vec::new()],
             ducks: vec![DuckTargets {
@@ -3173,6 +3221,7 @@ fn an_install_leaving_an_output_out_starts_it_as_configured() {
             flows: vec![Some(src.clone())],
             strips: vec![Vec::new()],
             outputs,
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             ducks: Vec::new(),
             masks: Vec::new(),
@@ -3521,6 +3570,7 @@ fn rebuilt_replica_continues_a_fade(wait: u64, assert_mid: bool) -> Result<(), S
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -3617,6 +3667,7 @@ fn rebuilt_replica_continues_a_masked_fade(delay: u32) -> Result<(), String> {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: vec![DuckTargets {
@@ -3718,6 +3769,7 @@ fn rebuilt_replica_continues_plain_ramps(chained: bool) -> Result<(), String> {
         up: vec![true],
         flows: vec![Some(src.clone())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -3899,6 +3951,7 @@ fn a_rebuilt_replica_keeps_a_meter_paused() {
             up: vec![true],
             flows: vec![Some(src.clone())],
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: vec![false],
             strips: vec![Vec::new()],
             limiters: Vec::new(),

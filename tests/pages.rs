@@ -28,16 +28,16 @@ struct Replica {
 /// gain 1 to a two-channel output, whose page hashes go to a channel of
 /// `room`.
 fn start(domain: &Domain, src: &str, voters: usize, room: usize) -> Replica {
-    start_delayed(domain, src, voters, room, 0)
+    start_with(domain, src, voters, room, |_| {})
 }
 
-/// [`start`] with a delay line of up to `max_delay` samples on the input.
-fn start_delayed(
+/// [`start`] with its configuration changed by `f`.
+fn start_with(
     domain: &Domain,
     src: &str,
     voters: usize,
     room: usize,
-    max_delay: u32,
+    f: impl FnOnce(&mut samplez::Config),
 ) -> Replica {
     let out = new_id();
     let mut config = config(
@@ -48,7 +48,7 @@ fn start_delayed(
         MARGIN,
     );
     config.ramp_samples = RAMP;
-    config.inputs[0].max_delay_samples = max_delay;
+    f(&mut config);
     let (report_tx, _reports) = std::sync::mpsc::sync_channel(64);
     let (hash_tx, hashes) = std::sync::mpsc::sync_channel(room);
     let (verdict_tx, verdicts) = std::sync::mpsc::sync_channel(1 << 16);
@@ -366,7 +366,8 @@ fn three_engines_with_a_delay_and_a_strip_change_hash_the_pages_alike() {
         let domain = Domain::new();
         let src = new_id();
         let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
-        let rs = [0; 3].map(|_| start_delayed(&domain, &src, 3, 1 << 16, 4800));
+        let delayed = |c: &mut samplez::Config| c.inputs[0].max_delay_samples = 4800;
+        let rs = [0; 3].map(|_| start_with(&domain, &src, 3, 1 << 16, delayed));
         let k = rs.iter().map(|r| processed(&r.e)).max().unwrap();
         let at = (k + u64::from(RAMP) / B + 100) * B;
         // After the delay's crossfade, then the second delay a few pages
@@ -450,6 +451,63 @@ fn three_engines_with_a_delay_and_a_strip_change_hash_the_pages_alike() {
             {
                 assert_ne!(hash(p), Some(h), "page {p} unchanged by the trim");
             }
+        }
+        Ok(())
+    });
+}
+
+/// Three engines on the same input and the same log switch the input's
+/// pre-strip meter on, off and on again alike, and hash every page all
+/// three computed alike: each reads the meter while the log has it on and
+/// none while it has it off, and the meter enters no page hash. Pages
+/// are compared outside those a silenced block disturbed; a run with
+/// fewer than twenty compared runs again. Fails with the `PreStripMeter`
+/// arm dropped from `Rt::apply_change`, and with the supervisor's
+/// `PreStripMeterOff` arm keeping the readings.
+#[test]
+fn three_engines_switch_a_pre_strip_meter_alike() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let metered = |c: &mut samplez::Config| c.inputs[0].pre_strip_meter = true;
+        let rs = [0; 3].map(|_| start_with(&domain, &src, 3, 1 << 16, metered));
+        let k = rs.iter().map(|r| processed(&r.e)).max().unwrap();
+        let at = (k + u64::from(RAMP) / B + 100) * B;
+        let (at2, at3) = (at + 24 * PAGE / B * B, at + 48 * PAGE / B * B);
+        let set = |enabled| Entry::PreStripMeter { slot: 0, enabled };
+        let entries = [(at, set(true)), (at2, set(false)), (at3, set(true))];
+        let on = |r: &Replica| r.e.status().inputs[0].pre_strip_meters.is_some();
+        for r in &rs {
+            assert!(!on(r), "off at start");
+            for (id, (at, entry)) in entries.iter().enumerate() {
+                r.e.append(id as u64 + 1, *at, entry.clone()).unwrap();
+            }
+            r.e.commit(entries.len() as u64);
+        }
+        let reads = |want: bool, what: &str| {
+            wait_for(Duration::from_secs(10), what, || rs.iter().all(|r| on(r) == want));
+        };
+        wait_all(&rs.each_ref(), at / B + 2 * 4800 / B);
+        reads(true, "the meter read on every engine");
+        wait_all(&rs.each_ref(), at2 / B + 4);
+        reads(false, "the meter gone on every engine");
+        wait_all(&rs.each_ref(), at3 / B + 2 * 4800 / B);
+        reads(true, "the meter read again on every engine");
+        let pages = rs.each_ref().map(Replica::pages);
+        let disturbed: Vec<(u64, u64)> = rs.iter().flat_map(Replica::disturbed).collect();
+        let triples: Vec<_> = (pages[0].iter())
+            .filter(|(p, _)| **p >= at / PAGE)
+            .filter(|(p, _)| !disturbed.iter().any(|d| (d.0..d.1).contains(*p)))
+            .filter_map(|(p, h)| Some([*h, *pages[1].get(p)?, *pages[2].get(p)?]))
+            .collect();
+        for [a, b, c] in &triples {
+            let page = |h: &PageHash| (h.hash, h.fingerprint);
+            assert_eq!(page(a), page(b), "page {}", a.page);
+            assert_eq!(page(a), page(c), "page {}", a.page);
+        }
+        if triples.len() < 20 {
+            return Err(format!("{} pages compared", triples.len()));
         }
         Ok(())
     });

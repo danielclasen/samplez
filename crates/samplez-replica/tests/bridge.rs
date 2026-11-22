@@ -577,6 +577,58 @@ fn an_output_delay_beyond_the_line_is_replaced_by_none() {
     assert!(audio.rebuild_engine(&state, 0), "not rebuilt");
 }
 
+/// A pre-strip meter switched on for an input configured without one is
+/// replaced by off, as a rebuild replaces it in the product state;
+/// counted as replaced, while one switched on for an input with one
+/// passes. A product state naming such a meter, and one of a slot the
+/// engine lacks, is rebuilt with the first switched off and the second
+/// left out. Fails with no neutral form of `Entry::PreStripMeter` in
+/// `EngineAudio::admitted`, which leaves the entry out uncounted, or
+/// with the state's pre-strip meters left unfiltered, which the engine
+/// refuses whole.
+#[test]
+fn a_pre_strip_meter_without_the_capability_is_replaced_by_off() {
+    let domain = Domain::new();
+    let flow = |n: u8| format!("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b{n:02x}");
+    let v = serde_json::json!({
+        "blockSize": B,
+        "readerMarginSamples": 960,
+        "libmxl": libmxl(),
+        "domains": [{ "name": "d", "path": domain.0 }],
+        "inputs": [{ "name": "in0", "domain": "d", "flowId": flow(0), "channels": 1,
+                     "preStripMeter": true },
+                   { "name": "in1", "domain": "d", "flowId": flow(1), "channels": 1 }],
+        "outputs": [{ "name": "out0", "domain": "d",
+                      "flowId": "8f2b8f6e-0d8a-4b8e-9d55-2f4c1f6f7f01", "label": "bridge",
+                      "group": "samplez-test", "role": "Audio 0", "channels": 1 }],
+        "matrix": [[1.0], [1.0]],
+        "rt": { "rtCpu": "none" },
+    });
+    let (engine, audio) = bridge_of(&v, 1 << 16);
+    wait_for("a block computed", || {
+        engine.progress().unwrap().processed.is_some()
+    });
+    let at = (engine.progress().unwrap().processed.unwrap() + 100) * B;
+    let set = |slot| Entry::PreStripMeter {
+        slot,
+        enabled: true,
+    };
+    audio.appended(3, at, &[set(0), set(1)]);
+    audio.committed(3);
+    assert_eq!(audio.sample().entries_filtered, 1);
+    let state = samplez::ProductState {
+        gains: vec![vec![1.0], vec![1.0]],
+        up: vec![true, true],
+        flows: vec![Some(flow(0)), Some(flow(1))],
+        strips: vec![Vec::new(), Vec::new()],
+        pre_strip_meters: vec![true, true, true],
+        last_id: 3,
+        ..Default::default()
+    };
+    audio.drop_engine();
+    assert!(audio.rebuild_engine(&state, 0), "not rebuilt");
+}
+
 /// A `LoudnessRun` or loudness reset of a meter the engine lacks is left
 /// out of a record and counted, one of its own meter passes through; a
 /// product state naming meters beyond the engine's rebuilds it with those
@@ -610,6 +662,7 @@ fn a_loudness_entry_of_a_meter_the_engine_lacks_is_left_out() {
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: vec![false, true, false],
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -654,6 +707,7 @@ fn ramps_in_flight_the_engine_refuses_are_filtered_from_a_rebuild() {
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -891,6 +945,7 @@ fn a_dropped_engine_keeps_reporting_its_processed_block() {
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),
@@ -1600,6 +1655,7 @@ fn rebuild_after_a_route() -> Result<(), String> {
         up: vec![true],
         flows: vec![Some(ROUTED.to_owned())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![vec![StripParam::Trim { db: -6.0 }]],
         ducks: Vec::new(),
@@ -1735,6 +1791,7 @@ fn a_rebuilt_replica_reads_what_a_cross_domain_reroute_left_live() {
         up: vec![true, true],
         flows: routed.map(|f| Some(f.to_owned())).to_vec(),
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new(), Vec::new()],
         ducks: Vec::new(),
@@ -1830,6 +1887,7 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
         up: vec![true],
         flows: vec![Some("5fbec3b1-1b0b-417e-a9f4-a7b1f1fd2b8a".to_owned())],
         outputs: Vec::new(),
+        pre_strip_meters: Vec::new(),
         loudness_running: Vec::new(),
         strips: vec![Vec::new()],
         ducks: Vec::new(),

@@ -265,8 +265,10 @@ pub enum Body {
 /// strip's and output delay's engine entries
 /// (`samplez::Entry::OutputStrip`, `samplez::Entry::OutputDelay`) and
 /// targets (`samplez::Targets::output_strips`,
-/// `samplez::Targets::output_delays`).
-pub const PROTOCOL: u32 = 5;
+/// `samplez::Targets::output_delays`); 6 adds the pre-strip meter's
+/// engine entry (`samplez::Entry::PreStripMeter`) and targets
+/// (`samplez::Targets::pre_strip_meters`).
+pub const PROTOCOL: u32 = 6;
 
 impl Body {
     /// An entry whose generation every replica builds on receipt: an
@@ -488,10 +490,11 @@ mod tests {
     /// computation bumps it, with the reason added here, and only such a
     /// change does. 2: the generation flags; 3: the tone generator's
     /// entry and targets; 4: an unfillable withheld block's digest; 5: the
-    /// output strip's and output delay's entries and targets.
+    /// output strip's and output delay's entries and targets; 6: the
+    /// pre-strip meter's entry and targets.
     #[test]
     fn the_protocol_is_pinned() {
-        assert_eq!(PROTOCOL, 5);
+        assert_eq!(PROTOCOL, 6);
     }
 
     /// The entries the leader flagged for a generation need one, so a

@@ -191,6 +191,10 @@ pub(crate) struct Batch {
     pub downs: Vec<u32>,
     /// The outputs enabled (true) or disabled, ascending.
     pub outputs: Vec<(u32, bool)>,
+    /// The slots whose pre-strip meter it switches on (true) or off,
+    /// ascending; not encoded while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_strip_meters: Vec<(u32, bool)>,
     /// Duck settings by group, one per kind ([`DuckChange::kind`]),
     /// ascending by group and kind.
     pub ducks: Vec<(u8, DuckChange)>,
@@ -255,6 +259,7 @@ impl Batch {
             && self.tones.windows(2).all(|w| w[0].0 < w[1].0)
             && self.downs.windows(2).all(|w| w[0] < w[1])
             && self.outputs.windows(2).all(|w| w[0].0 < w[1].0)
+            && self.pre_strip_meters.windows(2).all(|w| w[0].0 < w[1].0)
             && self
                 .ducks
                 .iter()
@@ -314,6 +319,7 @@ impl Batch {
             && self.tones.iter().all(|&(s, _)| (s as usize) < legs.len())
             && self.downs.iter().all(|&s| (s as usize) < legs.len())
             && self.outputs.iter().all(|&(o, _)| (o as usize) < outputs)
+            && (self.pre_strip_meters.iter()).all(|&(s, _)| (s as usize) < legs.len())
             && self.limiters.iter().all(|&(o, _)| (o as usize) < outputs)
             && (self.output_delays.iter()).all(|&(o, _)| (o as usize) < outputs)
             && self.ducks.iter().all(|(_, c)| c.fits(legs))
@@ -376,7 +382,8 @@ struct SlotFold {
 /// batch. Per coefficient, strip parameter key, duck setting kind, depth
 /// and mask last value counts, per output its last `Output`, last
 /// limiter parameters, last delay and last strip parameter per key, per
-/// slot its last delay and tone parameters, per meter its last
+/// slot its last delay, tone parameters and `PreStripMeter`, per meter its
+/// last
 /// `LoudnessRun`; each meter reset is kept once. Per
 /// input slot a `Route` and its up or
 /// down state are kept apart ([`SlotFold`]): an `InputUp` and a `Route`
@@ -399,6 +406,7 @@ pub(crate) fn fold(
     let mut depths = BTreeMap::new();
     let mut masks = BTreeMap::new();
     let mut outputs = BTreeMap::new();
+    let mut pre_strip_meters = BTreeMap::new();
     let mut limiters = BTreeMap::new();
     let mut delays = BTreeMap::new();
     let mut output_delays = BTreeMap::new();
@@ -471,6 +479,9 @@ pub(crate) fn fold(
             Change::Output { output, enabled } => {
                 outputs.insert(output as u32, enabled);
             }
+            Change::PreStripMeter { slot, enabled } => {
+                pre_strip_meters.insert(slot as u32, enabled);
+            }
             Change::LoudnessRun { meter, running } => {
                 runs.insert(meter as u32, running);
             }
@@ -502,6 +513,7 @@ pub(crate) fn fold(
         + tones.len()
         + downs.len()
         + outputs.len()
+        + pre_strip_meters.len()
         + runs.len()
         + resets.len()
         + up.count_ones() as usize
@@ -559,6 +571,11 @@ pub(crate) fn fold(
                 output: output as usize,
                 enabled,
             }
+        } else if let Some((&slot, &enabled)) = pre_strip_meters.first_key_value() {
+            Change::PreStripMeter {
+                slot: slot as usize,
+                enabled,
+            }
         } else if let Some((&meter, &running)) = runs.first_key_value() {
             Change::LoudnessRun {
                 meter: meter as usize,
@@ -590,6 +607,7 @@ pub(crate) fn fold(
         tones: tones.into_iter().collect(),
         downs,
         outputs: outputs.into_iter().collect(),
+        pre_strip_meters: pre_strip_meters.into_iter().collect(),
         ducks: ducks.into_iter().map(|((g, _), c)| (g, c)).collect(),
         depths: (depths.into_iter())
             .map(|((row, g), db)| (row, g, db))
@@ -725,6 +743,27 @@ mod tests {
         assert!(!batch.fits(2, 2, 3, 3, &[1, 1], &[], &[]), "output 3 of 3");
         let unordered = Batch {
             outputs: vec![(3, true), (0, false)],
+            ..(*batch).clone()
+        };
+        assert!(!unordered.sane());
+    }
+
+    /// Per slot the last `PreStripMeter` of a log entry counts, ascending;
+    /// a lone one is itself. A batch fits only an engine with every slot
+    /// it names, and one out of order is not sane.
+    #[test]
+    fn a_slots_last_pre_strip_meter_wins() {
+        let set = |slot, enabled| Change::PreStripMeter { slot, enabled };
+        let one = |changes: &[Change]| fold(&items(changes), 2, 4).unwrap().unwrap();
+        assert_eq!(one(&[set(1, true), set(1, false)]), (set(1, false), None));
+        let (_, batch) = one(&[set(3, true), set(0, true), set(3, false)]);
+        let batch = batch.unwrap();
+        assert_eq!(batch.pre_strip_meters, [(0, true), (3, false)]);
+        assert!(!batch.has_params());
+        assert!(batch.sane() && batch.fits(4, 2, 1, 1, &[1; 4], &[], &[]));
+        assert!(!batch.fits(3, 2, 1, 1, &[1; 3], &[], &[]), "slot 3 of 3");
+        let unordered = Batch {
+            pre_strip_meters: vec![(3, false), (0, true)],
             ..(*batch).clone()
         };
         assert!(!unordered.sane());
@@ -1031,6 +1070,7 @@ mod tests {
                     tones: Vec::new(),
                     downs: Vec::new(),
                     outputs: Vec::new(),
+                    pre_strip_meters: Vec::new(),
                     ducks: Vec::new(),
                     depths: Vec::new(),
                     masks: Coefs::default(),

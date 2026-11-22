@@ -133,7 +133,9 @@ replica") has the bump rules:
 - `PROTOCOL`: the log's wire format, the library's replicated semantics
   (state machine, `Entry` variants, `Targets` fields, restamp and void
   handling), and any change to how page hashes or entry fingerprints are
-  computed, also where the samples stay the same.
+  computed, also where the samples stay the same. It is 6: the
+  pre-strip meter's `Entry::PreStripMeter` and
+  `Targets::pre_strip_meters`.
 - `COMPUTE_VERSION`: any change to the samples or meters the engine
   computes, dependency and toolchain changes included, or to what a core
   copy holds or how it encodes. `samplez-dsp` pins `libm = "=0.2.16"`,

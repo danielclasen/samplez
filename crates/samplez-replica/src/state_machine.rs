@@ -1310,6 +1310,7 @@ impl<P: Product> StateMachine<P> {
             up,
             flows: targets.flows,
             outputs: targets.outputs,
+            pre_strip_meters: targets.pre_strip_meters,
             loudness_running: targets.loudness_running,
             strips: targets.strips,
             output_strips: targets.output_strips,
@@ -2519,6 +2520,7 @@ mod derive_tests {
                     .map(|&db| vec![StripParam::Trim { db }])
                     .collect(),
                 masks: vec![vec![0], vec![u8::from(self.ducked)]],
+                pre_strip_meters: Vec::new(),
                 // Listed only while a meter is paused.
                 loudness_running: if self.paused.contains(&true) {
                     self.paused.iter().map(|&p| !p).collect()

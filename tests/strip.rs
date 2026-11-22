@@ -133,12 +133,15 @@ fn inputs_and_meters_no_output_carries_are_metered() {
     common::stop(e);
 }
 
-/// An input with `preStripMeter` reads the pilot's full-scale sines
-/// before its strip: a -12 dB trim leaves its pre-strip meter at full
-/// scale, peak and RMS, while its meter after the strip reads them 12 dB
-/// down. An input without it has no pre-strip meter. Fails with the copy
-/// into `prebuf` moved after `run_strip` in `Slot::finish`, the
-/// pre-strip meter then reading the trim.
+/// An input with `preStripMeter`, its meter switched on, reads the
+/// pilot's full-scale sines before its strip: a -12 dB trim leaves its
+/// pre-strip meter at full scale, peak and RMS, while its meter after the
+/// strip reads them 12 dB down. Before it is switched on, and on an input
+/// without it, there is no pre-strip meter, and switching one on there
+/// is refused; switched off, it is gone again. Fails with the copy into
+/// `prebuf` moved after `run_strip` in `Slot::finish`, the pre-strip
+/// meter then reading the trim, with `check_pre_strip_meter` taking any
+/// slot, and with the RT thread telling the supervisor no stop.
 #[test]
 fn a_pre_strip_meter_reads_the_input_before_its_trim() {
     let domain = Domain::new();
@@ -153,6 +156,13 @@ fn a_pre_strip_meter_reads_the_input_before_its_trim() {
         (e.status().inputs.iter()).all(|i| i.state == InputState::Attached)
     });
     let at = (now(&rx) + 100) * B;
+    assert!(e.status().inputs[0].pre_strip_meters.is_none(), "off at start");
+    match e.set_pre_strip_meter(1, true, at) {
+        Err(GainError::Invalid(m)) => assert!(m.contains("preStripMeter"), "{m}"),
+        r => panic!("{r:?}"),
+    }
+    e.set_pre_strip_meter(1, false, at).unwrap();
+    e.set_pre_strip_meter(0, true, at).unwrap();
     e.set_strip(0, StripParam::Trim { db: -12.0 }, at).unwrap();
     let after = |w: Option<u64>| w.is_some_and(|w| w * 4800 >= at + 5 * 4800);
     wait_for(Duration::from_secs(10), "meters past the trim", || {
@@ -177,6 +187,12 @@ fn a_pre_strip_meter_reads_the_input_before_its_trim() {
         );
     }
     assert!(s.inputs[1].pre_strip_meters.is_none());
+    drop(s);
+    let off = (now(&rx) + 100) * B;
+    e.set_pre_strip_meter(0, false, off).unwrap();
+    wait_for(Duration::from_secs(10), "the pre-strip meter gone", || {
+        e.status().inputs[0].pre_strip_meters.is_none()
+    });
     common::stop(e);
 }
 

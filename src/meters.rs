@@ -329,6 +329,20 @@ impl OutputLoudness {
         }
     }
 
+    /// Records `r` as [`OutputLoudness::record`] does, after starting
+    /// afresh where `r` restarts the measurement: a pre-strip meter
+    /// switched on folds what it metered from there on alone. Whether it
+    /// started afresh.
+    pub fn record_restarting(&mut self, r: &MeterRecord) -> bool {
+        let restart = r.channel == 0 && r.reset().is_some();
+        if restart {
+            let on = self.correlation.is_some();
+            *self = OutputLoudness::new(std::mem::take(&mut self.weights)).correlating(on);
+        }
+        self.record(r);
+        restart
+    }
+
     pub fn record(&mut self, r: &MeterRecord) {
         if r.cross() {
             if let Some(k) = &mut self.correlation {

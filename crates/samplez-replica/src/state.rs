@@ -1245,6 +1245,7 @@ mod tests {
                     up: Vec::new(),
                     flows: Vec::new(),
                     outputs: Vec::new(),
+                    pre_strip_meters: Vec::new(),
                     loudness_running: Vec::new(),
                     strips: Vec::new(),
                     ducks: Vec::new(),

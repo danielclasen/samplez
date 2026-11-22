@@ -367,6 +367,12 @@ pub(crate) enum Telemetry {
         slot: usize,
         up: bool,
     },
+    /// A `PreStripMeter` entry, or a core installed, stopped the slot's
+    /// pre-strip meter from index `at_index` on.
+    PreStripMeterOff {
+        slot: usize,
+        at_index: u64,
+    },
     /// The generation of entry `id` was swapped in, or handed back
     /// unused because the entry was late.
     GenerationDone {
@@ -536,6 +542,10 @@ pub(crate) enum Change {
     /// disabled: nothing is written from the index on and its writer is
     /// handed back.
     Output { output: usize, enabled: bool },
+    /// The pre-strip meter of the slot, one configured with
+    /// `preStripMeter`, runs from the index on, its measurement started
+    /// afresh, or stops: its block is neither copied nor metered.
+    PreStripMeter { slot: usize, enabled: bool },
     /// The loudness measurement of `meter`, an output or after the
     /// outputs a configured meter, runs from the index on, or is paused:
     /// the slices metered while it is are left out of it.
@@ -546,7 +556,8 @@ pub(crate) enum Change {
     /// The engine entries of one log entry, folded: its gains, strip,
     /// output strip, limiter, delay, output delay and tone parameters
     /// (`strips` says whether it has any),
-    /// `InputDown`s, `Output`s, `LoudnessRun`s and loudness resets
+    /// `InputDown`s, `Output`s, `PreStripMeter`s, `LoudnessRun`s and
+    /// loudness resets
     /// (`resets` says whether it has any) in
     /// a [`Batch`] the RT thread holds by log id, and by bit per slot the
     /// slots it raises after them and those it re-routes, all of one
@@ -599,8 +610,8 @@ impl Change {
 
     /// Whether a core holds what this change did once applied: a gain
     /// change is in the matrix, an `InputDown` in the slot state, an
-    /// `Output` in the outputs disabled, a `LoudnessRun` in the meters
-    /// paused and a
+    /// `Output` in the outputs disabled, a `PreStripMeter` in the
+    /// pre-strip meters on, a `LoudnessRun` in the meters paused and a
     /// strip entry in the strip of a core holding `strips`, but a
     /// swapped-in generation, the strips under a core built from
     /// product state and the meters a loudness reset restarts stay with
@@ -610,6 +621,7 @@ impl Change {
             Change::Gain { .. }
             | Change::InputDown { .. }
             | Change::Output { .. }
+            | Change::PreStripMeter { .. }
             | Change::LoudnessRun { .. } => true,
             Change::Strip { .. }
             | Change::OutputStrip { .. }
@@ -742,9 +754,13 @@ pub(crate) struct Slot {
     /// The slot's tone generator, which it computes in place of a read;
     /// none on a slot that reads flows.
     pub tone: Option<Tone>,
-    /// Each block is copied into the slot's channels of `prebuf` after
-    /// the delay and before the strip, for its pre-strip meter.
+    /// The slot has a pre-strip meter, its config setting
+    /// `preStripMeter`, which [`Slot::pre_strip_on`] runs.
     pub pre_strip: bool,
+    /// The log has the slot's pre-strip meter on (`PreStripMeter`): each
+    /// block is copied into the slot's channels of `prebuf` after the
+    /// delay and before the strip, and metered there. Off at start.
+    pub pre_strip_on: bool,
     /// The first of the slot's pre-strip matrix rows, after every
     /// input's rows: each block is copied into these channels of `inbuf`
     /// after the delay and before the strip. None on a slot whose config
@@ -789,6 +805,7 @@ impl Slot {
             delay: None,
             tone: None,
             pre_strip: false,
+            pre_strip_on: false,
             pre_row: None,
             #[cfg(test)]
             flow: 0,
@@ -798,8 +815,8 @@ impl Slot {
     /// Runs the delay and then the strip over block `dst` of `frames`
     /// samples per channel starting at sample index `start`, read,
     /// generated or silenced, and copies it into the slot's channels of
-    /// `inbuf`; with [`Slot::pre_strip`], copies it after the delay and
-    /// before the strip into those of `prebuf` too, and with
+    /// `inbuf`; with [`Slot::pre_strip_on`], copies it after the delay
+    /// and before the strip into those of `prebuf` too, and with
     /// [`Slot::pre_row`] into its pre-strip rows of `inbuf`, so every tap
     /// of the input is as late as its delay.
     fn finish(
@@ -814,7 +831,7 @@ impl Slot {
         if let Some(d) = &mut self.delay {
             d.process(start, dst, frames);
         }
-        if self.pre_strip {
+        if self.pre_strip_on {
             for (c, ch) in dst.chunks_exact(frames).enumerate() {
                 prebuf.channel_mut(self.first_channel + c)[..frames].copy_from_slice(ch);
             }
@@ -1141,6 +1158,26 @@ impl OutMeter {
     /// starting at or after `at_index`, replacing a reset still pending.
     pub fn set_reset(&mut self, at_index: u64) {
         self.reset_at = Some(at_index.div_ceil(WINDOW) * WINDOW);
+    }
+
+    /// Starts the meter afresh from `at_index`, after samples it did not
+    /// meter: the slice in progress is dropped unsent, and the first
+    /// slice starting at or after the index restarts the measurement, its
+    /// record carrying the reset, so the readings fold from there on
+    /// alone. Allocates nothing.
+    pub fn restart(&mut self, at_index: u64) {
+        self.slice = None;
+        self.reset = None;
+        self.reset_at = Some(at_index.div_ceil(SLICE) * SLICE);
+        self.flags = 0;
+        self.frames = 0;
+        self.peak.fill(0.0);
+        self.true_peak.fill(0.0);
+        self.sum_sq.fill(0.0);
+        self.plain_sum_sq.fill(0.0);
+        if let Some(c) = &mut self.cross {
+            *c = 0.0;
+        }
     }
 
     /// Adds `frames` samples of output channels `first..` of `buf`,
@@ -2234,6 +2271,9 @@ fn capture_core(
     c.outputs_disabled = (outs.iter().enumerate())
         .filter(|(_, o)| !o.enabled)
         .fold(0, |m, (o, _)| m | bit(o));
+    c.pre_strip_meters = (slots.iter().enumerate())
+        .filter(|(_, s)| s.pre_strip_on)
+        .fold(0, |m, (s, _)| m | bit(s));
     c.loudness_paused = m.paused;
     for (d, o) in c.limiters.iter_mut().zip(outs) {
         // A limiter holds no heap memory: the copy allocates nothing.
@@ -3264,6 +3304,9 @@ impl Rt {
                 for &(output, enabled) in &b.outputs {
                     self.set_output(output as usize, enabled);
                 }
+                for &(slot, enabled) in &b.pre_strip_meters {
+                    self.set_pre_strip_meter(slot as usize, enabled, e.at_index);
+                }
                 let slots = &self.slots;
                 let legs = |s: usize| slots.get(s).map_or(0, |s| s.channels);
                 let refused = self.mix.apply_ducks(e.at_index, b, legs);
@@ -3348,6 +3391,9 @@ impl Rt {
             Change::OutputDelay { output, samples } => self.set_output_delay(e, output, samples),
             Change::Tone { slot, params } => self.set_tone(e, slot, params),
             Change::Output { output, enabled } => self.set_output(output, enabled),
+            Change::PreStripMeter { slot, enabled } => {
+                self.set_pre_strip_meter(slot, enabled, e.at_index)
+            }
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => {
                 self.apply_generation(e)
             }
@@ -3394,6 +3440,29 @@ impl Rt {
             );
         }
         self.hand_back(output, writer);
+    }
+
+    /// Runs slot `slot`'s pre-strip meter from sample index `at_index` on,
+    /// its measurement restarted, or stops it, telling the supervisor. A
+    /// slot without one, which the entry's check refuses, is left as it
+    /// is, and one already so starts nothing.
+    fn set_pre_strip_meter(&mut self, slot: usize, enabled: bool, at_index: u64) {
+        let Some(s) = self.slots.get_mut(slot).filter(|s| s.pre_strip) else {
+            return;
+        };
+        if s.pre_strip_on == enabled {
+            return;
+        }
+        s.pre_strip_on = enabled;
+        if !enabled {
+            self.send(Telemetry::PreStripMeterOff { slot, at_index });
+            return;
+        }
+        // The slot's meter among the pre-strip ones, in slot order.
+        let tap = self.slots[..slot].iter().filter(|s| s.pre_strip).count();
+        if let Some(m) = self.pre_taps.get_mut(tap) {
+            m.meter.restart(at_index);
+        }
     }
 
     /// Returns output `output`'s writer `writer` and marks the output
@@ -3851,12 +3920,15 @@ impl Rt {
             .taps
             .iter_mut()
             .map(|m| (&mut m.meter, m.first_channel, &self.inbuf));
-        let pre_taps = self
-            .pre_taps
-            .iter_mut()
-            .map(|m| (&mut m.meter, m.first_channel, &self.prebuf));
-        let all = outs.chain(buses).chain(taps).chain(pre_taps);
-        for (i, (meter, first, buf)) in all.enumerate() {
+        // A slot's pre-strip meter runs while the log has it on.
+        let on = self.slots.iter().filter(|s| s.pre_strip).map(|s| s.pre_strip_on);
+        let pre_taps = (self.pre_taps.iter_mut().zip(on))
+            .map(|(m, on)| on.then_some((&mut m.meter, m.first_channel, &self.prebuf)));
+        let all = (outs.chain(buses).chain(taps).map(Some)).chain(pre_taps);
+        for (i, metered) in all.enumerate() {
+            let Some((meter, first, buf)) = metered else {
+                continue;
+            };
             let mut sink = MeterSink {
                 meter: i as u32,
                 ring: &mut self.meters,
@@ -4015,6 +4087,10 @@ impl Rt {
             if self.outs[o].enabled != enabled {
                 self.set_output(o, enabled);
             }
+        }
+        for slot in 0..self.slots.len() {
+            let on = c.pre_strip_meters & bit(slot) != 0;
+            self.set_pre_strip_meter(slot, on, next);
         }
         for (d, s) in self.slots.iter_mut().zip(&c.slots) {
             d.up = s.up;
@@ -5099,6 +5175,7 @@ mod tests {
             delay: None,
             tone: None,
             pre_strip: false,
+            pre_strip_on: false,
             pre_row: None,
         }
     }
@@ -5130,6 +5207,7 @@ mod tests {
         slots[0].strip = Some(strip.clone());
         slots[0].strip_pos = Some(20 * B);
         slots[1].detached = true;
+        slots[1].pre_strip_on = true;
         // A tone generator mid-crossfade, its level ramping.
         let mut tone = Tone::new(1, 48_000, 480);
         let lineup = ToneParams {
@@ -5216,6 +5294,7 @@ mod tests {
             entries_lost: true,
             outputs_disabled: 0b010,
             loudness_paused: (1 << 2) | (1 << 100),
+            pre_strip_meters: 0b10,
             slots: vec![
                 SlotCore {
                     up: true,
