@@ -679,6 +679,77 @@ fn a_replayed_core_carries_a_compressor_mix_ramp() {
     });
 }
 
+/// The resync row at a mix of 0: a donor's compressor enabled at a mix
+/// of 0, its gain following a key 30 dB over its threshold while its
+/// output is dry, and a joiner's switched off, which is dry too. The
+/// joiner replays the donor's core and takes it over; a mix of 0.5 set
+/// on both after the hand-over then mixes in the gain the donor tracked
+/// on both, every page bit for bit. A core that left the tracking out
+/// would hand over a compressor at rest that attacks from 0 dB at the
+/// raise.
+#[test]
+fn a_replayed_core_carries_a_compressor_tracking_at_a_mix_of_0() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        let comp = |enabled, mix| {
+            StripParam::Comp(CompParams {
+                enabled,
+                threshold_db: -30.0,
+                ratio: 10.0,
+                attack_ms: 10.0,
+                release_ms: 500.0,
+                knee_db: 0.0,
+                makeup_db: 12.0,
+                mix,
+            })
+        };
+        let at1 = (now_block() + 20) * B;
+        strip(&a.e, 1, at1, comp(true, 0.0));
+        strip(&b.e, 1, at1, comp(false, 0.0));
+        let settled = (at1 + u64::from(RAMP)) / B + PAGE / B;
+        wait_for(Duration::from_secs(5), "the compressor tracking", || {
+            processed(&a.e) > settled && processed(&b.e) > settled
+        });
+        let skips = (a.skipped(), b.skipped());
+        let copy = copy(&a.e);
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+        let mut replay = b.e.replay(copy).unwrap();
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        // Raised a few pages after the hand-over, on both.
+        let at2 = ((((j + 1) * B).div_ceil(PAGE) + 4) * PAGE).next_multiple_of(B) + 5 * B;
+        strip(&a.e, 2, at2, comp(true, 0.5));
+        strip(&b.e, 2, at2, comp(true, 0.5));
+        let mut pair = Pair::new(&a, &b);
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        let end = (at2 + u64::from(RAMP)) / PAGE + 16;
+        let mut pages = BTreeMap::new();
+        wait_for(Duration::from_secs(10), "comparable pages", || {
+            let seen = pair.comparable(from..end);
+            if (a.skipped(), b.skipped()) == skips {
+                pages.extend(seen);
+            }
+            processed(&a.e).min(processed(&b.e)) * B / PAGE >= end + 2
+        });
+        let raised = pages.keys().filter(|&&p| p * PAGE >= at2).count();
+        if raised < 4 {
+            return Err(format!("{raised} pages compared after the raise"));
+        }
+        let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+        assert!(
+            apart.is_empty(),
+            "pages {apart:?} differ after the hand-over"
+        );
+        Ok(())
+    });
+}
+
 /// The resync row with a limiter releasing: a joiner whose limiter was
 /// set apart replays a donor's core copied while the donor's limiter
 /// recovers over a second after its input dropped below the ceiling,
