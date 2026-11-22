@@ -13,7 +13,7 @@ use samplez::{Engine, InputState};
 
 const SECOND: Duration = Duration::from_secs(1);
 const RATE: u64 = 48_000;
-const OFF: &str = " the MXL clock: producer not on the MXL clock";
+const OFF: &str = " the MXL clock, beyond the flow's history";
 
 /// A domain whose flows keep `secs` seconds of readable history.
 fn domain(secs: u64) -> Domain {

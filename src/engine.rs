@@ -4400,7 +4400,8 @@ impl ClockGap {
     /// for `history` samples of the clock, and back at the first
     /// observation within reach again. A head unchanged for longer than
     /// `limit` is a stopped producer, which the frozen-head prune reports:
-    /// it ends the run, so a head is reported off only while it moves.
+    /// it ends the run, and a head reported off is reported back, so a
+    /// head is reported off only while it moves.
     fn observe(
         &mut self,
         head: u64,
@@ -4421,7 +4422,7 @@ impl ClockGap {
         }
         if at.saturating_sub(since) > limit {
             self.run = None;
-            return None;
+            return self.off.take().map(GapChange::Back);
         }
         let start = *self.run.get_or_insert(at);
         if self.off.is_none() && at.saturating_sub(start) >= history {
@@ -4437,7 +4438,7 @@ impl ClockGap {
 fn off_clock(gap: i128, rate: u32) -> String {
     let side = if gap > 0 { "behind" } else { "ahead of" };
     format!(
-        "head {:.1} s {side} the MXL clock: producer not on the MXL clock",
+        "head {:.1} s {side} the MXL clock, beyond the flow's history",
         gap.unsigned_abs() as f64 / f64::from(rate)
     )
 }
@@ -5742,7 +5743,9 @@ impl Supervisor {
                 *error = Some(message);
             }
             GapChange::Back(gap) => {
-                log(format_args!("input {name}: head back on the MXL clock"));
+                log(format_args!(
+                    "input {name}: head no longer off the MXL clock"
+                ));
                 if error.as_deref() == Some(off_clock(gap, rate).as_str()) {
                     *error = None;
                 }
@@ -6711,11 +6714,11 @@ mod tests {
         }
         assert_eq!(
             off_clock(37 * 48_000 + 4_800, 48_000),
-            "head 37.1 s behind the MXL clock: producer not on the MXL clock"
+            "head 37.1 s behind the MXL clock, beyond the flow's history"
         );
         assert_eq!(
             off_clock(-5 * 48_000, 48_000),
-            "head 5.0 s ahead of the MXL clock: producer not on the MXL clock"
+            "head 5.0 s ahead of the MXL clock, beyond the flow's history"
         );
     }
 
@@ -6760,6 +6763,24 @@ mod tests {
         // Moving again, 37 s behind.
         let (changes, _) = observe(&mut gap, T0 + 20 * 48_000, 5, 48_000, |_| 37 * 48_000);
         assert_eq!(changes, [(T0 + 21 * 48_000, GapChange::Off(37 * 48_000))]);
+    }
+
+    /// A head reported off whose producer then stops is reported back
+    /// once the head has stood still past the frozen-head limit: the
+    /// input reads as frozen, not as off the clock.
+    #[test]
+    fn a_head_off_the_clock_that_stops_is_reported_back() {
+        const T0: u64 = 1 << 40;
+        let mut gap = ClockGap::default();
+        let (changes, at) = observe(&mut gap, T0, 3, 48_000, |_| 37 * 48_000);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        // Stopped at `at`, still 37 s behind and more.
+        let head = at - 37 * 48_000;
+        let (changes, _) = observe(&mut gap, at, 2, 48_000, |t| (t - head) as i64);
+        let back: Vec<GapChange> = changes.iter().map(|c| c.1).collect();
+        assert_eq!(back.len(), 1, "{changes:?}");
+        assert!(matches!(back[0], GapChange::Back(_)), "{changes:?}");
+        assert_eq!(gap.off, None);
     }
 
     /// A head reported off is reported back at the first observation
