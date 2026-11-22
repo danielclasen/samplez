@@ -11,7 +11,8 @@
 //! smoothed gain snaps to its target within 1e-4 dB, so a unit at rest
 //! applies exactly its settled gain. Switching a unit on or off, and a
 //! change of the compressor's mix, ramps its effect over the ramp
-//! length.
+//! length. A compressor switched on at a mix of 0 passes its input
+//! unchanged while its gain follows the key, as at any other mix.
 //!
 //! With an attack time constant of at least [`PER_SAMPLE_BELOW`]
 //! intervals, the gain computer and the smoother run once every
@@ -359,9 +360,11 @@ pub struct CompParams {
     pub makeup_db: f32,
     /// The share of the compressed signal in the output, within
     /// [`COMP_MIX`](crate::strip::COMP_MIX), the rest the input
-    /// unchanged and sample-aligned with it: parallel compression. 1,
-    /// the compressed signal alone, when absent from an encoding, and
-    /// left out of one at 1.
+    /// unchanged and sample-aligned with it: parallel compression. At 0
+    /// an enabled compressor passes its input unchanged and its gain
+    /// keeps following the key, so a mix raised from 0 starts from the
+    /// gain a compressor at another mix has. 1, the compressed signal
+    /// alone, when absent from an encoding, and left out of one at 1.
     #[serde(default = "full_mix", skip_serializing_if = "is_full_mix")]
     pub mix: f32,
 }
@@ -372,6 +375,10 @@ fn full_mix() -> f32 {
 
 fn is_full_mix(mix: &f32) -> bool {
     *mix == 1.0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -558,6 +565,12 @@ pub(crate) struct Comp {
     /// Smoothed gain, dB, the last one computed.
     y: f32,
     interval: Interval,
+    /// Switched on at a mix of 0: the switch ramps to 0 as when off, and
+    /// the gain computer and smoother run all the same. Left out of an
+    /// encoding while false, so a compressor at another mix or off
+    /// encodes as one before the mix.
+    #[serde(default, skip_serializing_if = "is_false")]
+    tracking: bool,
 }
 
 impl Comp {
@@ -573,11 +586,13 @@ impl Comp {
             makeup: Ramp::new(1.0),
             y: 0.0,
             interval: Interval::REST,
+            tracking: false,
         }
     }
 
     pub(crate) fn set(&mut self, p: &CompParams, ramp: u32) {
         self.wet.set(p.enabled, p.mix, ramp);
+        self.tracking = p.enabled && p.mix == 0.0;
         self.threshold_db = p.threshold_db;
         self.slope = 1.0 / p.ratio - 1.0;
         self.knee_db = p.knee_db;
@@ -622,8 +637,18 @@ impl Comp {
         if *y == 0.0 { 1.0 } else { db_to_gain_f32(*y) }
     }
 
+    /// Off, the switch at rest at 0: the input passes and the gain rests
+    /// at 0 dB. Switched on at a mix of 0 the switch rests at 0 too, but
+    /// the gain follows the key.
+    fn is_bypassed(&self) -> bool {
+        self.wet.is_off() && !self.tracking
+    }
+
+    /// Processes `frames` samples of `legs` legs in place. With the
+    /// switch at exactly 0 the applied gain `1 + 0 (gain - 1)` is exactly
+    /// 1 for any finite gain, and no sample is multiplied.
     pub(crate) fn process(&mut self, buf: &mut [f32], legs: usize, frames: usize) {
-        if self.wet.is_off() {
+        if self.is_bypassed() {
             self.y = 0.0;
             self.interval.rest(frames);
             self.makeup.advance(frames);
@@ -690,8 +715,9 @@ impl Comp {
     /// parameter ranges holds: threshold and knee within theirs, a slope
     /// of a ratio within it, the knee's start gain within `(0, 1]`, a
     /// makeup ramp within its range, a smoothed gain within
-    /// [`COMP_GAIN_MIN_DB`] and 0 dB, valid poles and interval, and a
-    /// switch ramping within the mix's range.
+    /// [`COMP_GAIN_MIN_DB`] and 0 dB, valid poles and interval, a
+    /// switch ramping within the mix's range, and one ramping to 0 when
+    /// tracking at a mix of 0.
     pub(crate) fn is_valid(&self) -> bool {
         use crate::strip::{COMP_KNEE_DB, COMP_RATIO, COMP_THRESHOLD_DB, MAKEUP_DB};
         let slope = 1.0 / *COMP_RATIO.end() - 1.0..=0.0;
@@ -707,11 +733,12 @@ impl Comp {
             && self.makeup.is_within(makeup)
             && (COMP_GAIN_MIN_DB..=0.0).contains(&self.y)
             && self.interval.is_valid()
+            && (!self.tracking || self.wet.0.target == 0.0)
     }
 
     /// Whether the compressor passes every input unchanged until it is
-    /// set again: off, or a ratio of 1 with the gain at 0 dB and the
-    /// makeup at rest at 0 dB.
+    /// set again: off or at a mix of 0 with the switch at rest, or a
+    /// ratio of 1 with the gain at 0 dB and the makeup at rest at 0 dB.
     pub(crate) fn is_identity(&self) -> bool {
         self.wet.is_off()
             || (self.slope == 0.0
@@ -1382,6 +1409,7 @@ mod tests {
         half.process(&mut burst, 1, 24);
         assert!(half.is_valid(), "a compressor ramping to a mix of 0.5");
         comp_invalid("mix above 1", &|u| u.wet.0.target = 1.5);
+        comp_invalid("tracking at a mix above 0", &|u| u.tracking = true);
         comp_invalid("mix below 0", &|u| u.wet.0.c0 = -0.25);
         comp_invalid("NaN gain", &|u| u.y = f32::NAN);
         comp_invalid("gain above 0 dB", &|u| u.y = 1.0);
@@ -1613,13 +1641,26 @@ mod tests {
     }
 
     /// A mix of 0 passes every bit of the input, switched on at it or
-    /// ramped to it.
+    /// ramped to it, while the gain keeps following the key: on these
+    /// programmes, more than 6 dB of reduction on their loud parts.
     #[test]
     fn a_mix_of_0_passes_the_input() {
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         for (x, legs, b, p) in mix_cases() {
             let dry = run_comp(&CompParams { mix: 0.0, ..p }, &[], 480, &x, legs, b);
             assert_eq!(bits(&dry), bits(&x), "{p:?} at mix 0, {legs} legs");
+            if legs == 1 {
+                let mut c = Comp::new();
+                c.set(&CompParams { mix: 0.0, ..p }, 480);
+                let mut y = x.clone();
+                let mut deepest = 0.0f32;
+                for chunk in y.chunks_mut(b) {
+                    c.process(chunk, 1, chunk.len());
+                    deepest = deepest.min(c.y);
+                }
+                assert_eq!(bits(&y), bits(&x));
+                assert!(deepest < -6.0, "{p:?} at mix 0: deepest gain {deepest} dB");
+            }
             // Ramped from 1 to 0 after 0.1 s: the input from the ramp's
             // end on.
             let frames = x.len() / legs;
@@ -1668,6 +1709,59 @@ mod tests {
             assert!(encoded.contains(r#""mix":"#), "{encoded}");
             let back: CompParams = serde_json::from_str(&encoded).unwrap();
             assert_eq!(back.mix.to_bits(), mix.to_bits());
+        }
+    }
+
+    /// The gain of a compressor switched on at a mix of 0 follows the key
+    /// throughout, so raising the mix starts from the gain it reached:
+    /// under a level 20 dB over the threshold, a mix raised from 0 to 0.5
+    /// computes from the change on the bits of a compressor that ran at
+    /// full mix, was dropped to 0 at once and raised the same way. One
+    /// switched on only at the change, its gain starting at 0 dB, computes
+    /// other bits, and with a 10 ms attack plays louder while it attacks
+    /// into reduction. Up to the change the output is the input's bits.
+    #[test]
+    fn a_mix_raised_from_0_starts_from_the_gain_followed_at_0() {
+        let len = 480u32;
+        let x = vec![db_to_gain(-10.0); 48_000];
+        let at = 24_000 + 203;
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for attack in [0.1, 1.0, 10.0] {
+            let p = heavy(attack, 0.0, 0.0);
+            let half = CompParams { mix: 0.5, ..p };
+            let raised = run_comp(&p, &[(at, half)], len, &x, 1, 48);
+            assert_eq!(
+                bits(&raised[..at]),
+                bits(&x[..at]),
+                "attack {attack}: dry at 0"
+            );
+            let mut c = Comp::new();
+            c.set(&CompParams { mix: 1.0, ..p }, len);
+            let mut reference = x.clone();
+            let (head, tail) = reference.split_at_mut(at);
+            for b in head.chunks_mut(48) {
+                c.process(b, 1, b.len());
+            }
+            c.set(&p, 0);
+            c.set(&half, len);
+            for b in tail.chunks_mut(48) {
+                c.process(b, 1, b.len());
+            }
+            assert_eq!(
+                bits(&raised[at..]),
+                bits(&reference[at..]),
+                "attack {attack}"
+            );
+            let off = CompParams {
+                enabled: false,
+                ..p
+            };
+            let cold = run_comp(&off, &[(at, half)], len, &x, 1, 48);
+            assert_ne!(bits(&cold[at..]), bits(&raised[at..]), "attack {attack}");
+            if attack == 10.0 {
+                let louder = (at..at + len as usize).any(|n| cold[n] > raised[n] * 1.01);
+                assert!(louder, "switching on at the change starts no attack");
+            }
         }
     }
 

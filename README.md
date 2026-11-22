@@ -561,8 +561,14 @@ its makeup. It is applied as one gain per sample, `1 + mix (g - 1)`,
 compressor alone applies at a mix of 1, so the two shares stay
 sample-aligned, cost nothing over the compressor alone and add no
 latency. A mix change ramps over the strip's ramp, as switching the
-compressor does; at 0 the input passes unchanged, and at 1, the
-default, the output is the compressor's alone.
+compressor does. At 0 an enabled compressor passes its input's bits
+while its gain keeps following the key, so a mix raised from 0 starts
+from that gain rather than attacking from 0 dB; only a compressor
+switched off rests its gain. At 1, the default, the output is the
+compressor's alone. The mix and its ramp are strip state: a core copy
+carries them, so a replica that replays or resyncs computes its donor's
+samples mid ramp, and a rebuild from product state has the strip's
+documented exceptions (Starting a replica) and no others.
 
 An input configured with `preStripRows: true` also feeds the matrix
 ahead of its strip: its channels are added as matrix rows after every
