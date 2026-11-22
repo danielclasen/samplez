@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.25.0](https://github.com/danielclasen/samplez/compare/v0.24.0...v0.25.0) (2026-11-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* **dsp:** CompParams has a public mix field, COMP_OFF carries a full mix, and samplez_replica::PROTOCOL is 7.
+
+### Features
+
+* **dsp:** add a parallel mix to the compressor ([498f993](https://github.com/danielclasen/samplez/commit/498f99332616d96a1a1257aa79d2171239a74b2a))
+
 ## [0.24.0](https://github.com/danielclasen/samplez/compare/v0.23.1...v0.24.0) (2026-11-22)
 
 
