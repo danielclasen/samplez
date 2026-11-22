@@ -124,8 +124,8 @@ pub struct InputStatus {
     pub counters: InputCounters,
     /// The input after its strip, read or silenced.
     pub meters: InputMeters,
-    /// The input before its strip, where its config sets
-    /// `preStripMeter`; none otherwise.
+    /// The input after its delay and before its strip, where its config
+    /// sets `preStripMeter`; none otherwise.
     pub pre_strip_meters: Option<InputMeters>,
 }
 
@@ -937,7 +937,7 @@ fn check_mask(config: &Config, input: usize, output: usize, mask: u8) -> Result<
     if input >= config.rows() || output >= config.columns() {
         return Err(format!("no matrix coefficient {input} -> {output}"));
     }
-    // A pre-strip row is the input as read: it takes no duck.
+    // A pre-strip row is the input before its strip: it takes no duck.
     if mask != 0 && input >= config.input_channels() {
         return Err(format!(
             "duck mask on pre-strip row {input}, which takes none"
@@ -9145,6 +9145,262 @@ mod tests {
             if let Some(s) = skipped.get(w) {
                 assert_eq!(s.0, *pre, "window {w}");
             }
+        }
+    }
+
+    /// [`tone_config`] at a ramp of 0, its input with a delay line of up
+    /// to 9600 samples.
+    fn delayed_tone_config() -> Config {
+        let mut config = tone_config();
+        config.ramp_samples = 0;
+        config.inputs[0].max_delay_samples = 9600;
+        config
+    }
+
+    /// The default tone's sample at index `n`, silence below 0.
+    fn default_tone(n: i64) -> f32 {
+        let p = ToneParams::DEFAULT;
+        u64::try_from(n).map_or(0.0, |n| {
+            samplez_dsp::tone::level_gain(p.level_db)
+                * samplez_dsp::tone::sine(n, p.frequency_hz, 48_000)
+        })
+    }
+
+    /// A loop on `config` metering as the engine's does, the matrix
+    /// coefficients `ones` set to 1, run with `changes` over blocks
+    /// `0..blocks`: the loop, each block's output legs, and the peaks of
+    /// the input's pre-strip meter per 100 ms window, none without
+    /// `preStripMeter`.
+    #[allow(clippy::type_complexity)]
+    fn delayed_tone(
+        config: &Config,
+        ones: &[(usize, usize)],
+        changes: Vec<(u64, Change)>,
+        blocks: u64,
+    ) -> (
+        Rt,
+        Vec<[Vec<f32>; 2]>,
+        std::collections::BTreeMap<u64, Vec<f32>>,
+    ) {
+        let api = samplez_mxl::load(&config.libmxl).unwrap();
+        let (hashes, _) = rtrb::RingBuffer::new(1);
+        let (_, control) = rtrb::RingBuffer::new(1);
+        let mut rt = replay_rt(config, &api, Vec::new(), hashes, control);
+        rt.replay = false;
+        (rt.buses, rt.taps, rt.pre_taps) = new_meters(config);
+        let (meters, mut rx) = rtrb::RingBuffer::new(1 << 10);
+        rt.meters = meters;
+        let (ducks, _ducks) = rtrb::RingBuffer::new(1 << 10);
+        rt.duck_meters = ducks;
+        let (ret, _back) = rtrb::RingBuffer::new(64);
+        rt.ret = ret;
+        for &(row, column) in ones {
+            assert!(rt.mix.matrix.set(row, column, 1.0, 0));
+        }
+        for (id, (at_index, change)) in changes.into_iter().enumerate() {
+            assert!(rt.mix.push(RtEntry {
+                id: id as u64 + 1,
+                at_index,
+                change,
+            }));
+        }
+        let b = config.block_size as usize;
+        // The outputs' meters, the input's, then its pre-strip meter.
+        let pre = config.outputs.len() as u32 + 1;
+        let mut l = OutputLoudness::new(config.inputs[0].loudness_weights().unwrap());
+        let (mut legs, mut windows) = (Vec::new(), std::collections::BTreeMap::new());
+        for k in 0..blocks {
+            rt.process(k, u64::MAX);
+            legs.push([0, 1].map(|c| rt.outbuf.channel(c)[..b].to_vec()));
+            while let Ok(r) = rx.pop() {
+                if r.meter == pre {
+                    l.record(&r);
+                }
+            }
+            if let Some(w) = l.meters.window {
+                windows.insert(w, l.meters.peak.clone());
+            }
+        }
+        assert_eq!(rt.counters.strip_refused.load(Relaxed), 0);
+        (rt, legs, windows)
+    }
+
+    /// An input with `preStripRows`, trimmed by 20 dB in its strip, delayed
+    /// by 1000 samples from index D: an output leg fed only by the
+    /// pre-strip row of its second channel is the tone untrimmed and
+    /// delayed, bit for bit: the tone before D, silent for the 999 samples
+    /// the delay reaches back over, then the tone 1000 samples late. Fails
+    /// with the delay run after the copy into the pre-strip rows in
+    /// `Slot::finish`, the row then undelayed.
+    #[test]
+    fn a_pre_strip_row_carries_the_input_as_late_as_its_delay() {
+        let mut config = delayed_tone_config();
+        config.inputs[0].pre_strip_rows = true;
+        config.matrix = vec![vec![0.0; 2]; 4];
+        let b = u64::from(config.block_size);
+        let (n, d) = (1000, 100 * b);
+        let trim = StripParam::Trim { db: -20.0 };
+        let changes = vec![
+            (
+                0,
+                Change::Strip {
+                    slot: 0,
+                    param: trim,
+                },
+            ),
+            (
+                d,
+                Change::Delay {
+                    slot: 0,
+                    samples: n as u32,
+                },
+            ),
+        ];
+        let blocks = (d + n) / b + 100;
+        let (_, legs, _) = delayed_tone(&config, &[(0, 0), (3, 1)], changes, blocks);
+        for (k, [_, leg]) in legs.iter().enumerate() {
+            for (j, &y) in leg.iter().enumerate() {
+                let i = k as u64 * b + j as u64;
+                let want = match i {
+                    _ if i < d => default_tone(i as i64),
+                    _ if i < d + n - 1 => 0.0,
+                    _ => default_tone(i as i64 - n as i64),
+                };
+                assert_eq!(y.to_bits(), want.to_bits(), "at {i}");
+            }
+        }
+    }
+
+    /// An input metered before its strip with `preStripMeter`, delayed by
+    /// 7200 samples from index 0, its tone stepping from -40 to -6 dB at
+    /// the start of window 10: the pre-strip meter reads the step 7200
+    /// samples later, in window 11, and window 10 at -40 dB. Fails with
+    /// the delay run after the copy into `prebuf` in `Slot::finish`, the
+    /// meter then reading the step in window 10.
+    #[test]
+    fn a_pre_strip_meter_reads_the_input_as_late_as_its_delay() {
+        let mut config = delayed_tone_config();
+        config.inputs[0].pre_strip_meter = true;
+        let (n, step): (u32, u64) = (7200, 10 * 4800);
+        let level = |level_db| ToneParams {
+            level_db,
+            ..ToneParams::DEFAULT
+        };
+        let tone = |params| Change::Tone { slot: 0, params };
+        let changes = vec![
+            (
+                0,
+                Change::Delay {
+                    slot: 0,
+                    samples: n,
+                },
+            ),
+            (0, tone(level(-40.0))),
+            (step, tone(level(-6.0))),
+        ];
+        let blocks = 15 * 4800 / u64::from(config.block_size);
+        let (_, _, windows) = delayed_tone(&config, &[(0, 0), (1, 1)], changes, blocks);
+        // The largest magnitude of the tone delayed by `n` over window `w`.
+        let peak = |w: u64| {
+            let p = ToneParams::DEFAULT;
+            (w * 4800 - u64::from(n)..(w + 1) * 4800 - u64::from(n))
+                .map(|i| {
+                    let db = if i < step { -40.0 } else { -6.0 };
+                    let x = samplez_dsp::tone::sine(i, p.frequency_hz, 48_000);
+                    (samplez_dsp::tone::level_gain(db) * x).abs()
+                })
+                .fold(0.0f32, f32::max)
+        };
+        assert!(peak(11) > 10.0 * peak(10));
+        for w in 2..14 {
+            let (peaks, want) = (&windows[&w], peak(w));
+            assert!(
+                peaks.iter().all(|p| (p - want).abs() < 1e-6),
+                "window {w}: {peaks:?}, {want}"
+            );
+        }
+    }
+
+    /// An input delayed by 1000 samples from index 0 and trimmed by 20 dB
+    /// in its strip from index X: the trim applies at X to the delayed
+    /// tone there, the input's sample at X - 1000, as every tap of the
+    /// input is as late as its delay. Before X each leg is the tone 1000
+    /// samples late, bit for bit; from X on, 20 dB down. Fails with the
+    /// delay run after the strip in `Slot::finish`, the legs then stepping
+    /// at X + 1000.
+    #[test]
+    fn a_strip_change_applies_to_the_delayed_input_at_its_index() {
+        let config = delayed_tone_config();
+        let b = u64::from(config.block_size);
+        let (n, x) = (1000, 200 * b);
+        let trim = StripParam::Trim { db: -20.0 };
+        let changes = vec![
+            (
+                0,
+                Change::Delay {
+                    slot: 0,
+                    samples: n as u32,
+                },
+            ),
+            (
+                x,
+                Change::Strip {
+                    slot: 0,
+                    param: trim,
+                },
+            ),
+        ];
+        let blocks = (x + n) / b + 100;
+        let (_, legs, _) = delayed_tone(&config, &[(0, 0), (1, 1)], changes, blocks);
+        for (k, block) in legs.iter().enumerate() {
+            for (c, leg) in block.iter().enumerate() {
+                for (j, &y) in leg.iter().enumerate() {
+                    let i = k as u64 * b + j as u64;
+                    let want = default_tone(i as i64 - n as i64);
+                    if i < x {
+                        assert_eq!(y.to_bits(), want.to_bits(), "leg {c} at {i}");
+                    } else {
+                        assert!((y - 0.1 * want).abs() < 1e-6, "leg {c} at {i}: {y}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// An input with a delay line and neither `preStripMeter` nor
+    /// `preStripRows` has no pre-strip meter, rows or copy: the matrix has
+    /// the input's rows alone, and its slot copies nothing into `prebuf`,
+    /// which stays silent through a delay and a trim. Fails with the copy
+    /// into `prebuf` made whatever [`Slot::pre_strip`] says.
+    #[test]
+    fn without_the_opt_ins_an_input_has_no_pre_strip_copy() {
+        let config = delayed_tone_config();
+        assert_eq!(config.rows(), config.input_channels());
+        let changes = vec![
+            (
+                0,
+                Change::Delay {
+                    slot: 0,
+                    samples: 1000,
+                },
+            ),
+            (
+                4800,
+                Change::Strip {
+                    slot: 0,
+                    param: StripParam::Trim { db: -20.0 },
+                },
+            ),
+        ];
+        let (rt, legs, windows) = delayed_tone(&config, &[(0, 0), (1, 1)], changes, 300);
+        assert!(!rt.slots[0].pre_strip && rt.slots[0].pre_row.is_none());
+        assert!(rt.pre_taps.is_empty() && windows.is_empty());
+        assert!(legs.last().unwrap()[0].iter().any(|&y| y != 0.0));
+        for c in 0..rt.prebuf.channels() {
+            assert!(
+                rt.prebuf.channel(c).iter().all(|&y| y == 0.0),
+                "channel {c}"
+            );
         }
     }
 

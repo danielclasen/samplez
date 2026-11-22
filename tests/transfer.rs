@@ -698,12 +698,13 @@ fn a_replayed_core_carries_the_limiter_mid_release() {
     });
 }
 
-/// The resync row with a delay line: a joiner whose input was trimmed
-/// apart until shortly before the copy holds another history in its
-/// delay line, which its output plays for the delay after the trims met.
-/// The core copy carries the donor's history and the hand-over writes
-/// the replay's into the joiner's other rings, so from the hand-over on
-/// the joiner computes the donor's pages bit for bit; keeping its own
+/// The resync row with a delay line: a joiner whose input was taken
+/// down apart until shortly before the copy holds another history in its
+/// delay line, which runs ahead of the strip: silence and a fade-in,
+/// which its output plays for the delay after the input came up. The
+/// core copy carries the donor's history and the hand-over writes the
+/// replay's into the joiner's other rings, so from the hand-over on the
+/// joiner computes the donor's pages bit for bit; keeping its own
 /// history, it would differ for the rest of the delay.
 #[test]
 fn a_replayed_core_carries_the_delay_history() {
@@ -716,8 +717,8 @@ fn a_replayed_core_carries_the_delay_history() {
             hashed_of(&domain, &[(&src, 2)], delayed),
             hashed_of(&domain, &[(&src, 2)], delayed),
         );
-        // Entry 1 delays both by 2 s; entry 2 trims the joiner apart,
-        // entry 3 brings it back.
+        // Entry 1 delays both by 2 s; entry 2 takes the joiner's input
+        // down, entry 3 brings it up on both.
         let at1 = (now_block() + 20) * B;
         const D: u64 = 96_000;
         let delay = Entry::Delay {
@@ -729,12 +730,15 @@ fn a_replayed_core_carries_the_delay_history() {
             e.commit(1);
         }
         strip(&a.e, 2, at1, StripParam::Trim { db: 0.0 });
-        strip(&b.e, 2, at1, StripParam::Trim { db: -6.0 });
-        // The trims meet a second after the trimmed history begins to play:
-        // the joiner's output differs from at1 + D to at3 + D.
-        let at3 = at1 + D + 48_000;
+        b.e.append(2, at1, Entry::InputDown { slot: 0 }).unwrap();
+        b.e.commit(2);
+        // Up a tenth of a second before the history played from at1 is
+        // heard: the joiner's output differs from at1 + D to at3 + D and
+        // the fade-in after it.
+        let at3 = at1 + D - 4_800;
         for e in [&a.e, &b.e] {
-            strip(e, 3, at3, StripParam::Trim { db: 0.0 });
+            e.append(3, at3, Entry::InputUp { slot: 0 }).unwrap();
+            e.commit(3);
         }
         let heard = at1 + D + 4_800;
         wait_for(Duration::from_secs(10), "the trimmed history heard", || {

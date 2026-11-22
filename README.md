@@ -226,10 +226,10 @@ the same cost per channel, and without it none.
 With `preStripMeter` set in an input's config, its status also carries
 `pre_strip_meters`, the same readings of the input before its strip:
 the block as read or generated, its `flowChannels` selected, after the
-fade-in, a re-route's crossfade and silencing, before the trim and the
-rest of the strip and before the delay. It costs a copy of the block
-and a second input meter on the RT thread; without it the input has
-none and nothing is copied.
+fade-in, a re-route's crossfade, silencing and the input's delay line
+(Input delay), before the trim and the rest of the strip. It costs a
+copy of the block and a second input meter on the RT thread; without it
+the input has none and nothing is copied.
 RMS is referenced to a sine as in AES17: the root mean square times the
 square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
 
@@ -528,12 +528,12 @@ applies it at.
 Each input of 1 to 8 channels has a strip: trim, per-leg trim and
 polarity, high-pass, a four-band equaliser, gate and compressor
 (`samplez_dsp::strip`). It runs on every block computed, after the
-input's copy, fade-in or crossfade and before the matrix, and passes
-its input unchanged until an entry sets it. Its ramps advance over
-skipped samples, as the matrix's do; its filter and envelope state
-follows the samples it processed, so after a skip or a silenced read it
-differs from that of an engine that computed them, until a resync
-copies a donor's. A filter state above 1e30 or not finite, which only a
+input's copy, fade-in or crossfade and its delay line, and before the
+matrix, and passes its input unchanged until an entry sets it. Its
+ramps advance over skipped samples, as the matrix's do; its filter and
+envelope state follows the samples it processed, so after a skip or a
+silenced read it differs from that of an engine that computed them,
+until a resync copies a donor's. A filter state above 1e30 or not finite, which only a
 non-finite or overflowing input leaves, is set to zero after each
 block, so the strip recovers at the next one. An entry for
 an input wider than 8 channels, or one its strip refuses, is refused
@@ -547,9 +547,9 @@ input's rows, in configuration order, so the configured `matrix` and
 `Gain` entries address them as rows `input_channels()` on, and an
 output whose column takes them carries the input untrimmed. They carry
 the block as read or generated, its `flowChannels` selected, after the
-fade-in, a re-route's crossfade and silencing, before the trim and the
-rest of the strip and before the delay: they are undelayed whatever
-the input's `Delay`. They mix, fade and hash as every row does and
+fade-in, a re-route's crossfade, silencing and the input's delay line,
+before the trim and the rest of the strip: they are as late as the
+input's other rows. They mix, fade and hash as every row does and
 count against the matrix's coefficient limits, but take no duck: a
 duck mask other than 0 on one is refused, and a depth applies to the
 input's own rows only. Without the setting the input has none and
@@ -623,11 +623,15 @@ replica reads a donor's answer of up to
 `samplez_replica::peer::max_response` of it, the limit it gives
 `samplez_replica::net::Pool::new`. A `Delay` entry (`Engine::set_delay`)
 sets the input's delay in samples, at most its `maxDelaySamples`; a
-delay of 0 any input takes. The line runs after the strip, on every
-block computed, read or silenced, so the matrix, the duck keys and the
-input's meter see the input late. Outside a change the output at index
-`n` is the strip's output at `n - d`, bit for bit; a change crossfades
-from the old tap to the new over the ramp length from its index, and
+delay of 0 any input takes. The line runs first, on every block
+computed, read or silenced, after the copy, fade-in or crossfade and
+ahead of the strip, so its rings hold the input before the strip and
+every tap of the input sees it late: the strip, the pre-strip meter and
+rows, the matrix, the duck keys and the input's meter. A strip entry at
+index `n` applies to the delayed sample there, the input's sample at
+`n - d`. Outside a change the line's output at index `n` is its input
+at `n - d`, bit for bit; a change crossfades from the old tap to the
+new over the ramp length from its index, and
 one during a crossfade waits until it ends, the latest counting. A
 raised delay reads silence for the samples it reaches back over, which
 the line played already, rather than playing them again: the line
@@ -1379,11 +1383,13 @@ fixed scene, log and input source, its columns' samples apart from
 every value its meters send, its outputs' page hashes, and the encoded
 core copy of its state, and from scenes of their own a tone generator's,
 output strips' and output delay lines' samples and core copies. Their
-hashes sit in tables
-with a row per
-`COMPUTE_VERSION`: a change that moves any of them fails until the
-version is bumped and a row added. The pages' entry fingerprints are a
-single pinned value: replicas compare page hashes and fingerprints, so
+hashes sit in tables with a row per `COMPUTE_VERSION`: a change that
+moves any of them fails until the version is bumped and a row added.
+At `COMPUTE_VERSION` 3 an input's delay line runs before its strip and
+its pre-strip meter and rows (Input delay); at 2 it ran after the strip,
+so around a strip or `Delay` entry the two compute other samples and
+their delay rings hold other history. The pages' entry fingerprints are
+a single pinned value: replicas compare page hashes and fingerprints, so
 a change to how either is computed bumps `PROTOCOL`, also where the
 samples stay the same, and the fingerprint value is replaced with that
 bump. `PROTOCOL` itself is a pinned value too

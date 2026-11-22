@@ -28,6 +28,17 @@ struct Replica {
 /// gain 1 to a two-channel output, whose page hashes go to a channel of
 /// `room`.
 fn start(domain: &Domain, src: &str, voters: usize, room: usize) -> Replica {
+    start_delayed(domain, src, voters, room, 0)
+}
+
+/// [`start`] with a delay line of up to `max_delay` samples on the input.
+fn start_delayed(
+    domain: &Domain,
+    src: &str,
+    voters: usize,
+    room: usize,
+    max_delay: u32,
+) -> Replica {
     let out = new_id();
     let mut config = config(
         &domain.0,
@@ -37,6 +48,7 @@ fn start(domain: &Domain, src: &str, voters: usize, room: usize) -> Replica {
         MARGIN,
     );
     config.ramp_samples = RAMP;
+    config.inputs[0].max_delay_samples = max_delay;
     let (report_tx, _reports) = std::sync::mpsc::sync_channel(64);
     let (hash_tx, hashes) = std::sync::mpsc::sync_channel(room);
     let (verdict_tx, verdicts) = std::sync::mpsc::sync_channel(1 << 16);
@@ -329,6 +341,114 @@ fn two_engines_with_strips_hash_the_pages_both_computed_alike() {
                     Some(before),
                     "page {p} unchanged by the strip"
                 );
+            }
+        }
+        Ok(())
+    });
+}
+
+/// Three engines on the same input and the same log hash every page all
+/// three computed alike with the input delayed and its strip changed
+/// mid-run, the delay changed again inside the trim's ramp: each runs
+/// the delay line ahead of the strip on the same history and applies
+/// both at their indices. The trim applies at its index to the delayed
+/// input there, so every page after the one holding it differs from the
+/// delayed input's. Pages are compared up to the first skip or silenced
+/// block after the delay, which leaves a strip's state and a line's
+/// history without those samples; a run with fewer than six pages
+/// compared after the trim runs again. Fails with the delay run after
+/// the strip in `Slot::finish`, the trim then reaching the output only
+/// 3001 samples later and the pages before that unchanged.
+#[test]
+fn three_engines_with_a_delay_and_a_strip_change_hash_the_pages_alike() {
+    use samplez_dsp::strip::StripParam;
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let rs = [0; 3].map(|_| start_delayed(&domain, &src, 3, 1 << 16, 4800));
+        let k = rs.iter().map(|r| processed(&r.e)).max().unwrap();
+        let at = (k + u64::from(RAMP) / B + 100) * B;
+        // After the delay's crossfade, then the second delay a few pages
+        // into the trim's ramp.
+        let at2 = (((at + u64::from(RAMP)) / PAGE + 4) * PAGE).next_multiple_of(B) + 5 * B;
+        let at3 = (at2 + 3 * PAGE).next_multiple_of(B);
+        let trim = StripParam::Trim { db: -6.0 };
+        let entries = [
+            (
+                at,
+                Entry::Delay {
+                    slot: 0,
+                    samples: 3001,
+                },
+            ),
+            (
+                at2,
+                Entry::Strip {
+                    slot: 0,
+                    param: trim,
+                },
+            ),
+            (
+                at3,
+                Entry::Delay {
+                    slot: 0,
+                    samples: 1200,
+                },
+            ),
+        ];
+        for r in &rs {
+            for (id, (at, entry)) in entries.iter().enumerate() {
+                r.e.append(id as u64 + 1, *at, entry.clone()).unwrap();
+            }
+            r.e.commit(entries.len() as u64);
+        }
+        wait_all(&rs.each_ref(), (at3 + u64::from(RAMP) + 12 * PAGE) / B);
+        let mut cut = u64::MAX;
+        let mut disturbed = Vec::new();
+        for r in &rs {
+            let vs: Vec<BlockVerdict> = r.verdicts.try_iter().collect();
+            for w in vs.windows(2) {
+                if w[1].k > w[0].k + 1 && w[1].k * B > at {
+                    cut = cut.min(((w[0].k + 1) * B).max(at));
+                }
+            }
+            for v in vs.iter().filter(|v| v.silenced != 0) {
+                let (from, to) = (v.k * B, (v.k + 1) * B + u64::from(RAMP));
+                disturbed.push((from / PAGE, to.div_ceil(PAGE)));
+                if to > at {
+                    cut = cut.min(from.max(at));
+                }
+            }
+        }
+        let pages = rs.each_ref().map(Replica::pages);
+        let pairs: Vec<_> = (pages[0].iter())
+            .filter(|(p, _)| (*p + 1) * PAGE <= cut)
+            .filter(|(p, _)| !disturbed.iter().any(|d| (d.0..d.1).contains(*p)))
+            .filter_map(|(p, h)| Some([*h, *pages[1].get(p)?, *pages[2].get(p)?]))
+            .collect();
+        for [a, b, c] in &pairs {
+            let page = |h: &PageHash| (h.hash, h.fingerprint);
+            assert_eq!(page(a), page(b), "page {}", a.page);
+            assert_eq!(page(a), page(c), "page {}", a.page);
+        }
+        let trimmed: Vec<u64> = (pairs.iter().map(|h| h[0].page))
+            .filter(|&p| p > at2 / PAGE)
+            .collect();
+        if trimmed.len() < 6 {
+            return Err(format!("{} pages after the trim compared", trimmed.len()));
+        }
+        // The delayed pilot repeats every three pages: the trim changes
+        // them, so no compared page after it hashes as the page a multiple
+        // of three before it, before the trim and after the first delay's
+        // crossfade.
+        let hash = |p: u64| pages[0].get(&p).map(|h| h.hash);
+        for p in trimmed {
+            let before = p - 3 * ((p - at2 / PAGE) / 3 + 1);
+            if before * PAGE > at + u64::from(RAMP)
+                && let Some(h) = hash(before)
+            {
+                assert_ne!(hash(p), Some(h), "page {p} unchanged by the trim");
             }
         }
         Ok(())

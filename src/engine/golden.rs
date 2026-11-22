@@ -100,6 +100,12 @@ const GOLDEN: &[(u32, u64, u64, u64)] = &[
         0xb8de_6030_57c2_013e,
         0x791b_ba52_022d_4223,
     ),
+    (
+        3,
+        0xf073_4915_5afa_ab24,
+        0x9dbc_a106_c4c3_376e,
+        0x7858_9d2e_5475_9eb9,
+    ),
 ];
 
 /// The pages' entry fingerprints: a function of the log's ids and indices
@@ -113,7 +119,11 @@ const FINGERPRINTS: u64 = 0xfd09_ad6f_7cbc_3be9;
 /// is taken only at an equal `COMPUTE_VERSION`, so a change to what it
 /// holds or how it encodes needs a bump here, or replicas of the new
 /// release fail to decode the running set's copies mid-roll.
-const CORES: &[(u32, u64)] = &[(1, 0xcd98_6111_aa8d_c6be), (2, 0xd976_b4b6_f4c1_ba1f)];
+const CORES: &[(u32, u64)] = &[
+    (1, 0xcd98_6111_aa8d_c6be),
+    (2, 0xd976_b4b6_f4c1_ba1f),
+    (3, 0xab5d_d68f_3c19_ebc0),
+];
 
 /// The block after which the core is copied: entries and their batches
 /// pending, slot 0's `InputUp` awaiting its late generation, the
@@ -122,7 +132,11 @@ const CORE_AT: u64 = 1650;
 
 /// The small scene's encoded core copy for each compute version:
 /// (version, XXH3-64 of [`CoreCopy::encode`]'s bytes).
-const PHASED_CORES: &[(u32, u64)] = &[(1, 0x9a09_eea1_eddb_5e87), (2, 0xdac9_558b_b958_0ffc)];
+const PHASED_CORES: &[(u32, u64)] = &[
+    (1, 0x9a09_eea1_eddb_5e87),
+    (2, 0xdac9_558b_b958_0ffc),
+    (3, 0x27b8_47a0_7972_6cfc),
+];
 
 /// The tone scene's hashes for each compute version: (version, samples,
 /// XXH3-64 of the encoded core copy after [`TONE_CORE_AT`]). A scene of
@@ -130,12 +144,16 @@ const PHASED_CORES: &[(u32, u64)] = &[(1, 0x9a09_eea1_eddb_5e87), (2, 0xdac9_558
 const TONES: &[(u32, u64, u64)] = &[
     (1, 0x7325_ebfb_0d8e_41e4, 0xb8af_9c78_1774_6585),
     (2, 0x7325_ebfb_0d8e_41e4, 0xb083_0c30_70c5_ded3),
+    (3, 0x7325_ebfb_0d8e_41e4, 0x1efa_ea45_c0cc_ccaa),
 ];
 
 /// The output scene's hashes for each compute version: (version,
 /// samples, XXH3-64 of the encoded core copy after [`OUTPUT_CORE_AT`]).
 /// A scene of its own, so the other scenes' rows stay as they are.
-const OUTPUTS: &[(u32, u64, u64)] = &[(2, 0x6057_6bf7_783f_a229, 0x4f92_e32b_2010_01b8)];
+const OUTPUTS: &[(u32, u64, u64)] = &[
+    (2, 0x6057_6bf7_783f_a229, 0x4f92_e32b_2010_01b8),
+    (3, 0x6057_6bf7_783f_a229, 0xa21d_994f_9128_48c2),
+];
 
 /// The block after which the output scene's core is copied: inside the
 /// crossfade of output 0's dynamics order, its compressor mid-envelope
@@ -151,7 +169,10 @@ const OUTPUT_BLOCKS: u64 = 1200;
 /// scene of its own, so the other scenes' rows stay as they are.
 /// `the_engine_computes_the_bits_pinned_for_this_compute_version` reports
 /// the output delay scene's hashes, which replace it.
-const OUTPUT_DELAYS: &[(u32, u64, u64)] = &[(2, 0x6892_1966_4d94_67a0, 0xe010_062c_d8f9_b2d7)];
+const OUTPUT_DELAYS: &[(u32, u64, u64)] = &[
+    (2, 0x6892_1966_4d94_67a0, 0xe010_062c_d8f9_b2d7),
+    (3, 0x6892_1966_4d94_67a0, 0xcb85_fcc5_6493_4ebc),
+];
 
 /// The block after which the output delay scene's core is copied: inside
 /// output 0's crossfade to a longer delay, a shorter one waiting behind it.
