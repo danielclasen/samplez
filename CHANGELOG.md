@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.23.0](https://github.com/danielclasen/samplez/compare/v0.22.0...v0.23.0) (2026-11-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** Entry::PreStripMeter, Engine::set_pre_strip_meter, Targets::pre_strip_meters and ProductState::pre_strip_meters are new, a configured pre-strip meter starts off until a PreStripMeter entry switches it on, and samplez_replica::PROTOCOL is 6.
+* **engine:** samplez::COMPUTE_VERSION 3: an input's delay line runs before its strip and pre-strip taps, so replicas of 0.22 and this release do not run as peers.
+
+### Features
+
+* **engine:** switch an input's pre-strip meter on at run time ([12e2492](https://github.com/danielclasen/samplez/commit/12e24924c748f5aeda50d4fbeba7ed79ccb9824d))
+
+
+### Bug Fixes
+
+* **engine:** run an input's delay before its strip and pre-strip taps ([#181](https://github.com/danielclasen/samplez/issues/181)) ([65e9179](https://github.com/danielclasen/samplez/commit/65e9179f522b3467a8a5242a92dfc8c5ee669971))
+
 ## [0.22.0](https://github.com/danielclasen/samplez/compare/v0.21.0...v0.22.0) (2026-11-21)
 
 
