@@ -736,11 +736,13 @@ impl Comp {
             && (!self.tracking || self.wet.0.target == 0.0)
     }
 
-    /// Whether the compressor passes every input unchanged until it is
-    /// set again: off or at a mix of 0 with the switch at rest, or a
-    /// ratio of 1 with the gain at 0 dB and the makeup at rest at 0 dB.
+    /// Whether the compressor passes every input unchanged and holds no
+    /// gain that follows it until it is set again: off, or a ratio of 1
+    /// with the gain at 0 dB and the makeup at rest at 0 dB. One at a
+    /// mix of 0 passes its input but its gain follows the key, so a
+    /// change of the dynamics order crossfades it as any other.
     pub(crate) fn is_identity(&self) -> bool {
-        self.wet.is_off()
+        self.is_bypassed()
             || (self.slope == 0.0
                 && self.y == 0.0
                 && self.interval.from == 1.0

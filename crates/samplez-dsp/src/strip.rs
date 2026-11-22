@@ -954,6 +954,71 @@ mod tests {
         peak
     }
 
+    /// A compressor at a mix of 0 passes its input, but its gain follows
+    /// the key, so flipping the dynamics order crossfades as it does for
+    /// any unit at work. The reference is the same strip with a gate
+    /// that is open throughout, which passes every bit and crossfades a
+    /// flip by itself: through each flip, and through a raise of the mix
+    /// to 0.5 after it, the two compute the same bits. A strip that took
+    /// the compressor at a mix of 0 for unity would flip at once, its
+    /// equaliser state continuing where the crossfade starts the other
+    /// order's from rest.
+    #[test]
+    fn a_flip_at_a_mix_of_0_crossfades() {
+        let comp = |mix| {
+            StripParam::Comp(CompParams {
+                threshold_db: -40.0,
+                ratio: 10.0,
+                mix,
+                ..COMP
+            })
+        };
+        let open = StripParam::Gate(GateParams {
+            threshold_db: -80.0,
+            ..GATE
+        });
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        for before in [false, true] {
+            let build = |gate: Option<StripParam>| {
+                let mut s = Strip::new(1, RAMP);
+                let bell = StripParam::EqBand {
+                    band: 1,
+                    value: band(BandType::Peak, 100.0, 12.0, 8.0),
+                };
+                let order = StripParam::DynamicsBeforeEq { enabled: before };
+                for p in [StripParam::Eq { enabled: true }, bell, comp(0.0), order]
+                    .into_iter()
+                    .chain(gate)
+                {
+                    assert!(s.set(p), "{p:?}");
+                }
+                s
+            };
+            let (mut dry, mut reference) = (build(None), build(Some(open)));
+            // Never at 0, so the gate opens on the first sample and stays.
+            let mut start = 100usize;
+            let mut run = |dry: &mut Strip, reference: &mut Strip, blocks: usize| {
+                for _ in 0..blocks {
+                    let x: Vec<f32> = (start..start + 48)
+                        .map(|n| 0.5 * (n as f32 * 0.013).sin())
+                        .collect();
+                    let (mut a, mut b) = (x.clone(), x.clone());
+                    dry.process(&mut a, 48);
+                    reference.process(&mut b, 48);
+                    assert_eq!(bits(&a), bits(&b), "before {before}, at {start}");
+                    start += 48;
+                }
+            };
+            run(&mut dry, &mut reference, 100);
+            let flip = StripParam::DynamicsBeforeEq { enabled: !before };
+            assert!(dry.set(flip) && reference.set(flip));
+            assert!(dry.is_fading(), "before {before}: flipped at once");
+            run(&mut dry, &mut reference, 2 * RAMP as usize / 48);
+            assert!(dry.set(comp(0.5)) && reference.set(comp(0.5)));
+            run(&mut dry, &mut reference, 4 * RAMP as usize / 48);
+        }
+    }
+
     /// Flipping the order crossfades: through the flip the output peaks
     /// within 0.5 dB of the louder of the two orders settled, with the
     /// compressor deep in reduction or the gate closed, where switching
