@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.24.0](https://github.com/danielclasen/samplez/compare/v0.23.1...v0.24.0) (2026-11-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** contact::PeerMetrics has a new public field, last_report_age, so code that builds it with a struct literal must set it.
+
+### Features
+
+* **replica:** report the age of each peer's last direct report ([e9961c0](https://github.com/danielclasen/samplez/commit/e9961c0c9b781c63b496ff588d574a08000aa5df))
+
 ## [0.23.1](https://github.com/danielclasen/samplez/compare/v0.23.0...v0.23.1) (2026-11-22)
 
 
