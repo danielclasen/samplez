@@ -1251,7 +1251,12 @@ of contact, or before a first report, counts as a transition but adds
 no gap. Both start at 0 when the peer joins the voter set and are
 dropped with it when it leaves, so a peer removed and added again
 starts from 0. Both are also `silent_transitions` and `silent_gap_max`
-in each peer's contact metrics.
+in each peer's contact metrics. Those metrics also carry
+`last_report_age`, the time since the peer's last report received
+directly, on the monotonic clock, none before the first; relayed copies
+and regaining contact leave it unchanged, so a peer not held silent in
+the first `contactWindowMs` after contact is regained can still show an
+age above it.
 
 Reports, like openraft's RPCs and the other peer requests, travel over
 HTTP/1.1 connections on the peer listener's mutual TLS, both ends with

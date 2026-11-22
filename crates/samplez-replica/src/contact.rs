@@ -1021,8 +1021,15 @@ pub struct PeerMetrics {
     /// The longest time from its last report heard to the next, over the
     /// gaps in which this replica held it silent.
     pub silent_gap_max: Duration,
-    /// This replica holds it silent.
+    /// This replica holds it silent. Silence counts from its last report
+    /// or from contact regained, whichever is later, so for one contact
+    /// window after contact is regained no peer is silent, however long
+    /// ago its last report arrived.
     pub silent: bool,
+    /// The time since its last report received directly, on the
+    /// monotonic clock, at this snapshot; none before the first. Relayed
+    /// copies and regaining contact leave it unchanged.
+    pub last_report_age: Option<Duration>,
     /// Its clock minus this one's, from the latest exchange, ns.
     pub offset_ns: Option<i64>,
 }
@@ -3816,6 +3823,7 @@ impl Contact {
         let members = self.lock().members.clone();
         let protocol_blocker = self.protocol_blocker(&members);
         let st = self.lock();
+        let now = Instant::now();
         let c = &st.counts;
         let q = |h: &Histogram| h.quantile(0.9999);
         let delta = st.peers.values().filter_map(|p| q(&p.delay)).max();
@@ -3845,6 +3853,7 @@ impl Contact {
                     silent_transitions: p.silent_transitions,
                     silent_gap_max: p.silent_gap_max,
                     silent: p.silent,
+                    last_report_age: p.last.as_ref().map(|d| since(now, d.received)),
                     offset_ns: p.offset_ns,
                 })
                 .collect(),
@@ -4811,6 +4820,55 @@ mod tests {
         let to_2 = f.tick().into_iter().find(|(to, _, _)| *to == 2).unwrap();
         let heard_3 = to_2.2.heard.iter().find(|h| h.node == 3).unwrap();
         assert!(heard_3.silent, "the silence is relayed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_report_age_counts_from_the_last_direct_report_not_from_regaining_contact() {
+        let f = fixture(&[&[1, 2, 3]]);
+        let age = |node: NodeId| {
+            let m = f.contact.metrics();
+            let p = m.peers.iter().find(|p| p.node == node).expect("a voter");
+            p.last_report_age
+        };
+        f.tick();
+        assert_eq!(age(2), None, "no report from 2 yet");
+        assert_eq!(age(3), None, "no report from 3 yet");
+        f.contact.receive(f.report(2, None));
+        f.contact.receive(f.report(3, None));
+        f.tick();
+        // 3 stops; 2 reports every 2 ms until 3 is held silent, 10 ms on.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(2)).await;
+            f.clock.add(Duration::from_millis(2));
+            f.contact.receive(f.report(2, None));
+            f.tick();
+        }
+        assert!(f.silent(3));
+        assert!(age(3).is_some_and(|a| a >= Duration::from_millis(10)));
+        // Then nothing for 20 ms: contact lost.
+        tokio::time::advance(Duration::from_millis(20)).await;
+        f.clock.add(Duration::from_millis(20));
+        f.tick();
+        assert!(!f.contact.metrics().in_contact);
+        // 2 alone brings contact back, relaying a fresh copy of 3.
+        let mut r = f.report(2, None);
+        r.heard = vec![Heard {
+            node: 3,
+            age_us: Some(0),
+            silent: false,
+            own: Some(Own::default()),
+        }];
+        f.contact.receive(r);
+        f.tick();
+        assert!(f.contact.metrics().in_contact);
+        assert!(!f.silent(3), "silence counts from regaining contact");
+        // 3 was last heard directly 30 ms ago, longer than w; 2 just now.
+        assert!(
+            age(3).is_some_and(|a| a >= Duration::from_millis(30) && a > W),
+            "{:?}",
+            age(3)
+        );
+        assert!(age(2).is_some_and(|a| a <= W), "{:?}", age(2));
     }
 
     #[tokio::test(start_paused = true)]
