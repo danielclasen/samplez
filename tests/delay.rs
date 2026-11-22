@@ -1,6 +1,6 @@
 //! Input and output delays on real libmxl flows: an input configured
 //! with a delay line plays its pilot the set number of samples late, bit
-//! for bit, after its strip and before the matrix, and an output its mix;
+//! for bit, before its strip and the matrix, and an output its mix;
 //! a delay beyond the line, or on an input or output without one, is
 //! refused.
 

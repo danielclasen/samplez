@@ -158,7 +158,8 @@ pub struct Input {
     pub loudness_channels: Option<Vec<String>>,
     /// The longest delay a `Delay` entry may set on the input, in
     /// samples, at most `samplez_dsp::MAX_DELAY_SAMPLES` (5 s); 0, the
-    /// default, gives the input no delay line. Its rings, two per leg of
+    /// default, gives the input no delay line. The line runs ahead of the
+    /// strip and of every tap of the input. Its rings, two per leg of
     /// this length plus `historySlackMs`, are allocated at start.
     #[serde(default)]
     pub max_delay_samples: u32,
@@ -174,13 +175,14 @@ pub struct Input {
     /// strip, metered as the input's meter is (`truePeak` included), so
     /// its trim, EQ and dynamics do not reach it. Before the strip means
     /// the block as read or generated, its `flowChannels` selected, after
-    /// the fade-in, a re-route's crossfade and silencing. Off by default:
-    /// the input then has no such meter and no block copy is made for it.
+    /// the fade-in, a re-route's crossfade, silencing and the input's
+    /// delay line. Off by default: the input then has no such meter and
+    /// no block copy is made for it.
     #[serde(default)]
     pub pre_strip_meter: bool,
     /// Adds the input's channels as matrix rows after every input's
     /// rows, in configuration order, fed the input before its strip as
-    /// `preStripMeter` meters it, and before its delay: undelayed. Off by
+    /// `preStripMeter` meters it, delayed by its delay line. Off by
     /// default: the input then has no such rows. The rows count against
     /// the matrix's coefficient limits as every row does.
     #[serde(default)]

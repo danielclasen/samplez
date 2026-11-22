@@ -227,11 +227,11 @@ fn manual_settings_apply_at_their_index() {
     common::stop(e);
 }
 
-/// A pre-strip row is the input as read and takes no duck: a duck mask
-/// other than 0 on one is refused, in an entry as in a batch, while the
-/// input's own rows take it and a mask of 0 there is taken. Fails with
-/// the pre-strip row check dropped from `check_mask`, which then takes
-/// the mask.
+/// A pre-strip row is the input before its strip and takes no duck: a
+/// duck mask other than 0 on one is refused, in an entry as in a batch,
+/// while the input's own rows take it and a mask of 0 there is taken.
+/// Fails with the pre-strip row check dropped from `check_mask`, which
+/// then takes the mask.
 #[test]
 fn a_pre_strip_row_takes_no_duck_mask() {
     let domain = Domain::new();

@@ -730,24 +730,25 @@ pub(crate) struct Slot {
     pub detached: bool,
     pub prune_requested: bool,
     pub stats: SlotStats,
-    /// The slot's strip, run on each block computed after the copy and
-    /// the fades; none on a slot wider than a strip.
+    /// The slot's strip, run on each block computed after the copy, the
+    /// fades and the delay; none on a slot wider than a strip.
     pub strip: Option<Strip>,
     /// The index of the next sample the strip processes.
     pub strip_pos: Option<u64>,
-    /// The slot's delay line, run after the strip; none on a slot
-    /// configured without one.
+    /// The slot's delay line, run first on each block computed, after the
+    /// copy and the fades, so its rings hold the input before the strip;
+    /// none on a slot configured without one.
     pub delay: Option<Delay>,
     /// The slot's tone generator, which it computes in place of a read;
     /// none on a slot that reads flows.
     pub tone: Option<Tone>,
-    /// Each block is copied into the slot's channels of `prebuf` before
-    /// the strip, for its pre-strip meter.
+    /// Each block is copied into the slot's channels of `prebuf` after
+    /// the delay and before the strip, for its pre-strip meter.
     pub pre_strip: bool,
     /// The first of the slot's pre-strip matrix rows, after every
     /// input's rows: each block is copied into these channels of `inbuf`
-    /// before the strip. None on a slot whose config does not set
-    /// `preStripRows`.
+    /// after the delay and before the strip. None on a slot whose config
+    /// does not set `preStripRows`.
     pub pre_row: Option<usize>,
     /// The flow the slot reads from [`Rt::test_input`]: the re-routes
     /// swapped in so far. Its outgoing flow in a crossfade is the one
@@ -794,12 +795,13 @@ impl Slot {
         }
     }
 
-    /// Runs the strip and the delay over block `dst` of `frames` samples
-    /// per channel starting at sample index `start`, read, generated or
-    /// silenced, and copies it into the slot's channels of `inbuf`; with
-    /// [`Slot::pre_strip`], copies it before the strip into those of
-    /// `prebuf` too, and with [`Slot::pre_row`] into its pre-strip rows
-    /// of `inbuf`.
+    /// Runs the delay and then the strip over block `dst` of `frames`
+    /// samples per channel starting at sample index `start`, read,
+    /// generated or silenced, and copies it into the slot's channels of
+    /// `inbuf`; with [`Slot::pre_strip`], copies it after the delay and
+    /// before the strip into those of `prebuf` too, and with
+    /// [`Slot::pre_row`] into its pre-strip rows of `inbuf`, so every tap
+    /// of the input is as late as its delay.
     fn finish(
         &mut self,
         start: u64,
@@ -808,6 +810,10 @@ impl Slot {
         inbuf: &mut PlanarBuffer,
         prebuf: &mut PlanarBuffer,
     ) {
+        // Silenced blocks too: the delay plays what came before.
+        if let Some(d) = &mut self.delay {
+            d.process(start, dst, frames);
+        }
         if self.pre_strip {
             for (c, ch) in dst.chunks_exact(frames).enumerate() {
                 prebuf.channel_mut(self.first_channel + c)[..frames].copy_from_slice(ch);
@@ -821,10 +827,6 @@ impl Slot {
         // Silenced blocks too: the strip's filters and dynamics ring out
         // on silence.
         self.run_strip(start, dst, frames);
-        // Silenced blocks too: the delay plays what came before.
-        if let Some(d) = &mut self.delay {
-            d.process(start, dst, frames);
-        }
         for (c, ch) in dst.chunks_exact(frames).enumerate() {
             inbuf.channel_mut(self.first_channel + c)[..frames].copy_from_slice(ch);
         }
@@ -1996,9 +1998,9 @@ pub(crate) struct Rt {
     pub pre_taps: Vec<Metered>,
     pub mix: Mix,
     pub inbuf: PlanarBuffer,
-    /// The blocks of the slots with [`Slot::pre_strip`] before their
-    /// strips, laid out as `inbuf`; other slots' channels are left as
-    /// they are.
+    /// The blocks of the slots with [`Slot::pre_strip`] after their
+    /// delays and before their strips, laid out as `inbuf`; other slots'
+    /// channels are left as they are.
     pub prebuf: PlanarBuffer,
     pub outbuf: PlanarBuffer,
     /// One input's or one output's channels, planar.

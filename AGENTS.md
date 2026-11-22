@@ -137,12 +137,15 @@ replica") has the bump rules:
 - `COMPUTE_VERSION`: any change to the samples or meters the engine
   computes, dependency and toolchain changes included, or to what a core
   copy holds or how it encodes. `samplez-dsp` pins `libm = "=0.2.16"`,
-  and products pin it too.
+  and products pin it too. It is 3: an input's delay line runs before
+  its strip and its pre-strip meter and rows, so every tap of an input
+  is as late as its delay.
 - Two goldens pin what `COMPUTE_VERSION` stands for: `tests/golden.rs`
   the DSP kernels on a fixed signal, and `src/engine/golden.rs` the RT
   loop run offline, with `GOLDEN` (samples, meters, page hashes) and
-  `CORES` (the encoded core copy). These are tables with a row per
-  `COMPUTE_VERSION`.
+  `CORES` (the encoded core copy), and a table per scene of its own.
+  These are tables with a row per `COMPUTE_VERSION`, and a bump adds one
+  to each, the core copies' moving with the version they encode.
 - `FINGERPRINTS` in `src/engine/golden.rs` is a single pinned value: a
   change to how page hashes or fingerprints are computed bumps
   `PROTOCOL` and replaces it in the same change. The `samplez` crate

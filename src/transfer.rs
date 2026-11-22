@@ -40,7 +40,7 @@ use crate::rt_loop::{Change, Control, LogId, PENDING_CHANGES, Rt, RtEntry, UNRES
 /// of the version that copied it, and replicas compute equal pages only
 /// at equal versions, so a release that changes neither keeps it and its
 /// replicas roll into a running set as peers.
-pub const COMPUTE_VERSION: u32 = 2;
+pub const COMPUTE_VERSION: u32 = 3;
 
 /// The highest sample index a decoded core may hold: far beyond any
 /// running engine's, and low enough that adding a ramp or a block to it
@@ -64,7 +64,8 @@ pub(crate) struct SlotCore {
     pub strip_pos: Option<u64>,
     /// The slot's delay: its taps and position, the set of rings it
     /// reads, and per leg the span of history its taps reach back over,
-    /// copied off the RT thread. None on a slot without a delay line.
+    /// the input before its strip, copied off the RT thread. None on a
+    /// slot without a delay line.
     pub delay: Option<DelayCore>,
     /// The slot's tone generator, which a core built from product state
     /// holds none of and leaves the RT thread's, as a strip. None on a
