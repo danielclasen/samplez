@@ -274,6 +274,10 @@ impl EngineAudio {
             },
             &Entry::Delay { slot, .. } => Entry::Delay { slot, samples: 0 },
             &Entry::OutputDelay { output, .. } => Entry::OutputDelay { output, samples: 0 },
+            &Entry::PreStripMeter { slot, .. } => Entry::PreStripMeter {
+                slot,
+                enabled: false,
+            },
             &Entry::Tone { slot, .. } => tone_entry(slot, samplez_dsp::ToneParams::DEFAULT),
             _ => return Some(entry.clone()),
         };
@@ -424,10 +428,22 @@ impl EngineAudio {
         // the live filter leaves out their entries.
         dropped += state.loudness_running.len().saturating_sub(self.meters);
         state.loudness_running.truncate(self.meters);
+        let slots = state.flows.len();
+        // A pre-strip meter the engine refuses is replaced as the live
+        // filter replaces it: off; those of slots beyond the engine's left
+        // out.
+        dropped += state.pre_strip_meters.len().saturating_sub(slots);
+        state.pre_strip_meters.truncate(slots);
+        for (slot, on) in state.pre_strip_meters.iter_mut().enumerate() {
+            let entry = Entry::PreStripMeter { slot, enabled: *on };
+            if *on && self.admitted(&entry) != Some(entry) {
+                *on = false;
+                dropped += 1;
+            }
+        }
         // A delay the engine refuses is replaced as the live filter
         // replaces it: no delay; those of slots beyond the engine's left
         // out.
-        let slots = state.flows.len();
         dropped += state.delays.len().saturating_sub(slots);
         state.delays.truncate(slots);
         for (slot, samples) in state.delays.iter_mut().enumerate() {
@@ -1033,6 +1049,7 @@ mod tests {
             up: vec![true, true],
             flows: vec![Some("a".to_owned()), Some("b".to_owned())],
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             strips: vec![Vec::new(), Vec::new()],
             limiters: Vec::new(),

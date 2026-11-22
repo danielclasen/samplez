@@ -176,8 +176,10 @@ pub struct Input {
     /// its trim, EQ and dynamics do not reach it. Before the strip means
     /// the block as read or generated, its `flowChannels` selected, after
     /// the fade-in, a re-route's crossfade, silencing and the input's
-    /// delay line. Off by default: the input then has no such meter and
-    /// no block copy is made for it.
+    /// delay line. It reserves the meter, which a `PreStripMeter` entry
+    /// switches on and off and which starts off: only while it is on is
+    /// the block copied and metered. Off by default: the input then has
+    /// no such meter and an entry switching it on is refused.
     #[serde(default)]
     pub pre_strip_meter: bool,
     /// Adds the input's channels as matrix rows after every input's

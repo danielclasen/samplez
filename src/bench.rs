@@ -116,11 +116,19 @@ impl Slice {
         Slice::before_end(rt)
     }
 
-    /// An RT loop off any flow of `inputs` stereo inputs, each metered
-    /// and, with `pre_strip`, metered before its strip too, all feeding
-    /// one stereo output, with `rows` from their pre-strip rows as well,
-    /// before the block that ends a meter slice.
-    pub fn inputs(libmxl: &str, inputs: usize, pre_strip: bool, rows: bool) -> Slice {
+    /// An RT loop off any flow of `inputs` stereo inputs, each metered,
+    /// with `true_peak` its true peak too, and with `pre_strip`
+    /// configured with a pre-strip meter, switched on for the first `on`
+    /// of them at the first block, all feeding one stereo output, with
+    /// `rows` from their pre-strip rows as well, before the block that
+    /// ends a meter slice.
+    pub fn inputs(
+        libmxl: &str,
+        inputs: usize,
+        (pre_strip, on): (bool, usize),
+        rows: bool,
+        true_peak: bool,
+    ) -> Slice {
         let v = serde_json::json!({
             "libmxl": libmxl,
             "blockSize": 48,
@@ -128,7 +136,7 @@ impl Slice {
             "inputs": (0..inputs).map(|i| serde_json::json!({
                 "name": format!("in{i}"), "domain": "d",
                 "flowId": format!("5fbec3b1-1b0f-417d-9059-{i:012}"), "channels": 2,
-                "preStripMeter": pre_strip, "preStripRows": rows }))
+                "preStripMeter": pre_strip, "preStripRows": rows, "truePeak": true_peak }))
                 .collect::<Vec<_>>(),
             "outputs": [{ "name": "out", "domain": "d",
                           "flowId": "6fbec3b1-1b0f-417d-9059-000000000000", "label": "o",
@@ -142,6 +150,17 @@ impl Slice {
         let (_, control) = rtrb::RingBuffer::new(1);
         let mut rt = crate::engine::replay_rt(&config, &api, vec![None], hashes, control);
         (rt.buses, rt.taps, rt.pre_taps) = crate::engine::new_meters(&config);
+        for slot in 0..on {
+            let entry = RtEntry {
+                id: slot as u64 + 1,
+                at_index: 1000 * 48,
+                change: Change::PreStripMeter {
+                    slot,
+                    enabled: true,
+                },
+            };
+            assert!(rt.mix.push(entry));
+        }
         Slice::before_end(rt)
     }
 

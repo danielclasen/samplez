@@ -61,6 +61,13 @@ pub struct Targets {
     /// output that starts other than configured is set only by its first
     /// change.
     pub outputs: Vec<bool>,
+    /// Per input slot, whether its pre-strip meter is on
+    /// ([`Entry::PreStripMeter`]); a slot past the list has it off. A
+    /// product lists the slots it meters before the strip, or every slot:
+    /// [`Targets::assert`] sets only the slots listed, and diff emits a
+    /// `PreStripMeter` only where the value changes, past the list taken
+    /// as off.
+    pub pre_strip_meters: Vec<bool>,
     /// Per meter, the outputs then the configured meters, whether its
     /// loudness measurement runs ([`Entry::LoudnessRun`]); a meter past
     /// the list, every meter of an empty one, runs. A product lists every
@@ -97,7 +104,9 @@ impl Targets {
     /// `Route` for each slot whose flow differs, a `Detach` for one
     /// `next` holds none for; an `Output` for each output whose enabled
     /// state differs, an output past either list compared as enabled,
-    /// whatever start the engine configures for it; a `LoudnessRun` for
+    /// whatever start the engine configures for it; a `PreStripMeter` for
+    /// each slot whose pre-strip meter differs, a slot past either list
+    /// compared as off; a `LoudnessRun` for
     /// each meter whose running state differs, a meter past either list
     /// compared as running; a `ResetLoudness` for each meter whose reset
     /// epoch `next` holds ahead of `self`'s, one however many resets the
@@ -182,6 +191,13 @@ impl Targets {
                 entries.push(Entry::Output { slot, enabled });
             }
         }
+        let on = |t: &Targets, s: usize| t.pre_strip_meters.get(s).copied().unwrap_or(false);
+        for slot in 0..self.pre_strip_meters.len().max(next.pre_strip_meters.len()) {
+            if on(self, slot) != on(next, slot) {
+                let enabled = on(next, slot);
+                entries.push(Entry::PreStripMeter { slot, enabled });
+            }
+        }
         let runs = |t: &Targets, m: usize| t.loudness_running.get(m).copied().unwrap_or(true);
         for meter in 0..self.loudness_running.len().max(next.loudness_running.len()) {
             if runs(self, meter) != runs(next, meter) {
@@ -202,9 +218,9 @@ impl Targets {
     /// tone parameter and duck setting of `self`, whatever an engine
     /// holds, in the order of [`Targets::diff`], a `Route`, or a `Detach`
     /// for a slot without a flow, for each of `slots` in ascending
-    /// order, an `Output` for
-    /// each output `self` holds and a `LoudnessRun` for each meter it
-    /// holds; never a `ResetLoudness`, a reset being an event and not a
+    /// order, an `Output` for each output `self` holds, a
+    /// `PreStripMeter` for each slot it lists and a `LoudnessRun` for each
+    /// meter it holds; never a `ResetLoudness`, a reset being an event and not a
     /// value. Of the duck masks,
     /// every one other than 0, and a 0 for each coefficient `masked`
     /// holds a mask other than 0 for: an engine holds
@@ -217,6 +233,7 @@ impl Targets {
         let mut entries = Targets::default().diff(&Targets {
             flows: Vec::new(),
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             loudness_resets: Vec::new(),
             ..self.clone()
@@ -247,6 +264,9 @@ impl Targets {
         }
         for (slot, &enabled) in self.outputs.iter().enumerate() {
             entries.push(Entry::Output { slot, enabled });
+        }
+        for (slot, &enabled) in self.pre_strip_meters.iter().enumerate() {
+            entries.push(Entry::PreStripMeter { slot, enabled });
         }
         for (meter, &running) in self.loudness_running.iter().enumerate() {
             entries.push(Entry::LoudnessRun { meter, running });
@@ -1167,6 +1187,33 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    /// A slot's pre-strip meter gets an entry when it differs, a slot past
+    /// either list taken as off, and every listed one from `assert`, off
+    /// ones included; an output's enable of the same index is apart.
+    #[test]
+    fn pre_strip_meters_differ_by_value() {
+        let was = Targets {
+            outputs: vec![true],
+            pre_strip_meters: vec![false, true, true],
+            ..Targets::default()
+        };
+        let next = Targets {
+            outputs: vec![true],
+            pre_strip_meters: vec![true, true],
+            ..Targets::default()
+        };
+        let set = |slot, enabled| Entry::PreStripMeter { slot, enabled };
+        assert_eq!(was.diff(&next), [set(0, true), set(2, false)]);
+        assert_eq!(next.diff(&was), [set(0, false), set(2, true)]);
+        assert!(was.diff(&was).is_empty());
+        assert!(Targets::default().diff(&Targets::default()).is_empty());
+        let all = was.assert(&[], None);
+        let pre: Vec<&Entry> = (all.iter())
+            .filter(|e| matches!(e, Entry::PreStripMeter { .. }))
+            .collect();
+        assert_eq!(pre, [&set(0, false), &set(1, true), &set(2, true)]);
     }
 
     /// An output's delay gets an entry when it differs, none when equal or

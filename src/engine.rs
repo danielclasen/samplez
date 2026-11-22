@@ -125,7 +125,9 @@ pub struct InputStatus {
     /// The input after its strip, read or silenced.
     pub meters: InputMeters,
     /// The input after its delay and before its strip, where its config
-    /// sets `preStripMeter`; none otherwise.
+    /// sets `preStripMeter` and the log has the meter on
+    /// ([`Entry::PreStripMeter`]); none otherwise. Switched on, it reads
+    /// what was metered since alone.
     pub pre_strip_meters: Option<InputMeters>,
 }
 
@@ -452,6 +454,14 @@ pub enum Entry {
         output: usize,
         mask: u8,
     },
+    /// Runs the pre-strip meter of input slot `slot`, one configured with
+    /// `preStripMeter`, from the entry's index on, or stops it: while it
+    /// is off the slot's block is neither copied nor metered before the
+    /// strip and the input's status carries no `pre_strip_meters`.
+    /// Switched on, its measurement starts afresh at the first 10 ms
+    /// slice at or after the index. Every pre-strip meter starts off;
+    /// off is taken on any slot.
+    PreStripMeter { slot: usize, enabled: bool },
     /// Runs the loudness measurement of `meter`, an output or after the
     /// outputs a configured meter, from the entry's index on, or pauses
     /// it: every 10 ms slice with a sample from a paused span is left out
@@ -851,6 +861,20 @@ fn check_output_delay(config: &Config, output: usize, samples: u32) -> Result<()
         return Err(format!(
             "a delay of {samples} samples on output {output}, its maxDelaySamples {}",
             o.max_delay_samples
+        ));
+    }
+    Ok(())
+}
+
+/// Whether input slot `slot` exists and takes its pre-strip meter
+/// `enabled`: on only where its config sets `preStripMeter`.
+fn check_pre_strip_meter(config: &Config, slot: usize, enabled: bool) -> Result<(), String> {
+    let Some(input) = config.inputs.get(slot) else {
+        return Err(format!("no input slot {slot}"));
+    };
+    if enabled && !input.pre_strip_meter {
+        return Err(format!(
+            "a pre-strip meter on input slot {slot}, configured without preStripMeter"
         ));
     }
     Ok(())
@@ -2171,7 +2195,7 @@ impl Engine {
                     margin_warning: None,
                     counters: InputCounters::default(),
                     meters: InputMeters::default(),
-                    pre_strip_meters: i.pre_strip_meter.then(InputMeters::default),
+                    pre_strip_meters: None,
                 })
                 .collect(),
             outputs: config
@@ -2323,6 +2347,7 @@ impl Engine {
                 b
             },
             loudness: config_loudness,
+            pre_runs: vec![None; config.inputs.iter().filter(|i| i.pre_strip_meter).count()],
             verdicts,
             status: Arc::clone(&status),
             counters: Arc::clone(&counters),
@@ -2984,6 +3009,10 @@ impl Engine {
                 if meter >= self.config.outputs.len() + self.config.meters.len() =>
             {
                 return invalid(format!("no output or meter {meter}"));
+            }
+            Entry::PreStripMeter { slot, enabled } => {
+                check_pre_strip_meter(&self.config, slot, enabled).map_err(EntryError::Invalid)?;
+                Change::PreStripMeter { slot, enabled }
             }
             Entry::LoudnessRun { meter, running } => Change::LoudnessRun { meter, running },
             Entry::ResetLoudness { meter } => Change::ResetLoudness { meter },
@@ -3716,6 +3745,7 @@ impl Engine {
             || state.tones.len() > slots
             || state.tone_ramps.len() > slots
             || state.outputs.len() > self.config.outputs.len()
+            || state.pre_strip_meters.len() > slots
             || state.limiters.len() > self.config.outputs.len()
             || state.output_strips.len() > self.config.outputs.len()
             || state.output_delays.len() > self.config.outputs.len()
@@ -3753,6 +3783,9 @@ impl Engine {
         }
         for (output, &samples) in state.output_delays.iter().enumerate() {
             check_output_delay(&self.config, output, samples).map_err(ReplayError::Invalid)?;
+        }
+        for (slot, &on) in state.pre_strip_meters.iter().enumerate() {
+            check_pre_strip_meter(&self.config, slot, on).map_err(ReplayError::Invalid)?;
         }
         for (slot, params) in state.tones.iter().enumerate() {
             if let Some(params) = params {
@@ -4057,6 +4090,22 @@ impl Engine {
         self.set_local_entry(&entry, at_index, "loudness resets")
     }
 
+    /// Runs the pre-strip meter of input slot `slot` from sample index
+    /// `at_index`, a multiple of the block size, or stops it, as
+    /// [`Entry::PreStripMeter`] does. Refused as [`Engine::set_gain`]
+    /// refuses a change, and as invalid for a slot that does not exist
+    /// or, switched on, is configured without `preStripMeter`.
+    pub fn set_pre_strip_meter(
+        &self,
+        slot: usize,
+        enabled: bool,
+        at_index: u64,
+    ) -> Result<(), GainError> {
+        check_pre_strip_meter(&self.config, slot, enabled).map_err(GainError::Invalid)?;
+        let change = Change::PreStripMeter { slot, enabled };
+        self.set_local(change, at_index, "pre-strip meter changes")
+    }
+
     /// Runs the loudness measurement of `meter` from sample index
     /// `at_index`, a multiple of the block size, or pauses it, as
     /// [`Entry::LoudnessRun`] does. Refused as
@@ -4280,6 +4329,11 @@ struct Supervisor {
     /// lifts a detected step's fence.
     alone: bool,
     loudness: Vec<OutputLoudness>,
+    /// Per pre-strip meter, in slot order, the first index of the
+    /// measurement its last restart record started, while it runs: none
+    /// while the RT thread meters nothing for it, so its records are
+    /// dropped until one restarts it.
+    pre_runs: Vec<Option<u64>>,
     verdicts: Option<SyncSender<BlockVerdict>>,
     status: Arc<Mutex<Status>>,
     counters: Arc<Counters>,
@@ -4428,14 +4482,29 @@ impl Supervisor {
                 self.loudness.iter_mut().for_each(OutputLoudness::gap);
             }
             self.next_meter_seq = r.seq + 1;
-            self.loudness[r.meter as usize].record(&r);
+            let m = r.meter as usize;
+            // The pre-strip meters come last; one runs from the record
+            // that restarts it, measured afresh, and reads nothing while
+            // it is off.
+            let pre = self.loudness.len() - self.pre_runs.len();
+            if m >= pre {
+                if r.channel == 0 && r.reset().is_some() {
+                    self.pre_runs[m - pre] = r.reset();
+                }
+                if self.pre_runs[m - pre].is_some() {
+                    self.loudness[m].record_restarting(&r);
+                }
+                continue;
+            }
+            self.loudness[m].record(&r);
         }
         if seen {
             let mut st = self.status();
             let st = &mut *st;
             let (outs, rest) = self.loudness.split_at(st.outputs.len());
             let (meters, rest) = rest.split_at(st.meters.len());
-            let (inputs, mut pre) = rest.split_at(st.inputs.len());
+            let (inputs, pre) = rest.split_at(st.inputs.len());
+            let mut pre = pre.iter().zip(&self.pre_runs);
             for (o, l) in st.outputs.iter_mut().zip(outs) {
                 o.meters.clone_from(&l.meters);
             }
@@ -4444,9 +4513,14 @@ impl Supervisor {
             }
             for ((i, l), c) in st.inputs.iter_mut().zip(inputs).zip(&self.config.inputs) {
                 i.meters.update(&l.meters, c.true_peak);
-                if let Some(m) = &mut i.pre_strip_meters {
-                    m.update(&pre[0].meters, c.true_peak);
-                    pre = &pre[1..];
+                if c.pre_strip_meter
+                    && let Some((l, run)) = pre.next()
+                {
+                    i.pre_strip_meters = run.map(|_| {
+                        let mut m = i.pre_strip_meters.take().unwrap_or_default();
+                        m.update(&l.meters, c.true_peak);
+                        m
+                    });
                 }
             }
         }
@@ -4566,6 +4640,19 @@ impl Supervisor {
                         if matches!(entry.change, Change::InputDown { .. }) {
                             self.report(Report::InputPruned { slot });
                         }
+                    }
+                }
+                Telemetry::PreStripMeterOff { slot, at_index } => {
+                    let tap = (self.config.inputs[..slot].iter())
+                        .filter(|i| i.pre_strip_meter)
+                        .count();
+                    // A restart the RT thread made after the stop, whose
+                    // record came in first, stands.
+                    if let Some(run) = self.pre_runs.get_mut(tap)
+                        && run.is_some_and(|start| start <= at_index)
+                    {
+                        *run = None;
+                        self.status().inputs[slot].pre_strip_meters = None;
                     }
                 }
                 Telemetry::Input { slot, up } => {
@@ -8265,6 +8352,7 @@ mod tests {
             up: Vec::new(),
             flows: Vec::new(),
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             strips: Vec::new(),
             ducks: Vec::new(),
@@ -8337,6 +8425,7 @@ mod tests {
             up: Vec::new(),
             flows: Vec::new(),
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             strips: Vec::new(),
             ducks: Vec::new(),
@@ -9083,8 +9172,13 @@ mod tests {
                 level_db: -6.0,
                 ident: false,
             };
+            let on = Change::PreStripMeter {
+                slot: 0,
+                enabled: true,
+            };
             let entries = [
                 (0, Change::Tone { slot: 0, params }),
+                (0, on),
                 (
                     trim_at,
                     Change::Strip {
@@ -9214,7 +9308,7 @@ mod tests {
             legs.push([0, 1].map(|c| rt.outbuf.channel(c)[..b].to_vec()));
             while let Ok(r) = rx.pop() {
                 if r.meter == pre {
-                    l.record(&r);
+                    l.record_restarting(&r);
                 }
             }
             if let Some(w) = l.meters.window {
@@ -9287,7 +9381,12 @@ mod tests {
             ..ToneParams::DEFAULT
         };
         let tone = |params| Change::Tone { slot: 0, params };
+        let on = Change::PreStripMeter {
+            slot: 0,
+            enabled: true,
+        };
         let changes = vec![
+            (0, on),
             (
                 0,
                 Change::Delay {
@@ -9371,7 +9470,7 @@ mod tests {
     /// `preStripRows` has no pre-strip meter, rows or copy: the matrix has
     /// the input's rows alone, and its slot copies nothing into `prebuf`,
     /// which stays silent through a delay and a trim. Fails with the copy
-    /// into `prebuf` made whatever [`Slot::pre_strip`] says.
+    /// into `prebuf` made whatever [`Slot::pre_strip_on`] says.
     #[test]
     fn without_the_opt_ins_an_input_has_no_pre_strip_copy() {
         let config = delayed_tone_config();
@@ -9400,6 +9499,80 @@ mod tests {
             assert!(
                 rt.prebuf.channel(c).iter().all(|&y| y == 0.0),
                 "channel {c}"
+            );
+        }
+    }
+
+    /// An input configured with `preStripMeter` and no `PreStripMeter`
+    /// entry has its pre-strip meter off: its slot copies nothing into
+    /// `prebuf` and the meter sends no record. Fails with the slot's
+    /// meter on from the start in `new_slots`, with the copy into
+    /// `prebuf` made for every slot with the capability, and with the
+    /// pre-strip meters run whether on or not.
+    #[test]
+    fn a_pre_strip_meter_is_off_until_switched_on() {
+        let mut config = delayed_tone_config();
+        config.inputs[0].pre_strip_meter = true;
+        let (rt, legs, windows) = delayed_tone(&config, &[(0, 0), (1, 1)], Vec::new(), 300);
+        assert!(rt.slots[0].pre_strip && !rt.slots[0].pre_strip_on);
+        assert_eq!(rt.pre_taps.len(), 1);
+        assert!(windows.is_empty(), "{windows:?}");
+        assert!(legs.last().unwrap()[0].iter().any(|&y| y != 0.0));
+        for c in 0..rt.prebuf.channels() {
+            assert!(
+                rt.prebuf.channel(c).iter().all(|&y| y == 0.0),
+                "channel {c}"
+            );
+        }
+    }
+
+    /// A pre-strip meter switched on at window 2, off inside window 5 and
+    /// on again at window 8 reads windows 2 to 4 and from 8 on, none of
+    /// 5 to 7, each at the tone's level then, bit for bit as metered
+    /// whole: the tone at -6 dB before the stop, at -30 dB from window 6
+    /// on. Switched on again, the meter starts afresh, so window 8 reads
+    /// -30 dB alone and not the part of window 5 metered before the stop.
+    /// Fails with the `restart` dropped from `Rt::set_pre_strip_meter`,
+    /// window 8 then reading -6 dB, and with the meter left running when
+    /// switched off.
+    #[test]
+    fn a_pre_strip_meter_meters_exactly_where_it_is_on() {
+        let mut config = delayed_tone_config();
+        config.inputs[0].pre_strip_meter = true;
+        let w = 4800u64;
+        let set = |enabled| Change::PreStripMeter { slot: 0, enabled };
+        let level = |level_db| Change::Tone {
+            slot: 0,
+            params: ToneParams {
+                level_db,
+                ..ToneParams::DEFAULT
+            },
+        };
+        let changes = vec![
+            (0, level(-6.0)),
+            (2 * w, set(true)),
+            (5 * w + 960, set(false)),
+            (6 * w, level(-30.0)),
+            (8 * w, set(true)),
+        ];
+        let blocks = 12 * w / u64::from(config.block_size);
+        let (_, _, windows) = delayed_tone(&config, &[(0, 0), (1, 1)], changes, blocks);
+        let metered: Vec<u64> = windows.keys().copied().collect();
+        assert_eq!(metered, [2, 3, 4, 8, 9, 10, 11]);
+        let peak = |w: u64, db: f32| {
+            let p = ToneParams::DEFAULT;
+            (w * 4800..(w + 1) * 4800)
+                .map(|i| {
+                    let x = samplez_dsp::tone::sine(i, p.frequency_hz, 48_000);
+                    (samplez_dsp::tone::level_gain(db) * x).abs()
+                })
+                .fold(0.0f32, f32::max)
+        };
+        for (&w, peaks) in &windows {
+            let want = peak(w, if w < 6 { -6.0 } else { -30.0 });
+            assert!(
+                peaks.iter().all(|&p| p == want),
+                "window {w}: {peaks:?} {want}"
             );
         }
     }

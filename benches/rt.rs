@@ -29,7 +29,8 @@
 //! And on the block that ends a meter slice for 48 stereo outputs, with
 //! and without each correlating its legs, and for 64 stereo inputs, with
 //! and without each metered before its strip or feeding the matrix
-//! from before its strip as well. And on one block of 32 stereo outputs
+//! from before its strip as well, and with their true peaks metered and
+//! the pre-strip meter of none, half or all of them switched on. And on one block of 32 stereo outputs
 //! with their limiters on, alone and after a strip with every unit on
 //! and a delay line.
 //! The hard limits are the instruction counts measured in the builder
@@ -837,35 +838,61 @@ const SLICE_CORRELATED: u64 = 563_796;
 
 // The block that ends a meter slice for 64 stereo inputs feeding one
 // stereo output, every input metered, without and with every input
-// metered before its strip too (`preStripMeter`), and with every input
-// feeding the output from its pre-strip rows as well (`preStripRows`).
-// The differences are the copies of each input's block before its strip
-// and its second meter, and the copies and the 256 coefficients more.
+// metered before its strip too (`preStripMeter`, switched on), and with
+// every input feeding the output from its pre-strip rows as well
+// (`preStripRows`). The differences are the copies of each input's block
+// before its strip and its second meter, and the copies and the 256
+// coefficients more.
+// At the full shape again with every input's true peak metered: without
+// a pre-strip meter, and with every input configured with one and none,
+// half or all of them switched on. A pre-strip meter switched off costs
+// what an input without one does: its limit is `tp_plain`'s count plus
+// 1 %, not 10 %.
 #[library_benchmark]
 #[bench::plain(setup = inputs_plain, config = limit(INPUTS_PLAIN))]
 #[bench::pre_strip(setup = inputs_pre_strip, config = limit(INPUTS_PRE_STRIP))]
 #[bench::pre_strip_rows(setup = inputs_pre_strip_rows, config = limit(INPUTS_PRE_STRIP_ROWS))]
+#[bench::tp_plain(setup = inputs_tp_plain, config = limit(INPUTS_TP_PLAIN))]
+#[bench::tp_off(setup = inputs_tp_off, config = limit(INPUTS_TP_OFF))]
+#[bench::tp_half(setup = inputs_tp_half, config = limit(INPUTS_TP_HALF))]
+#[bench::tp_on(setup = inputs_tp_on, config = limit(INPUTS_TP_ON))]
 fn input_slice_end(mut s: samplez::bench::Slice) -> samplez::bench::Slice {
     s.run();
     s
 }
 
-fn inputs_setup(pre_strip: bool, rows: bool) -> samplez::bench::Slice {
+fn inputs_setup(pre_strip: (bool, usize), rows: bool, true_peak: bool) -> samplez::bench::Slice {
     let libmxl =
         std::env::var("SAMPLEZ_TEST_LIBMXL").unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".into());
-    samplez::bench::Slice::inputs(&libmxl, 64, pre_strip, rows)
+    samplez::bench::Slice::inputs(&libmxl, 64, pre_strip, rows, true_peak)
 }
 
 fn inputs_plain() -> samplez::bench::Slice {
-    inputs_setup(false, false)
+    inputs_setup((false, 0), false, false)
 }
 
 fn inputs_pre_strip() -> samplez::bench::Slice {
-    inputs_setup(true, false)
+    inputs_setup((true, 64), false, false)
 }
 
 fn inputs_pre_strip_rows() -> samplez::bench::Slice {
-    inputs_setup(false, true)
+    inputs_setup((false, 0), true, false)
+}
+
+fn inputs_tp_plain() -> samplez::bench::Slice {
+    inputs_setup((false, 0), false, true)
+}
+
+fn inputs_tp_off() -> samplez::bench::Slice {
+    inputs_setup((true, 0), false, true)
+}
+
+fn inputs_tp_half() -> samplez::bench::Slice {
+    inputs_setup((true, 32), false, true)
+}
+
+fn inputs_tp_on() -> samplez::bench::Slice {
+    inputs_setup((true, 64), false, true)
 }
 
 // Measured 380,424 and 690,760: the copies and the pre-strip meters of
@@ -876,6 +903,14 @@ const INPUTS_PRE_STRIP: u64 = 759_836;
 // Measured 389,253, 8,896 above `plain` (380,357 in the same run): the
 // copies into the pre-strip rows and the 256 coefficients they add.
 const INPUTS_PRE_STRIP_ROWS: u64 = 428_179;
+// Measured 554,229, 555,765, 797,589 and 1,039,413 with every input's
+// true peak metered: 64 pre-strip meters switched off cost 1,536 more
+// than inputs without one, 0.28 %, and each one on about 7,560.
+const INPUTS_TP_PLAIN_MEASURED: u64 = 554_229;
+const INPUTS_TP_PLAIN: u64 = 609_652;
+const INPUTS_TP_OFF: u64 = INPUTS_TP_PLAIN_MEASURED + INPUTS_TP_PLAIN_MEASURED / 100;
+const INPUTS_TP_HALF: u64 = 877_348;
+const INPUTS_TP_ON: u64 = 1_143_355;
 
 library_benchmark_group!(name = slices, benchmarks = [slice_end, input_slice_end]);
 

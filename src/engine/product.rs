@@ -105,8 +105,10 @@ pub(crate) struct ProductFill {
     /// Per input slot the index its crossfade started at.
     crossfades: Vec<Option<u64>>,
     detached: Vec<bool>,
-    /// A bit per output disabled, and per meter paused.
+    /// A bit per output disabled, per slot with its pre-strip meter on,
+    /// and per meter paused.
     disabled_targets: u64,
+    pre_strip_targets: u64,
     paused_targets: u128,
     /// Empty for none, as a fill takes them: a state and pending list
     /// without masks or depths pay nothing for them.
@@ -150,6 +152,10 @@ impl ProductFill {
         let disabled_targets = (config.outputs.iter().enumerate())
             .filter(|&(o, cfg)| !state.outputs.get(o).copied().unwrap_or(cfg.enabled))
             .fold(0, |d, (o, _)| d | bit(o));
+        // A slot past the list has its pre-strip meter off.
+        let pre_strip_targets = (state.pre_strip_meters.iter().enumerate())
+            .filter(|&(_, &on)| on)
+            .fold(0, |p, (slot, _)| p | bit(slot));
         // A meter past the list runs.
         let paused_targets = (state.loudness_running.iter().enumerate())
             .filter(|&(_, &running)| !running)
@@ -232,6 +238,7 @@ impl ProductFill {
                 .collect(),
             detached: state.flows.iter().map(Option::is_none).collect(),
             disabled_targets,
+            pre_strip_targets,
             paused_targets,
             masks: mask_targets.clone(),
             mask_targets,
@@ -284,6 +291,7 @@ impl ProductFill {
         depths.copy_from_slice(&self.depth_targets);
         depth_fadings.copy_from_slice(&self.depth_fading_targets);
         let mut disabled = self.disabled_targets;
+        let mut pre_strip = self.pre_strip_targets;
         let mut paused = self.paused_targets;
         // Whatever a spare core held.
         core.ducks.copy_from(&self.cold);
@@ -321,6 +329,9 @@ impl ProductFill {
                 Change::Output { output, enabled } => {
                     disabled = output_disabled(disabled, output, enabled);
                 }
+                Change::PreStripMeter { slot, enabled } => {
+                    pre_strip = (pre_strip & !bit(slot)) | (u64::from(enabled) << slot);
+                }
                 // Folded into `paused` above.
                 Change::LoudnessRun { .. } => {}
                 // The core holds neither generation nor a strip, limiter,
@@ -355,6 +366,9 @@ impl ProductFill {
                         }
                         for &(o, enabled) in &b.outputs {
                             disabled = output_disabled(disabled, o as usize, enabled);
+                        }
+                        for &(slot, enabled) in &b.pre_strip_meters {
+                            pre_strip = (pre_strip & !(1 << slot)) | (u64::from(enabled) << slot);
                         }
                         // After the gains, as the RT thread applies them.
                         b.masks.each(|c, k| {
@@ -452,6 +466,7 @@ impl ProductFill {
         core.entries_page = None;
         core.entries_lost = false;
         core.outputs_disabled = disabled;
+        core.pre_strip_meters = pre_strip;
         core.loudness_paused = paused;
         // The RT thread keeps its strips. An input that is up and attached
         // continues as it does on a replica that ran through: its fade-in
@@ -591,6 +606,7 @@ mod tests {
                 .map(|i| Some(format!("5fbec3b1-1b0f-417d-9059-00000000000{i}")))
                 .collect(),
             outputs: Vec::new(),
+            pre_strip_meters: Vec::new(),
             loudness_running: Vec::new(),
             strips: vec![Vec::new(); SLOTS],
             limiters: Vec::new(),

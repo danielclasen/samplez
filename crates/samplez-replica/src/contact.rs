@@ -4273,6 +4273,7 @@ mod tests {
                 up: Vec::new(),
                 flows: log.flows.clone(),
                 outputs: log.outputs.clone(),
+                pre_strip_meters: Vec::new(),
                 loudness_running: Vec::new(),
                 strips: Vec::new(),
                 ducks: Vec::new(),

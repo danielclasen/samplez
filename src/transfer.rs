@@ -104,6 +104,10 @@ pub(crate) struct DelayCore {
     pub span: Vec<Vec<f32>>,
 }
 
+fn is_zero(mask: &u64) -> bool {
+    *mask == 0
+}
+
 /// Serde of a mask of meters as two words, the low one first: a JSON
 /// number holds 64 bits.
 mod meter_mask {
@@ -241,6 +245,10 @@ pub struct Core {
     /// paused, a bit per meter: the outputs, then the configured meters.
     #[serde(with = "meter_mask")]
     pub(crate) loudness_paused: u128,
+    /// The slots whose pre-strip meter a `PreStripMeter` entry switched
+    /// on, a bit per slot; not encoded while none is.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) pre_strip_meters: u64,
     pub(crate) slots: Vec<SlotCore>,
     /// Per output its limiter, its state included; none where the
     /// configuration has none. A core built from product state leaves the
@@ -298,6 +306,7 @@ impl Core {
             entries_lost: false,
             outputs_disabled: 0,
             loudness_paused: 0,
+            pre_strip_meters: 0,
             slots: vec![SlotCore::default(); slots],
             limiters: vec![None; outs],
             outs: Vec::with_capacity(outs),
@@ -637,6 +646,7 @@ impl Core {
                 .unwrap_or(0)
                 == 0
             && self.loudness_paused.checked_shr(meters as u32).unwrap_or(0) == 0
+            && (self.pre_strip_meters.checked_shr(slots as u32)).unwrap_or(0) == 0
             && self.page_entries.len() <= page_entries
             && self.pending.iter().chain(&self.awaiting_gen).all(entry)
             && self.batches.iter().all(batch)
@@ -699,6 +709,7 @@ pub(crate) fn fits(
                 && fade.is_none_or(|f| f.is_valid())
         }
         Change::Output { output, .. } => output < outputs,
+        Change::PreStripMeter { slot, .. } => slot < slots,
         Change::LoudnessRun { meter, .. } | Change::ResetLoudness { meter } => meter < meters,
         Change::InputDown { slot }
         | Change::InputUp { slot }
@@ -1132,6 +1143,7 @@ fn change_of(entry: &Entry) -> Change {
             output: slot,
             enabled,
         },
+        Entry::PreStripMeter { slot, enabled } => Change::PreStripMeter { slot, enabled },
         Entry::Strip { slot, param } => Change::Strip { slot, param },
         Entry::OutputStrip { output, param } => Change::OutputStrip { output, param },
         Entry::Limiter { output, params } => Change::Limiter { output, params },
@@ -1181,6 +1193,10 @@ pub struct ProductState {
     /// Per output whether it is enabled in the log, its last `Output`'s
     /// value; an output past the list is as configured (`enabled`).
     pub outputs: Vec<bool>,
+    /// Per input slot whether its pre-strip meter is on in the log, its
+    /// last `PreStripMeter`'s value; a slot past the list has it off. A
+    /// meter switched on at the install starts its measurement there.
+    pub pre_strip_meters: Vec<bool>,
     /// Per meter, the outputs then the configured meters, whether its
     /// loudness measurement runs in the log, its last `LoudnessRun`'s
     /// value; a meter past the list runs. A loudness reset is not state:
@@ -1752,6 +1768,41 @@ mod tests {
         // A strip's own state can name a delay: the part's own key counts.
         let value = serde_json::to_value(&part).unwrap();
         assert!(value.get("delay").is_none(), "{value}");
+    }
+
+    /// The pre-strip meters a core holds on decode as encoded, and a core
+    /// holding none encodes no field for them, as before they existed; a
+    /// core holding one on for a slot the engine lacks, or pending a
+    /// `PreStripMeter` for one, does not fit it.
+    #[test]
+    fn a_core_carries_the_pre_strip_meters_within_the_engines_slots() {
+        let fits = |c: &Core, legs: &[usize]| {
+            c.fits(2, 2, 1, 1, legs, &[], &[], &[], &[], &[], 48, 8, &[])
+        };
+        let plain = copy().encode();
+        assert!(!plain.contains("pre_strip_meters"));
+        let mut c = copy();
+        c.core.pre_strip_meters = 0b10;
+        let decoded = CoreCopy::decode(&c.encode()).unwrap();
+        assert_eq!(decoded.core.pre_strip_meters, 0b10);
+        assert!(fits(&decoded.core, &[1, 1]));
+        let mut c = decoded;
+        c.core.pre_strip_meters = 0b100;
+        assert!(!fits(&c.core, &[1, 1]), "slot 2 of 2");
+        let pending = |slot| {
+            let mut c = copy();
+            c.core.pending.push(RtEntry {
+                id: 8,
+                at_index: 9600,
+                change: Change::PreStripMeter {
+                    slot,
+                    enabled: true,
+                },
+            });
+            fits(&c.core, &[1, 1])
+        };
+        assert!(pending(1));
+        assert!(!pending(2), "slot 2 of 2");
     }
 
     /// The meters a core holds paused decode as encoded, on both words of

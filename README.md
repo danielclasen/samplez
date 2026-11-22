@@ -223,13 +223,24 @@ RMS per channel and the momentary loudness of the input after its
 strip, read or silenced; with `truePeak` set in the input's config,
 also its true peak and largest true peak, computed as an output's at
 the same cost per channel, and without it none.
-With `preStripMeter` set in an input's config, its status also carries
-`pre_strip_meters`, the same readings of the input before its strip:
-the block as read or generated, its `flowChannels` selected, after the
-fade-in, a re-route's crossfade, silencing and the input's delay line
-(Input delay), before the trim and the rest of the strip. It costs a
-copy of the block and a second input meter on the RT thread; without it
-the input has none and nothing is copied.
+With `preStripMeter` set in an input's config, the input has a second
+meter, the same readings of the input before its strip: the block as
+read or generated, its `flowChannels` selected, after the fade-in, a
+re-route's crossfade, silencing and the input's delay line (Input
+delay), before the trim and the rest of the strip. The setting reserves
+the meter; a `PreStripMeter` entry (`Engine::set_pre_strip_meter`)
+switches it on or off from its index, and it starts off. While it is
+on, it costs a copy of the block and a second input meter on the RT
+thread, and the input's status carries `pre_strip_meters`; while it is
+off, nothing is copied or metered and the status carries none, as for
+an input without the setting, on which an entry switching it on is
+refused (one switching it off is taken on any input). Switched on, the
+meter starts its measurement afresh at the first 10 ms slice at or
+after the entry's index: its readings, its momentary loudness once
+400 ms are in and its largest true peak cover only what it metered
+since. Meters enter no page hash, and neither does the switch; a core
+copy and a product state (`Targets::pre_strip_meters`,
+`ProductState::pre_strip_meters`) carry it.
 RMS is referenced to a sine as in AES17: the root mean square times the
 square root of 2, so a full-scale sine reads 1.0 (0 dB FS).
 
@@ -355,7 +366,8 @@ index and reads no flow, is not polled and is not reported until a
 `Limiter` (an output's limiter parameters, below), `Delay` (an input's
 delay, below), `OutputDelay` (an output's delay, below), `Tone` (a tone
 generator's frequency, level and ident,
-below), `LoudnessRun` (a meter's loudness measurement paused or
+below), `PreStripMeter` (an input's pre-strip meter switched on or off,
+see Meters), `LoudnessRun` (a meter's loudness measurement paused or
 run from the index, see Meters), `ResetLoudness` (a meter's loudness
 measurement restarted at the first window from the index, see Meters),
 `Output` (an output
@@ -1394,7 +1406,8 @@ a change to how either is computed bumps `PROTOCOL`, also where the
 samples stay the same, and the fingerprint value is replaced with that
 bump. `PROTOCOL` itself is a pinned value too
 (`entry::tests::the_protocol_is_pinned`), which a bump replaces and
-gives its reason in.
+gives its reason in. At `PROTOCOL` 6 the log carries the pre-strip
+meter's entry and targets (Meters); a replica at 5 does not.
 
 A rollout that changes the key hands the baseline over at a page and
 block boundary P to a replica at the StatefulSet's target revision,

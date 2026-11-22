@@ -848,6 +848,7 @@ pub fn hold_scenario(e: &Engine) {
             .collect(),
         outputs: Vec::new(),
         // Rebuilt with the output's loudness paused, as the log left it.
+        pre_strip_meters: Vec::new(),
         loudness_running: vec![false],
         strips: vec![Vec::new()],
         ducks: Vec::new(),
