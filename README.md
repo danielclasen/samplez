@@ -26,7 +26,7 @@ matrix, are built on it.
   index
 - A channel strip per input, set by strip entries for inputs of up to 8
   channels: trim, per-leg trim and polarity, high-pass, four-band
-  equaliser, gate and compressor
+  equaliser, gate and compressor with a parallel mix
 - A delay line per input, opt-in by configuration, up to 5 s
 - Line-up tone generators: an input configured with `tone` reads no flow
   and computes a sine of 20 Hz to 20 kHz at -60 to 0 dBFS on its legs,
@@ -552,6 +552,23 @@ an input wider than 8 channels, or one its strip refuses, is refused
 when appended (`append`) or set (`set_strip`); one that a strip on the
 RT thread still refuses is counted in `strip_refused`, not applied, and
 marks the engine diverged.
+
+The compressor's `mix`, 0 to 1, is the share of the compressed signal
+in the strip's output, the rest the input unchanged (parallel
+compression): `(1 - mix) x + mix c`, `c` the compressor's output with
+its makeup. It is applied as one gain per sample, `1 + mix (g - 1)`,
+`g` the compressor's gain with the makeup, the same gain the
+compressor alone applies at a mix of 1, so the two shares stay
+sample-aligned, cost nothing over the compressor alone and add no
+latency. A mix change ramps over the strip's ramp, as switching the
+compressor does. At 0 an enabled compressor passes its input's bits
+while its gain keeps following the key, so a mix raised from 0 starts
+from that gain rather than attacking from 0 dB; only a compressor
+switched off rests its gain. At 1, the default, the output is the
+compressor's alone. The mix and its ramp are strip state: a core copy
+carries them, so a replica that replays or resyncs computes its donor's
+samples mid ramp, and a rebuild from product state has the strip's
+documented exceptions (Starting a replica) and no others.
 
 An input configured with `preStripRows: true` also feeds the matrix
 ahead of its strip: its channels are added as matrix rows after every
@@ -1411,8 +1428,8 @@ a change to how either is computed bumps `PROTOCOL`, also where the
 samples stay the same, and the fingerprint value is replaced with that
 bump. `PROTOCOL` itself is a pinned value too
 (`entry::tests::the_protocol_is_pinned`), which a bump replaces and
-gives its reason in. At `PROTOCOL` 6 the log carries the pre-strip
-meter's entry and targets (Meters); a replica at 5 does not.
+gives its reason in. At `PROTOCOL` 7 a strip's compressor carries a
+mix (Channel strip), which a replica at 6 would drop.
 
 A rollout that changes the key hands the baseline over at a page and
 block boundary P to a replica at the StatefulSet's target revision,

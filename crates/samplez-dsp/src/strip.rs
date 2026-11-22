@@ -51,6 +51,8 @@ pub const COMP_RATIO: RangeInclusive<f32> = 1.0..=20.0;
 pub const COMP_KNEE_DB: RangeInclusive<f32> = 0.0..=24.0;
 /// Compressor makeup gain, dB.
 pub const MAKEUP_DB: RangeInclusive<f32> = 0.0..=24.0;
+/// Compressor mix, the share of the compressed signal in the output.
+pub const COMP_MIX: RangeInclusive<f32> = 0.0..=1.0;
 /// Attack time constant of the gate and the compressor, ms.
 pub const ATTACK_MS: RangeInclusive<f32> = 0.1..=200.0;
 /// Release time constant of the gate and the compressor, ms.
@@ -195,7 +197,7 @@ pub const GATE_OFF: GateParams = GateParams {
 };
 
 /// The compressor a refused compressor setting is replaced with: off,
-/// every value at the low end of its range.
+/// every value at the low end of its range but the mix, which is full.
 pub const COMP_OFF: CompParams = CompParams {
     enabled: false,
     threshold_db: *COMP_THRESHOLD_DB.start(),
@@ -204,6 +206,7 @@ pub const COMP_OFF: CompParams = CompParams {
     release_ms: *RELEASE_MS.start(),
     knee_db: *COMP_KNEE_DB.start(),
     makeup_db: *MAKEUP_DB.start(),
+    mix: *COMP_MIX.end(),
 };
 
 impl StripParam {
@@ -279,6 +282,7 @@ impl StripParam {
                 release_ms: c(p.release_ms, &RELEASE_MS)?,
                 knee_db: c(p.knee_db, &COMP_KNEE_DB)?,
                 makeup_db: c(p.makeup_db, &MAKEUP_DB)?,
+                mix: c(p.mix, &COMP_MIX)?,
             }),
             other => other,
         })
@@ -325,7 +329,8 @@ impl StripParam {
                 within("comp attack", c.attack_ms, &ATTACK_MS)?;
                 within("comp release", c.release_ms, &RELEASE_MS)?;
                 within("comp knee", c.knee_db, &COMP_KNEE_DB)?;
-                within("comp makeup", c.makeup_db, &MAKEUP_DB)
+                within("comp makeup", c.makeup_db, &MAKEUP_DB)?;
+                within("comp mix", c.mix, &COMP_MIX)
             }
             StripParam::DynamicsBeforeEq { .. } => Ok(()),
         }
@@ -838,6 +843,10 @@ mod tests {
                 ratio: 0.0,
                 ..COMP_OFF
             }),
+            StripParam::Comp(CompParams {
+                mix: nan,
+                ..COMP_OFF
+            }),
         ];
         let mut set = Strip::new(2, RAMP);
         for param in refused {
@@ -892,6 +901,10 @@ mod tests {
             ..GATE_OFF
         });
         assert_eq!(gate.clamped().unwrap().check(2), Ok(()));
+        let mix = |mix| StripParam::Comp(CompParams { mix, ..COMP_OFF });
+        assert_eq!(mix(1.5).clamped(), Some(mix(1.0)));
+        assert_eq!(mix(-0.5).clamped(), Some(mix(0.0)));
+        assert_eq!(mix(nan).clamped(), None);
         assert_eq!(StripParam::Trim { db: nan }.clamped(), None);
         assert_eq!(gate_inf().clamped(), None);
         // A leg or band the strip lacks stays refused either way.
@@ -923,6 +936,7 @@ mod tests {
         release_ms: 80.0,
         knee_db: 6.0,
         makeup_db: 4.0,
+        mix: 1.0,
     };
 
     /// The peak of `frames` samples of a 100 Hz sine at `level` from
@@ -938,6 +952,71 @@ mod tests {
             peak = b.iter().fold(peak, |p, v| p.max(v.abs()));
         }
         peak
+    }
+
+    /// A compressor at a mix of 0 passes its input, but its gain follows
+    /// the key, so flipping the dynamics order crossfades as it does for
+    /// any unit at work. The reference is the same strip with a gate
+    /// that is open throughout, which passes every bit and crossfades a
+    /// flip by itself: through each flip, and through a raise of the mix
+    /// to 0.5 after it, the two compute the same bits. A strip that took
+    /// the compressor at a mix of 0 for unity would flip at once, its
+    /// equaliser state continuing where the crossfade starts the other
+    /// order's from rest.
+    #[test]
+    fn a_flip_at_a_mix_of_0_crossfades() {
+        let comp = |mix| {
+            StripParam::Comp(CompParams {
+                threshold_db: -40.0,
+                ratio: 10.0,
+                mix,
+                ..COMP
+            })
+        };
+        let open = StripParam::Gate(GateParams {
+            threshold_db: -80.0,
+            ..GATE
+        });
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        for before in [false, true] {
+            let build = |gate: Option<StripParam>| {
+                let mut s = Strip::new(1, RAMP);
+                let bell = StripParam::EqBand {
+                    band: 1,
+                    value: band(BandType::Peak, 100.0, 12.0, 8.0),
+                };
+                let order = StripParam::DynamicsBeforeEq { enabled: before };
+                for p in [StripParam::Eq { enabled: true }, bell, comp(0.0), order]
+                    .into_iter()
+                    .chain(gate)
+                {
+                    assert!(s.set(p), "{p:?}");
+                }
+                s
+            };
+            let (mut dry, mut reference) = (build(None), build(Some(open)));
+            // Never at 0, so the gate opens on the first sample and stays.
+            let mut start = 100usize;
+            let mut run = |dry: &mut Strip, reference: &mut Strip, blocks: usize| {
+                for _ in 0..blocks {
+                    let x: Vec<f32> = (start..start + 48)
+                        .map(|n| 0.5 * (n as f32 * 0.013).sin())
+                        .collect();
+                    let (mut a, mut b) = (x.clone(), x.clone());
+                    dry.process(&mut a, 48);
+                    reference.process(&mut b, 48);
+                    assert_eq!(bits(&a), bits(&b), "before {before}, at {start}");
+                    start += 48;
+                }
+            };
+            run(&mut dry, &mut reference, 100);
+            let flip = StripParam::DynamicsBeforeEq { enabled: !before };
+            assert!(dry.set(flip) && reference.set(flip));
+            assert!(dry.is_fading(), "before {before}: flipped at once");
+            run(&mut dry, &mut reference, 2 * RAMP as usize / 48);
+            assert!(dry.set(comp(0.5)) && reference.set(comp(0.5)));
+            run(&mut dry, &mut reference, 4 * RAMP as usize / 48);
+        }
     }
 
     /// Flipping the order crossfades: through the flip the output peaks
@@ -959,6 +1038,7 @@ mod tests {
             release_ms: 100.0,
             knee_db: 0.0,
             makeup_db: 0.0,
+            mix: 1.0,
         });
         let gate = StripParam::Gate(GateParams {
             enabled: true,
@@ -1283,8 +1363,24 @@ mod tests {
                 makeup_db: -1.0,
                 ..COMP
             }),
+            StripParam::Comp(CompParams { mix: -0.01, ..COMP }),
+            StripParam::Comp(CompParams { mix: 1.01, ..COMP }),
+            StripParam::Comp(CompParams {
+                mix: f32::NAN,
+                ..COMP
+            }),
+            StripParam::Comp(CompParams {
+                mix: f32::INFINITY,
+                ..COMP
+            }),
         ]);
-        for p in [StripParam::Gate(GATE), StripParam::Comp(COMP)] {
+        for p in [
+            StripParam::Gate(GATE),
+            StripParam::Comp(COMP),
+            StripParam::Comp(CompParams { mix: 0.0, ..COMP }),
+            StripParam::Comp(CompParams { mix: -0.0, ..COMP }),
+            StripParam::Comp(CompParams { mix: 0.5, ..COMP }),
+        ] {
             assert_eq!(p.check(1), Ok(()));
         }
         let mut s = Strip::new(2, RAMP);
@@ -1802,6 +1898,7 @@ mod tests {
                 release_ms: pick(rng, &RELEASE_MS),
                 knee_db: pick(rng, &COMP_KNEE_DB),
                 makeup_db: pick(rng, &MAKEUP_DB),
+                mix: pick(rng, &COMP_MIX),
             }),
             _ => StripParam::DynamicsBeforeEq { enabled: on },
         }
@@ -1872,6 +1969,7 @@ mod tests {
                 release_ms: 50.0,
                 knee_db: 0.0,
                 makeup_db: 0.0,
+                mix: 1.0,
             }),
         ];
         for p in params {
@@ -2020,6 +2118,7 @@ mod tests {
             release_ms: 5000.0,
             knee_db: 6.0,
             makeup_db: 3.0,
+            mix: 1.0,
         })));
         assert!(base.set(StripParam::Eq { enabled: true }));
         let mut burst: Vec<f32> = (0..960).map(|n| (n as f32 * 0.1).sin()).collect();

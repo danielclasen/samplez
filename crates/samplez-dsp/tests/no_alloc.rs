@@ -177,6 +177,7 @@ fn process_calls_do_not_allocate() {
                     release_ms: 50.0,
                     knee_db: 6.0,
                     makeup_db: 3.0,
+                    mix: 1.0,
                 }),
             ] {
                 assert!(s.set(p));

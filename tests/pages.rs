@@ -276,6 +276,7 @@ fn two_engines_with_strips_hash_the_pages_both_computed_alike() {
                     release_ms: 80.0,
                     knee_db: 0.0,
                     makeup_db: 3.0,
+                    mix: 1.0,
                 }),
             ),
             (at2 + 2 * B, StripParam::DynamicsBeforeEq { enabled: true }),
@@ -452,6 +453,101 @@ fn three_engines_with_a_delay_and_a_strip_change_hash_the_pages_alike() {
                 assert_ne!(hash(p), Some(h), "page {p} unchanged by the trim");
             }
         }
+        Ok(())
+    });
+}
+
+/// Three engines on the same input and the same log run a compressor's
+/// mix through changes alike: switched on at full mix, ramped to half,
+/// to none and to a fifth, every page all three computed hashes alike,
+/// those inside the ramps included. The mix moves the output: settled at
+/// half mix a page differs from one of the same pilot phase at full mix
+/// and from one at no mix. Pages are compared up to the first skip and
+/// outside those a silenced block disturbed; a run with fewer than
+/// twenty compared, or without the settled pages, runs again. Fails with
+/// the compressor ignoring its mix.
+#[test]
+fn three_engines_mix_a_compressor_alike() {
+    use samplez_dsp::strip::{CompParams, StripParam};
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let rs = [0; 3].map(|_| start(&domain, &src, 3, 1 << 16));
+        let k = rs.iter().map(|r| processed(&r.e)).max().unwrap();
+        let at = (k + u64::from(RAMP) / B + 100) * B;
+        let comp = |mix| {
+            StripParam::Comp(CompParams {
+                enabled: true,
+                threshold_db: -30.0,
+                ratio: 10.0,
+                attack_ms: 1.0,
+                release_ms: 80.0,
+                knee_db: 0.0,
+                makeup_db: 12.0,
+                mix,
+            })
+        };
+        // A change every 36 pages, past the ramp of 23.4; the pilot
+        // repeats every three.
+        let step = 36 * PAGE;
+        let mixes = [1.0, 0.5, 0.0, 0.2];
+        let entries: Vec<(u64, Entry)> = (0..)
+            .zip(mixes)
+            .map(|(i, mix)| {
+                let param = comp(mix);
+                (at + i * step, Entry::Strip { slot: 0, param })
+            })
+            .collect();
+        for r in &rs {
+            for (id, (at, entry)) in entries.iter().enumerate() {
+                r.e.append(id as u64 + 1, *at, entry.clone()).unwrap();
+            }
+            r.e.commit(entries.len() as u64);
+        }
+        let end = at + 4 * step;
+        wait_all(&rs.each_ref(), end / B);
+        let mut cut = u64::MAX;
+        let mut disturbed = Vec::new();
+        for r in &rs {
+            let vs: Vec<BlockVerdict> = r.verdicts.try_iter().collect();
+            for w in vs.windows(2) {
+                if w[1].k > w[0].k + 1 && w[1].k * B > at {
+                    cut = cut.min(((w[0].k + 1) * B).max(at));
+                }
+            }
+            for v in vs.iter().filter(|v| v.silenced != 0) {
+                let (from, to) = (v.k * B, (v.k + 1) * B + u64::from(RAMP));
+                disturbed.push((from / PAGE, to.div_ceil(PAGE)));
+                if to > at {
+                    cut = cut.min(from.max(at));
+                }
+            }
+        }
+        let pages = rs.each_ref().map(Replica::pages);
+        let triples: Vec<_> = (pages[0].iter())
+            .filter(|(p, _)| **p >= at / PAGE && (*p + 1) * PAGE <= cut.min(end))
+            .filter(|(p, _)| !disturbed.iter().any(|d| (d.0..d.1).contains(*p)))
+            .filter_map(|(p, h)| Some([*h, *pages[1].get(p)?, *pages[2].get(p)?]))
+            .collect();
+        for [a, b, c] in &triples {
+            let page = |h: &PageHash| (h.hash, h.fingerprint);
+            assert_eq!(page(a), page(b), "page {}", a.page);
+            assert_eq!(page(a), page(c), "page {}", a.page);
+        }
+        if triples.len() < 20 {
+            return Err(format!("{} pages compared", triples.len()));
+        }
+        // Settled at full, half and no mix, at one pilot phase.
+        let full = (at + step) / PAGE - 6;
+        let settled = [full, full + 36, full + 72];
+        let hash = |p: u64| triples.iter().find(|t| t[0].page == p).map(|t| t[0].hash);
+        let hashes: Option<Vec<u64>> = settled.iter().map(|&p| hash(p)).collect();
+        let Some(&[full, half, none]) = hashes.as_deref() else {
+            return Err(format!("settled pages {settled:?} not all compared"));
+        };
+        assert_ne!(half, full, "half mix hashes as full");
+        assert_ne!(half, none, "half mix hashes as none");
         Ok(())
     });
 }

@@ -457,6 +457,7 @@ fn same_bits(a: &StripParam, b: &StripParam) -> bool {
                 release_ms,
                 knee_db,
                 makeup_db,
+                mix,
             } = c;
             enabled == d.enabled
                 && f(threshold_db, d.threshold_db)
@@ -465,6 +466,7 @@ fn same_bits(a: &StripParam, b: &StripParam) -> bool {
                 && f(release_ms, d.release_ms)
                 && f(knee_db, d.knee_db)
                 && f(makeup_db, d.makeup_db)
+                && f(mix, d.mix)
         }
         (P::DynamicsBeforeEq { enabled }, P::DynamicsBeforeEq { enabled: e }) => enabled == e,
         (
@@ -862,7 +864,7 @@ mod tests {
                 release_ms: rel,
             })
         };
-        let comp = |enabled, [t, r, a, rel, k, m]: [f32; 6]| {
+        let comp = |enabled, [t, r, a, rel, k, m, mix]: [f32; 7]| {
             StripParam::Comp(CompParams {
                 enabled,
                 threshold_db: t,
@@ -871,6 +873,7 @@ mod tests {
                 release_ms: rel,
                 knee_db: k,
                 makeup_db: m,
+                mix,
             })
         };
         let mut pairs = vec![
@@ -955,7 +958,7 @@ mod tests {
                 StripParam::DynamicsBeforeEq { enabled: false },
                 StripParam::DynamicsBeforeEq { enabled: true },
             ),
-            (comp(false, [1.0; 6]), comp(true, [1.0; 6])),
+            (comp(false, [1.0; 7]), comp(true, [1.0; 7])),
         ];
         for field in 0..4 {
             let mut x = [1.0; 4];
@@ -966,8 +969,8 @@ mod tests {
             let [u, s, b, sel] = y;
             pairs.push((gate(true, t, r, a, rel), gate(true, u, s, b, sel)));
         }
-        for field in 0..6 {
-            let mut x = [1.0; 6];
+        for field in 0..7 {
+            let mut x = [1.0; 7];
             x[field] = 0.0;
             let mut y = x;
             y[field] = -0.0;
@@ -1338,6 +1341,7 @@ mod tests {
                     release_ms: self.value(),
                     knee_db: self.value(),
                     makeup_db: self.value(),
+                    mix: self.value(),
                 }),
                 _ => StripParam::DynamicsBeforeEq { enabled: on },
             }

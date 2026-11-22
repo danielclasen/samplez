@@ -5506,6 +5506,7 @@ mod tests {
                 release_ms: 40.0,
                 knee_db: 6.0,
                 makeup_db,
+                mix: 1.0,
             })
         };
         let first = [
@@ -5771,6 +5772,7 @@ mod tests {
             release_ms: 40.0,
             knee_db: 6.0,
             makeup_db: 0.0,
+            mix: 1.0,
         });
         let b = 50;
         let block = |k: usize| -> Vec<f32> {

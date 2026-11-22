@@ -514,6 +514,7 @@ fn strips(release_ms: f32, threshold_db: f32) -> [StripParam; 5] {
             release_ms,
             knee_db: 6.0,
             makeup_db: 4.0,
+            mix: 1.0,
         }),
     ]
 }
@@ -587,6 +588,158 @@ fn a_replayed_core_carries_the_strips_mid_envelope() {
         });
         if pages.is_empty() {
             return Err(format!("{} comparable pages before a skip", pages.len()));
+        }
+        let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+        assert!(
+            apart.is_empty(),
+            "pages {apart:?} differ after the hand-over"
+        );
+        Ok(())
+    });
+}
+
+/// The resync row mid mix ramp: a joiner whose compressor mix was set
+/// apart replays a donor's core copied while the donor's mix ramps from
+/// full to a quarter over a second, and from the hand-over on computes
+/// the donor's pages bit for bit, the rest of the ramp included, as the
+/// replay does before it. The core carries the mix ramp's position and
+/// target: a joiner keeping its own would mix another share for good.
+#[test]
+fn a_replayed_core_carries_a_compressor_mix_ramp() {
+    const MIX_RAMP: u32 = 48_000;
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let slow = |c: &mut Config| c.ramp_samples = MIX_RAMP;
+        let a = hashed_of(&domain, &[(&src, 2)], slow);
+        let b = hashed_of(&domain, &[(&src, 2)], slow);
+        let comp = |mix| {
+            StripParam::Comp(CompParams {
+                enabled: true,
+                threshold_db: -30.0,
+                ratio: 10.0,
+                attack_ms: 1.0,
+                release_ms: 80.0,
+                knee_db: 0.0,
+                makeup_db: 12.0,
+                mix,
+            })
+        };
+        let at1 = (now_block() + 20) * B;
+        strip(&a.e, 1, at1, comp(1.0));
+        strip(&b.e, 1, at1, comp(1.0));
+        // Entry 2 once the compressor is in: the donor's mix ramps to a
+        // quarter, the joiner's to three quarters.
+        let at2 = at1 + u64::from(MIX_RAMP) + 100 * B;
+        strip(&a.e, 2, at2, comp(0.25));
+        strip(&b.e, 2, at2, comp(0.75));
+        let into = (at2 + 4 * PAGE) / B;
+        wait_for(Duration::from_secs(10), "the mix ramping", || {
+            processed(&a.e) > into && processed(&b.e) > into
+        });
+        let skips = (a.skipped(), b.skipped());
+        let copy = copy(&a.e);
+        let k0 = copy.k0;
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+        let mut replay = b.e.replay(copy).unwrap();
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        let ramp_end = at2 + u64::from(MIX_RAMP);
+        if (j + 1) * B + 4 * PAGE > ramp_end {
+            return Err(format!("handed over at block {j}, past the ramp"));
+        }
+        let mut pair = Pair::new(&a, &b);
+        let before = pair.comparable((k0 * B / PAGE).saturating_sub(4)..k0 * B / PAGE);
+        if !before.iter().any(|&(_, same)| !same) {
+            return Err("no page before the copy shows the joiner apart".to_owned());
+        }
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        let end = ramp_end / PAGE + 8;
+        let mut pages = BTreeMap::new();
+        wait_for(Duration::from_secs(10), "comparable pages", || {
+            let seen = pair.comparable(from..end);
+            if (a.skipped(), b.skipped()) == skips {
+                pages.extend(seen);
+            }
+            processed(&a.e).min(processed(&b.e)) * B / PAGE >= end + 2
+        });
+        if !pages.keys().any(|&p| (p + 1) * PAGE <= ramp_end) {
+            return Err(format!("{} pages compared, none in the ramp", pages.len()));
+        }
+        let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
+        assert!(
+            apart.is_empty(),
+            "pages {apart:?} differ after the hand-over"
+        );
+        Ok(())
+    });
+}
+
+/// The resync row at a mix of 0: a donor's compressor enabled at a mix
+/// of 0, its gain following a key 30 dB over its threshold while its
+/// output is dry, and a joiner's switched off, which is dry too. The
+/// joiner replays the donor's core and takes it over; a mix of 0.5 set
+/// on both after the hand-over then mixes in the gain the donor tracked
+/// on both, every page bit for bit. A core that left the tracking out
+/// would hand over a compressor at rest that attacks from 0 dB at the
+/// raise.
+#[test]
+fn a_replayed_core_carries_a_compressor_tracking_at_a_mix_of_0() {
+    common::undisturbed(|| {
+        let domain = Domain::new();
+        let src = new_id();
+        let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
+        let (a, b) = (hashed(&domain, &src), hashed(&domain, &src));
+        let comp = |enabled, mix| {
+            StripParam::Comp(CompParams {
+                enabled,
+                threshold_db: -30.0,
+                ratio: 10.0,
+                attack_ms: 10.0,
+                release_ms: 500.0,
+                knee_db: 0.0,
+                makeup_db: 12.0,
+                mix,
+            })
+        };
+        let at1 = (now_block() + 20) * B;
+        strip(&a.e, 1, at1, comp(true, 0.0));
+        strip(&b.e, 1, at1, comp(false, 0.0));
+        let settled = (at1 + u64::from(RAMP)) / B + PAGE / B;
+        wait_for(Duration::from_secs(5), "the compressor tracking", || {
+            processed(&a.e) > settled && processed(&b.e) > settled
+        });
+        let skips = (a.skipped(), b.skipped());
+        let copy = copy(&a.e);
+        let copy = samplez::CoreCopy::decode(&copy.encode()).unwrap();
+        let mut replay = b.e.replay(copy).unwrap();
+        let j = b.e.hand_over(&mut replay, Duration::from_secs(2)).unwrap();
+        let passed = b.e.counters().handovers_passed.load(Relaxed);
+        if passed >= MAX_PASSED {
+            return Err(format!("{passed} hand-overs passed"));
+        }
+        // Raised a few pages after the hand-over, on both.
+        let at2 = ((((j + 1) * B).div_ceil(PAGE) + 4) * PAGE).next_multiple_of(B) + 5 * B;
+        strip(&a.e, 2, at2, comp(true, 0.5));
+        strip(&b.e, 2, at2, comp(true, 0.5));
+        let mut pair = Pair::new(&a, &b);
+        let from = ((j + 1) * B).div_ceil(PAGE);
+        let end = (at2 + u64::from(RAMP)) / PAGE + 16;
+        let mut pages = BTreeMap::new();
+        wait_for(Duration::from_secs(10), "comparable pages", || {
+            let seen = pair.comparable(from..end);
+            if (a.skipped(), b.skipped()) == skips {
+                pages.extend(seen);
+            }
+            processed(&a.e).min(processed(&b.e)) * B / PAGE >= end + 2
+        });
+        let raised = pages.keys().filter(|&&p| p * PAGE >= at2).count();
+        if raised < 4 {
+            return Err(format!("{raised} pages compared after the raise"));
         }
         let apart: Vec<_> = pages.iter().filter(|(_, same)| !**same).collect();
         assert!(

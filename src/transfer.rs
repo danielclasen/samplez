@@ -1526,6 +1526,7 @@ mod tests {
                 release_ms: 5000.0,
                 knee_db: 6.0,
                 makeup_db: 3.0,
+                mix: 1.0,
             }),
         ] {
             assert!(s.set(p));
