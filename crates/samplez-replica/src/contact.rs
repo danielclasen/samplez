@@ -871,6 +871,7 @@ struct Costs {
     ticks: AtomicU64,
     tick_ns: AtomicU64,
     decisions_ns: AtomicU64,
+    decode_ns: AtomicU64,
     receive_ns: AtomicU64,
 }
 
@@ -889,7 +890,9 @@ pub struct CostCounts {
     pub tick: Duration,
     /// [`Contact::decisions`], the leader's.
     pub decisions: Duration,
-    /// Decoding the peers' reports and [`Contact::receive`].
+    /// Decoding the peers' requests that carry a report.
+    pub decode: Duration,
+    /// [`Contact::receive`]: taking a decoded report.
     pub receive: Duration,
 }
 
@@ -1507,13 +1510,14 @@ impl Contact {
             ticks: self.costs.ticks.load(Ordering::Relaxed),
             tick: ns(&self.costs.tick_ns),
             decisions: ns(&self.costs.decisions_ns),
+            decode: ns(&self.costs.decode_ns),
             receive: ns(&self.costs.receive_ns),
         }
     }
 
     /// Counts the CPU time since `since` of decoding a peer's report.
     pub(crate) fn decoded(&self, since: Duration) {
-        add_cpu(&self.costs.receive_ns, since);
+        add_cpu(&self.costs.decode_ns, since);
     }
 
     fn tick_held(&self, members: Members) -> Vec<(NodeId, String, Report)> {

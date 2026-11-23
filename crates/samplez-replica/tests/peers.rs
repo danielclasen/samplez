@@ -647,5 +647,6 @@ async fn the_exposition_carries_report_timeouts_and_dials_per_peer() {
     };
     assert!(cpu("tick") > 0.0);
     assert!(cpu("decisions") > 0.0, "the leader decides");
+    assert!(cpu("decode") > 0.0);
     assert!(cpu("receive") > 0.0);
 }

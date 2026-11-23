@@ -2141,11 +2141,12 @@ fn cost_samples(c: &contact::CostCounts) -> Vec<ReplicaMetric> {
     for (part, cpu) in [
         ("tick", c.tick),
         ("decisions", c.decisions),
+        ("decode", c.decode),
         ("receive", c.receive),
     ] {
         out.push(ReplicaMetric {
             name: "samplez_replica_contact_cpu_seconds_total",
-            help: "CPU time of the threads running the contact loop: a period's state and reports (tick), the leader's decisions, decoding and taking peers' reports (receive).",
+            help: "CPU time of the threads running the contact loop: a period's state and reports (tick), the leader's decisions, decoding peers' reports (decode) and taking them (receive).",
             kind: MetricKind::Counter,
             labels: vec![("part", part.to_owned())],
             value: cpu.as_secs_f64(),

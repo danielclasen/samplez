@@ -1312,8 +1312,8 @@ counts the report periods it ran, fewer than one per `reportPeriodMs`
 when periods were missed, which are skipped rather than caught up; and
 `samplez_replica_contact_cpu_seconds_total`, labelled `part`, the CPU
 time of the threads running it: `tick` for a period's state and the
-reports built, `decisions` for the leader's decisions each period, and
-`receive` for decoding the peers' reports and taking them.
+reports built, `decisions` for the leader's decisions each period,
+`decode` for decoding the peers' reports and `receive` for taking them.
 
 A replica catching up, its log having taken no entry past the commit
 index the first voter report named before that entry's deadline since
