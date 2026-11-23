@@ -650,3 +650,102 @@ async fn the_exposition_carries_report_timeouts_and_dials_per_peer() {
     assert!(cpu("decode") > 0.0);
     assert!(cpu("receive") > 0.0);
 }
+
+/// Prototype measurement, not a test: three replicas over mutual TLS with
+/// contact on, 2 s settling, then 10 s measured. Prints per-part CPU, the
+/// process CPU, report counts and sizes, and delivery and round-trip
+/// latency quantiles. The variant comes from the SAMPLEZ_PROTO_*
+/// environment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proto_measure() {
+    use samplez_replica::contact::{SystemClocks, Timing};
+    use samplez_replica::proto::{STATS, codec, pad, transport};
+    use std::sync::atomic::Ordering::Relaxed;
+    fn rusage() -> (f64, f64) {
+        // SAFETY: an all-zero rusage is valid; getrusage writes it.
+        let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) };
+        let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+        (t(r.ru_utime), t(r.ru_stime))
+    }
+    let set = Set::start().await;
+    for id in 1..=3 {
+        set.replica(id)
+            .contact(
+                Timing::defaults(harness::BLOCK),
+                Arc::new(SystemClocks),
+                None,
+            )
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let total = |set: &Set| {
+        let mut m = BTreeMap::<String, f64>::new();
+        for id in 1..=3 {
+            for s in set.replica(id).replica_metrics() {
+                if s.name.starts_with("samplez_replica_peer_")
+                    || s.name.starts_with("samplez_replica_contact")
+                {
+                    let labels: Vec<_> = s.labels.iter().filter(|l| l.0 != "node").collect();
+                    *m.entry(format!("{}{labels:?}", s.name)).or_default() += s.value;
+                }
+            }
+        }
+        m
+    };
+    let counters = || {
+        [
+            STATS.sent.load(Relaxed),
+            STATS.bytes.load(Relaxed),
+            STATS.encode_ns.load(Relaxed),
+            STATS.skipped.load(Relaxed),
+            STATS.dials.load(Relaxed),
+        ]
+    };
+    STATS.latency.lock().unwrap().clear();
+    STATS.round_trip.lock().unwrap().clear();
+    let (a, c0, k0, t0) = (total(&set), rusage(), counters(), Instant::now());
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let (b, c1, k1, secs) = (total(&set), rusage(), counters(), t0.elapsed().as_secs_f64());
+    let mut latency = std::mem::take(&mut *STATS.latency.lock().unwrap());
+    let mut round_trip = std::mem::take(&mut *STATS.round_trip.lock().unwrap());
+    println!(
+        "PROTO variant transport={:?} codec={:?} pad={} window_s={secs:.3}",
+        transport(),
+        codec(),
+        pad()
+    );
+    for (k, v) in &b {
+        let d = v - a.get(k).copied().unwrap_or(0.0);
+        if d != 0.0 {
+            println!("PROTO metric {k} {d:.6}");
+        }
+    }
+    let names = ["sent", "bytes", "encode_ns", "skipped", "dials"];
+    for (i, n) in names.iter().enumerate() {
+        println!("PROTO stats {n} {}", k1[i] - k0[i]);
+    }
+    println!(
+        "PROTO process_cpu_s user {:.4} system {:.4}",
+        c1.0 - c0.0,
+        c1.1 - c0.1
+    );
+    let q = |v: &mut Vec<u64>, name: &str| {
+        v.sort_unstable();
+        if v.is_empty() {
+            println!("PROTO {name} n 0");
+            return;
+        }
+        let at = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize] as f64 / 1e3;
+        println!(
+            "PROTO {name}_us n {} p50 {:.1} p99 {:.1} p999 {:.1} max {:.1}",
+            v.len(),
+            at(0.5),
+            at(0.99),
+            at(0.999),
+            at(1.0)
+        );
+    };
+    q(&mut latency, "delivery");
+    q(&mut round_trip, "round_trip");
+}

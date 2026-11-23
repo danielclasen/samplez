@@ -17,7 +17,9 @@ hyper = { version = "=1.12.0", features = ["client", "http1"] }
 hyper-util = { version = "=0.1.21", features = ["tokio"] }
 libc = "=0.2.191"
 openraft = "=0.9.26"
+postcard = { version = "=1.2.0", default-features = false, features = ["alloc"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki = { package = "rustls-webpki", version = "=0.103.17", default-features = false, features = ["std"] }
 samplez = { path = "../..", version = "0.26.0" }
 samplez-dsp = { path = "../samplez-dsp", version = "0.26.0" }
 samplez-mxl = { path = "../samplez-mxl", version = "0.26.0" }

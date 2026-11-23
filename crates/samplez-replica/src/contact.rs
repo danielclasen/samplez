@@ -1554,6 +1554,11 @@ impl Contact {
         out
     }
 
+    /// The address of member `id`, as the membership names it.
+    pub fn addr_of(&self, id: NodeId) -> Option<String> {
+        self.lock().members.addrs.get(&id).cloned()
+    }
+
     /// What the contact loop cost so far.
     pub fn costs(&self) -> CostCounts {
         let ns = |a: &AtomicU64| Duration::from_nanos(a.load(Ordering::Relaxed));
@@ -1629,6 +1634,9 @@ impl Contact {
             }
         } else {
             st.own.clock.tai_offset_s = self.clocks.tai_offset_s();
+            if crate::proto::pad() {
+                crate::proto::pad_own(&mut st.own, index_at(tai) / 48, self.id);
+            }
         }
         st.own.config = self.log.config_hash();
         st.own.protocol = PROTOCOL;
@@ -4150,6 +4158,8 @@ pub(crate) async fn run(
     let mut tick = tokio::time::interval(contact.timing.report_period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut senders: BTreeMap<NodeId, watch::Sender<Option<(String, Report)>>> = BTreeMap::new();
+    let mut streams = (crate::proto::transport() == crate::proto::Transport::Stream)
+        .then(|| crate::proto::Streams::new(shared.peers.tls().expect("the peer pool")));
     loop {
         tokio::select! {
             _ = tick.tick() => {
@@ -4159,7 +4169,14 @@ pub(crate) async fn run(
                 // Like its silence metrics, a peer's link counts leave
                 // with it, learners' kept while they are members.
                 shared.peers.retain_links(&|id| members.addrs.contains_key(&id));
+                if let Some(streams) = &mut streams {
+                    streams.retain(|id| voters.contains(&id));
+                }
                 for (to, addr, report) in contact.tick(members) {
+                    if let Some(streams) = &mut streams {
+                        streams.send(to, &addr, &report);
+                        continue;
+                    }
                     senders
                         .entry(to)
                         .or_insert_with(|| send(shared.clone(), to, contact.timing.contact_window))

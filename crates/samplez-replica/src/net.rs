@@ -50,7 +50,7 @@ use crate::snapshot::{StoredEntry, StoredLogId, StoredMembershipConfig, StoredVo
 type Sender = SendRequest<Full<Bytes>>;
 
 /// The host part of `host:port`, without the brackets of an IPv6 address.
-fn host(addr: &str) -> &str {
+pub(crate) fn host(addr: &str) -> &str {
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
     host.trim_start_matches('[').trim_end_matches(']')
 }
@@ -90,6 +90,42 @@ async fn handshake(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static) -> 
         .map_err(io::Error::other)?;
     tokio::spawn(connection);
     Ok(sender)
+}
+
+/// An HTTP/1.1 upgrade of a new connection to `addr` over the peer TLS:
+/// `POST path` answered 101, then the connection is the caller's.
+pub(crate) async fn upgrade(
+    addr: &str,
+    tls: Arc<PeerTls>,
+    path: &str,
+) -> io::Result<hyper::upgrade::Upgraded> {
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(addr).await?.collect();
+    let tcp = TcpStream::connect(&resolved[..]).await?;
+    tcp.set_nodelay(true)?;
+    let name = ServerName::try_from(host(addr).to_owned())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let config = tls.client().map_err(io::Error::other)?;
+    let io = TlsConnector::from(config).connect(name, tcp).await?;
+    let (mut sender, connection) = http1::handshake::<_, Full<Bytes>>(TokioIo::new(io))
+        .await
+        .map_err(io::Error::other)?;
+    tokio::spawn(connection.with_upgrades());
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(header::HOST, host(addr))
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, "samplez-reports")
+        .body(Full::new(Bytes::new()))
+        .expect("a valid request");
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(io::Error::other)?;
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return Err(io::Error::other(format!("{addr}{path}: {}", response.status())));
+    }
+    hyper::upgrade::on(response).await.map_err(io::Error::other)
 }
 
 /// One request on `sender`: the status and the whole body, refused
@@ -281,11 +317,30 @@ impl Pool {
         body: Vec<u8>,
         within: Duration,
     ) -> io::Result<Bytes> {
+        self.post_as(to, addr, path, body, within, None).await
+    }
+
+    /// [`Pool::post`] with another content type and the prototype's send
+    /// stamp.
+    async fn post_as(
+        &self,
+        to: Option<NodeId>,
+        addr: &str,
+        path: &str,
+        body: Vec<u8>,
+        within: Duration,
+        report: Option<&'static str>,
+    ) -> io::Result<Bytes> {
         let deadline = Instant::now() + within;
         let mut sender = tokio::time::timeout_at(deadline, self.ready(to, addr))
             .await
             .map_err(|_| timed_out())??;
-        let request = request(Method::POST, host(addr), path, body);
+        let mut request = request(Method::POST, host(addr), path, body);
+        if let Some(content_type) = report {
+            let h = request.headers_mut();
+            h.insert(header::CONTENT_TYPE, content_type.parse().expect("valid"));
+            h.insert("x-proto-sent", crate::proto::mono_ns().into());
+        }
         let state = Arc::new(AtomicU8::new(RUNNING));
         let exchange = tokio::spawn({
             let mut ended = Ended {
@@ -399,6 +454,10 @@ async fn dial(conns: Arc<Conns>, tls: Arc<PeerTls>, addr: String) {
 }
 
 impl Pool {
+    pub fn tls(&self) -> Arc<PeerTls> {
+        self.tls.clone()
+    }
+
     /// The idle connections kept to `addr`.
     pub fn idle(&self, addr: &str) -> usize {
         self.conns
@@ -425,9 +484,17 @@ impl PeerClient for Pool {
                 to.map_or_else(|| "any".to_owned(), |id| id.to_string())
             );
             let cpu = report.then(crate::contact::thread_cpu);
-            let body = serde_json::to_vec(&request).expect("encodes");
+            let (body, content_type) = if report {
+                crate::proto::encode_request(&request)
+            } else {
+                (serde_json::to_vec(&request).expect("encodes"), "application/json")
+            };
             if let (Some(cpu), Some(to)) = (cpu, to) {
                 let encode = crate::contact::thread_cpu().saturating_sub(cpu);
+                use crate::proto::{STATS, add};
+                add(&STATS.sent, 1);
+                add(&STATS.bytes, body.len() as u64);
+                add(&STATS.encode_ns, encode.as_nanos() as u64);
                 self.count(to, |c| {
                     c.reports_sent += 1;
                     c.report_bytes += body.len() as u64;
@@ -435,10 +502,16 @@ impl PeerClient for Pool {
                 });
             }
             let started = Instant::now();
-            let reply = self.post(to, addr, &path, body, within).await;
+            let reply = self
+                .post_as(to, addr, &path, body, within, report.then_some(content_type))
+                .await;
             if let (true, Some(to)) = (report, to) {
                 match &reply {
-                    Ok(_) => self.count(to, |c| c.answered(started.elapsed())),
+                    Ok(_) => {
+                        let rtt = started.elapsed();
+                        crate::proto::sample(&crate::proto::STATS.round_trip, rtt.as_nanos() as u64);
+                        self.count(to, |c| c.answered(rtt));
+                    }
                     Err(e) if e.kind() == io::ErrorKind::TimedOut => {
                         self.count(to, |c| c.report_timeouts += 1);
                     }
@@ -458,6 +531,10 @@ impl PeerClient for Pool {
     fn retain_links(&self, keep: &dyn Fn(NodeId) -> bool) {
         let mut counts = self.counts.lock().expect("counts lock poisoned");
         counts.retain(|&node, _| keep(node));
+    }
+
+    fn tls(&self) -> Option<Arc<PeerTls>> {
+        Some(self.tls.clone())
     }
 }
 

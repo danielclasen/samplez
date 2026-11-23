@@ -25,6 +25,7 @@ pub mod log_store;
 pub mod membership;
 pub mod net;
 pub mod peer;
+pub mod proto;
 pub mod rank;
 pub mod report;
 pub mod resync;

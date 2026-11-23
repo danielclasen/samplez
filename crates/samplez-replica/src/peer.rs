@@ -194,6 +194,11 @@ pub trait PeerClient: Send + Sync + 'static {
 
     /// Drops the counts of the peers `keep` refuses.
     fn retain_links(&self, _keep: &dyn Fn(NodeId) -> bool) {}
+
+    /// The peer TLS, for the prototype's report streams.
+    fn tls(&self) -> Option<Arc<PeerTls>> {
+        None
+    }
 }
 
 /// The peer listener's routes: `POST /raft/<node id>/{append,vote,snapshot}`
@@ -203,6 +208,7 @@ pub fn router<P: Product>(replica: Arc<Replica<P>>) -> Router {
     Router::new()
         .route("/raft/{to}/{rpc}", post(raft::<P>))
         .route("/peer/{to}", post(peer::<P>))
+        .route("/peer/{to}/stream", post(stream::<P>))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(replica)
 }
@@ -226,9 +232,12 @@ pub async fn serve<P: Product>(
             let _ = tls.reload();
         }
     });
-    let served = axum::serve(listener, router(replica))
-        .with_graceful_shutdown(shutdown)
-        .await;
+    let served = axum::serve(
+        listener,
+        router(replica).into_make_service_with_connect_info::<crate::proto::PeerCert>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await;
     reload.abort();
     served
 }
@@ -302,9 +311,39 @@ async fn raft<P: Product>(
     }
 }
 
+/// The prototype's report stream: answered 101, then read until it ends.
+async fn stream<P: Product>(
+    State(replica): State<Arc<Replica<P>>>,
+    Path(to): Path<NodeId>,
+    axum::extract::ConnectInfo(cert): axum::extract::ConnectInfo<crate::proto::PeerCert>,
+    mut request: axum::extract::Request,
+) -> Response {
+    if to != replica.id() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(contact) = replica.shared.contact.get().cloned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let upgrade = hyper::upgrade::on(&mut request);
+    tokio::spawn(async move {
+        if let Ok(io) = upgrade.await {
+            let _ = crate::proto::receive(io, cert, contact).await;
+        }
+    });
+    (
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (axum::http::header::CONNECTION, "upgrade"),
+            (axum::http::header::UPGRADE, "samplez-reports"),
+        ],
+    )
+        .into_response()
+}
+
 async fn peer<P: Product>(
     State(replica): State<Arc<Replica<P>>>,
     Path(to): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let to = match to.as_str() {
@@ -315,9 +354,19 @@ async fn peer<P: Product>(
         },
     };
     let cpu = crate::contact::thread_cpu();
-    let Ok(request) = serde_json::from_slice::<PeerRequest>(&body) else {
+    let postcard = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|v| v == "application/postcard");
+    let Some(request) = crate::proto::decode_request(&body, postcard) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if let Some(sent) = headers
+        .get("x-proto-sent")
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+    {
+        let now = crate::proto::mono_ns();
+        crate::proto::sample(&crate::proto::STATS.latency, now.saturating_sub(sent));
+    }
     if let (PeerRequest::Report(_), Some(contact)) = (&request, replica.shared.contact.get()) {
         contact.decoded(cpu);
     }
