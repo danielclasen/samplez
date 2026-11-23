@@ -175,9 +175,27 @@ fn threads_named(name: &str) -> Vec<i32> {
         .collect()
 }
 
+/// The CPUs sharing `cpu`'s core as the kernel lists them, `cpu` among
+/// them; none when it does not.
+fn siblings_of(cpu: usize) -> Vec<usize> {
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+    let Ok(list) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',') {
+        match part.split_once('-') {
+            Some((a, b)) => cpus.extend(a.parse::<usize>().unwrap()..=b.parse().unwrap()),
+            None => cpus.push(part.parse().unwrap()),
+        }
+    }
+    cpus
+}
+
 /// With the RT thread pinned, the threads created after
 /// `setup_process` (the supervisor and any later one) run on every
-/// allowed CPU but the RT thread's, and the RT thread alone on it.
+/// allowed CPU but the RT thread's and, while another core is allowed,
+/// its SMT siblings', and the RT thread alone on it.
 #[test]
 fn threads_created_after_set_up_stay_off_the_rt_cpu() {
     let _one = one_at_a_time();
@@ -220,7 +238,15 @@ fn threads_created_after_set_up_stay_off_the_rt_cpu() {
             "{}",
             s.process.isolation
         );
-        let others: Vec<usize> = allowed.iter().copied().filter(|&c| c != cpu).collect();
+        // Off the RT CPU's core too while another core is allowed.
+        let rest: Vec<usize> = allowed.iter().copied().filter(|&c| c != cpu).collect();
+        let siblings = siblings_of(cpu);
+        let off_core: Vec<usize> = rest
+            .iter()
+            .copied()
+            .filter(|c| !siblings.contains(c))
+            .collect();
+        let others = if off_core.is_empty() { rest } else { off_core };
         // A thread takes its name from inside itself once it runs, after
         // it inherited the affinity of the thread that created it: the
         // supervisor is waited for by name, its affinity fixed already.
