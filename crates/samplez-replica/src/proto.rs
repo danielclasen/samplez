@@ -58,6 +58,24 @@ pub fn codec() -> Codec {
     })
 }
 
+/// `SAMPLEZ_PROTO_BASE=1`: reports and copies as before page records were
+/// carried until confirmed.
+pub fn base() -> bool {
+    static B: OnceLock<bool> = OnceLock::new();
+    *B.get_or_init(|| env("SAMPLEZ_PROTO_BASE") == "1")
+}
+
+/// Thread CPU per part of a contact tick, ns: state, listed, heard,
+/// offered, carry, assemble.
+pub static SEGMENTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Adds the thread CPU since `*at` to segment `i` and moves `*at` on.
+pub fn lap(i: usize, at: &mut std::time::Duration) {
+    let now = crate::contact::thread_cpu();
+    SEGMENTS[i].fetch_add(now.saturating_sub(*at).as_nanos() as u64, Ordering::Relaxed);
+    *at = now;
+}
+
 pub fn pad() -> bool {
     static P: OnceLock<bool> = OnceLock::new();
     *P.get_or_init(|| env("SAMPLEZ_PROTO_PAD") == "1")
@@ -177,10 +195,10 @@ pub fn pad_own(own: &mut Own, k: u64, seed: u64) {
                 output: o,
                 page: page - 4 + p,
                 hash: r(u64::from(o) * 8 + p + page),
-                fingerprint: r(1000 + u64::from(o) * 8 + p),
+                fingerprint: r(1000 + u64::from(o) * 8 + p + page),
                 committed: true,
                 degraded: false,
-                digest: Some(r(2000 + u64::from(o) * 8 + p)),
+                digest: Some(r(2000 + u64::from(o) * 8 + p + page)),
             })
         })
         .collect();

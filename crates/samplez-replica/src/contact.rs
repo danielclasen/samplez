@@ -912,7 +912,7 @@ impl State {
         #[cfg(test)]
         return self.as_before;
         #[cfg(not(test))]
-        false
+        crate::proto::base()
     }
 }
 
@@ -1581,6 +1581,7 @@ impl Contact {
         // Taken before the engine's sample: every timestamp a report
         // carries precedes the flags beside it.
         let tai = self.clocks.tai_ns();
+        let mut lap = thread_cpu();
         let mut st = self.lock();
         let st = &mut *st;
         let as_before = st.as_before();
@@ -1742,6 +1743,7 @@ impl Contact {
         let mut slack = std::mem::take(&mut st.slack);
         slack.truncate(MAX_LISTED);
         let mut out = Vec::new();
+        crate::proto::lap(0, &mut lap);
         for to in voters.iter().copied().filter(|&v| v != self.id) {
             let Some(addr) = st.members.addrs.get(&to).cloned() else {
                 continue;
@@ -1771,6 +1773,7 @@ impl Contact {
             listed.sort_by_key(|l| (l.at_index, l.id.index));
             let unlisted = listed.get(MAX_LISTED).map(|l| l.at_index);
             listed.truncate(MAX_LISTED);
+            crate::proto::lap(1, &mut lap);
             let mut heard: Vec<Heard> = voters
                 .iter()
                 .copied()
@@ -1790,12 +1793,17 @@ impl Contact {
             // newest this replica holds of that voter, each carried until
             // the addressee confirms it. An addressee not heard within w
             // may have restarted with no record: it is sent every one.
-            let mut offered = vec![(self.id, st.own.pages.clone())];
-            offered.extend(
-                (heard.iter())
-                    .filter(|h| h.own.is_some())
-                    .map(|h| (h.node, st.pages.latest(h.node, PAGES_REPORTED))),
-            );
+            crate::proto::lap(2, &mut lap);
+            let mut offered = Vec::new();
+            if !as_before {
+                offered.push((self.id, st.own.pages.clone()));
+                offered.extend(
+                    (heard.iter())
+                        .filter(|h| h.own.is_some())
+                        .map(|h| (h.node, st.pages.latest(h.node, PAGES_REPORTED))),
+                );
+            }
+            crate::proto::lap(3, &mut lap);
             let heard_within_w = peer
                 .and_then(|p| p.last.as_ref())
                 .is_some_and(|d| since(now, d.received) <= w);
@@ -1804,6 +1812,7 @@ impl Contact {
                 *carried = Carried::default();
             }
             let mut carry = carried.carry(st.seq, &offered).into_iter();
+            crate::proto::lap(4, &mut lap);
             let mut own = st.own.clone();
             if !as_before {
                 own.pages = carry.next().unwrap_or_default();
@@ -1839,6 +1848,7 @@ impl Contact {
                     slack: slack.clone(),
                 },
             ));
+            crate::proto::lap(5, &mut lap);
         }
         out
     }

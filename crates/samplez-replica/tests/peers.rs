@@ -702,6 +702,9 @@ async fn proto_measure() {
             STATS.dials.load(Relaxed),
         ]
     };
+    for s in &samplez_replica::proto::SEGMENTS {
+        s.store(0, Relaxed);
+    }
     STATS.latency.lock().unwrap().clear();
     STATS.round_trip.lock().unwrap().clear();
     let (a, c0, k0, t0) = (total(&set), rusage(), counters(), Instant::now());
@@ -751,6 +754,13 @@ async fn proto_measure() {
             at(1.0)
         );
     };
+    for (i, name) in ["state", "listed", "heard", "offered", "carry", "assemble"]
+        .iter()
+        .enumerate()
+    {
+        let ns = samplez_replica::proto::SEGMENTS[i].load(Relaxed);
+        println!("PROTO segment {name} total_ns {ns}");
+    }
     q(&mut latency, "delivery");
     q(&mut round_trip, "round_trip");
 }
