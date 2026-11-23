@@ -816,6 +816,13 @@ struct State {
     as_before: bool,
     /// Per addressee, the page records it confirmed.
     carried: BTreeMap<NodeId, Carried>,
+    /// Per voter, the generation of its records in the page book: raised,
+    /// from `page_generation`, whenever one of them is new or differs.
+    page_generations: BTreeMap<NodeId, u64>,
+    page_generation: u64,
+    /// Offers of page records built, counted for the tests.
+    #[cfg(test)]
+    offers_built: u64,
     decider: crate::decide::Decider,
     liveness: crate::liveness::Liveness,
     /// The audio `/readyz` term, as of the last period in contact or, out
@@ -1217,6 +1224,10 @@ impl Contact {
                     #[cfg(test)]
                     as_before: false,
                     carried: BTreeMap::new(),
+                    page_generations: BTreeMap::new(),
+                    page_generation: 0,
+                    #[cfg(test)]
+                    offers_built: 0,
                     decider: crate::decide::Decider::default(),
                     liveness: crate::liveness::Liveness::default(),
                     serving: None,
@@ -1397,7 +1408,10 @@ impl Contact {
             peer.thetas.add(offset, (delay.max(0) / 2) as u64);
         }
         st.withhold.fold(self.id, report.from, &report.own);
-        st.pages.fold(report.from, &report.own.pages);
+        if st.pages.fold(report.from, &report.own.pages) {
+            st.page_generation += 1;
+            (st.page_generations).insert(report.from, st.page_generation);
+        }
         // Page records live in the page book alone: a copy holds none, and
         // one relayed carries the book's.
         let mut own = report.own;
@@ -1430,7 +1444,10 @@ impl Contact {
                 && other.relayed.as_ref().is_none_or(|(g, _)| *g < generated)
             {
                 st.withhold.fold(self.id, heard.node, &own);
-                st.pages.fold(heard.node, &own.pages);
+                if st.pages.fold(heard.node, &own.pages) {
+                    st.page_generation += 1;
+                    (st.page_generations).insert(heard.node, st.page_generation);
+                }
                 let mut own = own;
                 if !as_before {
                     own.pages = Vec::new();
@@ -1614,7 +1631,10 @@ impl Contact {
             st.enabled = sample.enabled;
             st.generation_ready = sample.generation_ready;
             st.clock_steps = sample.clock_steps;
-            st.pages.fold(self.id, &st.own.pages);
+            if st.pages.fold(self.id, &st.own.pages) {
+                st.page_generation += 1;
+                (st.page_generations).insert(self.id, st.page_generation);
+            }
             if sample.log_overflows > st.log_overflows {
                 st.log_overflows = sample.log_overflows;
                 // The engine dropped its core and committed entries with
@@ -1677,6 +1697,7 @@ impl Contact {
         }
         st.withhold.retain(&st.members);
         st.pages.retain(|v| voters.contains(&v));
+        st.page_generations.retain(|v, _| voters.contains(v));
         self.fence(st, tai);
         self.decide(st, tai);
         self.live(st, now, tai);
@@ -1782,12 +1803,14 @@ impl Contact {
             // newest this replica holds of that voter, each carried until
             // the addressee confirms it. An addressee not heard within w
             // may have restarted with no record: it is sent every one.
-            let mut offered = vec![(self.id, st.own.pages.clone())];
-            offered.extend(
-                (heard.iter())
-                    .filter(|h| h.own.is_some())
-                    .map(|h| (h.node, st.pages.latest(h.node, PAGES_REPORTED))),
-            );
+            // A period offering the same voters' records at the same
+            // generations, with none confirmed since, carries what the
+            // last did, and builds nothing.
+            let generation = |v: NodeId| st.page_generations.get(&v).copied().unwrap_or(0);
+            let offer: Vec<(NodeId, u64)> = std::iter::once(self.id)
+                .chain(heard.iter().filter(|h| h.own.is_some()).map(|h| h.node))
+                .map(|v| (v, generation(v)))
+                .collect();
             let heard_within_w = peer
                 .and_then(|p| p.last.as_ref())
                 .is_some_and(|d| since(now, d.received) <= w);
@@ -1795,7 +1818,23 @@ impl Contact {
             if !heard_within_w {
                 *carried = Carried::default();
             }
-            let mut carry = carried.carry(st.seq, &offered).into_iter();
+            let carry = match carried.unchanged(&offer) {
+                Some(carry) => carry,
+                None => {
+                    #[cfg(test)]
+                    {
+                        st.offers_built += 1;
+                    }
+                    let mut offered = vec![(self.id, st.own.pages.clone())];
+                    offered.extend(
+                        (heard.iter())
+                            .filter(|h| h.own.is_some())
+                            .map(|h| (h.node, st.pages.latest(h.node, PAGES_REPORTED))),
+                    );
+                    carried.carry(st.seq, offer, &offered)
+                }
+            };
+            let mut carry = carry.into_iter();
             let mut own = st.own.clone();
             if !as_before {
                 own.pages = carry.next().unwrap_or_default();
@@ -3352,6 +3391,11 @@ impl Contact {
     #[cfg(test)]
     pub(crate) fn latest_pages(&self, node: NodeId) -> Vec<crate::report::Page> {
         self.lock().pages.latest(node, PAGES_REPORTED)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn offers_built(&self) -> u64 {
+        self.lock().offers_built
     }
 
     #[cfg(test)]
@@ -8395,6 +8439,37 @@ mod tests {
         }
         let held = net.contact(2).latest_pages(3);
         assert!(held.iter().any(|p| p.page == 9), "{held:?}");
+    }
+
+    /// A period offering the records of the last one, with none
+    /// confirmed since, builds no offer: no record is cloned, read from
+    /// the page book or looked up. A new record builds one again.
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_period_builds_no_offer() {
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(T0),
+            step: AtomicU64::new(0),
+        });
+        let net = Net::new(&clock, false);
+        net.nodes[&1].1.page(1);
+        net.nodes[&3].1.page(1);
+        for _ in 0..6 {
+            net.period(|_, _| false);
+            Net::advance(&clock).await;
+        }
+        let built = net.contact(1).offers_built();
+        for _ in 0..20 {
+            net.period(|_, _| false);
+            Net::advance(&clock).await;
+        }
+        assert_eq!(net.contact(1).offers_built(), built, "20 unchanged periods");
+        net.nodes[&1].1.page(2);
+        net.period(|_, _| false);
+        assert_eq!(
+            net.contact(1).offers_built(),
+            built + 2,
+            "one per addressee"
+        );
     }
 
     /// What a sender holds per addressee is bounded by one report's
