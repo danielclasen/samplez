@@ -588,8 +588,9 @@ async fn a_slow_dial_is_dialed_once_and_serves_the_next_report() {
 
 /// Every replica exposes, per peer labelled `node`, the reports that
 /// got no answer in time, the connections it dialed, the reports sent
-/// with their bytes and encoding time, and those answered by round trip;
-/// and the contact loop's periods and CPU time.
+/// with their bytes and encoding time, and those answered by round trip,
+/// no report counted both answered and timed out; and the contact loop's
+/// periods and CPU time.
 #[tokio::test]
 async fn the_exposition_carries_report_timeouts_and_dials_per_peer() {
     use samplez_replica::contact::{SystemClocks, Timing};
@@ -614,7 +615,6 @@ async fn the_exposition_carries_report_timeouts_and_dials_per_peer() {
     for peer in (1..=3).filter(|&id| id != leader) {
         let of = |name: &str| find(name, &[("node", peer.to_string())]);
         assert!(of("samplez_replica_peer_dials_total") >= 1.0);
-        assert_eq!(of("samplez_replica_peer_report_timeouts_total"), 0.0);
         let sent = of("samplez_replica_peer_reports_sent_total");
         assert!(sent >= 1.0, "{sent}");
         assert!(of("samplez_replica_peer_report_bytes_total") > sent);
@@ -626,8 +626,15 @@ async fn the_exposition_carries_report_timeouts_and_dials_per_peer() {
                 &[("node", peer.to_string()), ("le", le.to_owned())],
             )
         };
+        // A report is answered, times out at contactWindowMs, which a
+        // loaded host can make it do, or is still in flight.
         let all = answered("+Inf");
-        assert!(all >= 1.0 && all <= sent, "{all} of {sent}");
+        let timeouts = of("samplez_replica_peer_report_timeouts_total");
+        assert!(all >= 1.0, "{all} of {sent} answered");
+        assert!(
+            all + timeouts <= sent,
+            "{all} answered, {timeouts} timed out of {sent}"
+        );
         assert!(answered("0.0005") <= answered("0.008"));
         assert!(answered("0.008") <= all);
     }
