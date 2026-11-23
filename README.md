@@ -804,7 +804,12 @@ With the RT thread pinned and `rt.isolateRtCpu` true (the default),
 without the RT thread's, so every thread created after it, the engine's
 and the embedding process's alike, inherits that set and only the RT
 thread, which pins itself, runs on its CPU. A time-shared thread on the
-RT CPU would wait out every block the RT thread computes. It applies to
+RT CPU would wait out every block the RT thread computes. While a CPU
+on another core is allowed, the set also leaves out the RT CPU's SMT
+siblings (`thread_siblings_list` in sysfs), which then stay idle, so no
+other thread shares the RT thread's core; the `isolation` step names
+them. With one core allowed its sibling is the only other CPU and takes
+the other threads. It applies to
 threads created after `setup_process`, which is why it runs before any
 other thread exists. With one allowed CPU, or the RT thread not pinned,
 it is off. Its step is `isolation` in the process status. Should the RT

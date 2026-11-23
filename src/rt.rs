@@ -292,9 +292,10 @@ pub fn setup_process(rt: &Rt) -> ProcessStatus {
     }
 }
 
-/// Sets the calling thread's affinity to `set` without `rt_cpu`, so every
-/// thread it creates later inherits it and only the RT thread, pinning
-/// itself, runs on `rt_cpu`.
+/// Sets the calling thread's affinity to `set` without `rt_cpu` and,
+/// when another core is allowed, without `rt_cpu`'s SMT siblings, so
+/// every thread it creates later inherits it and only the RT thread,
+/// pinning itself, runs on `rt_cpu`'s core.
 fn isolate(rt_cpu: &Result<usize, Step>, set: &[usize], enabled: bool) -> Step {
     let Ok(cpu) = *rt_cpu else {
         return Step::Off("the RT thread is not pinned".to_owned());
@@ -302,16 +303,55 @@ fn isolate(rt_cpu: &Result<usize, Step>, set: &[usize], enabled: bool) -> Step {
     if !enabled {
         return Step::Off("rt.isolateRtCpu is false".to_owned());
     }
-    let others: Vec<usize> = set.iter().copied().filter(|&c| c != cpu).collect();
+    let siblings = siblings(cpu);
+    let (others, idle) = others(set, cpu, siblings.as_deref().unwrap_or(&[]));
     if others.is_empty() {
         return Step::Off(format!("CPU {cpu} is the only allowed CPU"));
     }
+    let idle = match (&siblings, idle.is_empty()) {
+        (None, _) => format!(", the SMT siblings of CPU {cpu} unknown"),
+        (Some(_), true) => String::new(),
+        (Some(_), false) => format!(", its SMT siblings {idle:?} idle"),
+    };
     match set_affinity(&others) {
         Ok(()) => Step::Active(format!(
-            "other threads on CPUs {others:?}, CPU {cpu} left to the RT thread"
+            "other threads on CPUs {others:?}, CPU {cpu} left to the RT thread{idle}"
         )),
         Err(e) => Step::Degraded(format!("sched_setaffinity to {others:?} failed: {e}")),
     }
+}
+
+/// The CPUs the other threads run on, and those left idle: `set` without
+/// `cpu`, and without `siblings` too unless that leaves none, as with one
+/// core allowed, whose sibling is then the only other CPU.
+fn others(set: &[usize], cpu: usize, siblings: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let rest: Vec<usize> = set.iter().copied().filter(|&c| c != cpu).collect();
+    let (idle, off): (Vec<usize>, Vec<usize>) =
+        rest.iter().copied().partition(|c| siblings.contains(c));
+    if off.is_empty() {
+        (rest, Vec::new())
+    } else {
+        (off, idle)
+    }
+}
+
+/// The CPUs sharing `cpu`'s core, `cpu` among them, as the kernel lists
+/// them; none when it does not.
+fn siblings(cpu: usize) -> Option<Vec<usize>> {
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+    parse_cpu_list(std::fs::read_to_string(path).ok()?.trim())
+}
+
+/// A kernel CPU list such as `0-3,8,10-11`.
+fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in text.split(',') {
+        match part.split_once('-') {
+            Some((a, b)) => cpus.extend(a.parse::<usize>().ok()?..=b.parse().ok()?),
+            None => cpus.push(part.parse().ok()?),
+        }
+    }
+    Some(cpus)
 }
 
 /// The calling thread's allowed CPUs, ascending.
@@ -571,6 +611,32 @@ pub fn setup_thread(rt: &Rt, process: &ProcessStatus) -> ThreadStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cpu_list_reads_ranges_and_single_cpus() {
+        assert_eq!(parse_cpu_list("4,20"), Some(vec![4, 20]));
+        assert_eq!(
+            parse_cpu_list("0-3,8,10-11"),
+            Some(vec![0, 1, 2, 3, 8, 10, 11])
+        );
+        assert_eq!(parse_cpu_list("7"), Some(vec![7]));
+        assert_eq!(parse_cpu_list(""), None);
+        assert_eq!(parse_cpu_list("3-x"), None);
+    }
+
+    /// With two cores the RT CPU's sibling stays idle; with one it is the
+    /// only CPU left and takes the other threads; without SMT nothing is
+    /// left idle.
+    #[test]
+    fn the_other_threads_leave_the_rt_core_when_another_is_allowed() {
+        assert_eq!(
+            others(&[4, 6, 20, 22], 22, &[6, 22]),
+            (vec![4, 20], vec![6])
+        );
+        assert_eq!(others(&[4, 20], 20, &[4, 20]), (vec![4], Vec::new()));
+        assert_eq!(others(&[0, 1, 2], 2, &[2]), (vec![0, 1], Vec::new()));
+        assert_eq!(others(&[0, 1, 2], 2, &[]), (vec![0, 1], Vec::new()));
+    }
 
     #[test]
     fn the_v1_cpu_directory_comes_from_mountinfo() {
