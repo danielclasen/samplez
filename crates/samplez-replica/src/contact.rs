@@ -584,6 +584,9 @@ struct Direct {
 #[derive(Debug, Default)]
 struct Peer {
     last: Option<Direct>,
+    /// The voters its latest report said it took no report from within
+    /// w, or holds silent: their records are relayed to it untrimmed.
+    stale: BTreeSet<NodeId>,
     /// The peer's latest echoes: the TAI time this replica sent the report
     /// echoed, and the `silentAt` the echo carried.
     echoes: VecDeque<(u64, Option<u64>)>,
@@ -807,10 +810,10 @@ struct State {
     missed_after: Option<u64>,
     #[cfg(test)]
     verified_always: bool,
-    /// Every page record goes into every report, confirmed or not, as
-    /// before [`Carried`].
+    /// Reports and copies as before [`Carried`]: every record in every
+    /// report, copies keeping theirs and relaying them.
     #[cfg(test)]
-    carry_all_pages: bool,
+    as_before: bool,
     /// Per addressee, the page records it confirmed.
     carried: BTreeMap<NodeId, Carried>,
     decider: crate::decide::Decider,
@@ -901,6 +904,16 @@ pub struct CostCounts {
     pub decode: Duration,
     /// [`Contact::receive`]: taking a decoded report.
     pub receive: Duration,
+}
+
+impl State {
+    /// [`State::as_before`] in tests; never otherwise.
+    fn as_before(&self) -> bool {
+        #[cfg(test)]
+        return self.as_before;
+        #[cfg(not(test))]
+        false
+    }
 }
 
 /// Adds a counted replica's slack to the lead, naming the replica when
@@ -1202,7 +1215,7 @@ impl Contact {
                     #[cfg(test)]
                     verified_always: false,
                     #[cfg(test)]
-                    carry_all_pages: false,
+                    as_before: false,
                     carried: BTreeMap::new(),
                     decider: crate::decide::Decider::default(),
                     liveness: crate::liveness::Liveness::default(),
@@ -1271,6 +1284,7 @@ impl Contact {
         let w = self.timing.contact_window;
         let mut st = self.lock();
         let st = &mut *st;
+        let as_before = st.as_before();
         let voters = st.members.voters();
         if report.from == self.id {
             return;
@@ -1343,6 +1357,11 @@ impl Contact {
             _ => *carried = Carried::default(),
         }
         peer.reports += 1;
+        let w_us = w.as_micros() as u64;
+        peer.stale = (report.heard.iter())
+            .filter(|h| h.silent || h.age_us.is_none_or(|a| a > w_us))
+            .map(|h| h.node)
+            .collect();
         if let Some(last) = &peer.last {
             let gap = since(now, last.received);
             if peer.silent {
@@ -1381,14 +1400,15 @@ impl Contact {
         st.pages.fold(report.from, &report.own.pages);
         // Page records live in the page book alone: a copy holds none, and
         // one relayed carries the book's.
+        let mut own = report.own;
+        if !as_before {
+            own.pages = Vec::new();
+        }
         peer.last = Some(Direct {
             seq: report.seq,
             received_tai: tai,
             received: now,
-            own: Own {
-                pages: Vec::new(),
-                ..report.own
-            },
+            own,
             committed: report.committed,
         });
         // One relay hop: copies of voters the sender heard directly, and
@@ -1411,10 +1431,10 @@ impl Contact {
             {
                 st.withhold.fold(self.id, heard.node, &own);
                 st.pages.fold(heard.node, &own.pages);
-                let own = Own {
-                    pages: Vec::new(),
-                    ..own
-                };
+                let mut own = own;
+                if !as_before {
+                    own.pages = Vec::new();
+                }
                 other.relayed = Some((generated, own));
             }
         }
@@ -1558,6 +1578,7 @@ impl Contact {
         let tai = self.clocks.tai_ns();
         let mut st = self.lock();
         let st = &mut *st;
+        let as_before = st.as_before();
         let voters = members.voters();
         st.peers.retain(|id, _| voters.contains(id));
         st.carried.retain(|id, _| voters.contains(id));
@@ -1774,19 +1795,23 @@ impl Contact {
             if !heard_within_w {
                 *carried = Carried::default();
             }
-            let carry = carried.carry(st.seq, &offered);
-            #[cfg(test)]
-            let carry = if st.carry_all_pages {
-                offered.into_iter().map(|(_, pages)| pages).collect()
-            } else {
-                carry
-            };
-            let mut carry = carry.into_iter();
+            let mut carry = carried.carry(st.seq, &offered).into_iter();
             let mut own = st.own.clone();
-            own.pages = carry.next().unwrap_or_default();
-            for h in &mut heard {
-                if let Some(relayed) = &mut h.own {
-                    relayed.pages = carry.next().unwrap_or_default();
+            if !as_before {
+                own.pages = carry.next().unwrap_or_default();
+                // A voter the addressee took no direct report from
+                // within w gets its newest records relayed whole: one
+                // confirmed meanwhile may have come in a copy it dropped
+                // for a newer direct one.
+                for h in &mut heard {
+                    if let Some(relayed) = &mut h.own {
+                        let trimmed = carry.next().unwrap_or_default();
+                        relayed.pages = if peer.is_some_and(|p| p.stale.contains(&h.node)) {
+                            st.pages.latest(h.node, PAGES_REPORTED)
+                        } else {
+                            trimmed
+                        };
+                    }
                 }
             }
             out.push((
@@ -3303,18 +3328,23 @@ impl Contact {
         self.lock().verified_always = true;
     }
 
-    /// Every page record goes into every report, as before [`Carried`].
+    /// Reports and copies as before [`Carried`].
     #[cfg(test)]
-    pub(crate) fn carry_all_pages(&self) {
-        self.lock().carry_all_pages = true;
+    pub(crate) fn as_before(&self) {
+        self.lock().as_before = true;
     }
 
-    /// The page book, and the copies of every voter with their ages.
+    /// The page book, and the copies of every voter with their ages,
+    /// without the page records nothing reads in a copy.
     #[cfg(test)]
     pub(crate) fn pages_and_copies(&self) -> (String, Vec<(NodeId, Duration, Own)>) {
         let st = self.lock();
         let copies = (self.copies(&st, Instant::now()).into_iter())
-            .map(|(id, age, own)| (id, age, own.clone()))
+            .map(|(id, age, own)| {
+                let mut own = own.clone();
+                own.pages.clear();
+                (id, age, own)
+            })
             .collect();
         (format!("{:?}", st.pages), copies)
     }
@@ -4502,6 +4532,15 @@ mod tests {
     }
 
     impl Engine {
+        /// Page `page`'s records get another hash.
+        fn rehash(&self, page: u64) {
+            for p in self.pages.lock().unwrap().iter_mut() {
+                if p.page == page {
+                    p.hash += 1;
+                }
+            }
+        }
+
         /// Page `page` of outputs 0 and 1 is final: it reports it, and the
         /// latest [`PAGES_REPORTED`] of each output.
         fn page(&self, page: u64) {
@@ -7987,11 +8026,13 @@ mod tests {
     }
 
     impl Net {
-        fn new(clock: &Arc<Clock>, carry_all: bool) -> Net {
+        /// `as_before`: every node reports and relays as before
+        /// [`Carried`].
+        fn new(clock: &Arc<Clock>, as_before: bool) -> Net {
             let ids = [1, 2, 3];
             let nodes = ids
                 .into_iter()
-                .map(|id| (id, Net::node(clock, id, id * 1000, carry_all)))
+                .map(|id| (id, Net::node(clock, id, id * 1000, as_before)))
                 .collect();
             Net {
                 clock: clock.clone(),
@@ -8007,7 +8048,7 @@ mod tests {
             clock: &Arc<Clock>,
             id: NodeId,
             first_seq: u64,
-            carry_all: bool,
+            as_before: bool,
         ) -> (Contact, Arc<Engine>) {
             let engine = engine(clock);
             let log = Arc::new(Log::default());
@@ -8020,8 +8061,8 @@ mod tests {
                 first_seq,
             );
             contact.verified_always();
-            if carry_all {
-                contact.carry_all_pages();
+            if as_before {
+                contact.as_before();
             }
             (contact, engine)
         }
@@ -8081,10 +8122,11 @@ mod tests {
 
     /// A receiver fed by senders that carry each page record until it
     /// confirms it holds the same page book and the same copies, and
-    /// decides the same, as one fed by senders carrying every record in
-    /// every report: through lost reports, a lost echo, and a voter it
-    /// hears only through a relay. The trimmed reports carry no record
-    /// once every one is confirmed.
+    /// decides the same, as one in a set reporting as before: every
+    /// record in every report, copies keeping theirs and relaying them.
+    /// Through lost reports, a lost echo, and a voter it hears only
+    /// through a relay. The trimmed reports carry no record once every
+    /// one is confirmed.
     #[tokio::test(start_paused = true)]
     async fn a_receiver_holds_the_same_whether_records_are_trimmed_or_all_sent() {
         let clock = Arc::new(Clock {
@@ -8121,10 +8163,15 @@ mod tests {
             }
             // Confirmed two periods after a record is first carried, three
             // when relayed; the record of round 5 waits out its lost
-            // reports.
+            // reports. While 2 does not hear 3, 1 relays 3's newest whole.
             if round % 5 == 4 && round != 9 {
-                let to_2 = sent.iter().find(|(f, t, _)| (*f, *t) == (1, 2)).unwrap();
-                assert_eq!(records(&to_2.2), 0, "round {round}: all confirmed");
+                let to_2 = &sent.iter().find(|(f, t, _)| (*f, *t) == (1, 2)).unwrap().2;
+                let carried = if (21..=41).contains(&round) {
+                    to_2.own.pages.len()
+                } else {
+                    records(to_2)
+                };
+                assert_eq!(carried, 0, "round {round}: all confirmed");
                 steady += 1;
             }
         }
@@ -8252,6 +8299,102 @@ mod tests {
                 "{case:?}"
             );
         }
+    }
+
+    /// A confirmed record that changes is a new record: carried again
+    /// until confirmed, and the addressee holds the new one.
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmed_record_that_changes_is_sent_again() {
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(T0),
+            step: AtomicU64::new(0),
+        });
+        let net = Net::new(&clock, false);
+        net.nodes[&1].1.page(1);
+        for _ in 0..5 {
+            net.period(|_, _| false);
+            Net::advance(&clock).await;
+        }
+        let to_2 = |sent: &[(NodeId, NodeId, Report)]| {
+            records(&sent.iter().find(|(f, t, _)| (*f, *t) == (1, 2)).unwrap().2)
+        };
+        assert_eq!(to_2(&net.period(|_, _| false)), 0, "confirmed");
+        Net::advance(&clock).await;
+        net.nodes[&1].1.rehash(1);
+        assert_eq!(
+            to_2(&net.period(|_, _| false)),
+            2,
+            "both outputs' changed records"
+        );
+        Net::advance(&clock).await;
+        let held = net.contact(2).latest_pages(1);
+        assert_eq!(
+            held,
+            *net.nodes[&1].1.pages.lock().unwrap(),
+            "the changed ones"
+        );
+    }
+
+    /// A record relayed in copies the addressee dropped for a newer
+    /// direct report, and confirmed with them, still reaches the
+    /// addressee when the direct link has failed: that newer direct report
+    /// was built before the record, and the relayer sends a voter's newest
+    /// records whole while the addressee hears it no more.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_in_a_dropped_relay_reaches_the_addressee_once_its_link_fails() {
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(T0),
+            step: AtomicU64::new(0),
+        });
+        let net = Net::new(&clock, false);
+        for _ in 0..5 {
+            net.period(|_, _| false);
+            Net::advance(&clock).await;
+        }
+        // From here on 3 does not reach 2; one report of 3's, built
+        // before page 9, is held back.
+        let cut = |f: NodeId, t: NodeId| (f, t) == (3, 2);
+        let sent = net.period(cut);
+        let late = sent
+            .into_iter()
+            .find(|(f, t, _)| (*f, *t) == (3, 2))
+            .unwrap()
+            .2;
+        Net::advance(&clock).await;
+        net.nodes[&3].1.page(9);
+        // 1 takes page 9 from 3.
+        net.period(cut);
+        Net::advance(&clock).await;
+        // 1's first report relaying it is lost.
+        let sent = net.period(|f, t| cut(f, t) || (f, t) == (1, 2));
+        let relayed = |sent: &[(NodeId, NodeId, Report)]| {
+            let r = &sent.iter().find(|(f, t, _)| (*f, *t) == (1, 2)).unwrap().2;
+            let h = r.heard.iter().find(|h| h.node == 3).unwrap();
+            h.own.as_ref().unwrap().pages.iter().any(|p| p.page == 9)
+        };
+        assert!(relayed(&sent));
+        Net::advance(&clock).await;
+        // The held-back report reaches 2 now: newer than the copies 1
+        // relays next, which 2 drops.
+        net.contact(2).receive(late);
+        for _ in 0..2 {
+            let sent = net.period(cut);
+            assert!(relayed(&sent), "carried until 2 echoes one");
+            Net::advance(&clock).await;
+        }
+        let sent = net.period(cut);
+        assert!(!relayed(&sent), "confirmed");
+        Net::advance(&clock).await;
+        assert!(
+            !net.contact(2).latest_pages(3).iter().any(|p| p.page == 9),
+            "2 dropped every copy with page 9"
+        );
+        for _ in 0..8 {
+            net.period(cut);
+            Net::advance(&clock).await;
+        }
+        let held = net.contact(2).latest_pages(3);
+        assert!(held.iter().any(|p| p.page == 9), "{held:?}");
     }
 
     /// What a sender holds per addressee is bounded by one report's

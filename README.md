@@ -1314,13 +1314,15 @@ peer removed and added again starts from 0.
 
 A report carries each page record, of the sender's own pages and of
 those of every voter whose copy it relays (the newest it holds), until
-the addressee echoes a report carrying it; records are final once
-reported and a voter keeps every one it takes, so none is sent again
-after. An addressee not heard within `contactWindowMs`, one whose report
-echoes nothing or no report among the sender's last 1024, and one whose
+the addressee echoes a report carrying it; a voter keeps every record it
+takes, so a record is not sent again after, unless it changes. An
+addressee not heard within `contactWindowMs`, one whose report echoes
+nothing or no report among the sender's last 1024, and one whose
 sequence numbers jump by more than 2^20, as a restarted process's do, is
-sent every record again. Copies of a voter's report keep no page
-records: they live in the page book alone.
+sent every record again; a voter whose reports the addressee's last
+report says it did not take within `contactWindowMs`, or holds silent,
+has its newest records relayed to it whole. Copies of a voter's report
+keep no page records: they live in the page book alone.
 
 The contact loop's own cost: `samplez_replica_contact_ticks_total`
 counts the report periods it ran, fewer than one per `reportPeriodMs`
