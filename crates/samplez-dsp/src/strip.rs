@@ -91,7 +91,7 @@ pub struct EqBand {
 }
 
 impl EqBand {
-    fn refusal(&self) -> Result<(), Refusal> {
+    fn refusal(&self) -> Result<(), ParamError> {
         within("eq band freq", self.freq, &EQ_FREQ)?;
         within("eq band gain", self.gain_db, &EQ_GAIN_DB)?;
         within("eq band q", self.q, &EQ_Q)
@@ -147,27 +147,67 @@ pub enum StripParam {
     DynamicsBeforeEq { enabled: bool },
 }
 
-/// Why a strip or a duck detector refuses a parameter. Building one does
-/// not allocate, so [`Strip::set`] can refuse on the real-time thread.
-pub(crate) enum Refusal {
-    Outside(&'static str, f32, f32, f32),
-    NoLeg(usize, usize),
+/// Why a strip, a duck detector, a limiter or a tone generator refuses a
+/// parameter. Building one does not allocate, so the real-time thread can
+/// refuse one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum ParamError {
+    /// The value named is outside `lo..=hi`, or not a number.
+    Outside {
+        what: &'static str,
+        value: f32,
+        lo: f32,
+        hi: f32,
+    },
+    /// No leg `leg` on a strip of `legs`.
+    NoLeg {
+        leg: usize,
+        legs: usize,
+    },
     NoBand(usize),
     NoKey(usize),
+    /// A key of this many legs, not 1 to [`MAX_LEGS`].
     KeyLegs(usize),
+    /// A tone frequency, Hz, outside [`crate::TONE_FREQUENCY_HZ`].
+    ToneFrequency(u32),
+    /// A tone level, dBFS, outside [`crate::TONE_LEVEL_DB`].
+    ToneLevel(f32),
 }
 
-impl Refusal {
-    pub(crate) fn message(&self) -> String {
+impl std::fmt::Display for ParamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::tone::{TONE_FREQUENCY_HZ, TONE_LEVEL_DB};
         match *self {
-            Refusal::Outside(what, v, lo, hi) => format!("{what} {v} is outside {lo}..={hi}"),
-            Refusal::NoLeg(leg, legs) => format!("no leg {leg} on a strip of {legs}"),
-            Refusal::NoBand(band) => format!("no eq band {band}"),
-            Refusal::NoKey(key) => format!("no key {key}"),
-            Refusal::KeyLegs(legs) => format!("a key of {legs} legs, not 1 to {MAX_LEGS}"),
+            ParamError::Outside {
+                what,
+                value,
+                lo,
+                hi,
+            } => {
+                write!(f, "{what} {value} is outside {lo}..={hi}")
+            }
+            ParamError::NoLeg { leg, legs } => write!(f, "no leg {leg} on a strip of {legs}"),
+            ParamError::NoBand(band) => write!(f, "no eq band {band}"),
+            ParamError::NoKey(key) => write!(f, "no key {key}"),
+            ParamError::KeyLegs(legs) => write!(f, "a key of {legs} legs, not 1 to {MAX_LEGS}"),
+            ParamError::ToneFrequency(hz) => write!(
+                f,
+                "tone frequency {hz} Hz is outside {}..={}",
+                TONE_FREQUENCY_HZ.start(),
+                TONE_FREQUENCY_HZ.end()
+            ),
+            ParamError::ToneLevel(db) => write!(
+                f,
+                "tone level {db} dBFS is outside {}..={}",
+                TONE_LEVEL_DB.start(),
+                TONE_LEVEL_DB.end()
+            ),
         }
     }
 }
+
+impl std::error::Error for ParamError {}
 
 /// `v` moved into `range`; none when it is NaN or infinite.
 pub(crate) fn clamp_in(v: f32, range: &RangeInclusive<f32>) -> Option<f32> {
@@ -178,11 +218,16 @@ pub(crate) fn within(
     what: &'static str,
     v: f32,
     range: &RangeInclusive<f32>,
-) -> Result<(), Refusal> {
+) -> Result<(), ParamError> {
     if range.contains(&v) {
         Ok(())
     } else {
-        Err(Refusal::Outside(what, v, *range.start(), *range.end()))
+        Err(ParamError::Outside {
+            what,
+            value: v,
+            lo: *range.start(),
+            hi: *range.end(),
+        })
     }
 }
 
@@ -290,16 +335,20 @@ impl StripParam {
 
     /// Whether a strip of `legs` legs takes the parameter: legs and bands
     /// that exist, values within their ranges, no NaN.
-    pub fn check(&self, legs: usize) -> Result<(), String> {
-        self.refusal(legs).map_err(|r| r.message())
+    ///
+    /// # Errors
+    ///
+    /// The first value refused, with what it is.
+    pub fn check(&self, legs: usize) -> Result<(), ParamError> {
+        self.refusal(legs)
     }
 
-    fn refusal(&self, legs: usize) -> Result<(), Refusal> {
+    fn refusal(&self, legs: usize) -> Result<(), ParamError> {
         let leg_exists = |leg: usize| {
             if leg < legs {
                 Ok(())
             } else {
-                Err(Refusal::NoLeg(leg, legs))
+                Err(ParamError::NoLeg { leg, legs })
             }
         };
         match *self {
@@ -313,7 +362,7 @@ impl StripParam {
             StripParam::Eq { .. } => Ok(()),
             StripParam::EqBand { band, value } => {
                 if band >= EQ_BANDS {
-                    return Err(Refusal::NoBand(band));
+                    return Err(ParamError::NoBand(band));
                 }
                 value.refusal()
             }

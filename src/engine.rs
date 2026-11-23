@@ -822,7 +822,7 @@ fn check_limiter(config: &Config, output: usize, params: &LimiterParams) -> Resu
     if !o.limiter {
         return Err(format!("output {output} has no limiter"));
     }
-    params.check()
+    params.check().map_err(|e| e.to_string())
 }
 
 /// Whether output `output` exists, has a strip and the strip takes
@@ -834,7 +834,7 @@ fn check_output_strip(config: &Config, output: usize, param: &StripParam) -> Res
     if !o.strip {
         return Err(format!("output {output} has no strip"));
     }
-    param.check(o.channels as usize)
+    param.check(o.channels as usize).map_err(|e| e.to_string())
 }
 
 /// Whether input slot `slot` exists and its delay line takes a delay of
@@ -889,7 +889,7 @@ fn check_tone(config: &Config, slot: usize, params: &ToneParams) -> Result<(), S
     if input.tone.is_none() {
         return Err(format!("input slot {slot} is no tone generator"));
     }
-    params.check()
+    params.check().map_err(|e| e.to_string())
 }
 
 /// Whether input slot `slot` exists and has a strip that takes `param`:
@@ -904,7 +904,7 @@ fn check_strip(config: &Config, slot: usize, param: &StripParam) -> Result<(), S
             "input slot {slot} has {legs} channels, a strip at most {MAX_LEGS}"
         ));
     }
-    param.check(legs)
+    param.check(legs).map_err(|e| e.to_string())
 }
 
 /// Whether duck group `group` takes `setting` on `config`'s engine: a
@@ -920,7 +920,7 @@ fn check_duck(config: &Config, group: usize, setting: &DuckSetting) -> Result<()
         Ok(input.channels as usize)
     };
     match *setting {
-        DuckSetting::Detector(ref p) => DuckParam::Detector(**p).check(),
+        DuckSetting::Detector(ref p) => DuckParam::Detector(**p).check().map_err(|e| e.to_string()),
         DuckSetting::Keys(ref keys) => {
             if keys.len() > MAX_KEYS {
                 return Err(format!(

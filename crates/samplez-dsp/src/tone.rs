@@ -60,22 +60,16 @@ impl ToneParams {
     }
 
     /// [`ToneParams::is_valid`], with the value refused named.
-    pub fn check(&self) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// The frequency, else the level, when outside its range.
+    pub fn check(&self) -> Result<(), crate::ParamError> {
         if !TONE_FREQUENCY_HZ.contains(&self.frequency_hz) {
-            return Err(format!(
-                "tone frequency {} Hz is outside {}..={}",
-                self.frequency_hz,
-                TONE_FREQUENCY_HZ.start(),
-                TONE_FREQUENCY_HZ.end()
-            ));
+            return Err(crate::ParamError::ToneFrequency(self.frequency_hz));
         }
         if !TONE_LEVEL_DB.contains(&self.level_db) {
-            return Err(format!(
-                "tone level {} dBFS is outside {}..={}",
-                self.level_db,
-                TONE_LEVEL_DB.start(),
-                TONE_LEVEL_DB.end()
-            ));
+            return Err(crate::ParamError::ToneLevel(self.level_db));
         }
         Ok(())
     }

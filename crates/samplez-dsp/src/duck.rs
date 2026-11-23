@@ -50,7 +50,7 @@ use core::ops::RangeInclusive;
 
 use crate::dynamics::GAIN_INTERVAL;
 use crate::level::{OCTAVES_PER_DB, db_to_gain, exp2};
-use crate::strip::{HPF_FREQ, MAX_LEGS, Refusal, within};
+use crate::strip::{HPF_FREQ, MAX_LEGS, ParamError, within};
 use crate::svf::{SAMPLE_RATE, Shape, Svf};
 use crate::{MAX_GAIN, MAX_RAMP_LEN};
 
@@ -151,7 +151,7 @@ impl DetectorParams {
         })
     }
 
-    fn refusal(&self) -> Result<(), Refusal> {
+    fn refusal(&self) -> Result<(), ParamError> {
         within("duck threshold", self.threshold_db, &THRESHOLD_DB)?;
         within("duck hysteresis", self.hysteresis_db, &HYSTERESIS_DB)?;
         within("duck key hpf freq", self.hpf.freq, &KEY_HPF_FREQ)?;
@@ -219,16 +219,20 @@ pub enum DuckParam {
 impl DuckParam {
     /// Whether a detector takes the parameter: keys that exist, widths
     /// and values within their ranges, no NaN.
-    pub fn check(&self) -> Result<(), String> {
-        self.refusal().map_err(|r| r.message())
+    ///
+    /// # Errors
+    ///
+    /// The first value refused, with what it is.
+    pub fn check(&self) -> Result<(), ParamError> {
+        self.refusal()
     }
 
-    fn refusal(&self) -> Result<(), Refusal> {
+    fn refusal(&self) -> Result<(), ParamError> {
         let key_exists = |key: usize| {
             if key < MAX_KEYS {
                 Ok(())
             } else {
-                Err(Refusal::NoKey(key))
+                Err(ParamError::NoKey(key))
             }
         };
         match *self {
@@ -236,7 +240,7 @@ impl DuckParam {
             DuckParam::Key { key, legs, gain } => {
                 key_exists(key)?;
                 if !(1..=MAX_LEGS).contains(&legs) {
-                    return Err(Refusal::KeyLegs(legs));
+                    return Err(ParamError::KeyLegs(legs));
                 }
                 within("duck key gain", gain, &KEY_GAIN)
             }
@@ -1555,7 +1559,7 @@ mod tests {
                 assert_eq!(with(v).check(), Ok(()), "{name} {v}");
             }
             for v in [*range.start() - 0.5, *range.end() + 0.5, f32::NAN] {
-                let err = with(v).check().unwrap_err();
+                let err = with(v).check().unwrap_err().to_string();
                 assert!(err.starts_with(name), "{name} {v}: {err}");
                 let before = det;
                 assert!(!det.set(with(v)));
