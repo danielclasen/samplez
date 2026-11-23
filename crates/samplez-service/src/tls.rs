@@ -662,11 +662,13 @@ impl axum::serve::Listener for TlsListener {
     type Io = TlsStream<TcpStream>;
     type Addr = SocketAddr;
 
+    /// The next connection. Once the accept task is gone, as when the
+    /// runtime shuts down and drops it before the server, none comes.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        self.accepted
-            .recv()
-            .await
-            .expect("the accept task runs while the listener exists")
+        match self.accepted.recv().await {
+            Some(accepted) => accepted,
+            None => std::future::pending().await,
+        }
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -1324,6 +1326,26 @@ mod tests {
                 .await
                 .expect("within 5 s");
         assert!(accepted.get_ref().0.nodelay().unwrap());
+    }
+
+    /// A listener whose accept task is gone, as a shutting-down runtime
+    /// drops it, takes no more connections and does not panic.
+    #[tokio::test]
+    async fn a_listener_without_its_accept_task_waits_rather_than_panics() {
+        let (cert, key, _) = write_pair("no-task");
+        let tls = listener_tls(&files(&cert, &key), &Metrics::default());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = tls.listen(tcp, MAX_HANDSHAKES, ACCEPTED_QUEUE).unwrap();
+        listener.task.abort();
+        while !listener.task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let accept = axum::serve::Listener::accept(&mut listener);
+        let waited = tokio::time::timeout(Duration::from_millis(50), accept).await;
+        assert!(
+            waited.is_err(),
+            "no connection once the accept task is gone"
+        );
     }
 
     #[tokio::test]
