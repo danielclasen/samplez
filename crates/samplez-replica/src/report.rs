@@ -201,20 +201,44 @@ pub(crate) struct Carried {
     /// By (voter, output, page): the record carried, and the first report
     /// that carried it, none once confirmed.
     records: BTreeMap<(NodeId, u32, u64), (Page, Option<u64>)>,
+    /// The last offer and what it carried; none once an echo confirmed a
+    /// record since.
+    last: Option<LastOffer>,
     /// Records looked up in `records`, counted for the tests.
     #[cfg(test)]
     lookups: usize,
 }
 
+/// An offer, as its voters and their records' generations, and what it
+/// carried.
+#[derive(Debug)]
+struct LastOffer {
+    offer: Vec<(NodeId, u64)>,
+    carried: Vec<Vec<Page>>,
+}
+
 impl Carried {
-    /// Of the records `offered` per voter, those report `seq` carries:
-    /// every one not confirmed. Forgets the records not offered, so it
-    /// holds no more than one report offers.
-    pub(crate) fn carry(&mut self, seq: u64, offered: &[(NodeId, Vec<Page>)]) -> Vec<Vec<Page>> {
+    /// What an offer of the same voters at the same generations as the
+    /// last one carries, with nothing confirmed since: the same records.
+    pub(crate) fn unchanged(&self, offer: &[(NodeId, u64)]) -> Option<Vec<Vec<Page>>> {
+        let last = self.last.as_ref()?;
+        (last.offer == offer).then(|| last.carried.clone())
+    }
+
+    /// Of the records `offered` per voter, at the generations `offer`
+    /// names, those report `seq` carries: every one not confirmed.
+    /// Forgets the records not offered, so it holds no more than one
+    /// report offers.
+    pub(crate) fn carry(
+        &mut self,
+        seq: u64,
+        offer: Vec<(NodeId, u64)>,
+        offered: &[(NodeId, Vec<Page>)],
+    ) -> Vec<Vec<Page>> {
         // Rebuilt from the records offered, one lookup each: a record not
         // offered is left behind.
         let mut held = std::mem::take(&mut self.records);
-        offered
+        let carried: Vec<Vec<Page>> = offered
             .iter()
             .map(|(node, pages)| {
                 pages
@@ -235,7 +259,12 @@ impl Carried {
                     .copied()
                     .collect()
             })
-            .collect()
+            .collect();
+        self.last = Some(LastOffer {
+            offer,
+            carried: carried.clone(),
+        });
+        carried
     }
 
     /// The addressee echoed report `seq`: it took every record carried
@@ -244,6 +273,7 @@ impl Carried {
         for (_, first) in self.records.values_mut() {
             if first.is_some_and(|f| f <= seq) {
                 *first = None;
+                self.last = None;
             }
         }
     }
@@ -435,22 +465,47 @@ mod tests {
         let mut c = Carried::default();
         let offer = |pages: Vec<Page>| vec![(1, pages), (3, vec![page(0, 9)])];
         assert_eq!(
-            c.carry(10, &offer(vec![page(0, 1)])),
+            c.carry(10, Vec::new(), &offer(vec![page(0, 1)])),
             [vec![page(0, 1)], vec![page(0, 9)]]
         );
         c.echoed(9);
         let two = offer(vec![page(0, 1), page(0, 2)]);
         assert_eq!(
-            c.carry(11, &two),
+            c.carry(11, Vec::new(), &two),
             [vec![page(0, 1), page(0, 2)], vec![page(0, 9)]]
         );
         c.echoed(10);
-        assert_eq!(c.carry(12, &two), [vec![page(0, 2)], vec![]]);
+        assert_eq!(c.carry(12, Vec::new(), &two), [vec![page(0, 2)], vec![]]);
         c.echoed(12);
-        assert_eq!(c.carry(13, &two), [vec![], vec![]]);
+        assert_eq!(c.carry(13, Vec::new(), &two), [vec![], vec![]]);
         assert_eq!(c.len(), 3);
-        assert_eq!(c.carry(14, &offer(vec![page(0, 2)])), [vec![], vec![]]);
+        assert_eq!(
+            c.carry(14, Vec::new(), &offer(vec![page(0, 2)])),
+            [vec![], vec![]]
+        );
         assert_eq!(c.len(), 2, "page 1 is offered no more");
+    }
+
+    /// An offer of the same voters at the same generations carries what
+    /// the last one did, until an echo confirms one of its records; a
+    /// newer generation or an echo confirming nothing new changes nothing
+    /// else.
+    #[test]
+    fn an_unchanged_offer_carries_the_same_until_an_echo_confirms() {
+        let mut c = Carried::default();
+        let offered = vec![(1, vec![page(0, 1)])];
+        assert_eq!(c.unchanged(&[(1, 5)]), None, "nothing offered yet");
+        let carried = c.carry(10, vec![(1, 5)], &offered);
+        assert_eq!(carried, [vec![page(0, 1)]]);
+        assert_eq!(c.unchanged(&[(1, 5)]), Some(carried.clone()));
+        assert_eq!(c.unchanged(&[(1, 6)]), None, "a newer generation");
+        assert_eq!(c.unchanged(&[(1, 5), (3, 1)]), None, "another voter");
+        c.echoed(9);
+        assert_eq!(c.unchanged(&[(1, 5)]), Some(carried), "nothing confirmed");
+        c.echoed(10);
+        assert_eq!(c.unchanged(&[(1, 5)]), None, "a record confirmed");
+        assert_eq!(c.carry(11, vec![(1, 5)], &offered), [vec![]]);
+        assert_eq!(c.unchanged(&[(1, 5)]), Some(vec![vec![]]));
     }
 
     /// At the most outputs a set can have and three voters, a period
@@ -473,7 +528,7 @@ mod tests {
         let mut c = Carried::default();
         for period in 0..10 {
             c.lookups = 0;
-            c.carry(period, &offer(period));
+            c.carry(period, Vec::new(), &offer(period));
             c.echoed(period);
             assert_eq!(c.lookups, records, "period {period}");
             assert_eq!(c.len(), records, "period {period}");

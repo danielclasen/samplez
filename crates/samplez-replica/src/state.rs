@@ -65,15 +65,19 @@ pub(crate) struct PageBook {
 }
 
 impl PageBook {
-    /// Takes `node`'s page records.
-    pub fn fold(&mut self, node: NodeId, pages: &[Page]) {
+    /// Takes `node`'s page records; true when one was new or differed.
+    pub fn fold(&mut self, node: NodeId, pages: &[Page]) -> bool {
+        let mut changed = false;
         for p in pages {
             let held = self.pages.entry((node, p.output)).or_default();
-            held.insert(p.page, *p);
+            if held.insert(p.page, *p) != Some(*p) {
+                changed = true;
+            }
             while held.len() > PAGES_KEPT {
                 held.pop_first();
             }
         }
+        changed
     }
 
     pub fn of(&self, node: NodeId, output: u32) -> Option<&BTreeMap<u64, Page>> {
@@ -87,10 +91,13 @@ impl PageBook {
     /// The newest `n` pages of each output `node` reported, oldest first
     /// per output.
     pub fn latest(&self, node: NodeId, n: usize) -> Vec<Page> {
-        self.pages
-            .range((node, 0)..=(node, u32::MAX))
-            .flat_map(|(_, held)| held.values().skip(held.len().saturating_sub(n)).copied())
-            .collect()
+        let mut out = Vec::new();
+        for (_, held) in self.pages.range((node, 0)..=(node, u32::MAX)) {
+            let from = out.len();
+            out.extend(held.values().rev().take(n).copied());
+            out[from..].reverse();
+        }
+        out
     }
 
     /// The newest page `node` reported of `output`.
