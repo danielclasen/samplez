@@ -232,16 +232,15 @@ async fn start(store: Store<Paths>) -> Replica<Paths> {
 #[test]
 fn audio_with_another_ramp_length_or_block_is_refused() {
     let limits = Limits::defaults(48_000);
-    assert_eq!(
-        check_ramp_config(&limits, Some((limits.ramp_samples, limits.block))),
-        Ok(())
-    );
-    assert_eq!(check_ramp_config(&limits, None), Ok(()));
+    assert!(check_ramp_config(&limits, Some((limits.ramp_samples, limits.block))).is_ok());
+    assert!(check_ramp_config(&limits, None).is_ok());
     for engine in [
         (limits.ramp_samples + 1, limits.block),
         (limits.ramp_samples, 96),
     ] {
-        let e = check_ramp_config(&limits, Some(engine)).unwrap_err();
+        let e = check_ramp_config(&limits, Some(engine))
+            .unwrap_err()
+            .to_string();
         assert!(
             e.contains(&engine.0.to_string()) && e.contains(&engine.1.to_string()),
             "{e}"
@@ -309,7 +308,7 @@ async fn a_reopened_set_of_one_voter_whose_vote_takes_longer_than_the_tick_to_sa
 #[test]
 fn the_default_timing_is_valid_and_reaches_openraft() {
     assert_eq!(RaftTiming::default(), RaftTiming::DEFAULT);
-    assert_eq!(RaftTiming::DEFAULT.validate(), Ok(()));
+    assert!(RaftTiming::DEFAULT.validate().is_ok());
     let config = raft_config("t");
     let ms = |d: Duration| d.as_millis() as u64;
     assert_eq!(
@@ -432,4 +431,116 @@ async fn rpcs_record_only_a_vote_the_raft_accepted() {
     );
     replica.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What the replica's API errors say, word for word: products pass the
+/// messages on to their operators.
+mod error_messages {
+    use super::*;
+
+    #[test]
+    fn invalid_raft_timing_names_the_values() {
+        let ms = Duration::from_millis;
+        let timing = |heartbeat, election_min, election_max| RaftTiming {
+            election_min,
+            election_max,
+            heartbeat,
+        };
+        let refused = |t: RaftTiming| raft_config_with("x", &t).unwrap_err().to_string();
+        assert_eq!(
+            refused(timing(ms(0), ms(100), ms(200))),
+            "raft heartbeat must not be zero"
+        );
+        assert_eq!(
+            refused(timing(ms(150), ms(100), ms(200))),
+            "raft heartbeat (150ms) must be below the election timeout minimum (100ms)"
+        );
+        assert_eq!(
+            refused(timing(ms(50), ms(200), ms(200))),
+            "raft election timeout minimum (200ms) must be below its maximum (200ms)"
+        );
+    }
+
+    #[test]
+    fn an_even_voter_count_names_it() {
+        use crate::membership::Voters;
+        let refused = |r, w| Voters::new(r, w).map(|_| ()).unwrap_err().to_string();
+        assert_eq!(
+            refused(2, false),
+            "2 replicas without the witness are 2 voters; the count must be odd"
+        );
+        assert_eq!(
+            refused(3, true),
+            "3 replicas with the witness are 4 voters; the count must be odd"
+        );
+        assert_eq!(
+            refused(0, true),
+            "0 replicas with the witness are 1 voters; the count must be odd"
+        );
+    }
+
+    #[test]
+    fn another_ramp_or_block_names_both() {
+        let limits = Limits::defaults(48_000);
+        let e = check_ramp_config(&limits, Some((7, 96)))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            format!(
+                "the replica's ramp_samples {} and block {} are not the engine's \
+                 rampSamples 7 and blockSize 96: they must be equal",
+                limits.ramp_samples, limits.block
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contact_started_twice_is_refused() {
+        let dir = dir("contact-twice");
+        let replica = start(open(&dir)).await;
+        let timing = contact::Timing::defaults(48);
+        let clocks = || Arc::new(contact::SystemClocks);
+        replica.contact(timing, clocks(), None).expect("starts");
+        let again = replica.contact(timing, clocks(), None).unwrap_err();
+        assert_eq!(again.to_string(), "contact runs already");
+        replica.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_that_cannot_open_passes_its_error_on() {
+        let file = dir("not-a-dir");
+        std::fs::write(&file, b"").unwrap();
+        let settings = Settings {
+            id: ID,
+            epoch: 1,
+            limits: Limits::defaults(48_000),
+            block: 48,
+            write_timeout: Duration::from_secs(2),
+            addr: "local".to_owned(),
+            peers: vec![],
+            voters: None,
+        };
+        let opened = Store::open(&file, Arc::new(Paths::default), settings.limits)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        let started = Replica::start(
+            settings,
+            raft_config("lone"),
+            &file,
+            Arc::new(Paths::default),
+            Nobody,
+            Arc::new(Nobody),
+            Arc::new(|| 0),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert_eq!(started, opened);
+        assert!(!started.is_empty());
+        let _ = std::fs::remove_file(&file);
+    }
 }
