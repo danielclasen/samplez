@@ -56,7 +56,11 @@ matrix, are built on it.
   the baseline over by
 - A service layer for products: API, machine, ops and NMOS listeners,
   TLS, the auth modes `none`, `token`, `proxy` and `oidc`, `/healthz`,
-  `/readyz`, Prometheus `/metrics` and WebSocket fan-out
+  `/readyz`, Prometheus `/metrics` and WebSocket fan-out. The auth
+  middleware tells a write by its HTTP method and refuses viewers every
+  method but `GET`, `HEAD` and `OPTIONS`, so a product changes no state
+  on those; it checks the role itself, with `Connect::require_operator`,
+  before it applies a command received over the WebSocket
 
 ```mermaid
 flowchart LR
