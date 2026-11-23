@@ -1804,8 +1804,8 @@ impl Contact {
             // the addressee confirms it. An addressee not heard within w
             // may have restarted with no record: it is sent every one.
             // A period offering the same voters' records at the same
-            // generations, with none confirmed since, carries what the
-            // last did, and builds nothing.
+            // generations carries what the last did, less what was
+            // confirmed since, and builds nothing.
             let generation = |v: NodeId| st.page_generations.get(&v).copied().unwrap_or(0);
             let offer: Vec<(NodeId, u64)> = std::iter::once(self.id)
                 .chain(heard.iter().filter(|h| h.own.is_some()).map(|h| h.node))
@@ -8441,9 +8441,10 @@ mod tests {
         assert!(held.iter().any(|p| p.page == 9), "{held:?}");
     }
 
-    /// A period offering the records of the last one, with none
-    /// confirmed since, builds no offer: no record is cloned, read from
-    /// the page book or looked up. A new record builds one again.
+    /// A period offering the records of the last one builds no offer,
+    /// confirmations meanwhile included: no record is cloned, read from
+    /// the page book or looked up. A new record builds one again, once
+    /// per addressee.
     #[tokio::test(start_paused = true)]
     async fn an_unchanged_period_builds_no_offer() {
         let clock = Arc::new(Clock {
@@ -8464,11 +8465,14 @@ mod tests {
         }
         assert_eq!(net.contact(1).offers_built(), built, "20 unchanged periods");
         net.nodes[&1].1.page(2);
-        net.period(|_, _| false);
+        for _ in 0..6 {
+            net.period(|_, _| false);
+            Net::advance(&clock).await;
+        }
         assert_eq!(
             net.contact(1).offers_built(),
             built + 2,
-            "one per addressee"
+            "one per addressee, its confirmation building none"
         );
     }
 

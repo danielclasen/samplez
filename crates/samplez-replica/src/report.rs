@@ -201,8 +201,8 @@ pub(crate) struct Carried {
     /// By (voter, output, page): the record carried, and the first report
     /// that carried it, none once confirmed.
     records: BTreeMap<(NodeId, u32, u64), (Page, Option<u64>)>,
-    /// The last offer and what it carried; none once an echo confirmed a
-    /// record since.
+    /// The last offer and what it carried, less the records confirmed
+    /// since.
     last: Option<LastOffer>,
     /// Records looked up in `records`, counted for the tests.
     #[cfg(test)]
@@ -219,7 +219,7 @@ struct LastOffer {
 
 impl Carried {
     /// What an offer of the same voters at the same generations as the
-    /// last one carries, with nothing confirmed since: the same records.
+    /// last one carries: its records not confirmed since.
     pub(crate) fn unchanged(&self, offer: &[(NodeId, u64)]) -> Option<Vec<Vec<Page>>> {
         let last = self.last.as_ref()?;
         (last.offer == offer).then(|| last.carried.clone())
@@ -270,10 +270,16 @@ impl Carried {
     /// The addressee echoed report `seq`: it took every record carried
     /// from that report or an earlier one on.
     pub(crate) fn echoed(&mut self, seq: u64) {
-        for (_, first) in self.records.values_mut() {
+        let mut confirmed = Vec::new();
+        for (key, (_, first)) in &mut self.records {
             if first.is_some_and(|f| f <= seq) {
                 *first = None;
-                self.last = None;
+                confirmed.push(*key);
+            }
+        }
+        if let (false, Some(last)) = (confirmed.is_empty(), &mut self.last) {
+            for ((node, _), carried) in last.offer.iter().zip(&mut last.carried) {
+                carried.retain(|p| !confirmed.contains(&(*node, p.output, p.page)));
             }
         }
     }
@@ -487,9 +493,8 @@ mod tests {
     }
 
     /// An offer of the same voters at the same generations carries what
-    /// the last one did, until an echo confirms one of its records; a
-    /// newer generation or an echo confirming nothing new changes nothing
-    /// else.
+    /// the last one did, less the records an echo confirmed since; a
+    /// newer generation or another voter builds anew.
     #[test]
     fn an_unchanged_offer_carries_the_same_until_an_echo_confirms() {
         let mut c = Carried::default();
@@ -503,9 +508,12 @@ mod tests {
         c.echoed(9);
         assert_eq!(c.unchanged(&[(1, 5)]), Some(carried), "nothing confirmed");
         c.echoed(10);
-        assert_eq!(c.unchanged(&[(1, 5)]), None, "a record confirmed");
-        assert_eq!(c.carry(11, vec![(1, 5)], &offered), [vec![]]);
-        assert_eq!(c.unchanged(&[(1, 5)]), Some(vec![vec![]]));
+        assert_eq!(c.unchanged(&[(1, 5)]), Some(vec![vec![]]), "confirmed");
+        assert_eq!(
+            c.carry(11, vec![(1, 5)], &offered),
+            [vec![]],
+            "as a rebuild finds"
+        );
     }
 
     /// At the most outputs a set can have and three voters, a period
