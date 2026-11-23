@@ -1688,11 +1688,11 @@ impl<P: Product> ReplicatedState for Replica<P> {
     /// Contact's view of this audio replica, once contact runs: none for
     /// a single replica. Then the counts of the connections to each peer.
     fn replica_metrics(&self) -> Vec<ReplicaMetric> {
-        let mut samples = self
-            .shared
-            .contact
-            .get()
-            .map_or_else(Vec::new, |c| contact_samples(c.serving(), &c.metrics()));
+        let mut samples = self.shared.contact.get().map_or_else(Vec::new, |c| {
+            let mut samples = contact_samples(c.serving(), &c.metrics());
+            samples.extend(cost_samples(&c.costs()));
+            samples
+        });
         samples.extend(link_samples(&self.shared.peers.link_counts()));
         samples
     }
@@ -2128,34 +2128,100 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
     out
 }
 
+/// The `/metrics` samples of the contact loop's cost: the periods it ran
+/// and the CPU time of each part, labelled `part`.
+fn cost_samples(c: &contact::CostCounts) -> Vec<ReplicaMetric> {
+    let mut out = vec![ReplicaMetric {
+        name: "samplez_replica_contact_ticks_total",
+        help: "Report periods the contact loop ran; a missed period is skipped, not caught up.",
+        kind: MetricKind::Counter,
+        labels: Vec::new(),
+        value: c.ticks as f64,
+    }];
+    for (part, cpu) in [
+        ("tick", c.tick),
+        ("decisions", c.decisions),
+        ("decode", c.decode),
+        ("receive", c.receive),
+    ] {
+        out.push(ReplicaMetric {
+            name: "samplez_replica_contact_cpu_seconds_total",
+            help: "CPU time of the threads running the contact loop: a period's state and reports (tick), the leader's decisions, decoding peers' reports (decode) and taking them (receive).",
+            kind: MetricKind::Counter,
+            labels: vec![("part", part.to_owned())],
+            value: cpu.as_secs_f64(),
+        });
+    }
+    out
+}
+
 /// The `/metrics` samples of the counts of the connections to each peer,
 /// labelled `node`.
 fn link_samples(links: &[LinkCounts]) -> Vec<ReplicaMetric> {
-    let sample = |name: &'static str, help: &'static str, node: NodeId, value: u64| ReplicaMetric {
+    use MetricKind::Counter;
+    let sample = |name, help, node: NodeId, value: f64| ReplicaMetric {
         name,
         help,
-        kind: MetricKind::Counter,
+        kind: Counter,
         labels: vec![("node", node.to_string())],
-        value: value as f64,
+        value,
     };
     // A name's samples stay together.
-    let timeouts = links.iter().map(|l| {
-        sample(
+    type Family = (&'static str, &'static str, fn(&LinkCounts) -> f64);
+    let families: [Family; 6] = [
+        (
             "samplez_replica_peer_report_timeouts_total",
             "Reports to a peer that got no answer within contactWindowMs.",
-            l.node,
-            l.report_timeouts,
-        )
-    });
-    let dials = links.iter().map(|l| {
-        sample(
+            |l| l.report_timeouts as f64,
+        ),
+        (
             "samplez_replica_peer_dials_total",
             "Connections dialed to a peer.",
-            l.node,
-            l.dials,
-        )
-    });
-    timeouts.chain(dials).collect()
+            |l| l.dials as f64,
+        ),
+        (
+            "samplez_replica_peer_reports_sent_total",
+            "Reports to a peer handed to the connection pool.",
+            |l| l.reports_sent as f64,
+        ),
+        (
+            "samplez_replica_peer_report_bytes_total",
+            "Encoded bytes of the reports to a peer.",
+            |l| l.report_bytes as f64,
+        ),
+        (
+            "samplez_replica_peer_report_encode_cpu_seconds_total",
+            "CPU time of the threads encoding the reports to a peer.",
+            |l| l.report_encode.as_secs_f64(),
+        ),
+        (
+            "samplez_replica_peer_report_round_trip_seconds_total",
+            "Round trips of the answered reports to a peer, summed.",
+            |l| l.report_round_trip.as_secs_f64(),
+        ),
+    ];
+    let mut out = Vec::new();
+    for (name, help, value) in families {
+        out.extend(links.iter().map(|l| sample(name, help, l.node, value(l))));
+    }
+    // Cumulative over the round-trip buckets, as a histogram's are.
+    for l in links {
+        let mut cumulative = 0;
+        for (i, n) in l.reports_answered.iter().enumerate() {
+            cumulative += n;
+            let le = peer::ROUND_TRIP_BOUNDS
+                .get(i)
+                .map_or_else(|| "+Inf".to_owned(), |b| b.to_string());
+            out.push(ReplicaMetric {
+                name: "samplez_replica_peer_reports_answered_total",
+                help: "Reports to a peer answered within le seconds of being handed to the connection pool.",
+                kind: Counter,
+                labels: vec![("node", l.node.to_string()), ("le", le)],
+                value: cumulative as f64,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
