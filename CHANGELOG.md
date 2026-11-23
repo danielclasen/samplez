@@ -5,9 +5,9 @@
 
 ### ⚠ BREAKING CHANGES
 
-* **replica:** return a typed error from the replica's API
-* **replica:** let the link and contact counters grow without a break
-* **dsp:** peer::LinkCounts and contact::CostCounts are #[non_exhaustive]; build a LinkCounts with LinkCounts::new(node).
+* **dsp:** StripParam, DuckParam, LimiterParams and ToneParams check() return Result<(), ParamError>, not Result<(), String>.
+* **replica:** Replica::start, with_store, append, initialize and contact, RaftTiming::validate, raft_config_with and Voters::new return samplez_replica::Error instead of String; Replica::rollout returns ().
+* **replica:** peer::LinkCounts and contact::CostCounts are #[non_exhaustive]; build a LinkCounts with LinkCounts::new(node).
 
 ### Features
 
