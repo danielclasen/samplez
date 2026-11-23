@@ -270,6 +270,38 @@ impl Drop for Ended {
     }
 }
 
+type Exchange = std::pin::Pin<Box<dyn Future<Output = io::Result<(StatusCode, Bytes)>> + Send>>;
+
+/// An exchange polled by its caller, spawned to run to its end when the
+/// caller stops waiting first.
+struct Detached(Option<Exchange>);
+
+impl Future for Detached {
+    type Output = io::Result<(StatusCode, Bytes)>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let exchange = self.0.as_mut().expect("polled after it ended");
+        let polled = exchange.as_mut().poll(cx);
+        if polled.is_ready() {
+            self.0 = None;
+        }
+        polled
+    }
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        if let Some(exchange) = self.0.take() {
+            tokio::spawn(async move {
+                let _ = exchange.await;
+            });
+        }
+    }
+}
+
 /// Connections to the other replicas, kept open between requests, at
 /// most [`MAX_IDLE`] idle ones per peer.
 ///
@@ -345,38 +377,42 @@ impl Pool {
             h.insert("x-proto-sent", crate::proto::mono_ns().into());
         }
         let state = Arc::new(AtomicU8::new(RUNNING));
-        let exchange = tokio::spawn({
-            let mut ended = Ended {
-                conns: self.conns.clone(),
-                addr: addr.to_owned(),
-                state: state.clone(),
-                answered: None,
-            };
-            let limit = self.max_response;
-            async move {
-                let sent = tokio::time::timeout_at(
-                    deadline + DIAL_WITHIN,
-                    send(&mut sender, request, limit),
-                )
-                .await
-                .unwrap_or_else(|_| Err(timed_out()));
-                if sent.is_ok() {
-                    ended.answered = Some(sender);
-                }
-                // Dropping `ended` hands an answered connection back.
-                drop(ended);
-                sent
+        let mut ended = Ended {
+            conns: self.conns.clone(),
+            addr: addr.to_owned(),
+            state: state.clone(),
+            answered: None,
+        };
+        let limit = self.max_response;
+        let exchange = async move {
+            let sent =
+                tokio::time::timeout_at(deadline + DIAL_WITHIN, send(&mut sender, request, limit))
+                    .await
+                    .unwrap_or_else(|_| Err(timed_out()));
+            if sent.is_ok() {
+                ended.answered = Some(sender);
             }
-        });
+            // Dropping `ended` hands an answered connection back.
+            drop(ended);
+            sent
+        };
         let _waiting = Waiting {
             conns: self.conns.clone(),
             addr: addr.to_owned(),
             state,
         };
-        let (status, body) = tokio::time::timeout_at(deadline, exchange)
-            .await
-            .map_err(|_| timed_out())?
-            .map_err(io::Error::other)??;
+        let answered = if crate::proto::inline() {
+            let mut exchange = Detached(Some(Box::pin(exchange)));
+            tokio::time::timeout_at(deadline, &mut exchange)
+                .await
+                .map_err(|_| timed_out())?
+        } else {
+            tokio::time::timeout_at(deadline, tokio::spawn(exchange))
+                .await
+                .map_err(|_| timed_out())?
+                .map_err(io::Error::other)?
+        };
+        let (status, body) = answered?;
         if status != StatusCode::OK {
             return Err(io::Error::other(format!("{addr}{path}: {status}")));
         }

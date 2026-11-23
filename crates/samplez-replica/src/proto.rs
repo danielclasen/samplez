@@ -76,6 +76,20 @@ pub fn lap(i: usize, at: &mut std::time::Duration) {
     *at = now;
 }
 
+/// `SAMPLEZ_PROTO_INLINE=1`: an exchange runs in its caller's task, and is
+/// spawned only once the caller stops waiting.
+pub fn inline() -> bool {
+    static I: OnceLock<bool> = OnceLock::new();
+    *I.get_or_init(|| env("SAMPLEZ_PROTO_INLINE") == "1")
+}
+
+/// `SAMPLEZ_PROTO_RUNS=1`: one status run per output, every block
+/// committed.
+pub fn one_run() -> bool {
+    static R: OnceLock<bool> = OnceLock::new();
+    *R.get_or_init(|| env("SAMPLEZ_PROTO_RUNS") == "1")
+}
+
 pub fn pad() -> bool {
     static P: OnceLock<bool> = OnceLock::new();
     *P.get_or_init(|| env("SAMPLEZ_PROTO_PAD") == "1")
@@ -172,6 +186,12 @@ pub fn pad_own(own: &mut Own, k: u64, seed: u64) {
     let r = |x: u64| x.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ seed;
     own.statuses = (0..5)
         .map(|_| {
+            if one_run() {
+                return vec![Run {
+                    status: st(k - 22),
+                    count: 23,
+                }];
+            }
             vec![
                 Run {
                     status: st(k - 22),

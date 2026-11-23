@@ -705,6 +705,23 @@ async fn proto_measure() {
     for s in &samplez_replica::proto::SEGMENTS {
         s.store(0, Relaxed);
     }
+    // CPU and run-queue wait of the runtime's threads, ns, from schedstat.
+    fn workers() -> (u64, u64, usize) {
+        let (mut run, mut wait, mut n) = (0, 0, 0);
+        for t in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+            let comm = std::fs::read_to_string(t.path().join("comm")).unwrap_or_default();
+            if comm.trim() != "tokio-rt-worker" {
+                continue;
+            }
+            let st = std::fs::read_to_string(t.path().join("schedstat")).unwrap_or_default();
+            let mut f = st.split_whitespace().map(|x| x.parse::<u64>().unwrap_or(0));
+            run += f.next().unwrap_or(0);
+            wait += f.next().unwrap_or(0);
+            n += 1;
+        }
+        (run, wait, n)
+    }
+    let w0 = workers();
     STATS.latency.lock().unwrap().clear();
     STATS.round_trip.lock().unwrap().clear();
     let (a, c0, k0, t0) = (total(&set), rusage(), counters(), Instant::now());
@@ -714,6 +731,14 @@ async fn proto_measure() {
         rusage(),
         counters(),
         t0.elapsed().as_secs_f64(),
+    );
+    let w1 = workers();
+    println!(
+        "PROTO workers threads {} run_s {:.4} wait_s {:.4} inline={}",
+        w1.2,
+        (w1.0 - w0.0) as f64 / 1e9,
+        (w1.1 - w0.1) as f64 / 1e9,
+        samplez_replica::proto::inline()
     );
     let mut latency = std::mem::take(&mut *STATS.latency.lock().unwrap());
     let mut round_trip = std::mem::take(&mut *STATS.round_trip.lock().unwrap());
