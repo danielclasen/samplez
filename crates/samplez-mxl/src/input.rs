@@ -149,6 +149,13 @@ unsafe impl Send for FlowReader {}
 // only in Drop, which has the reader to itself.
 unsafe impl Sync for FlowReader {}
 
+// A generation shared between the RT thread and the supervisor holds its
+// readers: they must stay Send and Sync.
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<FlowReader>();
+};
+
 impl FlowReader {
     /// `mxlCreateFlowReader`.
     pub fn open(instance: &Arc<Instance>, flow_id: &str) -> Result<FlowReader> {

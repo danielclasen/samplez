@@ -2841,6 +2841,8 @@ impl Rt {
                 Ok(()) => return,
                 Err(rtrb::PushError::Full(Returned::Batch(b))) => b,
                 Err(rtrb::PushError::Full(other)) => {
+                    // Unreachable: a full ring hands back what was pushed,
+                    // a batch. Leaked rather than released on the RT thread.
                     std::mem::forget(other);
                     return;
                 }
@@ -2851,6 +2853,8 @@ impl Rt {
         if self.spent.len() < self.spent.capacity() {
             self.spent.push(b);
         } else {
+            // No room to keep it for the supervisor to free: leaked, and
+            // counted, rather than released on the RT thread.
             add(&self.counters.batches_leaked, 1);
             std::mem::forget(b);
         }
