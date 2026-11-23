@@ -368,9 +368,11 @@ impl ListenerTls {
         let handshakes = Arc::new(Semaphore::new(handshakes));
         let task = tokio::spawn(accept_loop(tcp, self.config.clone(), tx, handshakes));
         Ok(TlsListener {
+            name: self.listener,
             local,
             accepted,
             task,
+            ended: false,
         })
     }
 }
@@ -653,20 +655,42 @@ async fn accept_loop(
 
 /// A listener yielding connections that finished the TLS handshake.
 pub struct TlsListener {
+    name: &'static str,
     local: SocketAddr,
     accepted: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
     task: JoinHandle<()>,
+    /// The accept task's end was taken.
+    ended: bool,
 }
 
 impl axum::serve::Listener for TlsListener {
     type Io = TlsStream<TcpStream>;
     type Addr = SocketAddr;
 
+    /// The next connection. Once the accept task is gone none comes:
+    /// cancelled, as when the runtime shuts down and drops it before the
+    /// server, this waits for ever; panicked, the panic goes on here; and
+    /// ended otherwise, which its loop never does, this panics.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        self.accepted
-            .recv()
-            .await
-            .expect("the accept task runs while the listener exists")
+        if let Some(accepted) = self.accepted.recv().await {
+            return accepted;
+        }
+        if !self.ended {
+            // Taken only once the join ends: an accept dropped while it
+            // waits leaves the next one to take it.
+            match (&mut self.task).await {
+                Err(e) if e.is_cancelled() => self.ended = true,
+                Err(e) => {
+                    tracing::error!(listener = self.name, "the accept task panicked");
+                    std::panic::resume_unwind(e.into_panic());
+                }
+                Ok(()) => {
+                    tracing::error!(listener = self.name, "the accept task ended");
+                    panic!("the accept task of the {} listener ended", self.name);
+                }
+            }
+        }
+        std::future::pending().await
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -1324,6 +1348,83 @@ mod tests {
                 .await
                 .expect("within 5 s");
         assert!(accepted.get_ref().0.nodelay().unwrap());
+    }
+
+    /// A listener whose accept task is gone, as a shutting-down runtime
+    /// drops it, takes no more connections and does not panic.
+    #[tokio::test]
+    async fn a_listener_without_its_accept_task_waits_rather_than_panics() {
+        let (cert, key, _) = write_pair("no-task");
+        let tls = listener_tls(&files(&cert, &key), &Metrics::default());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = tls.listen(tcp, MAX_HANDSHAKES, ACCEPTED_QUEUE).unwrap();
+        listener.task.abort();
+        while !listener.task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let accept = axum::serve::Listener::accept(&mut listener);
+        let waited = tokio::time::timeout(Duration::from_millis(50), accept).await;
+        assert!(
+            waited.is_err(),
+            "no connection once the accept task is gone"
+        );
+    }
+
+    /// A listener whose accept task panicked does not wait quietly: the
+    /// accept that finds it gone panics with the task's panic.
+    #[tokio::test]
+    async fn a_listener_whose_accept_task_panicked_panics_with_it() {
+        let (cert, key, _) = write_pair("panicked-task");
+        let tls = listener_tls(&files(&cert, &key), &Metrics::default());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = tls.listen(tcp, MAX_HANDSHAKES, ACCEPTED_QUEUE).unwrap();
+        // The accept loop, and the sender it holds, end in a panic.
+        listener.task.abort();
+        listener.task = tokio::spawn(async { panic!("the accept loop failed") });
+        let accepted = tokio::spawn(async move {
+            axum::serve::Listener::accept(&mut listener).await;
+        });
+        let e = tokio::time::timeout(LIMIT, accepted)
+            .await
+            .expect("within 5 s")
+            .expect_err("accept panics");
+        let payload = e.into_panic();
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"the accept loop failed")
+        );
+    }
+
+    /// An accept dropped while it waits for the accept task to end leaves
+    /// the next accept to see how it ended.
+    #[tokio::test]
+    async fn an_accept_dropped_while_the_task_ends_leaves_its_end_to_the_next() {
+        let (cert, key, _) = write_pair("dropped-accept");
+        let tls = listener_tls(&files(&cert, &key), &Metrics::default());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = tls.listen(tcp, MAX_HANDSHAKES, ACCEPTED_QUEUE).unwrap();
+        // The sender is gone, but the task panics only when told.
+        listener.task.abort();
+        let (fail, failing) = tokio::sync::oneshot::channel::<()>();
+        listener.task = tokio::spawn(async move {
+            let _ = failing.await;
+            panic!("the accept loop failed");
+        });
+        let first = axum::serve::Listener::accept(&mut listener);
+        let waited = tokio::time::timeout(Duration::from_millis(50), first).await;
+        assert!(waited.is_err(), "the task is still running");
+        fail.send(()).unwrap();
+        let accepted = tokio::spawn(async move {
+            axum::serve::Listener::accept(&mut listener).await;
+        });
+        let e = tokio::time::timeout(LIMIT, accepted)
+            .await
+            .expect("within 5 s")
+            .expect_err("the next accept panics");
+        assert_eq!(
+            e.into_panic().downcast_ref::<&str>(),
+            Some(&"the accept loop failed")
+        );
     }
 
     #[tokio::test]
