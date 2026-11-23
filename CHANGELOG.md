@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.26.1](https://github.com/danielclasen/samplez/compare/v0.26.0...v0.26.1) (2026-11-23)
+
+
+### Features
+
+* **replica:** carry page records until the addressee confirms them ([#193](https://github.com/danielclasen/samplez/issues/193)) ([bb6984f](https://github.com/danielclasen/samplez/commit/bb6984f8135d52d9e26325b7833e8d10f6702fe3))
+
+
+### Bug Fixes
+
+* **service:** wait instead of panicking when the accept task is gone ([#194](https://github.com/danielclasen/samplez/issues/194)) ([37421d4](https://github.com/danielclasen/samplez/commit/37421d44e7e1cb126393930120ac2e4bcf4ab8b2))
+
+
+### Performance Improvements
+
+* **replica:** build no page-record offer in a period that changed nothing ([#196](https://github.com/danielclasen/samplez/issues/196)) ([f09ceba](https://github.com/danielclasen/samplez/commit/f09cebacf36dec082855ebec181bb424079887f8))
+
 ## [0.26.0](https://github.com/danielclasen/samplez/compare/v0.25.0...v0.26.0) (2026-11-23)
 
 
