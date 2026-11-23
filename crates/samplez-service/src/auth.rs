@@ -38,7 +38,7 @@ use crate::{Error, ServiceStatus};
 
 pub const SESSION_COOKIE: &str = "samplez_session";
 pub const CSRF_HEADER: &str = "x-samplez-request";
-pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
+pub const SESSION_TTL: Duration = Duration::from_hours(12);
 const LOGIN_PATH: &str = oidc::LOGIN_PATH;
 const LOGOUT_PATH: &str = "/api/v1/logout";
 const SESSION_PATH: &str = "/api/v1/session";
@@ -632,9 +632,8 @@ impl Auth {
         if secret.is_some_and(|s| s.matches(token)) {
             return Ok(Bearer::Valid(operator, SessionEnd::never()));
         }
-        let oidc = match (listener, &self.oidc) {
-            (Listener::Api, Some(o)) => o,
-            _ => return Err(Refused::UNAUTHORIZED),
+        let (Listener::Api, Some(oidc)) = (listener, &self.oidc) else {
+            return Err(Refused::UNAUTHORIZED);
         };
         let token = std::str::from_utf8(token).map_err(|_| Refused::UNAUTHORIZED)?;
         match oidc.bearer(token).await {
@@ -737,7 +736,10 @@ impl Auth {
         }
         let host = match req.headers().get(header::HOST) {
             Some(h) => h.to_str().ok(),
-            None => req.uri().authority().map(|a| a.as_str()),
+            None => req
+                .uri()
+                .authority()
+                .map(axum::http::uri::Authority::as_str),
         };
         let Some(host) = host else { return false };
         let name = match host.strip_prefix('[') {
@@ -777,7 +779,7 @@ fn single<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a [u8]>, Re
     if values.next().is_some() {
         return Err(Refused(StatusCode::UNAUTHORIZED, "repeated header"));
     }
-    Ok(first.map(|v| v.as_bytes()))
+    Ok(first.map(axum::http::HeaderValue::as_bytes))
 }
 
 /// Lowercase, without a trailing `/` and without the scheme's default
@@ -1351,7 +1353,7 @@ mod tests {
         end.ended().await;
         assert!(started.elapsed() >= Duration::from_secs(29));
         let never = SessionEnd::never();
-        let waited = tokio::time::timeout(Duration::from_secs(86_400), never.ended()).await;
+        let waited = tokio::time::timeout(Duration::from_hours(24), never.ended()).await;
         assert!(waited.is_err());
     }
 

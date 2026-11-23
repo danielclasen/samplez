@@ -320,7 +320,7 @@ impl Body {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     /// `ceil(E / B) * B` at stamping: the log time dedup retention counts
-    /// in, whatever the entry's at_index.
+    /// in, whatever the entry's `at_index`.
     pub stamp: u64,
     pub body: Body,
 }
@@ -367,7 +367,7 @@ pub struct Outcome {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response(pub Vec<Outcome>);
 
-/// Bytes as base64 text, a third above their length, where serde_json
+/// Bytes as base64 text, a third above their length, where `serde_json`
 /// would write an array of numbers, up to four times it.
 pub mod bytes {
     use base64::Engine;

@@ -1482,7 +1482,7 @@ impl Shared {
                     let _ = item.reply.send(result);
                 }
                 Err(Refused::NotLeader | Refused::Quiescing | Refused::Misaddressed) => {
-                    again.push(item)
+                    again.push(item);
                 }
                 Err(refused) => {
                     let _ = item.reply.send(Err(refused));
@@ -2224,7 +2224,7 @@ fn link_samples(links: &[LinkCounts]) -> Vec<ReplicaMetric> {
             cumulative += n;
             let le = peer::ROUND_TRIP_BOUNDS
                 .get(i)
-                .map_or_else(|| "+Inf".to_owned(), |b| b.to_string());
+                .map_or_else(|| "+Inf".to_owned(), std::string::ToString::to_string);
             out.push(ReplicaMetric {
                 name: "samplez_replica_peer_reports_answered_total",
                 help: "Reports to a peer answered within le seconds of being handed to the connection pool.",

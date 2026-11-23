@@ -43,7 +43,7 @@ impl Ids {
     }
 }
 
-/// BCP-007-03's MXL UUID (mxl_uuid.json): a version other than 0 and the
+/// BCP-007-03's MXL UUID (`mxl_uuid.json)`: a version other than 0 and the
 /// RFC 4122 variant. Lowercase is a matter of the text, which `Uuid`
 /// always writes so.
 pub(crate) fn is_mxl_uuid(u: Uuid) -> bool {

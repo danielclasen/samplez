@@ -62,9 +62,9 @@ pub struct Counters {
     /// checked on the supervisor side.
     pub input_probes: AtomicU64,
     /// Clock steps: libmxl's clock moved by more than a block period
-    /// against CLOCK_MONOTONIC between two wakes.
+    /// against `CLOCK_MONOTONIC` between two wakes.
     pub clock_steps: AtomicU64,
-    /// The kernel TAI offset in seconds, CLOCK_TAI - CLOCK_REALTIME read
+    /// The kernel TAI offset in seconds, `CLOCK_TAI` - `CLOCK_REALTIME` read
     /// back to back at each wake's step check; `i64::MIN` before the
     /// first.
     pub tai_offset_s: AtomicI64,
@@ -253,7 +253,7 @@ fn hold_pass_pause(counters: &Counters, k: Option<u64>, in_ring: bool) {
     }
 }
 
-/// The kernel TAI offset, CLOCK_TAI - CLOCK_REALTIME read back to back,
+/// The kernel TAI offset, `CLOCK_TAI` - `CLOCK_REALTIME` read back to back,
 /// in whole seconds. Each read goes through the vDSO where the kernel has
 /// one for the clock, else it is a `clock_gettime` syscall.
 fn tai_offset() -> i64 {
@@ -2477,7 +2477,7 @@ impl Rt {
             match stall {
                 0 => {}
                 ms => samplez_mxl::rtsan::allow(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(ms))
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
                 }),
             }
             #[cfg(test)]
@@ -3056,7 +3056,7 @@ impl Rt {
                 Change::Limiter { output, params } => self.set_limiter(e, output, params),
                 Change::Delay { slot, samples } => self.set_delay(e, slot, samples),
                 Change::OutputDelay { output, samples } => {
-                    self.set_output_delay(e, output, samples)
+                    self.set_output_delay(e, output, samples);
                 }
                 Change::Tone { slot, params } => self.set_tone(e, slot, params),
                 Change::ResetLoudness { .. } => self.reset_meters(&e, None),
@@ -3396,10 +3396,10 @@ impl Rt {
             Change::Tone { slot, params } => self.set_tone(e, slot, params),
             Change::Output { output, enabled } => self.set_output(output, enabled),
             Change::PreStripMeter { slot, enabled } => {
-                self.set_pre_strip_meter(slot, enabled, e.at_index)
+                self.set_pre_strip_meter(slot, enabled, e.at_index);
             }
             Change::InputUp { .. } | Change::Route { .. } | Change::Detach { .. } => {
-                self.apply_generation(e)
+                self.apply_generation(e);
             }
         }
     }

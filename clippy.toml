@@ -39,3 +39,11 @@ disallowed-methods = [
     { path = "libc::clock_nanosleep", reason = "a sleep blocks the RT thread" },
     { path = "libc::sched_yield", reason = "a yield gives up the RT thread" },
 ]
+
+# Proper names that appear in prose, not code: doc_markdown leaves them
+# unquoted. ".." keeps clippy's own list.
+doc-valid-idents = [
+    "..", "AppendEntries", "ConfigMap", "ConfigMaps", "InstallSnapshot", "NetworkPolicy",
+    "ORed", "OpenAPI", "OpenID", "RTSan", "RealtimeSanitizer", "SIGKILLed", "StatefulSet",
+    "UTCTime", "UUIDv5", "WebSockets",
+]

@@ -1339,7 +1339,7 @@ async fn a_reply_waits_for_a_catch_up_under_way() {
     let hub = Hub::new(8, &Metrics::default());
     let mut client = Client::connect(&hub, &state, None);
     assert_eq!(client.next().await, "snapshot@7:0");
-    *state.snapshot_delay.lock().unwrap() = Duration::from_millis(1000);
+    *state.snapshot_delay.lock().unwrap() = Duration::from_secs(1);
     state.apply(None);
     state.forget_through(1);
     apply(&state, &hub);
@@ -1820,8 +1820,8 @@ async fn pongs_delayed_by(hello: Duration, delay: Duration) -> (Option<(Ended, D
     (None, always_live)
 }
 
-/// Pings go every PING_PERIOD, so by each one the ping sent
-/// PONG_TIMEOUT - PING_PERIOD before has to be answered: a steady round
+/// Pings go every `PING_PERIOD`, so by each one the ping sent
+/// `PONG_TIMEOUT` - `PING_PERIOD` before has to be answered: a steady round
 /// trip just below that keeps the connection live, one just above ends it.
 #[tokio::test(start_paused = true)]
 async fn the_round_trip_has_to_stay_below_the_pong_timeout_less_a_ping_period() {
@@ -1996,7 +1996,7 @@ async fn live_sessions_are_renewed_once_per_second_in_one_batch() {
         c.next().await;
     }
     // Over 2 s of answered pings; the silent client is closed after 1 s.
-    let (_, closed) = tokio::join!(
+    let ((), closed) = tokio::join!(
         async {
             for _ in 0..7 {
                 wait_both(&mut a, &mut b).await;

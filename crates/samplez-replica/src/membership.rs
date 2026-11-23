@@ -554,8 +554,8 @@ fn promotable(
 pub(crate) async fn reconcile(shared: Arc<Shared>, want: Voters) {
     loop {
         tokio::select! {
-            _ = shared.reconcile.notified() => {}
-            _ = tokio::time::sleep(PERIOD) => {}
+            () = shared.reconcile.notified() => {}
+            () = tokio::time::sleep(PERIOD) => {}
         }
         let metrics = shared.raft.metrics().borrow().clone();
         let membership = metrics.membership_config.membership();

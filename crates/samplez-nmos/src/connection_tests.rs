@@ -738,7 +738,7 @@ async fn a_pending_activation_locks_staged_until_cancelled() {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(at, before.after(Duration::from_secs(60)));
+    assert_eq!(at, before.after(Duration::from_mins(1)));
     assert_eq!(
         staged(&n, "receivers", &r).await["activation"],
         v["activation"]
@@ -1444,7 +1444,7 @@ async fn an_apply_that_does_not_resolve_fails_and_the_queue_moves_on() {
     fake.results
         .lock()
         .unwrap()
-        .push_back((Duration::from_secs(3600), Ok(())));
+        .push_back((Duration::from_hours(1), Ok(())));
     let n = node(&fake);
     let r = receiver(&n, 0);
     let version = is04(&n, "receivers", &r).await["version"].clone();
@@ -1465,7 +1465,7 @@ async fn an_apply_that_does_not_resolve_fails_and_the_queue_moves_on() {
     fake.results
         .lock()
         .unwrap()
-        .push_back((Duration::from_secs(3600), Ok(())));
+        .push_back((Duration::from_hours(1), Ok(())));
     let body = json!({ "activation": { "mode": "activate_immediate" } });
     assert_eq!(patch(&n, "receivers", &r, body).await.0, StatusCode::OK);
     let before = is04(&n, "receivers", &r).await["version"].clone();
@@ -1674,9 +1674,7 @@ async fn a_stuck_check_times_out_and_holds_back_its_port_only() {
         let r = patch(&n, "receivers", &r1, json!({ "master_enable": false })).await;
         (r, start.elapsed())
     };
-    let both = tokio::time::timeout(Duration::from_secs(60), async {
-        tokio::join!(stuck, other)
-    });
+    let both = tokio::time::timeout(Duration::from_mins(1), async { tokio::join!(stuck, other) });
     let ((status, v), ((other, _), quick)) = both.await.expect("a PATCH never answered");
     assert_eq!(other, StatusCode::OK);
     assert_eq!(quick, Duration::ZERO);

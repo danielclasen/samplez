@@ -53,11 +53,11 @@ pub const MAX_HANDSHAKES: usize = 256;
 /// How long a `selfSigned` certificate is valid, starting an hour before
 /// it is generated so a client whose clock is behind accepts it. macOS and
 /// iOS refuse TLS server certificates valid for more than 825 days.
-pub const SELF_SIGNED_VALIDITY: Duration = Duration::from_secs(365 * 24 * 3600);
+pub const SELF_SIGNED_VALIDITY: Duration = Duration::from_hours(8760);
 
 /// A `selfSigned` certificate is replaced by a new one at the first reload
 /// within this of its expiry.
-pub const SELF_SIGNED_RENEWAL: Duration = Duration::from_secs(30 * 24 * 3600);
+pub const SELF_SIGNED_RENEWAL: Duration = Duration::from_hours(720);
 
 /// Handshaken connections waiting for the server to take them.
 const ACCEPTED_QUEUE: usize = 64;
@@ -601,7 +601,7 @@ fn self_signed(sans: &[String], provider: &CryptoProvider) -> Result<Presented, 
         .duration_since(UNIX_EPOCH)
         .map_err(|e| failed(&e))?;
     let mut params = rcgen::CertificateParams::new(sans.to_vec()).map_err(|e| failed(&e))?;
-    params.not_before = rcgen::date_time_ymd(1970, 1, 1) + since_epoch - Duration::from_secs(3600);
+    params.not_before = rcgen::date_time_ymd(1970, 1, 1) + since_epoch - Duration::from_hours(1);
     params.not_after = params.not_before + SELF_SIGNED_VALIDITY;
     // Apple platforms refuse a TLS server certificate without it.
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
@@ -953,7 +953,7 @@ mod tests {
                 .verify_server_cert(&der, &[], &name, &[], now)
                 .is_ok()
         };
-        let (minute, hour) = (Duration::from_secs(60), Duration::from_secs(3600));
+        let (minute, hour) = (Duration::from_mins(1), Duration::from_hours(1));
         assert!(valid_at(start - hour + minute), "a clock an hour behind");
         assert!(!valid_at(start - hour - minute));
         assert!(valid_at(start + SELF_SIGNED_VALIDITY - hour - minute));

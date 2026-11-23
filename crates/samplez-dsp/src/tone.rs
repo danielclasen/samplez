@@ -78,6 +78,7 @@ impl ToneParams {
     /// replica's bridge replaces a refused entry: these when valid, else
     /// [`ToneParams::clamped`], else [`ToneParams::DEFAULT`] for a level
     /// that is not finite.
+    #[must_use]
     pub fn admitted(&self) -> ToneParams {
         if self.is_valid() {
             *self

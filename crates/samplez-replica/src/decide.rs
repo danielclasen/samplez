@@ -1,9 +1,9 @@
 //! The leader's decisions on unresolved entries (plan 2.11, Unresolved
 //! entries). Audio replicas report the entries they hold unresolved; the
 //! leader decides each one once the baseline committed the block holding
-//! its at_index, or once every live audio replica withheld that block:
+//! its `at_index`, or once every live audio replica withheld that block:
 //! it stands when the baseline applied it there, and nothing is appended;
-//! else a `Restamp` gives it a fresh at_index, or a `Void` resolves it
+//! else a `Restamp` gives it a fresh `at_index`, or a `Void` resolves it
 //! when it is an engine body a later committed entry supersedes, or once
 //! three restamps were late. A product entry's restamp or void re-asserts
 //! the state at its own place, so no later entry is undone. An id the
@@ -426,7 +426,7 @@ mod tests {
 
     /// An entry appended after its apply deadline is unresolved wherever
     /// it arrives, so on the baseline too: once the baseline commits the
-    /// block holding its at_index the leader restamps it, once.
+    /// block holding its `at_index` the leader restamps it, once.
     #[tokio::test(start_paused = true)]
     async fn an_entry_late_on_the_baseline_is_restamped_once_the_baseline_commits_its_block() {
         let e = id(7, 2);
@@ -480,7 +480,7 @@ mod tests {
         );
     }
 
-    /// An entry whose at_index block every live audio replica withheld
+    /// An entry whose `at_index` block every live audio replica withheld
     /// was committed by nobody: restamped without waiting for the
     /// baseline. A silent replica does not hold it up; one that committed
     /// the block does.

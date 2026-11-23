@@ -1897,38 +1897,38 @@ mod tests {
         };
         // NaN has no JSON form: it encodes as null, which no f32 takes.
         refused("NaN filter state", &|s| {
-            s["strip"]["hpf"]["state"][0][0] = Value::Null
+            s["strip"]["hpf"]["state"][0][0] = Value::Null;
         });
         refused("infinite equaliser state", &|s| {
-            s["strip"]["eq"][1]["state"][0][1] = json!(1e39)
+            s["strip"]["eq"][1]["state"][0][1] = json!(1e39);
         });
         refused("infinite crossfade state", &|s| {
-            s["strip"]["alt_eq"][0][0][0] = json!(-1e39)
+            s["strip"]["alt_eq"][0][0][0] = json!(-1e39);
         });
         refused("gate gain below its range", &|s| {
-            s["strip"]["gate"]["y"] = json!(-200.0)
+            s["strip"]["gate"]["y"] = json!(-200.0);
         });
         refused("compressor gain above 0 dB", &|s| {
-            s["strip"]["comp"]["y"] = json!(3.0)
+            s["strip"]["comp"]["y"] = json!(3.0);
         });
         refused("smoother pole of no decay", &|s| {
-            s["strip"]["comp"]["release"]["sample"] = json!(1.5)
+            s["strip"]["comp"]["release"]["sample"] = json!(1.5);
         });
         refused("gate hold beyond its length", &|s| {
-            s["strip"]["gate"]["hold"] = json!(1 << 30)
+            s["strip"]["gate"]["hold"] = json!(1 << 30);
         });
         refused("gain interval phase", &|s| {
-            s["strip"]["comp"]["interval"]["phase"] = json!(samplez_dsp::strip::GAIN_INTERVAL)
+            s["strip"]["comp"]["interval"]["phase"] = json!(samplez_dsp::strip::GAIN_INTERVAL);
         });
         refused("makeup beyond its range", &|s| {
-            s["strip"]["comp"]["makeup"]["target"] = json!(100.0)
+            s["strip"]["comp"]["makeup"]["target"] = json!(100.0);
         });
         refused("ramp past its length", &|s| {
             s["strip"]["fade"]["len"] = json!(10);
             s["strip"]["fade"]["pos"] = json!(11);
         });
         refused("filter target of other parameters", &|s| {
-            s["strip"]["hpf_freq"] = json!(100.0)
+            s["strip"]["hpf_freq"] = json!(100.0);
         });
         refused("filter ramp through an unstable value", &|s| {
             s["strip"]["hpf"]["len"] = json!(100);
@@ -1955,38 +1955,38 @@ mod tests {
         });
         // Finite, but 2 v1 - s0 overflows within a sample.
         refused("filter state beyond any a block leaves", &|s| {
-            s["strip"]["hpf"]["state"][0][0] = json!(3e38)
+            s["strip"]["hpf"]["state"][0][0] = json!(3e38);
         });
         refused("crossfade state beyond any a block leaves", &|s| {
-            s["strip"]["alt_eq"][0][0][1] = json!(1e31)
+            s["strip"]["alt_eq"][0][0][1] = json!(1e31);
         });
         refused("leg gain beyond any trim", &|s| {
-            s["strip"]["gain"][0]["c0"] = json!(1.0e5)
+            s["strip"]["gain"][0]["c0"] = json!(1.0e5);
         });
         refused("compressor gain beyond any reduction", &|s| {
-            s["strip"]["comp"]["y"] = json!(-1.0e38)
+            s["strip"]["comp"]["y"] = json!(-1.0e38);
         });
         refused("release slower than the longest", &|s| {
-            s["strip"]["comp"]["release"]["interval"] = json!(0.999_999_94)
+            s["strip"]["comp"]["release"]["interval"] = json!(0.999_999_94);
         });
         refused("gain step beyond one interval", &|s| {
-            s["strip"]["gate"]["interval"]["step"] = json!(0.5)
+            s["strip"]["gate"]["interval"]["step"] = json!(0.5);
         });
         refused("leg gain of other trims", &|s| {
-            s["strip"]["trim_db"] = json!(3.0)
+            s["strip"]["trim_db"] = json!(3.0);
         });
         refused("trim out of range", &|s| {
-            s["strip"]["trim_db"] = json!(60.0)
+            s["strip"]["trim_db"] = json!(60.0);
         });
         refused("legs beyond a strip", &|s| {
-            s["strip"]["legs"] = json!(1u64 << 40)
+            s["strip"]["legs"] = json!(1u64 << 40);
         });
         refused("no legs", &|s| s["strip"]["legs"] = json!(0));
         refused("state array beyond a strip's legs", &|s| {
             s["strip"]["hpf"]["state"]
                 .as_array_mut()
                 .unwrap()
-                .push(json!([0.0, 0.0]))
+                .push(json!([0.0, 0.0]));
         });
         refused("strip position", &|s| s["strip_pos"] = json!(u64::MAX));
     }
@@ -2038,7 +2038,7 @@ mod tests {
                     gain: 1.0e9,
                     fade: None,
                 },
-            })
+            });
         });
         refused("strip parameter", &|c| {
             c.pending[0].change = Change::Strip {
@@ -2048,11 +2048,11 @@ mod tests {
         });
         refused("pending list", &|c| {
             let e = c.pending[0];
-            c.pending.resize(PENDING_CHANGES + 1, e)
+            c.pending.resize(PENDING_CHANGES + 1, e);
         });
         // A detached slot reads nothing: no engine copied a block of it.
         refused("detached slot with a block copied", &|c| {
-            c.slots[1].silenced_last = false
+            c.slots[1].silenced_last = false;
         });
         // Awaiting its generation, a batch holds no batch to mismatch.
         refused("batch detaching a slot it does not re-route", &|c| {
@@ -2066,7 +2066,7 @@ mod tests {
                     detached: 2,
                     resets: false,
                 },
-            })
+            });
         });
         // The first ramp is the one of length 48 at position 0.
         let encoded = copy().encode().replacen("\"pos\":0", "\"pos\":49", 1);
@@ -2388,34 +2388,34 @@ mod tests {
         let det = |c: &mut Value, f: &dyn Fn(&mut Value)| f(&mut c["ducks"]["detectors"][2]);
         refused("envelope above 1", &|c| det(c, &|d| d["to"] = json!(1.5)));
         refused("hold beyond its time", &|c| {
-            det(c, &|d| d["hold"] = json!(1 << 30))
+            det(c, &|d| d["hold"] = json!(1 << 30));
         });
         refused("threshold out of range", &|c| {
-            det(c, &|d| d["params"]["threshold_db"] = json!(6.0))
+            det(c, &|d| d["params"]["threshold_db"] = json!(6.0));
         });
         refused("key filter state beyond any a block leaves", &|c| {
-            det(c, &|d| d["keys"][0]["hpf"]["state"][0][0] = json!(3e38))
+            det(c, &|d| d["keys"][0]["hpf"]["state"][0][0] = json!(3e38));
         });
         refused("key gain out of range", &|c| {
-            det(c, &|d| d["keys"][0]["gain"] = json!(-1.0))
+            det(c, &|d| d["keys"][0]["gain"] = json!(-1.0));
         });
         refused("a key without a slot", &|c| {
-            c["ducks"]["keys"][2][0] = Value::Null
+            c["ducks"]["keys"][2][0] = Value::Null;
         });
         refused("a slot without a key", &|c| {
-            c["ducks"]["keys"][3][0] = json!(1)
+            c["ducks"]["keys"][3][0] = json!(1);
         });
         refused("a detector missing", &|c| {
             c["ducks"]["detectors"].as_array_mut().unwrap().pop();
         });
         refused("position beyond any index", &|c| {
-            c["ducks"]["pos"] = json!(u64::MAX)
+            c["ducks"]["pos"] = json!(u64::MAX);
         });
         refused("mask beyond the matrix", &|c| {
-            c["matrix"]["masks"][0][0] = json!(4)
+            c["matrix"]["masks"][0][0] = json!(4);
         });
         refused("depth beyond its range", &|c| {
-            c["matrix"]["depths"][0][1]["target"] = json!(41.0)
+            c["matrix"]["depths"][0][1]["target"] = json!(41.0);
         });
         refused("mask crossfade past its length", &|c| {
             let duck = &mut c["matrix"]["columns"][0][0]["duck"];

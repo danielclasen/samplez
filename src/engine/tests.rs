@@ -413,7 +413,7 @@ fn a_slow_build_ages_out_after_five_minutes_without_builds() {
     let fast = t.p9999();
     // A late reader's open, counted once it opened, raises it ...
     t.add(80_000_000, Some(at));
-    t.expire(at + Duration::from_secs(300));
+    t.expire(at + Duration::from_mins(5));
     assert!(t.p9999().unwrap() >= 80_000_000);
     // ... until it is five minutes old, with no build since; the
     // complete builds' times stay.
@@ -583,7 +583,9 @@ static ENGINES: Mutex<()> = Mutex::new(());
     ignore = "the panic allocates in the RT loop, which RealtimeSanitizer aborts"
 )]
 fn a_panic_on_the_rt_thread_releases_its_state_on_the_supervisor() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
         .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
     let domain = std::env::temp_dir().join(format!("samplez-panic-{}", std::process::id()));
@@ -631,7 +633,9 @@ fn a_panic_on_the_rt_thread_releases_its_state_on_the_supervisor() {
 #[test]
 fn an_overrun_skip_withholds_the_skipped_blocks_and_withdraws() {
     use crate::blocks::{Kind, PAGE};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
         .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
     let domain = std::env::temp_dir().join(format!("samplez-skip-{}", std::process::id()));
@@ -720,7 +724,9 @@ fn an_overrun_skip_withholds_the_skipped_blocks_and_withdraws() {
 #[test]
 fn a_block_after_a_withheld_one_does_not_commit_at_once() {
     use crate::blocks::{Cause, Kind, PAGE};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A run an overrun skip or an overflow disturbed is run again.
     let run = || -> Option<String> {
         let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -899,7 +905,9 @@ impl Drop for Unshift {
 #[test]
 fn a_forward_clock_step_withholds_the_skip_and_fences() {
     use crate::blocks::Kind;
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _unshift = Unshift;
     let (e, changes, _verdicts, domain) = outputs_only("forward", 1);
     let processed = || e.counters().processed.load(Acquire);
@@ -969,7 +977,9 @@ fn a_forward_clock_step_withholds_the_skip_and_fences() {
 #[test]
 fn a_status_set_ahead_keeps_a_page_committed_at_blocks_of_16() {
     use crate::blocks::PAGE;
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let run = || -> Option<String> {
         let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
             .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
@@ -1070,7 +1080,9 @@ fn a_status_set_ahead_keeps_a_page_committed_at_blocks_of_16() {
 #[test]
 fn a_late_input_entry_is_left_out_of_the_fingerprint() {
     use crate::blocks::{HEALTHY, PAGE};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A run an overrun skip or a slow pickup disturbed is run again.
     let run = || -> Option<String> {
         let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -1186,7 +1198,9 @@ fn a_late_input_entry_is_left_out_of_the_fingerprint() {
 #[test]
 fn page_hashes_leave_out_the_pages_a_skip_cut() {
     use crate::blocks::PAGE;
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _unshift = Unshift;
     let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
         .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
@@ -1315,7 +1329,9 @@ fn a_step_during_the_reading_is_not_cleared_by_it() {
 #[test]
 fn a_lone_voter_lifts_its_step_fence_on_a_clean_self_report() {
     use crate::blocks::{Cause, Kind};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _unshift = Unshift;
     let (e, _changes, _verdicts, domain) = outputs_of("lone", 1, 1);
     let processed = || e.counters().processed.load(Acquire);
@@ -1357,7 +1373,9 @@ fn a_lone_voter_lifts_its_step_fence_on_a_clean_self_report() {
 #[test]
 fn a_backward_clock_step_withholds_the_ring_and_computes_nothing_twice() {
     use crate::blocks::{Cause, Kind};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _unshift = Unshift;
     let (e, _changes, verdicts, domain) = outputs_only("backward", 1);
     let c = e.counters();
@@ -1456,7 +1474,9 @@ fn a_block_withheld_on_one_output_withdraws_the_next_before_it_advances() {
 /// start.
 fn withhold_in_a_pass(name: &str, on: usize, in_ring: bool, check: impl Fn(&Engine, u64)) {
     use crate::blocks::{Cause, Kind};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for _ in 0..10 {
         let (e, _changes, _verdicts, domain) = outputs_only(name, 2);
         let _unpause = Unpause;
@@ -1513,7 +1533,9 @@ fn a_block_withheld_on_a_later_output_withdraws_the_first_before_it_advances() {
 #[test]
 fn a_commit_through_up_to_p_on_a_later_output_withdraws_the_first() {
     use crate::blocks::{HEALTHY, Kind};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for _ in 0..10 {
         let (e, _changes, _verdicts, domain) = outputs_only("through-up-to", 2);
         let _unpause = Unpause;
@@ -1569,7 +1591,9 @@ fn a_full_ring_moves_at_the_fence_of_its_pass() {
     // The hold ring at the default holdMs and contactWindowMs; the
     // overflow of output 1's block f below proves it.
     const RING: u64 = 20;
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // An overrun skip under load leaves a block of the rings without a
     // fenced status: then the outputs are named again on a new engine.
     for _ in 0..10 {
@@ -1628,7 +1652,9 @@ fn a_full_ring_moves_at_the_fence_of_its_pass() {
 /// there again. Engine `p` writes the flow, engine `e` reads it.
 #[test]
 fn a_late_input_entry_of_the_own_log_is_stamped_again() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
         .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
     let shm = std::path::Path::new("/dev/shm");
@@ -1713,7 +1739,9 @@ fn a_late_input_entry_of_the_own_log_is_stamped_again() {
 #[test]
 fn the_failure_paths_run_on_the_rt_thread() {
     use crate::rt_loop::{CLOCK_SHIFT_NS, CLOCK_STEP_LOOP, CLOCK_STEP_NS, STALL_MS};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     /// Takes the clock shift off again, also when the test fails.
     struct Unshift;
     impl Drop for Unshift {
@@ -1827,7 +1855,9 @@ fn the_failure_paths_run_on_the_rt_thread() {
 /// engine diverged.
 #[test]
 fn a_strip_entry_refused_on_the_rt_thread_marks_the_engine_diverged() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
         .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
     let domain = std::env::temp_dir().join(format!("samplez-refused-{}", std::process::id()));
@@ -1903,7 +1933,9 @@ fn a_strip_entry_refused_on_the_rt_thread_marks_the_engine_diverged() {
 /// state after a later block with an older one.
 #[test]
 fn a_handover_the_rt_thread_passed_is_refused() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("handover-passed", 1);
     let copy = loop {
         match e.copy_core(Duration::from_secs(2)) {
@@ -1958,7 +1990,9 @@ fn copy_left_behind(e: &Engine) {
 /// its copy holds every control sent before it.
 #[test]
 fn a_copy_left_behind_holds_the_controls_sent_after_it() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("copy-behind", 1);
     copy_left_behind(&e);
     let far = (e.counters.processed.load(Acquire) + 1_000_000) * e.block;
@@ -1981,7 +2015,9 @@ fn bare_core(e: &Engine, j: u64, core: &mut Core) -> (u64, LogId) {
 /// the install.
 #[test]
 fn a_copy_left_behind_is_filled_again_after_a_hand_over() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("copy-handover", 1);
     copy_left_behind(&e);
     let j = e
@@ -2015,7 +2051,9 @@ fn a_copy_left_behind_is_filled_again_after_a_hand_over() {
 #[test]
 fn a_product_install_retries_the_drop_while_the_ring_is_full() {
     use crate::rt_loop::STALL_MS;
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("drop-full", 1);
     let c = &e.counters;
     let state = ProductState {
@@ -2077,7 +2115,9 @@ fn a_product_install_retries_the_drop_while_the_ring_is_full() {
 #[test]
 fn a_product_install_keeps_to_one_timeout() {
     use crate::rt_loop::{CLOCK_SHIFT_NS, CLOCK_STEP_LOOP, CLOCK_STEP_NS, STALL_MS};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     struct Unshift;
     impl Drop for Unshift {
         fn drop(&mut self) {
@@ -2143,7 +2183,9 @@ fn a_product_install_keeps_to_one_timeout() {
 #[test]
 fn the_drop_follows_a_hand_over_left_unanswered() {
     use crate::rt_loop::{CLOCK_SHIFT_NS, CLOCK_STEP_LOOP, CLOCK_STEP_NS};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     struct Unshift;
     impl Drop for Unshift {
         fn drop(&mut self) {
@@ -2203,7 +2245,9 @@ fn the_drop_follows_a_hand_over_left_unanswered() {
 /// as such in one gapless run of ranges, not as a skip.
 #[test]
 fn a_skip_without_a_core_is_reported_as_no_core() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, statuses, _verdicts, domain) = outputs_only("no-core-skip", 1);
     let c = &e.counters;
     e.drop_core().unwrap();
@@ -2239,7 +2283,9 @@ fn a_skip_without_a_core_is_reported_as_no_core() {
 /// clock less the reader margin sets it, at any sample.
 #[test]
 fn too_near_names_a_block_start() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let libmxl = std::env::var("SAMPLEZ_TEST_LIBMXL")
         .unwrap_or_else(|_| "/opt/mxl/lib/libmxl.so".to_owned());
     let domain = std::env::temp_dir().join(format!("samplez-too-near-{}", std::process::id()));
@@ -2287,7 +2333,9 @@ fn too_near_names_a_block_start() {
 /// would stay on the old flow that every other replica left.
 #[test]
 fn an_install_keeps_an_entry_waiting_for_its_generation() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("install-awaiting", 1);
     let v = serde_json::json!({
         "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -3303,7 +3351,9 @@ fn tone_parameters_are_checked_against_the_configuration() {
 /// from product state holds no strip, so the entry would be lost.
 #[test]
 fn a_strip_entry_due_without_a_core_reaches_the_strip() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("no-core-strip", 1);
     let v = serde_json::json!({
         "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -3378,7 +3428,9 @@ fn a_strip_entry_due_without_a_core_reaches_the_strip() {
 /// started.
 #[test]
 fn an_output_delay_entry_due_without_a_core_reaches_the_line() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("no-core-output-delay", 1);
     let v = serde_json::json!({
         "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -3442,7 +3494,9 @@ fn an_output_delay_entry_due_without_a_core_reaches_the_line() {
 /// state, which holds no strip.
 #[test]
 fn an_output_strip_entry_due_without_a_core_reaches_the_strip() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("no-core-output-strip", 1);
     let v = serde_json::json!({
         "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -3504,7 +3558,9 @@ fn an_output_strip_entry_due_without_a_core_reaches_the_strip() {
 /// not skipped as known, which would lose it.
 #[test]
 fn a_product_core_knowing_less_than_a_replayed_one_loses_and_repeats_nothing() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("product-below-replay", 1);
     let v = serde_json::json!({
         "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -3586,7 +3642,9 @@ fn a_product_core_knowing_less_than_a_replayed_one_loses_and_repeats_nothing() {
 /// (`last_taken > last_id`) refuses that core as Missed.
 #[test]
 fn an_entry_taken_through_a_replayed_core_refuses_a_core_knowing_less() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("taken-through-core", 1);
     let v = serde_json::json!({
         "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -3650,7 +3708,9 @@ fn an_entry_taken_through_a_replayed_core_refuses_a_core_knowing_less() {
 /// hand-over check (`last_taken > last_id`) refuses that core.
 #[test]
 fn a_strip_entry_held_by_the_strips_refuses_a_replayed_core_knowing_less() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("strip-taken", 1);
     let v = serde_json::json!({
         "libmxl": std::env::var("SAMPLEZ_TEST_LIBMXL")
@@ -4160,7 +4220,9 @@ fn batch_of(up: bool) -> (Change, Option<Arc<Batch>>) {
 /// would otherwise wait until the list drains, and turn late.
 #[test]
 fn a_held_entry_is_taken_off_a_full_ring() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("held-first", 1);
     let (mut rt, mut ring) = rt_of(&e, &domain, "1d41");
     let entry = |id| RtEntry {
@@ -4193,7 +4255,9 @@ fn a_held_entry_is_taken_off_a_full_ring() {
 /// batch is allocated or freed on the RT thread.
 #[test]
 fn an_install_moves_batches_without_allocating() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("batch-install", 1);
     let (mut rt, _ring) = rt_of(&e, &domain, "1d43");
     let (change, mine) = batch_of(false);
@@ -4239,7 +4303,9 @@ fn an_install_moves_batches_without_allocating() {
 /// alone, so its strip parameters wait with it.
 #[test]
 fn a_batch_due_without_a_core_passes_whole_or_waits_whole() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("batch-no-core", 1);
     let (mut rt, _ring) = rt_of(&e, &domain, "1d45");
     let (plain, plain_batch) = batch_of(false);
@@ -4271,7 +4337,9 @@ fn a_batch_due_without_a_core_passes_whole_or_waits_whole() {
 /// again, which would restart their ramps.
 #[test]
 fn a_batch_passed_without_a_core_keeps_strips_the_core_brought() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("batch-held-strips", 1);
     let (mut rt, _ring) = rt_of(&e, &domain, "1d49");
     let (change, batch) = batch_of(false);
@@ -4303,7 +4371,9 @@ fn a_batch_passed_without_a_core_keeps_strips_the_core_brought() {
 /// counted, and they leave through the ring once it has room.
 #[test]
 fn spent_batches_leave_room_for_a_generation_handed_back() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("batch-spent", 1);
     let (mut rt, _ring) = rt_of(&e, &domain, "1d47");
     rt.replay = false;
@@ -4344,7 +4414,9 @@ fn spent_batches_leave_room_for_a_generation_handed_back() {
 /// stays free, and an empty translation is refused by no replica.
 #[test]
 fn a_log_entry_of_no_engine_entries_appends_nothing() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("batch-empty", 1);
     assert_eq!(e.append_batch(5, 7, &[]), Ok(()));
     assert_eq!(e.log.lock().unwrap().last, 0);
@@ -4362,7 +4434,9 @@ fn a_log_entry_of_no_engine_entries_appends_nothing() {
 /// size is refused, not overflowed.
 #[test]
 fn a_core_after_a_block_beyond_any_index_is_not_replayed() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("replay-k0", 1);
     let copy = || loop {
         match e.copy_core(Duration::from_secs(2)) {
@@ -4387,7 +4461,9 @@ fn a_core_after_a_block_beyond_any_index_is_not_replayed() {
 /// own core.
 #[test]
 fn a_late_answer_is_not_taken_for_the_next_handover() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("handover-late", 1);
     let copy = || loop {
         match e.copy_core(Duration::from_secs(2)) {
@@ -4455,7 +4531,9 @@ fn a_late_answer_is_not_taken_for_the_next_handover() {
 /// only make it larger.
 #[test]
 fn a_core_is_filled_only_for_a_block_the_rt_thread_computed() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("handover-stall", 1);
     let processed = || e.counters.processed.load(Acquire);
     wait(&|| processed() > 10);
@@ -4498,7 +4576,9 @@ fn a_core_is_filled_only_for_a_block_the_rt_thread_computed() {
 /// timeout would spend the CPU quota the RT thread shares.
 #[test]
 fn a_handover_waiting_on_a_stalled_rt_thread_spends_little_cpu() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("handover-cpu", 1);
     let processed = || e.counters.processed.load(Acquire);
     wait(&|| processed() > 10);
@@ -4549,7 +4629,9 @@ fn a_handover_waiting_on_a_stalled_rt_thread_spends_little_cpu() {
 /// judged against it.
 #[test]
 fn a_timed_out_handover_names_its_passed_refusals() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (e, _statuses, _verdicts, domain) = outputs_only("handover-timeout", 1);
     let before = e.counters.handovers_passed.load(Relaxed);
     // Each core follows a block two behind the last one computed:
@@ -4941,7 +5023,9 @@ fn transient(from: u64, steady: u64, skip: Option<u64>, end: u64, slices: u64) -
 #[test]
 fn a_skip_is_lost_on_its_replica_alone_and_both_measure_on() {
     use samplez_dsp::{SLICE, WINDOW};
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let l = lost(Upset::Skip);
     let (ma, mb) = (&l.a, &l.b);
     let lost = l.skipped.end - l.skipped.start;
@@ -5009,7 +5093,9 @@ fn a_skip_is_lost_on_its_replica_alone_and_both_measure_on() {
 /// outside that stretch are lost.
 #[test]
 fn a_skip_over_an_input_down_counts_the_peers_gaps() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let l = lost(Upset::SkipOverDown);
     let (ma, mb) = (&l.a, &l.b);
     let gaps = l.down.end - l.down.start;
@@ -5024,7 +5110,9 @@ fn a_skip_over_an_input_down_counts_the_peers_gaps() {
 /// and its peer none; both count the same gaps (none) and measure on.
 #[test]
 fn a_diverged_replica_loses_its_slices_and_its_peer_none() {
-    let _engines = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    let _engines = ENGINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let l = lost(Upset::Diverged);
     let (ma, mb) = (&l.a, &l.b);
     let (least, most) = l.diverged;

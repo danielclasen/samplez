@@ -144,7 +144,7 @@ pub struct OutputStatus {
     /// Creations that opened a flow another writer created first.
     pub races: u64,
     /// `mxlCreateFlowWriter` failures after `mxlIsFlowActive` found no
-    /// flow; libmxl reports any open() error of the check as not found.
+    /// flow; libmxl reports any `open()` error of the check as not found.
     pub create_failures: u64,
     /// The flow's ring length and effective batch hints, once created.
     pub buffer_length: Option<u64>,
@@ -189,7 +189,7 @@ pub struct GenerationStatus {
 /// The clocks as the engine sees them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClockStatus {
-    /// The kernel TAI offset, CLOCK_TAI - CLOCK_REALTIME in whole seconds,
+    /// The kernel TAI offset, `CLOCK_TAI` - `CLOCK_REALTIME` in whole seconds,
     /// as the RT thread sampled it last.
     pub tai_offset_s: Option<i64>,
     /// The kernel clock is unsynchronised (`adjtimex`: `TIME_ERROR` or
@@ -1075,7 +1075,7 @@ const BUILD_WINDOW: usize = 256;
 /// builds followed it. Complete builds' times stay in the window: an
 /// empty window falls back to [`UNMEASURED_BUILD`], so aging them out too
 /// would raise the lead of a set that routes rarely to that maximum.
-const BUILD_AGE: Duration = Duration::from_secs(300);
+const BUILD_AGE: Duration = Duration::from_mins(5);
 
 /// The latest [`BUILD_WINDOW`] generation build times in quarter-octave
 /// buckets of nanoseconds.
@@ -1346,7 +1346,9 @@ impl Drop for Openers {
     fn drop(&mut self) {
         let (lock, ready) = &*self.queue;
         let tasks = {
-            let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             q.stop = true;
             std::mem::take(&mut q.tasks)
         };
@@ -2428,8 +2430,8 @@ impl Engine {
     /// one index apply in the order sent.
     ///
     /// A change is refused, never dropped later, when `at_index` is below
-    /// `max(produced, mxlTimestampToIndex(now) - margin) + (maxCatchupBlocks
-    /// + 2)B`, `produced` being the index of the next sample the matrix
+    /// `max(produced, mxlTimestampToIndex(now) - margin) +
+    /// (maxCatchupBlocks + 2)B`, `produced` being the index of the next sample the matrix
     /// produces: the RT thread takes changes once per wake and may then
     /// process a backlog of up to `maxCatchupBlocks` blocks and the next
     /// one. It is refused with [`GainError::Full`] while
@@ -2938,7 +2940,7 @@ impl Engine {
         let invalid = |m: String| EntryError::Invalid(m);
         match *entry {
             Entry::Duck { group, ref setting } => {
-                check_duck(&self.config, group, setting).map_err(invalid)?
+                check_duck(&self.config, group, setting).map_err(invalid)?;
             }
             Entry::DuckMask {
                 input,
@@ -3332,7 +3334,9 @@ impl Engine {
         let (Some((shared, control)), Some(transfer)) = (&self.replica, &self.transfer) else {
             return Err(CopyError::NotReplicated);
         };
-        let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = transfer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deadline = Instant::now() + timeout;
         let before = control.lock().expect("control lock").sent;
         let copy = loop {
@@ -3428,7 +3432,11 @@ impl Engine {
         let (n, m, _, page, _) = self
             .transfer
             .as_ref()
-            .map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).shape)
+            .map(|t| {
+                t.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .shape
+            })
             .expect("checked above");
         let (slots, in_domains) = new_slots(&self.config);
         let legs: Vec<usize> = slots.iter().map(|s| s.channels).collect();
@@ -3517,7 +3525,7 @@ impl Engine {
             .collect();
         let dirs: Vec<PathBuf> = attached.iter().map(|a| a.0.clone()).collect();
         let found = (self.replay_gate.lock())
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .found(&dirs, GATE_WAIT);
         if let Some(((_, id), f)) = attached.iter().zip(&found).find(|(_, f)| **f != Found::Yes) {
             return Err(ReplayError::Attach(unopened(id, *f)));
@@ -3664,7 +3672,9 @@ impl Engine {
         // A hand-over left unanswered by a timeout may install one: the
         // drop has to follow its answer.
         let mut unanswered = loop {
-            let t = transfer.lock().unwrap_or_else(|e| e.into_inner());
+            let t = transfer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !t.handing || t.handed.slots() > 0 {
                 break t.handing;
             }
@@ -3957,7 +3967,9 @@ impl Engine {
                 "the engine is not replicated with more than one voter".to_owned(),
             ));
         };
-        let mut t = transfer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = transfer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deadline = Instant::now() + timeout;
         let (n, m, slots, page, outs) = t.shape;
         let new = || Box::new(Core::new(n, m, slots, page, outs));
@@ -4895,7 +4907,7 @@ impl Supervisor {
                         opener,
                         flows: HashMap::new(),
                         releases: HashMap::new(),
-                    })
+                    });
                 }
                 Err(e) => {
                     let message = format!("poll instance on {}: {e}", path.display());
@@ -5450,9 +5462,8 @@ impl Supervisor {
                 self.slots[slot].flow == o.want.flow
                     || self.jobs.iter().any(|j| j.routes.iter().any(to))
             };
-            let input = match o.result {
-                Ok((input, _)) => input,
-                Err(_) => continue,
+            let Ok((input, _)) = o.result else {
+                continue;
             };
             if awaited {
                 // An open the hand-over did not wait for, bounded by the

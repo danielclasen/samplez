@@ -515,7 +515,7 @@ async fn quiesce_waits_for_a_proposal_that_raced_its_flag() {
         let replica = replica.clone();
         async move {
             let _ = stamped.await;
-            replica.quiesce(Duration::from_secs(5)).await
+            replica.quiesce(Duration::from_secs(5)).await;
         }
     });
     // The entry reaches the followers only after quiesce has looked.

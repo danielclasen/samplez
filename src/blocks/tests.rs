@@ -1073,7 +1073,7 @@ fn a_page_without_a_fingerprint_is_counted() {
     assert_eq!(h.dropped.load(Relaxed), 1);
 }
 
-/// The fingerprint is XXH3-64 over the (log id, at_index) pairs in log
+/// The fingerprint is XXH3-64 over the (log id, `at_index`) pairs in log
 /// id order, whatever order they come in.
 #[test]
 fn the_fingerprint_is_xxh3_over_the_sorted_entries() {

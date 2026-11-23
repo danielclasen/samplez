@@ -434,7 +434,7 @@ impl Set {
     /// election `slot` calls takes that long; it calls the next only once
     /// the last one had the time to end.
     async fn lead(&self, slot: Slot) {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         loop {
             if self.settled().await == slot {
                 return;

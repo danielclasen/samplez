@@ -114,7 +114,7 @@ fn key_of(v: Versions, output: &[u8]) -> u64 {
     h.digest()
 }
 
-/// The at_index of a `Baseline` that hands the baseline over to another
+/// The `at_index` of a `Baseline` that hands the baseline over to another
 /// key, at or after `at`: a multiple of both the page and the block size
 /// `block`, so P, the first page boundary at or after it, is a block
 /// boundary. The old-key replicas then stop at a block boundary right

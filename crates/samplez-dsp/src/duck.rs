@@ -1641,7 +1641,7 @@ mod tests {
         refused("ramp beyond the longest", &|d| d.ramp = MAX_RAMP_LEN + 1);
         refused("threshold out of range", &|d| d.params.threshold_db = 6.0);
         refused("levels not the parameters'", &|d| {
-            d.levels.reopen = d.levels.threshold
+            d.levels.reopen = d.levels.threshold;
         });
         refused("hold beyond its time", &|d| d.hold = d.levels.hold + 1);
         refused("hold while not engaged", &|d| d.engaged = false);
@@ -1667,17 +1667,17 @@ mod tests {
         refused("negative key", &|d| d.peak = -1.0);
         refused("key of no legs", &|d| d.keys[0].legs = 0);
         refused("key beyond a strip's legs", &|d| {
-            d.keys[1].legs = MAX_LEGS + 1
+            d.keys[1].legs = MAX_LEGS + 1;
         });
         refused("key gain beyond its range", &|d| {
-            d.keys[1].gain = 2.0 * MAX_GAIN
+            d.keys[1].gain = 2.0 * MAX_GAIN;
         });
         refused("key filter state beyond a block's", &|d| {
-            d.keys[0].hpf.state[0][1] = 1e31
+            d.keys[0].hpf.state[0][1] = 1e31;
         });
         refused("key filter off its shape", &|d| d.params.lpf.freq = 5000.0);
         refused("state on a key not keyed", &|d| {
-            d.keys[5].lpf.state[0][0] = 0.5
+            d.keys[5].lpf.state[0][0] = 0.5;
         });
         let mut nine = serde_json::to_value(d).unwrap();
         let keys = nine["keys"].as_array_mut().unwrap();
@@ -1812,7 +1812,7 @@ mod tests {
         }
     }
 
-    /// An infinity, a NaN or f32::MAX in a key, through the key filters
+    /// An infinity, a NaN or `f32::MAX` in a key, through the key filters
     /// or past them at a key gain above unity, leaves a valid detector
     /// that recovers: the key filters drop the state it left, and once
     /// the duck it may have triggered has released the envelope is that

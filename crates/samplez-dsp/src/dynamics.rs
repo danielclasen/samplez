@@ -835,7 +835,7 @@ mod tests {
     }
 
     /// The gain covers 1 - 1/e of a step in its time constant: attack
-    /// into reduction, release out of it, GAIN_INTERVAL samples late for
+    /// into reduction, release out of it, `GAIN_INTERVAL` samples late for
     /// a step at the start of an interval.
     #[test]
     fn compressor_time_constants() {
@@ -1020,7 +1020,7 @@ mod tests {
         y
     }
 
-    /// An attack time constant under PER_SAMPLE_BELOW intervals runs the
+    /// An attack time constant under `PER_SAMPLE_BELOW` intervals runs the
     /// gain computer every sample: a compressor at 0.1 ms computes the
     /// bits of one run every sample, a step reduced from its first
     /// sample on, at every position of the step in an interval and any
@@ -1085,7 +1085,7 @@ mod tests {
     /// within the span the per-sample gain had over the two intervals
     /// before. Its hold counts down by intervals from the end of the one
     /// with the last key at the threshold, so it starts closing 1 to
-    /// GAIN_INTERVAL samples after the per-sample gate.
+    /// `GAIN_INTERVAL` samples after the per-sample gate.
     #[test]
     fn a_gate_trails_a_per_sample_one_by_two_intervals_at_most() {
         let late = 2 * GAIN_INTERVAL as usize;
@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     /// An attack set across the bound mid-interval takes effect at the
-    /// next multiple of GAIN_INTERVAL: up to it the unit computes the
+    /// next multiple of `GAIN_INTERVAL`: up to it the unit computes the
     /// bits of one left at the old attack, at any block size.
     #[test]
     fn a_new_run_length_starts_on_the_grid() {
@@ -1198,7 +1198,7 @@ mod tests {
     }
 
     /// Below the threshold the gate settles at its range, above it the
-    /// signal passes untouched; it holds GATE_HOLD samples after the key
+    /// signal passes untouched; it holds `GATE_HOLD` samples after the key
     /// leaves the threshold, then closes with its release.
     #[test]
     fn the_gate_opens_holds_and_closes() {
@@ -1417,23 +1417,23 @@ mod tests {
         comp_invalid("gain above 0 dB", &|u| u.y = 1.0);
         comp_invalid("NaN key", &|u| u.interval.peak = f32::NAN);
         comp_invalid("phase beyond the interval", &|u| {
-            u.interval.phase = GAIN_INTERVAL
+            u.interval.phase = GAIN_INTERVAL;
         });
         comp_invalid("run of neither length", &|u| u.interval.next = 3);
         comp_invalid("interval gain above unity", &|u| u.interval.to = 1.5);
         comp_invalid("pole of no decay", &|u| u.release.sample = 1.0);
         let slowest = |ms: f32| Pole::new(ms * 1.01);
         gate_invalid("attack slower than the longest", &|u| {
-            u.attack.interval = slowest(*ATTACK_MS.end()).interval
+            u.attack.interval = slowest(*ATTACK_MS.end()).interval;
         });
         gate_invalid("release slower than the longest", &|u| {
-            u.release.sample = slowest(*RELEASE_MS.end()).sample
+            u.release.sample = slowest(*RELEASE_MS.end()).sample;
         });
         comp_invalid("attack slower than the longest", &|u| {
-            u.attack.sample = slowest(*ATTACK_MS.end()).sample
+            u.attack.sample = slowest(*ATTACK_MS.end()).sample;
         });
         comp_invalid("release slower than the longest", &|u| {
-            u.release.interval = 0.999_999_94
+            u.release.interval = 0.999_999_94;
         });
         comp_invalid("gain beyond any reduction", &|u| u.y = -801.0);
         comp_invalid("step beyond one interval", &|u| u.interval.step = -0.13);

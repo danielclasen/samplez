@@ -61,7 +61,7 @@ impl Product for Desk {
         let words: Vec<&str> = text.split(' ').collect();
         match words[..] {
             ["fader", slot, gain] => {
-                self.faders[slot.parse::<usize>().unwrap()] = gain.parse().unwrap()
+                self.faders[slot.parse::<usize>().unwrap()] = gain.parse().unwrap();
             }
             ["vca", gain] => self.vca = gain.parse().unwrap(),
             ["duck", on] => self.ducked = on == "1",
@@ -71,7 +71,7 @@ impl Product for Desk {
                 *epoch = epoch.wrapping_add(1);
             }
             ["tone", hz, db, ident] => {
-                self.tone = Some((hz.parse().unwrap(), db.parse().unwrap(), ident == "1"))
+                self.tone = Some((hz.parse().unwrap(), db.parse().unwrap(), ident == "1"));
             }
             ["trim", slot, db] => self.trims[slot.parse::<usize>().unwrap()] = db.parse().unwrap(),
             // Ordered off the generation path, or across two input
@@ -896,7 +896,7 @@ fn the_product_reads_how_a_command_was_ordered() {
     assert_eq!(sm.product.flows[0], "c");
 }
 
-/// Floats survive a snapshot bit for bit: serde_json parses each one
+/// Floats survive a snapshot bit for bit: `serde_json` parses each one
 /// correctly rounded.
 #[test]
 fn product_floats_survive_a_snapshot_bit_for_bit() {

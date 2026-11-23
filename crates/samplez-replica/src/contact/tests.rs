@@ -3456,17 +3456,17 @@ impl Audio for Real {
         self.audio.sample()
     }
     fn fence(&self, end: u64) {
-        self.audio.fence(end)
+        self.audio.fence(end);
     }
     fn settled(&self, k: u64) -> bool {
         self.audio.settled(k)
     }
     fn appended(&self, index: u64, at_index: u64, entries: &[Entry]) {
         self.record("appended", index);
-        self.audio.appended(index, at_index, entries)
+        self.audio.appended(index, at_index, entries);
     }
     fn committed(&self, up_to: u64) {
-        self.audio.committed(up_to)
+        self.audio.committed(up_to);
     }
     fn unresolved(&self, index: u64, at_index: u64) -> bool {
         let taken = self.audio.unresolved(index, at_index);
@@ -3475,7 +3475,7 @@ impl Audio for Real {
     }
     fn overwhelmed(&self) {
         self.record("overwhelmed", 0);
-        self.audio.overwhelmed()
+        self.audio.overwhelmed();
     }
     fn status(&self, output: usize, k: u64) -> Option<BlockStatus> {
         self.audio.status(output, k)
@@ -3487,27 +3487,27 @@ impl Audio for Real {
         self.audio.commit_through(output, k, on, up_to)
     }
     fn withdraw(&self) {
-        self.audio.withdraw()
+        self.audio.withdraw();
     }
     fn ranks(&self, ranks: Ranks) {
-        self.audio.ranks(ranks)
+        self.audio.ranks(ranks);
     }
     fn commit_from(&self, output: usize, min_k: u64, seen: u64) {
-        self.audio.commit_from(output, min_k, seen)
+        self.audio.commit_from(output, min_k, seen);
     }
     fn cancel_commit_start(&self, output: usize) {
-        self.audio.cancel_commit_start(output)
+        self.audio.cancel_commit_start(output);
     }
     fn stop_at(&self, output: usize, at: u64) {
-        self.audio.stop_at(output, at)
+        self.audio.stop_at(output, at);
     }
     fn resolved(&self, index: u64) {
         self.record("resolved", index);
-        self.audio.resolved(index)
+        self.audio.resolved(index);
     }
     fn drop_engine(&self) {
         self.record("drop", 0);
-        self.audio.drop_engine()
+        self.audio.drop_engine();
     }
     fn rebuild_engine(&self, state: &ProductState, at_least: u64) -> bool {
         self.audio.rebuild_engine(state, at_least)

@@ -82,7 +82,7 @@ pub trait Product: Send + Sync + 'static {
     fn forget(&mut self, session: &SessionKey);
 
     /// The one delta clients get for one entry's changes, in the order
-    /// applied: a command's with its origin, id and at_index, a server-side
+    /// applied: a command's with its origin, id and `at_index`, a server-side
     /// one, such as a lease expiry, without; `stamp` is the entry's
     /// stamping index. Where two change the same value the later one wins.
     /// Called with the state after the entry, and only when something
@@ -150,7 +150,7 @@ pub struct Apply {
     pub generation: Option<bool>,
     /// The sample index the command's entry takes effect at, at the
     /// engine's rate in the epoch of the flows' indexes: its own
-    /// at_index, raised to [`StateMachine::floor`] ([`floored`]), the
+    /// `at_index`, raised to [`StateMachine::floor`] ([`floored`]), the
     /// index of the record of its engine entries. Every replica applies the
     /// entry at the same one. None for an entry that has none.
     ///
@@ -161,7 +161,7 @@ pub struct Apply {
     pub at_index: Option<u64>,
 }
 
-/// An entry's at_index further than this past its stamping index, one
+/// An entry's `at_index` further than this past its stamping index, one
 /// second at 48 kHz, does not move [`StateMachine::floor`] past the stamp:
 /// an entry from a writer that kept a far client index would hold every
 /// later entry back until it.
@@ -187,7 +187,7 @@ pub const RECORDS_KEPT: u64 = 48_000;
 pub const FALLBACK_LEAD: u64 = 3_072;
 
 /// The index the entry `request` takes effect at after entries that
-/// left the floor at `floor`, and the floor after it: its own at_index,
+/// left the floor at `floor`, and the floor after it: its own `at_index`,
 /// or its stamp, a block start, for one further than [`AHEAD_MAX`] past
 /// it, or [`FALLBACK_LEAD`] past its stamp for a lease expiry from an
 /// older leader, which stamps none. A void from an older leader takes
@@ -244,7 +244,7 @@ pub struct Change {
 }
 
 /// How far below the highest stamping index applied an engine entry's
-/// at_index lies before [`StateMachine::prune`] keeps only the latest per
+/// `at_index` lies before [`StateMachine::prune`] keeps only the latest per
 /// target: past the longest a restamp can lie behind (three restamps of
 /// at most a second each, the decision path's bound) at 48 kHz, and past
 /// the retention a resent copy can still be stamped in.
@@ -287,18 +287,18 @@ pub type Raise = (u64, bool, Option<u64>);
 pub struct StateMachine<P> {
     pub product: P,
     pub dedup: Dedup,
-    /// Entries the engine applies at their at_index, by log index: the
+    /// Entries the engine applies at their `at_index`, by log index: the
     /// latest per target ([`StateMachine::prune`]) and every one ahead.
     pub pending: BTreeMap<u64, Body>,
-    /// The term and at_index of each entry with an at_index that can
+    /// The term and `at_index` of each entry with an `at_index` that can
     /// still be decided, by log index: a decision naming another term at
     /// that index names an entry this log does not hold.
     pub terms: BTreeMap<u64, (u64, u64)>,
     /// The restamps behind a restamped entry, by the log index it is
-    /// known under now, with its at_index: a fourth is never appended.
+    /// known under now, with its `at_index`: a fourth is never appended.
     pub restamps: BTreeMap<u64, (u32, u64)>,
     /// The first decision applied on each (log index, term), by its own
-    /// log index, with the at_index it is kept until: a later decision on
+    /// log index, with the `at_index` it is kept until: a later decision on
     /// the same id is a copy and changes nothing.
     pub decided: BTreeMap<(u64, u64), (u64, u64)>,
     pub baseline: Option<Baseline>,
@@ -1242,7 +1242,7 @@ impl<P: Product> StateMachine<P> {
         *renewed = (*renewed).max(stamp);
     }
 
-    /// The highest at_index of an applied entry that built a generation
+    /// The highest `at_index` of an applied entry that built a generation
     /// on every replica: a decidable one that re-routed an input, or an
     /// `InputUp` held. The one source of the pending generation of the
     /// applied log, so a command the product refused waits for nothing,
@@ -1424,7 +1424,10 @@ impl<P: Product> StateMachine<P> {
         // Ramps no generator holds are left out, as an install would
         // refuse them.
         self.tone_ramps = (saved.tone_ramps.iter())
-            .map(|r| r.map(samplez_dsp::ToneRamps::from).filter(|r| r.is_valid()))
+            .map(|r| {
+                r.map(samplez_dsp::ToneRamps::from)
+                    .filter(samplez_dsp::ToneRamps::is_valid)
+            })
             .collect();
         let f = &saved.in_flight;
         self.down = f.down;
@@ -1535,7 +1538,7 @@ pub(crate) mod tests {
         pub holding: BTreeSet<SessionKey>,
         pub expired: Vec<SessionKey>,
         pub forgotten: Vec<SessionKey>,
-        /// Each [`Product::delta`] call's stamp and its changes' at_index.
+        /// Each [`Product::delta`] call's stamp and its changes' `at_index`.
         pub delta_calls: std::sync::Mutex<Vec<(u64, Vec<Option<u64>>)>>,
         /// The configuration it was built with; not saved.
         pub config: u64,
@@ -1683,7 +1686,7 @@ pub(crate) mod tests {
     }
 
     /// A command sees the index its entry takes effect at: the earliest
-    /// of its commands' at_index, raised to the floor an earlier entry
+    /// of its commands' `at_index`, raised to the floor an earlier entry
     /// left, none for an entry with none. Two machines applying one log
     /// see the same.
     #[test]
@@ -1700,7 +1703,7 @@ pub(crate) mod tests {
             commands(1_920, vec![at(command("a", "3", "/x=2@2"), Some(1_000))]),
             commands(2_880, vec![command("a", "4", "/y=2@2")]),
         ];
-        let seen = |_: ()| {
+        let seen = |(): ()| {
             let mut sm = machine();
             for (n, request) in log.iter().enumerate() {
                 sm.apply(n as u64 + 1, request);
@@ -1771,7 +1774,7 @@ pub(crate) mod tests {
     }
 
     /// The product gets the entry's stamping index and each command's
-    /// at_index with its changes, for the one atIndex its delta carries.
+    /// `at_index` with its changes, for the one atIndex its delta carries.
     #[test]
     fn delta_gets_the_stamp_and_each_commands_at_index() {
         let mut sm = machine();

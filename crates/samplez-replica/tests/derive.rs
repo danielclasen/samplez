@@ -51,7 +51,7 @@ impl Product for Desk {
     fn apply(&mut self, _: &Origin, command: &[u8], _: &Apply) -> Effect<()> {
         match words(command)[..] {
             ["fader", slot, gain] => {
-                self.gains[slot.parse::<usize>().unwrap()] = gain.parse().unwrap()
+                self.gains[slot.parse::<usize>().unwrap()] = gain.parse().unwrap();
             }
             ["route", slot, flow] => self.flows[slot.parse::<usize>().unwrap()] = flow.into(),
             _ => return Effect::Stale,
@@ -722,7 +722,10 @@ async fn a_witness_snapshot_loads_to_the_audio_replicas_floor_and_records() {
         .expect("committed");
     faders(&set, 0, 4).await;
     sleep(Duration::from_millis(100)).await;
-    let saved = set.replica(witness).store().with_state(|sm| sm.save());
+    let saved = set
+        .replica(witness)
+        .store()
+        .with_state(samplez_replica::state_machine::StateMachine::save);
     let n = set.replica(witness).store().applied_index();
     let mut loaded = StateMachine::new(Desk::new(), Limits::defaults(48_000));
     loaded.load(saved, Limits::defaults(48_000)).expect("loads");
@@ -952,7 +955,7 @@ async fn a_command_late_everywhere_is_restamped_and_reasserted() {
             .entries_after(0, |id, req| match &req.body {
                 Body::Commands(c) if c.iter().any(|c| c.id == "late") => late = Some(id.index),
                 Body::Restamp { revision, .. } if Some(*revision) == late => {
-                    restamp = Some(id.index)
+                    restamp = Some(id.index);
                 }
                 Body::Void { revision, .. } if Some(*revision) == late => {
                     panic!("a product entry voided")

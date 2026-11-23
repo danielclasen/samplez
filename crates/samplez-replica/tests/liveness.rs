@@ -162,7 +162,7 @@ async fn a_restarted_leader_reading_nothing_silences_no_input() {
     // Its peers refuse a vote while they hear a leader: elections until
     // one finds the lease lapsed.
     let raft = set.replica(rolled).raft().clone();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while set.leader().await != rolled {
         assert!(Instant::now() < deadline, "the restarted replica never led");
         let _ = raft.trigger().elect().await;

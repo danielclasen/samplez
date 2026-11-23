@@ -71,6 +71,7 @@ impl DuckSetting {
     /// value that is not finite, or for keys the engine cannot take, is
     /// replaced with, so a group that held another value and one that
     /// held none end up alike.
+    #[must_use]
     pub fn neutral(&self) -> DuckSetting {
         match *self {
             DuckSetting::Detector(_) => DuckSetting::Detector(Box::new(DetectorParams::DEFAULT)),

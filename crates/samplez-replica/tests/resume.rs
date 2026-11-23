@@ -148,7 +148,7 @@ fn led(set: &Set) -> samplez_replica::baseline::Counts {
 
 /// A cold start of two audio replicas plus the witness and of three: the
 /// leader's first `Baseline` names one ready replica, which commits from
-/// P, the first page boundary at or after the entry's at_index, a partial
+/// P, the first page boundary at or after the entry's `at_index`, a partial
 /// first commit when P lies inside a block; the others resume on a page
 /// hash match from a later page boundary, and every page from P on is
 /// whole on a member.

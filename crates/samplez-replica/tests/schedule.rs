@@ -1,5 +1,5 @@
 //! Command scheduling on an in-process set with contact running: E, the
-//! stamps and at_indices the leader gives entries, the future list, the
+//! stamps and `at_indices` the leader gives entries, the future list, the
 //! serialised generation-needing entries and the command age bound.
 
 mod harness;

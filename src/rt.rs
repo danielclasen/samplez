@@ -578,7 +578,7 @@ fn block_signals() -> Step {
     }
 }
 
-/// The RT thread's steps, run on the RT thread itself: SCHED_FIFO,
+/// The RT thread's steps, run on the RT thread itself: `SCHED_FIFO`,
 /// affinity to the CPU `process` chose, FTZ/DAZ and signal blocking.
 /// FTZ/DAZ stays set for the thread's life.
 pub fn setup_thread(rt: &Rt, process: &ProcessStatus) -> ThreadStatus {

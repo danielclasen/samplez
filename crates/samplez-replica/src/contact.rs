@@ -118,7 +118,7 @@ impl Timing {
 pub trait Clocks: Send + Sync + 'static {
     /// TAI time, ns.
     fn tai_ns(&self) -> u64;
-    /// The kernel TAI offset, CLOCK_TAI - CLOCK_REALTIME read back to
+    /// The kernel TAI offset, `CLOCK_TAI` - `CLOCK_REALTIME` read back to
     /// back and rounded to whole seconds. An audio replica reports the
     /// RT thread's sample instead; the witness reports this one.
     fn tai_offset_s(&self) -> Option<i64>;
@@ -439,7 +439,7 @@ impl<P: Product> LogView for Store<P> {
         Store::log_id_at(self, index)
     }
     fn entries_after(&self, index: u64, f: &mut dyn FnMut(StoredLogId, &Request)) {
-        Store::entries_after(self, index, f)
+        Store::entries_after(self, index, f);
     }
     fn entries_after_max(
         &self,
@@ -450,7 +450,7 @@ impl<P: Product> LogView for Store<P> {
         Store::entries_after_max(self, index, max, f)
     }
     fn pending(&self, f: &mut dyn FnMut(u64, &Body)) {
-        Store::pending(self, f)
+        Store::pending(self, f);
     }
     fn purged(&self) -> u64 {
         self.purged_index()
@@ -517,7 +517,7 @@ impl<P: Product> LogView for Store<P> {
 /// The lead before any slack was reported: 30 ms.
 pub const START_LEAD: Duration = Duration::from_millis(30);
 
-/// Entries with an at_index the engine holds at most (plan 2.7): the
+/// Entries with an `at_index` the engine holds at most (plan 2.7): the
 /// leader stamps no entry beyond them.
 pub const FUTURE_LIST: usize = 64;
 
@@ -538,7 +538,7 @@ const AWAITING_MAX: usize = 1024;
 /// in parts, each hold short of the lock watchdog's limit.
 const TAKEN_AT_ONCE: usize = 1024;
 
-/// Entries with an at_index kept for listings, at most; the lowest index
+/// Entries with an `at_index` kept for listings, at most; the lowest index
 /// is dropped first, counted.
 const SCHEDULED_MAX: usize = 4096;
 
@@ -547,7 +547,7 @@ const SCHEDULED_MAX: usize = 4096;
 const GIVEN_KEPT: usize = 1024;
 
 /// The ids of the unresolvable entries a listing's overflow names: this
-/// bit and the omitted at_index in blocks, so replicas that hold one for
+/// bit and the omitted `at_index` in blocks, so replicas that hold one for
 /// the same index hold the same id, and none equals a log id or the
 /// engine's own reserved `u64::MAX`.
 pub const UNLISTED_BIT: u64 = 1 << 63;
@@ -688,8 +688,8 @@ struct State {
     /// Entries taken as appended whose commit is not known, until then:
     /// a truncation is found among them.
     uncommitted: BTreeMap<u64, StoredLogId>,
-    /// Entries with an at_index, for listings, until every voter reported
-    /// them committed: log id, at_index, stamp, and whether it is a
+    /// Entries with an `at_index`, for listings, until every voter reported
+    /// them committed: log id, `at_index`, stamp, and whether it is a
     /// `Baseline`.
     scheduled: BTreeMap<u64, (StoredLogId, u64, u64, bool)>,
     /// The earliest index the last generation stamp reserved, whatever
@@ -731,7 +731,7 @@ struct State {
     /// it: slack of an entry stamped by an earlier term is not counted
     /// ([`add_slack`]). Zero before the first.
     office_term: u64,
-    /// The lead each entry with an at_index was stamped with, by log
+    /// The lead each entry with an `at_index` was stamped with, by log
     /// index, the lowest forgotten past [`SCHEDULED_MAX`]: kept after
     /// `scheduled` drops an entry every voter reported committed, since a
     /// replica that reported the commit may apply the entry, and report
@@ -759,7 +759,7 @@ struct State {
     /// late: until its rebuild starts, the later parts of the same
     /// catch-up are rebuilt past by it too.
     late_restart: bool,
-    /// The lowest at_index of a listing overflow given as unresolved: a
+    /// The lowest `at_index` of a listing overflow given as unresolved: a
     /// later overflow at or above it adds nothing, one below it is given.
     unlisted_low: Option<u64>,
     /// Per listing overflow given as unresolved, the committed index of
@@ -2052,10 +2052,10 @@ impl Contact {
             match &request.body {
                 Body::Baseline(b) => st.baselines.appended(id, b),
                 Body::Diverged { replica, page } if *replica == self.id => {
-                    st.verdicts.push((id.index, *page))
+                    st.verdicts.push((id.index, *page));
                 }
                 Body::PurgePoint { replica, index } if *replica == self.id => {
-                    st.purge_points.push((id.index, *index))
+                    st.purge_points.push((id.index, *index));
                 }
                 body => {
                     if let Some((revision, term)) = body.decides() {
@@ -4165,7 +4165,7 @@ impl Contact {
 pub struct Stamp {
     /// `ceil(E / B) * B`: the log time dedup retention counts in.
     pub stamp: u64,
-    /// The earliest at_index: the stamp plus the lead, or for a
+    /// The earliest `at_index`: the stamp plus the lead, or for a
     /// generation-needing entry plus the larger of the lead and buildLead.
     pub earliest: u64,
 }
@@ -4176,7 +4176,7 @@ pub enum StampRefusal {
     NobodyCounted,
     /// [`FUTURE_LIST`] entries are pending.
     FutureListFull,
-    /// The previous generation-needing entry's at_index has not passed on
+    /// The previous generation-needing entry's `at_index` has not passed on
     /// the baseline.
     GenerationPending,
 }

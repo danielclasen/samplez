@@ -8,6 +8,10 @@
 
 /// `(b0, b1, b2, a1, a2)` of the stage 1 pre-filter, BS.1770-5 Table 1,
 /// for 48 kHz.
+#[allow(
+    clippy::unreadable_literal,
+    reason = "the digits as the standard prints them"
+)]
 pub const STAGE1: [f64; 5] = [
     1.53512485958697,
     -2.69169618940638,
@@ -18,6 +22,10 @@ pub const STAGE1: [f64; 5] = [
 
 /// `(b0, b1, b2, a1, a2)` of the RLB high-pass, BS.1770-5 Table 2, for
 /// 48 kHz.
+#[allow(
+    clippy::unreadable_literal,
+    reason = "the digits as the standard prints them"
+)]
 pub const STAGE2: [f64; 5] = [1.0, -2.0, 1.0, -1.99004745483398, 0.99007225036621];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -81,7 +89,7 @@ mod tests {
     fn gain(freq: f64) -> f64 {
         let mut k = KWeighting::new(1);
         let x: Vec<f32> = (0..96_000)
-            .map(|n| (2.0 * std::f64::consts::PI * freq * n as f64 / 48_000.0).sin() as f32)
+            .map(|n| (2.0 * std::f64::consts::PI * freq * f64::from(n) / 48_000.0).sin() as f32)
             .collect();
         k.process(0, &x[..48_000]);
         k.process(0, &x[48_000..]) / 48_000.0 / 0.5

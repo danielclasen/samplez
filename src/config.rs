@@ -55,7 +55,7 @@ pub struct Config {
     /// pass its ends, which a decoded strip is held to.
     #[serde(default = "default_ramp")]
     pub ramp_samples: u32,
-    /// Replicated mode: D, how long past a block's deadline T_k a fenced
+    /// Replicated mode: D, how long past a block's deadline `T_k` a fenced
     /// block is held before it is withheld, in ms.
     #[serde(default = "default_hold_ms")]
     pub hold_ms: u32,
@@ -339,7 +339,7 @@ fn loudness_weights(
 pub struct Rt {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// SCHED_FIFO priority, 1..=99.
+    /// `SCHED_FIFO` priority, 1..=99.
     #[serde(default = "default_priority")]
     pub priority: i32,
     #[serde(default)]
@@ -1224,7 +1224,7 @@ mod tests {
     }
 
     /// A selection names one flow channel per leg, below
-    /// MAX_FLOW_CHANNELS; without one the input reads the flow in order.
+    /// `MAX_FLOW_CHANNELS`; without one the input reads the flow in order.
     #[test]
     fn flow_channels_name_one_flow_channel_per_leg() {
         let max = samplez_mxl::input::MAX_FLOW_CHANNELS;

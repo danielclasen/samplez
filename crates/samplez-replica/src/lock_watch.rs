@@ -182,7 +182,9 @@ impl Record {
 
     fn notes(&self) -> MutexGuard<'_, Notes> {
         // The notes hold plain data: a poisoned lock still reads.
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -464,7 +466,7 @@ mod tests {
     #[test]
     fn a_lock_held_past_the_limit_is_reported_with_its_holder() {
         let lock = Arc::new(WatchedMutex::new("test-lock", 0u32));
-        let limit = Duration::from_secs(60);
+        let limit = Duration::from_mins(1);
         assert_eq!(overdue(&records(&lock), limit, Instant::now()), None);
 
         let (taken, release) = (
@@ -492,7 +494,7 @@ mod tests {
         let report = overdue(
             &records(&lock),
             limit,
-            Instant::now() + Duration::from_secs(120),
+            Instant::now() + Duration::from_mins(2),
         )
         .expect("held past the limit");
         assert!(report.contains("\"test-lock\""), "{report}");
@@ -505,7 +507,7 @@ mod tests {
             overdue(
                 &records(&lock),
                 limit,
-                Instant::now() + Duration::from_secs(120)
+                Instant::now() + Duration::from_mins(2)
             ),
             None,
             "released"
@@ -529,7 +531,7 @@ mod tests {
             let r = overdue(
                 &records(&lock),
                 Duration::ZERO,
-                Instant::now() + Duration::from_secs(120),
+                Instant::now() + Duration::from_mins(2),
             );
             if r.as_deref().is_some_and(|r| r.contains("test-waiter")) {
                 break r.unwrap();
@@ -572,7 +574,7 @@ mod tests {
             let r = overdue(
                 &lock_records,
                 Duration::ZERO,
-                Instant::now() + Duration::from_secs(120),
+                Instant::now() + Duration::from_mins(2),
             );
             if r.as_deref().is_some_and(|r| r.contains("has waited")) {
                 break r.unwrap();

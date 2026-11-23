@@ -32,16 +32,16 @@ pub struct Report {
     /// What the sender last received directly from each other voter.
     pub heard: Vec<Heard>,
     /// The entries above the addressee's reported commit index whose
-    /// at_index lies below the sender's `now + maxApplyLead + w`, lowest
-    /// at_index first, at most [`MAX_LISTED`].
+    /// `at_index` lies below the sender's `now + maxApplyLead + w`, lowest
+    /// `at_index` first, at most [`MAX_LISTED`].
     pub listed: Vec<Listed>,
-    /// The lowest at_index of the entries the listing had no room for:
+    /// The lowest `at_index` of the entries the listing had no room for:
     /// an entry the addressee knows of and cannot resolve.
     pub unlisted: Option<u64>,
     /// The sender's E estimate when it built the report, in samples.
     pub estimate: Option<u64>,
     /// Per entry the sender learned committed since its last report, the
-    /// slack: its at_index less the first index the sender could still
+    /// slack: its `at_index` less the first index the sender could still
     /// apply it at by the apply deadline, in samples; at most
     /// [`MAX_LISTED`].
     pub slack: Vec<Slack>,
@@ -136,7 +136,7 @@ pub struct Own {
     /// The page hashes of its latest pages, per output, oldest first.
     #[serde(default)]
     pub pages: Vec<Page>,
-    /// The entries it holds unresolved, lowest at_index first, at most
+    /// The entries it holds unresolved, lowest `at_index` first, at most
     /// [`MAX_LISTED`]: the leader decides them.
     #[serde(default)]
     pub unresolved: Vec<Listed>,

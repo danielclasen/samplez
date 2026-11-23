@@ -317,7 +317,7 @@ async fn an_offset_step_on_the_only_live_audio_replica_holds_it() {
 }
 
 /// A leap second the kernel applies moves the offset without stepping
-/// CLOCK_TAI: it ends no verification, and the window in which the
+/// `CLOCK_TAI`: it ends no verification, and the window in which the
 /// voters' offsets differ raises no `replica_clock_unverified`.
 #[tokio::test(start_paused = true)]
 async fn an_offset_moved_without_a_step_ends_nothing_and_raises_nothing() {

@@ -1134,26 +1134,26 @@ fn a_duck_no_matrix_holds_is_refused() {
         assert!(serde_json::from_value::<Matrix>(w).is_err(), "{what}");
     };
     refused("a term mask other than the table's", &|w| {
-        term(w)["mask"] = json!(1)
+        term(w)["mask"] = json!(1);
     });
     refused("a mask with no duck", &|w| {
         term(w).as_object_mut().unwrap().remove("duck");
     });
     refused("a duck gain above 1", &|w| {
-        term(w)["duck"]["to"] = json!(1.5)
+        term(w)["duck"]["to"] = json!(1.5);
     });
     refused("a negative duck gain", &|w| {
-        term(w)["duck"]["live"] = json!(-0.25)
+        term(w)["duck"]["live"] = json!(-0.25);
     });
     refused("a live gain of mask 0 other than 1", &|w| {
         term(w)["duck"]["live_mask"] = json!(0);
         term(w)["duck"]["live"] = json!(0.5);
     });
     refused("a bias beyond the distance of two gains", &|w| {
-        term(w)["duck"]["bias"] = json!(1.5)
+        term(w)["duck"]["bias"] = json!(1.5);
     });
     refused("a crossfade past its length", &|w| {
-        term(w)["duck"]["pos"] = json!(101)
+        term(w)["duck"]["pos"] = json!(101);
     });
     refused("a crossfade too long", &|w| {
         term(w)["duck"]["len"] = json!(MAX_RAMP_LEN + 1);
@@ -1161,19 +1161,19 @@ fn a_duck_no_matrix_holds_is_refused() {
     });
     refused("a mask of 0 listed", &|w| w["masks"][0][1] = json!(0));
     refused("a mask past the coefficients", &|w| {
-        w["masks"][1][0] = json!(4)
+        w["masks"][1][0] = json!(4);
     });
     refused("masks out of order", &|w| {
         w["masks"] = json!([[2, 3], [0, 4]]);
     });
     refused("a depth beyond 40 dB", &|w| {
-        w["depths"][0][1]["target"] = json!(41.0)
+        w["depths"][0][1]["target"] = json!(41.0);
     });
     refused("a depth past the inputs", &|w| {
-        w["depths"][0][0] = json!(2 * MAX_DUCKS)
+        w["depths"][0][0] = json!(2 * MAX_DUCKS);
     });
     refused("a position past the interval", &|w| {
-        w["phase"] = json!(GAIN_INTERVAL)
+        w["phase"] = json!(GAIN_INTERVAL);
     });
 }
 
@@ -1577,7 +1577,7 @@ fn a_settled_fill_mixes_the_bits_of_a_running_matrix() {
         if !path_runs("a_settled_fill_mixes_the_bits_of_a_running_matrix", path) {
             continue;
         }
-        let mut rng = Rng::new(0x5e771e);
+        let mut rng = Rng::new(0x005e_771e);
         let mut input = PlanarBuffer::new(1, CAP);
         let mut env = PlanarBuffer::new(MAX_DUCKS, CAP);
         env.channel_mut(0).fill(1.0);

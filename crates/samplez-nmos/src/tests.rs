@@ -783,7 +783,7 @@ async fn a_restarted_instance_serves_its_peers_active() {
     assert_eq!(documents(&restarted).await, documents(&peer).await);
 }
 
-/// An instance restored from the versions replicated_change returned, as
+/// An instance restored from the versions `replicated_change` returned, as
 /// a product persists them, serves its peer's versions also after two
 /// changes of one port at one time.
 #[tokio::test]

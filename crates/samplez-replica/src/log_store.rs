@@ -316,6 +316,7 @@ impl<P: Product> Store<P> {
     /// refuses a snapshot of another product configuration, in place of
     /// ending the process with [`CONFIG_MISMATCH_EXIT`]; the install fails
     /// after it either way.
+    #[must_use]
     pub fn on_config_mismatch(mut self, f: impl Fn(u64, u64) + Send + Sync + 'static) -> Store<P> {
         self.on_mismatch = Arc::new(f);
         self
@@ -411,6 +412,7 @@ impl<P: Product> Store<P> {
 
     /// This store with every fsynced write taking `delay` longer: a slow
     /// disk, for tests.
+    #[must_use]
     pub fn with_sync_delay(mut self, delay: std::time::Duration) -> Store<P> {
         self.sync_delay = delay;
         self
@@ -815,7 +817,7 @@ fn command_bytes(entry: &StoredEntry) -> usize {
         StoredPayload::Normal(Request {
             body: Body::Commands(commands),
             ..
-        }) => commands.iter().map(|c| c.size()).sum(),
+        }) => commands.iter().map(super::entry::Command::size).sum(),
         _ => 0,
     }
 }
@@ -1790,18 +1792,24 @@ mod tests {
         store.append_to_log(entries.clone()).await.expect("append");
         store.apply_to_state_machine(&entries).await.expect("apply");
         let snapshot = store.build_snapshot().await.expect("build");
-        let saved = store.with_state(|sm| sm.save());
+        let saved = store.with_state(super::super::state_machine::StateMachine::save);
         drop(store);
         let store = open(&dir);
         assert_eq!(store.applied_index(), 3);
-        assert_eq!(store.with_state(|sm| sm.save()), saved);
+        assert_eq!(
+            store.with_state(super::super::state_machine::StateMachine::save),
+            saved
+        );
 
         let mut other = open(&super::tests::dir("snap-install"));
         other
             .install_snapshot(&snapshot.meta, snapshot.snapshot)
             .await
             .expect("install");
-        assert_eq!(other.with_state(|sm| sm.save()), saved);
+        assert_eq!(
+            other.with_state(super::super::state_machine::StateMachine::save),
+            saved
+        );
         assert_eq!(other.applied_index(), 3);
     }
 
@@ -1865,7 +1873,7 @@ mod tests {
         let mut other = open_as(&to, 7).on_config_mismatch(move |ours, theirs| {
             seen.lock().unwrap().push((ours, theirs));
         });
-        let before = other.with_state(|sm| sm.save());
+        let before = other.with_state(super::super::state_machine::StateMachine::save);
         let bytes = snapshot.snapshot.into_inner();
         let installed = other
             .install_snapshot(&snapshot.meta, Box::new(Cursor::new(bytes.clone())))
@@ -1873,7 +1881,10 @@ mod tests {
         assert!(installed.is_err());
         assert_eq!(*ended.lock().unwrap(), [(7, 8)], "the process ends");
         assert_eq!(other.applied_index(), 0);
-        assert_eq!(other.with_state(|sm| sm.save()), before);
+        assert_eq!(
+            other.with_state(super::super::state_machine::StateMachine::save),
+            before
+        );
         assert_eq!(other.installs(), 0);
         drop(other);
         let mut restarted = open_as(&to, 8);
@@ -1992,7 +2003,7 @@ mod tests {
             .expect("apply");
         other.build_snapshot().await.expect("build");
         let file = fs::read(to.join("snapshot")).expect("snapshot");
-        let before = other.with_state(|sm| sm.save());
+        let before = other.with_state(super::super::state_machine::StateMachine::save);
         let installed = other
             .install_snapshot(
                 &snapshot.meta,
@@ -2002,7 +2013,10 @@ mod tests {
         assert!(installed.is_err());
         assert_eq!(fs::read(to.join("snapshot")).expect("snapshot"), file);
         assert_eq!(other.applied_index(), 1);
-        assert_eq!(other.with_state(|sm| sm.save()), before);
+        assert_eq!(
+            other.with_state(super::super::state_machine::StateMachine::save),
+            before
+        );
     }
 
     /// An install whose file cannot be written leaves the state as it was,
@@ -2017,7 +2031,7 @@ mod tests {
         let snapshot = store.build_snapshot().await.expect("build");
         let to = dir("snap-readonly");
         let mut other = open(&to);
-        let before = other.with_state(|sm| sm.save());
+        let before = other.with_state(super::super::state_machine::StateMachine::save);
         fs::set_permissions(&to, fs::Permissions::from_mode(0o555)).expect("read-only");
         let installed = other
             .install_snapshot(&snapshot.meta, snapshot.snapshot)
@@ -2025,6 +2039,9 @@ mod tests {
         fs::set_permissions(&to, fs::Permissions::from_mode(0o755)).expect("writable");
         assert!(installed.is_err());
         assert_eq!(other.applied_index(), 0);
-        assert_eq!(other.with_state(|sm| sm.save()), before);
+        assert_eq!(
+            other.with_state(super::super::state_machine::StateMachine::save),
+            before
+        );
     }
 }

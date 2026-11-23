@@ -661,8 +661,8 @@ pub fn read_blocks(domain: &Path, flow_id: &str, channels: usize, ks: Range<u64>
 }
 
 /// Starts an engine with a verdict stream of 65 s of blocks. With
-/// `SAMPLEZ_REQUIRE_RT=1` the RT thread must run SCHED_FIFO and the
-/// process memory must be locked; hop's two_inputs then also fails on any
+/// `SAMPLEZ_REQUIRE_RT=1` the RT thread must run `SCHED_FIFO` and the
+/// process memory must be locked; hop's `two_inputs` then also fails on any
 /// overrun skip instead of printing it.
 pub fn start(config: Config) -> (Engine, Receiver<BlockVerdict>) {
     let (tx, rx) = std::sync::mpsc::sync_channel(1 << 16);
@@ -790,7 +790,7 @@ pub fn hold_scenario(e: &Engine) {
     let wait = |k: u64| {
         wait_for(Duration::from_secs(10), "blocks processed", || {
             processed(e) > k
-        })
+        });
     };
     let through = |e: &Engine| {
         let p = processed(e);

@@ -185,7 +185,9 @@ impl Inner {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn key(&self, port: Port) -> PortKey {
@@ -402,7 +404,7 @@ impl Nmos {
     /// Deletes the Node from its registry, for a graceful shutdown after
     /// [`Nmos::registration`] is dropped.
     pub async fn unregister(&self) {
-        registration::unregister(&self.inner).await
+        registration::unregister(&self.inner).await;
     }
 
     pub fn node_id(&self) -> Uuid {
@@ -559,7 +561,7 @@ impl Nmos {
                 .inner
                 .registry
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
         }
     }
@@ -623,7 +625,7 @@ fn check(model: &NodeModel, cfg: &NmosConfig) -> Result<(), Error> {
         .iter()
         .any(|v| v.is_empty())
         || a.functions.is_empty()
-        || a.functions.iter().any(|f| f.is_empty())
+        || a.functions.iter().any(std::string::String::is_empty)
     {
         return fail("every asset tag needs a value and the device a function".into());
     }

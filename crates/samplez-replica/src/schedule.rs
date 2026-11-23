@@ -38,7 +38,7 @@ pub struct Lead {
 }
 
 /// The minute the lead's slack is kept in.
-pub const MINUTE: Duration = Duration::from_secs(60);
+pub const MINUTE: Duration = Duration::from_mins(1);
 
 /// Minutes of slack the lead falls on.
 const MINUTES: usize = 10;
@@ -252,10 +252,10 @@ mod tests {
         for _ in 0..100 {
             lead.add(5 * B as i64, 1, 1);
         }
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         lead.roll();
         assert_eq!(lead.samples(), 2400 - B, "one clean minute is enough");
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         lead.roll();
         assert_eq!(lead.samples(), 2400 - 2 * B, "and a block a minute after");
         // A raise ends the fast fall.
@@ -264,7 +264,7 @@ mod tests {
         for _ in 0..100 {
             lead.add(5 * B as i64, 3, 3);
         }
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         lead.roll();
         assert_eq!(lead.samples(), raised, "ten minutes again");
     }
@@ -276,7 +276,7 @@ mod tests {
         for _ in 0..100 {
             lead.add(5 * B as i64, 1, 1);
         }
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         lead.roll();
         assert_eq!(lead.samples(), 2400);
     }
@@ -325,14 +325,14 @@ mod tests {
             for _ in 0..100 {
                 lead.add(5 * B as i64, 1, 1);
             }
-            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::time::advance(Duration::from_mins(1)).await;
             lead.roll();
             assert_eq!(lead.samples(), 1440 + B, "minute {minute}: not ten yet");
         }
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         lead.roll();
         assert_eq!(lead.samples(), 1440, "ten minutes at 3B or more");
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         lead.roll();
         assert_eq!(lead.samples(), 1440 - B, "and a block a minute after");
     }
@@ -352,10 +352,10 @@ mod tests {
         assert_eq!(lead.stamping(), 72 * B, "at the cap: what was needed");
         lead.needs(50 * B, -(200 * B as i64));
         assert_eq!(lead.wanted(), 50 * B + 3072, "64 ms past the cap");
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         lead.roll();
         assert_eq!(lead.wanted(), 50 * B + 3072, "the last minute counts");
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         lead.roll();
         assert_eq!(lead.wanted(), 50 * B, "the lead itself");
     }
@@ -374,7 +374,7 @@ mod tests {
                 lead.add(5 * B as i64, 1, 1);
                 lead.needs(72 * B, 5 * B as i64);
             }
-            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::time::advance(Duration::from_mins(1)).await;
             lead.roll();
             assert_eq!(lead.samples(), 50 * B, "minute {minute}");
             assert!(lead.capped, "minute {minute}");
@@ -384,7 +384,7 @@ mod tests {
             lead.add(5 * B as i64, 1, 1);
             lead.needs(40 * B, 5 * B as i64);
         }
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_mins(1)).await;
         lead.roll();
         assert_eq!(lead.samples(), 49 * B, "a minute needing less, it falls");
         assert!(!lead.capped);
@@ -400,7 +400,7 @@ mod tests {
                 lead.add(B as i64, 1, 1);
                 lead.needs(30 * B, B as i64);
             }
-            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::time::advance(Duration::from_mins(1)).await;
             lead.roll();
         }
         assert_eq!(lead.samples(), 29 * B, "below the cap it falls");

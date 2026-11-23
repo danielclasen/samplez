@@ -263,6 +263,7 @@ impl StripParam {
     /// not finite is replaced with, so a strip that held another value
     /// and one that held none end up alike. A leg or band the strip lacks
     /// stays refused.
+    #[must_use]
     pub fn neutral(&self) -> StripParam {
         match *self {
             StripParam::Trim { .. } => StripParam::Trim { db: 0.0 },
@@ -2180,15 +2181,15 @@ mod tests {
         };
         invalid("NaN filter state", &|s| s.eq[0].state[1][0] = f32::NAN);
         invalid("infinite crossfade state", &|s| {
-            s.alt_eq[2][0][1] = f32::INFINITY
+            s.alt_eq[2][0][1] = f32::INFINITY;
         });
         invalid("filter state beyond a block's", &|s| {
-            s.hpf.state[0][1] = 1e31
+            s.hpf.state[0][1] = 1e31;
         });
         invalid("leg gain beyond any trim", &|s| s.gain[1].c0 = 101.0);
         invalid("leg gain below any trim", &|s| s.gain[0].c0 = -150.0);
         invalid("crossfade state beyond a block's", &|s| {
-            s.alt_eq[0][1][0] = -1e31
+            s.alt_eq[0][1][0] = -1e31;
         });
         invalid("infinite leg gain", &|s| s.gain[0].c0 = f32::INFINITY);
         invalid("NaN trim", &|s| s.trim_db = f32::NAN);

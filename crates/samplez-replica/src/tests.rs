@@ -376,14 +376,14 @@ async fn a_heard_leader_counts_for_its_own_vote_within_the_lease() {
 
 /// The leader a replica took is recorded from what its raft answered:
 /// an AppendEntries answered Conflict or Success took the sender's vote,
-/// one answered HigherVote did not, nor an InstallSnapshot answered
+/// one answered `HigherVote` did not, nor an InstallSnapshot answered
 /// with another vote.
 #[tokio::test]
 async fn rpcs_record_only_a_vote_the_raft_accepted() {
     let dir = dir("rpcs");
     let replica = start(open(&dir)).await;
     let rpcs = replica.rpcs();
-    let lease = Duration::from_secs(60);
+    let lease = Duration::from_mins(1);
     let heard = |vote: &Vote<NodeId>| replica.shared.heard.within(vote, lease);
     let append = |vote: Vote<NodeId>, prev: Option<LogId<NodeId>>| AppendEntriesRequest {
         vote,

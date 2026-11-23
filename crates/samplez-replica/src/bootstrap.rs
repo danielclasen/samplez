@@ -311,6 +311,7 @@ impl Kube {
     /// created again under the name since, or one being deleted, so a
     /// replica of a deleted set never writes its cluster id into the
     /// marker of the set that replaces it.
+    #[must_use]
     pub fn owned_by(mut self, statefulset: String) -> Kube {
         self.owner = Some(statefulset);
         self
