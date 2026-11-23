@@ -123,7 +123,10 @@ pub(crate) async fn upgrade(
         .await
         .map_err(io::Error::other)?;
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
-        return Err(io::Error::other(format!("{addr}{path}: {}", response.status())));
+        return Err(io::Error::other(format!(
+            "{addr}{path}: {}",
+            response.status()
+        )));
     }
     hyper::upgrade::on(response).await.map_err(io::Error::other)
 }
@@ -487,7 +490,10 @@ impl PeerClient for Pool {
             let (body, content_type) = if report {
                 crate::proto::encode_request(&request)
             } else {
-                (serde_json::to_vec(&request).expect("encodes"), "application/json")
+                (
+                    serde_json::to_vec(&request).expect("encodes"),
+                    "application/json",
+                )
             };
             if let (Some(cpu), Some(to)) = (cpu, to) {
                 let encode = crate::contact::thread_cpu().saturating_sub(cpu);
@@ -503,13 +509,23 @@ impl PeerClient for Pool {
             }
             let started = Instant::now();
             let reply = self
-                .post_as(to, addr, &path, body, within, report.then_some(content_type))
+                .post_as(
+                    to,
+                    addr,
+                    &path,
+                    body,
+                    within,
+                    report.then_some(content_type),
+                )
                 .await;
             if let (true, Some(to)) = (report, to) {
                 match &reply {
                     Ok(_) => {
                         let rtt = started.elapsed();
-                        crate::proto::sample(&crate::proto::STATS.round_trip, rtt.as_nanos() as u64);
+                        crate::proto::sample(
+                            &crate::proto::STATS.round_trip,
+                            rtt.as_nanos() as u64,
+                        );
                         self.count(to, |c| c.answered(rtt));
                     }
                     Err(e) if e.kind() == io::ErrorKind::TimedOut => {

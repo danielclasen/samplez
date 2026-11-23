@@ -706,7 +706,12 @@ async fn proto_measure() {
     STATS.round_trip.lock().unwrap().clear();
     let (a, c0, k0, t0) = (total(&set), rusage(), counters(), Instant::now());
     tokio::time::sleep(Duration::from_secs(10)).await;
-    let (b, c1, k1, secs) = (total(&set), rusage(), counters(), t0.elapsed().as_secs_f64());
+    let (b, c1, k1, secs) = (
+        total(&set),
+        rusage(),
+        counters(),
+        t0.elapsed().as_secs_f64(),
+    );
     let mut latency = std::mem::take(&mut *STATS.latency.lock().unwrap());
     let mut round_trip = std::mem::take(&mut *STATS.round_trip.lock().unwrap());
     println!(

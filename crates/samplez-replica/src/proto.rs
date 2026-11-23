@@ -105,7 +105,10 @@ pub fn sample(to: &Mutex<Vec<u64>>, ns: u64) {
 /// A report request body in the configured codec, and its content type.
 pub fn encode_request(request: &PeerRequest) -> (Vec<u8>, &'static str) {
     match codec() {
-        Codec::Json => (serde_json::to_vec(request).expect("encodes"), "application/json"),
+        Codec::Json => (
+            serde_json::to_vec(request).expect("encodes"),
+            "application/json",
+        ),
         Codec::Postcard => (
             postcard::to_allocvec(request).expect("encodes"),
             "application/postcard",
@@ -311,15 +314,20 @@ impl Link {
 #[derive(Clone)]
 pub struct PeerCert(pub Option<rustls::pki_types::CertificateDer<'static>>);
 
-impl axum::extract::connect_info::Connected<
-    axum::serve::IncomingStream<'_, samplez_service::tls::TlsListener>,
-> for PeerCert
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, samplez_service::tls::TlsListener>,
+    > for PeerCert
 {
     fn connect_info(
         stream: axum::serve::IncomingStream<'_, samplez_service::tls::TlsListener>,
     ) -> PeerCert {
         let certs = stream.io().get_ref().1.peer_certificates();
-        PeerCert(certs.and_then(|c| c.first()).map(|c| c.clone().into_owned()))
+        PeerCert(
+            certs
+                .and_then(|c| c.first())
+                .map(|c| c.clone().into_owned()),
+        )
     }
 }
 
