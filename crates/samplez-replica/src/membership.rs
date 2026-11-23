@@ -69,13 +69,15 @@ pub struct Voters {
 impl Voters {
     /// Refuses an even number of voters: two halves could not tell which
     /// one holds the quorum.
-    pub fn new(replicas: u16, witness: bool) -> Result<Voters, String> {
+    ///
+    /// # Errors
+    ///
+    /// No replica, an even count of voters, or more replicas than node
+    /// ids below the witness's.
+    pub fn new(replicas: u16, witness: bool) -> Result<Voters, crate::Error> {
         let count = u32::from(replicas) + u32::from(witness);
         if replicas == 0 || count % 2 == 0 || u64::from(replicas) >= WITNESS {
-            return Err(format!(
-                "{replicas} replicas {} the witness are {count} voters; the count must be odd",
-                if witness { "with" } else { "without" }
-            ));
+            return Err(crate::Error::VoterCount { replicas, witness });
         }
         Ok(Voters { replicas, witness })
     }

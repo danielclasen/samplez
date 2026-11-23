@@ -18,6 +18,8 @@ pub mod contact;
 pub mod decide;
 pub mod dedup;
 pub mod entry;
+mod error;
+pub use error::Error;
 pub mod horizon;
 pub mod liveness;
 pub mod lock_watch;
@@ -223,21 +225,25 @@ impl RaftTiming {
     /// Whether `heartbeat` is not zero and below `election_min`, which is
     /// below `election_max` (openraft draws a timeout from a range of
     /// more than one value).
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// The first of those that does not hold.
+    pub fn validate(&self) -> Result<(), Error> {
         if self.heartbeat.is_zero() {
-            return Err("raft heartbeat must not be zero".to_owned());
+            return Err(Error::HeartbeatZero);
         }
         if self.heartbeat >= self.election_min {
-            return Err(format!(
-                "raft heartbeat ({:?}) must be below the election timeout minimum ({:?})",
-                self.heartbeat, self.election_min
-            ));
+            return Err(Error::HeartbeatNotBelowElection {
+                heartbeat: self.heartbeat,
+                election_min: self.election_min,
+            });
         }
         if self.election_min >= self.election_max {
-            return Err(format!(
-                "raft election timeout minimum ({:?}) must be below its maximum ({:?})",
-                self.election_min, self.election_max
-            ));
+            return Err(Error::ElectionRange {
+                min: self.election_min,
+                max: self.election_max,
+            });
         }
         Ok(())
     }
@@ -251,9 +257,12 @@ pub fn raft_config(cluster: &str) -> openraft::Config {
 /// openraft's configuration with `timing` and the rest as the chart pins
 /// it: openraft's 0.9.26 defaults, so the figures do not move with a
 /// dependency update; and [`MAX_PAYLOAD_ENTRIES`], which
-/// [`MAX_APPEND_BYTES`] bounds further. An invalid `timing`
-/// ([`RaftTiming::validate`]) is an error.
-pub fn raft_config_with(cluster: &str, timing: &RaftTiming) -> Result<openraft::Config, String> {
+/// [`MAX_APPEND_BYTES`] bounds further.
+///
+/// # Errors
+///
+/// An invalid `timing` ([`RaftTiming::validate`]).
+pub fn raft_config_with(cluster: &str, timing: &RaftTiming) -> Result<openraft::Config, Error> {
     timing.validate()?;
     let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     Ok(openraft::Config {
@@ -448,14 +457,15 @@ impl Drop for Proposing<'_> {
 
 /// Refuses an engine whose `rampSamples` and `blockSize` are not the
 /// limits': the replica follows gain ramps at those.
-fn check_ramp_config(limits: &Limits, engine: Option<(u32, u64)>) -> Result<(), String> {
+fn check_ramp_config(limits: &Limits, engine: Option<(u32, u64)>) -> Result<(), Error> {
     match engine {
         Some((ramp, block)) if (ramp, block) != (limits.ramp_samples, limits.block) => {
-            Err(format!(
-                "the replica's ramp_samples {} and block {} are not the engine's rampSamples {ramp} \
-             and blockSize {block}: they must be equal",
-                limits.ramp_samples, limits.block
-            ))
+            Err(Error::RampConfig {
+                replica_ramp: limits.ramp_samples,
+                replica_block: limits.block,
+                engine_ramp: ramp,
+                engine_block: block,
+            })
         }
         _ => Ok(()),
     }
@@ -495,11 +505,11 @@ impl<P: Product> Replica<P> {
         network: N,
         peers: Arc<dyn PeerClient>,
         estimate: Estimate,
-    ) -> Result<Replica<P>, String>
+    ) -> Result<Replica<P>, Error>
     where
         N: RaftNetworkFactory<TypeConfig>,
     {
-        let store = Store::open(dir, factory, settings.limits).map_err(|e| e.to_string())?;
+        let store = Store::open(dir, factory, settings.limits)?;
         Replica::with_store(settings, raft, store, network, peers, estimate).await
     }
 
@@ -514,12 +524,12 @@ impl<P: Product> Replica<P> {
         network: N,
         peers: Arc<dyn PeerClient>,
         estimate: Estimate,
-    ) -> Result<Replica<P>, String>
+    ) -> Result<Replica<P>, Error>
     where
         N: RaftNetworkFactory<TypeConfig>,
     {
         lock_watch::start_watchdog(lock_watch::HELD_LIMIT);
-        let raft_config = Arc::new(raft.validate().map_err(|e| e.to_string())?);
+        let raft_config = Arc::new(raft.validate().map_err(Error::raft)?);
         let (log, state_machine) = Adaptor::new(store.clone());
         let raft = Raft::new(
             settings.id,
@@ -529,7 +539,7 @@ impl<P: Product> Replica<P> {
             state_machine,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(Error::raft)?;
         let voters = settings.voters;
         let settings_epoch = settings.epoch;
         let shared = Arc::new(Shared {
@@ -648,9 +658,9 @@ impl<P: Product> Replica<P> {
     ///
     /// When the product drives an engine and `body` is a `Route` or a
     /// `MasterEnable`.
-    pub fn append(&self, body: Body) -> Result<(), String> {
+    pub fn append(&self, body: Body) -> Result<(), Error> {
         if P::DRIVES_ENGINE && matches!(body, Body::Route { .. } | Body::MasterEnable { .. }) {
-            return Err("the product owns the inputs' flows".to_owned());
+            return Err(Error::ProductOwnsInputs);
         }
         let queue = if body.needs_generation() {
             &self.generations
@@ -667,10 +677,14 @@ impl<P: Product> Replica<P> {
     }
 
     /// Makes `members` the first voters; on one node of a new set only.
+    ///
+    /// # Errors
+    ///
+    /// openraft's refusal, such as on a node that is initialized.
     pub async fn initialize(
         &self,
         members: impl IntoIterator<Item = (NodeId, String)>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let members: BTreeMap<NodeId, BasicNode> = members
             .into_iter()
             .map(|(id, addr)| (id, BasicNode::new(addr)))
@@ -679,7 +693,7 @@ impl<P: Product> Replica<P> {
             .raft
             .initialize(members)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(Error::raft)
     }
 
     /// Keeps the replica in its set ([`membership::watch`]): an empty
@@ -700,12 +714,12 @@ impl<P: Product> Replica<P> {
         timing: contact::Timing,
         clocks: Arc<dyn contact::Clocks>,
         audio: Option<Arc<dyn contact::Audio>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         check_ramp_config(
             &self.shared.settings.limits,
             audio.as_ref().and_then(|a| a.ramp_config()),
         )?;
-        let first_seq = bootstrap::random_id().map_err(|e| e.to_string())? >> 1;
+        let first_seq = bootstrap::random_id()? >> 1;
         let contact = Arc::new(contact::Contact::new(
             self.id(),
             timing,
@@ -719,7 +733,7 @@ impl<P: Product> Replica<P> {
         self.shared
             .contact
             .set(contact.clone())
-            .map_err(|_| "contact runs already".to_owned())?;
+            .map_err(|_| Error::ContactRunning)?;
         if let Some(rollout) = pending.take() {
             contact.set_rollout(rollout);
         }
@@ -737,13 +751,12 @@ impl<P: Product> Replica<P> {
     /// [`Replica::contact`], contact reports the key from its first report
     /// period on; given later, the replica's first periods report none,
     /// and it may leave `starting` before its key is known.
-    pub fn rollout(&self, rollout: Arc<dyn rollout::Rollout>) -> Result<(), String> {
+    pub fn rollout(&self, rollout: Arc<dyn rollout::Rollout>) {
         let mut pending = self.rollout.lock().expect("rollout lock poisoned");
         match self.shared.contact.get() {
             Some(contact) => contact.set_rollout(rollout),
             None => *pending = Some(rollout),
         }
-        Ok(())
     }
 
     /// Contact as status shows it, once started.

@@ -2041,7 +2041,7 @@ impl<P: Product> Set<P> {
             rollout.set_target(self.target.clone());
             // Given before contact starts: its first report carries the key.
             if !self.held.contains(&id) {
-                replica.rollout(rollout.clone()).expect("a rollout");
+                replica.rollout(rollout.clone());
             }
             replica
                 .contact(timing, Arc::new(Tai(clock)), engine)
@@ -2092,7 +2092,7 @@ impl<P: Product> Set<P> {
     pub fn release_rollout(&mut self, id: NodeId) {
         if self.held.remove(&id) {
             let rollout = self.rollouts[&id].clone();
-            self.replicas[&id].rollout(rollout).expect("a rollout");
+            self.replicas[&id].rollout(rollout);
         }
     }
 
