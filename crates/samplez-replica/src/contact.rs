@@ -20,12 +20,13 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::Shared;
 use crate::baseline::{Leader, LeaderView, Voter};
+use crate::bridge::PAGES_REPORTED;
 use crate::entry::{Baseline, Body, NodeId, PROTOCOL, Request};
 use crate::lock_watch::{WatchedGuard, WatchedMutex};
 use crate::log_store::Store;
 use crate::peer::{PeerRequest, PeerResponse};
 use crate::rank::Baselines;
-use crate::report::{Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report, Slack};
+use crate::report::{Carried, Echo, Heard, Histogram, Listed, MAX_LISTED, Own, Report, Slack};
 use crate::resync::{CoreReply, Failed, Missed, Resynced, Source};
 use crate::schedule::Lead;
 use crate::snapshot::StoredLogId;
@@ -583,6 +584,9 @@ struct Direct {
 #[derive(Debug, Default)]
 struct Peer {
     last: Option<Direct>,
+    /// The voters its latest report said it took no report from within
+    /// w, or holds silent: their records are relayed to it untrimmed.
+    stale: BTreeSet<NodeId>,
     /// The peer's latest echoes: the TAI time this replica sent the report
     /// echoed, and the `silentAt` the echo carried.
     echoes: VecDeque<(u64, Option<u64>)>,
@@ -806,6 +810,12 @@ struct State {
     missed_after: Option<u64>,
     #[cfg(test)]
     verified_always: bool,
+    /// Reports and copies as before [`Carried`]: every record in every
+    /// report, copies keeping theirs and relaying them.
+    #[cfg(test)]
+    as_before: bool,
+    /// Per addressee, the page records it confirmed.
+    carried: BTreeMap<NodeId, Carried>,
     decider: crate::decide::Decider,
     liveness: crate::liveness::Liveness,
     /// The audio `/readyz` term, as of the last period in contact or, out
@@ -894,6 +904,16 @@ pub struct CostCounts {
     pub decode: Duration,
     /// [`Contact::receive`]: taking a decoded report.
     pub receive: Duration,
+}
+
+impl State {
+    /// [`State::as_before`] in tests; never otherwise.
+    fn as_before(&self) -> bool {
+        #[cfg(test)]
+        return self.as_before;
+        #[cfg(not(test))]
+        false
+    }
 }
 
 /// Adds a counted replica's slack to the lead, naming the replica when
@@ -1194,6 +1214,9 @@ impl Contact {
                     missed_after: None,
                     #[cfg(test)]
                     verified_always: false,
+                    #[cfg(test)]
+                    as_before: false,
+                    carried: BTreeMap::new(),
                     decider: crate::decide::Decider::default(),
                     liveness: crate::liveness::Liveness::default(),
                     serving: None,
@@ -1261,6 +1284,7 @@ impl Contact {
         let w = self.timing.contact_window;
         let mut st = self.lock();
         let st = &mut *st;
+        let as_before = st.as_before();
         let voters = st.members.voters();
         if report.from == self.id {
             return;
@@ -1320,7 +1344,24 @@ impl Contact {
         {
             return;
         }
+        // A sequence number this far past the last one is another
+        // process's: the sender restarted.
+        let restarted =
+            (peer.last.as_ref()).is_some_and(|l| report.seq.wrapping_sub(l.seq) > SEQ_WINDOW);
+        // The page records it took: those of the report it echoes and
+        // before. No echo, an echo of no report this process sent lately,
+        // or a restart: it may hold no record, and is sent every one.
+        let carried = st.carried.entry(report.from).or_default();
+        match (report.echo, t1) {
+            (Some(echo), Some(_)) if !restarted => carried.echoed(echo.seq),
+            _ => *carried = Carried::default(),
+        }
         peer.reports += 1;
+        let w_us = w.as_micros() as u64;
+        peer.stale = (report.heard.iter())
+            .filter(|h| h.silent || h.age_us.is_none_or(|a| a > w_us))
+            .map(|h| h.node)
+            .collect();
         if let Some(last) = &peer.last {
             let gap = since(now, last.received);
             if peer.silent {
@@ -1357,11 +1398,17 @@ impl Contact {
         }
         st.withhold.fold(self.id, report.from, &report.own);
         st.pages.fold(report.from, &report.own.pages);
+        // Page records live in the page book alone: a copy holds none, and
+        // one relayed carries the book's.
+        let mut own = report.own;
+        if !as_before {
+            own.pages = Vec::new();
+        }
         peer.last = Some(Direct {
             seq: report.seq,
             received_tai: tai,
             received: now,
-            own: report.own,
+            own,
             committed: report.committed,
         });
         // One relay hop: copies of voters the sender heard directly, and
@@ -1384,6 +1431,10 @@ impl Contact {
             {
                 st.withhold.fold(self.id, heard.node, &own);
                 st.pages.fold(heard.node, &own.pages);
+                let mut own = own;
+                if !as_before {
+                    own.pages = Vec::new();
+                }
                 other.relayed = Some((generated, own));
             }
         }
@@ -1527,8 +1578,10 @@ impl Contact {
         let tai = self.clocks.tai_ns();
         let mut st = self.lock();
         let st = &mut *st;
+        let as_before = st.as_before();
         let voters = members.voters();
         st.peers.retain(|id, _| voters.contains(id));
+        st.carried.retain(|id, _| voters.contains(id));
         st.lead_raised_by = st.lead_raised_by.filter(|id| voters.contains(id));
         st.learners
             .retain(|id, _| members.addrs.contains_key(id) && !voters.contains(id));
@@ -1710,7 +1763,7 @@ impl Contact {
             listed.sort_by_key(|l| (l.at_index, l.id.index));
             let unlisted = listed.get(MAX_LISTED).map(|l| l.at_index);
             listed.truncate(MAX_LISTED);
-            let heard = voters
+            let mut heard: Vec<Heard> = voters
                 .iter()
                 .copied()
                 .filter(|&v| v != self.id && v != to)
@@ -1725,6 +1778,42 @@ impl Contact {
                     }
                 })
                 .collect();
+            // Page records: its own latest, and for each copy relayed the
+            // newest this replica holds of that voter, each carried until
+            // the addressee confirms it. An addressee not heard within w
+            // may have restarted with no record: it is sent every one.
+            let mut offered = vec![(self.id, st.own.pages.clone())];
+            offered.extend(
+                (heard.iter())
+                    .filter(|h| h.own.is_some())
+                    .map(|h| (h.node, st.pages.latest(h.node, PAGES_REPORTED))),
+            );
+            let heard_within_w = peer
+                .and_then(|p| p.last.as_ref())
+                .is_some_and(|d| since(now, d.received) <= w);
+            let carried = st.carried.entry(to).or_default();
+            if !heard_within_w {
+                *carried = Carried::default();
+            }
+            let mut carry = carried.carry(st.seq, &offered).into_iter();
+            let mut own = st.own.clone();
+            if !as_before {
+                own.pages = carry.next().unwrap_or_default();
+                // A voter the addressee took no direct report from
+                // within w gets its newest records relayed whole: one
+                // confirmed meanwhile may have come in a copy it dropped
+                // for a newer direct one.
+                for h in &mut heard {
+                    if let Some(relayed) = &mut h.own {
+                        let trimmed = carry.next().unwrap_or_default();
+                        relayed.pages = if peer.is_some_and(|p| p.stale.contains(&h.node)) {
+                            st.pages.latest(h.node, PAGES_REPORTED)
+                        } else {
+                            trimmed
+                        };
+                    }
+                }
+            }
             out.push((
                 to,
                 addr,
@@ -1734,7 +1823,7 @@ impl Contact {
                     sent_at: tai,
                     echo,
                     committed,
-                    own: st.own.clone(),
+                    own,
                     heard,
                     listed,
                     unlisted,
@@ -3239,6 +3328,37 @@ impl Contact {
         self.lock().verified_always = true;
     }
 
+    /// Reports and copies as before [`Carried`].
+    #[cfg(test)]
+    pub(crate) fn as_before(&self) {
+        self.lock().as_before = true;
+    }
+
+    /// The page book, and the copies of every voter with their ages,
+    /// without the page records nothing reads in a copy.
+    #[cfg(test)]
+    pub(crate) fn pages_and_copies(&self) -> (String, Vec<(NodeId, Duration, Own)>) {
+        let st = self.lock();
+        let copies = (self.copies(&st, Instant::now()).into_iter())
+            .map(|(id, age, own)| {
+                let mut own = own.clone();
+                own.pages.clear();
+                (id, age, own)
+            })
+            .collect();
+        (format!("{:?}", st.pages), copies)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_pages(&self, node: NodeId) -> Vec<crate::report::Page> {
+        self.lock().pages.latest(node, PAGES_REPORTED)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn carried_len(&self, to: NodeId) -> usize {
+        self.lock().carried.get(&to).map_or(0, Carried::len)
+    }
+
     fn clock_readings(
         &self,
         st: &State,
@@ -4158,7 +4278,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::report::ClockFlags;
+    use crate::report::{ClockFlags, Page};
 
     const B: u64 = 48;
     const T0: u64 = 1_000_000_000_000_000;
@@ -4407,9 +4527,42 @@ mod tests {
         committing: std::sync::atomic::AtomicBool,
         /// The last [`Audio::diverged`].
         apart: std::sync::atomic::AtomicBool,
+        /// The page records it reports.
+        pages: Mutex<Vec<Page>>,
     }
 
     impl Engine {
+        /// Page `page`'s records get another hash.
+        fn rehash(&self, page: u64) {
+            for p in self.pages.lock().unwrap().iter_mut() {
+                if p.page == page {
+                    p.hash += 1;
+                }
+            }
+        }
+
+        /// Page `page` of outputs 0 and 1 is final: it reports it, and the
+        /// latest [`PAGES_REPORTED`] of each output.
+        fn page(&self, page: u64) {
+            let mut pages = self.pages.lock().unwrap();
+            for output in 0..2 {
+                pages.push(Page {
+                    output,
+                    page,
+                    hash: page * 10 + u64::from(output),
+                    fingerprint: 1,
+                    committed: true,
+                    degraded: false,
+                    digest: None,
+                });
+                let of = pages.iter().filter(|p| p.output == output).count();
+                if of > PAGES_REPORTED {
+                    let oldest = pages.iter().position(|p| p.output == output).unwrap();
+                    pages.remove(oldest);
+                }
+            }
+        }
+
         /// The outputs it reports.
         fn reported(&self) -> usize {
             match (
@@ -4442,6 +4595,7 @@ mod tests {
                         self.reported()
                     ],
                     build_time: Some(self.build_time.load(Ordering::SeqCst)).filter(|&t| t > 0),
+                    pages: self.pages.lock().unwrap().clone(),
                     ..Own::default()
                 },
                 status_changes_lost: 0,
@@ -4640,25 +4794,7 @@ mod tests {
             step: AtomicU64::new(0),
         });
         let log = Arc::new(Log::default());
-        let engine = Arc::new(Engine {
-            clock: clock.clone(),
-            step_at: AtomicU64::new(u64::MAX),
-            fence: AtomicU64::new(0),
-            calls: Mutex::new(Vec::new()),
-            room: AtomicU64::new(u64::MAX),
-            requests: Mutex::new(Vec::new()),
-            handed_from: Mutex::new(Vec::new()),
-            rebuilds: std::sync::atomic::AtomicBool::new(true),
-            holding: std::sync::atomic::AtomicBool::new(false),
-            rebuilt_with: Mutex::new(Vec::new()),
-            outputs: std::sync::atomic::AtomicBool::new(false),
-            second: std::sync::atomic::AtomicBool::new(false),
-            disabled: AtomicU64::new(0),
-            build_time: AtomicU64::new(0),
-            follows: std::sync::atomic::AtomicBool::new(true),
-            committing: std::sync::atomic::AtomicBool::new(false),
-            apart: std::sync::atomic::AtomicBool::new(false),
-        });
+        let engine = engine(&clock);
         let contact = Contact::new(
             1,
             Timing::defaults(B),
@@ -4684,6 +4820,29 @@ mod tests {
             contact,
             members: Members { configs, addrs },
         }
+    }
+
+    fn engine(clock: &Arc<Clock>) -> Arc<Engine> {
+        Arc::new(Engine {
+            clock: clock.clone(),
+            step_at: AtomicU64::new(u64::MAX),
+            fence: AtomicU64::new(0),
+            calls: Mutex::new(Vec::new()),
+            room: AtomicU64::new(u64::MAX),
+            requests: Mutex::new(Vec::new()),
+            handed_from: Mutex::new(Vec::new()),
+            rebuilds: std::sync::atomic::AtomicBool::new(true),
+            holding: std::sync::atomic::AtomicBool::new(false),
+            rebuilt_with: Mutex::new(Vec::new()),
+            outputs: std::sync::atomic::AtomicBool::new(false),
+            second: std::sync::atomic::AtomicBool::new(false),
+            disabled: AtomicU64::new(0),
+            build_time: AtomicU64::new(0),
+            follows: std::sync::atomic::AtomicBool::new(true),
+            committing: std::sync::atomic::AtomicBool::new(false),
+            apart: std::sync::atomic::AtomicBool::new(false),
+            pages: Mutex::new(Vec::new()),
+        })
     }
 
     impl Fixture {
@@ -7856,5 +8015,406 @@ mod tests {
         assert!(f.contact.lock().given.is_empty(), "rebuilt past, not held");
         f.tick();
         assert_eq!(f.contact.metrics().late_rebuilds, 1, "nothing left to fold");
+    }
+
+    /// Three voters, each a contact over a fake engine and log of its
+    /// own on one clock, whose reports a test delivers or drops.
+    struct Net {
+        clock: Arc<Clock>,
+        members: Members,
+        nodes: BTreeMap<NodeId, (Contact, Arc<Engine>)>,
+    }
+
+    impl Net {
+        /// `as_before`: every node reports and relays as before
+        /// [`Carried`].
+        fn new(clock: &Arc<Clock>, as_before: bool) -> Net {
+            let ids = [1, 2, 3];
+            let nodes = ids
+                .into_iter()
+                .map(|id| (id, Net::node(clock, id, id * 1000, as_before)))
+                .collect();
+            Net {
+                clock: clock.clone(),
+                members: Members {
+                    configs: vec![ids.into_iter().collect()],
+                    addrs: ids.into_iter().map(|v| (v, v.to_string())).collect(),
+                },
+                nodes,
+            }
+        }
+
+        fn node(
+            clock: &Arc<Clock>,
+            id: NodeId,
+            first_seq: u64,
+            as_before: bool,
+        ) -> (Contact, Arc<Engine>) {
+            let engine = engine(clock);
+            let log = Arc::new(Log::default());
+            let contact = Contact::new(
+                id,
+                Timing::defaults(B),
+                clock.clone(),
+                Some(engine.clone()),
+                log,
+                first_seq,
+            );
+            contact.verified_always();
+            if as_before {
+                contact.as_before();
+            }
+            (contact, engine)
+        }
+
+        fn contact(&self, id: NodeId) -> &Contact {
+            &self.nodes[&id].0
+        }
+
+        /// Replaces `id` by a process that holds nothing, its sequence
+        /// numbers from `first_seq` on.
+        fn restart(&mut self, id: NodeId, first_seq: u64) {
+            let node = Net::node(&self.clock, id, first_seq, false);
+            self.nodes.insert(id, node);
+        }
+
+        /// Every node ticks, and each report reaches its addressee unless
+        /// `lost(from, to)`. Returns the reports, delivered or not.
+        fn period(&self, lost: impl Fn(NodeId, NodeId) -> bool) -> Vec<(NodeId, NodeId, Report)> {
+            self.period_with(lost, |_, _, _| {})
+        }
+
+        /// [`Net::period`], each report changed by `edit` on its way.
+        fn period_with(
+            &self,
+            lost: impl Fn(NodeId, NodeId) -> bool,
+            edit: impl Fn(NodeId, NodeId, &mut Report),
+        ) -> Vec<(NodeId, NodeId, Report)> {
+            let mut sent: Vec<(NodeId, NodeId, Report)> = (self.nodes.iter())
+                .flat_map(|(&from, (c, _))| {
+                    let reports = c.tick(self.members.clone());
+                    reports.into_iter().map(move |(to, _, r)| (from, to, r))
+                })
+                .collect();
+            for (from, to, report) in &mut sent {
+                edit(*from, *to, report);
+                if !lost(*from, *to) {
+                    self.contact(*to).receive(report.clone());
+                }
+            }
+            sent
+        }
+
+        /// One report period on, on the TAI clock and the monotonic one.
+        async fn advance(clock: &Clock) {
+            clock.add(Duration::from_millis(2));
+            tokio::time::advance(Duration::from_millis(2)).await;
+        }
+    }
+
+    fn records(r: &Report) -> usize {
+        r.own.pages.len()
+            + (r.heard.iter())
+                .filter_map(|h| h.own.as_ref())
+                .map(|o| o.pages.len())
+                .sum::<usize>()
+    }
+
+    /// A receiver fed by senders that carry each page record until it
+    /// confirms it holds the same page book and the same copies, and
+    /// decides the same, as one in a set reporting as before: every
+    /// record in every report, copies keeping theirs and relaying them.
+    /// Through lost reports, a lost echo, and a voter it hears only
+    /// through a relay. The trimmed reports carry no record once every
+    /// one is confirmed.
+    #[tokio::test(start_paused = true)]
+    async fn a_receiver_holds_the_same_whether_records_are_trimmed_or_all_sent() {
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(T0),
+            step: AtomicU64::new(0),
+        });
+        let all = Net::new(&clock, true);
+        let trimmed = Net::new(&clock, false);
+        let lost = |round: u64, from: NodeId, to: NodeId| {
+            (from == 1 && to == 2 && (5..8).contains(&round))
+                || (from == 2 && to == 1 && round == 12)
+                || (from == 3 && to == 2 && (20..40).contains(&round))
+        };
+        let mut steady = 0;
+        for round in 0..60u64 {
+            for net in [&all, &trimmed] {
+                if round % 5 == 0 {
+                    net.nodes[&1].1.page(round / 5);
+                    net.nodes[&3].1.page(100 + round / 5);
+                }
+            }
+            all.period(|f, t| lost(round, f, t));
+            let sent = trimmed.period(|f, t| lost(round, f, t));
+            Net::advance(&clock).await;
+            assert_eq!(
+                all.contact(2).pages_and_copies(),
+                trimmed.contact(2).pages_and_copies(),
+                "round {round}"
+            );
+            if round == 39 {
+                // While 3 did not reach 2, its records came through 1.
+                let newest = trimmed.contact(2).latest_pages(3);
+                assert!(newest.iter().any(|p| p.page == 107), "{newest:?}");
+            }
+            // Confirmed two periods after a record is first carried, three
+            // when relayed; the record of round 5 waits out its lost
+            // reports. While 2 does not hear 3, 1 relays 3's newest whole.
+            if round % 5 == 4 && round != 9 {
+                let to_2 = &sent.iter().find(|(f, t, _)| (*f, *t) == (1, 2)).unwrap().2;
+                let carried = if (21..=41).contains(&round) {
+                    to_2.own.pages.len()
+                } else {
+                    records(to_2)
+                };
+                assert_eq!(carried, 0, "round {round}: all confirmed");
+                steady += 1;
+            }
+        }
+        assert!(steady > 5);
+        assert_eq!(all.contact(2).decisions(1), trimmed.contact(2).decisions(1));
+    }
+
+    /// A record is carried in every report from the first that carries
+    /// it, the lost ones too, until the addressee echoes one of them.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_is_carried_until_a_report_with_it_is_echoed() {
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(T0),
+            step: AtomicU64::new(0),
+        });
+        let net = Net::new(&clock, false);
+        for _ in 0..3 {
+            net.period(|_, _| false);
+            Net::advance(&clock).await;
+        }
+        net.nodes[&1].1.page(7);
+        let to_2 = |sent: &[(NodeId, NodeId, Report)]| {
+            records(&sent.iter().find(|(f, t, _)| (*f, *t) == (1, 2)).unwrap().2)
+        };
+        // Its first two reports to 2 are lost, and 2 echoes older ones.
+        for _ in 0..2 {
+            let sent = net.period(|f, t| (f, t) == (1, 2));
+            assert_eq!(to_2(&sent), 2, "both outputs' records, until confirmed");
+            Net::advance(&clock).await;
+        }
+        let sent = net.period(|_, _| false);
+        assert_eq!(to_2(&sent), 2, "carried again: no echo of a report with it");
+        Net::advance(&clock).await;
+        // 2's report echoing it arrives after 1 built this one.
+        let sent = net.period(|_, _| false);
+        assert_eq!(to_2(&sent), 2, "its echo is on the way");
+        Net::advance(&clock).await;
+        let sent = net.period(|_, _| false);
+        assert_eq!(to_2(&sent), 0, "confirmed");
+        assert!(net.contact(2).latest_pages(1).iter().any(|p| p.page == 7));
+    }
+
+    /// An addressee restarted with no record is sent every one again,
+    /// each rule alone: a sequence number of another process, a report
+    /// with no echo, an echo of no report the sender sent, and a silence
+    /// longer than w.
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_addressee_is_sent_every_record_again() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Case {
+            OtherProcess,
+            NoEcho,
+            UnknownEcho,
+            Silent,
+        }
+        use Case::*;
+        for case in [OtherProcess, NoEcho, UnknownEcho, Silent] {
+            let clock = Arc::new(Clock {
+                now: AtomicU64::new(T0),
+                step: AtomicU64::new(0),
+            });
+            let mut net = Net::new(&clock, false);
+            net.nodes[&1].1.page(1);
+            net.nodes[&1].1.page(2);
+            let mut last_seq = 0;
+            for _ in 0..10 {
+                let sent = net.period(|_, _| false);
+                last_seq = sent.iter().find(|(f, _, _)| *f == 2).unwrap().2.seq;
+                Net::advance(&clock).await;
+            }
+            assert_eq!(net.contact(1).carried_len(2), 4, "{case:?}: confirmed");
+            // Each case but one goes on with 2's sequence numbers, and
+            // all but `Silent` report to 1 within w of the last report.
+            net.restart(
+                2,
+                if case == OtherProcess {
+                    1 << 40
+                } else {
+                    last_seq
+                },
+            );
+            let from_2 = |f: NodeId, t: NodeId| (f, t) == (2, 1);
+            match case {
+                // Its first report is lost: its next one echoes a report
+                // of 1's it took, under a sequence number of its own.
+                OtherProcess => {
+                    net.period(from_2);
+                }
+                // Its first report reaches 1 and echoes nothing.
+                NoEcho => {}
+                // Its first report is lost, its next one echoes a report
+                // 1 never sent.
+                UnknownEcho => {
+                    net.period(from_2);
+                    Net::advance(&clock).await;
+                    net.period_with(
+                        |_, _| false,
+                        |f, t, r| {
+                            if (f, t) == (2, 1) {
+                                r.echo.as_mut().unwrap().seq = 1;
+                            }
+                        },
+                    );
+                }
+                // Nothing of it reaches 1 for longer than w.
+                Silent => {
+                    for _ in 0..5 {
+                        net.period(|f, _| f == 2);
+                        Net::advance(&clock).await;
+                    }
+                }
+            }
+            Net::advance(&clock).await;
+            for _ in 0..3 {
+                net.period(|_, _| false);
+                Net::advance(&clock).await;
+            }
+            let sorted = |mut pages: Vec<Page>| {
+                pages.sort_by_key(|p| (p.output, p.page));
+                pages
+            };
+            assert_eq!(
+                sorted(net.contact(2).latest_pages(1)),
+                sorted(net.nodes[&1].1.pages.lock().unwrap().clone()),
+                "{case:?}"
+            );
+        }
+    }
+
+    /// A confirmed record that changes is a new record: carried again
+    /// until confirmed, and the addressee holds the new one.
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmed_record_that_changes_is_sent_again() {
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(T0),
+            step: AtomicU64::new(0),
+        });
+        let net = Net::new(&clock, false);
+        net.nodes[&1].1.page(1);
+        for _ in 0..5 {
+            net.period(|_, _| false);
+            Net::advance(&clock).await;
+        }
+        let to_2 = |sent: &[(NodeId, NodeId, Report)]| {
+            records(&sent.iter().find(|(f, t, _)| (*f, *t) == (1, 2)).unwrap().2)
+        };
+        assert_eq!(to_2(&net.period(|_, _| false)), 0, "confirmed");
+        Net::advance(&clock).await;
+        net.nodes[&1].1.rehash(1);
+        assert_eq!(
+            to_2(&net.period(|_, _| false)),
+            2,
+            "both outputs' changed records"
+        );
+        Net::advance(&clock).await;
+        let held = net.contact(2).latest_pages(1);
+        assert_eq!(
+            held,
+            *net.nodes[&1].1.pages.lock().unwrap(),
+            "the changed ones"
+        );
+    }
+
+    /// A record relayed in copies the addressee dropped for a newer
+    /// direct report, and confirmed with them, still reaches the
+    /// addressee when the direct link has failed: that newer direct report
+    /// was built before the record, and the relayer sends a voter's newest
+    /// records whole while the addressee hears it no more.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_in_a_dropped_relay_reaches_the_addressee_once_its_link_fails() {
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(T0),
+            step: AtomicU64::new(0),
+        });
+        let net = Net::new(&clock, false);
+        for _ in 0..5 {
+            net.period(|_, _| false);
+            Net::advance(&clock).await;
+        }
+        // From here on 3 does not reach 2; one report of 3's, built
+        // before page 9, is held back.
+        let cut = |f: NodeId, t: NodeId| (f, t) == (3, 2);
+        let sent = net.period(cut);
+        let late = sent
+            .into_iter()
+            .find(|(f, t, _)| (*f, *t) == (3, 2))
+            .unwrap()
+            .2;
+        Net::advance(&clock).await;
+        net.nodes[&3].1.page(9);
+        // 1 takes page 9 from 3.
+        net.period(cut);
+        Net::advance(&clock).await;
+        // 1's first report relaying it is lost.
+        let sent = net.period(|f, t| cut(f, t) || (f, t) == (1, 2));
+        let relayed = |sent: &[(NodeId, NodeId, Report)]| {
+            let r = &sent.iter().find(|(f, t, _)| (*f, *t) == (1, 2)).unwrap().2;
+            let h = r.heard.iter().find(|h| h.node == 3).unwrap();
+            h.own.as_ref().unwrap().pages.iter().any(|p| p.page == 9)
+        };
+        assert!(relayed(&sent));
+        Net::advance(&clock).await;
+        // The held-back report reaches 2 now: newer than the copies 1
+        // relays next, which 2 drops.
+        net.contact(2).receive(late);
+        for _ in 0..2 {
+            let sent = net.period(cut);
+            assert!(relayed(&sent), "carried until 2 echoes one");
+            Net::advance(&clock).await;
+        }
+        let sent = net.period(cut);
+        assert!(!relayed(&sent), "confirmed");
+        Net::advance(&clock).await;
+        assert!(
+            !net.contact(2).latest_pages(3).iter().any(|p| p.page == 9),
+            "2 dropped every copy with page 9"
+        );
+        for _ in 0..8 {
+            net.period(cut);
+            Net::advance(&clock).await;
+        }
+        let held = net.contact(2).latest_pages(3);
+        assert!(held.iter().any(|p| p.page == 9), "{held:?}");
+    }
+
+    /// What a sender holds per addressee is bounded by one report's
+    /// records, however many pages pass, and whether or not it hears it.
+    #[tokio::test(start_paused = true)]
+    async fn the_records_held_per_addressee_are_bounded() {
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(T0),
+            step: AtomicU64::new(0),
+        });
+        let net = Net::new(&clock, false);
+        // Its own records and those it relays of 3, two outputs each.
+        let bound = 2 * 2 * PAGES_REPORTED;
+        for round in 0..300u64 {
+            net.nodes[&1].1.page(round);
+            net.nodes[&3].1.page(round);
+            net.period(|f, _| f == 2 && (100..200).contains(&round));
+            Net::advance(&clock).await;
+            let held = net.contact(1).carried_len(2);
+            assert!(held <= bound, "round {round}: {held} records held");
+        }
     }
 }

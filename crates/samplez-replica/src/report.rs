@@ -4,6 +4,8 @@
 //! last heard from every other voter (one relay hop) and the entries it
 //! lists for the addressee.
 
+use std::collections::BTreeMap;
+
 use samplez::blocks::{BlockStatus, Range, Standing};
 use serde::{Deserialize, Serialize};
 
@@ -189,6 +191,70 @@ pub struct Page {
     pub digest: Option<u64>,
 }
 
+/// The page records one addressee confirmed. A voter folds every record
+/// of a report it takes, so a record is carried to the addressee from the
+/// first report carrying it until the addressee echoes that report or a
+/// later one, and not after; a record of the same page that differs from
+/// the one confirmed is a new one.
+#[derive(Debug, Default)]
+pub(crate) struct Carried {
+    /// By (voter, output, page): the record carried, and the first report
+    /// that carried it, none once confirmed.
+    records: BTreeMap<(NodeId, u32, u64), (Page, Option<u64>)>,
+    /// Records looked up in `records`, counted for the tests.
+    #[cfg(test)]
+    lookups: usize,
+}
+
+impl Carried {
+    /// Of the records `offered` per voter, those report `seq` carries:
+    /// every one not confirmed. Forgets the records not offered, so it
+    /// holds no more than one report offers.
+    pub(crate) fn carry(&mut self, seq: u64, offered: &[(NodeId, Vec<Page>)]) -> Vec<Vec<Page>> {
+        // Rebuilt from the records offered, one lookup each: a record not
+        // offered is left behind.
+        let mut held = std::mem::take(&mut self.records);
+        offered
+            .iter()
+            .map(|(node, pages)| {
+                pages
+                    .iter()
+                    .filter(|&&p| {
+                        let key = (*node, p.output, p.page);
+                        #[cfg(test)]
+                        {
+                            self.lookups += 1;
+                        }
+                        let record = match held.remove(&key) {
+                            Some((was, first)) if was == p => (p, first),
+                            _ => (p, Some(seq)),
+                        };
+                        self.records.insert(key, record);
+                        record.1.is_some()
+                    })
+                    .copied()
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The addressee echoed report `seq`: it took every record carried
+    /// from that report or an earlier one on.
+    pub(crate) fn echoed(&mut self, seq: u64) {
+        for (_, first) in self.records.values_mut() {
+            if first.is_some_and(|f| f <= seq) {
+                *first = None;
+            }
+        }
+    }
+
+    /// The records held, confirmed or not.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
+    }
+}
+
 /// [`Page::digest`] over the digests of a page's blocks, in block order.
 pub fn page_digest(digests: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
     let mut h = xxhash_rust::xxh3::Xxh3Default::new();
@@ -347,6 +413,71 @@ mod tests {
         }
         assert_eq!(status_of(&r, 12), None, "a block without a status");
         assert_eq!(status_of(&r, 15), None);
+    }
+
+    fn page(output: u32, page: u64) -> Page {
+        Page {
+            output,
+            page,
+            hash: page,
+            fingerprint: 0,
+            committed: true,
+            degraded: false,
+            digest: None,
+        }
+    }
+
+    /// A record is carried from the report first offering it until a
+    /// report at or after that one is echoed, and forgotten once no
+    /// report offers it.
+    #[test]
+    fn a_record_is_carried_until_echoed_and_forgotten_once_not_offered() {
+        let mut c = Carried::default();
+        let offer = |pages: Vec<Page>| vec![(1, pages), (3, vec![page(0, 9)])];
+        assert_eq!(
+            c.carry(10, &offer(vec![page(0, 1)])),
+            [vec![page(0, 1)], vec![page(0, 9)]]
+        );
+        c.echoed(9);
+        let two = offer(vec![page(0, 1), page(0, 2)]);
+        assert_eq!(
+            c.carry(11, &two),
+            [vec![page(0, 1), page(0, 2)], vec![page(0, 9)]]
+        );
+        c.echoed(10);
+        assert_eq!(c.carry(12, &two), [vec![page(0, 2)], vec![]]);
+        c.echoed(12);
+        assert_eq!(c.carry(13, &two), [vec![], vec![]]);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.carry(14, &offer(vec![page(0, 2)])), [vec![], vec![]]);
+        assert_eq!(c.len(), 2, "page 1 is offered no more");
+    }
+
+    /// At the most outputs a set can have and three voters, a period
+    /// looks up each record offered once and holds no more than it
+    /// offered, the records of a period before included.
+    #[test]
+    fn a_period_looks_up_each_offered_record_once() {
+        let offer = |first: u64| -> Vec<(NodeId, Vec<Page>)> {
+            (1..=2)
+                .map(|node| {
+                    let outputs = samplez::config::MAX_OUTPUTS as u32;
+                    let pages = (0..outputs)
+                        .flat_map(|o| (first..first + 4).map(move |p| page(o, p)))
+                        .collect();
+                    (node, pages)
+                })
+                .collect()
+        };
+        let records = 2 * samplez::config::MAX_OUTPUTS * 4;
+        let mut c = Carried::default();
+        for period in 0..10 {
+            c.lookups = 0;
+            c.carry(period, &offer(period));
+            c.echoed(period);
+            assert_eq!(c.lookups, records, "period {period}");
+            assert_eq!(c.len(), records, "period {period}");
+        }
     }
 
     #[test]

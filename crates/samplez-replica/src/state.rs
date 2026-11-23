@@ -59,7 +59,7 @@ impl ReplicaState {
 pub(crate) const PAGES_KEPT: usize = 64;
 
 /// The page hashes every voter reported, by voter, output and page.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct PageBook {
     pages: BTreeMap<(NodeId, u32), BTreeMap<u64, Page>>,
 }
@@ -82,6 +82,15 @@ impl PageBook {
 
     pub fn get(&self, node: NodeId, output: u32, page: u64) -> Option<&Page> {
         self.of(node, output)?.get(&page)
+    }
+
+    /// The newest `n` pages of each output `node` reported, oldest first
+    /// per output.
+    pub fn latest(&self, node: NodeId, n: usize) -> Vec<Page> {
+        self.pages
+            .range((node, 0)..=(node, u32::MAX))
+            .flat_map(|(_, held)| held.values().skip(held.len().saturating_sub(n)).copied())
+            .collect()
     }
 
     /// The newest page `node` reported of `output`.
