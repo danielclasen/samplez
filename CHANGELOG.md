@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.27.0](https://github.com/danielclasen/samplez/compare/v0.26.1...v0.27.0) (2026-11-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** return a typed error from the replica's API
+* **replica:** let the link and contact counters grow without a break
+* **dsp:** peer::LinkCounts and contact::CostCounts are #[non_exhaustive]; build a LinkCounts with LinkCounts::new(node).
+
+### Features
+
+* **replica:** let the link and contact counters grow without a break ([102e8b6](https://github.com/danielclasen/samplez/commit/102e8b6e1eae90b5425fc55eacf11aa3fbbbde40))
+* **replica:** return a typed error from the replica's API ([102e8b6](https://github.com/danielclasen/samplez/commit/102e8b6e1eae90b5425fc55eacf11aa3fbbbde40))
+
+
+### Bug Fixes
+
+* **dsp:** refuse parameters with a typed error that allocates nothing ([102e8b6](https://github.com/danielclasen/samplez/commit/102e8b6e1eae90b5425fc55eacf11aa3fbbbde40))
+
 ## [0.26.1](https://github.com/danielclasen/samplez/compare/v0.26.0...v0.26.1) (2026-11-23)
 
 

@@ -2458,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "samplez"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "gungraun",
  "libc",
@@ -2473,7 +2473,7 @@ dependencies = [
 
 [[package]]
 name = "samplez-dsp"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "gungraun",
  "libm",
@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "samplez-mxl"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "gungraun",
  "mxl",
@@ -2493,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "samplez-nmos"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "axum",
  "hickory-resolver",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "samplez-replica"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2539,7 +2539,7 @@ dependencies = [
 
 [[package]]
 name = "samplez-service"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
