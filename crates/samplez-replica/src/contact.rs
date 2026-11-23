@@ -904,6 +904,7 @@ fn add_cpu(to: &AtomicU64, since: Duration) {
 /// The contact loop's cost so far: the report periods it ran, and the
 /// CPU time of the threads running each part of it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CostCounts {
     pub ticks: u64,
     /// [`Contact::tick`]: the period's state and the reports to send.

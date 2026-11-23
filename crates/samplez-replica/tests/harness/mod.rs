@@ -1541,10 +1541,7 @@ impl PeerClient for Peers {
                 && let Some(to) = to
             {
                 let mut counts = self.counts.lock().unwrap();
-                let counted = counts.entry(to).or_insert(LinkCounts {
-                    node: to,
-                    ..LinkCounts::default()
-                });
+                let counted = counts.entry(to).or_insert(LinkCounts::new(to));
                 counted.report_timeouts += 1;
             }
             reply

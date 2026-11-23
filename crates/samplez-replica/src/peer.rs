@@ -144,6 +144,7 @@ pub const ROUND_TRIP_BOUNDS: [f64; 5] = [0.0005, 0.001, 0.002, 0.004, 0.008];
 /// What a [`PeerClient`] counted of its exchanges with one peer while it
 /// is a member.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LinkCounts {
     pub node: NodeId,
     /// Reports that got no answer within their time, the contact window.
@@ -165,6 +166,15 @@ pub struct LinkCounts {
 }
 
 impl LinkCounts {
+    /// No exchange counted yet with peer `node`.
+    #[must_use]
+    pub fn new(node: NodeId) -> LinkCounts {
+        LinkCounts {
+            node,
+            ..LinkCounts::default()
+        }
+    }
+
     /// Counts an answered report by its round trip.
     pub fn answered(&mut self, round_trip: Duration) {
         let s = round_trip.as_secs_f64();
