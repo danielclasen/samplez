@@ -155,17 +155,23 @@ pub enum StripParam {
 pub enum ParamError {
     /// The value named is outside `lo..=hi`, or not a number.
     Outside {
+        /// What the value sets, as the message names it.
         what: &'static str,
         value: f32,
+        /// The range's ends.
         lo: f32,
         hi: f32,
     },
     /// No leg `leg` on a strip of `legs`.
     NoLeg {
+        /// The leg asked for.
         leg: usize,
+        /// The legs the strip has.
         legs: usize,
     },
+    /// No equaliser band of this index.
     NoBand(usize),
+    /// No duck key of this index.
     NoKey(usize),
     /// A key of this many legs, not 1 to [`MAX_LEGS`].
     KeyLegs(usize),

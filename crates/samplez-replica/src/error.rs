@@ -31,10 +31,12 @@ pub enum Error {
     ContactRunning,
     /// A count of voters that is not odd, or not one the node ids hold.
     VoterCount { replicas: u16, witness: bool },
-    /// The store, or the random source, could not be read.
+    /// The store, or the random source, could not be read. Displays as
+    /// the I/O error, which is therefore not also its source.
     Io(io::Error),
     /// openraft refused the configuration, did not start, or did not
-    /// initialize the set.
+    /// initialize the set. Displays as openraft's error, which is
+    /// therefore not also its source.
     Raft(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -79,15 +81,9 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Io(e) => Some(e),
-            Error::Raft(e) => Some(e.as_ref()),
-            _ => None,
-        }
-    }
-}
+// No source: the variants that wrap an error display it, so a printer
+// walking the chain would print it twice.
+impl std::error::Error for Error {}
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Error {

@@ -480,6 +480,33 @@ mod error_messages {
     }
 
     #[test]
+    fn fixed_refusals_say_what_they_are() {
+        assert_eq!(
+            Error::ProductOwnsInputs.to_string(),
+            "the product owns the inputs' flows"
+        );
+    }
+
+    /// An error that wraps another prints it once down its chain: as its
+    /// own message, not again as its source.
+    #[test]
+    fn a_wrapped_error_prints_once_down_the_chain() {
+        use std::error::Error as _;
+        for e in [
+            Error::Io(std::io::Error::other("disk gone")),
+            Error::raft(std::io::Error::other("raft gone")),
+        ] {
+            let mut chain = vec![e.to_string()];
+            let mut source = e.source();
+            while let Some(s) = source {
+                chain.push(s.to_string());
+                source = s.source();
+            }
+            assert_eq!(chain.len(), 1, "{chain:?}");
+        }
+    }
+
+    #[test]
     fn another_ramp_or_block_names_both() {
         let limits = Limits::defaults(48_000);
         let e = check_ramp_config(&limits, Some((7, 96)))
