@@ -823,6 +823,9 @@ struct State {
     /// Offers of page records built, counted for the tests.
     #[cfg(test)]
     offers_built: u64,
+    /// Every period builds its offers, none taken from the last one.
+    #[cfg(test)]
+    offer_cache_off: bool,
     decider: crate::decide::Decider,
     liveness: crate::liveness::Liveness,
     /// The audio `/readyz` term, as of the last period in contact or, out
@@ -1228,6 +1231,8 @@ impl Contact {
                     page_generation: 0,
                     #[cfg(test)]
                     offers_built: 0,
+                    #[cfg(test)]
+                    offer_cache_off: false,
                     decider: crate::decide::Decider::default(),
                     liveness: crate::liveness::Liveness::default(),
                     serving: None,
@@ -1622,6 +1627,9 @@ impl Contact {
                 let lag = tai.saturating_sub(self.timing.block_deadline(k));
                 st.counts.status_lag.add(lag);
             }
+            // Its offer is its own latest records: a change to them, one
+            // dropped included, is a new generation.
+            let own_pages_changed = sample.own.pages != st.own.pages;
             st.own = sample.own;
             st.own_at = now;
             st.status_changes_lost = sample.status_changes_lost;
@@ -1631,7 +1639,7 @@ impl Contact {
             st.enabled = sample.enabled;
             st.generation_ready = sample.generation_ready;
             st.clock_steps = sample.clock_steps;
-            if st.pages.fold(self.id, &st.own.pages) {
+            if st.pages.fold(self.id, &st.own.pages) | own_pages_changed {
                 st.page_generation += 1;
                 (st.page_generations).insert(self.id, st.page_generation);
             }
@@ -1818,7 +1826,10 @@ impl Contact {
             if !heard_within_w {
                 *carried = Carried::default();
             }
-            let carry = match carried.unchanged(&offer) {
+            let cached = carried.unchanged(&offer);
+            #[cfg(test)]
+            let cached = cached.filter(|_| !st.offer_cache_off);
+            let carry = match cached {
                 Some(carry) => carry,
                 None => {
                     #[cfg(test)]
@@ -3394,6 +3405,11 @@ impl Contact {
     }
 
     #[cfg(test)]
+    pub(crate) fn rebuild_every_offer(&self) {
+        self.lock().offer_cache_off = true;
+    }
+
+    #[cfg(test)]
     pub(crate) fn offers_built(&self) -> u64 {
         self.lock().offers_built
     }
@@ -4576,6 +4592,13 @@ mod tests {
     }
 
     impl Engine {
+        /// Page `page` of output 0 is no longer reported, and no other
+        /// comes in its place.
+        fn drop_page(&self, page: u64) {
+            let mut pages = self.pages.lock().unwrap();
+            pages.retain(|p| (p.output, p.page) != (0, page));
+        }
+
         /// Page `page`'s records get another hash.
         fn rehash(&self, page: u64) {
             for p in self.pages.lock().unwrap().iter_mut() {
@@ -8474,6 +8497,56 @@ mod tests {
             built + 2,
             "one per addressee, its confirmation building none"
         );
+    }
+
+    /// A set whose offers come from the last period's, where nothing
+    /// changed, sends exactly the reports of one building every offer
+    /// anew: over new records on two voters, a sender's record dropped
+    /// with nothing newer while an addressee has not confirmed it, lost
+    /// reports and echoes confirming records to one addressee and not
+    /// yet to the other.
+    #[tokio::test(start_paused = true)]
+    async fn offers_from_the_last_period_carry_what_a_rebuild_does() {
+        let clock = Arc::new(Clock {
+            now: AtomicU64::new(T0),
+            step: AtomicU64::new(0),
+        });
+        let cached = Net::new(&clock, false);
+        let rebuilt = Net::new(&clock, false);
+        for id in 1..=3 {
+            rebuilt.contact(id).rebuild_every_offer();
+        }
+        let lost = |round: u64, from: NodeId, to: NodeId| {
+            (from == 2 && to == 1 && (8..11).contains(&round))
+                || (from == 1 && to == 3 && (round % 7 == 3 || (20..35).contains(&round)))
+                || (from == 3 && to == 1 && (40..43).contains(&round))
+        };
+        let pages = |r: &Report| {
+            let relayed = r
+                .heard
+                .iter()
+                .map(|h| h.own.as_ref().map(|o| o.pages.clone()));
+            (r.own.pages.clone(), relayed.collect::<Vec<_>>())
+        };
+        for round in 0..60u64 {
+            for net in [&cached, &rebuilt] {
+                match round {
+                    r if r % 9 == 0 => net.nodes[&1].1.page(r / 9),
+                    r if r % 11 == 5 => net.nodes[&3].1.page(100 + r / 11),
+                    // Page 3, new at round 27, which 3 cannot confirm yet.
+                    28 => net.nodes[&1].1.drop_page(3),
+                    _ => {}
+                }
+            }
+            let a = cached.period(|f, t| lost(round, f, t));
+            let b = rebuilt.period(|f, t| lost(round, f, t));
+            Net::advance(&clock).await;
+            for ((fa, ta, ra), (fb, tb, rb)) in a.iter().zip(&b) {
+                assert_eq!((fa, ta), (fb, tb));
+                assert_eq!(pages(ra), pages(rb), "round {round}: {fa} to {ta}");
+            }
+        }
+        assert!(cached.contact(1).offers_built() < rebuilt.contact(1).offers_built());
     }
 
     /// What a sender holds per addressee is bounded by one report's
