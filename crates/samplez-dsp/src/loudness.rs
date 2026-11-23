@@ -34,10 +34,22 @@ const BLOCK: usize = 40;
 const SHORT: usize = 300;
 
 /// Lowest histogram edge: the power at -70 LKFS, 10^((-70 + 0.691) / 10).
+#[allow(
+    clippy::unreadable_literal,
+    reason = "the value as computed, to compare"
+)]
 const P_ABS: f64 = 1.1724653045822964e-07;
 /// Ratio of consecutive edges: 10^(0.01 / 10), a 0.01 LU bin.
+#[allow(
+    clippy::unreadable_literal,
+    reason = "the value as computed, to compare"
+)]
 const STEP: f64 = 1.0023052380778996;
 /// Square root of [`STEP`]: the centre of a bin over its lower edge.
+#[allow(
+    clippy::unreadable_literal,
+    reason = "the value as computed, to compare"
+)]
 const HALF_STEP: f64 = 1.001151955538169;
 /// Bins from -70 to +20 LKFS. Powers at or above +20 LKFS go into the
 /// last bin.

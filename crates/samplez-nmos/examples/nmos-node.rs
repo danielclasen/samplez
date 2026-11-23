@@ -67,14 +67,14 @@ fn args() -> Args {
             "--bind" => {
                 a.bind = value
                     .parse()
-                    .unwrap_or_else(|e| usage(&format!("--bind: {e}")))
+                    .unwrap_or_else(|e| usage(&format!("--bind: {e}")));
             }
             "--advertise-host" => a.advertise_host = value,
             "--seed" => a.seed = value,
             "--domain" => {
                 a.domain = value
                     .parse()
-                    .unwrap_or_else(|e| usage(&format!("--domain: {e}")))
+                    .unwrap_or_else(|e| usage(&format!("--domain: {e}")));
             }
             "--registry" => a.registries.push(value),
             "--dns-sd-domain" => a.dns_sd_domain = Some(value),

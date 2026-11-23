@@ -22,21 +22,23 @@ impl Tai {
 
     pub fn from_nanos(nanos: u128) -> Tai {
         Tai {
-            sec: (nanos / NANOS as u128) as u64,
-            nsec: (nanos % NANOS as u128) as u32,
+            sec: (nanos / u128::from(NANOS)) as u64,
+            nsec: (nanos % u128::from(NANOS)) as u32,
         }
     }
 
     pub fn as_nanos(self) -> u128 {
-        self.sec as u128 * NANOS as u128 + self.nsec as u128
+        u128::from(self.sec) * u128::from(NANOS) + u128::from(self.nsec)
     }
 
     /// The next representable time, one nanosecond later.
+    #[must_use]
     pub fn next(self) -> Tai {
         Tai::from_nanos(self.as_nanos() + 1)
     }
 
     /// `self + d`; panics past the last representable time.
+    #[must_use]
     pub fn after(self, d: Duration) -> Tai {
         self.checked_after(d)
             .expect("a TAI time past u64::MAX seconds")
@@ -45,13 +47,16 @@ impl Tai {
     /// `self + d`, `None` past the last representable time.
     pub fn checked_after(self, d: Duration) -> Option<Tai> {
         let n = self.as_nanos() + d.as_nanos();
-        (n / NANOS as u128 <= u64::MAX as u128).then(|| Tai::from_nanos(n))
+        (n / u128::from(NANOS) <= u128::from(u64::MAX)).then(|| Tai::from_nanos(n))
     }
 
     /// `self - earlier`, zero when `earlier` is not earlier.
     pub fn since(self, earlier: Tai) -> Duration {
         let n = self.as_nanos().saturating_sub(earlier.as_nanos());
-        Duration::new((n / NANOS as u128) as u64, (n % NANOS as u128) as u32)
+        Duration::new(
+            (n / u128::from(NANOS)) as u64,
+            (n % u128::from(NANOS)) as u32,
+        )
     }
 }
 
@@ -73,7 +78,7 @@ impl FromStr for Tai {
         }
         let sec = sec.parse::<u64>().map_err(|_| ())?;
         let nsec = nsec.parse::<u32>().map_err(|_| ())?;
-        if nsec as u64 >= NANOS {
+        if u64::from(nsec) >= NANOS {
             return Err(());
         }
         Ok(Tai { sec, nsec })
@@ -131,10 +136,10 @@ impl TaiClock for SystemTai {
             };
             // SAFETY: `ts` is writable; both clocks exist on Linux.
             unsafe { libc::clock_gettime(clock, &mut ts) };
-            ts.tv_sec as i128 * NANOS as i128 + ts.tv_nsec as i128
+            i128::from(ts.tv_sec) * i128::from(NANOS) + i128::from(ts.tv_nsec)
         };
         let ns = read(libc::CLOCK_TAI) - read(libc::CLOCK_REALTIME);
-        Some(((ns + NANOS as i128 / 2).div_euclid(NANOS as i128)) as i64)
+        Some(((ns + i128::from(NANOS) / 2).div_euclid(i128::from(NANOS))) as i64)
     }
 }
 

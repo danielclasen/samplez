@@ -1137,7 +1137,7 @@ where
             }
             let paused_since = paused.map(|(since, _)| since);
             let out: Vec<Message> = tokio::select! {
-                _ = tokio::time::sleep_until(paused.map_or_else(Instant::now, |(_, end)| end)),
+                () = tokio::time::sleep_until(paused.map_or_else(Instant::now, |(_, end)| end)),
                     if paused.is_some() =>
                 {
                     return Ended::Failed;
@@ -1389,7 +1389,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(sessions.live().is_empty(), "the pause ended");
 
-        sessions.resumed(&owner, answered + Duration::from_millis(2000));
+        sessions.resumed(&owner, answered + Duration::from_secs(2));
         assert_eq!(
             sessions.live(),
             std::slice::from_ref(&owner),

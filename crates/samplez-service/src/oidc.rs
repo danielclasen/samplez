@@ -44,14 +44,14 @@ pub const PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(15);
 /// The longest answer read from the provider.
 pub const MAX_BODY: usize = 1 << 20;
 /// How long a session lasts without `sessionTtl`.
-pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_hours(8);
 /// The shortest `sessionTtl`, in seconds.
 pub const MIN_SESSION_TTL: u64 = 60;
 /// The longest `sessionTtl`, in seconds.
 pub const MAX_SESSION_TTL: u64 = 7 * 86_400;
 /// How long a sign-in may take from the redirect to the provider to the
 /// callback.
-pub const LOGIN_TTL: Duration = Duration::from_secs(600);
+pub const LOGIN_TTL: Duration = Duration::from_mins(10);
 /// Holds the state, nonce and PKCE verifier of a sign-in in progress.
 pub const LOGIN_COOKIE: &str = "samplez_login";
 pub(crate) const LOGIN_PATH: &str = "/api/v1/login";
@@ -205,9 +205,8 @@ fn check_signature(alg: &str, key: &Jwk, message: &[u8], sig: &[u8]) -> Result<(
 pub fn verify(token: &str, keys: &[Jwk], expect: &Expect, now: u64) -> Result<Value, Invalid> {
     let head = header(token)?;
     let mut parts = token.split('.');
-    let (h, p, s) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(h), Some(p), Some(s)) => (h, p, s),
-        _ => return Err(Invalid::Malformed),
+    let (Some(h), Some(p), Some(s)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(Invalid::Malformed);
     };
     let alg = head.alg.as_str();
     let (kty, crv) = algorithm(alg).ok_or(Invalid::Algorithm)?;
@@ -1002,7 +1001,7 @@ pub(crate) async fn callback(
     if let Some(error) = &query.error {
         let error: String = error
             .chars()
-            .filter(|c| c.is_ascii_graphic())
+            .filter(char::is_ascii_graphic)
             .take(64)
             .collect();
         return refuse(

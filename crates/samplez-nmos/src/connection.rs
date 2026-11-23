@@ -454,7 +454,7 @@ fn uuid_of(v: &Value, versions: &str) -> Option<Uuid> {
 }
 
 /// A staged MXL id: `null`, `auto` where `auto_ok`, or an MXL UUID
-/// (BCP-007-03 mxl_uuid.json) within `allowed` when that is given.
+/// (BCP-007-03 `mxl_uuid.json`) within `allowed` when that is given.
 fn param(
     name: &str,
     v: &Value,
@@ -505,7 +505,7 @@ fn parse(inner: &Inner, port: Port, body: &Value) -> Result<Request, (StatusCode
                 r.master_enable = Some(v.as_bool().ok_or((
                     StatusCode::BAD_REQUEST,
                     "master_enable must be a boolean".into(),
-                ))?)
+                ))?);
             }
             k if k == peer_key(port) => {
                 r.peer = Some(match v {
@@ -514,7 +514,7 @@ fn parse(inner: &Inner, port: Port, body: &Value) -> Result<Request, (StatusCode
                         StatusCode::BAD_REQUEST,
                         format!("{k} must be null or a UUID"),
                     ))?),
-                })
+                });
             }
             "transport_params" => {
                 let Some([leg]) = v.as_array().map(Vec::as_slice) else {
@@ -737,7 +737,7 @@ pub(crate) async fn patch(inner: &Arc<Inner>, port: Port, body: Value) -> Patche
             };
             let t: Tai = requested
                 .parse()
-                .map_err(|_| (StatusCode::BAD_REQUEST, "requested_time".to_string()))?;
+                .map_err(|()| (StatusCode::BAD_REQUEST, "requested_time".to_string()))?;
             let at = if mode == RELATIVE {
                 let after = inner
                     .clock
@@ -1024,9 +1024,8 @@ async fn sleep_until(inner: &Inner, at: Tai, lead: Duration) {
 }
 
 async fn bulk(inner: &Arc<Inner>, kind: &str, body: &[u8]) -> Response {
-    let items = match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Array(items)) => items,
-        _ => return error(StatusCode::BAD_REQUEST, "the body must be an array"),
+    let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(body) else {
+        return error(StatusCode::BAD_REQUEST, "the body must be an array");
     };
     let well_formed = |i: &Value| {
         i.as_object().is_some_and(|o| {

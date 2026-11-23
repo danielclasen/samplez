@@ -315,10 +315,10 @@ pub(crate) struct Life {
     /// The highest fill block counted, per output.
     fills_counted: Vec<u64>,
     /// The latest `Baseline` seen, once one was, by its replica and
-    /// at_index, with its key as last resolved.
+    /// `at_index`, with its key as last resolved.
     base_seen: Option<((NodeId, u64), Option<u64>)>,
     /// A `Baseline` without a key naming this replica, by its replica and
-    /// at_index, with this replica's key when it first saw it.
+    /// `at_index`, with this replica's key when it first saw it.
     keyless_naming: Option<((NodeId, u64), Option<u64>)>,
     /// An old-key filler from this P on: it fills through only, ranks
     /// below every replica with the baseline's key and never resumes.
@@ -591,7 +591,7 @@ impl Life {
         let withdrawn = standing().any(|(_, s)| matches!(s, Standing::Withdrawn { .. }));
         match self.state {
             ReplicaState::Committing if withdrawn || !committing => {
-                self.state = ReplicaState::Withdrawn
+                self.state = ReplicaState::Withdrawn;
             }
             // Handed over: committing once a commit start Resume named
             // on a matched page took.
@@ -618,7 +618,7 @@ impl Life {
                 self.matched = false;
             }
             ReplicaState::Withdrawn if committing && !withdrawn => {
-                self.state = ReplicaState::Committing
+                self.state = ReplicaState::Committing;
             }
             _ => {}
         }
@@ -626,7 +626,7 @@ impl Life {
 
     /// The Named rule: the latest applied `Baseline` names this replica,
     /// which is not committing and not excluded. It commits from P, the
-    /// first page boundary at or after the entry's at_index, when it knew
+    /// first page boundary at or after the entry's `at_index`, when it knew
     /// the entry before it processed the block holding P; else, or when
     /// named while starting, from its commit start once ready. A replica
     /// that withheld a block for a cause at or after P does not commit by

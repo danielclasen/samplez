@@ -182,6 +182,7 @@ impl Service {
     /// mode, the machine listener. The service adds `/session` on the API
     /// listener, `/login` and `/logout` in `token` and `oidc` mode, and
     /// `/login/callback` in `oidc` mode.
+    #[must_use]
     pub fn api(mut self, router: Router) -> Service {
         self.api = router;
         self
@@ -192,6 +193,7 @@ impl Service {
     /// reason in English, so a product answers it in the body its API
     /// defines. A 401 gets `WWW-Authenticate: Bearer` on top. Without it,
     /// the status alone.
+    #[must_use]
     pub fn refusal<F>(mut self, render: F) -> Service
     where
         F: Fn(StatusCode, &'static str) -> Response + Send + Sync + 'static,
@@ -203,6 +205,7 @@ impl Service {
     /// Served at `/` on the API listener with the `Host` check only, no
     /// authentication: the UI's static files and login page. Paths under
     /// `/api/v1` never reach it.
+    #[must_use]
     pub fn ui(mut self, router: Router) -> Service {
         self.ui = router;
         self
@@ -228,6 +231,7 @@ impl Service {
     /// new for every connection. The service logs no request URI, and the
     /// `Debug` output of [`Connect`] shows the session's [`Owner::handle`]
     /// in place of the session.
+    #[must_use]
     pub fn ws<F, Fut>(mut self, handler: F) -> Service
     where
         F: Fn(WebSocket, Connect) -> Fut + Send + Sync + 'static,
@@ -244,6 +248,7 @@ impl Service {
     /// bind address and a NetworkPolicy are what protect it. Controllers
     /// address the node by its advertised href under any name, which is why
     /// `Host` is not checked.
+    #[must_use]
     pub fn nmos(mut self, router: Router) -> Service {
         self.nmos = router;
         self
@@ -441,7 +446,7 @@ impl Bound {
     }
 
     pub fn machine_addr(&self) -> Option<io::Result<SocketAddr>> {
-        self.machine.as_ref().map(|l| l.local_addr())
+        self.machine.as_ref().map(Socket::local_addr)
     }
 
     pub fn ops_addr(&self) -> io::Result<SocketAddr> {

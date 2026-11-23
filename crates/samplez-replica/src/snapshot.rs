@@ -19,7 +19,7 @@ use crate::entry::{Baseline, Body, Disruption, NodeId, Request, SessionKey};
 pub struct Replicated {
     #[serde(with = "crate::entry::bytes")]
     pub product: Vec<u8>,
-    /// Entries the engine applies at a future at_index, and the decisions
+    /// Entries the engine applies at a future `at_index`, and the decisions
     /// on them (restamped, voided), by revision.
     pub pending: BTreeMap<u64, Body>,
     /// [`crate::state_machine::StateMachine::terms`].
@@ -334,9 +334,8 @@ impl TryFrom<Wire<Replicated>> for StoredSnapshot {
     type Error = String;
 
     fn try_from(wire: Wire<Replicated>) -> Result<StoredSnapshot, String> {
-        let state = match (wire.state, wire.flagged) {
-            (Some(state), None) | (None, Some(state)) => state,
-            _ => return Err("a snapshot holds one state, `state` or `flagged`".to_owned()),
+        let ((Some(state), None) | (None, Some(state))) = (wire.state, wire.flagged) else {
+            return Err("a snapshot holds one state, `state` or `flagged`".to_owned());
         };
         Ok(StoredSnapshot {
             id: wire.id,

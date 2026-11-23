@@ -432,7 +432,7 @@ async fn superseded_and_rolled_back_rollouts_follow_the_target() {
     let p = baseline(&set, a(1)).unwrap().at_index;
     // Rolled back to r1: a(0) at the target never takes over.
     set.set_target(Some("r1"));
-    sleep(Duration::from_millis(1000)).await;
+    sleep(Duration::from_secs(1)).await;
     let b = baseline(&set, a(1)).unwrap();
     assert_eq!((b.replica, b.key), (a(1), Some(3)), "the baseline moved");
     assert_eq!(b.versions, up(2));
@@ -791,7 +791,7 @@ async fn a_downgraded_pod_never_takes_over_while_a_newer_one_is_live() {
         state(&set, a(1)) == Some(ReplicaState::VersionMismatch)
     })
     .await;
-    sleep(Duration::from_millis(1000)).await;
+    sleep(Duration::from_secs(1)).await;
     let b = baseline(&set, a(0)).unwrap();
     assert_eq!((b.replica, b.key), (n, Some(2)), "the baseline moved");
     assert_eq!(state(&set, a(1)), Some(ReplicaState::VersionMismatch));

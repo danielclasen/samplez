@@ -866,7 +866,7 @@ fn a_long_missing_flow_is_looked_up_at_the_backoff_pace() {
     let slow = lookups_until(&mut p, 300, 600);
     assert!((5..=7).contains(&slow), "{slow} lookups from 30 s to 60 s");
 
-    p.want_at(t0 + Duration::from_millis(60_000));
+    p.want_at(t0 + Duration::from_mins(1));
     let wanted = lookups_until(&mut p, 600, 700);
     assert!(
         (90..=101).contains(&wanted),

@@ -28,7 +28,7 @@ use crate::{Error, Instance, MxlApi, Result, Status, check, id_cstring};
 #[deprecated(note = "only the deprecated `Input::identify` probes")]
 pub const FROZEN_PROBE_BLOCKS: u32 = 10;
 
-/// The x86_64 base page size. A larger page is touched more than once.
+/// The `x86_64` base page size. A larger page is touched more than once.
 const PAGE: usize = 4096;
 
 /// How long a polled head must keep advancing before the input is added
@@ -148,6 +148,13 @@ unsafe impl Send for FlowReader {}
 // Instance::releaseReader at lib/internal/src/Instance.cpp:142), is made
 // only in Drop, which has the reader to itself.
 unsafe impl Sync for FlowReader {}
+
+// A generation shared between the RT thread and the supervisor holds its
+// readers: they must stay Send and Sync.
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<FlowReader>();
+};
 
 impl FlowReader {
     /// `mxlCreateFlowReader`.
@@ -709,7 +716,9 @@ fn check_flow_def(def: &str, cfg: &InputConfig) -> Result<()> {
     // The rate is checked on the normalised grainRate of the config info.
     // libmxl's flow parser reads numbers as doubles and defaults an absent
     // channel_count to 1.
-    let count = v.get("channel_count").map_or(Some(1.0), |c| c.as_f64());
+    let count = v
+        .get("channel_count")
+        .map_or(Some(1.0), serde_json::Value::as_f64);
     let ok = v["format"] == "urn:x-nmos:format:audio"
         && v["media_type"] == "audio/float32"
         && v["bit_depth"].as_f64() == Some(32.0)
@@ -1192,6 +1201,7 @@ impl PolledFlow {
     /// This poll reader, counting the references it lets go in `releases`,
     /// which an earlier poll reader of the flow on the instance may still
     /// hold references in.
+    #[must_use]
     pub fn with_releases(mut self, releases: &Releases) -> PolledFlow {
         self.pending = releases.clone();
         self
@@ -1199,6 +1209,7 @@ impl PolledFlow {
 
     /// This poll reader, opening its references on `opener`, which other
     /// poll readers may share.
+    #[must_use]
     pub fn with_opener(mut self, opener: &PollOpener) -> PolledFlow {
         self.opener = Some(opener.clone());
         self

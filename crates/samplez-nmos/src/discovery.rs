@@ -185,7 +185,12 @@ impl Discovery {
         let domains: Vec<String> = match &self.domain {
             Some(d) => vec![d.clone()],
             None => hickory_resolver::system_conf::read_system_conf()
-                .map(|(c, _)| c.search().iter().map(|n| n.to_string()).collect())
+                .map(|(c, _)| {
+                    c.search()
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect()
+                })
                 .unwrap_or_default(),
         };
         let mut found = Vec::new();
@@ -274,12 +279,17 @@ impl Mdns {
             .name("nmos-mdns".into())
             .spawn(move || {
                 while let Ok(event) = events.recv() {
-                    let mut found = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut found = shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     match event {
                         mdns_sd::ServiceEvent::ServiceResolved(s) => {
                             let txt = s.txt_properties.iter().map(|p| (p.key(), p.val_str()));
-                            let mut ips: Vec<IpAddr> =
-                                s.addresses.iter().map(|a| a.to_ip_addr()).collect();
+                            let mut ips: Vec<IpAddr> = s
+                                .addresses
+                                .iter()
+                                .map(mdns_sd::ScopedIp::to_ip_addr)
+                                .collect();
                             ips.sort_by_key(IpAddr::is_ipv6);
                             match suitable(txt) {
                                 Some(pri) if !ips.is_empty() => {
@@ -314,7 +324,7 @@ impl Mdns {
     fn found(&self) -> Vec<Instance> {
         self.found
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .cloned()
             .collect()
@@ -395,7 +405,7 @@ mod tests {
         let i = |name: &str, pri, bases: &[&str]| Instance {
             name: name.into(),
             pri,
-            bases: bases.iter().map(|b| b.to_string()).collect(),
+            bases: bases.iter().map(std::string::ToString::to_string).collect(),
         };
         let found = vec![
             i("c", 30, &["c"]),

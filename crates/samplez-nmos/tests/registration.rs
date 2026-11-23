@@ -637,7 +637,7 @@ async fn a_refused_continued_node_is_registered_anew() {
     let id = first.node_id().to_string();
     let held = r.version(&id).unwrap();
     r.clear();
-    let next = node_clocked(&[&r], Duration::ZERO, true, Behind(Duration::from_secs(60)));
+    let next = node_clocked(&[&r], Duration::ZERO, true, Behind(Duration::from_mins(1)));
     let task = tokio::spawn(next.registration());
     until("a delete", || {
         r.seen().iter().any(|s| s.method == Method::DELETE)

@@ -109,8 +109,8 @@ fn start(dir: &std::path::Path, input: &str, output: &str) -> (Arc<Engine>, Chan
     (engine, (status_rx, hash_rx))
 }
 
-/// Sets the kernel TAI offset (`ADJ_TAI`): CLOCK_TAI moves by the
-/// difference, CLOCK_REALTIME does not.
+/// Sets the kernel TAI offset (`ADJ_TAI`): `CLOCK_TAI` moves by the
+/// difference, `CLOCK_REALTIME` does not.
 fn set_tai_offset(s: i64) {
     // SAFETY: a zeroed timex is valid input; only `constant` is read.
     let mut tx: libc::timex = unsafe { std::mem::zeroed() };
@@ -137,7 +137,7 @@ fn clock(audio: &EngineAudio) -> (Option<i64>, u64) {
     (s.own.clock.tai_offset_s, s.clock_steps)
 }
 
-/// An `adjtimex` step of the TAI offset steps CLOCK_TAI: the RT thread
+/// An `adjtimex` step of the TAI offset steps `CLOCK_TAI`: the RT thread
 /// detects the step, its offset sample moves with it, and the replica
 /// loses its verification.
 #[test]
@@ -170,10 +170,10 @@ fn an_adjtimex_offset_step_unverifies_the_replica() {
     assert!(!v.verified(), "an offset change across a step unverifies");
 }
 
-/// A leap second the kernel inserts (STA_INS, armed by the kernel
+/// A leap second the kernel inserts (`STA_INS`, armed by the kernel
 /// selftest `leap-a-day` shortly before UTC midnight) moves the offset
-/// 37 -> 38 with CLOCK_TAI continuous: no step is detected across it and
-/// verification holds. The deadline misses of libmxl's CLOCK_REALTIME
+/// 37 -> 38 with `CLOCK_TAI` continuous: no step is detected across it and
+/// verification holds. The deadline misses of libmxl's `CLOCK_REALTIME`
 /// deadline waits across the 1 s step are counted and printed.
 #[test]
 fn a_leap_second_moves_the_offset_without_a_step() {
@@ -192,7 +192,7 @@ fn a_leap_second_moves_the_offset_without_a_step() {
         .expect("leap-a-day starts");
     let mut v = Verifier::default();
     let mut samples = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let mut misses_before = None;
     loop {
         let (offset, steps) = clock(&audio);

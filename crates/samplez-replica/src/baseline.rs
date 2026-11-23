@@ -387,7 +387,7 @@ impl Leader {
                     refused.insert(a.id, why);
                 }
                 None if named.is_none_or(|(n, _)| ((v.rank)(a.id), a.id) < ((v.rank)(n), n)) => {
-                    named = Some((a.id, own.versions))
+                    named = Some((a.id, own.versions));
                 }
                 None => {}
             }
@@ -952,7 +952,7 @@ mod tests {
         g.baseline = f.baseline.clone();
         match &g.decide(&mut Leader::default())[..] {
             [Body::Baseline(b)] => {
-                assert_eq!((b.replica, &b.order[..]), (a(1), &[a(3), a(2), a(4)][..]))
+                assert_eq!((b.replica, &b.order[..]), (a(1), &[a(3), a(2), a(4)][..]));
             }
             other => panic!("{other:?}"),
         }

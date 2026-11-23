@@ -17,7 +17,11 @@ pub const TAPS: usize = 12;
 /// The coefficients of ITU-R BS.1770-5 Annex 2, one row per phase, the
 /// columns of the Annex's table. Each value is a multiple of 2^-13, exact
 /// in f32; the literals keep the table's digits.
-#[allow(clippy::excessive_precision)]
+#[allow(
+    clippy::excessive_precision,
+    clippy::unreadable_literal,
+    reason = "the digits as the Annex's table prints them"
+)]
 pub const COEFFICIENTS: [[f32; TAPS]; 4] = [
     [
         0.0017089843750,

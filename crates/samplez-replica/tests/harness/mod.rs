@@ -208,7 +208,7 @@ pub fn owner(session: &str) -> Owner {
     }
 }
 
-/// A replica's CLOCK_MONOTONIC in samples: the runtime's virtual time
+/// A replica's `CLOCK_MONOTONIC` in samples: the runtime's virtual time
 /// since the set started, plus an offset a test sets.
 pub struct Clock {
     base: Instant,
@@ -248,12 +248,12 @@ impl Clock {
     }
 
     /// Sets the kernel TAI offset without a clock step, as the kernel's
-    /// leap second (STA_INS) or a node configured before its pod starts.
+    /// leap second (`STA_INS`) or a node configured before its pod starts.
     pub fn set_kernel_offset(&self, s: i64) {
         self.kernel_offset.store(s, Ordering::Relaxed);
     }
 
-    /// Steps the kernel TAI offset as `adjtimex` does: CLOCK_TAI moves by
+    /// Steps the kernel TAI offset as `adjtimex` does: `CLOCK_TAI` moves by
     /// the difference and the engine detects the step.
     pub fn step_kernel_offset(&self, s: i64) {
         let before = self.kernel_offset.swap(s, Ordering::Relaxed);
@@ -411,9 +411,9 @@ impl Fake {
 
 #[derive(Default)]
 pub struct Fake {
-    /// Records handed, by log index, with their at_index and entries.
+    /// Records handed, by log index, with their `at_index` and entries.
     pub appended: Vec<(u64, u64, Vec<Entry>)>,
-    /// Records handed once the block of their at_index was due.
+    /// Records handed once the block of their `at_index` was due.
     pub late: u64,
     /// Each commit point handed, with the TAI time it was handed at.
     pub committed: Vec<(u64, u64)>,
@@ -1541,10 +1541,7 @@ impl PeerClient for Peers {
                 && let Some(to) = to
             {
                 let mut counts = self.counts.lock().unwrap();
-                let counted = counts.entry(to).or_insert(LinkCounts {
-                    node: to,
-                    ..LinkCounts::default()
-                });
+                let counted = counts.entry(to).or_insert(LinkCounts::new(to));
                 counted.report_timeouts += 1;
             }
             reply
@@ -2041,7 +2038,7 @@ impl<P: Product> Set<P> {
             rollout.set_target(self.target.clone());
             // Given before contact starts: its first report carries the key.
             if !self.held.contains(&id) {
-                replica.rollout(rollout.clone()).expect("a rollout");
+                replica.rollout(rollout.clone());
             }
             replica
                 .contact(timing, Arc::new(Tai(clock)), engine)
@@ -2092,7 +2089,7 @@ impl<P: Product> Set<P> {
     pub fn release_rollout(&mut self, id: NodeId) {
         if self.held.remove(&id) {
             let rollout = self.rollouts[&id].clone();
-            self.replicas[&id].rollout(rollout).expect("a rollout");
+            self.replicas[&id].rollout(rollout);
         }
     }
 
@@ -2251,7 +2248,7 @@ impl<P: Product> Set<P> {
         });
         // Bounded in wall time: the paused runtime clock jumps ahead while
         // the tasks are idle, which an fsync on a slow disk makes them.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + Duration::from_mins(1);
         until_wall(deadline, "the entry applied on the leader", || {
             store.applied_index() > before
         })
@@ -2372,7 +2369,7 @@ impl PanicGuard {
 
 impl Drop for PanicGuard {
     fn drop(&mut self) {
-        if !std::thread::panicking() && PANICKED.with(|panicked| panicked.get()) {
+        if !std::thread::panicking() && PANICKED.with(std::cell::Cell::get) {
             panic!("a task panicked during the test");
         }
     }

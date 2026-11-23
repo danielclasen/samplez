@@ -21,7 +21,9 @@ const MAX_FAULTS: u64 = 2;
 static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Minor page faults of thread `tid`, field 10 of its stat file.

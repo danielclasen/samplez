@@ -723,7 +723,7 @@ async fn a_forced_install_holds_through_a_leader_change() {
     set.force_install_after(r, async {
         // Votes are refused while the leader's lease runs: called again
         // until one election is won.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + Duration::from_mins(1);
         while raft.metrics().borrow().state != openraft::ServerState::Leader {
             assert!(std::time::Instant::now() < deadline, "{other} leads");
             let _ = raft.trigger().elect().await;
@@ -786,7 +786,7 @@ async fn quiet_restart(leader: bool, rebuilt: bool) {
         .append(Body::LeaseRenew(Vec::new()))
         .unwrap();
     // Bounded in wall time, as an fsync lets the paused clock run ahead.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     harness::until_wall(deadline, "both entries applied", || {
         store.applied_index() >= before + 2
     })

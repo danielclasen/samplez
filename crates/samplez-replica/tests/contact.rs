@@ -185,7 +185,7 @@ async fn links_recovering_6_ms_apart_hold_nobody_silent() {
 }
 
 /// Appends an `InputDown` on the leader 40 ms ahead and waits until `on`
-/// holds it in its log; its log index and at_index.
+/// holds it in its log; its log index and `at_index`.
 async fn append_ahead(set: &Set, leader: NodeId, on: NodeId) -> (u64, u64) {
     let at = (index_at(tai(set)) + 40 * 48).next_multiple_of(BLOCK);
     set.replica(leader)

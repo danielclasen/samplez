@@ -40,3 +40,14 @@ test = false
 [lints.clippy]
 disallowed_methods = "allow"
 disallowed_types = "allow"
+# Pedantic lints the code is held to: each fix is mechanical and changes
+# no behaviour, so a new warning means a slip, not a judgement call.
+cast_lossless = "warn"
+doc_markdown = "warn"
+duration_suboptimal_units = "warn"
+ignored_unit_patterns = "warn"
+manual_let_else = "warn"
+redundant_closure_for_method_calls = "warn"
+return_self_not_must_use = "warn"
+semicolon_if_nothing_returned = "warn"
+unreadable_literal = "warn"

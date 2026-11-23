@@ -16,7 +16,7 @@ pub const RATE: Rational = Rational {
     denominator: 1,
 };
 
-/// RT. `mxlGetTime`: the current time of libmxl's clock (CLOCK_TAI on
+/// RT. `mxlGetTime`: the current time of libmxl's clock (`CLOCK_TAI` on
 /// Linux) in nanoseconds since the epoch.
 pub fn now(api: &MxlApi) -> u64 {
     // SAFETY: mxlGetTime has no preconditions.

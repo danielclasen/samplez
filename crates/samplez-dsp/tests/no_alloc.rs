@@ -8,8 +8,9 @@ use samplez_dsp::duck::MAX_KEYS;
 use samplez_dsp::strip::DEFAULT_BANDS;
 use samplez_dsp::{
     BandType, CompParams, Detector, DetectorParams, DuckMode, DuckParam, EqBand, GateParams,
-    KWeighting, KeyFilter, Loudness, MAX_DUCKS, Matrix, Meters, Path, PlanarBuffer, Ramp, Slice,
-    Strip, StripParam, Tone, ToneParams, TruePeak, duck_gain, restore_mxcsr, set_ftz_daz,
+    KWeighting, KeyFilter, Limiter, LimiterParams, Loudness, MAX_DUCKS, Matrix, Meters, Path,
+    PlanarBuffer, Ramp, Slice, Strip, StripParam, Tone, ToneParams, TruePeak, duck_gain,
+    restore_mxcsr, set_ftz_daz,
 };
 
 #[path = "../src/require.rs"]
@@ -273,4 +274,20 @@ fn process_calls_do_not_allocate() {
 
     assert_eq!(during, 0, "allocations during process calls on {paths:?}");
     assert!(meters.frames() > 0);
+}
+
+/// A limiter refuses parameters out of range without allocating, by
+/// either setter: the RT thread sets them at an index.
+#[test]
+fn a_limiter_refuses_without_allocating() {
+    let mut limiter = Limiter::new(2, 64);
+    let refused = LimiterParams {
+        enabled: true,
+        ceiling_db: 6.0,
+        release_ms: 50.0,
+    };
+    let before = allocations();
+    assert!(!limiter.set(refused));
+    assert!(!limiter.set_at(4800, refused));
+    assert_eq!(allocations(), before, "allocations while refusing");
 }

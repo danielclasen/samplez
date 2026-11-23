@@ -187,12 +187,12 @@ fn tech3341_cases_9_12_sliding_windows() {
 fn tech3341_cases_10_13_maxima_per_file() {
     for i in 0..20 {
         let mut m = Meter::stereo();
-        let s = tones(&[(None, i as f64 * 0.15), (Some(-23.0), 3.0), (None, 1.0)]);
+        let s = tones(&[(None, f64::from(i) * 0.15), (Some(-23.0), 3.0), (None, 1.0)]);
         m.feed(&stereo(s), |_| {});
         let v = m.loudness.max_short_term();
         assert!(near(v, -23.0, 0.1), "case 10 segment {i}: max S = {v:?}");
         let mut m = Meter::stereo();
-        let s = tones(&[(None, i as f64 * 0.02), (Some(-23.0), 0.4), (None, 1.0)]);
+        let s = tones(&[(None, f64::from(i) * 0.02), (Some(-23.0), 0.4), (None, 1.0)]);
         m.feed(&stereo(s), |_| {});
         let v = m.loudness.max_momentary();
         assert!(near(v, -23.0, 0.1), "case 13 segment {i}: max M = {v:?}");
@@ -207,10 +207,10 @@ fn tech3341_cases_11_14_live_maxima() {
         let step = if case == 11 { 0.15 } else { 0.02 };
         let mut segments = Vec::new();
         for i in 0..20 {
-            let lead = i as f64 * step;
+            let lead = f64::from(i) * step;
             segments.extend([
                 (None, lead),
-                (Some(-38.0 + i as f64), tone),
+                (Some(-38.0 + f64::from(i)), tone),
                 (None, segment - tone - lead),
             ]);
         }
@@ -245,13 +245,14 @@ fn tp_sine(freq: f64, amplitude: f64, phase_deg: f64) -> Vec<f32> {
     (0..n)
         .map(|i| {
             let ramp = if i < fade {
-                0.5 - 0.5 * (PI * i as f64 / fade as f64).cos()
+                0.5 - 0.5 * (PI * f64::from(i) / f64::from(fade)).cos()
             } else if i >= n - fade {
-                0.5 - 0.5 * (PI * (n - i) as f64 / fade as f64).cos()
+                0.5 - 0.5 * (PI * f64::from(n - i) / f64::from(fade)).cos()
             } else {
                 1.0
             };
-            let x = amplitude * (2.0 * PI * freq * i as f64 / FS + phase_deg.to_radians()).sin();
+            let x =
+                amplitude * (2.0 * PI * freq * f64::from(i) / FS + phase_deg.to_radians()).sin();
             (ramp * x) as f32
         })
         .collect()

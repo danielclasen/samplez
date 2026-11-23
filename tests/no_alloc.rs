@@ -96,7 +96,9 @@ fn assert_no_rt_calls() {
 
 #[test]
 fn rt_thread_allocates_nothing_holding_blocks() {
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = ONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);
@@ -122,7 +124,9 @@ fn rt_thread_allocates_nothing_holding_blocks() {
 
 #[test]
 fn rt_thread_allocates_nothing() {
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = ONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -296,7 +300,9 @@ fn rt_thread_allocates_nothing() {
 /// a mode change that releases, and the readings of every slice sent.
 #[test]
 fn rt_thread_allocates_nothing_with_ducks() {
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = ONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
@@ -358,7 +364,9 @@ fn rt_thread_allocates_nothing_with_ducks() {
 /// a replayed one installed ([`common::duck_resync_scenario`]).
 #[test]
 fn rt_thread_allocates_nothing_with_ducks_through_a_resync() {
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = ONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let domain = Domain::new();
     let (src, dst) = (new_id(), new_id());
     let _pilot = Pilot::start(&domain.0, &src, 1, B, 0);

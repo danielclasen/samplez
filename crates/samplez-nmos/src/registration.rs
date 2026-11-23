@@ -191,11 +191,17 @@ pub(crate) async fn run(inner: Arc<Inner>) {
             registered_once = true;
             served = true;
             backoff = BACKOFF_MIN;
-            *inner.registry.lock().unwrap_or_else(|e| e.into_inner()) = Some(registry.base.clone());
+            *inner
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(registry.base.clone());
             tracing::info!(registry = %registry.base, "nmos: registered");
             last = Some(registry.base.clone());
             let Err(Leave::Failover) = maintain(&inner, &client, &registry.base, posted).await;
-            *inner.registry.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *inner
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             tracing::warn!(registry = %registry.base, "nmos: the registry failed; trying another");
             failed = Some(registry.base.clone());
             break;
@@ -211,10 +217,10 @@ pub(crate) async fn run(inner: Arc<Inner>) {
 fn log_failover(registry: &Registry, a: &Answer) {
     match a {
         Answer::Status(s, ..) => {
-            tracing::warn!(registry = %registry.base, status = %s, "nmos: registry unusable")
+            tracing::warn!(registry = %registry.base, status = %s, "nmos: registry unusable");
         }
         Answer::None(e) => {
-            tracing::warn!(registry = %registry.base, error = %e, "nmos: registry unreachable")
+            tracing::warn!(registry = %registry.base, error = %e, "nmos: registry unreachable");
         }
     }
 }
@@ -405,7 +411,7 @@ pub(crate) async fn unregister(inner: &Inner) {
     let base = inner
         .registry
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     let Some(base) = base else {
         return;

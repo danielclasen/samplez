@@ -133,7 +133,7 @@ fn a_single_voter_copies_no_core() {
 
 /// A resync replay reads `resyncBudgetMs` past the read window: with more
 /// than one voter an input whose flow keeps less history is refused,
-/// naming the history_duration it needs. A lone voter has no donor and
+/// naming the `history_duration` it needs. A lone voter has no donor and
 /// attaches it.
 #[test]
 fn only_a_set_of_voters_needs_the_replay_history() {
@@ -1093,7 +1093,7 @@ fn a_product_state_switches_the_pre_strip_meter_on() {
     let src = new_id();
     let _pilot = Pilot::start(&domain.0, &src, 2, B, 0);
     let h = hashed_of(&domain, &[(&src, 2)], |c| {
-        c.inputs[0].pre_strip_meter = true
+        c.inputs[0].pre_strip_meter = true;
     });
     let state = ProductState {
         gains: common::diagonal(2, 1.0),
@@ -3305,7 +3305,7 @@ fn a_product_core_starts_its_ducks_cold_and_a_forced_group_at_full_depth() {
         });
         refused("nine keys", &|s| s.ducks[0].keys = vec![(0, 1.0); 9]);
         refused("nine groups", &|s| {
-            s.ducks.resize(9, DuckTargets::default())
+            s.ducks.resize(9, DuckTargets::default());
         });
         refused("a depth beyond its range", &|s| s.ducks[0].depths[0] = 41.0);
         assert_eq!(h.e.counters().blocks_without_core.load(Relaxed), 0);

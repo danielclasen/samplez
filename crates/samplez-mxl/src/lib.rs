@@ -226,7 +226,9 @@ impl Instance {
 
     /// Held around reader and group creation and release.
     pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
-        self.lock.lock().unwrap_or_else(|e| e.into_inner())
+        self.lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn api(&self) -> &MxlApi {

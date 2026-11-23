@@ -1,6 +1,6 @@
 //! The filters of the strip and of the duck detector's keys: a state
 //! variable filter in the trapezoidal form of Andrew Simper (Cytomic,
-//! "SvfLinearTrapOptimised2"), whose outputs mix to the high-pass,
+//! "`SvfLinearTrapOptimised2`"), whose outputs mix to the high-pass,
 //! low-pass, bell and shelf responses of the RBJ Audio EQ Cookbook
 //! (Robert Bristow-Johnson), with the same bilinear prewarp.
 //!

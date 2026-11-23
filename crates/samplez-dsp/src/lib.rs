@@ -45,7 +45,9 @@ pub use matrix::{MAX_COEFFICIENTS, Matrix, Path};
 pub use meter::{Meters, accumulate};
 pub use mxcsr::{DAZ, FTZ, SavedMxcsr, mxcsr, restore_mxcsr, set_ftz_daz};
 pub use ramp::{MAX_EXACT_RAMP_LEN, MAX_GAIN, MAX_RAMP_LEN, Ramp, valid_gain};
-pub use strip::{BandType, COMP_OFF, CompParams, EqBand, GATE_OFF, GateParams, Strip, StripParam};
+pub use strip::{
+    BandType, COMP_OFF, CompParams, EqBand, GATE_OFF, GateParams, ParamError, Strip, StripParam,
+};
 pub use tone::{TONE_FREQUENCY_HZ, TONE_LEVEL_DB, Tone, ToneParams, ToneRamps};
 pub use true_peak::TruePeak;
 

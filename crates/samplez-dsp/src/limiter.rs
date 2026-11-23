@@ -39,7 +39,7 @@ use core::ops::RangeInclusive;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::level::db_to_gain;
-use crate::strip::{MAX_LEGS, clamp_in, within};
+use crate::strip::{MAX_LEGS, ParamError, clamp_in, within};
 use crate::svf::SAMPLE_RATE;
 use crate::true_peak::{HISTORY, phase_peaks};
 use crate::{Path, Ramp};
@@ -90,10 +90,13 @@ impl LimiterParams {
 
     /// Whether a limiter takes the parameters: values within their
     /// ranges, no NaN.
-    pub fn check(&self) -> Result<(), String> {
-        within("limiter ceiling", self.ceiling_db, &LIMITER_CEILING_DB)
-            .and_then(|()| within("limiter release", self.release_ms, &LIMITER_RELEASE_MS))
-            .map_err(|r| r.message())
+    ///
+    /// # Errors
+    ///
+    /// The first value refused, with what it is.
+    pub fn check(&self) -> Result<(), ParamError> {
+        within("limiter ceiling", self.ceiling_db, &LIMITER_CEILING_DB)?;
+        within("limiter release", self.release_ms, &LIMITER_RELEASE_MS)
     }
 
     /// The parameters with the ceiling and release moved to the nearest
