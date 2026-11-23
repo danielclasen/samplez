@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.26.0](https://github.com/danielclasen/samplez/compare/v0.25.0...v0.26.0) (2026-11-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **replica:** peer::LinkCounts has new public fields reports_sent, report_bytes, reports_answered, report_round_trip and report_encode, so code that builds it with a struct literal must set them.
+
+### Features
+
+* **engine:** keep the other threads off the RT CPU's SMT siblings ([#191](https://github.com/danielclasen/samplez/issues/191)) ([6303700](https://github.com/danielclasen/samplez/commit/630370078fd5c65b5f38a9a0986cf2b9eb944d92))
+* **replica:** count report sizes, round trips and contact loop CPU ([e68139c](https://github.com/danielclasen/samplez/commit/e68139c428a3dc91d4a2ede2ba740952741fc456))
+
 ## [0.25.0](https://github.com/danielclasen/samplez/compare/v0.24.0...v0.25.0) (2026-11-22)
 
 

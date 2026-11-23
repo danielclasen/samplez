@@ -1,6 +1,6 @@
 [package]
 name = "samplez-nmos"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -16,7 +16,7 @@ mdns-sd = { version = "=0.21.7", default-features = false }
 # Plain HTTP to the registry: registries advertising api_proto=https are
 # not used.
 reqwest = { version = "=0.12.28", default-features = false }
-samplez-service = { path = "../samplez-service", version = "0.25.0" }
+samplez-service = { path = "../samplez-service", version = "0.26.0" }
 serde_json = "=1.0.154"
 tokio = { version = "=1.54.1", features = ["macros", "rt", "sync", "time"] }
 tracing = "=0.1.44"
