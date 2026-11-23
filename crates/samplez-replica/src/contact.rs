@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use openraft::{BasicNode, RaftMetrics};
@@ -850,6 +851,46 @@ pub struct Contact {
     audio: Option<Arc<dyn Audio>>,
     log: Arc<dyn LogView>,
     state: WatchedMutex<State>,
+    costs: Costs,
+}
+
+/// The calling thread's CPU time.
+pub(crate) fn thread_cpu() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is writable; CLOCK_THREAD_CPUTIME_ID exists on Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// What the contact loop cost, counted outside the contact lock.
+#[derive(Default)]
+struct Costs {
+    ticks: AtomicU64,
+    tick_ns: AtomicU64,
+    decisions_ns: AtomicU64,
+    receive_ns: AtomicU64,
+}
+
+/// Adds the calling thread's CPU time since `since` to `to`.
+fn add_cpu(to: &AtomicU64, since: Duration) {
+    let ns = thread_cpu().saturating_sub(since).as_nanos() as u64;
+    to.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// The contact loop's cost so far: the report periods it ran, and the
+/// CPU time of the threads running each part of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CostCounts {
+    pub ticks: u64,
+    /// [`Contact::tick`]: the period's state and the reports to send.
+    pub tick: Duration,
+    /// [`Contact::decisions`], the leader's.
+    pub decisions: Duration,
+    /// Decoding the peers' reports and [`Contact::receive`].
+    pub receive: Duration,
 }
 
 /// Adds a counted replica's slack to the lead, naming the replica when
@@ -1079,6 +1120,7 @@ impl Contact {
             clocks,
             audio,
             log,
+            costs: Costs::default(),
             state: WatchedMutex::new(
                 "contact",
                 State {
@@ -1204,8 +1246,10 @@ impl Contact {
 
     /// Takes a report from another voter.
     pub fn receive(&self, report: Report) {
+        let cpu = thread_cpu();
         self.receive_held(report);
         self.overwhelm();
+        add_cpu(&self.costs.receive_ns, cpu);
     }
 
     fn receive_held(&self, report: Report) {
@@ -1448,9 +1492,28 @@ impl Contact {
     /// One report period: the log, the deadlines, F, silence, and the
     /// reports to send, with each addressee's address.
     pub fn tick(&self, members: Members) -> Vec<(NodeId, String, Report)> {
+        let cpu = thread_cpu();
         let out = self.tick_held(members);
         self.overwhelm();
+        self.costs.ticks.fetch_add(1, Ordering::Relaxed);
+        add_cpu(&self.costs.tick_ns, cpu);
         out
+    }
+
+    /// What the contact loop cost so far.
+    pub fn costs(&self) -> CostCounts {
+        let ns = |a: &AtomicU64| Duration::from_nanos(a.load(Ordering::Relaxed));
+        CostCounts {
+            ticks: self.costs.ticks.load(Ordering::Relaxed),
+            tick: ns(&self.costs.tick_ns),
+            decisions: ns(&self.costs.decisions_ns),
+            receive: ns(&self.costs.receive_ns),
+        }
+    }
+
+    /// Counts the CPU time since `since` of decoding a peer's report.
+    pub(crate) fn decoded(&self, since: Duration) {
+        add_cpu(&self.costs.receive_ns, since);
     }
 
     fn tick_held(&self, members: Members) -> Vec<(NodeId, String, Report)> {
@@ -2921,6 +2984,13 @@ impl Contact {
     /// The leader's decisions this period ([`crate::baseline`]): none
     /// while out of contact.
     pub fn decisions(&self, term: u64) -> Vec<Body> {
+        let cpu = thread_cpu();
+        let out = self.decisions_held(term);
+        add_cpu(&self.costs.decisions_ns, cpu);
+        out
+    }
+
+    fn decisions_held(&self, term: u64) -> Vec<Body> {
         let now = Instant::now();
         let tai = self.clocks.tai_ns();
         let mut st = self.lock();
@@ -4703,6 +4773,31 @@ mod tests {
         f.tick();
         assert_eq!(f.contact.config_differs(), None, "both left the membership");
         assert!(!f.contact.learner_holds_set_config(9));
+    }
+
+    /// Each tick counts one period, and each part of the contact loop
+    /// adds its thread's CPU time to its own part alone.
+    #[tokio::test(start_paused = true)]
+    async fn each_part_of_the_contact_loop_counts_its_own_cpu_time() {
+        let f = fixture(&[&[1, 2, 3]]);
+        assert_eq!(f.contact.costs(), CostCounts::default());
+        f.tick();
+        f.tick();
+        let ticked = f.contact.costs();
+        assert_eq!(ticked.ticks, 2);
+        assert!(ticked.tick > Duration::ZERO);
+        assert_eq!(
+            (ticked.decisions, ticked.receive),
+            (Duration::ZERO, Duration::ZERO)
+        );
+        f.contact.receive(f.report(2, None));
+        let received = f.contact.costs();
+        assert!(received.receive > Duration::ZERO);
+        assert_eq!((received.ticks, received.tick), (2, ticked.tick));
+        f.contact.decisions(1);
+        let decided = f.contact.costs();
+        assert!(decided.decisions > Duration::ZERO);
+        assert_eq!(decided.receive, received.receive);
     }
 
     #[tokio::test(start_paused = true)]

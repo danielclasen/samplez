@@ -1295,8 +1295,25 @@ since a peer restarted under its name may answer at another. Per peer,
 labelled `node`, `samplez_replica_peer_report_timeouts_total` counts
 reports with no answer within `contactWindowMs` and
 `samplez_replica_peer_dials_total` every connection dialed, the first
-included. Contact drops both when the peer leaves the membership, so a
+included. Per peer too, `samplez_replica_peer_reports_sent_total` counts
+the reports handed to the pool, `samplez_replica_peer_report_bytes_total`
+their encoded bytes and
+`samplez_replica_peer_report_encode_cpu_seconds_total` the CPU time of
+encoding them; `samplez_replica_peer_reports_answered_total` counts the
+answered ones by round trip, from the encoded report handed to the pool
+to its answer, cumulative over the bounds in its `le` label (0.5, 1, 2,
+4 and 8 ms, and `+Inf`) as a histogram's buckets are, and
+`samplez_replica_peer_report_round_trip_seconds_total` sums their round
+trips. Contact drops them all when the peer leaves the membership, so a
 peer removed and added again starts from 0.
+
+The contact loop's own cost: `samplez_replica_contact_ticks_total`
+counts the report periods it ran, fewer than one per `reportPeriodMs`
+when periods were missed, which are skipped rather than caught up; and
+`samplez_replica_contact_cpu_seconds_total`, labelled `part`, the CPU
+time of the threads running it: `tick` for a period's state and the
+reports built, `decisions` for the leader's decisions each period, and
+`receive` for decoding the peers' reports and taking them.
 
 A replica catching up, its log having taken no entry past the commit
 index the first voter report named before that entry's deadline since

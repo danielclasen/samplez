@@ -424,13 +424,26 @@ impl PeerClient for Pool {
                 "/peer/{}",
                 to.map_or_else(|| "any".to_owned(), |id| id.to_string())
             );
+            let cpu = report.then(crate::contact::thread_cpu);
             let body = serde_json::to_vec(&request).expect("encodes");
+            if let (Some(cpu), Some(to)) = (cpu, to) {
+                let encode = crate::contact::thread_cpu().saturating_sub(cpu);
+                self.count(to, |c| {
+                    c.reports_sent += 1;
+                    c.report_bytes += body.len() as u64;
+                    c.report_encode += encode;
+                });
+            }
+            let started = Instant::now();
             let reply = self.post(to, addr, &path, body, within).await;
-            if report
-                && let (Some(to), Err(e)) = (to, &reply)
-                && e.kind() == io::ErrorKind::TimedOut
-            {
-                self.count(to, |c| c.report_timeouts += 1);
+            if let (true, Some(to)) = (report, to) {
+                match &reply {
+                    Ok(_) => self.count(to, |c| c.answered(started.elapsed())),
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                        self.count(to, |c| c.report_timeouts += 1);
+                    }
+                    Err(_) => {}
+                }
             }
             let reply = reply.map_err(|e| e.to_string())?;
             serde_json::from_slice(&reply).map_err(|e| e.to_string())

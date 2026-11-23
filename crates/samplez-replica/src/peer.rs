@@ -137,6 +137,10 @@ pub enum Refused {
 
 pub type PeerReply = Result<PeerResponse, Refused>;
 
+/// The upper bounds of the round-trip buckets [`LinkCounts::reports_answered`]
+/// counts answered reports in, seconds; one more bucket takes the rest.
+pub const ROUND_TRIP_BOUNDS: [f64; 5] = [0.0005, 0.001, 0.002, 0.004, 0.008];
+
 /// What a [`PeerClient`] counted of its exchanges with one peer while it
 /// is a member.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -146,6 +150,28 @@ pub struct LinkCounts {
     pub report_timeouts: u64,
     /// Connections dialed to it.
     pub dials: u64,
+    /// Reports handed to the connection pool.
+    pub reports_sent: u64,
+    /// Their encoded bytes.
+    pub report_bytes: u64,
+    /// Reports answered, per bucket of [`ROUND_TRIP_BOUNDS`] by round trip
+    /// (from the encoded report handed to the pool to its answer), the
+    /// last beyond them; not cumulative.
+    pub reports_answered: [u64; ROUND_TRIP_BOUNDS.len() + 1],
+    /// The round trips of the answered reports, summed.
+    pub report_round_trip: Duration,
+    /// The CPU time of the thread encoding the reports, summed.
+    pub report_encode: Duration,
+}
+
+impl LinkCounts {
+    /// Counts an answered report by its round trip.
+    pub fn answered(&mut self, round_trip: Duration) {
+        let s = round_trip.as_secs_f64();
+        let bucket = ROUND_TRIP_BOUNDS.iter().take_while(|&&b| s > b).count();
+        self.reports_answered[bucket] += 1;
+        self.report_round_trip += round_trip;
+    }
 }
 
 /// Sends [`PeerRequest`]s: [`net::Pool`] over the peer listener, or a test
@@ -288,10 +314,33 @@ async fn peer<P: Product>(
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         },
     };
+    let cpu = crate::contact::thread_cpu();
     let Ok(request) = serde_json::from_slice::<PeerRequest>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if let (PeerRequest::Report(_), Some(contact)) = (&request, replica.shared.contact.get()) {
+        contact.decoded(cpu);
+    }
     json(&replica.handle(to, request).await)
+}
+
+#[cfg(test)]
+mod link_tests {
+    use std::time::Duration;
+
+    use super::LinkCounts;
+
+    /// An answer counts in the first bucket whose bound it does not
+    /// exceed, a bound itself included, and beyond the last in the last.
+    #[test]
+    fn an_answer_counts_in_the_bucket_of_its_round_trip() {
+        let mut c = LinkCounts::default();
+        for us in [500, 501, 2_000, 8_001, 1_000_000] {
+            c.answered(Duration::from_micros(us));
+        }
+        assert_eq!(c.reports_answered, [1, 1, 1, 0, 0, 2]);
+        assert_eq!(c.report_round_trip, Duration::from_micros(1_011_002));
+    }
 }
 
 #[cfg(test)]

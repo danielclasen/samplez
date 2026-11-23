@@ -20,7 +20,7 @@ use samplez_replica::entry::NodeId;
 use samplez_replica::membership::slot_of;
 use samplez_replica::net::{DIAL_WITHIN, MAX_IDLE};
 use samplez_replica::net::{Network, Pool};
-use samplez_replica::peer::{self, LinkCounts, PeerClient, PeerRequest, PeerResponse, Refused};
+use samplez_replica::peer::{self, PeerClient, PeerRequest, PeerResponse, Refused};
 use samplez_replica::report::{Own, Report};
 use samplez_replica::{MAX_COMMAND_BYTES, Replica, Settings};
 use samplez_service::config::{Tls, TlsMode};
@@ -525,12 +525,38 @@ async fn a_late_answer_keeps_its_connection() {
         assert_eq!(next, reported);
     }
     assert_eq!(peer.accepted.load(SeqCst), 1, "connections accepted");
-    let counts = LinkCounts {
-        node: 1,
-        report_timeouts: 1,
-        dials: 1,
+    let [c] = pool.link_counts()[..] else {
+        panic!("one peer counted")
     };
-    assert_eq!(pool.link_counts(), [counts]);
+    assert_eq!((c.node, c.report_timeouts, c.dials), (1, 1, 1));
+    // The late answer reached the pool, not the report's sender.
+    assert_eq!(c.reports_sent, 5);
+    assert_eq!(c.reports_answered.iter().sum::<u64>(), 4);
+}
+
+/// Per peer, the pool counts every report handed to it with its encoded
+/// bytes and the time encoding it took, and every answered one by its
+/// round trip: a report answered after 3 ms is beyond the 2 ms bucket.
+#[tokio::test]
+async fn reports_are_counted_with_their_bytes_and_round_trips() {
+    let delay = Duration::from_millis(3);
+    let peer = FakePeer::start(2, delay, Duration::ZERO).await;
+    let (pool, addr) = (&peer.pool, peer.addr.as_str());
+    for _ in 0..3 {
+        let answered = pool.call(Some(1), addr, report(), LIMIT).await;
+        assert_eq!(answered, Ok(Ok(PeerResponse::Reported)));
+    }
+    let [c] = pool.link_counts()[..] else {
+        panic!("one peer counted")
+    };
+    let bytes = serde_json::to_vec(&report()).unwrap().len() as u64;
+    assert_eq!((c.reports_sent, c.report_bytes), (3, 3 * bytes));
+    assert_eq!(c.reports_answered.iter().sum::<u64>(), 3);
+    assert_eq!(peer::ROUND_TRIP_BOUNDS[2], 0.002);
+    let within_2ms: u64 = c.reports_answered[..3].iter().sum();
+    assert!(within_2ms <= 2, "the delayed report within 2 ms: {c:?}");
+    assert!(c.report_round_trip >= delay, "{c:?}");
+    assert!(c.report_encode > Duration::ZERO, "{c:?}");
 }
 
 /// A peer slower to connect than a report's time, though within
@@ -554,30 +580,65 @@ async fn a_slow_dial_is_dialed_once_and_serves_the_next_report() {
     }
     assert!(missed > 0, "the dial outlasted a report");
     assert_eq!(peer.accepted.load(SeqCst), 1, "connections accepted");
-    let counts = LinkCounts {
-        node: 1,
-        report_timeouts: missed,
-        dials: 1,
+    let [c] = pool.link_counts()[..] else {
+        panic!("one peer counted")
     };
-    assert_eq!(pool.link_counts(), [counts]);
+    assert_eq!((c.node, c.report_timeouts, c.dials), (1, missed, 1));
 }
 
 /// Every replica exposes, per peer labelled `node`, the reports that
-/// got no answer in time and the connections it dialed.
+/// got no answer in time, the connections it dialed, the reports sent
+/// with their bytes and encoding time, and those answered by round trip;
+/// and the contact loop's periods and CPU time.
 #[tokio::test]
 async fn the_exposition_carries_report_timeouts_and_dials_per_peer() {
+    use samplez_replica::contact::{SystemClocks, Timing};
     let set = Set::start().await;
+    for id in 1..=3 {
+        let timing = Timing::defaults(harness::BLOCK);
+        set.replica(id)
+            .contact(timing, Arc::new(SystemClocks), None)
+            .unwrap();
+    }
     let leader = set.leader().await;
+    // Reports flow every 2 ms once contact runs.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let samples = set.replica(leader).replica_metrics();
+    let find = |name: &str, labels: &[(&str, String)]| {
+        samples
+            .iter()
+            .find(|m| m.name == name && m.labels == labels)
+            .unwrap_or_else(|| panic!("no {name} sample labelled {labels:?}"))
+            .value
+    };
     for peer in (1..=3).filter(|&id| id != leader) {
-        let of = |name: &str| {
-            samples
-                .iter()
-                .find(|m| m.name == name && m.labels == [("node", peer.to_string())])
-                .unwrap_or_else(|| panic!("no {name} sample for node {peer}"))
-                .value
-        };
+        let of = |name: &str| find(name, &[("node", peer.to_string())]);
         assert!(of("samplez_replica_peer_dials_total") >= 1.0);
         assert_eq!(of("samplez_replica_peer_report_timeouts_total"), 0.0);
+        let sent = of("samplez_replica_peer_reports_sent_total");
+        assert!(sent >= 1.0, "{sent}");
+        assert!(of("samplez_replica_peer_report_bytes_total") > sent);
+        assert!(of("samplez_replica_peer_report_encode_cpu_seconds_total") > 0.0);
+        assert!(of("samplez_replica_peer_report_round_trip_seconds_total") > 0.0);
+        let answered = |le: &str| {
+            find(
+                "samplez_replica_peer_reports_answered_total",
+                &[("node", peer.to_string()), ("le", le.to_owned())],
+            )
+        };
+        let all = answered("+Inf");
+        assert!(all >= 1.0 && all <= sent, "{all} of {sent}");
+        assert!(answered("0.0005") <= answered("0.008"));
+        assert!(answered("0.008") <= all);
     }
+    assert!(find("samplez_replica_contact_ticks_total", &[]) >= 1.0);
+    let cpu = |part: &str| {
+        find(
+            "samplez_replica_contact_cpu_seconds_total",
+            &[("part", part.to_owned())],
+        )
+    };
+    assert!(cpu("tick") > 0.0);
+    assert!(cpu("decisions") > 0.0, "the leader decides");
+    assert!(cpu("receive") > 0.0);
 }
