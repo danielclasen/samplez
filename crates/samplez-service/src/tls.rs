@@ -676,9 +676,10 @@ impl axum::serve::Listener for TlsListener {
             return accepted;
         }
         if !self.ended {
-            self.ended = true;
+            // Taken only once the join ends: an accept dropped while it
+            // waits leaves the next one to take it.
             match (&mut self.task).await {
-                Err(e) if e.is_cancelled() => {}
+                Err(e) if e.is_cancelled() => self.ended = true,
                 Err(e) => {
                     tracing::error!(listener = self.name, "the accept task panicked");
                     std::panic::resume_unwind(e.into_panic());
@@ -1390,6 +1391,38 @@ mod tests {
         let payload = e.into_panic();
         assert_eq!(
             payload.downcast_ref::<&str>(),
+            Some(&"the accept loop failed")
+        );
+    }
+
+    /// An accept dropped while it waits for the accept task to end leaves
+    /// the next accept to see how it ended.
+    #[tokio::test]
+    async fn an_accept_dropped_while_the_task_ends_leaves_its_end_to_the_next() {
+        let (cert, key, _) = write_pair("dropped-accept");
+        let tls = listener_tls(&files(&cert, &key), &Metrics::default());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = tls.listen(tcp, MAX_HANDSHAKES, ACCEPTED_QUEUE).unwrap();
+        // The sender is gone, but the task panics only when told.
+        listener.task.abort();
+        let (fail, failing) = tokio::sync::oneshot::channel::<()>();
+        listener.task = tokio::spawn(async move {
+            let _ = failing.await;
+            panic!("the accept loop failed");
+        });
+        let first = axum::serve::Listener::accept(&mut listener);
+        let waited = tokio::time::timeout(Duration::from_millis(50), first).await;
+        assert!(waited.is_err(), "the task is still running");
+        fail.send(()).unwrap();
+        let accepted = tokio::spawn(async move {
+            axum::serve::Listener::accept(&mut listener).await;
+        });
+        let e = tokio::time::timeout(LIMIT, accepted)
+            .await
+            .expect("within 5 s")
+            .expect_err("the next accept panics");
+        assert_eq!(
+            e.into_panic().downcast_ref::<&str>(),
             Some(&"the accept loop failed")
         );
     }
