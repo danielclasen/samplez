@@ -5,8 +5,8 @@
 
 ### ⚠ BREAKING CHANGES
 
-* **engine:** InFlight has a new field, depth_changes.
-* **replica:** contact::Metrics has new public fields, start_hold and start_hold_warnings, so code that builds it with a struct literal must set them.
+* **engine:** InFlight has a new field, depth_changes, and PROTOCOL is 8, so a set moves to this release through a rollout.
+* **replica:** contact::Metrics has new public fields, start_hold and start_hold_warnings, and contact::PeerMetrics a new public field, clock_best, so code that builds either with a struct literal must set them.
 
 ### Features
 
