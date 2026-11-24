@@ -687,10 +687,10 @@ fn a_loudness_entry_of_a_meter_the_engine_lacks_is_left_out() {
 /// Ramps in flight that the engine refuses are filtered as the live
 /// filter filters entries, so the rebuild is taken: a fade-in and a
 /// crossfade of a slot beyond the engine's are left out, a depth ramp
-/// from a depth the engine refuses is dropped, and a mask change the
-/// engine refuses, on a column that does not duck, is taken as 0, the
-/// mask the state's own refused mask becomes. Unfiltered, the engine
-/// refuses each state whole.
+/// and depth changes from a depth the engine refuses are dropped, and a
+/// mask change the engine refuses, on a column that does not duck, is
+/// taken as 0, the mask the state's own refused mask becomes.
+/// Unfiltered, the engine refuses each state whole.
 #[test]
 fn ramps_in_flight_the_engine_refuses_are_filtered_from_a_rebuild() {
     let domain = Domain::new();
@@ -729,6 +729,8 @@ fn ramps_in_flight_the_engine_refuses_are_filtered_from_a_rebuild() {
         len: 480,
     };
     depths.in_flight.depths = vec![vec![Some(from_99)]];
+    let mut depth_changes = base.clone();
+    depth_changes.in_flight.depth_changes = vec![(0, 0, 99.0, vec![(at, 0.0)])];
     let mut masks = base.clone();
     masks.masks = vec![vec![1]];
     masks.in_flight.masks = vec![(0, 0, 0, vec![(at, 1)])];
@@ -736,6 +738,7 @@ fn ramps_in_flight_the_engine_refuses_are_filtered_from_a_rebuild() {
         ("fade-ins", &fade_ins),
         ("crossfades", &crossfades),
         ("depths", &depths),
+        ("depth changes", &depth_changes),
         ("masks", &masks),
     ] {
         assert!(
@@ -1911,7 +1914,8 @@ fn a_rebuild_waits_for_a_floor_the_lead_and_a_build_ahead() {
 /// Two mono input slots reading one flow into one output, as a product
 /// drives them: `fader <slot> <gain>`, `vca <gain>`, `gate <slot> <dB>`
 /// for the gate threshold, `recall <gain>` setting both faders, `duck
-/// <dB>` holding duck group 0 down on slot 0 by that depth.
+/// <dB>` holding duck group 0 down on slot 0 by that depth, `mask <0|1>`
+/// the duck mask of slot 0's term, 1 unless set.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Console {
     faders: [f32; 2],
@@ -1920,6 +1924,8 @@ struct Console {
     flow: String,
     #[serde(default)]
     duck: Option<f32>,
+    #[serde(default)]
+    unmasked: bool,
 }
 
 impl Console {
@@ -1930,6 +1936,7 @@ impl Console {
             gates: [-60.0, -60.0],
             flow: flow.to_owned(),
             duck: None,
+            unmasked: false,
         }
     }
 }
@@ -1948,6 +1955,7 @@ impl Product for Console {
             ["gate", slot, db] => self.gates[slot.parse::<usize>().unwrap()] = number(db),
             ["recall", gain] => self.faders = [number(gain), number(gain) / 2.0],
             ["duck", db] => self.duck = Some(number(db)),
+            ["mask", mask] => self.unmasked = mask == "0",
             _ => return Effect::Stale,
         }
         Effect::Changed(())
@@ -1989,7 +1997,7 @@ impl Product for Console {
                     depths: vec![db, 0.0],
                     ..DuckTargets::default()
                 }],
-                vec![vec![1], vec![0]],
+                vec![vec![u8::from(!self.unmasked)], vec![0]],
             ),
             None => (Vec::new(), Vec::new()),
         };
@@ -2439,6 +2447,94 @@ fn refused_settings_live_and_rebuilt() -> Result<(), String> {
     if compared < 4 {
         return Err(format!("{compared} pages compared"));
     }
+    Ok(())
+}
+
+/// A replica rebuilt from its machine's product state, through a JSON
+/// snapshot and the bridge's filter, inside a mask crossfade and a change
+/// back over a depth changed twice within them, the second change while
+/// the first one's ramp ran, computes the live engine's pages from its
+/// install on: the tracker names every depth change the crossfade reads.
+#[test]
+fn a_replica_rebuilt_inside_a_mask_crossfade_over_two_depth_ramps_computes_the_live_pages() {
+    undisturbed(mask_crossfade_over_two_depth_ramps_rebuilt);
+}
+
+fn mask_crossfade_over_two_depth_ramps_rebuilt() -> Result<(), String> {
+    let domain = Domain::new();
+    let _pilot = Pilot::start(&domain, CONSOLE_INPUT);
+    let [(live, la), (rebuilt, ra)] = consoles_with(&domain, true);
+    let silenced = |e: &Engine| e.counters().input_silenced_blocks.load(Ordering::Relaxed);
+    let silenced_before = silenced(&live) + silenced(&rebuilt);
+    let mut m = Machine::new(CONSOLE_INPUT);
+    let index = std::cell::Cell::new(0u64);
+    let write = |m: &mut Machine, body: &str, at: Option<u64>| {
+        index.set(index.get() + 1);
+        let index = index.get();
+        let stamp = processed_of(&live).max(processed_of(&rebuilt)) * B;
+        let r = m.apply(index, stamp, at.unwrap_or(stamp + 40 * B), body);
+        for audio in [&la, &ra] {
+            audio.appended(index, r.at_index, &r.entries);
+            audio.committed(index);
+        }
+        r.at_index
+    };
+    // A held duck of 10 dB on slot 0, its term unmasked: a mask set
+    // before the duck derives no entry.
+    write(&mut m, "duck 10", None);
+    write(&mut m, "mask 0", None);
+    wait_for("the duck held", || {
+        processed_of(&live) * B > m.0.floor + 4800
+    });
+    ra.drop_engine();
+    // The install at a page start that is a block start, as the product
+    // engine test has it: the mask on 240 samples before, the depth to 20
+    // dB, the mask off and the depth to 30 dB each a block later.
+    let unit = 64 * B;
+    assert_eq!(unit % PAGE, 0);
+    let now = processed_of(&live).max(processed_of(&rebuilt)) * B;
+    // Within the rebuild's wait: REBUILD_WAIT and the apply lead.
+    let install = (now + 2400).div_ceil(unit) * unit;
+    for (n, body) in ["mask 1", "duck 20", "mask 0", "duck 30"]
+        .iter()
+        .enumerate()
+    {
+        let at = install - 240 + n as u64 * B;
+        if write(&mut m, body, Some(at)) != at {
+            return Err(format!("{body} not at {at}"));
+        }
+    }
+    // The snapshot a restarted replica installs, as JSON.
+    let bytes = serde_json::to_vec(&m.0.save()).map_err(|e| e.to_string())?;
+    let mut loaded = Machine::new(CONSOLE_INPUT);
+    let saved = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    loaded.0.load(saved, Limits::defaults(48_000))?;
+    let state = loaded.0.product_state(index.get());
+    assert_eq!(
+        state.in_flight.depth_changes.len(),
+        1,
+        "{:?}",
+        state.in_flight
+    );
+    if processed_of(&rebuilt) * B + 2 * B >= install {
+        return Err("the install index passed before the rebuild".into());
+    }
+    if !ra.rebuild_engine(&state, install) {
+        return Err("not rebuilt".into());
+    }
+    let first = install / PAGE;
+    let pages = pages_until(&[(&live, &la), (&rebuilt, &ra)], (install + 4 * PAGE) / B)?;
+    if silenced(&live) + silenced(&rebuilt) > silenced_before {
+        return Err("an input block silenced".into());
+    }
+    if !pages.iter().all(|p| p.contains_key(&first)) {
+        return Err(format!(
+            "page {first} of the install not computed whole by both"
+        ));
+    }
+    let compared = equal_pages(&pages[0], &pages[1], first, first + 2)
+        .map_err(|e| format!("{e}: the rebuilt duck holds other gains"))?;
+    assert_eq!(compared, 3);
     Ok(())
 }
 

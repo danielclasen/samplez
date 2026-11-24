@@ -270,8 +270,12 @@ pub enum Body {
 /// (`samplez::Targets::pre_strip_meters`); 7 adds the compressor's mix
 /// (`samplez_dsp::CompParams::mix`) to the strip entries and targets,
 /// which a binary of protocol 6 decodes and drops, computing the
-/// compressor alone where its peers mix.
-pub const PROTOCOL: u32 = 7;
+/// compressor alone where its peers mix; 8 names in its product state,
+/// and carries in its snapshots, every duck depth change a mask
+/// crossfade in flight reads, where protocol 7 named the latest depth
+/// ramp alone, so a replica rebuilt inside a mask crossfade over a depth
+/// changed more than once continues it as its peers do.
+pub const PROTOCOL: u32 = 8;
 
 impl Body {
     /// An entry whose generation every replica builds on receipt: an
@@ -495,10 +499,11 @@ mod tests {
     /// entry and targets; 4: an unfillable withheld block's digest; 5: the
     /// output strip's and output delay's entries and targets; 6: the
     /// pre-strip meter's entry and targets; 7: the compressor's mix in
-    /// the strip entries and targets.
+    /// the strip entries and targets; 8: the depth changes a mask
+    /// crossfade in flight reads, in product state and snapshots.
     #[test]
     fn the_protocol_is_pinned() {
-        assert_eq!(PROTOCOL, 7);
+        assert_eq!(PROTOCOL, 8);
     }
 
     /// The entries the leader flagged for a generation need one, so a

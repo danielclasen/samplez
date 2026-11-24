@@ -572,12 +572,14 @@ impl<P: Product> StateMachine<P> {
                         depths[group].resize(slot + 1, None);
                     }
                     let cell = &mut depths[group][slot];
-                    let from = cell.map_or(old, |f| f.value_at(old, at));
+                    let ramp = *cell;
+                    let from = ramp.map_or(old, |f| f.value_at(old, at));
                     *cell = (from != db && len != 0).then_some(samplez::Fade {
                         from,
                         start: at,
                         len,
                     });
+                    self.in_flight.depth((group, slot), (old, ramp), (at, db));
                 }
                 samplez::Entry::Route { slot, .. } | samplez::Entry::Detach { slot } => {
                     // The flow the slot read; unknown without targets.
@@ -1377,6 +1379,12 @@ impl<P: Product> StateMachine<P> {
                         })
                         .collect(),
                     masks: f.masks.clone(),
+                    depth_changes: (f.depth_changes.iter())
+                        .map(|(g, slot, from, changes)| {
+                            let changes = changes.iter().map(|&(at, db)| (at, db.to_bits()));
+                            (*g, *slot, from.to_bits(), changes.collect())
+                        })
+                        .collect(),
                 }
             },
         }
@@ -1449,6 +1457,12 @@ impl<P: Product> StateMachine<P> {
                 })
                 .collect(),
             masks: f.masks.clone(),
+            depth_changes: (f.depth_changes.iter())
+                .map(|(g, slot, from, changes)| {
+                    let changes = changes.iter().map(|&(at, db)| (at, f32::from_bits(db)));
+                    (*g, *slot, f32::from_bits(*from), changes.collect())
+                })
+                .collect(),
         };
         self.ramps = (saved.ramps.iter())
             .map(|row| {

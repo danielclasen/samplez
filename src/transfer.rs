@@ -1279,12 +1279,23 @@ pub struct InFlight {
     /// mask in order, the last the coefficient's mask in `masks`. A change
     /// joins the one before when it comes within the ramp length and two
     /// duck gain intervals of it. The crossfades are continued on
-    /// detectors steady at the install, and depths that held their value
-    /// before the ramp `depths` names. Only an engine built from product
+    /// detectors steady at the install, and the depths `depth_changes`
+    /// gives, or else `depths`. Only an engine built from product
     /// state reads it, to continue those crossfades; the samples of an
     /// engine not built from it never depend on it, and no entry, target,
     /// page hash or fingerprint carries it.
     pub masks: Vec<MaskChain>,
+    /// The duck depth changes a mask crossfade in `masks`, or one a later
+    /// mask change starts, may still read, per duck group and input slot
+    /// `(group, slot, from, changes)`: the depth in dB held before them,
+    /// then each change's index and depth in order, each ramping over the
+    /// ramp length from the depth it finds, the last the depth in
+    /// `ducks`. A mask crossfade's gains follow the depth at every end of
+    /// a gain interval since its first change, so a depth changed more
+    /// than once within it needs every ramp, not only the latest that
+    /// `depths` names. Only an engine built from product state reads it,
+    /// as it reads `masks`.
+    pub depth_changes: Vec<DepthChain>,
 }
 
 /// One coefficient's duck mask changes in [`InFlight::masks`]: (input
@@ -1292,7 +1303,54 @@ pub struct InFlight {
 /// mask).
 pub type MaskChain = (usize, usize, u8, Vec<(u64, u8)>);
 
+/// One depth's changes in [`InFlight::depth_changes`]: (duck group,
+/// input slot, the depth in dB held before them, each change's index and
+/// depth in dB).
+pub type DepthChain = (usize, usize, f32, Vec<(u64, f32)>);
+
+/// The depth at sample index `n` of a depth held at `from` before the
+/// changes `changes`, each `(index, dB)` in order ramping over `len`
+/// samples from the depth it finds, as a running matrix ramps a depth.
+pub(crate) fn depth_at((from, changes): (f32, &[(u64, f32)]), len: u32, n: u64) -> f32 {
+    let (mut to, mut ramp) = (from, None::<Fade>);
+    for &(at, db) in changes.iter().take_while(|c| c.0 <= n) {
+        let from = ramp.map_or(to, |f| f.value_at(to, at));
+        ramp = (from != db && len != 0).then_some(Fade {
+            from,
+            start: at,
+            len,
+        });
+        to = db;
+    }
+    ramp.map_or(to, |f| f.value_at(to, n))
+}
+
 impl InFlight {
+    /// Takes a change of the depth of duck group `group` on input slot
+    /// `slot` to `db` at index `at` into [`InFlight::depth_changes`]: onto
+    /// the depth's changes, or as the first of new ones from `held`, the
+    /// depth before it, after the ramp `ramp` towards `held` that the
+    /// depth may still run, which `depths` names. A change to the depth
+    /// held with no ramp running is none.
+    pub fn depth(
+        &mut self,
+        (group, slot): (usize, usize),
+        (held, ramp): (f32, Option<Fade>),
+        (at, db): (u64, f32),
+    ) {
+        if let Some(c) = (self.depth_changes.iter_mut()).find(|c| (c.0, c.1) == (group, slot)) {
+            c.3.push((at, db));
+            return;
+        }
+        let (from, mut changes) = match ramp {
+            Some(f) => (f.from, vec![(f.start, held)]),
+            None if held == db => return,
+            None => (held, Vec::new()),
+        };
+        changes.push((at, db));
+        self.depth_changes.push((group, slot, from, changes));
+    }
+
     /// Takes a duck mask change of the coefficient from input channel
     /// `input` to column `output`, from `held` to `mask` at index `at`,
     /// crossfading over `ramp` samples, into [`InFlight::masks`]: onto
@@ -1358,6 +1416,24 @@ impl InFlight {
             c.3.last()
                 .is_some_and(|&(last, _)| last.saturating_add(reach(ramp)) > floor)
         });
+        // A mask crossfade reads the depth from two gain intervals before
+        // its first change on, and a mask change at or after the floor
+        // from two before the floor.
+        let first = self.masks.iter().filter_map(|c| c.3.first().map(|f| f.0));
+        let horizon = (first.fold(floor, u64::min))
+            .saturating_sub(2 * u64::from(samplez_dsp::strip::GAIN_INTERVAL));
+        self.depth_changes.retain_mut(|(_, _, from, changes)| {
+            // A change starting at or before the horizon makes those
+            // before it unread: its ramp starts from the depth they gave.
+            let read = changes.iter().rposition(|c| c.0 <= horizon).unwrap_or(0);
+            if read > 0 {
+                *from = depth_at((*from, &changes[..read]), ramp, changes[read].0);
+                changes.drain(..read);
+            }
+            changes
+                .last()
+                .is_some_and(|&(last, _)| last.saturating_add(len) > horizon)
+        });
     }
 
     /// Whether it names nothing.
@@ -1366,6 +1442,7 @@ impl InFlight {
             && self.crossfades.iter().all(Option::is_none)
             && self.depths.iter().flatten().all(Option::is_none)
             && self.masks.is_empty()
+            && self.depth_changes.is_empty()
     }
 }
 
@@ -1477,6 +1554,7 @@ mod tests {
                 (0, 0, 0, vec![(900, 1), (1000, 0)]),
                 (1, 0, 0, vec![(2000, 1)]),
             ],
+            depth_changes: Vec::new(),
         };
         f.prune(1495, 480);
         assert_eq!(f.fade_ins, vec![None, Some(2000)]);
@@ -1489,6 +1567,64 @@ mod tests {
         assert!(!f.is_empty());
         f.prune(4000, 480);
         assert!(f.is_empty());
+    }
+
+    /// A prune keeps of a depth's changes what a kept mask crossfade, or
+    /// one a mask change at or after the floor starts, reads: the depth
+    /// from two gain intervals before the earliest first mask change, or
+    /// before the floor, on. The last change at or before that horizon
+    /// starts from the depth the ones before it gave, which go; changes
+    /// whose last ramp ended there go whole.
+    #[test]
+    fn a_prune_keeps_the_depth_changes_a_mask_crossfade_reads() {
+        let changes = vec![(1000, 20.0), (1100, 30.0), (3000, 0.0)];
+        let mut f = InFlight {
+            masks: vec![(1, 0, 0, vec![(1050, 1)])],
+            depth_changes: vec![(0, 1, 10.0, changes.clone())],
+            ..InFlight::default()
+        };
+        // The mask crossfade reads from 1034 on, inside the first ramp.
+        f.prune(1500, 480);
+        assert_eq!(f.depth_changes, vec![(0, 1, 10.0, changes.clone())]);
+        // The mask crossfade is over; the horizon 1584 lies past 1100.
+        f.prune(1600, 480);
+        assert!(f.masks.is_empty());
+        let from = depth_at((10.0, &changes[..1]), 480, 1100);
+        assert!(10.0 < from && from < 20.0, "{from}");
+        assert_eq!(f.depth_changes, vec![(0, 1, from, changes[1..].to_vec())]);
+        for n in [1584, 2000, 3000, 3200] {
+            let (kept, all) = (
+                depth_at((from, &changes[1..]), 480, n),
+                depth_at((10.0, &changes), 480, n),
+            );
+            assert_eq!(kept.to_bits(), all.to_bits(), "at {n}");
+        }
+        f.prune(3496, 480);
+        assert!(f.is_empty());
+    }
+
+    /// A depth change with no changes kept starts them from the ramp the
+    /// depth runs, so the depth before the change is that ramp's; one to
+    /// the depth held with no ramp running is none.
+    #[test]
+    fn a_depth_change_starts_from_the_ramp_it_finds() {
+        let mut f = InFlight::default();
+        f.depth((0, 1), (20.0, None), (900, 20.0));
+        assert!(f.is_empty());
+        let ramp = Fade {
+            from: 12.0,
+            start: 800,
+            len: 480,
+        };
+        f.depth((0, 1), (20.0, Some(ramp)), (900, 30.0));
+        let (from, changes) = (12.0, vec![(800, 20.0), (900, 30.0)]);
+        assert_eq!(f.depth_changes, vec![(0, 1, from, changes.clone())]);
+        for n in [700, 800, 850] {
+            let d = depth_at((from, &changes), 480, n);
+            assert_eq!(d.to_bits(), ramp.value_at(20.0, n).to_bits(), "at {n}");
+        }
+        f.depth((0, 1), (30.0, None), (1000, 30.0));
+        assert_eq!(f.depth_changes[0].3.len(), 3);
     }
 
     /// A strip mid-envelope: high-pass, a bell, gate and a compressor of

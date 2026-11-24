@@ -108,15 +108,14 @@ Weakening one is a design change: say so and agree it first.
 - **A rebuilt or resynced replica matches its peers from its first
   page.** The exceptions `docs/ARCHITECTURE.md` "Rebuild from product
   state" lists for a rebuild
-  (duck detector state, a mask crossfade over a depth changed more than
-  once within it, a depth changed again while its earlier ramp ran, the
-  later change after the second last end of a duck gain interval
-  before the install index or at it, and signal state outside product
-  state: the filter and envelope state of input and output strips, the
-  limiters' state and the delay lines' history and taps (a crossfade
-  in flight), which follow the samples an engine computed and only a
-  resync copies) cost one
-  diverged page and a resync; do not widen that list.
+  (duck detector state, a depth changed again while its earlier ramp
+  ran, the later change after the second last end of a duck gain
+  interval before the install index or at it, and signal state outside
+  product state: the filter and envelope state of input and output
+  strips, the limiters' state and the delay lines' history and taps (a
+  crossfade in flight), which follow the samples an engine computed and
+  only a resync copies) cost one diverged page and a resync; do not
+  widen that list.
   Enforced by: the replay, install and rebuild tests in
   `tests/transfer.rs` (`a_replayed_core_computes_the_donors_pages`,
   `a_replayed_core_carries_*`, `a_product_core_installs_at_the_index_*`,
@@ -143,9 +142,9 @@ of the compatibility key (`rollout::key`, `docs/ARCHITECTURE.md`
 - `PROTOCOL`: the log's wire format, the library's replicated semantics
   (state machine, `Entry` variants, `Targets` fields, restamp and void
   handling), and any change to how page hashes or entry fingerprints are
-  computed, also where the samples stay the same. It is 7: the
-  compressor's mix (`samplez_dsp::CompParams::mix`) in the strip entries
-  and targets.
+  computed, also where the samples stay the same. It is 8: the duck
+  depth changes a mask crossfade in flight reads, in product state and
+  snapshots.
 - `COMPUTE_VERSION`: any change to the samples or meters the engine
   computes, dependency and toolchain changes included, or to what a core
   copy holds or how it encodes. `samplez-dsp` pins `libm = "=0.2.16"`,

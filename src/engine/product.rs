@@ -11,7 +11,7 @@ use crate::batch::Batch;
 use crate::config::Config;
 use crate::ducks::DuckCore;
 use crate::rt_loop::{Change, LogId, RtEntry, bit, meter_bit, slots_of};
-use crate::transfer::{Core, InFlight, ProductState, SlotCore};
+use crate::transfer::{Core, InFlight, ProductState, SlotCore, depth_at};
 
 /// Refuses in-flight ramps no log leaves on an engine of `config` whose
 /// matrix is `(n, m)`: of more inputs or duck groups than it has, a
@@ -47,6 +47,23 @@ pub(crate) fn check(
             d.from, d.len
         ));
     }
+    for (group, slot, from, changes) in &f.depth_changes {
+        let depth = (state.ducks.get(*group))
+            .and_then(|d| d.depths.get(*slot))
+            .copied()
+            .unwrap_or(0.0);
+        if *group >= MAX_DUCKS
+            || *slot >= slots
+            || !DEPTH_DB.contains(from)
+            || changes.iter().any(|c| !DEPTH_DB.contains(&c.1))
+            || changes.last().is_none_or(|c| c.1 != depth)
+        {
+            return Err(format!(
+                "depth changes of group {group} on input {slot} outside the depth bounds or \
+                 not ending at its depth"
+            ));
+        }
+    }
     for (input, output, _, changes) in &f.masks {
         let mask = (state.masks.get(*input).and_then(|r| r.get(*output)))
             .copied()
@@ -77,7 +94,7 @@ pub(crate) fn leaving(state: &ProductState, ramp: u32) -> Vec<Option<(u64, Strin
 /// ramps and its pending entries, folded, prepared off the RT thread
 /// before the first attempt, with the room each attempt fills, so an
 /// attempt between two blocks of the RT thread allocates nothing but a
-/// mask change's list the passed entries add.
+/// mask or depth change's list the passed entries add.
 pub(crate) struct ProductFill {
     /// Input channels and columns.
     shape: (usize, usize),
@@ -114,8 +131,9 @@ pub(crate) struct ProductFill {
     /// without masks or depths pay nothing for them.
     mask_targets: Vec<u8>,
     masks: Vec<u8>,
-    /// The mask changes whose crossfades may still run, in
-    /// [`InFlight::masks`] alone.
+    /// The mask changes whose crossfades may still run and the depth
+    /// changes they read, by input channel, in [`InFlight::masks`] and
+    /// [`InFlight::depth_changes`] alone.
     chain_targets: InFlight,
     chains: InFlight,
     /// Per input channel and group, as the matrix holds them.
@@ -205,8 +223,16 @@ impl ProductFill {
         let fade_in_targets: Vec<Option<u64>> = (0..slots)
             .map(|s| flight.fade_ins.get(s).copied().flatten())
             .collect();
+        // The depth changes per input channel, as the matrix holds depths.
+        let depth_changes = (flight.depth_changes.iter())
+            .flat_map(|(g, slot, from, changes)| {
+                let (first, legs) = rows[*slot];
+                (first..first + legs).map(move |row| (*g, row, *from, changes.clone()))
+            })
+            .collect();
         let chain_targets = InFlight {
             masks: flight.masks.clone(),
+            depth_changes,
             ..InFlight::default()
         };
         ProductFill {
@@ -288,6 +314,9 @@ impl ProductFill {
         fade_ins.copy_from_slice(&self.fade_in_targets);
         masks.copy_from_slice(&self.mask_targets);
         chains.masks.clone_from(&self.chain_targets.masks);
+        chains
+            .depth_changes
+            .clone_from(&self.chain_targets.depth_changes);
         depths.copy_from_slice(&self.depth_targets);
         depth_fadings.copy_from_slice(&self.depth_fading_targets);
         let mut disabled = self.disabled_targets;
@@ -380,6 +409,9 @@ impl ProductFill {
                         });
                         for &(row, g, db) in &b.depths {
                             let r = row as usize * MAX_DUCKS + usize::from(g);
+                            let held = (depths[r], depth_fadings[r]);
+                            let (g, row) = (usize::from(g), row as usize);
+                            chains.depth((g, row), held, (e.at_index, db));
                             fold_passed(depths, depth_fadings, r, (db, None), e.at_index, ramp);
                         }
                         for &(g, change) in &b.ducks {
@@ -439,9 +471,12 @@ impl ProductFill {
         for (input, output, from, changes) in &chains.masks {
             let depth = |g: usize, n: u64| {
                 let r = input * MAX_DUCKS + g;
-                depths.get(r).map_or(0.0, |&db| {
-                    depth_fadings[r].map_or(db, |f| f.value_at(db, n))
-                })
+                let changed = (chains.depth_changes.iter()).find(|c| (c.0, c.1) == (g, *input));
+                match (changed, depths.get(r)) {
+                    (Some((.., held, changes)), _) => depth_at((*held, changes), ramp, n),
+                    (None, Some(&db)) => depth_fadings[r].map_or(db, |f| f.value_at(db, n)),
+                    (None, None) => 0.0,
+                }
             };
             let changed = (*from, changes.as_slice());
             let _ =
@@ -788,6 +823,46 @@ mod tests {
         let mut state = state(20.0, false);
         state.in_flight.masks = vec![(1, 0, 0, vec![(AT, 1), (back, 0)])];
         rebuilt_alike("mask", &entries, &[], back / B + 1, &state, [0; SLOTS]);
+    }
+
+    /// A mask crossfade, and a change back inside it, over a depth changed
+    /// twice within them, the second change while the first one's ramp
+    /// ran, continue on an engine rebuilt inside all of them: the change
+    /// back starts from the gains of the depth the first ramp gave there,
+    /// not of the depth the second one started from.
+    #[test]
+    fn a_rebuilt_engine_continues_a_mask_crossfade_over_two_depth_ramps() {
+        let (first, back, second) = (AT + B, AT + 2 * B, AT + 3 * B);
+        let depth = |db| vec![duck(DuckSetting::Depth { slot: 1, db })];
+        let entries = [
+            setup(10.0, false),
+            (AT, vec![mask(1, 1)]),
+            (first, depth(20.0)),
+            (back, vec![mask(1, 0)]),
+            (second, depth(30.0)),
+        ];
+        let mut state = state(30.0, false);
+        let ramp = Fade {
+            from: 10.0,
+            start: first,
+            len: RAMP,
+        };
+        let ramp = Fade {
+            from: ramp.value_at(20.0, second),
+            start: second,
+            len: RAMP,
+        };
+        state.in_flight.depths = vec![vec![None, Some(ramp)]];
+        state.in_flight.masks = vec![(1, 0, 0, vec![(AT, 1), (back, 0)])];
+        state.in_flight.depth_changes = vec![(0, 1, 10.0, vec![(first, 20.0), (second, 30.0)])];
+        rebuilt_alike(
+            "mask-depths",
+            &entries,
+            &[],
+            second / B + 2,
+            &state,
+            [0; SLOTS],
+        );
     }
 
     /// An input's fade-in after an `InputUp` continues on an engine

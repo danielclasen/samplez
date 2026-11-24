@@ -208,7 +208,9 @@ fn the_tracker_joins_a_late_fade() {
 
 /// A depth setting ramps the slot's depth from the value it has at
 /// the setting's index over the ramp length, a ramp still running
-/// included, the value as the bridge admits it.
+/// included, the value as the bridge admits it. Every change is kept
+/// in the depth's changes, from the depth before the first, for a mask
+/// crossfade to read, and a snapshot carries them.
 #[test]
 fn the_tracker_follows_the_depth_ramps() {
     let mut sm = machine();
@@ -223,6 +225,8 @@ fn the_tracker_follows_the_depth_ramps() {
         len: 480,
     };
     assert_eq!(sm.in_flight.depths, vec![vec![Some(first)]]);
+    let changes = vec![(0, 0, 10.0, vec![(9600, 30.0)])];
+    assert_eq!(sm.in_flight.depth_changes, changes);
     let mut now = held();
     now.ducks[0].depths[0] = 30.0;
     // Clamped to 40 dB, from where the first ramp is.
@@ -233,6 +237,34 @@ fn the_tracker_follows_the_depth_ramps() {
         len: 480,
     };
     assert_eq!(sm.in_flight.depths, vec![vec![Some(second)]]);
+    let changes = vec![(0, 0, 10.0, vec![(9600, 30.0), (9696, 40.0)])];
+    assert_eq!(sm.in_flight.depth_changes, changes);
+    let mut loaded = machine();
+    loaded
+        .load(sm.save(), Limits::defaults(48_000))
+        .expect("loads");
+    assert_eq!(loaded.in_flight, sm.in_flight);
+}
+
+/// A snapshot written before the depth changes were kept, without the
+/// field, loads with none and the depth ramps it carries as they were.
+#[test]
+fn a_snapshot_without_depth_changes_loads_with_none() {
+    let mut sm = machine();
+    let depth = Entry::Duck {
+        group: 0,
+        setting: samplez::DuckSetting::Depth { slot: 0, db: 30.0 },
+    };
+    sm.follow(&[depth], Some(&held()), 9600);
+    assert!(!sm.in_flight.depth_changes.is_empty());
+    let mut saved = serde_json::to_value(sm.save()).expect("encodes");
+    let flight = saved["in_flight"].as_object_mut().expect("in flight");
+    assert!(flight.remove("depth_changes").is_some());
+    let mut loaded = machine();
+    let saved = serde_json::from_value(saved).expect("decodes");
+    loaded.load(saved, Limits::defaults(48_000)).expect("loads");
+    assert!(loaded.in_flight.depth_changes.is_empty());
+    assert_eq!(loaded.in_flight.depths, sm.in_flight.depths);
 }
 
 /// A mask change joins the coefficient's changes while the last of

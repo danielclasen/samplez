@@ -421,10 +421,10 @@ follow the samples an engine computed and only a resync copies:
 
 - duck detectors start cold: key filters at rest, no hold, the envelope
   at 0 or, for a group on or held, at full depth. A mask crossfade
-  continues bit for bit only where the detectors were steady over it and
-  the depth held its value before the ramp; over a depth changed more than
-  once within it, it differs until both end. A depth changed again while
-  its earlier ramp ran, after the second last end of a duck gain interval
+  continues bit for bit only where the detectors were steady over it, its
+  gains following every depth change the state names within it
+  (`InFlight::depth_changes`). A depth changed again while its earlier
+  ramp ran, after the second last end of a duck gain interval
   before the install index, gets other gains there than its peers held;
 - the filter and envelope state of input and output strips, the limiters'
   rings and gain, and the delay lines' history and taps (a crossfade in
@@ -591,7 +591,7 @@ A replica's compatibility key (`rollout::key`) is a hash of three versions
   taken only at an equal `COMPUTE_VERSION`. `samplez-dsp` pins `libm` to
   one exact version, since another can compute other bits, and a product
   pins it likewise.
-- `samplez_replica::PROTOCOL` (7): the log's wire format and the
+- `samplez_replica::PROTOCOL` (8): the log's wire format and the
   library's replicated semantics (the state machine, the `Entry`
   variants, the `Targets` fields, restamp and void handling, the block
   digests peers judge pages by), and how page hashes or entry
