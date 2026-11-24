@@ -458,7 +458,8 @@ fsync.
 
 The replica's `Contact` lock and the `Store`'s log lock, applied-state
 lock and state gate record their holders; no other lock is watched
-(`lock_watch`). A watchdog thread checks them every second, and when one
+(`lock_watch`). A watchdog thread, started with the first replica in a
+process, a test's included, checks them every second, and when one
 has been held for more than 10 s it writes the lock's name, each holder's
 thread, how long it has held it and the call site where it took it, and
 every thread waiting for it with its call site, to stderr, and aborts the

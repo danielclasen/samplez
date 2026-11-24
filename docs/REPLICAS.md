@@ -153,11 +153,9 @@ replicated state on a blocking pool of at most 4 threads and answer 503
 with a body naming the timeout when the read has not returned within 1 s,
 so neither can hold up `/healthz`.
 
-A watchdog thread, started with the first replica, aborts the process
-when a watched lock is held for more than 10 s, writing each holder and
-waiter with its call site to stderr
-([Locks](ARCHITECTURE.md#locks)). Any process that starts a replica, a
-test included, is subject to it.
+A replica lock held for more than 10 s ends the process with SIGABRT,
+after a report on stderr starting `samplez: a replica lock was held past
+its limit, aborting` ([Locks](ARCHITECTURE.md#locks)).
 
 ## Metrics
 
