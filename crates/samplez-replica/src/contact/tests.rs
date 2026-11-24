@@ -246,6 +246,10 @@ struct Engine {
     disabled: AtomicU64,
     /// The build time it reports, in samples; none at 0.
     build_time: AtomicU64,
+    /// It reports its pending generation not built.
+    generation_pending: std::sync::atomic::AtomicBool,
+    /// It reports no processed block.
+    idle: std::sync::atomic::AtomicBool,
     /// [`Audio::follows`].
     follows: std::sync::atomic::AtomicBool,
     /// Its outputs stand committing, not withdrawn.
@@ -313,7 +317,7 @@ impl Audio for Engine {
         let step = self.clock.tai_ns() >= self.step_at.load(Ordering::SeqCst);
         Sample {
             own: Own {
-                processed: Some(1),
+                processed: Some(1).filter(|_| !self.idle.load(Ordering::SeqCst)),
                 clock: ClockFlags {
                     step_fence: step,
                     ..ClockFlags::default()
@@ -337,7 +341,7 @@ impl Audio for Engine {
             enabled: (0..self.reported())
                 .map(|o| self.disabled.load(Ordering::SeqCst) & 1 << o == 0)
                 .collect(),
-            generation_ready: true,
+            generation_ready: !self.generation_pending.load(Ordering::SeqCst),
             clock_steps: 0,
             log_overflows: 0,
         }
@@ -570,6 +574,8 @@ fn engine(clock: &Arc<Clock>) -> Arc<Engine> {
         second: std::sync::atomic::AtomicBool::new(false),
         disabled: AtomicU64::new(0),
         build_time: AtomicU64::new(0),
+        generation_pending: std::sync::atomic::AtomicBool::new(false),
+        idle: std::sync::atomic::AtomicBool::new(false),
         follows: std::sync::atomic::AtomicBool::new(true),
         committing: std::sync::atomic::AtomicBool::new(false),
         apart: std::sync::atomic::AtomicBool::new(false),
@@ -4233,4 +4239,165 @@ async fn the_records_held_per_addressee_are_bounded() {
         let held = net.contact(1).carried_len(2);
         assert!(held <= bound, "round {round}: {held} records held");
     }
+}
+
+/// A start an unverified clock holds names that reason from its first
+/// period, is logged once it has been in `starting` for
+/// [`START_HOLD_WARN`] and not again, and names nothing once the clock
+/// verifies and the engine is rebuilt: a start held for minutes says why.
+#[tokio::test(start_paused = true)]
+async fn a_start_held_by_an_unverified_clock_names_its_reason_and_logs_it_once() {
+    let f = fixture(&[&[1, 2, 3]]);
+    f.contact.lock().verified_always = false;
+    f.tick();
+    assert_eq!(f.state(), Some(ReplicaState::Starting));
+    let m = f.contact.metrics();
+    assert_eq!(m.start_hold, Some(StartHold::ClockUnverified));
+    assert_eq!(m.start_hold_warnings, 0);
+    tokio::time::advance(START_HOLD_WARN - Duration::from_millis(1)).await;
+    f.tick();
+    assert_eq!(
+        f.contact.metrics().start_hold_warnings,
+        0,
+        "held too briefly"
+    );
+    tokio::time::advance(Duration::from_millis(2)).await;
+    f.tick();
+    assert_eq!(f.contact.metrics().start_hold_warnings, 1);
+    tokio::time::advance(Duration::from_mins(5)).await;
+    f.tick();
+    let m = f.contact.metrics();
+    assert_eq!(m.start_hold_warnings, 1, "logged once per start");
+    assert_eq!(m.start_hold, Some(StartHold::ClockUnverified));
+    f.contact.verified_always();
+    for _ in 0..5 {
+        f.tick();
+    }
+    let m = f.contact.metrics();
+    assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+    assert_eq!(m.start_hold, None);
+    assert_eq!(m.start_hold_warnings, 1);
+}
+
+/// A verified replica whose engine core cannot be rebuilt names the
+/// rebuild as what holds its start.
+#[tokio::test(start_paused = true)]
+async fn a_start_held_by_a_failing_rebuild_names_the_rebuild() {
+    let f = fixture(&[&[1, 2, 3]]);
+    f.tick();
+    assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+    assert_eq!(f.contact.metrics().start_hold, None, "not in starting");
+    f.engine.rebuilds.store(false, Ordering::SeqCst);
+    f.apply(10);
+    f.log.0.lock().unwrap().installs += 1;
+    f.contact.log_changed();
+    f.tick();
+    f.tick();
+    assert_eq!(f.state(), Some(ReplicaState::Starting));
+    assert_eq!(f.contact.metrics().start_hold, Some(StartHold::Rebuilding));
+}
+
+/// A stay in `starting` is logged once, after [`START_HOLD_WARN`], and
+/// only while a reason holds it; leaving `starting` starts the next stay
+/// afresh.
+#[tokio::test(start_paused = true)]
+async fn a_stay_in_starting_is_logged_once_past_the_bound_while_held() {
+    let t0 = Instant::now();
+    let mut w = StartWatch::default();
+    assert!(!w.observe(true, true, t0));
+    assert!(!w.observe(true, true, t0 + START_HOLD_WARN - Duration::from_millis(1)));
+    // Not held at the bound: nothing to name yet.
+    assert!(!w.observe(true, false, t0 + START_HOLD_WARN));
+    assert!(w.observe(true, true, t0 + START_HOLD_WARN));
+    assert!(!w.observe(true, true, t0 + 2 * START_HOLD_WARN));
+    assert!(!w.observe(false, false, t0 + 2 * START_HOLD_WARN));
+    let t1 = t0 + 3 * START_HOLD_WARN;
+    assert!(!w.observe(true, true, t1));
+    assert!(w.observe(true, true, t1 + START_HOLD_WARN));
+}
+
+/// The reason a start is held on a fresh fixture after `setup`, and its
+/// state after one tick.
+fn first_hold(setup: impl FnOnce(&Fixture)) -> (Option<StartHold>, Option<ReplicaState>) {
+    let f = fixture(&[&[1, 2, 3]]);
+    setup(&f);
+    f.tick();
+    (f.contact.metrics().start_hold, f.state())
+}
+
+/// Each term of a start's readiness is named when it alone fails, in
+/// the order `live` checks them: a horizon hold before the log, the
+/// log before the generation, the generation before the first block.
+#[tokio::test(start_paused = true)]
+async fn each_term_holding_a_start_is_named() {
+    use ReplicaState::Starting;
+    assert_eq!(first_hold(|_| {}), (None, Some(ReplicaState::Withdrawn)));
+    assert_eq!(
+        first_hold(|f| f.contact.lock().horizon_always = true),
+        (Some(StartHold::HorizonHeld), Some(Starting))
+    );
+    // The commit it knows lies past what its log applied.
+    assert_eq!(
+        first_hold(|f| f.contact.lock().known_committed = 5),
+        (
+            Some(StartHold::Applying {
+                applied: 0,
+                needed: 5
+            }),
+            Some(Starting)
+        )
+    );
+    // A restart needs its log applied past the index it began at.
+    assert_eq!(
+        first_hold(|f| {
+            let mut st = f.contact.lock();
+            f.contact.begin_restart(&mut st, 7, "test");
+        }),
+        (
+            Some(StartHold::Applying {
+                applied: 0,
+                needed: 7
+            }),
+            Some(Starting)
+        )
+    );
+    assert_eq!(
+        first_hold(|f| f.engine.generation_pending.store(true, Ordering::SeqCst)),
+        (Some(StartHold::GenerationPending), Some(Starting))
+    );
+    // Ready by the log and the generation, but no block processed:
+    // `starting` is left only with one.
+    assert_eq!(
+        first_hold(|f| f.engine.idle.store(true, Ordering::SeqCst)),
+        (Some(StartHold::NotProcessing), Some(Starting))
+    );
+    // Two terms failing name the first: the horizon before the log, the
+    // log before the generation.
+    assert_eq!(
+        first_hold(|f| {
+            f.contact.lock().horizon_always = true;
+            f.contact.lock().known_committed = 5;
+        })
+        .0,
+        Some(StartHold::HorizonHeld)
+    );
+    assert_eq!(
+        first_hold(|f| {
+            f.contact.lock().known_committed = 5;
+            f.engine.generation_pending.store(true, Ordering::SeqCst);
+        })
+        .0,
+        Some(StartHold::Applying {
+            applied: 0,
+            needed: 5
+        })
+    );
+    assert_eq!(
+        first_hold(|f| {
+            f.engine.generation_pending.store(true, Ordering::SeqCst);
+            f.engine.idle.store(true, Ordering::SeqCst);
+        })
+        .0,
+        Some(StartHold::GenerationPending)
+    );
 }

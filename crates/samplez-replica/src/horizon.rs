@@ -16,6 +16,12 @@ impl Horizon {
         self.held
     }
 
+    /// Holds the replica, for tests that drive contact, not the horizon.
+    #[cfg(test)]
+    pub(crate) fn hold(&mut self) {
+        self.held = true;
+    }
+
     /// One period: the end of the replica's processed block and its E
     /// estimate, samples, none before either is known; `counted` whether
     /// E counts it; the bounds in samples.

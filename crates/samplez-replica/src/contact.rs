@@ -638,6 +638,7 @@ struct Counts {
     contradicted: u64,
     clock_holds: u64,
     late_rebuilds: u64,
+    start_hold_warnings: u64,
 }
 
 /// What contact takes of a learner's newest report.
@@ -797,6 +798,10 @@ struct State {
     horizon: crate::horizon::Horizon,
     /// The clock hold has the replica in `starting`.
     held: bool,
+    /// Why the replica, in `starting`, is not ready, and how long it has
+    /// been in `starting`.
+    start_hold: Option<StartHold>,
+    start_watch: StartWatch,
     /// Clock steps the engine detected, as of the last sample.
     clock_steps: u64,
     /// What `replica_clock_unverified` names, and since when it has.
@@ -810,6 +815,9 @@ struct State {
     missed_after: Option<u64>,
     #[cfg(test)]
     verified_always: bool,
+    /// The horizon holds this replica whatever it measures.
+    #[cfg(test)]
+    horizon_always: bool,
     /// Reports and copies as before [`Carried`]: every record in every
     /// report, copies keeping theirs and relaying them.
     #[cfg(test)]
@@ -1074,6 +1082,85 @@ pub struct Metrics {
     /// Times the clock hold or the horizon took the replica to
     /// `starting`, its engine dropped.
     pub clock_holds: u64,
+    /// Why the audio replica, in `starting`, is not ready; none outside
+    /// `starting` and once ready.
+    pub start_hold: Option<StartHold>,
+    /// Starts held past [`START_HOLD_WARN`], each logged once.
+    pub start_hold_warnings: u64,
+}
+
+/// Why an audio replica in `starting` is not ready: the first term of
+/// its readiness that fails, in the order [`Contact::live`] needs them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartHold {
+    /// Its clock is not verified ([`crate::verify`]).
+    ClockUnverified,
+    /// The horizon holds it ([`crate::horizon`]).
+    HorizonHeld,
+    /// Its log has applied below the index its restart, or the commit it
+    /// knows, needs.
+    Applying { applied: u64, needed: u64 },
+    /// Its engine core is being rebuilt from product state.
+    Rebuilding,
+    /// The engine's pending generation is not built yet.
+    GenerationPending,
+    /// The engine has processed no block since its core was installed.
+    NotProcessing,
+}
+
+impl StartHold {
+    /// Every [`StartHold::reason`].
+    pub const REASONS: [&'static str; 6] = [
+        "clock_unverified",
+        "horizon_held",
+        "applying",
+        "rebuilding",
+        "generation_pending",
+        "not_processing",
+    ];
+
+    /// Its label.
+    pub fn reason(self) -> &'static str {
+        match self {
+            StartHold::ClockUnverified => "clock_unverified",
+            StartHold::HorizonHeld => "horizon_held",
+            StartHold::Applying { .. } => "applying",
+            StartHold::Rebuilding => "rebuilding",
+            StartHold::GenerationPending => "generation_pending",
+            StartHold::NotProcessing => "not_processing",
+        }
+    }
+}
+
+/// How long an audio replica stays in `starting` held for a reason
+/// before it logs that reason, once per start.
+pub const START_HOLD_WARN: Duration = Duration::from_secs(30);
+
+/// One stay in `starting`: since when, and whether it was logged.
+#[derive(Debug, Default)]
+struct StartWatch {
+    since: Option<Instant>,
+    warned: bool,
+}
+
+impl StartWatch {
+    /// One period at `now`, `starting` whether the replica is in
+    /// `starting` and `held` whether a reason holds it there. True once
+    /// per stay, the first period in which a reason holds it and it has
+    /// been in `starting` for [`START_HOLD_WARN`].
+    fn observe(&mut self, starting: bool, held: bool, now: Instant) -> bool {
+        if !starting {
+            *self = StartWatch::default();
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        if self.warned || !held || now.saturating_duration_since(since) < START_HOLD_WARN {
+            return false;
+        }
+        self.warned = true;
+        true
+    }
 }
 
 /// How long `replica_clock_unverified` waits before it raises, so the
@@ -1107,6 +1194,10 @@ pub struct PeerMetrics {
     pub last_report_age: Option<Duration>,
     /// Its clock minus this one's, from the latest exchange, ns.
     pub offset_ns: Option<i64>,
+    /// What clock verification reads of it: its clock minus this one's
+    /// from the exchange with the lowest round trip of the last
+    /// [`crate::clock::WINDOW`], and that exchange's one-way delay, ns.
+    pub clock_best: Option<(i64, u64)>,
 }
 
 fn since(now: Instant, then: Instant) -> Duration {
@@ -1218,6 +1309,8 @@ impl Contact {
                     verifier: crate::verify::Verifier::default(),
                     horizon: crate::horizon::Horizon::default(),
                     held: false,
+                    start_hold: None,
+                    start_watch: StartWatch::default(),
                     clock_steps: 0,
                     unverified: Vec::new(),
                     unverified_since: None,
@@ -1225,6 +1318,8 @@ impl Contact {
                     missed_after: None,
                     #[cfg(test)]
                     verified_always: false,
+                    #[cfg(test)]
+                    horizon_always: false,
                     #[cfg(test)]
                     as_before: false,
                     carried: BTreeMap::new(),
@@ -2810,6 +2905,67 @@ impl Contact {
         );
     }
 
+    /// Logs why the replica has been in `starting` for
+    /// [`START_HOLD_WARN`], with the values that decide it.
+    fn log_start_hold(&self, st: &State, hold: StartHold, now: Instant) {
+        let held_s = st
+            .start_watch
+            .since
+            .map_or(0.0, |s| since(now, s).as_secs_f64());
+        match hold {
+            StartHold::ClockUnverified => {
+                // Each peer's clock minus this one's from its lowest
+                // round trip, and that exchange's one-way delay.
+                let peers: Vec<String> = (st.peers.iter())
+                    .map(|(id, p)| match p.thetas.best() {
+                        Some((theta, delay)) => format!(
+                            "{id}: {:.3} ms +/- {:.3} ms",
+                            theta as f64 / 1e6,
+                            delay as f64 / 1e6
+                        ),
+                        None => format!("{id}: no exchange"),
+                    })
+                    .collect();
+                tracing::warn!(
+                    held_s,
+                    tai_offset_s = ?st.own.clock.tai_offset_s,
+                    clock_guard_ms = time_of(self.timing.clock_guard) as f64 / 1e6,
+                    counted = ?self.counted(st, now),
+                    peers = %peers.join(", "),
+                    "a start is held: this replica's clock is not verified"
+                );
+            }
+            StartHold::HorizonHeld => {
+                let end = st.own.processed.map(|k| (k + 1) * self.timing.block);
+                tracing::warn!(
+                    held_s,
+                    processed_end = ?end,
+                    estimate = ?self.estimate_in(st, now),
+                    apply_guard = index_at(self.timing.apply_guard_ns()),
+                    "a start is held: the horizon holds this replica"
+                );
+            }
+            StartHold::Applying { applied, needed } => tracing::warn!(
+                held_s,
+                applied,
+                needed,
+                "a start is held: the log has not applied the entries it needs"
+            ),
+            StartHold::Rebuilding => tracing::warn!(
+                held_s,
+                running = matches!(st.rebuild, Rebuild::Running { .. }),
+                "a start is held: the engine core is being rebuilt from product state"
+            ),
+            StartHold::GenerationPending => tracing::warn!(
+                held_s,
+                "a start is held: the engine's pending generation is not built"
+            ),
+            StartHold::NotProcessing => {
+                tracing::warn!(held_s, "a start is held: the engine has processed no block");
+            }
+        }
+    }
+
     /// The replica's own state (plan 2.11, Replica states), with the
     /// verdicts naming it once their commit is known, and the audio
     /// `/readyz` term while in contact.
@@ -2842,6 +2998,27 @@ impl Contact {
             None => false,
         };
         let rebuilding = self.fold_late(st) || rebuilding;
+        let applied = self.log.applied();
+        let hold = if held && !st.verifier.verified() {
+            Some(StartHold::ClockUnverified)
+        } else if held {
+            Some(StartHold::HorizonHeld)
+        } else if let Some(needed) = st.restart.filter(|&after| applied < after) {
+            Some(StartHold::Applying { applied, needed })
+        } else if rebuilding {
+            Some(StartHold::Rebuilding)
+        } else if applied < st.known_committed {
+            Some(StartHold::Applying {
+                applied,
+                needed: st.known_committed,
+            })
+        } else if !st.generation_ready {
+            Some(StartHold::GenerationPending)
+        } else if st.own.processed.is_none() {
+            Some(StartHold::NotProcessing)
+        } else {
+            None
+        };
         let Some(life) = st.life.as_mut() else { return };
         let known = st.known_committed;
         let due: Vec<u64> = st
@@ -2854,7 +3031,7 @@ impl Contact {
         for page in due {
             life.verdict(page, &st.own, &st.realised, audio.as_ref());
         }
-        let ready = self.log.applied() >= st.known_committed && st.generation_ready && !rebuilding;
+        let ready = applied >= st.known_committed && st.generation_ready && !rebuilding;
         let baseline = self.log.baseline();
         let t = self.timing;
         let fresh = t.contact_window + t.hold;
@@ -2919,6 +3096,16 @@ impl Contact {
         }
         st.own.state = Some(state);
         st.own.ready = ready;
+        let starting = state == ReplicaState::Starting;
+        st.start_hold = hold.filter(|_| starting);
+        if st
+            .start_watch
+            .observe(starting, st.start_hold.is_some(), now)
+            && let Some(hold) = st.start_hold
+        {
+            st.counts.start_hold_warnings += 1;
+            self.log_start_hold(st, hold, now);
+        }
         // Without an engine core, or with one being rebuilt or replayed,
         // what the inputs read says nothing of their flows.
         if matches!(state, ReplicaState::Starting | ReplicaState::Resync) {
@@ -3370,6 +3557,10 @@ impl Contact {
             index_at(self.timing.apply_guard_ns()),
             spread,
         );
+        #[cfg(test)]
+        if st.horizon_always {
+            st.horizon.hold();
+        }
     }
 
     /// Unit tests that drive the log, not the clock: this replica counts
@@ -4110,6 +4301,7 @@ impl Contact {
                     silent: p.silent,
                     last_report_age: p.last.as_ref().map(|d| since(now, d.received)),
                     offset_ns: p.offset_ns,
+                    clock_best: p.thetas.best(),
                 })
                 .collect(),
             shared_gaps: c.shared_gaps,
@@ -4157,6 +4349,8 @@ impl Contact {
             replica_tai_offset_zero: st.offset_zero.clone(),
             horizon_held: st.horizon.held(),
             clock_holds: c.clock_holds,
+            start_hold: st.start_hold,
+            start_hold_warnings: c.start_hold_warnings,
         }
     }
 }
