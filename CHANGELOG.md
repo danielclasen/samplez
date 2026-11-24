@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.28.0](https://github.com/danielclasen/samplez/compare/v0.27.0...v0.28.0) (2026-11-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** InFlight has a new field, depth_changes.
+* **replica:** contact::Metrics has new public fields, start_hold and start_hold_warnings, so code that builds it with a struct literal must set them.
+
+### Features
+
+* **replica:** name why an audio replica's start is held ([#201](https://github.com/danielclasen/samplez/issues/201)) ([3a6e871](https://github.com/danielclasen/samplez/commit/3a6e871e394f35149ed98a081bdbd5dbae54ba4e))
+
+
+### Bug Fixes
+
+* **engine:** continue a mask crossfade over a depth changed twice ([#200](https://github.com/danielclasen/samplez/issues/200)) ([6a3a7ab](https://github.com/danielclasen/samplez/commit/6a3a7ab3f4c9a3c0a31e8e7167e117a944843fb2))
+
 ## [0.27.0](https://github.com/danielclasen/samplez/compare/v0.26.1...v0.27.0) (2026-11-23)
 
 
