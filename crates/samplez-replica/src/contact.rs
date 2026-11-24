@@ -3014,8 +3014,6 @@ impl Contact {
             })
         } else if !st.generation_ready {
             Some(StartHold::GenerationPending)
-        } else if st.own.processed.is_none() {
-            Some(StartHold::NotProcessing)
         } else {
             None
         };
