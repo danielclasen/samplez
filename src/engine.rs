@@ -113,7 +113,7 @@ pub struct InputStatus {
     /// none.
     pub flow_id: String,
     /// Why the last attach failed, or how far the flow's head stays off
-    /// the MXL clock (README "Real-time requirements").
+    /// the MXL clock (`docs/USAGE.md` "Inputs").
     pub error: Option<String>,
     /// The margin the producer's `maxCommitBatchSizeHint` needs, when the
     /// configured margin is below it.
