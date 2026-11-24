@@ -1,7 +1,14 @@
 # Contributor notes (agents and humans)
 
-How to change samplez. `README.md` describes what it does and wins on
-behaviour.
+How to change samplez. `README.md` is the overview, `docs/USAGE.md`
+describes how the engine behaves and is configured, `docs/REPLICAS.md`
+how a replica set is run, `docs/ARCHITECTURE.md` how the parts are built
+and fit together, and `docs/BUILDING.md` how samplez is compiled, tested
+and released; this file holds the rules for changing it. A change to
+behaviour updates `docs/USAGE.md` or `docs/REPLICAS.md`, a change to how
+the parts fit together `docs/ARCHITECTURE.md`, and a change to the
+build, tests, CI or releases `docs/BUILDING.md`, in the same PR. The
+docs win on behaviour.
 
 ## Worktrees
 
@@ -28,7 +35,7 @@ git worktree remove .claude/worktrees/<topic>-$id   # after the merge
 - **Fail loudly**: "tests pass" is wrong if any were skipped, or if the
   suite covering the change runs only in CI and has not run.
 - **Leave it cleaner**: what is touched leaves more correct and shorter,
-  `README.md` included. No session artefacts (task refs, phases, todos),
+  the docs included. No session artefacts (task refs, phases, todos),
   nothing private, only public issues and PRs, no SPDX/copyright headers
   on new files, no new `.md` files unasked.
 - **Tests at every level** (unit, `tests/`, `crates/*/tests/`,
@@ -41,11 +48,13 @@ git worktree remove .claude/worktrees/<topic>-$id   # after the merge
   `...`); vendored and generated skills under `.agents/skills/` are
   exempt.
 - **Documentation states facts** the source, a run or authoritative docs
-  confirm; a behaviour change updates the README in the same PR.
+  confirm. `README.md` stays an overview: features link into `docs/`,
+  reference material lives there.
 
 ## Orientation
 
-Six crates, x86_64 Linux only; README "Crates" has the detail.
+Six crates, x86_64 Linux only; `docs/ARCHITECTURE.md` "Crates" has the
+detail.
 
 - `samplez` (`src/`): `engine.rs` the supervisor, the one thread making
   instance-mutating libmxl calls; `rt_loop.rs` the RT block loop;
@@ -89,15 +98,16 @@ Weakening one is a design change: say so and agree it first.
   (the contact loop reads the store under it); no lock is held across
   I/O or a wait; `Product` methods and store-read closures never call
   back into `Replica` or `Store` nor wait for an apply. A watched lock
-  held past 10 s aborts the process, tests included. README "Ops
-  endpoints and the lock watchdog".
+  held past 10 s aborts the process, tests included.
+  `docs/ARCHITECTURE.md` "Locks".
   Enforced by: the call-back rule, the `log_store.rs` tests that such a
   call panics (`*_under_the_lock_panics`,
   `an_apply_inside_with_state_panics`). No test checks the order itself:
   a violation shows only as a stall the 10 s watchdog in `lock_watch.rs`
   aborts.
 - **A rebuilt or resynced replica matches its peers from its first
-  page.** The exceptions README "Starting a replica" lists for a rebuild
+  page.** The exceptions `docs/ARCHITECTURE.md` "Rebuild from product
+  state" lists for a rebuild
   (duck detector state, a mask crossfade over a depth changed more than
   once within it, a depth changed again while its earlier ramp ran, the
   later change after the second last end of a duck gain interval
@@ -126,16 +136,16 @@ Weakening one is a design change: say so and agree it first.
 ## Versions and compatibility
 
 Replicas run side by side only at equal `samplez::COMPUTE_VERSION`,
-`samplez_replica::PROTOCOL` and `Product::DERIVATION_VERSION`. The README
-paragraph on the compatibility key (`rollout::key`, in "Starting a
-replica") has the bump rules:
+`samplez_replica::PROTOCOL` and `Product::DERIVATION_VERSION`, the parts
+of the compatibility key (`rollout::key`, `docs/ARCHITECTURE.md`
+"Versions and the compatibility key"). The bump rules:
 
 - `PROTOCOL`: the log's wire format, the library's replicated semantics
   (state machine, `Entry` variants, `Targets` fields, restamp and void
   handling), and any change to how page hashes or entry fingerprints are
-  computed, also where the samples stay the same. It is 6: the
-  pre-strip meter's `Entry::PreStripMeter` and
-  `Targets::pre_strip_meters`.
+  computed, also where the samples stay the same. It is 7: the
+  compressor's mix (`samplez_dsp::CompParams::mix`) in the strip entries
+  and targets.
 - `COMPUTE_VERSION`: any change to the samples or meters the engine
   computes, dependency and toolchain changes included, or to what a core
   copy holds or how it encodes. `samplez-dsp` pins `libm = "=0.2.16"`,
@@ -158,7 +168,8 @@ A version bump a change needs belongs to that change: add a new row to
 
 ## Build and test
 
-Run the way `.github/workflows/ci.yml` runs, in the builder image:
+Run the way `.github/workflows/ci.yml` runs, in the builder image
+(`docs/BUILDING.md` has every command):
 
 ```sh
 docker build -t samplez-builder:ci docker/builder
