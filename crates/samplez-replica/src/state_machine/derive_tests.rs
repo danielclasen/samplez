@@ -246,6 +246,27 @@ fn the_tracker_follows_the_depth_ramps() {
     assert_eq!(loaded.in_flight, sm.in_flight);
 }
 
+/// A snapshot written before the depth changes were kept, without the
+/// field, loads with none and the depth ramps it carries as they were.
+#[test]
+fn a_snapshot_without_depth_changes_loads_with_none() {
+    let mut sm = machine();
+    let depth = Entry::Duck {
+        group: 0,
+        setting: samplez::DuckSetting::Depth { slot: 0, db: 30.0 },
+    };
+    sm.follow(&[depth], Some(&held()), 9600);
+    assert!(!sm.in_flight.depth_changes.is_empty());
+    let mut saved = serde_json::to_value(sm.save()).expect("encodes");
+    let flight = saved["in_flight"].as_object_mut().expect("in flight");
+    assert!(flight.remove("depth_changes").is_some());
+    let mut loaded = machine();
+    let saved = serde_json::from_value(saved).expect("decodes");
+    loaded.load(saved, Limits::defaults(48_000)).expect("loads");
+    assert!(loaded.in_flight.depth_changes.is_empty());
+    assert_eq!(loaded.in_flight.depths, sm.in_flight.depths);
+}
+
 /// A mask change joins the coefficient's changes while the last of
 /// them is within the ramp and two gain intervals, starts new ones
 /// after that, and is no crossfade on a coefficient at 0.
