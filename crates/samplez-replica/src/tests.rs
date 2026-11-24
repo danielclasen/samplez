@@ -28,6 +28,44 @@ fn the_version_mismatch_reason_is_exposed_by_its_label() {
     assert_eq!(reason(&none, "awaiting_hand_over"), 0.0);
 }
 
+/// Each reason a start is held is exposed under its own label: the one
+/// holding the replica reads 1 and every other 0, and with none every
+/// reason reads 0.
+#[test]
+fn the_start_hold_reason_is_exposed_by_its_label() {
+    use contact::StartHold;
+    let value = |samples: &[ReplicaMetric], reason: &str| {
+        let s = samples
+            .iter()
+            .find(|s| s.labels == [("reason", reason.to_owned())])
+            .expect("a sample per reason");
+        assert_eq!(s.name, "samplez_replica_start_held");
+        s.value
+    };
+    let holds = [
+        StartHold::ClockUnverified,
+        StartHold::HorizonHeld,
+        StartHold::Applying {
+            applied: 3,
+            needed: 7,
+        },
+        StartHold::Rebuilding,
+        StartHold::GenerationPending,
+    ];
+    for hold in holds {
+        let samples = start_hold_samples(Some(hold));
+        assert_eq!(samples.len(), StartHold::REASONS.len());
+        for reason in StartHold::REASONS {
+            let want = if reason == hold.reason() { 1.0 } else { 0.0 };
+            assert_eq!(value(&samples, reason), want, "{hold:?} under {reason}");
+        }
+    }
+    let none = start_hold_samples(None);
+    for reason in StartHold::REASONS {
+        assert_eq!(value(&none, reason), 0.0, "{reason}");
+    }
+}
+
 /// The value of `samplez_replica_disagreements_total` of `kind`.
 fn disagreements(samples: &[ReplicaMetric], kind: &str) -> f64 {
     let s = samples

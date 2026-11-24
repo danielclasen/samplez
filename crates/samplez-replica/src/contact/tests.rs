@@ -4234,3 +4234,78 @@ async fn the_records_held_per_addressee_are_bounded() {
         assert!(held <= bound, "round {round}: {held} records held");
     }
 }
+
+/// A start an unverified clock holds names that reason from its first
+/// period, is logged once it has been in `starting` for
+/// [`START_HOLD_WARN`] and not again, and names nothing once the clock
+/// verifies and the engine is rebuilt: a start held for minutes says why.
+#[tokio::test(start_paused = true)]
+async fn a_start_held_by_an_unverified_clock_names_its_reason_and_logs_it_once() {
+    let f = fixture(&[&[1, 2, 3]]);
+    f.contact.lock().verified_always = false;
+    f.tick();
+    assert_eq!(f.state(), Some(ReplicaState::Starting));
+    let m = f.contact.metrics();
+    assert_eq!(m.start_hold, Some(StartHold::ClockUnverified));
+    assert_eq!(m.start_hold_warnings, 0);
+    tokio::time::advance(START_HOLD_WARN - Duration::from_millis(1)).await;
+    f.tick();
+    assert_eq!(
+        f.contact.metrics().start_hold_warnings,
+        0,
+        "held too briefly"
+    );
+    tokio::time::advance(Duration::from_millis(2)).await;
+    f.tick();
+    assert_eq!(f.contact.metrics().start_hold_warnings, 1);
+    tokio::time::advance(Duration::from_mins(5)).await;
+    f.tick();
+    let m = f.contact.metrics();
+    assert_eq!(m.start_hold_warnings, 1, "logged once per start");
+    assert_eq!(m.start_hold, Some(StartHold::ClockUnverified));
+    f.contact.verified_always();
+    for _ in 0..5 {
+        f.tick();
+    }
+    let m = f.contact.metrics();
+    assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+    assert_eq!(m.start_hold, None);
+    assert_eq!(m.start_hold_warnings, 1);
+}
+
+/// A verified replica whose engine core cannot be rebuilt names the
+/// rebuild as what holds its start.
+#[tokio::test(start_paused = true)]
+async fn a_start_held_by_a_failing_rebuild_names_the_rebuild() {
+    let f = fixture(&[&[1, 2, 3]]);
+    f.tick();
+    assert_eq!(f.state(), Some(ReplicaState::Withdrawn));
+    assert_eq!(f.contact.metrics().start_hold, None, "not in starting");
+    f.engine.rebuilds.store(false, Ordering::SeqCst);
+    f.apply(10);
+    f.log.0.lock().unwrap().installs += 1;
+    f.contact.log_changed();
+    f.tick();
+    f.tick();
+    assert_eq!(f.state(), Some(ReplicaState::Starting));
+    assert_eq!(f.contact.metrics().start_hold, Some(StartHold::Rebuilding));
+}
+
+/// A stay in `starting` is logged once, after [`START_HOLD_WARN`], and
+/// only while a reason holds it; leaving `starting` starts the next stay
+/// afresh.
+#[tokio::test(start_paused = true)]
+async fn a_stay_in_starting_is_logged_once_past_the_bound_while_held() {
+    let t0 = Instant::now();
+    let mut w = StartWatch::default();
+    assert!(!w.observe(true, true, t0));
+    assert!(!w.observe(true, true, t0 + START_HOLD_WARN - Duration::from_millis(1)));
+    // Not held at the bound: nothing to name yet.
+    assert!(!w.observe(true, false, t0 + START_HOLD_WARN));
+    assert!(w.observe(true, true, t0 + START_HOLD_WARN));
+    assert!(!w.observe(true, true, t0 + 2 * START_HOLD_WARN));
+    assert!(!w.observe(false, false, t0 + 2 * START_HOLD_WARN));
+    let t1 = t0 + 3 * START_HOLD_WARN;
+    assert!(!w.observe(true, true, t1));
+    assert!(w.observe(true, true, t1 + START_HOLD_WARN));
+}

@@ -1948,6 +1948,21 @@ fn disagreement_samples(c: &baseline::Counts) -> Vec<ReplicaMetric> {
     .collect()
 }
 
+/// `samplez_replica_start_held`: 1 under the reason `hold` names, 0
+/// under every other, all 0 for none.
+fn start_hold_samples(hold: Option<contact::StartHold>) -> Vec<ReplicaMetric> {
+    let held = hold.map(contact::StartHold::reason);
+    (contact::StartHold::REASONS.into_iter())
+        .map(|reason| ReplicaMetric {
+            name: "samplez_replica_start_held",
+            help: "1 for the reason the audio replica, in starting, is not ready.",
+            kind: MetricKind::Gauge,
+            labels: vec![("reason", reason.to_owned())],
+            value: if held == Some(reason) { 1.0 } else { 0.0 },
+        })
+        .collect()
+}
+
 /// The `/metrics` samples of contact metrics `m`, `serving` the `/readyz`
 /// term ([`contact::Contact::serving`]).
 fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
@@ -1993,6 +2008,13 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
             value: flag(now == Some(state)),
         });
     }
+    out.extend(start_hold_samples(m.start_hold));
+    out.push(one(
+        "samplez_replica_clock_verified",
+        "Whether this voter's clock is verified.",
+        Gauge,
+        flag(m.verified),
+    ));
     out.extend(mismatch_samples(m.replica.and_then(|l| l.mismatch)));
     out.extend(disagreement_samples(&m.leader));
     if let Some(v) = m.versions {
@@ -2119,6 +2141,16 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
             kind: Gauge,
             labels: vec![("node", p.node.to_string())],
             value: p.silent_gap_max.as_secs_f64(),
+        });
+    }
+    for p in &m.peers {
+        let Some(offset) = p.offset_ns else { continue };
+        out.push(ReplicaMetric {
+            name: "samplez_replica_peer_clock_offset_seconds",
+            help: "A peer's clock minus this replica's, from the latest report exchange.",
+            kind: Gauge,
+            labels: vec![("node", p.node.to_string())],
+            value: offset as f64 / 1e9,
         });
     }
     if let Some(lead) = m.build_lead {

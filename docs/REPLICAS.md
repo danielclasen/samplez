@@ -57,6 +57,22 @@ keeps its last value for `rollout::DEPARTED` (3 s); past that the replica
 reads ready only while it commits. Before its first contact it reads not
 ready.
 
+An audio replica leaves `starting` once, in this order, its clock is
+verified, the horizon does not hold it, its log has applied what its
+restart and the commit it knows need, its engine core is rebuilt from
+product state, and the engine's pending generation is built.
+`samplez_replica_start_held{reason}` reads 1 under the first of these
+that fails (`clock_unverified`, `horizon_held`, `applying`,
+`rebuilding`, `generation_pending`), and a stay in `starting` held for
+30 s logs that reason once at WARN with the values that decide it. A
+clock verifies once its kernel TAI offset is the set's and it lies
+within `clock_guard` plus the exchange's one-way delay of more than half
+of the audio replicas counted (of a majority of the voters while none
+is counted). So a restart waits in `starting` while its node's clock is
+further than that from its peers', as a node's clock can be while its
+time service settles after a reboot, and with two replicas counted, one
+whose node's clock is off holds the other replicas' restarts as well.
+
 A ready replica that commits nothing serves the product's API as one that
 commits: it forwards writes to the leader and takes the leader's read
 index. A ready audio replica takes writes whether or not a leader counts
@@ -174,12 +190,17 @@ leaves the membership, so a peer removed and added again starts from 0:
 | `samplez_replica_peer_report_encode_cpu_seconds_total` | the CPU time of encoding them |
 | `samplez_replica_peer_reports_answered_total` | answered reports by round trip, cumulative over `le` (0.0005, 0.001, 0.002, 0.004, 0.008 s, `+Inf`) |
 | `samplez_replica_peer_report_round_trip_seconds_total` | the sum of their round trips |
+| `samplez_replica_peer_clock_offset_seconds` | the peer's clock minus this replica's, from the latest report exchange |
 
 A silence that ends in a loss of contact, or before a first report,
 counts as a transition but adds no gap. The peer's contact metrics also
 carry these as `silent_transitions` and `silent_gap_max`, and
 `last_report_age`, the time since its last report received directly;
 relayed copies and regaining contact leave that unchanged.
+
+Every audio replica's start: `samplez_replica_start_held{reason}`
+([Readiness](#readiness)), and `samplez_replica_clock_verified`, whether
+its clock is verified.
 
 The leader's:
 
