@@ -103,8 +103,11 @@ pub struct InFlightBits {
     /// Absent from snapshots written before it was kept, which then carry
     /// none.
     #[serde(default)]
-    pub depth_changes: Vec<(usize, usize, u32, Vec<(u64, u32)>)>,
+    pub depth_changes: Vec<DepthChainBits>,
 }
+
+/// [`samplez::DepthChain`] with each depth as its bits.
+pub type DepthChainBits = (usize, usize, u32, Vec<(u64, u32)>);
 
 /// [`samplez_dsp::ToneRamps`] with its values as bit patterns: each
 /// glide's from and to and its start, the frequency's from, to, start and
