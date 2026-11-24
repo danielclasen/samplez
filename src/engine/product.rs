@@ -790,6 +790,38 @@ mod tests {
         rebuilt_alike("mask", &entries, &[], back / B + 1, &state, [0; SLOTS]);
     }
 
+    /// A mask crossfade, and a change back inside it, over a depth changed
+    /// twice within them, the second change while the first one's ramp
+    /// ran, continue on an engine rebuilt inside all of them: the change
+    /// back starts from the gains of the depth the first ramp gave there,
+    /// not of the depth the second one started from.
+    #[test]
+    fn a_rebuilt_engine_continues_a_mask_crossfade_over_two_depth_ramps() {
+        let (first, back, second) = (AT + B, AT + 2 * B, AT + 3 * B);
+        let depth = |db| vec![duck(DuckSetting::Depth { slot: 1, db })];
+        let entries = [
+            setup(10.0, false),
+            (AT, vec![mask(1, 1)]),
+            (first, depth(20.0)),
+            (back, vec![mask(1, 0)]),
+            (second, depth(30.0)),
+        ];
+        let mut state = state(30.0, false);
+        let ramp = Fade {
+            from: 10.0,
+            start: first,
+            len: RAMP,
+        };
+        let ramp = Fade {
+            from: ramp.value_at(20.0, second),
+            start: second,
+            len: RAMP,
+        };
+        state.in_flight.depths = vec![vec![None, Some(ramp)]];
+        state.in_flight.masks = vec![(1, 0, 0, vec![(AT, 1), (back, 0)])];
+        rebuilt_alike("mask-depths", &entries, &[], second / B + 2, &state, [0; SLOTS]);
+    }
+
     /// An input's fade-in after an `InputUp` continues on an engine
     /// rebuilt inside it.
     #[test]
