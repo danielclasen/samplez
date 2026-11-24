@@ -815,6 +815,9 @@ struct State {
     missed_after: Option<u64>,
     #[cfg(test)]
     verified_always: bool,
+    /// The horizon holds this replica whatever it measures.
+    #[cfg(test)]
+    horizon_always: bool,
     /// Reports and copies as before [`Carried`]: every record in every
     /// report, copies keeping theirs and relaying them.
     #[cfg(test)]
@@ -1089,6 +1092,7 @@ pub struct Metrics {
 /// Why an audio replica in `starting` is not ready: the first term of
 /// its readiness that fails, in the order [`Contact::live`] needs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StartHold {
     /// Its clock is not verified ([`crate::verify`]).
     ClockUnverified,
@@ -1101,16 +1105,19 @@ pub enum StartHold {
     Rebuilding,
     /// The engine's pending generation is not built yet.
     GenerationPending,
+    /// The engine has processed no block since its core was installed.
+    NotProcessing,
 }
 
 impl StartHold {
     /// Every [`StartHold::reason`].
-    pub const REASONS: [&'static str; 5] = [
+    pub const REASONS: [&'static str; 6] = [
         "clock_unverified",
         "horizon_held",
         "applying",
         "rebuilding",
         "generation_pending",
+        "not_processing",
     ];
 
     /// Its label.
@@ -1121,6 +1128,7 @@ impl StartHold {
             StartHold::Applying { .. } => "applying",
             StartHold::Rebuilding => "rebuilding",
             StartHold::GenerationPending => "generation_pending",
+            StartHold::NotProcessing => "not_processing",
         }
     }
 }
@@ -1186,6 +1194,10 @@ pub struct PeerMetrics {
     pub last_report_age: Option<Duration>,
     /// Its clock minus this one's, from the latest exchange, ns.
     pub offset_ns: Option<i64>,
+    /// What clock verification reads of it: its clock minus this one's
+    /// from the exchange with the lowest round trip of the last
+    /// [`crate::clock::WINDOW`], and that exchange's one-way delay, ns.
+    pub clock_best: Option<(i64, u64)>,
 }
 
 fn since(now: Instant, then: Instant) -> Duration {
@@ -1306,6 +1318,8 @@ impl Contact {
                     missed_after: None,
                     #[cfg(test)]
                     verified_always: false,
+                    #[cfg(test)]
+                    horizon_always: false,
                     #[cfg(test)]
                     as_before: false,
                     carried: BTreeMap::new(),
@@ -2946,6 +2960,9 @@ impl Contact {
                 held_s,
                 "a start is held: the engine's pending generation is not built"
             ),
+            StartHold::NotProcessing => {
+                tracing::warn!(held_s, "a start is held: the engine has processed no block");
+            }
         }
     }
 
@@ -2997,6 +3014,8 @@ impl Contact {
             })
         } else if !st.generation_ready {
             Some(StartHold::GenerationPending)
+        } else if st.own.processed.is_none() {
+            Some(StartHold::NotProcessing)
         } else {
             None
         };
@@ -3012,7 +3031,7 @@ impl Contact {
         for page in due {
             life.verdict(page, &st.own, &st.realised, audio.as_ref());
         }
-        let ready = self.log.applied() >= st.known_committed && st.generation_ready && !rebuilding;
+        let ready = applied >= st.known_committed && st.generation_ready && !rebuilding;
         let baseline = self.log.baseline();
         let t = self.timing;
         let fresh = t.contact_window + t.hold;
@@ -3538,6 +3557,10 @@ impl Contact {
             index_at(self.timing.apply_guard_ns()),
             spread,
         );
+        #[cfg(test)]
+        if st.horizon_always {
+            st.horizon.hold();
+        }
     }
 
     /// Unit tests that drive the log, not the clock: this replica counts
@@ -4278,6 +4301,7 @@ impl Contact {
                     silent: p.silent,
                     last_report_age: p.last.as_ref().map(|d| since(now, d.received)),
                     offset_ns: p.offset_ns,
+                    clock_best: p.thetas.best(),
                 })
                 .collect(),
             shared_gaps: c.shared_gaps,

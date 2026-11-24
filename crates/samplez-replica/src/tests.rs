@@ -51,8 +51,10 @@ fn the_start_hold_reason_is_exposed_by_its_label() {
         },
         StartHold::Rebuilding,
         StartHold::GenerationPending,
+        StartHold::NotProcessing,
     ];
     for hold in holds {
+        assert!(StartHold::REASONS.contains(&hold.reason()), "{hold:?}");
         let samples = start_hold_samples(Some(hold));
         assert_eq!(samples.len(), StartHold::REASONS.len());
         for reason in StartHold::REASONS {

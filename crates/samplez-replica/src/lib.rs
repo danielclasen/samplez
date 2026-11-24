@@ -2144,13 +2144,27 @@ fn contact_samples(serving: bool, m: &contact::Metrics) -> Vec<ReplicaMetric> {
         });
     }
     for p in &m.peers {
-        let Some(offset) = p.offset_ns else { continue };
+        let Some((theta, _)) = p.clock_best else {
+            continue;
+        };
         out.push(ReplicaMetric {
             name: "samplez_replica_peer_clock_offset_seconds",
-            help: "A peer's clock minus this replica's, from the latest report exchange.",
+            help: "A peer's clock minus this replica's, from the report exchange with the lowest round trip of the last 64, as clock verification reads it.",
             kind: Gauge,
             labels: vec![("node", p.node.to_string())],
-            value: offset as f64 / 1e9,
+            value: theta as f64 / 1e9,
+        });
+    }
+    for p in &m.peers {
+        let Some((_, delay)) = p.clock_best else {
+            continue;
+        };
+        out.push(ReplicaMetric {
+            name: "samplez_replica_peer_clock_offset_delay_seconds",
+            help: "The one-way delay of that exchange: clock verification accepts an offset within clockGuard plus it.",
+            kind: Gauge,
+            labels: vec![("node", p.node.to_string())],
+            value: delay as f64 / 1e9,
         });
     }
     if let Some(lead) = m.build_lead {

@@ -246,6 +246,10 @@ struct Engine {
     disabled: AtomicU64,
     /// The build time it reports, in samples; none at 0.
     build_time: AtomicU64,
+    /// It reports its pending generation not built.
+    generation_pending: std::sync::atomic::AtomicBool,
+    /// It reports no processed block.
+    idle: std::sync::atomic::AtomicBool,
     /// [`Audio::follows`].
     follows: std::sync::atomic::AtomicBool,
     /// Its outputs stand committing, not withdrawn.
@@ -313,7 +317,7 @@ impl Audio for Engine {
         let step = self.clock.tai_ns() >= self.step_at.load(Ordering::SeqCst);
         Sample {
             own: Own {
-                processed: Some(1),
+                processed: Some(1).filter(|_| !self.idle.load(Ordering::SeqCst)),
                 clock: ClockFlags {
                     step_fence: step,
                     ..ClockFlags::default()
@@ -337,7 +341,7 @@ impl Audio for Engine {
             enabled: (0..self.reported())
                 .map(|o| self.disabled.load(Ordering::SeqCst) & 1 << o == 0)
                 .collect(),
-            generation_ready: true,
+            generation_ready: !self.generation_pending.load(Ordering::SeqCst),
             clock_steps: 0,
             log_overflows: 0,
         }
@@ -570,6 +574,8 @@ fn engine(clock: &Arc<Clock>) -> Arc<Engine> {
         second: std::sync::atomic::AtomicBool::new(false),
         disabled: AtomicU64::new(0),
         build_time: AtomicU64::new(0),
+        generation_pending: std::sync::atomic::AtomicBool::new(false),
+        idle: std::sync::atomic::AtomicBool::new(false),
         follows: std::sync::atomic::AtomicBool::new(true),
         committing: std::sync::atomic::AtomicBool::new(false),
         apart: std::sync::atomic::AtomicBool::new(false),
@@ -4308,4 +4314,90 @@ async fn a_stay_in_starting_is_logged_once_past_the_bound_while_held() {
     let t1 = t0 + 3 * START_HOLD_WARN;
     assert!(!w.observe(true, true, t1));
     assert!(w.observe(true, true, t1 + START_HOLD_WARN));
+}
+
+/// The reason a start is held on a fresh fixture after `setup`, and its
+/// state after one tick.
+fn first_hold(setup: impl FnOnce(&Fixture)) -> (Option<StartHold>, Option<ReplicaState>) {
+    let f = fixture(&[&[1, 2, 3]]);
+    setup(&f);
+    f.tick();
+    (f.contact.metrics().start_hold, f.state())
+}
+
+/// Each term of a start's readiness is named when it alone fails, in
+/// the order `live` checks them: a horizon hold before the log, the
+/// log before the generation, the generation before the first block.
+#[tokio::test(start_paused = true)]
+async fn each_term_holding_a_start_is_named() {
+    use ReplicaState::Starting;
+    assert_eq!(first_hold(|_| {}), (None, Some(ReplicaState::Withdrawn)));
+    assert_eq!(
+        first_hold(|f| f.contact.lock().horizon_always = true),
+        (Some(StartHold::HorizonHeld), Some(Starting))
+    );
+    // The commit it knows lies past what its log applied.
+    assert_eq!(
+        first_hold(|f| f.contact.lock().known_committed = 5),
+        (
+            Some(StartHold::Applying {
+                applied: 0,
+                needed: 5
+            }),
+            Some(Starting)
+        )
+    );
+    // A restart needs its log applied past the index it began at.
+    assert_eq!(
+        first_hold(|f| {
+            let mut st = f.contact.lock();
+            f.contact.begin_restart(&mut st, 7, "test");
+        }),
+        (
+            Some(StartHold::Applying {
+                applied: 0,
+                needed: 7
+            }),
+            Some(Starting)
+        )
+    );
+    assert_eq!(
+        first_hold(|f| f.engine.generation_pending.store(true, Ordering::SeqCst)),
+        (Some(StartHold::GenerationPending), Some(Starting))
+    );
+    // Ready by the log and the generation, but no block processed:
+    // `starting` is left only with one.
+    assert_eq!(
+        first_hold(|f| f.engine.idle.store(true, Ordering::SeqCst)),
+        (Some(StartHold::NotProcessing), Some(Starting))
+    );
+    // Two terms failing name the first: the horizon before the log, the
+    // log before the generation.
+    assert_eq!(
+        first_hold(|f| {
+            f.contact.lock().horizon_always = true;
+            f.contact.lock().known_committed = 5;
+        })
+        .0,
+        Some(StartHold::HorizonHeld)
+    );
+    assert_eq!(
+        first_hold(|f| {
+            f.contact.lock().known_committed = 5;
+            f.engine.generation_pending.store(true, Ordering::SeqCst);
+        })
+        .0,
+        Some(StartHold::Applying {
+            applied: 0,
+            needed: 5
+        })
+    );
+    assert_eq!(
+        first_hold(|f| {
+            f.engine.generation_pending.store(true, Ordering::SeqCst);
+            f.engine.idle.store(true, Ordering::SeqCst);
+        })
+        .0,
+        Some(StartHold::GenerationPending)
+    );
 }
