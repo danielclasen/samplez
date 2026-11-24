@@ -687,10 +687,10 @@ fn a_loudness_entry_of_a_meter_the_engine_lacks_is_left_out() {
 /// Ramps in flight that the engine refuses are filtered as the live
 /// filter filters entries, so the rebuild is taken: a fade-in and a
 /// crossfade of a slot beyond the engine's are left out, a depth ramp
-/// from a depth the engine refuses is dropped, and a mask change the
-/// engine refuses, on a column that does not duck, is taken as 0, the
-/// mask the state's own refused mask becomes. Unfiltered, the engine
-/// refuses each state whole.
+/// and depth changes from a depth the engine refuses are dropped, and a
+/// mask change the engine refuses, on a column that does not duck, is
+/// taken as 0, the mask the state's own refused mask becomes.
+/// Unfiltered, the engine refuses each state whole.
 #[test]
 fn ramps_in_flight_the_engine_refuses_are_filtered_from_a_rebuild() {
     let domain = Domain::new();
@@ -729,6 +729,8 @@ fn ramps_in_flight_the_engine_refuses_are_filtered_from_a_rebuild() {
         len: 480,
     };
     depths.in_flight.depths = vec![vec![Some(from_99)]];
+    let mut depth_changes = base.clone();
+    depth_changes.in_flight.depth_changes = vec![(0, 0, 99.0, vec![(at, 0.0)])];
     let mut masks = base.clone();
     masks.masks = vec![vec![1]];
     masks.in_flight.masks = vec![(0, 0, 0, vec![(at, 1)])];
@@ -736,6 +738,7 @@ fn ramps_in_flight_the_engine_refuses_are_filtered_from_a_rebuild() {
         ("fade-ins", &fade_ins),
         ("crossfades", &crossfades),
         ("depths", &depths),
+        ("depth changes", &depth_changes),
         ("masks", &masks),
     ] {
         assert!(

@@ -87,9 +87,9 @@ pub struct Replicated {
 }
 
 /// [`samplez::InFlight`] with each depth ramp as `(from bits, start,
-/// len)`, the input slots the derived entries hold down, a bit per
-/// slot, and per slot the entry that started its last fade-in with what
-/// it changed.
+/// len)` and each depth of the depth changes as its bits, the input
+/// slots the derived entries hold down, a bit per slot, and per slot
+/// the entry that started its last fade-in with what it changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InFlightBits {
     pub down: u64,
@@ -100,6 +100,10 @@ pub struct InFlightBits {
     pub crossfades: Vec<Option<(u64, Option<String>)>>,
     pub depths: Vec<Vec<Option<(u32, u64, u32)>>>,
     pub masks: Vec<samplez::MaskChain>,
+    /// Absent from snapshots written before it was kept, which then carry
+    /// none.
+    #[serde(default)]
+    pub depth_changes: Vec<(usize, usize, u32, Vec<(u64, u32)>)>,
 }
 
 /// [`samplez_dsp::ToneRamps`] with its values as bit patterns: each

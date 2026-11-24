@@ -968,13 +968,13 @@ fn replay_failed(e: ReplayError) -> Failed {
 }
 
 /// Filters the ramps in flight of `state` as the live filter filters
-/// entries, for an engine of `state`'s input slots: a crossfade of a slot
-/// of `left`, which stays at the flow it reads, is none; fade-ins and
-/// crossfades of slots beyond the engine's are left out; a depth ramp
-/// from or to a depth `takes` refuses, by group, slot and dB, is left
-/// out; each mask of a mask change, the one it starts from included, is
-/// the one `mask` lets through, by input channel and column. How many
-/// were left out.
+/// entries, for an engine of `state`'s input slots: a crossfade of a
+/// slot of `left`, which stays at the flow it reads, is none; fade-ins
+/// and crossfades of slots beyond the engine's are left out; a depth
+/// ramp from or to a depth `takes` refuses, by group, slot and dB, is
+/// left out, as are depth changes holding one; each mask of a mask
+/// change, the one it starts from included, is the one `mask` lets
+/// through, by input channel and column. How many were left out.
 fn filter_in_flight(
     state: &mut ProductState,
     left: &[usize],
@@ -1003,6 +1003,11 @@ fn filter_in_flight(
             }
         }
     }
+    let before = flight.depth_changes.len();
+    flight.depth_changes.retain(|(group, slot, from, changes)| {
+        takes(*group, *slot, *from) && changes.iter().all(|c| takes(*group, *slot, c.1))
+    });
+    dropped += before - flight.depth_changes.len();
     for (input, output, from, changes) in &mut flight.masks {
         *from = mask(*input, *output, *from);
         for (_, k) in changes.iter_mut() {
