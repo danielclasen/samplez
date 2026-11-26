@@ -1669,7 +1669,7 @@ dependencies = [
 [[package]]
 name = "mxl"
 version = "0.1.0"
-source = "git+https://github.com/dmf-mxl/mxl?rev=8f3f1096e804bfb822eb959cdf2fc23199a7d15d#8f3f1096e804bfb822eb959cdf2fc23199a7d15d"
+source = "git+https://github.com/dmf-mxl/mxl?tag=v1.1.0#8f3f1096e804bfb822eb959cdf2fc23199a7d15d"
 dependencies = [
  "libloading",
  "mxl-sys",
@@ -1682,7 +1682,7 @@ dependencies = [
 [[package]]
 name = "mxl-sys"
 version = "0.1.0"
-source = "git+https://github.com/dmf-mxl/mxl?rev=8f3f1096e804bfb822eb959cdf2fc23199a7d15d#8f3f1096e804bfb822eb959cdf2fc23199a7d15d"
+source = "git+https://github.com/dmf-mxl/mxl?tag=v1.1.0#8f3f1096e804bfb822eb959cdf2fc23199a7d15d"
 dependencies = [
  "bindgen",
  "cmake",

@@ -14,7 +14,7 @@ members = ["crates/samplez-dsp", "crates/samplez-mxl", "crates/samplez-nmos", "c
 [dependencies]
 
 libc = "0.2"
-mxl-sys = { git = "https://github.com/dmf-mxl/mxl", rev = "8f3f1096e804bfb822eb959cdf2fc23199a7d15d", features = ["mxl-not-built"] }
+mxl-sys = { git = "https://github.com/dmf-mxl/mxl", tag = "v1.1.0", features = ["mxl-not-built"] }
 rtrb = "0.3"
 samplez-dsp = { path = "crates/samplez-dsp", version = "0.28.0" }
 samplez-mxl = { path = "crates/samplez-mxl", version = "0.28.0" }

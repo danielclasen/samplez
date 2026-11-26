@@ -147,7 +147,7 @@ of the compatibility key (`rollout::key`, `docs/ARCHITECTURE.md`
   snapshots.
 - `COMPUTE_VERSION`: any change to the samples or meters the engine
   computes, dependency and toolchain changes included, or to what a core
-  copy holds or how it encodes. `samplez-dsp` pins `libm = "=0.2.16"`,
+  copy holds or how it encodes. `samplez-dsp` pins `libm` to one version,
   and products pin it too. It is 3: an input's delay line runs before
   its strip and its pre-strip meter and rows, so every tap of an input
   is as late as its delay.

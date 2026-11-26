@@ -1,14 +1,16 @@
 # Build environment for samplez: Rust, clang and libclang for bindgen, a
-# Release build of libmxl (MXL v1.1.0) installed under /opt/mxl, and the
+# Release build of libmxl installed under /opt/mxl, and the
 # tools of the RT gates.
 FROM debian:trixie-20261027@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1 AS libmxl
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
-# MXL v1.1.0
+# renovate: datasource=github-tags depName=dmf-mxl/mxl tag=v1.1.0
 ARG MXL_SHA=8f3f1096e804bfb822eb959cdf2fc23199a7d15d
 # vcpkg tool and registry checkout. Port versions follow the
-# builtin-baseline and minimum versions in libmxl's vcpkg.json.
+# builtin-baseline and minimum versions in libmxl's vcpkg.json, so the
+# checkout has to contain that baseline commit.
+# renovate: datasource=git-refs depName=https://github.com/microsoft/vcpkg branch=master
 ARG VCPKG_REF=3d22b64585ca026e881728fd87e541c23a611a43
 
 RUN apt-get update \
@@ -44,7 +46,11 @@ FROM debian:trixie-20261027@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8f
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
+# renovate: datasource=rust-version depName=rust
 ARG RUST_VERSION=1.96.0
+# RUSTUP_SHA256 is the sha256 of rustup-init at RUSTUP_VERSION, from
+# rustup-init.sha256 beside it; a version bump replaces both.
+# renovate: datasource=github-tags depName=rust-lang/rustup
 ARG RUSTUP_VERSION=1.29.0
 ARG RUSTUP_SHA256=4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10
 
@@ -68,10 +74,14 @@ RUN curl -sSfo /tmp/rustup-init \
 # The RT gates: a pinned nightly with rust-src for RealtimeSanitizer
 # (-Zsanitizer=realtime with -Zbuild-std), and valgrind with the Gungraun
 # (formerly iai-callgrind) runner for the instruction-count benchmarks.
+# renovate: datasource=rust-version depName=rust-nightly
 ARG NIGHTLY=nightly-2026-09-20
+# renovate: datasource=crate depName=gungraun-runner
 ARG GUNGRAUN_VERSION=0.20.0
+# renovate: datasource=deb depName=valgrind registryUrl=https://deb.debian.org/debian?suite=trixie&components=main&binaryArch=amd64 versioning=deb
+ARG VALGRIND_VERSION=1:3.24.0-3
 RUN apt-get update \
- && apt-get install -y --no-install-recommends valgrind=1:3.24.0-3 \
+ && apt-get install -y --no-install-recommends valgrind="${VALGRIND_VERSION}" \
  && rm -rf /var/lib/apt/lists/* \
  && rustup toolchain install "${NIGHTLY}" --profile minimal --component rust-src \
  && cargo install --locked gungraun-runner --version "${GUNGRAUN_VERSION}" \

@@ -93,6 +93,9 @@ jobs:
       # included, may carry.
       - name: Dependency licences
         env:
+          # The sha256 below is the release's .sha256 asset; a version bump
+          # replaces both.
+          # renovate: datasource=github-releases depName=EmbarkStudios/cargo-deny
           DENY: https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
         run: |
           mkdir -p "$RUNNER_TEMP/deny"
