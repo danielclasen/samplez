@@ -1,0 +1,113 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":semanticCommits"],
+  "minimumReleaseAge": "3 days",
+  "prHourlyLimit": 2,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Builder image versions pinned as ARGs below a marker comment. A marker with tag= or branch= pins a commit, which moves with that tag or branch.",
+      "managerFilePatterns": ["/^docker/builder/Dockerfile$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+) (?:tag|branch)=(?<currentValue>\\S+)\\s+ARG \\w+=(?<currentDigest>[0-9a-f]{40})",
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: registryUrl=(?<registryUrl>\\S+))?(?: versioning=(?<versioning>\\S+))?\\s+ARG \\w+=(?<currentValue>\\S+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "CI tools downloaded by a release URL below a marker comment; the version appears twice in the URL and both move.",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+: https://\\S+/download/(?<currentValue>[^/\\s]+)/\\S+"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Crates the released crates compile in ship to every product built on samplez, so they land as fix(deps) and cut a release. Grouped because the exact pins of one crate across the workspace must move together. 14 days because lint fails a crates.io release younger than that.",
+      "matchManagers": ["cargo"],
+      "matchDatasources": ["crate"],
+      "matchPackageNames": ["!libm", "!xxhash-rust", "!gungraun", "!jsonschema", "!tokio-tungstenite", "!tower", "!tracing-subscriber"],
+      "groupName": "Rust crates",
+      "minimumReleaseAge": "14 days",
+      "semanticCommitType": "fix",
+      "semanticCommitScope": "deps"
+    },
+    {
+      "description": "libm and xxhash-rust decide the samples and the page hashes, so a bump is a COMPUTE_VERSION or PROTOCOL question and gets a PR of its own that the goldens judge.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["libm", "xxhash-rust"],
+      "minimumReleaseAge": "14 days",
+      "semanticCommitType": "fix",
+      "semanticCommitScope": "deps"
+    },
+    {
+      "description": "Crates only tests use ship nothing, so they cut no release.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["jsonschema", "tokio-tungstenite", "tower", "tracing-subscriber"],
+      "groupName": "Rust dev crates",
+      "minimumReleaseAge": "14 days",
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "deps"
+    },
+    {
+      "description": "The builder image is the build and test environment, not part of a release.",
+      "matchFileNames": ["docker/builder/Dockerfile"],
+      "semanticCommitType": "build",
+      "semanticCommitScope": "deps"
+    },
+    {
+      "description": "The Debian base is tagged <suite>-<date>, which only a regex orders.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["debian"],
+      "versioning": "regex:^(?<compatibility>[a-z]+)-(?<patch>\\d{8})$"
+    },
+    {
+      "description": "gungraun-runner in the builder has to be the version of the gungraun crate the benches link, so both move in one PR.",
+      "matchPackageNames": ["gungraun", "gungraun-runner"],
+      "groupName": "gungraun",
+      "minimumReleaseAge": "14 days",
+      "semanticCommitType": "build",
+      "semanticCommitScope": "deps"
+    },
+    {
+      "description": "A nightly appears every day; the RealtimeSanitizer gate needs one at a time, so it is offered once a month.",
+      "matchPackageNames": ["rust-nightly"],
+      "schedule": ["on the first day of the month"]
+    },
+    {
+      "description": "vcpkg is pinned to a master commit; once a month keeps it near the registry without a PR per commit.",
+      "matchPackageNames": ["https://github.com/microsoft/vcpkg"],
+      "schedule": ["on the first day of the month"]
+    },
+    {
+      "description": "Renovate cannot compute the rustup-init checksum, so the PR fails the builder build until RUSTUP_SHA256 is replaced by hand.",
+      "matchPackageNames": ["rust-lang/rustup"],
+      "prBodyNotes": ["Replace `RUSTUP_SHA256` with the value from `https://static.rust-lang.org/rustup/archive/{{{newValue}}}/x86_64-unknown-linux-gnu/rustup-init.sha256`; the builder build fails until then."]
+    },
+    {
+      "description": "Renovate cannot compute the cargo-deny tarball checksum, so lint fails until it is replaced by hand. A CI tool cuts no release.",
+      "matchPackageNames": ["EmbarkStudios/cargo-deny"],
+      "semanticCommitType": "ci",
+      "semanticCommitScope": "deps",
+      "prBodyNotes": ["Replace the sha256 next to `DENY` with the release's `cargo-deny-{{{newValue}}}-x86_64-unknown-linux-musl.tar.gz.sha256` asset; lint fails until then."]
+    },
+    {
+      "description": "libmxl is the Rust bindings in the released crates and the C library in the builder, which must be the same commit, so they move in one PR. Not delayed, so an upstream release that breaks samplez surfaces at once as a CI-red PR.",
+      "matchPackageNames": ["dmf-mxl/mxl"],
+      "groupName": "libmxl",
+      "minimumReleaseAge": "0 days",
+      "prBodyNotes": ["README.md, AGENTS.md and docs/ARCHITECTURE.md name the libmxl version samplez needs at run time; move them with it."],
+      "schedule": ["at any time"],
+      "semanticCommitType": "fix",
+      "semanticCommitScope": "deps"
+    },
+    {
+      "description": "Group GitHub Actions and runner bumps into one PR; CI only, so no release.",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "semanticCommitType": "ci",
+      "semanticCommitScope": "deps"
+    }
+  ]
+}

@@ -9,8 +9,8 @@ description = "MXL flow input and output for the samplez engine"
 publish = false
 
 [dependencies]
-mxl = { git = "https://github.com/dmf-mxl/mxl", rev = "8f3f1096e804bfb822eb959cdf2fc23199a7d15d", features = ["mxl-not-built"] }
-mxl-sys = { git = "https://github.com/dmf-mxl/mxl", rev = "8f3f1096e804bfb822eb959cdf2fc23199a7d15d", features = ["mxl-not-built"] }
+mxl = { git = "https://github.com/dmf-mxl/mxl", tag = "v1.1.0", features = ["mxl-not-built"] }
+mxl-sys = { git = "https://github.com/dmf-mxl/mxl", tag = "v1.1.0", features = ["mxl-not-built"] }
 serde_json = "1"
 
 # Test-only hooks (`input::set_open_delay`, `input::set_open_failure`)

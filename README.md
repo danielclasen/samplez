@@ -65,8 +65,8 @@ it is built is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   its priority (70 by default), and `CAP_IPC_LOCK` or an unlimited
   `RLIMIT_MEMLOCK`; without them it runs degraded. Swap off and `vm.compact_unevictable_allowed=0` on the host,
   and MXL domains on tmpfs. [Real-time set-up](docs/USAGE.md#real-time-set-up)
-- Building: the builder image in `docker/builder` (Rust 1.96.0, libmxl
-  under `/opt/mxl`). [docs/BUILDING.md](docs/BUILDING.md)
+- Building: the builder image in `docker/builder` (Rust, libmxl under
+  `/opt/mxl`). [docs/BUILDING.md](docs/BUILDING.md)
 
 ## Quick start
 

@@ -5,14 +5,15 @@ how it behaves.
 
 ## The builder image
 
-`docker/builder` holds the build environment: Rust 1.96.0 with clippy and
-rustfmt, clang and libclang for bindgen, a Release build of libmxl (MXL
-v1.1.0) under `/opt/mxl` with its tools `mxl-info` and `mxl-data-probe`,
-and the tools of the RT gates: a pinned nightly with `rust-src`
-(`$SAMPLEZ_NIGHTLY`), Valgrind and the Gungraun runner. CI builds it and
-builds and tests inside it. `.github/workflows/builder.yml` publishes it
-from `main` as `ghcr.io/danielclasen/samplez-builder`, tagged `latest`,
-`mxl-<sha>-rust-<version>` and the commit.
+`docker/builder` holds the build environment: the Rust release
+`RUST_VERSION` names with clippy and rustfmt, clang and libclang for
+bindgen, a Release build of libmxl at `MXL_SHA` under `/opt/mxl` with its
+tools `mxl-info` and `mxl-data-probe`, and the tools of the RT gates: a
+pinned nightly with `rust-src` (`$SAMPLEZ_NIGHTLY`), Valgrind and the
+Gungraun runner. CI builds it and builds and tests inside it.
+`.github/workflows/builder.yml` publishes it from each push to `main`
+that changes `docker/builder` as `ghcr.io/danielclasen/samplez-builder`,
+tagged `latest`, `mxl-<sha>-rust-<version>` and the commit.
 
 ## Build and test
 
@@ -119,6 +120,13 @@ the required check and passes only when every job did.
 
 A crates.io release `Cargo.lock` gains has to be 14 days old unless
 `.github/lockfile-age/allow.txt` lists it.
+
+Renovate (`renovate.json`) proposes updates for the pins: the crates,
+which it holds back 14 days for that check; libmxl, whose tag in the
+manifests and `MXL_SHA` in the builder move in one PR; the builder's
+base image, toolchains and tools; and the Actions. It cannot compute two
+checksums, `RUSTUP_SHA256` in the builder and cargo-deny's in `ci.yml`,
+so those PRs fail CI until the checksum is replaced by hand.
 
 ## Releases
 
