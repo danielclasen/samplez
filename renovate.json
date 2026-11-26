@@ -108,6 +108,11 @@
       "groupName": "GitHub Actions",
       "semanticCommitType": "ci",
       "semanticCommitScope": "deps"
+    },
+    {
+      "description": "The debian base, the vcpkg commit and valgrind (the docker, git-refs and deb datasources) come without a release timestamp, which minimumReleaseAge would otherwise hold back for good.",
+      "matchDatasources": ["docker", "git-refs", "deb"],
+      "minimumReleaseAgeBehaviour": "timestamp-optional"
     }
   ]
 }
